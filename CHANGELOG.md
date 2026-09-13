@@ -48,5 +48,3 @@
 Validation: 592 Python tests and 45 JavaScript tests passed. Isolated browser
 checks covered exact selections, immediate feedback, progress after reload,
 failed requests, and mobile layout, with application requests mocked.
-
-See the [Career Ops guide](docs/career-ops.md) for setup and workflow details.

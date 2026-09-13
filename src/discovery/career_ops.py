@@ -110,7 +110,7 @@ def _catalog_at(root: str, config_dir: str) -> tuple:
     ).stdout.strip()
     if revision != REVISION:
         raise ValueError(
-            "Career Ops version changed. Restore the pinned revision in docs/career-ops.md."
+            f"Career Ops version changed. Restore the pinned revision: {REVISION}."
         )
     from discovery.watchlist import load_watchlist
 

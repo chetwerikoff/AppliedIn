@@ -143,7 +143,7 @@ off, which is what you want for a first run.
 
 Startup also installs Career Ops for **Find jobs** when it is missing, including
 Git and Node.js through Homebrew if needed. Existing installations are checked
-without downloading again. See [Career Ops setup](docs/career-ops.md).
+without downloading again.
 
 It runs in the background and logs to `.local/daemon.log`. `./appliedin status`,
 `./appliedin logs` and `./appliedin stop` do what they say.

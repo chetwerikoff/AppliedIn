@@ -138,7 +138,24 @@ class SearchEvents:
         return {"parsed": parsed, "source_urls": self.sources, "queries": self.queries}
 
 
-def run_search(prompt: str, schema: dict, progress) -> dict:
+def watch_cancellation(proc, cancelled):
+    finished = threading.Event()
+    if cancelled:
+
+        def watch():
+            while not finished.wait(0.25):
+                if cancelled():
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    return
+
+        threading.Thread(target=watch, daemon=True, name="search-cancel").start()
+    return finished
+
+
+def run_search(prompt: str, schema: dict, progress, *, cancelled=None) -> dict:
     if not shutil.which("claude"):
         raise ValueError(
             "Install Claude Code and sign in with your Claude subscription to search jobs."
@@ -200,6 +217,7 @@ def run_search(prompt: str, schema: dict, progress) -> dict:
             timer = threading.Timer(TIMEOUT, expire)
             timer.daemon = True
             timer.start()
+            cancellation = watch_cancellation(proc, cancelled)
             try:
                 for line in proc.stdout:
                     try:
@@ -211,6 +229,7 @@ def run_search(prompt: str, schema: dict, progress) -> dict:
                 code = proc.wait()
             finally:
                 timer.cancel()
+                cancellation.set()
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()

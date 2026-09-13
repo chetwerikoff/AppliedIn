@@ -100,6 +100,7 @@ class RedisTracking(AbstractTracking):
             # every job was discovered seconds ago and none of them are new.
             "posted_at": getattr(job, "posted_at", "") or "",
             "discovery_source": job.discovery_source,
+            "apply_requested_at": job.apply_requested_at,
             "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
         }
         self._write(job.pk, row, prev_status=None)

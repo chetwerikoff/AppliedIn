@@ -39,6 +39,32 @@ def _validate(repo: Path) -> None:
     )
     if result.stdout.strip() != "[]":
         raise ValueError("Career Ops provider check returned an unexpected result.")
+    ensure_scanner(repo)
+
+
+def ensure_scanner(repo: Path) -> None:
+    """Install only runtime modules; upstream's postinstall drives a browser."""
+    check = ["node", str(ROOT / "scripts/integrations/career-network.mjs"), str(repo), "--check"]
+    result = subprocess.run(check, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        print("▸ installing Career Ops scanner dependencies…", flush=True)
+        subprocess.run(
+            [
+                "npm",
+                "install",
+                "--ignore-scripts",
+                "--omit=dev",
+                "--no-package-lock",
+                "--no-audit",
+                "--no-fund",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=180,
+        )
+        subprocess.run(check, capture_output=True, text=True, check=True, timeout=30)
 
 
 def ensure_checkout(local_dir: Path) -> bool:

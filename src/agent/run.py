@@ -233,7 +233,13 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
     emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
          url=row.get("jd_url"))
     try:
-        return _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+        result = _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+        # Career Ops always uses the review graph: it must finish scoring and
+        # produce a real PDF before an explicit Apply-selected request advances.
+        # The authorization is persisted before the first worker sees the row.
+        if (result or {}).get("result") == "prepared" and row.get("apply_requested_at"):
+            return _enqueue_apply(pk, stores, priority=True)
+        return result
     finally:
         _release(pk, stores)
 

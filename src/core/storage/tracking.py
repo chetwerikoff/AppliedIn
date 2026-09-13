@@ -43,6 +43,7 @@ class TrackingStore(AbstractTracking):
             "ats": job.ats,
             "attempts": 0,
             "discovery_source": job.discovery_source,
+            "apply_requested_at": job.apply_requested_at,
             "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
         }
         try:

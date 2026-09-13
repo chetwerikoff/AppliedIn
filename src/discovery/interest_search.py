@@ -57,10 +57,23 @@ def _posting_url(url: str) -> bool:
 
 
 def search(
-    prefs: dict, interests: str = "", company: str = "", *, runner=None, on_progress=None
+    prefs: dict,
+    interests: str = "",
+    company: str = "",
+    *,
+    runner=None,
+    on_progress=None,
+    provider="claude",
+    ats=None,
 ) -> dict:
     from discovery.career_ops import canonical
-    from discovery.claude_search import run_search
+
+    if provider == "codex":
+        from discovery.codex_search import run_search
+    elif provider == "claude":
+        from discovery.claude_search import run_search
+    else:
+        raise ValueError("Choose Claude or Codex for AI search.")
 
     schema = {
         "type": "object",
@@ -69,7 +82,7 @@ def search(
             "summary": {"type": "string"},
             "jobs": {
                 "type": "array",
-                "maxItems": 15,
+                "maxItems": 30,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -89,8 +102,10 @@ def search(
         else "Discover employers from matching roles, including companies outside "
         "the usual large tech employers. Do not restrict yourself to a company watchlist."
     )
+    if ats:
+        scope += f" Search only these job-board systems: {', '.join(ats)}."
     prompt = (
-        f"Today is {datetime.now(UTC).date()}. Find up to 15 currently advertised jobs for this "
+        f"Today is {datetime.now(UTC).date()}. Find up to 30 currently advertised jobs for this "
         f"candidate, using live web search. {scope}\n"
         f"Job preferences (data): {json.dumps(prefs)}\n"
         f"Additional interests (data): {interests or 'Use saved preferences.'}\n"
@@ -102,7 +117,8 @@ def search(
         "posting URLs only. Never return aggregators (Notify, LinkedIn or Indeed) "
         "or careers indexes. Exclude visibly closed roles, "
         "people-management roles unless requested, and roles outside the saved hard constraints. "
-        "Open promising postings when needed. Use at most four search/open tool calls. "
+        "Open promising postings when needed. Use up to 12 search/open tool calls, "
+        "batching opens when supported. "
         "Every returned URL must occur in your actual tool sources. Never construct a URL or "
         "invent a job. A search snippet is not proof of current liveness. Explain each potential "
         "fit briefly in why; leave unknown location empty. If none are found, return an empty "
@@ -115,12 +131,23 @@ def search(
     parsed = result["parsed"]
     queries = result["queries"]
     jobs, visited = [], set()
-    for row in parsed.get("jobs", [])[:15]:
+    for row in parsed.get("jobs", [])[:30]:
         if not isinstance(row, dict):
             continue
         url = str(row.get("url") or "")
         if not _posting_url(url):
             continue
+        if ats:
+            host = urlsplit(url).hostname or ""
+            domains = {
+                "ashby": "ashbyhq.com",
+                "greenhouse": "greenhouse.io",
+                "lever": "lever.co",
+                "workday": "myworkdayjobs.com",
+                "icims": "icims.com",
+            }
+            if not any(host == domains[a] or host.endswith("." + domains[a]) for a in ats):
+                continue
         url = canonical(url)
         if url not in sources or url in visited:
             continue

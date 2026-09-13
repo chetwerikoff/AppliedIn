@@ -80,6 +80,8 @@ class JobRecord(BaseModel):
     location: str = ""
     ats: str = ""
     discovery_source: str = ""
+    # Explicit, per-role submission authorization from the discovery inbox.
+    apply_requested_at: str = ""
     # Set when the posting was read by an agent that judged fit while it was
     # already looking at it. Saves scoring the same text twice; None means the
     # scorer still has to run.

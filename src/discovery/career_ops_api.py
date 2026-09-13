@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
@@ -22,6 +23,7 @@ class BoardSettings(BaseModel):
     auto_prepare: bool
     interests: str = Field(default="", max_length=600)
     scheduled_interests: bool = False
+    search_provider: Literal["claude", "codex"] = "claude"
 
 
 class ScanScope(BaseModel):
@@ -30,6 +32,60 @@ class ScanScope(BaseModel):
 
 class InterestSearch(ScanScope):
     interests: str | None = Field(default=None, max_length=600)
+    provider: Literal["claude", "codex"] = "claude"
+
+
+class SearchProvider(BaseModel):
+    provider: Literal["claude", "codex"]
+
+
+@router.post("/provider")
+def provider(body: SearchProvider):
+    with career_ops._LOCK:
+        data = career_ops._read()
+        data["settings"]["search_provider"] = body.provider
+        career_ops._write(data)
+    return {"provider": body.provider}
+
+
+class NetworkSearch(BaseModel):
+    provider: Literal["claude", "codex"] = "claude"
+    interests: str = Field(default="", max_length=600)
+    positive: list[str] = Field(default_factory=list, max_length=50)
+    negative: list[str] = Field(default_factory=list, max_length=50)
+    locations: list[str] = Field(default_factory=list, max_length=50)
+    ats: list[Literal["greenhouse", "lever", "ashby", "workday", "icims"]] = Field(
+        min_length=1, max_length=5
+    )
+    days: int = Field(default=30, ge=1, le=365)
+    include_undated: bool = True
+    limit: int = Field(default=150, ge=0, le=10000)
+    resume: bool = False
+
+
+@router.post("/network")
+def network(body: NetworkSearch, background: BackgroundTasks):
+    from discovery import career_network
+
+    filters = body.model_dump(exclude={"resume"})
+    filters["ats"] = list(dict.fromkeys(filters["ats"]))
+    if body.resume:
+        with career_ops._LOCK:
+            previous = career_ops._read().get("network_search")
+        if not previous or previous["filters"] != filters:
+            raise HTTPException(400, "Filters changed. Start a new scan to use these filters.")
+    if not career_ops.reserve_scan("network"):
+        return {"running": True, "already_running": True}
+    career_network.STOP.clear()
+    background.add_task(career_network.run_reserved, filters, body.resume)
+    return {"running": True, "kind": "network"}
+
+
+@router.post("/network/stop")
+def stop_network():
+    from discovery import career_network
+
+    return career_network.stop()
 
 
 @router.get("")
@@ -87,7 +143,7 @@ def scan(body: ScanScope, background: BackgroundTasks):
 def search(body: InterestSearch, background: BackgroundTasks):
     if not career_ops.reserve_scan("company_web" if body.company else "interests", body.company):
         return {"running": True, "already_running": True}
-    background.add_task(career_ops.search_reserved, body.company, body.interests)
+    background.add_task(career_ops.search_reserved, body.company, body.interests, body.provider)
     return {"running": True, "kind": "web"}
 
 
@@ -97,6 +153,18 @@ def prepare(body: BoardSelection):
         return career_ops.prepare(body.ids)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/apply")
+def apply_selected(body: BoardSelection, background: BackgroundTasks):
+    from discovery.career_apply import run_selected
+
+    try:
+        result = career_ops.prepare(body.ids, apply_requested=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    background.add_task(run_selected, result["pks"])
+    return {**result, "started": result["prepared"]}
 
 
 @router.post("/dismiss")

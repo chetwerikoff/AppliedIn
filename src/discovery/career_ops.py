@@ -215,12 +215,17 @@ def snapshot() -> dict:
         data = _read()
     # Keep full descriptions private on disk; list polling should stay small.
     rows = [{k: v for k, v in j.items() if k != "description"} for j in data["jobs"].values()]
+    from discovery.career_progress import attach_progress
+
+    attach_progress(rows, make_stores())
     return {
         "sources": sources,
         "settings": _settings(data, sources),
         "jobs": rows,
         "last_scan": data.get("last_scan"),
         "last_search": data.get("last_search"),
+        "last_network": data.get("last_network"),
+        "network_filters": (data.get("network_search") or {}).get("filters"),
         "active_search": dict(_ACTIVE),
         "progress": progress_snapshot(),
         "preferences": search_preferences(),
@@ -228,6 +233,7 @@ def snapshot() -> dict:
         "paused": flags.paused(),
         "error": error,
         "revision": REVISION[:12],
+        "capabilities": {"apply_selected": True},
     }
 
 
@@ -248,7 +254,7 @@ def configure(values: dict) -> dict:
             "scheduled": values["scheduled"],
             "auto_prepare": values["auto_prepare"],
         }
-        for key in ("interests", "scheduled_interests"):
+        for key in ("interests", "scheduled_interests", "search_provider"):
             if key in values:
                 data["settings"][key] = values[key]
         _write(data)
@@ -316,7 +322,7 @@ def _save_results(receipts: list[dict], receipt: dict):
                     row.update(
                         {k: old[k] for k in ("state", "pk", "first_seen", "job_id") if k in old}
                     )
-                    if result["provider"] != "web_search":
+                    if result["provider"] != "web_search" and not raw.get("search_id"):
                         row.update({k: old[k] for k in ("search_id", "why") if k in old})
                 else:
                     receipt["added"] += 1
@@ -394,7 +400,9 @@ def search_preferences(company: str = "") -> dict:
     return {k: v for k, v in prefs.model_dump().items() if k != "github"}
 
 
-def search_reserved(company: str = "", interests: str | None = None) -> None:
+def search_reserved(
+    company: str = "", interests: str | None = None, provider: str | None = None
+) -> None:
     global _RUNNING, _ACTIVE
     from discovery.interest_search import search
 
@@ -416,9 +424,19 @@ def search_reserved(company: str = "", interests: str | None = None) -> None:
         with _LOCK:
             settings = _read()["settings"]
         interests = settings.get("interests", "") if interests is None else interests
+        provider = provider or settings.get("search_provider", "claude")
+        with _LOCK:
+            data = _read()
+            data["settings"]["search_provider"] = provider
+            _write(data)
+        receipt["provider"] = provider
         receipt["interests"] = interests
         result = search(
-            search_preferences(company), interests, company, on_progress=report_progress
+            search_preferences(company),
+            interests,
+            company,
+            on_progress=report_progress,
+            provider=provider,
         )
         receipt.update(summary=result["summary"], queries=result["queries"])
         grouped = {}
@@ -461,8 +479,8 @@ def search_reserved(company: str = "", interests: str | None = None) -> None:
             _SCAN.release()
 
 
-def prepare(ids: list[str], stores=None) -> dict:
-    """Idempotent handoff to scoring/tailoring. Approval remains mandatory."""
+def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> dict:
+    """Idempotent handoff; only an explicit Apply action authorizes submission."""
     stores = stores or make_stores()
     from core.events import emit
     from tools import seen
@@ -499,6 +517,7 @@ def prepare(ids: list[str], stores=None) -> dict:
                 ats=row["provider"],
                 posted_at=row["posted_at"],
                 discovery_source="career_ops",
+                apply_requested_at=now() if apply_requested else "",
             )
             if stores.tracking.put_new(job):
                 # Resume preparation can now happen automatically, even after a

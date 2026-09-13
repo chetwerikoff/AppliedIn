@@ -33,6 +33,7 @@ def board(tmp_path, monkeypatch):
         apply_queue="apply",
     )
     monkeypatch.setattr(co, "make_stores", lambda: stores)
+    monkeypatch.setattr("core.events.recent", lambda _limit: [])
     monkeypatch.setattr("core.flags.paused", lambda: False)
     monkeypatch.setattr("core.flags.company_filter", lambda company: [])
     monkeypatch.setattr("discovery.crawler._age_limit", lambda company: 0)
@@ -349,3 +350,141 @@ async def test_progress_stream_replays_then_finishes_when_search_ends(board, mon
     assert last["running"] is False
     with pytest.raises(StopAsyncIteration):
         await anext(events)
+
+
+def test_network_matches_are_saved_before_failure_and_wait_for_selection(board, monkeypatch):
+    from discovery import career_network as network
+
+    stores, rows = board
+    filters = {
+        "ats": ["ashby"],
+        "days": 30,
+        "include_undated": True,
+        "positive": [],
+        "negative": [],
+        "locations": [],
+        "limit": 150,
+    }
+
+    def stream(payload):
+        yield {
+            "kind": "source",
+            "source": "ashby",
+            "total": 200,
+            "next": 0,
+            "hash": "abc",
+            "status": "ok",
+        }
+        yield {
+            "kind": "company",
+            "source": "ashby",
+            "company": "New employer",
+            "provider": "ashby",
+            "jobs": [
+                {"title": "Engineer", "url": "https://jobs.ashbyhq.com/new/123", "search_id": "x"}
+            ],
+            "error": "",
+            "read": 3,
+            "undated": 0,
+            "old": 1,
+            "filtered": 1,
+            "capped": False,
+            "cursor": {"hash": "abc", "next": 1},
+        }
+        saved = co._read()
+        assert any(r["company"] == "New employer" for r in saved["jobs"].values())
+        raise ValueError("connection interrupted")
+
+    monkeypatch.setattr(network, "events", stream)
+    assert co.reserve_scan("network")
+    network.run_reserved(filters)
+    data = co._read()
+    assert data["network_search"]["cursor"]["ashby"]["next"] == 1
+    assert data["last_network"]["found"] == 1
+    assert not data["last_network"]["complete"]
+    assert not co._RUNNING and not co._SCAN.locked()
+    stores.queue.enqueue.assert_not_called()
+
+
+def test_rescan_preserves_review_state_but_updates_search_membership(board):
+    _, rows = board
+    data = co._read()
+    data["jobs"][rows[0]["id"]].update(state="dismissed", search_id="old")
+    co._write(data)
+    receipt = {"errors": [], "sources": [], "companies": 0, "found": 0, "added": 0}
+    co._save_results(
+        [
+            {
+                "company": "Acme",
+                "provider": "ashby",
+                "jobs": [{"title": "Engineer", "url": rows[0]["url"], "search_id": "new"}],
+            }
+        ],
+        receipt,
+    )
+    row = co._read()["jobs"][rows[0]["id"]]
+    assert row["state"] == "dismissed"
+    assert row["search_id"] == "new"
+
+
+def test_network_continue_rejects_changed_filters_without_reserving_worker(board):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException, match="Filters changed"):
+        api.network(api.NetworkSearch(ats=["ashby"], resume=True), BackgroundTasks())
+    assert not co._SCAN.locked()
+
+
+def test_unified_search_uses_selected_client_and_boards_before_directory_expansion(
+    board, monkeypatch
+):
+    from discovery import career_network as network
+
+    stores, _ = board
+    filters = {
+        "provider": "codex",
+        "interests": "AI infrastructure",
+        "ats": ["ashby"],
+        "days": 30,
+        "include_undated": True,
+        "positive": ["Engineer"],
+        "negative": [],
+        "locations": ["Seattle"],
+        "limit": 150,
+    }
+    search = Mock(
+        return_value={
+            "jobs": [
+                {
+                    "company": "Acme",
+                    "title": "Engineer",
+                    "url": "https://jobs.ashbyhq.com/acme/brand-new",
+                    "verification": "needs_posting_read",
+                }
+            ],
+            "queries": ["AI infrastructure"],
+        }
+    )
+    monkeypatch.setattr("discovery.interest_search.search", search)
+
+    def directory(payload):
+        assert search.call_count == 1
+        assert any(r["url"].endswith("brand-new") for r in co._read()["jobs"].values())
+        yield {
+            "kind": "source",
+            "source": "ashby",
+            "total": 0,
+            "next": 0,
+            "hash": "empty",
+            "status": "unavailable",
+        }
+        yield {"kind": "done", "stopped": False}
+
+    monkeypatch.setattr(network, "events", directory)
+    assert co.reserve_scan("network")
+    network.run_reserved(filters)
+    assert search.call_args.kwargs["provider"] == "codex"
+    assert search.call_args.kwargs["ats"] == ["ashby"]
+    assert search.call_args.args[0]["titles"] == ["Engineer"]
+    assert co._read()["last_network"]["found"] == 1
+    stores.queue.enqueue.assert_not_called()

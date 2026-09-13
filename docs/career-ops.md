@@ -1,78 +1,106 @@
-# Career Ops search in AppliedIn
+# Career Ops discovery inside AppliedIn
 
-Open **Find jobs → Career Ops search** in the dashboard, or `http://127.0.0.1:8787/#career-ops`.
-Enter an optional interest and press Enter or **Search jobs**. Leaving it blank
-uses your saved role, location and keyword preferences. Broad search discovers
-employers across the web; it is not restricted to companies on your watchlist.
+Open **Find jobs → Career Ops search** (`/#career-ops`). There is one search form:
+choose **Claude or Codex**, select job boards, and edit roles, locations, and the
+posting-date window. An optional brief describes the kind of work you want.
+**More preferences** contains excluded titles, undated postings, and scan depth.
 
-Search activity streams the actual web queries and posting checks as they finish.
-Expand or collapse **Search activity** to follow the run; completed activity is
-saved with the search receipt. Interrupted connections fall back to polling.
+**Search jobs** uses the selected client to discover leads on the selected boards,
+then expands through Career Ops' public company directories and HTTP readers.
+Greenhouse, Lever, Ashby, Workday, and iCIMS are supported. Directory expansion
+uses no model tokens and does not require a curated company watchlist. AI search
+supplements it with up to 30 leads and 12 search/open calls; the directory scan
+has no job-result cap.
 
-Select results and choose **Prepare selected**, then **View pipeline**. This is
-the same scoring, tailoring and final approval queue used by native discovery.
-The company filter follows the prepared jobs. Importing a role never approves an
-application, even with global auto-apply enabled.
+The default batch checks 150 companies per selected source. **Continue scan**
+checks the next companies using the same filters and original date cutoff.
+Changing filters requires a new search. A directory change invalidates its old
+position and starts that source again, avoiding skipped employers. **Stop scan**
+preserves completed matches and progress. Each invocation stops after 30 minutes;
+an entire directory may take multiple invocations. Results stream to the same
+board as company reads finish and survive refreshes and daemon restarts.
 
-**Advanced settings** contains company-feed scans, source selection, saved search
-interests and separate six-hour schedules for feed scans and web searches.
-Schedules repeat after the first completed search while the daemon is running
-and unpaused. Manual searches work while paused. Automatic preparation is opt-in,
-uses existing global/per-company preferences, saved posting-age windows and title
-filters, and respects per-company `max_new_per_run`, up to 50 jobs per scan.
+Coverage reports attempted boards, including unreachable ones. Cached directories
+are refreshed after 24 hours; stale/unavailable directories are reported.
+Provider pagination limits, unreachable boards, and excluded undated postings
+are visible. Reaching the end of a directory is not a guarantee that every job
+was reachable or matched. Restart a search to retry previously attempted boards.
 
-The integration has two distinct discovery paths:
+Select roles and choose **Apply selected** to authorize scoring, tailoring, and
+final submission for those exact roles. **Score & tailor selected** prepares
+them and stops for review instead. Both actions use AppliedIn's existing pipeline;
+**View pipeline** shows their progress. Manual Apply works while automation is
+paused and does not approve other roles at the same company. A low score,
+unanswered question, or missing résumé stops submission. Successful application
+status still requires confirmation from the employer's page.
 
-- Career Ops' public HTTP providers: Greenhouse, Ashby, Lever, Workable,
-  SmartRecruiters, Recruitee and Oracle Recruiting Cloud. Oracle uses its direct
-  candidate-site feed. Its upstream provider caps a scan at 5,000 newest postings.
-- Career Ops' broad-search workflow runs through your Claude Code subscription
-  login, using its WebSearch and WebFetch tools. It requests at most four tool
-  calls and returns up to 15 leads per search. This uses your Claude allowance.
-  OpenAI API access is not used for search and is never a fallback.
-  Unknown company feeds fall back to scoped web search instead of a disabled button.
+After **Apply selected**, **Your applications** stays above the search results.
+It immediately acknowledges the request and refreshes each role's scoring,
+tailoring, browser, and final status every six seconds. Confirmed applications
+show their application date; blocked roles show the reason and a pipeline link.
+The panel survives page reloads and search-filter changes. A failed request or
+lost connection is shown explicitly and never treated as a successful submission.
 
-Only URLs returned by the search tool are admitted. Known aggregator links are
-excluded. Greenhouse, Ashby and Lever leads are checked against live employer
-APIs; confirmed missing roles are removed. Temporary failures and other websites
-remain visibly unverified. Search snippets never become job descriptions:
-unverified hits must be read by the existing posting reader before tailoring.
-Web search requires Claude Code signed in with a subscribed Claude account
-(`claude auth login`). Public company feeds require no model login. Search uses
-no Chrome session, résumé sharing or application submission. Résumé preparation and applying retain their
-existing requirements.
+No second Career Ops application tracker is created. Discovery alone never
+authorizes submitting an application. Existing tracking rows, handled URLs, and dismissed jobs retain
+their state when rediscovered. Detailed hard constraints are checked in the
+existing scoring pipeline, before tailoring or approval.
 
-## Automatic local setup
+## Search clients
 
-Run `./appliedin start`. Both **start** and **setup** check Git, Node.js 18+ and
-Career Ops. Missing system tools are installed through Homebrew when available;
-otherwise startup names the tool to install. No npm packages or browser
-installation are needed.
+Claude uses Claude Code's subscription login (`claude auth login`). Codex uses
+its ChatGPT login (`codex login`). The chosen client is remembered; missing login
+or usage failures are reported, and public board scanning can still continue.
+Neither worker silently falls back to API-key billing. API-key environment
+variables are removed; client authentication is checked before search. Workers
+run in temporary directories, without application tools or Chrome sessions.
+Codex runs read-only with shell, apps, and delegation disabled.
 
-The first run downloads the pinned providers into
-`.local/integrations/career-ops`. Later starts check the installation locally,
-without downloading it again. `APPLIEDIN_LOCAL_DIR` is respected from the
-environment or `.env`. Downloads are staged so a failed install can be retried;
-existing local edits are preserved and reported rather than overwritten.
+Only posting URLs observed in completed web-tool events are eligible. Codex's
+JSONL stream exposes opened URLs but not search-result source lists, so its
+worker must open every returned posting. Common ATS links are checked against
+employer feeds; confirmed missing roles are dropped. Search snippets never
+become job descriptions. Other leads must be read before tailoring.
 
-Wait for any active applications to finish before restarting. The provider
-contract is pinned to `da8c6f9193ac3d7a48a583f815b7d0feab742b81`; updating it requires
-verifying the bridge and its provider outputs before changing `REVISION` in
-`src/discovery/career_ops_setup.py`.
+[Codex non-interactive CLI documentation](https://learn.chatgpt.com/docs/non-interactive-mode).
 
-Results, dismissed jobs, source choices and receipts are private local data in
-`.local/career-ops-board.json`. Already-handled URLs and existing tracking rows
-are checked before a role enters the pipeline. A partial scan keeps completed
-company results and reports failed sources. Posted dates come from the employer;
-missing dates are shown as unavailable. Previously found jobs remain on the
-board, with their last-seen timestamp; rediscovery does not prove a job remained
-open between scans. Unverified web leads must be read before preparation; application checks still run at submission.
+## Setup and storage
+
+`./appliedin start` and `./appliedin setup` check Git, Node.js 18+, the pinned
+Career Ops checkout, and its scanner runtime dependencies. npm installs run
+with lifecycle scripts disabled: no upstream browser installation or agent setup
+is launched. The existing provider-only bridge also supports selected-company
+feeds for Workable, SmartRecruiters, Recruitee, and Oracle Recruiting Cloud.
+
+The pin is `da8c6f9193ac3d7a48a583f815b7d0feab742b81`. The checkout lives in
+`.local/integrations/career-ops`; local edits are preserved and reported at setup.
+Board data and checkpoints live in `.local/career-ops-board.json`; directory
+caches live in `.local/career-ops-cache`. `APPLIEDIN_LOCAL_DIR` is respected.
+No preview web server, iframe, or separate Next.js app is needed.
+
+**Tracked companies & automation** retains the existing selected-company feed
+and additional web-search schedules. These are separate from manual directory
+continuation. Manual searches work while paused. Preparation remains opt-in;
+the main search only adds discoveries to the board.
+
+## Implementation
+
+- `scripts/integrations/career-network.mjs`: imports the pinned upstream source
+  definitions, providers, and title/location filters; emits completed companies
+  and progress with bounded concurrency.
+- `src/discovery/career_network.py`: selected-client search, persistence,
+  cancellation, resumable directory positions, and coverage receipts.
+- `src/discovery/career_ops.py`: the shared discovery inbox and idempotent handoff.
+- `src/discovery/career_apply.py`: exact-selection preparation and submission
+  through the existing application queue and company leases.
+- `src/discovery/career_ops_api.py`: validated local routes and progress stream.
+- `web/career-board.js`: the embedded native dashboard, with stable forms during
+  polling and streaming.
+
+The adopted pipeline patterns are a discovery inbox, selected-job evaluation,
+durable incremental results, explicit partial coverage, and resumable work.
+AppliedIn's existing safety and approval invariants remain the submission boundary.
 
 Upstream: [Career Ops](https://github.com/career-ops-hq/career-ops), MIT licensed.
-The checkout keeps the upstream license. AppliedIn's bridge is in
-`scripts/integrations/career-ops.mjs`; local routes and board persistence are in
-`src/discovery/career_ops*.py`.
-
-Verified source corrections live in `config/career_ops_sources.yaml`. These replace
-entire upstream entries, so an obsolete API URL cannot override a corrected
-careers URL. Restart after editing this source catalog.
+Its checkout retains the upstream license. No upstream UI or application workflow
+is copied into AppliedIn.

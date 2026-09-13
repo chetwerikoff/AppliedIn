@@ -7,6 +7,8 @@
 [![Local first](https://img.shields.io/badge/Runtime-local--first-139C6D)](#privacy-and-data)
 [![MIT License](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
 
+[Release notes](CHANGELOG.md)
+
 AppliedIn turns a job search into a reviewable pipeline:
 
 **discover → score → tailor resume → review → approve → apply**

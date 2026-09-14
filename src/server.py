@@ -390,6 +390,24 @@ def create_app() -> FastAPI:
     app.include_router(career_ops_router)
     settings = get_settings()
 
+    @app.get("/steering")
+    def get_steering():
+        from core.steering import read
+        return read()
+
+    @app.post("/steering")
+    def save_steering(body: dict):
+        from fastapi import HTTPException
+
+        from core.steering import ConflictError, save
+
+        try:
+            return save(body.get("content"), body.get("revision"))
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.middleware("http")
     async def revalidate_dashboard(request, call_next):
         response = await call_next(request)

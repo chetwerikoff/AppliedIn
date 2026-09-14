@@ -420,7 +420,9 @@ async def run_task(task: str, *, report_key: str, model: str = "",
         if cancelled():
             return {}, "Stopped by you"
         record(stage="Reading careers page in Chrome")
-    return await _run_task_impl(task, report_key=report_key, model=model,
+    from core.steering import prompt as steer
+
+    return await _run_task_impl(steer(task), report_key=report_key, model=model,
                                 timeout_s=timeout_s, allow_dirs=allow_dirs, kind=kind)
 
 

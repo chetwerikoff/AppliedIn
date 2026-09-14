@@ -58,3 +58,67 @@ test('hidden and idle search pages do not open streaming connections', async () 
   await board.streamProgress();
   assert.equal(board.progressController, undefined);
 });
+
+test('scanner startup failures name the cause instead of looking like empty results', () => {
+  const board = harness(async () => {});
+  board.data = {running:false, error:'', jobs:[], last_network:{kind:'network', found:0,
+    read:0, unreachable:0, complete:false, errors:[
+      {company:'claude', error:'Search timed out'},
+      {company:'Scanner', error:'Cannot find module scan-ats-full.mjs'}
+    ]}};
+  board.getAttribute = () => '';
+  board.$ = () => ({value:'network', setAttribute:()=>{}});
+  board.paintNetwork = board.paintProgress = () => {};
+  board.rows = () => [];
+  let message, error;
+  board.message = (text, failed) => {message=text; error=failed};
+  Object.getPrototypeOf(board).paintStatus.call(board);
+  assert.match(message, /Scan failed: Cannot find module/);
+  assert.match(message, /Claude search: Search timed out/);
+  assert.doesNotMatch(message, /Partial scan/);
+  assert.equal(error, true);
+});
+test('search activity groups repeats and separates actual matches from zero-match messages', () => {
+  const board = harness(async () => {});
+  const events = [
+    {seq:1,at:'first',message:'Example: 0 postings read · 0 matches · HTTP 422 Unprocessable Entity'},
+    {seq:2,at:'second',message:'Example: 0 postings read · 0 matches · HTTP 422 Unprocessable Entity'},
+    {seq:3,at:'third',message:'Other: 200 postings read · 0 matches'},
+    {seq:4,at:'fourth',message:'Sample: 20 postings read · 2 matches'},
+  ];
+  const all = board.progressRows(events);
+  assert.equal(all.length,3);
+  assert.equal(all[0].seq,4);
+  assert.equal(all[2].count,2);
+  assert.equal(all[2].at,'second');
+  assert.equal(board.progressRows(events,'issues').length,1);
+  const matches = board.progressRows(events,'matches');
+  assert.equal(matches.length,1);
+  assert.equal(matches[0].seq,4);
+  assert.equal(events.length,4, 'Display grouping must not change the stored event history');
+});
+test('matching jobs exclude confirmed applications without removing their history', () => {
+  const board = harness(async () => {});
+  board.getAttribute = () => '';
+  board.data.jobs = [
+    {id:'new', state:'new'},
+    {id:'done', pipeline_status:'applied'},
+    {id:'manual', pipeline_status:'applied_manual'},
+    {id:'older', application:{phase:'applied'}},
+    {id:'waiting', application:{phase:'apply',status:'submitting'}},
+  ];
+  assert.deepEqual(Array.from(board.rows(),r=>r.id),['new','waiting']);
+  assert.equal(board.data.jobs.length,5);
+});
+
+test('application groups separate active work, skipped roles and confirmed submissions', () => {
+  const board = harness(async () => {});
+  const groups = board.applicationGroups([
+    {id:'applied',application:{phase:'applied',status:'applied'}},
+    {id:'skipped',application:{phase:'attention',status:'skipped'}},
+    {id:'applying',application:{phase:'apply',status:'submitting'}},
+    {id:'unknown',application:{phase:'unknown'}},
+  ]);
+  assert.deepEqual(Array.from(groups,g=>g.key),['apply','attention','skipped','applied']);
+  assert.equal(groups[0].items[0].id,'applying');
+});

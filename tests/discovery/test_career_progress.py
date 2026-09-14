@@ -56,3 +56,20 @@ def test_progress_survives_refresh_without_exposing_resume_or_raw_model_output(b
     assert selected["application"]["requested_at"]
     assert "private" not in str(selected)
     assert all("application" not in r for r in data["jobs"] if r["id"] != rows[0]["id"])
+
+
+@pytest.mark.parametrize("status", ["applied", "applied_manual"])
+def test_posting_applied_elsewhere_is_resolved_even_when_board_never_requested_apply(board, status):
+    stores, rows = board
+    pk = co.prepare([rows[0]["id"]])["pks"][0]
+    stores.tracking.set_status(pk, status)
+    # Simulate a board saved before another flow processed this posting.
+    data = co._read()
+    data["jobs"][rows[0]["id"]].pop("pk", None)
+    data["jobs"][rows[0]["id"]]["state"] = "new"
+    co._write(data)
+    visible = next(r for r in co.snapshot()["jobs"] if r["id"] == rows[0]["id"])
+    assert visible["pipeline_status"] == status
+    assert visible["state"] == "pipeline"
+    assert stores.tracking.get(pk)["status"] == status
+    assert "application" not in visible, "Do not invent a Career Ops apply request"

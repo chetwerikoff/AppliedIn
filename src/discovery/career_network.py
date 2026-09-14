@@ -261,13 +261,16 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
         )
     except Exception as exc:
         co.log.exception("Career Ops network scan failed")
+        receipt["scan_error"] = str(exc)
         receipt["errors"].append({"company": "Scanner", "error": str(exc)})
     finally:
         receipt["finished_at"] = co.now()
         co.report_progress(
             f"{receipt['found']} matches saved · {receipt['companies']} company boards checked"
             + (
-                " · directory scan finished"
+                f" · scan failed: {receipt['scan_error']}"
+                if receipt.get("scan_error")
+                else " · directory scan finished"
                 if receipt["complete"]
                 else " · partial scan; continue to check more"
             )

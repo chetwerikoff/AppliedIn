@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import subprocess
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -67,6 +68,10 @@ class NetworkSearch(BaseModel):
 def network(body: NetworkSearch, background: BackgroundTasks):
     from discovery import career_network
 
+    try:
+        career_ops.catalog()
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(503, str(exc)) from exc
     filters = body.model_dump(exclude={"resume"})
     filters["ats"] = list(dict.fromkeys(filters["ats"]))
     if body.resume:
@@ -91,6 +96,36 @@ def stop_network():
 @router.get("")
 def board():
     return career_ops.snapshot()
+
+
+@router.get("/job/{identity}")
+def job_detail(identity: str):
+    """Read saved information only; opening a drawer never starts an agent."""
+    import html
+
+    from tools.jd import _text
+
+    with career_ops._LOCK:
+        job = dict(career_ops._read()["jobs"].get(identity) or {})
+    if not job:
+        raise HTTPException(404, "This role is no longer on the discovery board.")
+    tracked, resume_url = {}, None
+    if job.get("pk"):
+        from server import _to_ui
+
+        stores = career_ops.make_stores()
+        tracked = stores.tracking.get(job["pk"]) or {}
+        resume_url = _to_ui(tracked, stores.artifacts)["resume_url"]
+    description = tracked.get("jd_text") or job.get("description") or ""
+    description = html.unescape(_text(description))
+    return {
+        "id": identity,
+        "description": description,
+        "resume_url": resume_url,
+        "match_score": tracked.get("match_score"),
+        "status": tracked.get("status", ""),
+        "applied_at": tracked.get("applied_at", ""),
+    }
 
 
 @router.get("/progress")

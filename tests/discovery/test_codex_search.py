@@ -1,8 +1,9 @@
 """Codex discovery must have actual search/open events and a ChatGPT login."""
 
+import io
 import json
 import subprocess
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -52,3 +53,27 @@ def test_api_key_auth_is_refused_and_key_env_is_removed(monkeypatch):
         codex.run_search("search", {}, lambda _: None)
     env = login.call_args.kwargs["env"]
     assert "OPENAI_API_KEY" not in env and "CODEX_API_KEY" not in env
+
+
+def test_subscription_worker_receives_instance_steering_with_read_only_permissions(monkeypatch):
+    from core import steering
+
+    steering.save("Prefer platform teams", steering.read()["revision"])
+    monkeypatch.setattr(codex.shutil, "which", lambda _: "/bin/codex")
+    monkeypatch.setattr(
+        codex.subprocess,
+        "run",
+        Mock(return_value=subprocess.CompletedProcess([], 0, "Logged in using ChatGPT", "")),
+    )
+    proc = MagicMock()
+    proc.__enter__.return_value = proc
+    proc.stdout = io.StringIO("")
+    proc.wait.return_value = proc.poll.return_value = 0
+    launch = Mock(return_value=proc)
+    monkeypatch.setattr(codex.subprocess, "Popen", launch)
+    monkeypatch.setattr(codex.SearchEvents, "finish", lambda _: {})
+    codex.run_search("Find roles", {}, lambda _: None)
+    command = launch.call_args.args[0]
+    assert "Prefer platform teams" in command[-1]
+    assert "Find roles" in command[-1]
+    assert command[command.index("--sandbox") + 1] == "read-only"

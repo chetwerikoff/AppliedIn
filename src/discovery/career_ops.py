@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import threading
 from datetime import UTC, datetime
@@ -104,7 +105,11 @@ def _bridge(payload: dict, timeout: int = 600) -> list:
 def _catalog_at(root: str, config_dir: str) -> tuple:
     repo = Path(root)
     if not (repo / "providers/_http.mjs").exists():
-        raise ValueError("Career Ops is not installed. Run ./appliedin start to install it.")
+        port = os.environ.get("APPLIEDIN_WEB_PORT", "8787")
+        raise ValueError(
+            f"Career Ops is not installed for this instance. "
+            f"Run ./appliedin start --port {port} to install it."
+        )
     revision = subprocess.run(
         ["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
     ).stdout.strip()

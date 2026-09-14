@@ -156,6 +156,9 @@ def watch_cancellation(proc, cancelled):
 
 
 def run_search(prompt: str, schema: dict, progress, *, cancelled=None) -> dict:
+    from core.steering import prompt as steer
+
+    prompt = steer(prompt)
     if not shutil.which("claude"):
         raise ValueError(
             "Install Claude Code and sign in with your Claude subscription to search jobs."

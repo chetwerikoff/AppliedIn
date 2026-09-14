@@ -58,6 +58,12 @@ def _isolate_owner_state(tmp_path, monkeypatch):
     except Exception:  # noqa: BLE001 — never block a run on the isolation itself
         pass
 
+    from types import SimpleNamespace
+
+    from core import steering
+
+    monkeypatch.setattr(steering, "get_settings", lambda: SimpleNamespace(local_dir=tmp_path))
+
     # 2) Memory diary — a durable markdown log of real outcomes.
     try:
         from core import memory

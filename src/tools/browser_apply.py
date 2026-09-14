@@ -12,6 +12,7 @@ import contextvars
 import json
 
 from core.logging import get_logger
+from core.steering import messages
 
 log = get_logger(__name__)
 
@@ -184,7 +185,7 @@ def _map_fields(fields: list, facts: dict, company: str, jd_text: str) -> dict:
         "Never map a field to a fact that doesn't answer it."
     )
     model = get_settings().agent_model("") or "openai/gpt-4.1-mini"
-    resp = completion(model=model, messages=[{"role": "user", "content": prompt}],
+    resp = completion(model=model, messages=messages(prompt),
                       response_format={"type": "json_object"})
     try:
         out = json.loads(resp["choices"][0]["message"]["content"])

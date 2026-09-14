@@ -1,3 +1,4 @@
+import { showSteering } from './steering.js';
 // AppliedIn — a calm console for the job-application pipeline.
 // Vanilla ES module, no build step. One screen: a control bar with the two-step
 // flow (Discover → Process), a tabbed work area (Pipeline board / Applications
@@ -26,7 +27,7 @@ const state = {
   requests: new Set(), launch: null,
   stats: {},
   events: [],
-  tab: location.hash === "#career-ops" ? "career-ops" : location.hash === "#fresh" ? "fresh" : "pipeline",
+  tab: location.hash === "#steering" ? "steering" : location.hash === "#career-ops" ? "career-ops" : location.hash === "#fresh" ? "fresh" : "pipeline",
   findView: location.hash === "#career-ops" ? "career-ops" : "fresh",
   filter: "all",      // status chip on the Applications table
   logKind: "all",     // kind chip on the Logs view
@@ -883,6 +884,7 @@ function renderTabs() {
     b.setAttribute("aria-pressed", String(b.dataset.findView === state.tab));
   });
   document.body.classList.toggle("career-search-page", state.tab === "career-ops");
+  document.body.classList.toggle("steering-page", state.tab === "steering");
   $("#search").placeholder = state.tab === "career-ops" ? "Filter results…" : "Search company or role…";
   renderActivityLayout();
   $$("#tabs .tab").forEach(b => {
@@ -3126,6 +3128,7 @@ function refreshPane() {
 }
 
 function renderPane() {
+  showSteering(state.tab === "steering");
   const careerBoard = $("#career-ops-board");
   if (careerBoard) {
     careerBoard.hidden = state.tab !== "career-ops";
@@ -3152,7 +3155,7 @@ function renderPane() {
   const fsListEl = $("#fs-list");
   const fsScroll = fsListEl ? fsListEl.scrollTop : 0;
   $("#pane").innerHTML =
-    state.tab === "career-ops" ? "" :
+    ["career-ops", "steering"].includes(state.tab) ? "" :
     state.tab === "apps" ? viewApps() :
     state.tab === "needs" ? viewNeeds() :
     state.tab === "stuck" ? viewStuck() :
@@ -5228,7 +5231,7 @@ function wire() {
       state.coFilter = ""; state.query = ""; $("#co-filter").value = ""; $("#search").value = "";
     }
     state.tab = next;
-    const hash = ["fresh", "career-ops"].includes(next) ? "#" + next : "";
+    const hash = ["fresh", "career-ops", "steering"].includes(next) ? "#" + next : "";
     history.replaceState(null, "", location.pathname + location.search + hash);
     // Cached data renders at once; the fetch refreshes it behind the paint.
     if (state.tab === "activity") loadActivity();

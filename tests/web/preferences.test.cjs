@@ -32,7 +32,7 @@ function harness() {
     fetch: async () => { throw Error('Unexpected network request'); },
     loadRotation: async () => {},
   });
-  vm.runInContext(source.replace('import { auth } from "./auth.js";',
+  vm.runInContext(source.replace("import { showSteering } from './steering.js';", 'const showSteering = () => {};').replace('import { auth } from "./auth.js";',
     'const auth = { header: () => ({}) };').replace(/\nboot\(\);\s*$/, ''), context);
   const state = vm.runInContext('state', context);
   context.reply = async () => ({ ok: true, prefs: { acme: { titles: ['Staff Engineer'] } } });

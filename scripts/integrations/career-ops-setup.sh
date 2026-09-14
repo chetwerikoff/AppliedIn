@@ -22,5 +22,9 @@ ensure_career_ops() {
     warn "Career Ops needs Node.js 18+. Update Node.js on PATH, then retry startup."; return 1;
   }
 
-  .venv/bin/python -m discovery.career_ops_setup
+  # start resolves --port (and any fresh-instance reset) in the Python CLI.
+  # Installing here would populate .local while the daemon reads .local-8788.
+  if [ "${1:-}" != "--tools-only" ]; then
+    .venv/bin/python -m discovery.career_ops_setup
+  fi
 }

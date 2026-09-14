@@ -18,6 +18,7 @@ from google.adk.tools import ToolContext
 from google.adk.tools.skill_toolset import SkillToolset
 
 from core.config import get_settings
+from core.steering import before_model
 
 from .graph import _SKILLS
 
@@ -71,6 +72,7 @@ def discover_company(name: str, tool_context: ToolContext) -> dict:
 
 
 root_agent = LlmAgent(
+    before_model_callback=before_model,
     name="finder", model=_model(),
     description="Discovers new job postings across the watchlist and enqueues "
     "matches for the application pipeline.",

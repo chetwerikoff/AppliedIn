@@ -228,6 +228,15 @@ def start(no_discover: bool = False) -> dict:
     """Launch the daemon detached, in the background. With no_discover=True the
     crawler/discovery is off — just the dashboard + queue worker (handy for
     testing the approval workflow without the crawler churning)."""
+    from discovery.career_ops_setup import ensure_checkout
+
+    # Instance selection and --fresh have already run. Repair this instance even
+    # if its daemon is already running, without touching another port's data.
+    try:
+        ensure_checkout(Path(get_settings().local_dir))
+    except Exception as exc:
+        return {"status": "setup failed", "error": f"Career Ops: {exc}",
+                "dashboard": _dashboard()}
     if (pid := _live_pid()) is not None:
         return {"status": "already running", "pid": pid, "dashboard": _dashboard(),
                 "hint": "use `appliedin stop` first to restart"}

@@ -29,6 +29,7 @@ import httpx
 
 from core.logging import get_logger
 from core.models import DiscoveryMode, JobRecord
+from core.steering import messages
 
 from . import progress
 from .relevance import relevant
@@ -104,7 +105,7 @@ def _default_extractor(html: str, company: str) -> list[JobRecord]:
     )
     try:
         resp = completion(model=get_settings().litellm_model,
-                          messages=[{"role": "user", "content": prompt}])
+                          messages=messages(prompt))
         text = resp["choices"][0]["message"]["content"]
     except Exception as exc:
         log.error("%s: LLM extraction call failed: %s", company, exc)

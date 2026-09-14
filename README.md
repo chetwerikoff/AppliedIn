@@ -182,6 +182,23 @@ Use **Job preferences** in the dashboard or edit
 Preferences are used by both the early relevance filter and the deeper per-job
 scorer.
 
+### Give agents shared instructions
+
+Open **Agent instructions** in the dashboard's top tabs. Write guidance directly,
+or import a `.md` or `.txt` file, then click **Save instructions**. Importing alone
+does not activate it. Clear the editor and save to remove shared guidance.
+
+Search (Claude or Codex), discovery, scoring, tailoring, review and application
+agents receive it on new model requests or browser sessions. Already-running
+browser sessions keep their existing instructions. Structured job filters,
+approved facts and application safety checks still apply.
+
+Instructions are private to each instance: `<local_dir>/steering.md`, normally
+`.local/steering.md` on port 8787 and `.local-8788/steering.md` when started with
+`--port 8788`. Saving one instance never copies its instructions to another.
+The editor preserves unsaved drafts across tabs and rejects stale saves if another
+window has changed the file.
+
 ### Choose companies
 
 Edit [`config/watchlist.yaml`](config/watchlist.yaml) or add a company from the

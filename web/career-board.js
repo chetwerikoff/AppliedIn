@@ -12,7 +12,7 @@ class CareerBoard extends HTMLElement {
   static observedAttributes = ['company', 'query', 'hidden'];
   connectedCallback() {
     this.selected = new Set(); this.data = null; this.busy = false; this.page = 1;
-    this.pendingApplications = new Map();
+    this.pendingApplications = new Map(); this.detailVersion = 0;
     this.innerHTML = `<section class="cb-panel cb-page"><header class="cb-heading"><div><h2>Discover jobs</h2><p>Search your preferred job boards, then review the roles that fit.</p></div><button type="button" class="btn cb-pipeline">View pipeline →</button></header>
       <div class="cb-body">
         <aside class="cb-search-column" aria-label="Search preferences"><div class="cb-network"><h3 class="cb-search-title">Your search</h3>
@@ -38,16 +38,16 @@ class CareerBoard extends HTMLElement {
         </aside><section class="cb-results" aria-label="Discovered jobs"><section class="cb-applications" hidden aria-label="Selected applications"><header><div><h3>Your applications</h3><p class="cb-application-summary" role="status"></p></div><span class="cb-application-refresh">Updates every 6 seconds</span></header><div class="cb-application-list"></div></section><div class="cb-results-heading"><h3>Matching jobs</h3><span>Choose roles to score, tailor, and review.</span></div>
         <span class="cb-count" hidden></span><p class="cb-message" role="status" aria-live="polite"></p>
         <div class="cb-coverage" hidden aria-live="polite"></div>
-        <details class="cb-progress" hidden><summary>Search activity</summary><ol aria-label="Search progress"></ol></details>
+        <details class="cb-progress" hidden><summary><span class="cb-progress-heading"><strong>Search activity</strong><span class="cb-progress-state"></span></span><span class="cb-progress-latest"></span></summary><div class="cb-progress-tools"><label>Show <select class="cb-progress-filter"><option value="all">All updates</option><option value="matches">Matches found</option><option value="issues">Issues</option></select></label><span class="cb-progress-count"></span></div><ol aria-label="Search progress, newest first"></ol></details>
         <div class="cb-toolbar cb-filters"><label>Show <select class="cb-state"><option value="network">Latest search</option><option value="interest">Earlier interest searches</option><option value="new">All new jobs</option><option value="pipeline">In pipeline</option><option value="dismissed">Dismissed</option><option value="all">All results</option></select></label>
           <label>Sort <select class="cb-sort"><option value="found">Recently found</option><option value="posted">Recently posted</option><option value="company">Company</option></select></label>
           <span class="cb-result-count"></span>
         </div>
-        <div class="cb-toolbar cb-actions"><label><input class="cb-all" type="checkbox"> Select visible</label><span class="cb-selection">0 selected</span><button type="button" class="btn cb-apply" disabled hidden title="Score, tailor, and submit only the selected roles">Apply selected</button><button type="button" class="btn cb-prepare" disabled>Score & tailor selected</button><button type="button" class="btn cb-dismiss" disabled>Dismiss</button></div>
+        <div class="cb-toolbar cb-actions"><label><input class="cb-all" type="checkbox"> Select visible</label><span class="cb-selection">Select roles to take action</span><button type="button" class="btn cb-clear" hidden>Clear</button><div class="cb-selected-actions" hidden><button type="button" class="btn cb-apply" disabled hidden title="Score, tailor, and submit only the selected roles">Apply selected</button><button type="button" class="btn cb-prepare" disabled>Score & tailor selected</button><button type="button" class="btn cb-dismiss" disabled>Dismiss</button></div></div>
         <p class="cb-apply-help" hidden>Apply selected scores, tailors, and submits. Score & tailor stops for review.</p><div class="cb-list"></div><div class="cb-pagination"><button type="button" class="btn cb-prev">Previous</button><span></span><button type="button" class="btn cb-next">Next</button></div>
 
         </section>
-      </div></section>`;
+      </div></section><dialog class="cb-job-drawer" aria-labelledby="cb-detail-title"><div class="cb-drawer-head"><span>Role details</span><button type="button" class="btn cb-drawer-close" aria-label="Close role details">✕</button></div><div class="cb-drawer-content"></div><footer class="cb-drawer-foot"><label><input type="checkbox" class="cb-detail-select"> Include in selection</label><button type="button" class="btn cb-drawer-done">Back to results</button></footer></dialog>`;
     this.mode = 'network';
     this.$('.cb-client').onchange = async () => {
       try { await this.request('/provider', {provider:this.$('.cb-client').value}); }
@@ -65,6 +65,7 @@ class CareerBoard extends HTMLElement {
     this.$('#cb-search-query').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.network(false); } };
     this.$('.cb-pipeline').onclick = () => this.dispatchEvent(new CustomEvent('career-pipeline', {bubbles:true, detail:{company:this.preparedCompany || this.getAttribute('company') || ''}}));
     this.$('form').onsubmit = event => { event.preventDefault(); this.save(); };
+    this.$('.cb-progress-filter').onchange = () => { this.progressSignature = ''; this.paintProgress(); };
     this.$('.cb-source-search').oninput = event => {
       const q = event.target.value.toLowerCase();
       this.querySelectorAll('.cb-source').forEach(el => el.hidden = !el.textContent.toLowerCase().includes(q));
@@ -79,6 +80,26 @@ class CareerBoard extends HTMLElement {
     this.$('.cb-list').onchange = event => {
       const id = event.target.dataset.pick;
       if (id) { event.target.checked ? this.selected.add(id) : this.selected.delete(id); this.paintSelection(); }
+    };
+    this.$('.cb-clear').onclick = () => { this.selected.clear(); this.renderRows(); };
+    this.$('.cb-list').onclick = event => {
+      const button = event.target.closest('[data-detail]');
+      if (button) this.openDetail(button.dataset.detail);
+    };
+    const drawer = this.$('.cb-job-drawer');
+    this.$('.cb-drawer-close').onclick = this.$('.cb-drawer-done').onclick = () => drawer.close();
+    drawer.onclick = event => { if (event.target === drawer && event.clientX < drawer.getBoundingClientRect().left) drawer.close(); };
+    drawer.onclose = () => {
+      const id = this.detailId;
+      this.detailVersion++; this.detailId = null;
+      const trigger = this.detailTrigger?.isConnected ? this.detailTrigger : [...this.querySelectorAll('[data-detail]')].find(el => el.dataset.detail === id);
+      trigger?.focus({preventScroll:true});
+    };
+    this.$('.cb-detail-select').onchange = event => {
+      const row = this.data.jobs.find(r => r.id === this.detailId);
+      if (row?.state !== 'new' || this.busy) return;
+      event.target.checked ? this.selected.add(row.id) : this.selected.delete(row.id);
+      this.renderRows();
     };
     this.$('.cb-apply').onclick = () => this.act('apply');
     this.$('.cb-application-list').onpointerdown = () => { this.applicationPointerUntil = Date.now() + 500; };
@@ -97,7 +118,7 @@ class CareerBoard extends HTMLElement {
   attributeChangedCallback(name, oldValue, newValue) {
     if (oldValue === newValue || !this.data) return;
     if (name === 'hidden') {
-      if (this.hidden) this.progressController?.abort(); else this.refresh();
+      if (this.hidden) { this.progressController?.abort(); this.$('.cb-job-drawer').close(); } else this.refresh();
       return;
     }
     this.selected.clear(); this.page = 1; this.renderRows(); this.paintStatus();
@@ -149,23 +170,28 @@ class CareerBoard extends HTMLElement {
     const rows = [...jobs.values()].sort((a,b) => Number(active(b.application.phase)) - Number(active(a.application.phase)) || (b.application.requested_at || '').localeCompare(a.application.requested_at || ''));
     const panel = this.$('.cb-applications'); panel.hidden = !rows.length;
     if (!rows.length) return;
-    const counts = rows.reduce((n,r) => { const p = r.application.phase; n[active(p) ? 'active' : p === 'applied' ? 'applied' : 'attention']++; return n; }, {active:0, applied:0, attention:0});
-    this.$('.cb-application-summary').textContent = [counts.active && `${counts.active} in progress`, counts.applied && `${counts.applied} applied`, counts.attention && `${counts.attention} need attention`].filter(Boolean).join(' · ');
+    const counts = rows.reduce((n,r) => { const a = r.application; n[active(a.phase) ? 'active' : a.phase === 'applied' ? 'applied' : a.status === 'skipped' ? 'skipped' : a.status === 'job_gone' ? 'closed' : 'attention']++; return n; }, {active:0, applied:0, attention:0, skipped:0, closed:0});
+    this.$('.cb-application-summary').textContent = [counts.active && `${counts.active} in progress`, counts.applied && `${counts.applied} applied`, counts.attention && `${counts.attention} need attention`, counts.skipped && `${counts.skipped} skipped`, counts.closed && `${counts.closed} closed`].filter(Boolean).join(' · ');
     this.$('.cb-application-refresh').textContent = this.applicationRefreshFailed ? 'Connection interrupted · retrying…' : 'Updates every 6 seconds';
     // A poll must not replace a button between pointerdown and click, or steal
     // keyboard focus while the user is opening a role's pipeline.
     if (Date.now() < (this.applicationPointerUntil || 0) || this.$('.cb-application-list').contains(document.activeElement)) return;
-    const steps = ['Queued', 'Score', 'Tailor', 'Apply'];
-    this.$('.cb-application-list').innerHTML = rows.slice(0, 50).map(r => {
-      const a = r.application, index = {starting:0, queued:0, score:1, tailor:2, waiting:3, apply:3, applied:4}[a.phase];
-      const requested = Date.parse(a.requested_at), elapsed = Number.isFinite(requested) ? Math.max(0, Math.floor((Date.now() - requested) / 1000)) : null;
-      const duration = elapsed === null ? '' : elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
-      const stamp = a.applied_at ? new Date(a.applied_at).toLocaleString(undefined, {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}) : '';
-      return `<article class="cb-application ${active(a.phase) ? 'is-active' : a.phase === 'applied' ? 'is-applied' : 'needs-attention'}"><div class="cb-application-top"><div><strong>${esc(r.title)}</strong><p>${esc(r.company)}</p></div><span class="cb-application-state">${active(a.phase) ? '<i class="cb-live-dot" aria-hidden="true"></i>' : ''}${esc(a.label)}</span></div>
-        ${index !== undefined ? `<ol class="cb-application-steps" aria-label="Application stages">${steps.map((s,i) => `<li class="${i < index ? 'done' : i === index ? 'current' : ''}" ${i === index ? 'aria-current="step"' : ''}>${i < index ? '✓ ' : ''}${s}</li>`).join('')}</ol>` : ''}
-        ${a.detail ? `<p class="cb-application-detail">${esc(a.detail)}</p>` : ''}<footer><span>${a.phase === 'applied' ? (stamp ? `Applied ${esc(stamp)}` : 'Application recorded') : active(a.phase) ? `${duration ? `Requested ${duration} ago · ` : ''}Not yet confirmed submitted` : 'Open the pipeline to review the outcome'}${a.match_score != null ? ` · Match ${esc(a.match_score)}/10` : ''}</span><button type="button" class="btn" data-application-company="${esc(r.company)}">${active(a.phase) || a.phase === 'applied' ? 'View in pipeline' : 'Review in pipeline'} →</button></footer></article>`;
-    }).join('') + (rows.length > 50 ? '<p class="cb-note">Showing the 50 most recent applications, with active roles first. View pipeline for all roles.</p>' : '');
+    const list = this.$('.cb-application-list');
+    const expanded = new Map([...list.querySelectorAll('[data-application-group]')].map(el => [el.dataset.applicationGroup, el.open]));
+    const groups = this.applicationGroups(rows);
+    list.innerHTML = groups.map(({key, label, items}) => `<details class="cb-application-group" data-application-group="${key}" ${(expanded.get(key) ?? !['applied','skipped','closed'].includes(key)) ? 'open' : ''}><summary>${label}<span>${items.length}</span></summary>${items.slice(0,50).map(r => {
+      const a = r.application;
+      const stamp = a.applied_at ? new Date(a.applied_at).toLocaleDateString(undefined, {month:'short', day:'numeric'}) : '';
+      const time = a.phase === 'applied' ? (stamp ? `Applied ${stamp}` : 'Date unavailable') : a.match_score != null ? `${a.match_score}/10 match` : '';
+      return `<article class="cb-application-row ${active(a.phase) ? 'is-active' : a.phase === 'applied' ? 'is-applied' : 'needs-attention'}"><button type="button" class="cb-application-role" data-application-company="${esc(r.company)}" title="${esc(r.title)} at ${esc(r.company)} — open in pipeline">${esc(r.title)} <span>· ${esc(r.company)}</span></button><span class="cb-application-state" title="${esc(a.detail || a.label)}">${active(a.phase) ? '<i class="cb-live-dot" aria-hidden="true"></i>' : ''}${esc(a.label)}</span><span class="cb-application-time">${esc(time)}</span><button type="button" class="btn cb-application-open" data-application-company="${esc(r.company)}" aria-label="View ${esc(r.title)} at ${esc(r.company)} in pipeline">View →</button></article>`;
+    }).join('')}${items.length > 50 ? '<p class="cb-note">Showing the latest 50. Open the pipeline for all roles.</p>' : ''}</details>`).join('');
   }
+  applicationGroups(rows) {
+    const definitions = [['apply','Applying now'], ['score','Scoring'], ['tailor','Tailoring'], ['waiting','Waiting to apply'], ['queued','Queued'], ['attention','Needs attention'], ['skipped','Skipped'], ['closed','Posting closed'], ['applied','Applied']];
+    const key = a => a.phase === 'starting' ? 'queued' : a.phase === 'attention' && a.status === 'skipped' ? 'skipped' : a.status === 'job_gone' ? 'closed' : definitions.some(([k]) => k === a.phase) ? a.phase : 'attention';
+    return definitions.map(([group, label]) => ({key:group, label, items:rows.filter(r => key(r.application) === group)})).filter(g => g.items.length);
+  }
+
   message(text, error = false) {
     this.$('.cb-message').hidden = !text; this.$('.cb-message').textContent = text; this.$('.cb-message').classList.toggle('cb-error', error);
   }
@@ -190,9 +216,29 @@ class CareerBoard extends HTMLElement {
     const errors = this.data.running ? [] : receipt?.errors || [];
     if (!this.data.running && receipt?.kind !== 'web' && receipt?.kind !== 'network' && receipt?.sources?.length) status += ' ' + receipt.sources.slice(0, 4).map(s => `${s.company}: ${s.found} postings`).join(' · ') + '.';
     if (!this.data.running && receipt?.kind === 'network') status = `${receipt.found} matches saved this batch · ${receipt.read} postings read · ${receipt.unreachable} boards unreachable. ${receipt.complete ? 'Reached the end of the selected directories.' : 'Partial scan — continue to check more companies.'}`;
+    if (!this.data.running && receipt?.kind === 'network') {
+      const failure = receipt.scan_error || errors.find(e => e.company === 'Scanner')?.error;
+      if (failure) status = `${receipt.found || 0} matches saved. Scan failed: ${failure}`;
+      const clientFailure = errors.find(e => ['claude', 'codex'].includes(e.company));
+      if (clientFailure) status += ` ${clientFailure.company === 'claude' ? 'Claude' : 'Codex'} search: ${clientFailure.error}`;
+    }
+    if (!this.data.running && this.data.error) status = this.data.error + (status ? ` ${status}` : '');
     if (errors.length && receipt?.kind !== 'network') status += ' ' + errors.slice(0, 3).map(e => `${e.company}: ${e.error}`).join(' ');
-    this.message(status, !!errors.length && (receipt?.kind !== 'network' || !receipt.found));
+    this.message(status, !!this.data.error || !!receipt?.scan_error || errors.some(e => e.company === 'Scanner') || (!!errors.length && (receipt?.kind !== 'network' || !receipt.found)));
     this.$('.cb-count').textContent = `${this.rows().filter(r => r.state === 'new').length} new${company ? ` · ${company}` : ''}`;
+  }
+  progressRows(events, filter = 'all') {
+    const groups = [];
+    for (const event of events) {
+      const message = String(event.message || '');
+      const issue = /HTTP [45]\d\d|failed|timed? out|unreachable|could not|cannot|error/i.test(message);
+      const match = /\b[1-9]\d* matches?\b/i.test(message);
+      if (filter === 'issues' && !issue || filter === 'matches' && !match) continue;
+      const previous = groups.at(-1);
+      if (previous?.message === message) { previous.count++; previous.at = event.at; }
+      else groups.push({...event, message, issue, match, count:1});
+    }
+    return groups.reverse();
   }
   paintProgress() {
     const latest = [this.data.last_search, this.data.last_scan, this.data.last_network].filter(Boolean).sort((a,b) => (b.started_at || '').localeCompare(a.started_at || ''))[0];
@@ -202,18 +248,29 @@ class CareerBoard extends HTMLElement {
     box.hidden = !events.length;
     if (!events.length) return;
     if (this.progressRun !== progress.run_id) {
-      this.progressRun = progress.run_id; box.open = false;
+      this.progressRun = progress.run_id; this.progressSignature = ''; box.open = false;
+      this.$('.cb-progress-filter').value = 'all';
     }
-    const list = box.querySelector('ol');
-    const signature = progress.run_id + ':' + events.at(-1).seq;
+    const state = this.$('.cb-progress-state');
+    state.textContent = this.data.running ? 'Live' : shown?.scan_error ? 'Stopped with an error' : shown?.complete === false ? 'Partial scan' : 'Finished';
+    state.classList.toggle('is-live', !!this.data.running);
+    this.$('.cb-progress-latest').textContent = events.at(-1).message;
+    this.$('.cb-progress-latest').title = events.at(-1).message;
+    const filter = this.$('.cb-progress-filter').value;
+    const signature = progress.run_id + ':' + events.at(-1).seq + ':' + filter;
     if (signature === this.progressSignature) return;
+    const sameView = this.progressSignature?.split(':').at(-1) === filter;
     this.progressSignature = signature;
-    const follow = list.scrollHeight - list.scrollTop - list.clientHeight < 35;
-    list.innerHTML = events.map(event => {
+    const list = box.querySelector('ol'), previousHeight = list.scrollHeight, previousTop = list.scrollTop;
+    const rows = this.progressRows(events, filter);
+    this.$('.cb-progress-count').textContent = `${rows.length} update${rows.length === 1 ? '' : 's'} · newest first${events[0].seq > 1 ? ' · recent history' : ''}`;
+    list.innerHTML = rows.map(event => {
       const seconds = Math.max(0, Math.floor((Date.parse(event.at) - Date.parse(progress.run_id)) / 1000)) || 0;
-      return `<li><time>${seconds}s</time><span>${esc(event.message)}</span></li>`;
-    }).join('');
-    if (follow) list.scrollTop = list.scrollHeight;
+      const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+      return `<li class="${event.issue ? 'cb-progress-issue' : event.match ? 'cb-progress-match' : ''}"><time title="Time since this search started">${elapsed}</time><span>${esc(event.message)}${event.count > 1 ? `<small class="cb-progress-repeat">${event.count} repeated updates</small>` : ''}</span></li>`;
+    }).join('') || `<li class="cb-progress-empty">${filter === 'issues' ? 'No issues in recent activity.' : 'No matches reported in recent activity yet.'}</li>`;
+    // Keep the newest update visible, but do not pull readers away from older entries.
+    list.scrollTop = sameView && previousTop > 12 ? previousTop + list.scrollHeight - previousHeight : 0;
   }
   async streamProgress() {
     if (!this.data?.running || this.hidden || this.progressController) return;
@@ -250,7 +307,7 @@ class CareerBoard extends HTMLElement {
   }
   rows() {
     const company = this.getAttribute('company') || '', query = (this.getAttribute('query') || '').toLowerCase().trim();
-    return (this.data?.jobs || []).filter(r => (!company || r.company === company) && (!query || `${r.title} ${r.company} ${r.location}`.toLowerCase().includes(query)));
+    return (this.data?.jobs || []).filter(r => !['applied', 'applied_manual'].includes(r.pipeline_status || r.application?.status) && r.application?.phase !== 'applied' && (!company || r.company === company) && (!query || `${r.title} ${r.company} ${r.location}`.toLowerCase().includes(query)));
   }
   renderRows() {
     if (!this.data) return;
@@ -261,8 +318,8 @@ class CareerBoard extends HTMLElement {
     const pages = Math.max(1, Math.ceil(rows.length / 25)); this.page = Math.min(Math.max(this.page, 1), pages);
     this.visibleRows = rows.slice((this.page-1)*25, this.page*25);
     this.$('.cb-result-count').textContent = `${rows.length} role${rows.length === 1 ? '' : 's'}`;
-    this.$('.cb-list').innerHTML = this.visibleRows.map(r => `<article class="cb-job"><input type="checkbox" data-pick="${esc(r.id)}" aria-label="Select ${esc(r.title)} at ${esc(r.company)}" ${r.state !== 'new' ? 'disabled' : ''} ${this.selected.has(r.id) ? 'checked' : ''}>
-      <div><a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title)}</a><p>${esc(r.company)} · ${esc(r.location || 'Location not listed')}</p><small>${r.posted_at ? `Posted ${esc(date(r.posted_at))}` : 'Posting date unavailable'} · Found ${esc(date(r.first_seen))}${r.last_seen ? ` · Last seen ${esc(date(r.last_seen))}` : ''}</small>${r.why ? `<p class="cb-why">${esc(plainWhy(r.why))}</p>` : ""}${r.verification === "needs_posting_read" ? `<small>Posting will be checked before tailoring</small>` : ""}</div><span class="cb-state-label">${esc(r.application?.label || (r.state === "new" && r.verification === "verified" ? "Posting checked" : labels[r.state] || r.state))}</span></article>`).join('') || '<div class="cb-empty"><span class="cb-empty-icon" aria-hidden="true">⌕</span><strong>Your next role starts here</strong><p>Search jobs above, or choose All new jobs to browse earlier discoveries.</p></div>';
+    this.$('.cb-list').innerHTML = this.visibleRows.map(r => `<article class="cb-job cb-job-compact"><input type="checkbox" data-pick="${esc(r.id)}" aria-label="Select ${esc(r.title)} at ${esc(r.company)}" ${r.state !== 'new' ? 'disabled' : ''} ${this.selected.has(r.id) ? 'checked' : ''}>
+      <span class="cb-company-mark" aria-hidden="true">${esc(r.company.slice(0,2).toUpperCase())}</span><div class="cb-job-info"><button type="button" class="cb-job-title" data-detail="${esc(r.id)}" aria-haspopup="dialog">${esc(r.title)}</button><p>${esc(r.company)} <span>· ${esc(r.location || 'Location not listed')}</span></p><small>${r.posted_at ? `Posted ${esc(date(r.posted_at))}` : 'Posting date unavailable'} · Found ${esc(date(r.first_seen))}</small></div><div class="cb-job-meta">${r.application?.match_score != null ? `<span class="cb-score">${esc(r.application.match_score)}/10 match</span>` : ''}<span class="cb-state-label">${esc(r.application?.label || (r.state === 'new' && r.verification === 'verified' ? 'Posting checked' : labels[r.state] || r.state))}</span><button type="button" class="cb-details-link" data-detail="${esc(r.id)}" aria-label="Details for ${esc(r.title)} at ${esc(r.company)}">Details →</button></div></article>`).join('') || '<div class="cb-empty"><span class="cb-empty-icon" aria-hidden="true">⌕</span><strong>No roles in this view</strong><p>Choose All new jobs to browse earlier discoveries, or adjust your search.</p></div>';
     this.$('.cb-actions').hidden = !rows.length;
     this.$('.cb-pagination').hidden = pages <= 1;
     this.$('.cb-pagination span').textContent = `${this.page} / ${pages}`;
@@ -271,7 +328,14 @@ class CareerBoard extends HTMLElement {
   }
   paintSelection() {
     const size = this.selected.size;
-    this.$('.cb-selection').textContent = `${size} selected`;
+    this.$('.cb-selection').textContent = size ? `${size} selected${size > 50 ? ' · select up to 50 at a time' : ''}` : 'Select roles to take action';
+    this.$('.cb-selected-actions').hidden = !size;
+    this.$('.cb-clear').hidden = !size;
+    this.$('.cb-clear').disabled = this.busy;
+    this.$('.cb-actions').classList.toggle('has-selection', !!size);
+    const detailRow = this.data?.jobs.find(r => r.id === this.detailId);
+    this.$('.cb-detail-select').checked = !!detailRow && this.selected.has(detailRow.id);
+    this.$('.cb-detail-select').disabled = this.busy || detailRow?.state !== 'new';
     this.$('.cb-apply').hidden = !this.data?.capabilities?.apply_selected;
     this.$('.cb-apply').disabled = this.busy || !size || size > 50;
     this.$('.cb-apply-help').hidden = !size || !this.data?.capabilities?.apply_selected;
@@ -282,6 +346,28 @@ class CareerBoard extends HTMLElement {
     this.$('.cb-all').checked = !!eligible.length && checked === eligible.length;
     this.$('.cb-all').indeterminate = checked > 0 && checked < eligible.length;
     this.$('.cb-all').disabled = !eligible.length || this.busy;
+  }
+  async openDetail(id) {
+    const row = this.data?.jobs.find(r => r.id === id);
+    if (!row) return;
+    this.detailId = id; this.detailTrigger = document.activeElement;
+    const version = ++this.detailVersion;
+    const drawer = this.$('.cb-job-drawer'), body = this.$('.cb-drawer-content');
+    body.innerHTML = `<div class="cb-detail-company"><span class="cb-company-mark" aria-hidden="true">${esc(row.company.slice(0,2).toUpperCase())}</span><span>${esc(row.company)}</span></div><h2 id="cb-detail-title">${esc(row.title)}</h2><p class="cb-detail-location">${esc(row.location || 'Location not listed')}</p><div class="cb-detail-tags"><span>${esc(labels[row.state] || row.state)}</span><span>${row.posted_at ? `Posted ${esc(date(row.posted_at))}` : 'Posting date unavailable'}</span><span>${esc(row.provider || 'Career page')}</span></div><a class="cb-original-link" href="${esc(row.url)}" target="_blank" rel="noopener noreferrer">Open original posting ↗</a>${row.why ? `<section class="cb-detail-section"><h3>Why it was found</h3><p>${esc(plainWhy(row.why))}</p></section>` : ''}<section class="cb-detail-section"><h3>Application & résumé</h3><div class="cb-detail-application">Loading saved information…</div></section><section class="cb-detail-section"><h3>Job description</h3><p class="cb-detail-description" aria-live="polite">Loading saved description…</p></section>`;
+    this.paintSelection();
+    if (!drawer.open) drawer.showModal();
+    this.$('.cb-drawer-close').focus();
+    try {
+      const detail = await this.request('/job/' + encodeURIComponent(id));
+      if (version !== this.detailVersion || !drawer.open) return;
+      this.$('.cb-detail-description').textContent = detail.description || 'A full description has not been saved yet. Open the original posting to read it; AppliedIn will check it before tailoring.';
+      const cfg = window.APPLIEDIN_CONFIG || {}, resume = detail.resume_url ? (cfg.apiUrl || '').replace(/\/$/, '') + detail.resume_url : '';
+      this.$('.cb-detail-application').innerHTML = `<p>${detail.match_score != null ? `Match score: <strong>${esc(detail.match_score)}/10</strong>` : 'Not scored yet'}${row.application?.label ? ` · ${esc(row.application.label)}` : ''}${detail.applied_at ? ` · Applied ${esc(date(detail.applied_at))}` : ''}</p>${resume ? `<a class="btn" href="${esc(resume)}" target="_blank" rel="noopener noreferrer">Open tailored résumé ↗</a>` : '<p class="cb-note">A tailored résumé will appear here once it is ready.</p>'}`;
+    } catch (error) {
+      if (version !== this.detailVersion || !drawer.open) return;
+      this.$('.cb-detail-description').textContent = 'Saved details could not be loaded. You can still open the original posting.';
+      this.$('.cb-detail-application').textContent = error.message;
+    }
   }
   seedNetwork(filters, prefs = this.data?.preferences || {}) {
     filters ||= {positive:prefs.titles || [], negative:prefs.exclude_keywords || [], locations:prefs.locations || [], ats:['greenhouse','lever','ashby','workday'], days:30, include_undated:true, limit:150};

@@ -23,6 +23,7 @@ facts.seed.yaml
 # local runtime state: saved logins (secrets.json), your facts (facts.md),
 # ADK sessions, artifacts, daemon pid/log — never commit
 .local/
+.local-*/
 
 # OS / IDE
 .DS_Store

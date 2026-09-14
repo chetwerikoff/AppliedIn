@@ -28,6 +28,7 @@ from google.adk.tools.skill_toolset import SkillToolset
 
 from core.config import get_settings
 from core.logging import get_logger
+from core.steering import before_model
 from tools.schema import MatchScore
 
 log = get_logger(__name__)
@@ -283,6 +284,7 @@ def _skill(name: str) -> SkillToolset:
 
 # --- agents ------------------------------------------------------------------
 scorer = LlmAgent(
+    before_model_callback=before_model,
     name="scorer", model=_model("scorer"),
     description="Agentic discovery: extract the role and match-score it.",
     instruction=(
@@ -305,6 +307,7 @@ scorer = LlmAgent(
 )
 
 tailor = LlmAgent(
+    before_model_callback=before_model,
     name="tailor", model=_model("tailor"),
     description="Re-emphasizes the seed résumé LaTeX for the JD (via the tailoring skill).",
     instruction=(
@@ -372,6 +375,7 @@ tailor = LlmAgent(
 )
 
 critic = LlmAgent(
+    before_model_callback=before_model,
     name="critic", model=_model("critic"),
     description="Reviews the draft; ends the loop when it's strong.",
     instruction=(
@@ -405,6 +409,7 @@ critic = LlmAgent(
 tailor_critique = LoopAgent(name="tailor_critique", sub_agents=[tailor, critic], max_iterations=2)
 
 applier = LlmAgent(
+    before_model_callback=before_model,
     name="applier", model=_model(),
     description="Human-gated apply: waits for approval, then submits via the browser.",
     instruction=(

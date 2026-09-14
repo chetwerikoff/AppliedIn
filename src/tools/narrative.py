@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 
 from core.logging import get_logger
+from core.steering import messages
 
 log = get_logger(__name__)
 
@@ -112,7 +113,7 @@ def draft_answer(question: str, company: str, jd_text: str, *,
         + (_OPEN_INVITATION_BRIEF if _OPEN_INVITATION_RX.search(question or "") else "")
     )
     try:
-        resp = completion(model=model, messages=[{"role": "user", "content": prompt}])
+        resp = completion(model=model, messages=messages(prompt))
         text = (resp["choices"][0]["message"]["content"] or "").strip()
     except Exception as exc:
         log.warning("narrative draft failed (%s)", exc)

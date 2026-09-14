@@ -1,5 +1,20 @@
 # Release notes
 
+## 2026-09-14 — Shared agent instructions and clearer job review
+
+- Add **Agent instructions** to the top navigation. Edit or import a private
+  steering file shared with all agent paths, including Claude and Codex search.
+  Each instance keeps its own file; stale saves cannot overwrite newer edits.
+- Keep the Career Ops sidebar layout, with compact job rows, a role details
+  drawer, and selection actions that remain accessible while scrolling.
+- Show the latest search activity with readable elapsed times, grouped repeated
+  updates, and filters for matches and issues.
+- Hide already-applied jobs from Matching jobs, including roles submitted through
+  another pipeline view. Group Your applications by status using compact rows;
+  completed applications remain available in collapsed history.
+- Install the Career Ops scanner in the selected instance's directory at startup.
+  Report scanner failures explicitly instead of presenting them as empty results.
+
 ## 2026-09-13 — Career Ops search and application progress
 
 ### Find jobs

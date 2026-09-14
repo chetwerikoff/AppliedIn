@@ -62,6 +62,9 @@ class SearchEvents:
 
 
 def run_search(prompt, schema, progress, *, cancelled=None):
+    from core.steering import prompt as steer
+
+    prompt = steer(prompt)
     if not shutil.which("codex"):
         raise ValueError("Install Codex CLI and run codex login with your ChatGPT account.")
     env = {

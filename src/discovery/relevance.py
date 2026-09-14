@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 
 from core.logging import get_logger
+from core.steering import messages
 from core.models import JobRecord
 from tools.schema import RelevanceResult
 
@@ -84,7 +85,7 @@ def relevant(
         "the 0-based numbers that fit. Use an empty list if none fit."
     )
     try:
-        resp = completion(model=model, messages=[{"role": "user", "content": prompt}],
+        resp = completion(model=model, messages=messages(prompt),
                           response_format=RelevanceResult)
         text = resp["choices"][0]["message"]["content"]
     except Exception as exc:

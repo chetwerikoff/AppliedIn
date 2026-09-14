@@ -53,7 +53,7 @@ preflight() {
 
 case "${1:-}" in
   setup) exec ./setup.sh ;;
-  start) ensure_env; preflight; ensure_career_ops ;;
+  start) ensure_env; preflight; ensure_career_ops --tools-only ;;
 esac
 
 exec uv run python -m cli "$@"

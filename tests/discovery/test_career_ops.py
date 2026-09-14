@@ -108,6 +108,41 @@ def test_invalid_batch_changes_nothing(board):
     assert not stores.tracking.all()
 
 
+def test_detail_drawer_reads_saved_description_without_starting_an_agent(board):
+    stores, rows = board
+    data = co._read()
+    data["jobs"][rows[0]["id"]]["description"] = "<p>Build APIs &amp; tools.</p>"
+    co._write(data)
+    detail = api.job_detail(rows[0]["id"])
+    assert detail["description"] == "Build APIs & tools."
+    assert detail["match_score"] is None
+    assert detail["resume_url"] is None
+    assert not stores.tracking.all()
+    stores.queue.enqueue.assert_not_called()
+
+
+def test_detail_drawer_links_existing_resume_without_leaking_form_answers(board):
+    stores, rows = board
+    pk = co.prepare([rows[0]["id"]])["pks"][0]
+    stores.queue.reset_mock()
+    stores.artifacts = Mock()
+    stores.artifacts.exists.return_value = True
+    stores.artifacts.version.return_value = "2"
+    stores.tracking.set_status(
+        pk,
+        Status.TAILORED,
+        resume_s3_key="acme#one/resume.pdf",
+        match_score=8,
+        fields=[{"answer": "private"}],
+    )
+    detail = api.job_detail(rows[0]["id"])
+    assert detail["resume_url"] == "/artifact/acme%23one/resume.pdf?v=2"
+    assert detail["match_score"] == 8
+    assert "fields" not in detail
+    assert stores.tracking.get(pk)["status"] == "tailored"
+    stores.queue.enqueue.assert_not_called()
+
+
 def test_rescan_keeps_dismissal_and_first_seen_and_reports_partial_failures(board, monkeypatch):
     stores, rows = board
     co.dismiss([rows[0]["id"]])
@@ -402,8 +437,23 @@ def test_network_matches_are_saved_before_failure_and_wait_for_selection(board, 
     assert data["network_search"]["cursor"]["ashby"]["next"] == 1
     assert data["last_network"]["found"] == 1
     assert not data["last_network"]["complete"]
+    assert data["last_network"]["scan_error"] == "connection interrupted"
+    assert "scan failed" in data["last_network"]["progress"]["events"][-1]["message"]
     assert not co._RUNNING and not co._SCAN.locked()
     stores.queue.enqueue.assert_not_called()
+
+
+def test_missing_scanner_is_reported_before_spending_time_on_ai_search(board, monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(co, "catalog", Mock(side_effect=ValueError("Install for port 8788")))
+    background = BackgroundTasks()
+    with pytest.raises(HTTPException) as error:
+        api.network(api.NetworkSearch(ats=["ashby"]), background)
+    assert error.value.status_code == 503
+    assert "port 8788" in error.value.detail
+    assert not background.tasks
+    assert not co._SCAN.locked()
 
 
 def test_rescan_preserves_review_state_but_updates_search_membership(board):

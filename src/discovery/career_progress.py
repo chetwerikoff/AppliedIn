@@ -53,7 +53,27 @@ def application_progress(row: dict, event: dict | None = None, *, in_flight=Fals
 def attach_progress(rows: list[dict], stores) -> None:
     from core.apply_queue import ApplyQueue
     from core.events import recent
+    from discovery.career_ops import canonical
 
+    # A role can be submitted through the main pipeline after the board saved it.
+    # Resolve its live tracking state rather than trusting the board's old "new" flag.
+    records = stores.tracking.all()
+    by_pk = {r["pk"]: r for r in records}
+    by_url = {}
+    for row in records:
+        url = canonical(row["jd_url"]) if row.get("jd_url") else ""
+        if url and (url not in by_url or row.get("status") in ("applied", "applied_manual")):
+            by_url[url] = row
+    for job in rows:
+        linked = by_url.get(canonical(job["url"])) if job.get("url") else None
+        linked = linked or {}
+        row = by_pk.get(job.get("pk")) or linked
+        if linked.get("status") in ("applied", "applied_manual"):
+            row = linked
+        if row:
+            job.update(pk=row["pk"], pipeline_status=row.get("status", ""))
+            if job.get("state") == "new":
+                job["state"] = "pipeline"
     tracked = [r for r in rows if r.get("pk")]
     if not tracked:
         return
@@ -63,7 +83,7 @@ def attach_progress(rows: list[dict], stores) -> None:
             events.setdefault(event.get("pk"), event)
     flight = ApplyQueue(stores.tracking.r).in_flight() if hasattr(stores.tracking, "r") else set()
     for job in tracked:
-        row = stores.tracking.get(job["pk"]) or {}
+        row = by_pk.get(job["pk"]) or {}
         if row.get("apply_requested_at"):
             job["application"] = application_progress(
                 row, events.get(job["pk"]), in_flight=job["pk"] in flight

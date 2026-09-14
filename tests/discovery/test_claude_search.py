@@ -136,6 +136,8 @@ def test_api_auth_or_missing_login_cannot_fall_back_to_another_provider(monkeypa
 
 
 def test_worker_has_only_web_tools_and_never_inherits_repo_settings_or_opens_chrome(monkeypatch):
+    from core import steering
+    steering.save("Prefer platform teams", steering.read()["revision"])
     monkeypatch.setattr(cs.shutil, "which", lambda name: "/bin/claude")
     monkeypatch.setattr(cs, "require_subscription", Mock())
     proc = MagicMock()
@@ -149,6 +151,7 @@ def test_worker_has_only_web_tools_and_never_inherits_repo_settings_or_opens_chr
     assert result["source_urls"] == {URL}
     args, kwargs = popen.call_args
     cmd = args[0]
+    assert any("Prefer platform teams" in arg for arg in cmd)
     assert cmd[cmd.index("--tools") + 1] == "WebSearch,WebFetch"
     assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
     assert "--no-chrome" in cmd and "--chrome" not in cmd

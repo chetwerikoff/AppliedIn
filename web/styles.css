@@ -3705,13 +3705,19 @@ button.ps-head:hover { background: var(--card-2); }
 .fs-sum b { color: var(--fg); font-weight: 600; }
 .fs-run {
   flex: none;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
   border-color: color-mix(in srgb, var(--scan) 45%, transparent);
   background: color-mix(in srgb, var(--scan) 12%, transparent);
   color: var(--scan);
   font-size: 12.5px;
   font-weight: 600;
   padding: 6px 14px;
-  white-space: nowrap;
+  /* Company counts and date windows must fit the narrow discovery rail. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
 }
 .fs-run:hover:not(:disabled) { background: color-mix(in srgb, var(--scan) 22%, transparent); }
 .fs-run:disabled { opacity: 0.45; cursor: default; }

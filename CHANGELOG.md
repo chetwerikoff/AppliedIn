@@ -1,5 +1,17 @@
 # Release notes
 
+## 2026-09-14 — Clearer application details and compact workflow
+
+- Add a compact Find → Prepare → Apply guide to Career Ops search, with aligned
+  application columns and clearer status badges.
+- Show the résumé, match score, submission status, and application date together
+  in role details. Keep requested dates separate from confirmed application dates.
+- Wrap the Fresh jobs Scan button label within the sidebar at narrow widths.
+
+Validation: 46 JavaScript tests passed. Browser checks covered light and dark
+themes, compact application rows, role details, and Scan button sizing from
+390px to 1440px wide.
+
 ## 2026-09-14 — Shared agent instructions and clearer job review
 
 - Add **Agent instructions** to the top navigation. Edit or import a private

@@ -13,9 +13,9 @@ class CareerBoard extends HTMLElement {
   connectedCallback() {
     this.selected = new Set(); this.data = null; this.busy = false; this.page = 1;
     this.pendingApplications = new Map(); this.detailVersion = 0;
-    this.innerHTML = `<section class="cb-panel cb-page"><header class="cb-heading"><div><h2>Discover jobs</h2><p>Search your preferred job boards, then review the roles that fit.</p></div><button type="button" class="btn cb-pipeline">View pipeline →</button></header>
+    this.innerHTML = `<section class="cb-panel cb-page"><header class="cb-heading"><div><h2>Discover jobs</h2><ol class="cb-flow-guide" aria-label="Application workflow"><li><span>01</span> Find roles</li><li><span>02</span> Prepare résumé</li><li><span>03</span> Apply & track</li></ol></div><button type="button" class="btn cb-pipeline">View pipeline →</button></header>
       <div class="cb-body">
-        <aside class="cb-search-column" aria-label="Search preferences"><div class="cb-network"><h3 class="cb-search-title">Your search</h3>
+        <aside class="cb-search-column" aria-label="Search preferences"><div class="cb-network"><h3 class="cb-search-title">Your search <span>Preferences</span></h3>
           <div class="cb-search-brief"><label for="cb-search-query">Interests <small>Optional</small></label><textarea id="cb-search-query" rows="2" maxlength="600" placeholder="AI infrastructure, developer tools, fintech…"></textarea></div>
           <div class="cb-search-options"><label>Search with <select class="cb-client"><option value="claude">Claude</option><option value="codex">Codex</option></select></label><fieldset class="cb-board-picker"><legend>Job boards</legend><div class="cb-ats">${['greenhouse','lever','ashby','workday','icims'].map(name => `<label><input type="checkbox" value="${name}" ${name !== 'icims' ? 'checked' : ''}>${({greenhouse:'Greenhouse',lever:'Lever',ashby:'Ashby',workday:'Workday',icims:'iCIMS'})[name]}</label>`).join('')}</div></fieldset></div>
           <div class="cb-search-fields"><label>Roles to find<textarea class="cb-roles" rows="3" placeholder="Software Engineer, Platform Engineer" aria-describedby="cb-filter-help"></textarea></label><label>Locations<textarea class="cb-locations" rows="3" placeholder="Seattle, California, Remote (US)"></textarea></label></div>
@@ -179,11 +179,11 @@ class CareerBoard extends HTMLElement {
     const list = this.$('.cb-application-list');
     const expanded = new Map([...list.querySelectorAll('[data-application-group]')].map(el => [el.dataset.applicationGroup, el.open]));
     const groups = this.applicationGroups(rows);
-    list.innerHTML = groups.map(({key, label, items}) => `<details class="cb-application-group" data-application-group="${key}" ${(expanded.get(key) ?? !['applied','skipped','closed'].includes(key)) ? 'open' : ''}><summary>${label}<span>${items.length}</span></summary>${items.slice(0,50).map(r => {
+    list.innerHTML = '<div class="cb-application-columns" aria-hidden="true"><span>Role & company</span><span>Status</span><span>Match / applied</span><span></span></div>' + groups.map(({key, label, items}) => `<details class="cb-application-group" data-application-group="${key}" ${(expanded.get(key) ?? !['applied','skipped','closed'].includes(key)) ? 'open' : ''}><summary>${label}<span>${items.length}</span></summary>${items.slice(0,50).map(r => {
       const a = r.application;
       const stamp = a.applied_at ? new Date(a.applied_at).toLocaleDateString(undefined, {month:'short', day:'numeric'}) : '';
       const time = a.phase === 'applied' ? (stamp ? `Applied ${stamp}` : 'Date unavailable') : a.match_score != null ? `${a.match_score}/10 match` : '';
-      return `<article class="cb-application-row ${active(a.phase) ? 'is-active' : a.phase === 'applied' ? 'is-applied' : 'needs-attention'}"><button type="button" class="cb-application-role" data-application-company="${esc(r.company)}" title="${esc(r.title)} at ${esc(r.company)} — open in pipeline">${esc(r.title)} <span>· ${esc(r.company)}</span></button><span class="cb-application-state" title="${esc(a.detail || a.label)}">${active(a.phase) ? '<i class="cb-live-dot" aria-hidden="true"></i>' : ''}${esc(a.label)}</span><span class="cb-application-time">${esc(time)}</span><button type="button" class="btn cb-application-open" data-application-company="${esc(r.company)}" aria-label="View ${esc(r.title)} at ${esc(r.company)} in pipeline">View →</button></article>`;
+      return `<article class="cb-application-row ${active(a.phase) ? 'is-active' : a.phase === 'applied' ? 'is-applied' : 'needs-attention'}"><button type="button" class="cb-application-role" data-application-company="${esc(r.company)}" title="${esc(r.title)} at ${esc(r.company)} — open in pipeline">${esc(r.title)} <span>· ${esc(r.company)}</span></button><span class="cb-application-state" data-phase="${esc(a.phase)}" title="${esc(a.detail || a.label)}">${active(a.phase) ? '<i class="cb-live-dot" aria-hidden="true"></i>' : ''}${esc(a.label)}</span><span class="cb-application-time">${esc(time)}</span><button type="button" class="btn cb-application-open" data-application-company="${esc(r.company)}" aria-label="View ${esc(r.title)} at ${esc(r.company)} in pipeline">View →</button></article>`;
     }).join('')}${items.length > 50 ? '<p class="cb-note">Showing the latest 50. Open the pipeline for all roles.</p>' : ''}</details>`).join('');
   }
   applicationGroups(rows) {
@@ -362,12 +362,23 @@ class CareerBoard extends HTMLElement {
       if (version !== this.detailVersion || !drawer.open) return;
       this.$('.cb-detail-description').textContent = detail.description || 'A full description has not been saved yet. Open the original posting to read it; AppliedIn will check it before tailoring.';
       const cfg = window.APPLIEDIN_CONFIG || {}, resume = detail.resume_url ? (cfg.apiUrl || '').replace(/\/$/, '') + detail.resume_url : '';
-      this.$('.cb-detail-application').innerHTML = `<p>${detail.match_score != null ? `Match score: <strong>${esc(detail.match_score)}/10</strong>` : 'Not scored yet'}${row.application?.label ? ` · ${esc(row.application.label)}` : ''}${detail.applied_at ? ` · Applied ${esc(date(detail.applied_at))}` : ''}</p>${resume ? `<a class="btn" href="${esc(resume)}" target="_blank" rel="noopener noreferrer">Open tailored résumé ↗</a>` : '<p class="cb-note">A tailored résumé will appear here once it is ready.</p>'}`;
+      this.$('.cb-detail-application').innerHTML = this.receiptHtml(row, detail, resume);
     } catch (error) {
       if (version !== this.detailVersion || !drawer.open) return;
       this.$('.cb-detail-description').textContent = 'Saved details could not be loaded. You can still open the original posting.';
       this.$('.cb-detail-application').textContent = error.message;
     }
+  }
+  receiptHtml(row, detail, resume) {
+    const status = detail.status || row.pipeline_status || row.application?.status || '';
+    const applied = ['applied', 'applied_manual'].includes(status);
+    const labels = {found:'Waiting for preparation', tailoring:'Preparing résumé', tailored:row.application?.requested_at ? 'Waiting to apply' : 'Ready for review', submitting:'Applying in browser', applied:'Application confirmed', applied_manual:'Marked applied manually', needs_human:'Needs your attention', failed:'Could not finish', error:'Could not finish', skipped:'Skipped', job_gone:'Posting closed', uncertain:'Check the application outcome'};
+    const label = labels[status] || (status ? 'Status unavailable' : 'Not started');
+    const tone = applied ? 'complete' : ['needs_human','failed','error','uncertain'].includes(status) ? 'attention' : 'pending';
+    const score = detail.match_score ?? row.application?.match_score;
+    const stamp = detail.applied_at || row.application?.applied_at;
+    const requested = row.application?.requested_at;
+    return `<div class="cb-receipt" data-outcome="${tone}"><header><span>Application status</span><strong>${esc(label)}</strong></header><dl><div><dt>Match score</dt><dd>${score != null ? `${esc(score)} / 10` : 'Not scored yet'}</dd></div><div><dt>Tailored résumé</dt><dd>${resume ? `<a href="${esc(resume)}" target="_blank" rel="noopener noreferrer">Open résumé ↗</a>` : 'Not available yet'}</dd></div><div><dt>Submission</dt><dd>${applied ? status === 'applied_manual' ? 'Recorded by you' : 'Confirmed' : 'Not confirmed'}</dd></div>${applied ? `<div><dt>Applied on</dt><dd>${stamp ? esc(date(stamp)) : 'No date recorded'}</dd></div>` : requested ? `<div><dt>Requested on</dt><dd>${esc(date(requested))}</dd></div>` : ''}</dl><p>${applied ? 'Saved in your application history.' : status && status !== 'found' ? 'Open the pipeline to review this role and its next step. No confirmed submission is recorded.' : 'Prepare a résumé for review, or use Apply selected to score, tailor and submit. Submission still depends on the score and required answers.'}</p></div>`;
   }
   seedNetwork(filters, prefs = this.data?.preferences || {}) {
     filters ||= {positive:prefs.titles || [], negative:prefs.exclude_keywords || [], locations:prefs.locations || [], ats:['greenhouse','lever','ashby','workday'], days:30, include_undated:true, limit:150};

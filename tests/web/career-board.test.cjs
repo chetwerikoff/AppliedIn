@@ -122,3 +122,19 @@ test('application groups separate active work, skipped roles and confirmed submi
   assert.deepEqual(Array.from(groups,g=>g.key),['apply','attention','skipped','applied']);
   assert.equal(groups[0].items[0].id,'applying');
 });
+test('role receipts use durable submission status and never mistake a request for an application', () => {
+  const board = harness(async () => {});
+  const row = {pipeline_status:'submitting', application:{phase:'applied', requested_at:'2026-09-14'}};
+  const pending = board.receiptHtml(row,{status:'submitting',match_score:8},'');
+  assert.match(pending,/Applying in browser/);
+  assert.match(pending,/Not confirmed/);
+  assert.match(pending,/Requested on/);
+  assert.doesNotMatch(pending,/Applied on|Application confirmed/);
+  const done = board.receiptHtml(row,{status:'applied',applied_at:'2026-09-14'},'/artifact/resume.pdf');
+  assert.match(done,/Application confirmed/);
+  assert.match(done,/Applied on/);
+  assert.match(done,/Open résumé/);
+  const missingDate = board.receiptHtml(row,{status:'applied'},'');
+  assert.match(missingDate,/No date recorded/);
+  assert.doesNotMatch(missingDate,/Requested on/);
+});

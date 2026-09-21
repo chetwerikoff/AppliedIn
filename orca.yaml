@@ -1,0 +1,36 @@
+# Orca worktree hooks for AppliedIn (read by Orca from the repo root).
+# The main checkout is the operating instance; these hooks only prepare
+# task worktrees so an agent never touches the operator's real board.
+setupAgentStartupPolicy: wait-for-setup
+scripts:
+  setup: |
+    export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:$PATH"
+    set -u
+    cd "$ORCA_WORKTREE_PATH"
+
+    # Python env for the worktree (uv shares its download cache, so this is fast).
+    uv sync --all-groups
+
+    # Operator-local configuration exists only in the root checkout (.env is gitignored).
+    cp "$ORCA_ROOT_PATH/.env" .env 2>/dev/null || true
+
+    # A non-default port is its own instance (.local-<port>, own Redis db), so a
+    # daemon started from this worktree cannot see or dispatch the real applications.
+    if [ -f .env ]; then
+      port=$((9000 + $(printf '%s' "$ORCA_WORKTREE_PATH" | cksum | cut -d' ' -f1) % 900))
+      # Redis db is 1 + port % 15; the operator instance on 8788 uses db 14 — skip that slot.
+      [ $((port % 15)) -eq 13 ] && port=$((port + 1))
+      sed -i "s/^APPLIEDIN_WEB_PORT=.*/APPLIEDIN_WEB_PORT=${port}/" .env
+    fi
+  archive: |
+    # Stop anything still running from this worktree (a forgotten daemon or redis-cli).
+    target="${ORCA_WORKTREE_PATH%/}"
+    [ -n "$target" ] || exit 0
+    for p in /proc/[0-9]*; do
+      pid="${p##*/}"
+      [ "$pid" = "$$" ] && continue
+      cwd="$(readlink "$p/cwd" 2>/dev/null)" || continue
+      case "$cwd" in
+        "$target"|"$target"/*) kill "$pid" 2>/dev/null || true ;;
+      esac
+    done

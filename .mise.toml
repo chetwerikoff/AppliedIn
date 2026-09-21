@@ -1,0 +1,5 @@
+# Node 22 for Career Ops tooling and for orchestrator-pack adoption
+# (the pack's scripts/toolchain/node-version.json declares nodeMajor 22).
+# Python is pinned separately in .python-version and managed by uv.
+[tools]
+node = "22"

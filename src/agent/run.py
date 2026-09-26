@@ -500,8 +500,12 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
 
     q = ApplyQueue(stores.tracking.r)
-    fresh = q.put(pk, row.get("company") or "", priority=priority)
-    stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
+    # A role the owner pressed Apply on already has its go-ahead. Marking it
+    # "approval" is what put it back in front of them as a question.
+    requested = bool(row.get("apply_requested_at"))
+    fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
+    stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
+                               **({"gate_pending": {}} if requested else {}),
                                fail_reason="", fail_kind="")
     ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
     log.info("queued %s for apply%s (%s in that company's queue)",
@@ -968,9 +972,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     if is_signed_out(reason):
         from core import flags
 
-        stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
-                                   fail_reason="", fail_kind="")
-        stores.queue.enqueue(stores.apply_queue, {"pk": pk})
+        _requeue_untouched(pk, stores)
         if not flags.paused():
             flags.set_flag("paused", "yes")
             flags.set_flag("paused_reason", "signed out of the Claude CLI")
@@ -986,9 +988,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         # reached a form.
         from core import flags
 
-        stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
-                                   fail_reason="", fail_kind="")
-        stores.queue.enqueue(stores.apply_queue, {"pk": pk})
+        _requeue_untouched(pk, stores)
         if not flags.paused():
             flags.set_flag("paused", "yes")
             flags.set_flag("paused_reason", "the Claude browser extension is disconnected")
@@ -997,9 +997,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "requeued", "pk": pk, "reason": "extension_disconnected"}
 
     if _is_browser_conflict(reason):
-        stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
-                                   fail_reason="", fail_kind="")
-        stores.queue.enqueue(stores.apply_queue, {"pk": pk})
+        _requeue_untouched(pk, stores)
         emit("running", pk=pk, agent="applier", url=jd_url,
              detail="browser was busy — re-queued, nothing was submitted")
         log.info("browser conflict for pk=%s — re-queued rather than failed", pk)
@@ -1023,6 +1021,18 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # no-sponsorship close were all retried too. The sentence moves to `detail`.
     return {"result": "failed", "pk": pk, "reason": code, "detail": reason}
 
+
+
+def _requeue_untouched(pk: str, stores: Any) -> None:
+    """Put a job the browser never reached back on the queue, attempt unspent.
+
+    A role the owner pressed Apply on keeps that instruction: it waits for the
+    browser, not for a second go-ahead.
+    """
+    requested = bool((stores.tracking.get(pk) or {}).get("apply_requested_at"))
+    stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
+                               fail_reason="", fail_kind="")
+    stores.queue.enqueue(stores.apply_queue, {"pk": pk})
 
 
 def _note_rotation_use(pk: str, stores: Any) -> None:
@@ -1386,6 +1396,14 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             stores.tracking.set_status(pk, Status.FAILED, fail_kind="no_resume",
                                        fail_reason="No PDF was saved. Retry preparation.")
             return {"result": "failed", "pk": pk, "reason": "no_resume"}
+        if row.get("apply_requested_at"):
+            # The owner pressed Apply: the score cleared the bar and the résumé
+            # is saved, so this is not a question for them. It goes to the apply
+            # queue, which starts it even while applying is paused by hand.
+            _enqueue_apply(pk, stores)
+            emit("running", pk=pk, agent="applier",
+                 detail="Résumé ready — queued to apply, as you asked")
+            return {"result": "queued_apply", "pk": pk}
         stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
                                    gate_pending={"question":
                                                  "Ready to apply? Review the résumé first."})

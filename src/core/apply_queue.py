@@ -95,7 +95,8 @@ class ApplyQueue:
     # --- writing ----------------------------------------------------------
     def put(self, pk: str, company: str, *, attempts: int = 0,
             not_before: float = 0.0, history: list | None = None,
-            queued_at: float = 0.0, priority: bool = False) -> bool:
+            queued_at: float = 0.0, priority: bool = False,
+            requested: bool = False) -> bool:
         """Queue an application. False when that job is already waiting.
 
         The same pk can be offered more than once — approve-all clicked twice, a
@@ -125,7 +126,11 @@ class ApplyQueue:
                 # on one field. Re-queuing stamps queued_at NOW, which put it last
                 # behind 344 jobs spanning 712 hours — so the answer looked like it
                 # had done nothing. See `next`.
-                "priority": bool(priority)}
+                "priority": bool(priority),
+                # The owner pressed Apply on this exact role. Like an answered
+                # question it needs no further go-ahead, so gated mode may start
+                # it; unlike one it keeps its place in line. See `next`.
+                "requested": bool(requested)}
         self.r.sadd(f"{_KEY}:companies", co)
         self.r.rpush(f"{_KEY}:co:{co}", json.dumps(item))
         return True
@@ -162,7 +167,8 @@ class ApplyQueue:
         # it here is the same disappearance as before, one step later.
         self.put(item["pk"], item.get("company", ""), attempts=attempts,
                  not_before=time.time() + wait, history=history,
-                 priority=bool(item.get("priority")))
+                 priority=bool(item.get("priority")),
+                 requested=bool(item.get("requested")))
         log.info("apply retry %d/%d for %s in %ds (%s)",
                  attempts, MAX_ATTEMPTS, item["pk"], wait, reason[:80])
         return True
@@ -176,7 +182,7 @@ class ApplyQueue:
 
     # --- reading ----------------------------------------------------------
     def next(self, only: str = "", *, priority_only: bool = False,
-             pks: set[str] | None = None) -> dict | None:
+             requested_only: bool = False, pks: set[str] | None = None) -> dict | None:
         """Lease the next application, or None when nothing can start.
 
         `pks` bounds a manual batch to the exact reviewed IDs; an empty set
@@ -227,7 +233,10 @@ class ApplyQueue:
                 if float(item.get("not_before") or 0) > now:
                     continue                            # still backing off
                 answered = bool(item.get("priority"))
-                if priority_only and not answered:
+                requested = bool(item.get("requested"))
+                if requested_only and not requested:
+                    continue
+                if priority_only and not (answered or requested):
                     continue
                 # Answered gates first, then first come first served within each
                 # group — two answered gates still run in the order they were.

@@ -1,0 +1,58 @@
+/* Motion for Find jobs (Fresh, Career Ops, Cosign), in cosign.co's vocabulary:
+   short, eased, blur-to-sharp. Entrances play only when the owner switches view
+   (app.js adds .fj-enter for a moment), never on the background repaints that
+   refresh these lists every few seconds, which would make the page twitch. */
+:root {
+  --fj-ease: cubic-bezier(.2, 0, 0, 1);
+  --fj-out: cubic-bezier(.16, 1, .3, 1);
+}
+
+/* ─── The view switcher: a pill that slides to the chosen board ─── */
+#find-jobs-views { position: relative; isolation: isolate; }
+#find-jobs-views::before {
+  content: ""; position: absolute; z-index: -1; left: 0; top: var(--seg-y, 10px);
+  width: var(--seg-w, 0); height: var(--seg-h, 0); border-radius: 999px; background: var(--fg);
+  transform: translateX(var(--seg-x, 0)); opacity: var(--seg-on, 0);
+  transition: transform .38s var(--fj-out), width .38s var(--fj-out), opacity .2s var(--fj-ease);
+}
+#find-jobs-views .chip { position: relative; transition: color .25s var(--fj-ease), border-color .25s var(--fj-ease), transform .12s var(--fj-ease); }
+#find-jobs-views.seg-ready .chip.active { background: transparent; border-color: transparent; color: var(--bg); }
+#find-jobs-views .chip:active { transform: scale(.96); }
+
+/* ─── Entering a board ─── */
+@keyframes fj-rise { from { opacity: 0; filter: blur(3px); transform: translate(calc(var(--fj-dir, 0) * 14px), 8px); } }
+.fj-enter :is(.co-hero, .co-workspace),
+.fj-enter :is(.cb-heading, .cb-search-column, .cb-results-heading, .cb-toolbar),
+.fj-enter :is(.fresh-rail, .fresh-card, .fr-head, .fresh-stats, .fresh-empty) {
+  animation: fj-rise .36s var(--fj-out) both;
+}
+.fj-enter :is(.co-workspace, .cb-search-column, .fresh-card) { animation-delay: 60ms; }
+.fj-enter :is(.cb-results-heading, .fresh-rail) { animation-delay: 100ms; }
+/* The first rows cascade in; anything further down is off screen anyway. */
+.fj-enter :is(.cb-job, .fresh-row) { animation: fj-rise .34s var(--fj-out) both; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(1) { animation-delay: 90ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(2) { animation-delay: 120ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(3) { animation-delay: 150ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(4) { animation-delay: 180ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(5) { animation-delay: 210ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(6) { animation-delay: 240ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(n+7) { animation-delay: 270ms; }
+
+/* ─── Rows and controls respond to the hand ─── */
+:is(.cb-job, .fresh-row) { transition: background-color .15s var(--fj-ease), border-color .15s var(--fj-ease), box-shadow .2s var(--fj-ease); }
+.cb-results .cb-job:hover { border-color: var(--border-2); box-shadow: var(--shadow-1); }
+:is(career-board, cosign-board, .fresh-layout) .btn { transition: color .13s ease, border-color .13s ease, background .13s ease, transform .12s var(--fj-ease), filter .15s ease; }
+:is(career-board, cosign-board, .fresh-layout) .btn:active:not(:disabled) { transform: scale(.97); }
+
+/* ─── Career Ops role drawer slides in over a fading backdrop ─── */
+@keyframes fj-drawer { from { opacity: .4; transform: translateX(28px); } }
+@keyframes fj-fade { from { opacity: 0; } }
+.cb-job-drawer[open] { animation: fj-drawer .28s var(--fj-out); }
+.cb-job-drawer[open]::backdrop { animation: fj-fade .2s var(--fj-ease); }
+.cb-job-drawer[open] .cb-drawer-content > * { animation: fj-rise .32s var(--fj-out) both; animation-delay: 60ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  #find-jobs-views::before { transition: none; }
+  .fj-enter *, .cb-job-drawer[open], .cb-job-drawer[open] *, .cb-job-drawer[open]::backdrop { animation: none !important; }
+  :is(career-board, cosign-board, .fresh-layout) .btn:active, #find-jobs-views .chip:active { transform: none; }
+}

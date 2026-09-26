@@ -4452,6 +4452,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 /* Keep the job workflow visible; group secondary views and controls. */
 #find-jobs-views { display:flex; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border); }
 #find-jobs-views[hidden] { display:none; }
+#find-jobs-views .chip.active { background:var(--fg); color:var(--bg); border-color:var(--fg); font-weight:600; }
+/* Cosign has its own composer; the pipeline's company filter and search do nothing there. */
+.cosign-page #co-filter, .cosign-page #search, .cosign-page #refresh-btn { display:none; }
 #tabs { overflow:visible; flex-wrap:wrap; align-items:center; }
 .nav-more { position:relative; }
 .nav-more > summary { list-style:none; display:flex; gap:8px; align-items:center; cursor:pointer; padding:7px 12px; border:1px solid transparent; border-radius:var(--r-md); font-size:13px; color:var(--muted); }

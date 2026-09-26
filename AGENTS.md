@@ -141,6 +141,7 @@ src/
     crawler.py       career pages with no feed: fetch, then escalate to Chrome
     chrome_crawl.py  the browser finder and its prompt
     relevance.py     the screen that decides what is worth tailoring
+    cosign.py        live search of cosign.co's public index; picks stage via career_ops
     watchlist.py     watchlist.yaml + preferences.yaml loaders
   core/
     flags.py         runtime settings in Redis, incl. per company preferences

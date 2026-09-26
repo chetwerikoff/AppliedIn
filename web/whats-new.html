@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#101312" />
+  <title>What's new &middot; AppliedIn</title>
+  <meta name="description" content="Release notes for AppliedIn: job search across multiple job boards including the Cosign network, one-click apply, and live application steps." />
+<script>
+  (function () {
+    try {
+      var saved = localStorage.getItem("appliedin.theme");
+      var theme = saved || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      document.documentElement.dataset.theme = theme;
+    } catch (_) {}
+  })();
+</script>
+  <link rel="icon" href="/logo.svg" />
+  <link rel="stylesheet" href="/landing.css?v=7" />
+</head>
+<body>
+
+<div class="announce" id="announce" data-release="v1.2.0" role="region" aria-label="What's new">
+  <a class="announce_link" href="/whats-new">
+    <span class="announce_tag">New</span>
+    <span class="announce_text"><strong>AppliedIn v1.2.0</strong><span class="announce_more"> · Cosign network search, one-click apply and live application steps</span></span>
+    <span class="announce_cta">See what's new <span aria-hidden="true">→</span></span>
+  </a>
+  <button class="announce_close" type="button" aria-label="Dismiss announcement">×</button>
+</div>
+
+<header class="topbar">
+  <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
+  <nav class="topnav">
+    <a href="/#architecture">Workflow</a>
+    <a href="/#product">Product</a>
+    <a href="/#guarantees">Guardrails</a>
+    <a href="/whats-new">What's new</a>
+    <a href="/notes">Notes</a>
+    <button class="btn btn_quiet theme_toggle" id="theme-toggle" type="button"
+            aria-label="Switch theme">
+      <span class="theme_icon" aria-hidden="true">&#9686;</span>
+      <span class="theme_label">Theme</span>
+    </button>
+    <a class="btn btn_quiet demo_link" href="/demo">Demo</a>
+    <a class="btn btn_primary" href="https://github.com/sayantan94/AppliedIn">GitHub</a>
+  </nav>
+</header>
+
+<div class="shell">
+
+  <aside class="sidebar">
+    <p class="side_h">Releases</p>
+    <a href="#v1-2-0">v1.2.0 · September 2026</a>
+    <a href="#v1-1-0">v1.1.0 · September 2026</a>
+    <p class="side_h">More</p>
+    <a href="https://github.com/sayantan94/AppliedIn/releases">All releases on GitHub</a>
+    <a href="/">Back to the overview</a>
+  </aside>
+
+  <main class="doc">
+    <article>
+      <p class="eyebrow">Release notes</p>
+      <h1>What's new</h1>
+      <p class="lede">What changed in AppliedIn, newest first.</p>
+
+      <hr />
+
+      <h2 id="v1-2-0">v1.2.0 <span class="release_date">Job search and one-click apply</span></h2>
+      <div class="cards cols_2">
+        <div class="card">
+          <p class="card_n">Job search</p>
+          <h3>Multiple job boards, one place</h3>
+          <p>Find jobs offers Fresh, Career Ops search and the Cosign network. Each names its sources, and every result shows the board its posting lives on.</p>
+        </div>
+        <div class="card">
+          <p class="card_n">Cosign network</p>
+          <h3>About 70,000 open roles</h3>
+          <p>Search by title, cities, salary and remote. All of the US by default, filled to about a hundred matches from your preferences.</p>
+        </div>
+        <div class="card">
+          <p class="card_n">One-click apply</p>
+          <h3>Select all, apply in one press</h3>
+          <p>Each role is scored first, and only roles that clear your match bar are tailored and submitted. You're asked only when a form needs an answer.</p>
+        </div>
+        <div class="card">
+          <p class="card_n">Live steps</p>
+          <h3>Follow every application</h3>
+          <p>Score, Tailor, Check, Apply and Submitted, with a readable timeline. Open any application in the pipeline in its own window.</p>
+        </div>
+      </div>
+      <ul>
+        <li>Career Ops search redesigned: one search composer, results beside the role you're reading, and your applications in the same column.</li>
+        <li>A refreshed dashboard: consistent motion, a status bar in the header, calmer Needs you cards and icon links.</li>
+      </ul>
+      <p><a href="https://github.com/sayantan94/AppliedIn/releases/tag/v1.2.0">Read v1.2.0 on GitHub →</a></p>
+
+      <hr />
+
+      <h2 id="v1-1-0">v1.1.0 <span class="release_date">Career Ops search and application progress</span></h2>
+      <ul>
+        <li>One job search form: choose Claude or Codex, job boards, roles, locations, interests and posting dates.</li>
+        <li>Broader discovery across Greenhouse, Lever, Ashby, Workday and iCIMS using the Career Ops directory.</li>
+        <li>Streaming, resumable searches you can stop and continue.</li>
+        <li>Apply selected and Score &amp; tailor selected, with live application progress.</li>
+      </ul>
+      <p><a href="https://github.com/sayantan94/AppliedIn/releases/tag/v1.1.0">Read v1.1.0 on GitHub →</a></p>
+    </article>
+  </main>
+</div>
+
+<script src="/landing.js?v=5" defer></script>
+</body>
+</html>

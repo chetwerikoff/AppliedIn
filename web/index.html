@@ -32,9 +32,18 @@
 <link
   href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap"
   rel="stylesheet" />
-<link rel="stylesheet" href="/landing.css?v=6" />
+<link rel="stylesheet" href="/landing.css?v=7" />
 </head>
 <body>
+
+<div class="announce" id="announce" data-release="v1.2.0" role="region" aria-label="What's new">
+  <a class="announce_link" href="/whats-new">
+    <span class="announce_tag">New</span>
+    <span class="announce_text"><strong>AppliedIn v1.2.0</strong><span class="announce_more"> · Cosign network search, one-click apply and live application steps</span></span>
+    <span class="announce_cta">See what's new <span aria-hidden="true">→</span></span>
+  </a>
+  <button class="announce_close" type="button" aria-label="Dismiss announcement">×</button>
+</div>
 
 <header class="topbar">
   <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
@@ -43,6 +52,7 @@
     <a href="#product">Product</a>
     <a href="#guarantees">Guardrails</a>
     <a href="#start">Get started</a>
+    <a href="/whats-new">What's new</a>
     <a href="/notes">Notes</a>
     <button class="btn btn_quiet theme_toggle" id="theme-toggle" type="button"
             aria-label="Switch theme">
@@ -56,11 +66,6 @@
 
 <section class="site_hero" id="top">
   <div class="hero_copy">
-    <a class="release_pill" href="https://github.com/sayantan94/AppliedIn/releases/tag/v1.2.0">
-      <span class="release_tag">New</span>
-      <span>v1.2.0 · Cosign network search and one-click apply</span>
-      <span class="release_arrow" aria-hidden="true">→</span>
-    </a>
     <p class="eyebrow">Open-source agent graph</p>
     <h1>
       <span class="hero_name">AppliedIn</span>
@@ -483,6 +488,6 @@ cp .env.example .env
   </main>
 </div>
 
-<script src="/landing.js?v=4" defer></script>
+<script src="/landing.js?v=5" defer></script>
 </body>
 </html>

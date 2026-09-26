@@ -1,42 +1,5 @@
 # Release notes
 
-## 2026-09-25 — Cosign job search and Find jobs motion
-
-- Add **Cosign** under Find jobs: a live search of ~71,000 roles indexed by
-  cosign.co, with posting URLs and full descriptions on the ATS itself. Searches
-  **all of the US** by default; titles matching your excluded keywords are hidden.
-- Pick up to five cities, or one-tap your preferred cities. Cosign filters one
-  city per search, so each city runs separately: its pill settles with a count as
-  it answers, and results merge newest first with each role listed once. "All of
-  the US" keeps US postings from an unfiltered search, since Cosign has no country
-  filter.
-- A search row with a filter rail beneath it, a list of roles beside the selected
-  role's details, company logos, salary and deduplicated locations ("Rome, NY"
-  keeps its state). On phones the details replace the list.
-- Motion modelled on Cosign across Find jobs: an odometer role count, example
-  searches flipping through the empty box, a spinner that settles into a drawn
-  check, shimmering placeholder rows, a sliding view switcher, board entrances
-  when you switch views, and a sliding Career Ops role drawer. Entrances never
-  replay on background refreshes, and everything stops under reduced motion.
-- Each search fills to about a hundred roles: the first page shows at once, then
-  more stream in until it gets there. **Select all** picks every new role on
-  screen; Apply and Score & tailor act on one press and stay pinned to the bottom
-  of the window while you scroll.
-- After Apply, the side pane follows every role live: a Score → Tailor → Check →
-  Apply → Submitted stepper, a timeline of what happened in words, and a click
-  that opens the job in the pipeline in its own window (`?job=<pk>`).
-- Apply asks nothing unless a form needs an answer. It runs through an owner's
-  pause, keeps the request through a browser fault, and prepares a large
-  selection in turn while the apply worker submits in parallel, one per company.
-  Search results survive a daemon restart.
-- Picked roles go through the Career Ops path, so they inherit its duplicate
-  checks and score gate: only roles clearing your match bar are submitted, one at
-  a time. The posting's real ATS is recorded.
-
-Validation: 637 Python and 59 JavaScript tests passed. Browser checks covered
-the US default, filling to ~100 roles, select all, multi-city merge, view
-switching, dark theme and 390px width.
-
 ## 2026-09-14 — Clearer application details and compact workflow
 
 - Add a compact Find → Prepare → Apply guide to Career Ops search, with aligned

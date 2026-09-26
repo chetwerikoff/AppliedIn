@@ -1,0 +1,143 @@
+/* Motion for the whole dashboard, in cosign.co's vocabulary: short, eased,
+   blur-to-sharp. Entrances play only when the owner switches view (app.js adds
+   .fj-enter for a moment), never on the background repaints that refresh these
+   lists every few seconds, which would make the page twitch. */
+:root {
+  --fj-ease: cubic-bezier(.2, 0, 0, 1);
+  --fj-out: cubic-bezier(.16, 1, .3, 1);
+}
+
+/* ─── The view switcher: a pill that slides to the chosen board ─── */
+#find-jobs-views { position: relative; isolation: isolate; }
+#find-jobs-views::before {
+  content: ""; position: absolute; z-index: -1; left: 0; top: var(--seg-y, 10px);
+  width: var(--seg-w, 0); height: var(--seg-h, 0); border-radius: 999px; background: var(--fg);
+  transform: translateX(var(--seg-x, 0)); opacity: var(--seg-on, 0);
+  transition: transform .38s var(--fj-out), width .38s var(--fj-out), opacity .2s var(--fj-ease);
+}
+#find-jobs-views .chip { position: relative; transition: color .25s var(--fj-ease), border-color .25s var(--fj-ease), transform .12s var(--fj-ease); }
+#find-jobs-views.seg-ready .chip.active { background: transparent; border-color: transparent; color: var(--bg); }
+#find-jobs-views .chip:active { transform: scale(.96); }
+
+/* ─── Entering a board ─── */
+@keyframes fj-rise { from { opacity: 0; filter: blur(3px); transform: translate(calc(var(--fj-dir, 0) * 14px), 8px); } }
+.fj-enter :is(.co-hero, .co-workspace),
+.fj-enter :is(.cb-heading, .cb-search-column, .cb-results-heading, .cb-toolbar),
+.fj-enter :is(.fresh-rail, .fresh-card, .fr-head, .fresh-stats, .fresh-empty) {
+  animation: fj-rise .36s var(--fj-out) both;
+}
+.fj-enter :is(.co-workspace, .cb-search-column, .fresh-card) { animation-delay: 60ms; }
+.fj-enter :is(.cb-results-heading, .fresh-rail) { animation-delay: 100ms; }
+/* The first rows cascade in; anything further down is off screen anyway. */
+.fj-enter :is(.cb-job, .fresh-row) { animation: fj-rise .34s var(--fj-out) both; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(1) { animation-delay: 90ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(2) { animation-delay: 120ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(3) { animation-delay: 150ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(4) { animation-delay: 180ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(5) { animation-delay: 210ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(6) { animation-delay: 240ms; }
+.fj-enter :is(.cb-job, .fresh-row):nth-child(n+7) { animation-delay: 270ms; }
+
+/* ─── Rows and controls respond to the hand ─── */
+:is(.cb-job, .fresh-row) { transition: background-color .15s var(--fj-ease), border-color .15s var(--fj-ease), box-shadow .2s var(--fj-ease); }
+.cb-results .cb-job:hover { border-color: var(--border-2); box-shadow: var(--shadow-1); }
+:is(career-board, cosign-board, .fresh-layout) .btn { transition: color .13s ease, border-color .13s ease, background .13s ease, transform .12s var(--fj-ease), filter .15s ease; }
+:is(career-board, cosign-board, .fresh-layout) .btn:active:not(:disabled) { transform: scale(.97); }
+
+/* ─── Career Ops role drawer slides in over a fading backdrop ─── */
+@keyframes fj-drawer { from { opacity: .4; transform: translateX(28px); } }
+@keyframes fj-fade { from { opacity: 0; } }
+.cb-job-drawer[open] { animation: fj-drawer .28s var(--fj-out); }
+.cb-job-drawer[open]::backdrop { animation: fj-fade .2s var(--fj-ease); }
+.cb-job-drawer[open] .cb-drawer-content > * { animation: fj-rise .32s var(--fj-out) both; animation-delay: 60ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  #find-jobs-views::before { transition: none; }
+  .fj-enter *, .cb-job-drawer[open], .cb-job-drawer[open] *, .cb-job-drawer[open]::backdrop { animation: none !important; }
+  :is(career-board, cosign-board, .fresh-layout) .btn:active, #find-jobs-views .chip:active { transform: none; }
+}
+
+/* ═══ The same vocabulary across the whole dashboard ═══════════════════════
+   Everything below reuses the Cosign board's curves and shapes so every view
+   moves and reads alike: pills that slide, spinners that settle into a check,
+   numbers that tick, surfaces that rise in once when you arrive. */
+
+/* ─── Main tabs: one pill slides to the chosen view ─── */
+#tabs { position: relative; isolation: isolate; }
+#tabs::before {
+  content: ""; position: absolute; z-index: -1; left: 0; top: var(--tab-y, 0);
+  width: var(--tab-w, 0); height: var(--tab-h, 0); border-radius: var(--r-md);
+  background: var(--card-2); box-shadow: inset 0 0 0 1px var(--border);
+  transform: translateX(var(--tab-x, 0)); opacity: var(--tab-on, 0);
+  transition: transform .38s var(--fj-out), width .38s var(--fj-out), opacity .2s var(--fj-ease);
+}
+#tabs.tab-ready > .tab.active, #tabs.tab-ready > #nav-more.active > summary { background: transparent; border-color: transparent; }
+#tabs .tab { transition: color .2s var(--fj-ease), transform .12s var(--fj-ease); }
+#tabs .tab:active { transform: scale(.97); }
+
+/* ─── Numbers tick into place when they change ─── */
+@keyframes tick-up { from { opacity: 0; transform: translateY(55%); filter: blur(2px); } }
+@keyframes tick-down { from { opacity: 0; transform: translateY(-55%); filter: blur(2px); } }
+.tick-up, .tick-down { display: inline-block; }
+.tick-up { animation: tick-up .32s var(--fj-out) backwards; }
+.tick-down { animation: tick-down .32s var(--fj-out) backwards; }
+
+/* ─── Every view rises in once, from the side you came from ─── */
+#pane.fj-enter > *, #steering-panel.fj-enter > * { animation: fj-rise .36s var(--fj-out) both; }
+#pane.fj-enter > *:nth-child(2) { animation-delay: 50ms; }
+#pane.fj-enter > *:nth-child(3) { animation-delay: 90ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr) { animation: fj-rise .34s var(--fj-out) both; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(1) { animation-delay: 80ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(2) { animation-delay: 110ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(3) { animation-delay: 140ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(4) { animation-delay: 170ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(5) { animation-delay: 200ms; }
+.fj-enter :is(.kcard, .gatecard, tbody tr):nth-child(n+6) { animation-delay: 230ms; }
+
+/* ─── Controls: the Cosign filter rail's pills, everywhere ─── */
+.workbar-right :is(select, input[type="search"], input[type="text"], .btn, button:not(.tab)),
+.workbar :is(#prefmgr, #co-filter, #search, #refresh-btn) {
+  border-radius: 999px;
+  transition: border-color .15s var(--fj-ease), background .15s var(--fj-ease), box-shadow .2s var(--fj-ease), transform .12s var(--fj-ease);
+}
+.workbar :is(#search, #co-filter):focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--scan) 16%, transparent); }
+.btn { transition: color .13s ease, border-color .13s ease, background .13s ease, filter .15s ease, transform .12s var(--fj-ease); }
+.btn:active:not(:disabled), .chip:active, .workbar-right button:active:not(:disabled) { transform: scale(.97); }
+.chip { transition: color .15s var(--fj-ease), border-color .15s var(--fj-ease), background .2s var(--fj-ease), transform .12s var(--fj-ease); }
+
+/* ─── Status pills: a spinner while work runs, a check once it lands ─── */
+@keyframes fj-turn { to { transform: rotate(1turn); } }
+@keyframes fj-pop { from { opacity: 0; transform: scale(.6) rotate(45deg); } }
+.pill.s-tailoring::before, .pill.s-live::before {
+  width: 8px; height: 8px; background: transparent; border: 1.5px solid currentColor; border-right-color: transparent;
+  animation: fj-turn .8s linear infinite;
+}
+.pill.s-ok::before {
+  width: 3px; height: 6px; border-radius: 0; background: transparent; margin: 0 2px -1px 1px;
+  border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg);
+  animation: fj-pop .24s var(--fj-ease) backwards;
+}
+
+/* ─── Cards and rows answer the pointer ─── */
+.kcard, .gatecard { transition: border-color .15s var(--fj-ease), box-shadow .2s var(--fj-ease), transform .15s var(--fj-ease); }
+.kcard:hover, .gatecard:hover { box-shadow: var(--shadow-1); border-color: var(--border-2); }
+.kcard:active { transform: scale(.99); }
+tbody tr { transition: background-color .15s var(--fj-ease); }
+
+/* ─── Job details panel: slides in on the shared curve, content rises after ─── */
+.drawer { transition: transform .34s var(--fj-out); }
+.drawer.show .drawer-head, .drawer.show .drawer-body > * { animation: fj-rise .34s var(--fj-out) both; }
+.drawer.show .drawer-body > *:nth-child(1) { animation-delay: 60ms; }
+.drawer.show .drawer-body > *:nth-child(2) { animation-delay: 90ms; }
+.drawer.show .drawer-body > *:nth-child(3) { animation-delay: 120ms; }
+.drawer.show .drawer-body > *:nth-child(n+4) { animation-delay: 150ms; }
+
+/* ─── Toasts arrive the way Cosign's status text does ─── */
+.toast { filter: blur(4px); transition: opacity .22s var(--fj-ease), transform .28s var(--fj-out), filter .22s var(--fj-ease); }
+.toast.show { filter: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  #tabs::before, .drawer, .toast { transition: none; }
+  .tick-up, .tick-down, #pane.fj-enter > *, .fj-enter *, .drawer.show *, .pill::before { animation: none !important; }
+  .btn:active, .chip:active, .kcard:active, #tabs .tab:active { transform: none; }
+}

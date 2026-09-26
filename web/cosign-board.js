@@ -66,6 +66,17 @@ export function merge(jobs, page, interleave) {
   if (interleave) jobs.sort((a, b) => (b.posted || 0) - (a.posted || 0));
   return fresh;
 }
+// Where a posting actually lives, read from its address: the board it will be
+// applied on, not the index that found it.
+const BOARDS = [[/ashbyhq\.com/, 'Ashby'], [/greenhouse\.io/, 'Greenhouse'], [/lever\.co/, 'Lever'],
+  [/myworkday(jobs|site)\.com/, 'Workday'], [/icims\.com/, 'iCIMS'], [/smartrecruiters\.com/, 'SmartRecruiters'],
+  [/oraclecloud\.com/, 'Oracle'], [/workable\.com/, 'Workable']];
+export const sourceOf = url => {
+  let host = '';
+  try { host = new URL(url).hostname; } catch { return ''; }
+  const hit = BOARDS.find(([re]) => re.test(host));
+  return hit ? hit[1] : host.replace(/^(www|careers|jobs|boards|job-boards)\./, '');
+};
 const STATES = {pipeline:'In pipeline', handled:'Already handled', dismissed:'Dismissed'};
 // Cosign serves 30 roles a request; a useful first screen is about a hundred.
 const TARGET = 100;
@@ -93,7 +104,7 @@ class CosignBoard extends HTMLElement {
     this.active = null; this.showExcluded = false; this.examples = [];
     this.innerHTML = `<section class="co-page">
       <header class="co-hero">
-        <p class="co-eyebrow">Cosign job network</p>
+        <p class="co-eyebrow">Cosign network</p>
         <h2>Search <span class="co-count">open</span> roles</h2>
         <p class="co-sub">Starts from your preferences. Anything you pick is scored and tailored first, then waits for your approval.</p>
         <form class="co-composer" role="search">
@@ -229,13 +240,13 @@ class CosignBoard extends HTMLElement {
 
   async request(path, body) {
     const cfg = window.APPLIEDIN_CONFIG || {};
-    if (cfg.demo === true || new URLSearchParams(location.search).has('demo')) throw new Error('Cosign search is available when connected to your local AppliedIn server.');
+    if (cfg.demo === true || new URLSearchParams(location.search).has('demo')) throw new Error('Cosign network search is available when connected to your local AppliedIn server.');
     const response = await fetch((cfg.apiUrl || '').replace(/\/$/, '') + '/cosign' + path, {
       method: body === undefined ? 'GET' : 'POST', headers: {'Content-Type': 'application/json', ...auth.header()},
       ...(body === undefined ? {} : {body: JSON.stringify(body)}),
     });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(response.status === 404 ? 'Restart AppliedIn to enable Cosign search.' : typeof result.detail === 'string' ? result.detail : 'Could not complete this action. Try again.');
+    if (!response.ok) throw new Error(response.status === 404 ? 'Restart AppliedIn to enable Cosign network search.' : typeof result.detail === 'string' ? result.detail : 'Could not complete this action. Try again.');
     return result;
   }
 
@@ -496,7 +507,7 @@ class CosignBoard extends HTMLElement {
     list.innerHTML = rows.map(([c, name]) => {
       const on = this.cities.includes(c);
       return `<label class="co-city-opt${on ? ' co-on' : ''}"><input type="checkbox" value="${esc(c)}" ${on ? 'checked' : ''} ${!on && full ? 'disabled' : ''}>${esc(name)}</label>`;
-    }).join('') || '<p class="co-cities-note">Cosign has no city by that name.</p>';
+    }).join('') || '<p class="co-cities-note">No city by that name.</p>';
     if (scroll) list.scrollTop = 0;
   }
 
@@ -516,7 +527,7 @@ class CosignBoard extends HTMLElement {
       const meta = [salary(job), places(job.location, 2)].filter(Boolean).map(esc).join(' · ');
       return `<li class="co-row${job.excluded ? ' co-dim' : ''}${enter}" data-id="${esc(job.id)}" aria-selected="${job.id === this.active}">
         <label class="co-pick" title="${job.state === 'new' ? 'Select' : esc(tag)}"><input type="checkbox" ${this.selected.has(job.id) ? 'checked' : ''} ${job.state === 'new' ? '' : 'disabled'} aria-label="Select ${esc(job.title)}"></label>
-        <button type="button" class="co-open">${logo(job, 34)}<span class="co-row-text"><span class="co-row-title">${esc(job.title)}</span><span class="co-row-company">${esc(job.company)}</span><span class="co-row-meta">${meta}</span></span><span class="co-row-side"><time>${esc(age(job.posted))}</time>${tag ? `<span class="co-tag${STATES[job.state] ? ' co-tag-on' : ''}">${esc(tag)}</span>` : ''}</span></button></li>`;
+        <button type="button" class="co-open">${logo(job, 34)}<span class="co-row-text"><span class="co-row-title">${esc(job.title)}</span><span class="co-row-company">${esc(job.company)}</span><span class="co-row-meta">${meta}</span></span><span class="co-row-side"><time>${esc(age(job.posted))}</time><span class="co-src">via ${esc(sourceOf(job.url))}</span>${tag ? `<span class="co-tag${STATES[job.state] ? ' co-tag-on' : ''}">${esc(tag)}</span>` : ''}</span></button></li>`;
     }).join('') + (this.filling ? SKELETON(2) : '');
     this.$('.co-more').hidden = this.done || !this.jobs.length || this.filling;
     this.paintSelection();
@@ -545,7 +556,7 @@ class CosignBoard extends HTMLElement {
     this.querySelectorAll('.co-row').forEach(r => r.setAttribute('aria-selected', String(r.dataset.id === id)));
     this.classList.add('co-reading');
     const pay = salary(job);
-    const meta = [places(job.location, 6), job.remote ? 'Remote' : '', job.employment.replace(/([a-z])([A-Z])/g, '$1 $2'), job.posted ? `Posted ${age(job.posted)}` : ''].filter(Boolean);
+    const meta = [places(job.location, 6), job.remote ? 'Remote' : '', `Posting on ${sourceOf(job.url)}`, job.employment.replace(/([a-z])([A-Z])/g, '$1 $2'), job.posted ? `Posted ${age(job.posted)}` : ''].filter(Boolean);
     const staged = job.state !== 'new';
     const live = job.pk && this.live[job.pk];
     this.$('.co-detail').innerHTML = `${this.paneTabs()}<div class="co-detail-body">
@@ -561,7 +572,7 @@ class CosignBoard extends HTMLElement {
         <a class="btn btn-ghost" href="${esc(job.url)}" target="_blank" rel="noopener noreferrer">Posting ↗</a></div>
       ${staged ? '' : '<p class="co-hint">Score & tailor stops for your review. Apply scores, tailors and submits if it passes your bar.</p>'}
       <hr>
-      <div class="co-desc${job.description.length > 1600 ? ' co-collapsed' : ''}">${esc(job.description || 'Cosign has no description for this role. Open the posting to read it.')}</div>
+      <div class="co-desc${job.description.length > 1600 ? ' co-collapsed' : ''}">${esc(job.description || 'No description was found for this role. Open the posting to read it.')}</div>
       ${job.description.length > 1600 ? '<button type="button" class="co-link co-expand">Show full description</button>' : ''}
     </div>`;
     this.$('.co-detail').scrollTop = 0;

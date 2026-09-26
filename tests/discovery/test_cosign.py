@@ -341,7 +341,7 @@ def test_the_timeline_reads_as_words_not_plumbing():
     ]
     said = [m and m["text"] for m in map(cosign._moment, events)]
     assert said == [
-        "Added from Cosign",
+        "Added from the Cosign network",
         None,
         None,
         "Scored 8/10 — Strong agent work",

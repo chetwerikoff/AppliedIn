@@ -312,3 +312,5 @@ cosign-board.co-loading .co-list { opacity: .55; }
   cosign-board *, cosign-board *::before, cosign-board *::after { animation: none !important; transition: none !important; }
   .co-reel { transform: translateY(var(--to)); }
 }
+/* The board a posting lives on, always visible but never loud. */
+.co-src { font-size: 10.5px; color: var(--faint); white-space: nowrap; }

@@ -10,10 +10,10 @@ const source = fs.readFileSync(path.join(__dirname, '../../web/cosign-board.js')
 function load(fetch) {
   let Board;
   const context = vm.createContext({HTMLElement: class {}, customElements: {define: (_, cls) => Board = cls},
-    window: {}, location: {search: ''}, URLSearchParams, matchMedia: () => ({matches: true}), fetch, setTimeout, clearTimeout, Set, Date, Number});
+    window: {}, location: {search: ''}, URL, URLSearchParams, matchMedia: () => ({matches: true}), fetch, setTimeout, clearTimeout, Set, Date, Number});
   vm.runInContext(source.replace("import { auth } from './auth.js';", "const auth = {header: () => ({})};")
-    .replace('export function odometer', 'globalThis.odometer = function odometer').replace('export const places', 'globalThis.places').replace('export function merge', 'globalThis.merge = function merge'), context);
-  return {Board, odometer: context.odometer, places: context.places, merge: context.merge};
+    .replace('export function odometer', 'globalThis.odometer = function odometer').replace('export const places', 'globalThis.places').replace('export function merge', 'globalThis.merge = function merge').replace('export const sourceOf', 'globalThis.sourceOf'), context);
+  return {Board, odometer: context.odometer, places: context.places, merge: context.merge, sourceOf: context.sourceOf};
 }
 
 test('one press of Apply sends the selection; the score gate lives on the server', async () => {
@@ -149,4 +149,13 @@ test('polling stops by itself once every application has landed', async () => {
   await board.poll();
   assert.equal(calls.length, 1);
   assert.equal(board.pollTimer, undefined, 'no further poll is scheduled');
+});
+
+test('every posting names the board it lives on', () => {
+  const {sourceOf} = load(async () => {});
+  assert.equal(sourceOf('https://jobs.ashbyhq.com/replit/abc'), 'Ashby');
+  assert.equal(sourceOf('https://job-boards.greenhouse.io/snorkelai/jobs/1'), 'Greenhouse');
+  assert.equal(sourceOf('https://bostondynamics.wd1.myworkdayjobs.com/x'), 'Workday');
+  assert.equal(sourceOf('https://careers.acme.com/job/1'), 'acme.com');
+  assert.equal(sourceOf('not a url'), '');
 });

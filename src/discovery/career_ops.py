@@ -535,7 +535,7 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 emit(
                     "discovered",
                     pk=job.pk,
-                    detail=f"{'Cosign' if row['provider'] == 'cosign' else 'Career Ops'}: "
+                    detail=f"{'Cosign network' if row['provider'] == 'cosign' else 'Career Ops'}: "
                     f"{job.title} @ {job.company}",
                     url=url,
                 )

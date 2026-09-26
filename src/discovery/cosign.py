@@ -140,13 +140,17 @@ def _call(kind: str, path: str, args: dict, client: httpx.Client | None = None):
                 data = reply.json()
             except (httpx.HTTPError, ValueError) as exc:
                 if delay is None:
-                    raise CosignError("Cosign is not reachable right now. Try again.") from exc
+                    raise CosignError(
+                        "The Cosign network is not reachable right now. Try again."
+                    ) from exc
             else:
                 if data.get("status") == "success":
                     return data.get("value")
                 if delay is None or "Server Error" not in str(data.get("errorMessage")):
                     log.warning("cosign %s failed: %s", path, data.get("errorMessage"))
-                    raise CosignError("Cosign could not run this search. Try other filters.")
+                    raise CosignError(
+                        "The Cosign network could not run this search. Try other filters."
+                    )
             time.sleep(delay)
     finally:
         if own:
@@ -371,7 +375,7 @@ def stage(ids: list[str], *, apply_requested: bool = False) -> dict:
                     "description": job["description"],
                     "location": job["location"],
                     "postedAt": job["posted"],
-                    "why": "Found on Cosign" + (f" · {salary}" if salary else ""),
+                    "why": "Found in the Cosign network" + (f" · {salary}" if salary else ""),
                     "verification": "cosign",
                 },
                 job["company"],
@@ -438,7 +442,9 @@ def _moment(event: dict) -> dict | None:
     detail = str(event.get("detail") or "").strip()
     text, tone = "", ""
     if kind == "discovered":
-        text = "Added from Cosign" if detail.startswith("Cosign") else "Added to the pipeline"
+        # Older events say "Cosign:"; newer ones "Cosign network:".
+        text = ("Added from the Cosign network" if detail.startswith("Cosign")
+                else "Added to the pipeline")
     elif kind == "running" and not agent:
         text = "You asked to apply" if detail.startswith("Apply selected") else ""
     elif kind == "response" and agent == "scorer":

@@ -7,6 +7,7 @@ const date = value => {
   return value && Number.isFinite(+d) ? d.toLocaleDateString(undefined, {month:'short', day:'numeric'}) : 'Date unavailable';
 };
 const plainWhy = value => String(value || '').replace(/\s*\(\[[^\]]+\]\(https?:\/\/[^)]+\)\)/g, '').replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1').trim();
+const SOURCES = {web_search:'Found by web search', greenhouse:'Greenhouse', lever:'Lever', ashby:'Ashby', workday:'Workday', icims:'iCIMS', oraclecloud:'Oracle Cloud', cosign:'Cosign network', smartrecruiters:'SmartRecruiters'};
 const labels = {new:'New', pipeline:'In pipeline', handled:'Already handled', dismissed:'Dismissed'};
 class CareerBoard extends HTMLElement {
   static observedAttributes = ['company', 'query', 'hidden'];
@@ -35,10 +36,10 @@ class CareerBoard extends HTMLElement {
             <div class="cb-sources"></div><button type="submit" class="btn">Save sources & automation</button><span class="cb-saved" role="status"></span>
           </form>
         </details>
-        </aside><section class="cb-results" aria-label="Discovered jobs"><section class="cb-applications" hidden aria-label="Selected applications"><header><div><h3>Your applications</h3><p class="cb-application-summary" role="status"></p></div><span class="cb-application-refresh">Updates every 6 seconds</span></header><div class="cb-application-list"></div></section><div class="cb-results-heading"><h3>Matching jobs</h3><span>Choose roles to score, tailor, and review.</span></div>
-        <span class="cb-count" hidden></span><p class="cb-message" role="status" aria-live="polite"></p>
+        </aside><section class="cb-results" aria-label="Discovered jobs"><div class="cb-results-heading"><h3>Matching jobs</h3><span>Choose roles to score, tailor, and review.</span></div>
+        <span class="cb-count" hidden></span><div class="cb-status"><p class="cb-message" role="status" aria-live="polite"></p>
         <div class="cb-coverage" hidden aria-live="polite"></div>
-        <details class="cb-progress" hidden><summary><span class="cb-progress-heading"><strong>Search activity</strong><span class="cb-progress-state"></span></span><span class="cb-progress-latest"></span></summary><div class="cb-progress-tools"><label>Show <select class="cb-progress-filter"><option value="all">All updates</option><option value="matches">Matches found</option><option value="issues">Issues</option></select></label><span class="cb-progress-count"></span></div><ol aria-label="Search progress, newest first"></ol></details>
+        <details class="cb-progress" hidden><summary><span class="cb-progress-heading"><strong>Search activity</strong><span class="cb-progress-state"></span></span><span class="cb-progress-latest"></span></summary><div class="cb-progress-tools"><label>Show <select class="cb-progress-filter"><option value="all">All updates</option><option value="matches">Matches found</option><option value="issues">Issues</option></select></label><span class="cb-progress-count"></span></div><ol aria-label="Search progress, newest first"></ol></details></div>
         <div class="cb-workspace"><div class="cb-list-pane">
         <div class="cb-toolbar cb-filters"><label>Show <select class="cb-state"><option value="network">Latest search</option><option value="interest">Earlier interest searches</option><option value="new">All new jobs</option><option value="pipeline">In pipeline</option><option value="dismissed">Dismissed</option><option value="all">All results</option></select></label>
           <label>Sort <select class="cb-sort"><option value="found">Recently found</option><option value="posted">Recently posted</option><option value="company">Company</option></select></label>
@@ -46,7 +47,7 @@ class CareerBoard extends HTMLElement {
         </div>
         <div class="cb-toolbar cb-actions"><label><input class="cb-all" type="checkbox"> Select visible</label><span class="cb-selection">Select roles to take action</span><button type="button" class="btn cb-clear" hidden>Clear</button><div class="cb-selected-actions" hidden><button type="button" class="btn cb-apply" disabled hidden title="Score, tailor, and submit only the selected roles">Apply selected</button><button type="button" class="btn cb-prepare" disabled>Score & tailor selected</button><button type="button" class="btn cb-dismiss" disabled>Dismiss</button></div></div>
         <p class="cb-apply-help" hidden>Apply selected scores, tailors, and submits. Score & tailor stops for review.</p><div class="cb-list"></div><div class="cb-pagination"><button type="button" class="btn cb-prev">Previous</button><span></span><button type="button" class="btn cb-next">Next</button></div>
-        </div><div class="cb-detail-empty">Pick a role to read it here.</div><dialog class="cb-job-drawer" aria-labelledby="cb-detail-title"><div class="cb-drawer-head"><span>Role details</span><button type="button" class="btn cb-drawer-close" aria-label="Close role details">✕</button></div><div class="cb-drawer-content"></div><footer class="cb-drawer-foot"><label><input type="checkbox" class="cb-detail-select"> Include in selection</label><button type="button" class="btn cb-drawer-done">Back to results</button></footer></dialog></div>
+        </div><div class="cb-side" data-view="role"><div class="cb-side-tabs" role="tablist"><button type="button" role="tab" data-side="role" aria-selected="true">Role</button><button type="button" role="tab" data-side="apps" aria-selected="false" hidden>Applications <b class="cb-side-n"></b></button></div><div class="cb-detail-empty">Pick a role to read it here.</div><dialog class="cb-job-drawer" aria-labelledby="cb-detail-title"><div class="cb-drawer-head"><span>Role details</span><button type="button" class="btn cb-drawer-close" aria-label="Close role details">✕</button></div><div class="cb-drawer-content"></div><footer class="cb-drawer-foot"><label><input type="checkbox" class="cb-detail-select"> Include in selection</label><button type="button" class="btn cb-drawer-done">Back to results</button></footer></dialog><section class="cb-applications" hidden aria-label="Selected applications"><header><div><h3>Your applications</h3><p class="cb-application-summary" role="status"></p></div><span class="cb-application-refresh">Updates every 6 seconds</span></header><div class="cb-application-list"></div></section></div></div>
         </section>
       </div></section>`;
     this.mode = 'network';
@@ -106,6 +107,7 @@ class CareerBoard extends HTMLElement {
       this.renderRows();
     };
     this.$('.cb-apply').onclick = () => this.act('apply');
+    this.$('.cb-side-tabs').onclick = event => { const tab = event.target.closest('[data-side]'); if (tab) this.showSide(tab.dataset.side); };
     this.$('.cb-application-list').onpointerdown = () => { this.applicationPointerUntil = Date.now() + 500; };
     this.$('.cb-application-list').onclick = event => {
       const button = event.target.closest('[data-application-company]');
@@ -117,6 +119,14 @@ class CareerBoard extends HTMLElement {
     this.$('.cb-next').onclick = () => { this.page++; this.renderRows(); };
     this.refresh();
     this.timer = setInterval(() => { if (!this.hidden) this.refresh(); }, 6000);
+  }
+  // The right column shows either the role being read or your applications,
+  // like the Cosign board's Role / Applications tabs.
+  showSide(view) {
+    const side = this.$('.cb-side');
+    if (!side || side.dataset.view === view) return;
+    side.dataset.view = view;
+    this.querySelectorAll('.cb-side-tabs [data-side]').forEach(b => b.setAttribute('aria-selected', String(b.dataset.side === view)));
   }
   disconnectedCallback() { clearInterval(this.timer); this.progressController?.abort(); }
   attributeChangedCallback(name, oldValue, newValue) {
@@ -173,8 +183,12 @@ class CareerBoard extends HTMLElement {
     const active = p => ['starting', 'queued', 'score', 'tailor', 'waiting', 'apply'].includes(p);
     const rows = [...jobs.values()].sort((a,b) => Number(active(b.application.phase)) - Number(active(a.application.phase)) || (b.application.requested_at || '').localeCompare(a.application.requested_at || ''));
     const panel = this.$('.cb-applications'); panel.hidden = !rows.length;
-    if (!rows.length) return;
+    const tab = this.$('.cb-side-tabs [data-side="apps"]');
+    tab.hidden = !rows.length;
+    if (!rows.length) { this.showSide('role'); return; }
     const counts = rows.reduce((n,r) => { const a = r.application; n[active(a.phase) ? 'active' : a.phase === 'applied' ? 'applied' : a.status === 'skipped' ? 'skipped' : a.status === 'job_gone' ? 'closed' : 'attention']++; return n; }, {active:0, applied:0, attention:0, skipped:0, closed:0});
+    const running = rows.filter(r => active(r.application.phase)).length;
+    this.$('.cb-side-n').textContent = running ? `${running} active` : String(rows.length);
     this.$('.cb-application-summary').textContent = [counts.active && `${counts.active} in progress`, counts.applied && `${counts.applied} applied`, counts.attention && `${counts.attention} need attention`, counts.skipped && `${counts.skipped} skipped`, counts.closed && `${counts.closed} closed`].filter(Boolean).join(' · ');
     this.$('.cb-application-refresh').textContent = this.applicationRefreshFailed ? 'Connection interrupted · retrying…' : 'Updates every 6 seconds';
     // A poll must not replace a button between pointerdown and click, or steal
@@ -323,7 +337,7 @@ class CareerBoard extends HTMLElement {
     this.visibleRows = rows.slice((this.page-1)*25, this.page*25);
     this.$('.cb-result-count').textContent = `${rows.length} role${rows.length === 1 ? '' : 's'}`;
     this.$('.cb-list').innerHTML = this.visibleRows.map(r => `<article class="cb-job cb-job-compact${r.id === this.detailId ? ' is-active' : ''}" data-id="${esc(r.id)}"><input type="checkbox" data-pick="${esc(r.id)}" aria-label="Select ${esc(r.title)} at ${esc(r.company)}" ${r.state !== 'new' ? 'disabled' : ''} ${this.selected.has(r.id) ? 'checked' : ''}>
-      <span class="cb-company-mark" aria-hidden="true">${esc(r.company.slice(0,2).toUpperCase())}</span><div class="cb-job-info"><button type="button" class="cb-job-title" data-detail="${esc(r.id)}" aria-haspopup="dialog">${esc(r.title)}</button><p>${esc(r.company)} <span>· ${esc(r.location || 'Location not listed')}</span></p><small>${r.posted_at ? `Posted ${esc(date(r.posted_at))}` : 'Posting date unavailable'} · Found ${esc(date(r.first_seen))}</small></div><div class="cb-job-meta">${r.application?.match_score != null ? `<span class="cb-score">${esc(r.application.match_score)}/10 match</span>` : ''}<span class="cb-state-label">${esc(r.application?.label || (r.state === 'new' && r.verification === 'verified' ? 'Posting checked' : labels[r.state] || r.state))}</span><button type="button" class="cb-details-link" data-detail="${esc(r.id)}" aria-label="Details for ${esc(r.title)} at ${esc(r.company)}">Details →</button></div></article>`).join('') || '<div class="cb-empty"><span class="cb-empty-icon" aria-hidden="true">⌕</span><strong>No roles in this view</strong><p>Choose All new jobs to browse earlier discoveries, or adjust your search.</p></div>';
+      <span class="cb-company-mark" aria-hidden="true">${esc(r.company.slice(0,2).toUpperCase())}</span><div class="cb-job-info"><button type="button" class="cb-job-title" data-detail="${esc(r.id)}" aria-haspopup="dialog">${esc(r.title)}</button><p>${esc(r.company)}${r.location ? ` <span>· ${esc(r.location)}</span>` : ''} <span>· ${r.posted_at ? `Posted ${esc(date(r.posted_at))}` : `Found ${esc(date(r.first_seen))}`}</span></p></div><div class="cb-job-meta"><span class="cb-src">${esc(SOURCES[r.provider] || r.provider || 'Career page')}</span>${r.application?.match_score != null ? `<span class="cb-score">${esc(r.application.match_score)}/10 match</span>` : ''}<span class="cb-state-label">${esc(r.application?.label || (r.state === 'new' && r.verification === 'verified' ? 'Posting checked' : labels[r.state] || r.state))}</span><button type="button" class="cb-details-link" data-detail="${esc(r.id)}" aria-label="Details for ${esc(r.title)} at ${esc(r.company)}">Details →</button></div></article>`).join('') || '<div class="cb-empty"><span class="cb-empty-icon" aria-hidden="true">⌕</span><strong>No roles in this view</strong><p>Choose All new jobs to browse earlier discoveries, or adjust your search.</p></div>';
     this.$('.cb-actions').hidden = !rows.length;
     this.$('.cb-pagination').hidden = pages <= 1;
     this.$('.cb-pagination span').textContent = `${this.page} / ${pages}`;
@@ -358,11 +372,12 @@ class CareerBoard extends HTMLElement {
     const row = this.data?.jobs.find(r => r.id === id);
     if (!row) return;
     this.detailId = id; this.detailDismissed = false;
+    this.showSide('role');
     if (!quiet) this.detailTrigger = document.activeElement;
     this.querySelectorAll('.cb-job[data-id]').forEach(el => el.classList.toggle('is-active', el.dataset.id === id));
     const version = ++this.detailVersion;
     const drawer = this.$('.cb-job-drawer'), body = this.$('.cb-drawer-content');
-    body.innerHTML = `<div class="cb-detail-company"><span class="cb-company-mark" aria-hidden="true">${esc(row.company.slice(0,2).toUpperCase())}</span><span>${esc(row.company)}</span></div><h2 id="cb-detail-title">${esc(row.title)}</h2><p class="cb-detail-location">${esc(row.location || 'Location not listed')}</p><div class="cb-detail-tags"><span>${esc(labels[row.state] || row.state)}</span><span>${row.posted_at ? `Posted ${esc(date(row.posted_at))}` : 'Posting date unavailable'}</span><span>${esc(row.provider || 'Career page')}</span></div><a class="cb-original-link" href="${esc(row.url)}" target="_blank" rel="noopener noreferrer">Open original posting ↗</a>${row.why ? `<section class="cb-detail-section"><h3>Why it was found</h3><p>${esc(plainWhy(row.why))}</p></section>` : ''}<section class="cb-detail-section"><h3>Application & résumé</h3><div class="cb-detail-application">Loading saved information…</div></section><section class="cb-detail-section"><h3>Job description</h3><p class="cb-detail-description" aria-live="polite">Loading saved description…</p></section>`;
+    body.innerHTML = `<div class="cb-detail-company"><span class="cb-company-mark" aria-hidden="true">${esc(row.company.slice(0,2).toUpperCase())}</span><span>${esc(row.company)}</span></div><h2 id="cb-detail-title">${esc(row.title)}</h2><p class="cb-detail-location">${esc(row.location || 'Location not listed')}</p><div class="cb-detail-tags"><span>${esc(labels[row.state] || row.state)}</span>${row.posted_at ? `<span>Posted ${esc(date(row.posted_at))}</span>` : ''}<span>${esc(SOURCES[row.provider] || row.provider || 'Career page')}</span></div><a class="cb-original-link" href="${esc(row.url)}" target="_blank" rel="noopener noreferrer">Open original posting ↗</a>${row.why ? `<section class="cb-detail-section"><h3>Why it was found</h3><p>${esc(plainWhy(row.why))}</p></section>` : ''}<section class="cb-detail-section"><h3>Application & résumé</h3><div class="cb-detail-application">Loading saved information…</div></section><section class="cb-detail-section"><h3>Job description</h3><p class="cb-detail-description" aria-live="polite">Loading saved description…</p></section>`;
     this.paintSelection();
     const inline = this.wide();
     // show() moves focus into the panel; beside the list that would pull the
@@ -471,6 +486,7 @@ class CareerBoard extends HTMLElement {
     if (action === 'apply') {
       const requested_at = new Date().toISOString();
       for (const r of this.data.jobs.filter(r => this.selected.has(r.id))) this.pendingApplications.set(r.id, {...r, application:{phase:'starting', label:'Sending request…', requested_at}});
+      this.paintApplications(); this.showSide('apps');
       this.paintApplications();
       this.$('.cb-apply').textContent = 'Starting…';
       this.$('.cb-applications').scrollIntoView({block:'nearest', behavior:'smooth'});

@@ -451,10 +451,22 @@
               </button>
             </div>
           </div>
-          <nav id="find-jobs-views" aria-label="Ways to find jobs" hidden>
-            <button type="button" class="chip" data-find-view="fresh" aria-pressed="false">Fresh</button>
-            <button type="button" class="chip" data-find-view="career-ops" aria-pressed="false">Career Ops search</button>
-            <button type="button" class="chip" data-find-view="cosign" aria-pressed="false">Cosign</button>
+          <nav id="find-jobs-views" class="fj-options" aria-label="Ways to find jobs" hidden>
+            <button type="button" class="chip fj-opt" data-find-view="fresh" aria-pressed="false">
+              <span class="fj-opt-name">Fresh</span>
+              <span class="fj-opt-desc">New roles from companies you watch</span>
+              <span class="fj-opt-src">Your watchlist · Greenhouse · Lever · Ashby · Workday · career sites</span>
+            </button>
+            <button type="button" class="chip fj-opt" data-find-view="career-ops" aria-pressed="false">
+              <span class="fj-opt-name">Career Ops search</span>
+              <span class="fj-opt-desc">Find companies you don't track yet</span>
+              <span class="fj-opt-src">Greenhouse · Lever · Ashby · Workday · iCIMS</span>
+            </button>
+            <button type="button" class="chip fj-opt" data-find-view="cosign" aria-pressed="false">
+              <span class="fj-opt-name">Cosign network</span>
+              <span class="fj-opt-desc">Search ~70,000 open roles at once</span>
+              <span class="fj-opt-src">Cosign network · postings on Ashby, Greenhouse, Workday</span>
+            </button>
           </nav>
           <career-board id="career-ops-board" hidden></career-board>
           <cosign-board id="cosign-board" hidden></cosign-board>

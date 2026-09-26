@@ -391,7 +391,6 @@ career-board .cb-search-column .cb-sources { grid-template-columns: repeat(auto-
 
 /* Status strip, applications and results heading */
 career-board .cb-results { padding: 0; border-top: 1px solid var(--border); }
-career-board .cb-results > :is(.cb-message, .cb-coverage, .cb-progress, .cb-applications) { margin: 14px 24px 0; }
 career-board .cb-results-heading, career-board .cb-count { display: none !important; }
 career-board .cb-coverage, career-board .cb-progress { border-radius: var(--r-md); }
 
@@ -465,7 +464,6 @@ career-board .cb-job-drawer:modal[open] { animation: cb-slide .3s var(--cb-out);
   career-board .cb-search-column .cb-network { grid-template-columns: 1fr; grid-template-areas: "brief" "fields" "options" "bar" "refine"; }
   career-board .cb-search-column .cb-search-fields { grid-template-columns: 1fr; padding: 12px 14px 0; }
   career-board .cb-search-column .cb-search-options { padding: 12px 14px; }
-  career-board .cb-results > :is(.cb-message, .cb-coverage, .cb-progress, .cb-applications) { margin: 12px 12px 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   career-board .cb-job-drawer, career-board .cb-job-drawer *, career-board .cb-live-dot { animation: none !important; }
@@ -475,3 +473,55 @@ career-board .cb-list-pane > .cb-filters { flex-wrap: nowrap; font-size: 12px; }
 career-board .cb-list-pane > .cb-filters label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); }
 career-board .cb-list-pane > .cb-filters select { max-width: 130px; min-width: 0; }
 career-board .cb-list-pane > .cb-filters .cb-result-count { margin-left: auto; margin-right: 0; white-space: nowrap; }
+
+/* ─── One status strip, results right under it ─── */
+career-board .cb-status { margin: 14px 24px 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--card); display: flex; flex-direction: column; gap: 8px; }
+career-board .cb-status:not(:has(> :not([hidden]))) { display: none; }
+career-board .cb-status > * { margin: 0 !important; }
+career-board .cb-status .cb-message { font-size: 12.5px; color: var(--muted); }
+career-board .cb-status .cb-message.cb-error { color: var(--bad); }
+career-board .cb-status .cb-coverage { border: 0 !important; padding: 0 !important; background: transparent !important; box-shadow: none !important; font-size: 12px; }
+career-board .cb-status .cb-progress { border: 0 !important; padding: 0 !important; background: transparent !important; font-size: 12px; }
+career-board .cb-status .cb-progress > summary { padding: 0 !important; }
+
+/* ─── Right column: Role | Applications, like the Cosign board ─── */
+career-board .cb-side { display: flex; flex-direction: column; min-width: 0; }
+career-board .cb-side-tabs { position: sticky; top: 0; z-index: 2; display: flex; gap: 4px; padding: 10px 40px 0; background: var(--panel); border-bottom: 1px solid var(--border); }
+career-board .cb-side-tabs button { position: relative; padding: 8px 12px 10px; border: 0; background: none; color: var(--muted); font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
+career-board .cb-side-tabs button[hidden] { display: none; }
+career-board .cb-side-tabs button[aria-selected="true"] { color: var(--fg); font-weight: 600; }
+career-board .cb-side-tabs button::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--scan);
+  transform: scaleX(0); transition: transform .22s var(--cb-out); }
+career-board .cb-side-tabs button[aria-selected="true"]::after { transform: scaleX(1); }
+career-board .cb-side-n { margin-left: 4px; padding: 0 6px; border-radius: 999px; background: var(--card-2); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
+career-board .cb-side:not(:has(.cb-side-tabs [data-side="apps"]:not([hidden]))) .cb-side-tabs { display: none; }
+career-board .cb-side[data-view="apps"] :is(.cb-job-drawer, .cb-detail-empty) { display: none !important; }
+career-board .cb-side[data-view="role"] .cb-applications { display: none !important; }
+career-board .cb-side .cb-detail-empty { flex: 1; }
+
+/* Applications live in the column now: no card, no scroll trap. */
+career-board .cb-side .cb-applications { margin: 0; padding: 26px 40px 34px; border: 0; border-radius: 0; background: transparent; animation: cb-reveal .18s var(--cb-ease) backwards; }
+career-board .cb-side .cb-applications h3 { font-size: 22px; font-weight: 600; letter-spacing: -.012em; }
+career-board .cb-side .cb-application-list { max-height: none; overflow: visible; }
+career-board .cb-side .cb-application-row { grid-template-columns: minmax(0, 1fr) auto auto auto; }
+career-board .cb-application-open { border-radius: 999px; }
+
+/* Interests: one quiet line until you use it. */
+career-board #cb-search-query { height: 30px; min-height: 30px; transition: height .2s var(--cb-ease); }
+career-board #cb-search-query:focus, career-board #cb-search-query:not(:placeholder-shown) { height: 64px; }
+
+/* Two-line rows. */
+career-board .cb-job-info small { display: none; }
+career-board .cb-job-info p { color: var(--muted); }
+career-board .cb-job-info p span { color: var(--faint); }
+
+@media (max-width: 999px) {
+  career-board .cb-side { border-top: 1px solid var(--border); }
+  career-board .cb-side-tabs { padding: 8px 16px 0; }
+  career-board .cb-side .cb-applications { padding: 18px 16px 24px; }
+}
+@media (max-width: 720px) {
+  career-board .cb-status { margin: 12px 12px 0; }
+  career-board .cb-side .cb-application-row { grid-template-columns: minmax(0, 1fr) auto; }
+}
+career-board .cb-src { font-size: 10.5px; color: var(--faint); white-space: nowrap; }

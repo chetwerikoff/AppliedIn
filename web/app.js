@@ -6465,8 +6465,11 @@ function wire() {
 
 // --- boot ------------------------------------------------------------------
 async function boot() {
-  const savedTheme = localStorage.getItem("appliedin.theme");
-  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  // Light unless someone chose dark. The stylesheet's base palette is the dark
+  // one, so with nothing saved the demo opened as an all-black board.
+  let savedTheme = null;
+  try { savedTheme = localStorage.getItem("appliedin.theme"); } catch { /* private window */ }
+  document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
   const savedW = Number(localStorage.getItem("appliedin.freshw"));
   if (FRESH_WINDOWS.some(([h]) => h === savedW)) state.freshHours = savedW;
   const savedScan = Number(localStorage.getItem("appliedin.scanw"));

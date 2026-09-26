@@ -1,0 +1,10 @@
+/* Notes and What's new: the docs layout from landing.css under the site's
+   header, type and colours (site.css), so all three pages read as one site. */
+body { font-family: var(--sans); }
+.shell { margin-top: 8px; }
+.doc h1, .doc h2, .doc h3 { font-family: var(--sans); letter-spacing: -.02em; }
+.doc h1 { font-weight: 750; letter-spacing: -.035em; }
+.sidebar a.active { color: var(--green_ink, var(--green)); }
+.eyebrow { color: var(--green_ink, var(--green)); text-transform: none; letter-spacing: 0; font-weight: 600; }
+.card_n { color: var(--green_ink, var(--green)); font-family: var(--sans); font-weight: 600; }
+.doc a { color: var(--green_ink, var(--green)); }

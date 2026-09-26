@@ -1,0 +1,281 @@
+/* appliedin.dev home page.
+   One idea carries the page: the application itself, happening. The hero is the
+   product's own step tracker playing through a real run once; everything else
+   stays still, set in one grotesk on cool paper, with green meaning "done" and
+   amber meaning "needs you", exactly as they do in the app. */
+
+:root {
+  --paper: #f6f7f5;
+  --paper_2: #eceeeb;
+  --card: #ffffff;
+  --ink: #141816;
+  --graphite: #56615a;
+  --faint: #879189;
+  --rule: #dde2de;
+  --rule_2: #c9d0cb;
+  --green: #0b8f59;
+  --green_soft: #e3f1e8;
+  --amber: #b87306;
+  --code_bg: #141816;
+  --code_ink: #dfe6e1;
+  --shadow: 0 1px 2px rgba(20, 24, 22, .06), 0 24px 48px -28px rgba(20, 24, 22, .28);
+
+  --sans: "Schibsted Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --wrap: 1180px;
+  --ease: cubic-bezier(.2, 0, 0, 1);
+}
+:root[data-theme="dark"] {
+  --paper: #0f1211;
+  --paper_2: #151917;
+  --card: #151917;
+  --ink: #e9edea;
+  --graphite: #a3ada7;
+  --faint: #6c766f;
+  --rule: #252b28;
+  --rule_2: #343c37;
+  --green: #3fcb8b;
+  --green_soft: #13241b;
+  --amber: #e9a93a;
+  --code_bg: #0a0c0b;
+  --code_ink: #dfe6e1;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 30px 60px -30px rgba(0, 0, 0, .7);
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+body { margin: 0; background: var(--paper); color: var(--ink); font-family: var(--sans); font-size: 17px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+img { max-width: 100%; height: auto; display: block; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; border-radius: 4px; }
+::selection { background: var(--green); color: var(--paper); }
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 32px; }
+
+/* What's new strip (markup shared with the other pages) */
+.announce { display: flex; justify-content: center; align-items: center; position: relative; min-height: 40px; padding: 0 44px;
+  background: var(--green_soft); border-bottom: 1px solid var(--rule); font-size: 14px; }
+.announce[hidden] { display: none; }
+.announce_link { display: inline-flex; align-items: center; gap: 10px; min-width: 0; padding: 8px 0; color: var(--graphite); text-decoration: none; }
+.announce_tag { flex-shrink: 0; padding: 1px 9px; border-radius: 999px; background: var(--green); color: var(--paper); font-size: 12px; font-weight: 700; }
+.announce_text { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.announce_text strong { color: var(--ink); font-weight: 600; }
+.announce_cta { flex-shrink: 0; color: var(--green); font-weight: 600; }
+.announce_cta span { display: none; }
+.announce_link:hover .announce_cta { text-decoration: underline; text-underline-offset: 3px; }
+.announce_close { position: absolute; right: 10px; top: 50%; translate: 0 -50%; width: 28px; height: 28px; border: 0; border-radius: 8px;
+  background: transparent; color: var(--graphite); font-size: 18px; line-height: 1; cursor: pointer; }
+.announce_close:hover { color: var(--ink); background: var(--paper_2); }
+
+/* Header */
+.topbar { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--paper) 86%, transparent);
+  backdrop-filter: saturate(1.4) blur(12px); border-bottom: 1px solid transparent; transition: border-color .2s var(--ease); }
+.topbar.scrolled { border-bottom-color: var(--rule); }
+.topbar .wrap { display: flex; align-items: center; gap: 28px; height: 64px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; letter-spacing: -.01em; text-decoration: none; }
+.topnav { display: flex; align-items: center; gap: 22px; margin-left: auto; font-size: 15px; }
+.topnav a { color: var(--graphite); text-decoration: none; }
+.topnav a:hover { color: var(--ink); }
+.topbar_actions { display: flex; align-items: center; gap: 8px; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 10px;
+  border: 1px solid var(--rule_2); background: transparent; color: var(--ink); font: inherit; font-size: 15px; font-weight: 600;
+  text-decoration: none; cursor: pointer; transition: background-color .15s var(--ease), border-color .15s var(--ease); }
+.btn:hover { border-color: var(--ink); }
+.btn_primary { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.btn_primary:hover { background: color-mix(in srgb, var(--ink) 86%, var(--green)); }
+.btn_small { height: 34px; padding: 0 12px; font-size: 14px; border-radius: 9px; }
+.theme_toggle .theme_label { font-weight: 500; }
+
+/* Hero */
+.hero { padding: 84px 0 96px; }
+.hero .wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 520px); gap: 72px; align-items: center; }
+.hero h1 { margin: 0; font-size: clamp(46px, 6.2vw, 80px); line-height: .98; letter-spacing: -.045em; font-weight: 750; max-width: 11ch; }
+.hero_lede { margin: 28px 0 0; max-width: 34em; font-size: 19px; line-height: 1.55; color: var(--graphite); }
+.hero_lede strong { color: var(--ink); font-weight: 600; }
+.hero_actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 36px; }
+.hero_actions .btn { height: 48px; padding: 0 22px; font-size: 16px; border-radius: 12px; }
+.hero_meta { margin: 22px 0 0; font-size: 14px; color: var(--faint); }
+
+/* The ticket: the app's own step tracker, playing one real run */
+.ticket { margin: 0; padding: 18px 26px 20px; border: 1px solid var(--rule); border-radius: 18px; background: var(--card); box-shadow: var(--shadow); }
+.ticket_head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.ticket_role { margin: 0; font-size: 19px; font-weight: 650; line-height: 1.3; letter-spacing: -.01em; }
+.ticket_co { margin: 4px 0 0; font-size: 14px; color: var(--graphite); }
+.ticket_state { flex-shrink: 0; padding: 3px 11px; border-radius: 999px; border: 1px solid var(--rule_2); font-size: 13px; font-weight: 600; color: var(--graphite); }
+.ticket_state .is_done { display: none; color: var(--green); }
+.ticket_score { margin: 18px 0 0; font-size: 14px; color: var(--graphite); }
+.ticket_score b { color: var(--ink); font-size: 22px; font-weight: 700; letter-spacing: -.02em; margin-right: 2px; }
+
+.steps { position: relative; display: grid; grid-template-columns: repeat(5, 1fr); list-style: none; margin: 22px 0 0; padding: 0; }
+.steps::before, .steps::after { content: ""; position: absolute; top: 10px; left: 10%; height: 2px; border-radius: 2px; }
+.steps::before { right: 10%; background: var(--rule); }
+.steps::after { width: 0; background: var(--green); }
+.steps li { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 7px; font-size: 12.5px; color: var(--faint); }
+.steps i { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--rule_2); background: var(--card); display: grid; place-items: center; }
+.steps i::after { content: ""; width: 6px; height: 11px; margin-top: -2px; border: solid var(--paper); border-width: 0 2px 2px 0; transform: rotate(45deg); opacity: 0; }
+
+.log { list-style: none; margin: 22px 0 0; padding: 16px 0 0 0; border-top: 1px solid var(--rule); min-height: 208px; }
+.log li { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 10px; padding: 4px 0; font-size: 14.5px; line-height: 1.45; opacity: 0; }
+.log time { font-family: var(--mono); font-size: 12.5px; color: var(--faint); padding-top: 1px; }
+.log li.good span { color: var(--green); font-weight: 600; }
+.ticket_foot { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; font-size: 13px; color: var(--faint); }
+.replay { border: 0; background: none; padding: 0; color: var(--graphite); font: inherit; font-size: 13px; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.replay:hover { color: var(--ink); }
+
+/* The one orchestrated moment: about seven seconds, once. */
+.ticket.play .log li { animation: line-in .35s var(--ease) forwards; animation-delay: var(--t); }
+@keyframes line-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.ticket.play .steps li { animation: step-on .01s linear forwards, step-done .3s var(--ease) forwards; animation-delay: var(--on), var(--done); }
+@keyframes step-on { to { color: var(--ink); font-weight: 600; } }
+@keyframes step-done { to { color: var(--graphite); font-weight: 500; } }
+.ticket.play .steps li i { animation: dot-on .3s var(--ease) forwards, dot-done .3s var(--ease) forwards; animation-delay: var(--on), var(--done); }
+@keyframes dot-on { to { border-color: var(--ink); box-shadow: 0 0 0 5px color-mix(in srgb, var(--ink) 10%, transparent); } }
+@keyframes dot-done { to { border-color: var(--green); background: var(--green); box-shadow: none; } }
+.ticket.play .steps li i::after { animation: tick .25s var(--ease) forwards; animation-delay: var(--done); }
+@keyframes tick { to { opacity: 1; } }
+.ticket.play .steps::after { animation: fill 6.2s linear forwards; animation-delay: 1.6s; }
+@keyframes fill {
+  0%, 10% { width: 0; } 13%, 26% { width: 20%; } 29%, 39% { width: 40%; } 42%, 86% { width: 60%; } 90%, 100% { width: 80%; }
+}
+/* The finished state is set by site.js when the run ends, so it never depends
+   on animating display. */
+.ticket.finished .ticket_state { border-color: var(--green); background: var(--green_soft); transition: background-color .3s var(--ease), border-color .3s var(--ease); }
+.ticket.finished .ticket_state .is_run { display: none; }
+.ticket.finished .ticket_state .is_done { display: inline; }
+
+/* The run starts as a search, typed in the way Cosign's composer is: each word
+   arrives blurred and settles, then the match and its run appear. */
+.ticket_search { display: flex; align-items: center; gap: 10px; margin: 0 -8px 18px; padding: 10px 12px; border-radius: 12px;
+  background: var(--paper_2); color: var(--faint); font-size: 15px; }
+.ticket_query { color: var(--ink); }
+.ticket_query span { display: inline-block; }
+.ticket.play .ticket_query span { animation: word-in .42s var(--ease) both; animation-delay: calc(.12s + var(--w) * .07s); }
+@keyframes word-in { from { opacity: 0; filter: blur(4px); transform: translateY(2px); } }
+.ticket.play :is(.ticket_head, .ticket_score, .steps) { animation: rise-in .45s var(--ease) both; animation-delay: 1.05s; }
+.ticket.play .ticket_score { animation-delay: 1.15s; }
+.ticket.play .steps { animation-delay: 1.25s; }
+@keyframes rise-in { from { opacity: 0; transform: translateY(6px); } }
+
+/* A count that rolls into place, the way Cosign's role count does. */
+.odo { display: inline-flex; height: 1.3em; overflow: hidden; vertical-align: bottom; font-weight: 600; color: var(--ink); }
+.odo .d { position: relative; display: inline-block; height: 1.3em; overflow: hidden; }
+.odo > span:not(.d) { margin: 0 .01em; }
+.odo .dw { visibility: hidden; }
+.odo .r { position: absolute; inset: 0 auto auto 0; width: 100%; display: flex; flex-direction: column; align-items: center; transform: translateY(0); }
+.odo .r > span { height: 1.3em; line-height: 1.3em; }
+.odo.rolling .r { transform: translateY(var(--to)); transition: transform 1.2s cubic-bezier(.16, 1, .3, 1); transition-delay: var(--dl); }
+
+/* Sections */
+.section { padding: 104px 0; border-top: 1px solid var(--rule); }
+.section h2 { margin: 0; font-size: clamp(32px, 3.6vw, 44px); line-height: 1.05; letter-spacing: -.035em; font-weight: 750; max-width: 18ch; }
+.section_lede { margin: 18px 0 0; max-width: 36em; font-size: 18px; color: var(--graphite); }
+
+/* Where jobs come from */
+/* Three live lanes of postings above their columns (boards3d.js). */
+.boards3d { position: relative; height: 360px; margin-top: 28px; opacity: 0; transition: opacity .8s var(--ease); }
+.boards3d.ready { opacity: 1; }
+.boards3d canvas { display: block; width: 100%; height: 100%; }
+.sources { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 0; border-top: 1px solid var(--ink); }
+.source { padding: 22px 28px 4px 0; }
+.source + .source { padding-left: 28px; border-left: 1px solid var(--rule); }
+.source h3 { margin: 0; font-size: 21px; letter-spacing: -.015em; font-weight: 700; }
+.source p { margin: 8px 0 0; color: var(--graphite); }
+.source .source_from { margin-top: 18px; font-size: 14px; color: var(--faint); }
+
+/* One press, then it runs */
+.press_head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 72px; align-items: end; }
+.press_head .section_lede { margin: 0; }
+.shot { margin: 56px 0 0; border: 1px solid var(--rule); border-radius: 16px; overflow: hidden; background: var(--card); box-shadow: var(--shadow); }
+.shot_caption { margin: 16px 0 0; font-size: 14px; color: var(--faint); }
+
+/* Guardrails */
+.rails { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 72px; }
+.rails_list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--ink); }
+.rails_list li { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); gap: 28px; padding: 20px 0; border-bottom: 1px solid var(--rule); }
+.rails_list strong { font-size: 18px; font-weight: 650; letter-spacing: -.01em; line-height: 1.35; }
+.rails_list span { color: var(--graphite); font-size: 16px; }
+
+/* How it works */
+.how { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 72px; align-items: start; }
+.how p { margin: 18px 0 0; color: var(--graphite); max-width: 32em; }
+.how .how_link { display: inline-block; margin-top: 22px; font-weight: 600; color: var(--ink); text-underline-offset: 4px; }
+.diagram { margin: 0; border: 1px solid var(--rule); border-radius: 16px; overflow: hidden; background: var(--card); }
+
+/* Get started */
+.start { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 72px; align-items: start; }
+.term { margin: 28px 0 0; padding: 22px 24px; border-radius: 14px; background: var(--code_bg); color: var(--code_ink); font-family: var(--mono);
+  font-size: 14.5px; line-height: 1.9; overflow-x: auto; }
+.term .c { color: #7e8b83; }
+.needs h3, .caveats h3 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
+.needs ul, .caveats ul { margin: 12px 0 0; padding-left: 18px; color: var(--graphite); font-size: 16px; }
+.needs li + li, .caveats li + li { margin-top: 8px; }
+.needs li strong { color: var(--ink); font-weight: 600; }
+.needs_note { margin: 14px 0 0; font-size: 14px; color: var(--faint); }
+.caveats { margin-top: 36px; padding-top: 28px; border-top: 1px solid var(--rule); }
+.caveats h3 { color: var(--amber); }
+
+/* Footer */
+.footer { padding: 40px 0 56px; border-top: 1px solid var(--rule); font-size: 14px; color: var(--faint); }
+.footer .wrap { display: flex; flex-wrap: wrap; gap: 20px 28px; align-items: center; }
+.footer nav { display: flex; gap: 22px; margin-left: auto; }
+.footer a { color: var(--graphite); text-decoration: none; }
+.footer a:hover { color: var(--ink); }
+
+@media (max-width: 1000px) {
+  .hero .wrap, .press_head, .rails, .how, .start { grid-template-columns: minmax(0, 1fr); gap: 44px; }
+  .topnav { display: none; }
+  .topbar_actions { margin-left: auto; }
+}
+@media (max-width: 720px) {
+  body { font-size: 16px; }
+  .wrap { padding: 0 20px; }
+  .hero { padding: 48px 0 64px; }
+  .hero h1 { font-size: 44px; }
+  .section { padding: 72px 0; }
+  .sources { grid-template-columns: minmax(0, 1fr); }
+  .boards3d { display: none; }
+  .source, .source + .source { padding: 20px 0; border-left: 0; }
+  .source + .source { border-top: 1px solid var(--rule); }
+  .rails_list li { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .announce { justify-content: flex-start; padding: 0 40px 0 16px; }
+  .announce_more { display: none; }
+  .theme_toggle .theme_label { display: none; }
+  .topbar_actions .demo_link { display: none; }
+  .ticket { padding: 20px 18px 16px; }
+  .steps li { font-size: 11px; }
+}
+
+/* Reduced motion: the finished application, no playback. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .ticket.play *, .ticket.play, .ticket.play .steps::after { animation: none !important; }
+  .odo .r { transition: none !important; transform: translateY(var(--to)) !important; }
+  .log li { opacity: 1; }
+  .steps::after { width: 80%; }
+  .steps li i { border-color: var(--green); background: var(--green); }
+  .steps li i::after { opacity: 1; }
+  .ticket_state { border-color: var(--green); background: var(--green_soft); }
+  .ticket_state .is_run { display: none; }
+  .ticket_state .is_done { display: inline; }
+}
+
+/* ─── A touch of green in the text ────────────────────────────────────────────
+   Green marks what AppliedIn does for you and where to go next: the primary
+   actions, the key phrase, the three sources, the rules it keeps, and links.
+   Headlines and body copy stay ink, so the green reads as emphasis. */
+:root { --green_ink: #0a7d4e; }
+:root[data-theme="dark"] { --green_ink: #4fd699; }
+.btn_primary { background: var(--green); border-color: var(--green); color: #fff; }
+.btn_primary:hover { background: color-mix(in srgb, var(--green) 88%, var(--ink)); border-color: color-mix(in srgb, var(--green) 88%, var(--ink)); }
+:root[data-theme="dark"] .btn_primary { color: #06140d; }
+.hero_kicker { margin: 0 0 18px; color: var(--green_ink); font-size: 15px; font-weight: 600; }
+.hero_lede strong { color: var(--green_ink); }
+.source h3 { color: var(--green_ink); }
+.odo { color: var(--green_ink); }
+.rails_list strong { display: flex; gap: 10px; align-items: baseline; }
+.rails_list strong::before { content: ""; flex-shrink: 0; width: 6px; height: 11px; margin: 0 4px 0 2px; border: solid var(--green); border-width: 0 2px 2px 0;
+  transform: rotate(45deg) translateY(-2px); }
+.shot_caption a, .how .how_link, .footer a:hover { color: var(--green_ink); }
+.how .how_link { text-decoration-color: color-mix(in srgb, var(--green_ink) 45%, transparent); }
+.shot_caption a { text-underline-offset: 3px; }
+.term .c { color: #62b98f; }

@@ -10,13 +10,16 @@
   (function () {
     try {
       var saved = localStorage.getItem("appliedin.theme");
-      var theme = saved || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      var theme = saved === "dark" ? "dark" : "light";
       document.documentElement.dataset.theme = theme;
     } catch (_) {}
   })();
 </script>
   <link rel="icon" href="/logo.svg" />
+  <link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/landing.css?v=7" />
+  <link rel="stylesheet" href="/site.css?v=7" />
+  <link rel="stylesheet" href="/pages.css?v=1" />
 </head>
 <body>
 
@@ -30,21 +33,24 @@
 </div>
 
 <header class="topbar">
-  <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
-  <nav class="topnav">
-    <a href="/#architecture">Workflow</a>
-    <a href="/#product">Product</a>
-    <a href="/#guarantees">Guardrails</a>
-    <a href="/whats-new">What's new</a>
-    <a href="/notes">Notes</a>
-    <button class="btn btn_quiet theme_toggle" id="theme-toggle" type="button"
-            aria-label="Switch theme">
-      <span class="theme_icon" aria-hidden="true">&#9686;</span>
-      <span class="theme_label">Theme</span>
-    </button>
-    <a class="btn btn_quiet demo_link" href="/demo">Demo</a>
-    <a class="btn btn_primary" href="https://github.com/sayantan94/AppliedIn">GitHub</a>
-  </nav>
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
+    <nav class="topnav" aria-label="Sections">
+      <a href="/#sources">Job boards</a>
+      <a href="/#guardrails">Guardrails</a>
+      <a href="/#how">How it works</a>
+      <a href="/#start">Get started</a>
+      <a href="/whats-new">What's new</a>
+      <a href="/notes">Notes</a>
+    </nav>
+    <div class="topbar_actions">
+      <button class="btn btn_small theme_toggle" id="theme-toggle" type="button" aria-label="Switch theme">
+        <span class="theme_icon" aria-hidden="true">◐</span><span class="theme_label">Theme</span>
+      </button>
+      <a class="btn btn_small demo_link" href="/demo">Demo</a>
+      <a class="btn btn_small btn_primary" href="https://github.com/sayantan94/AppliedIn">GitHub</a>
+    </div>
+  </div>
 </header>
 
 <div class="shell">
@@ -109,6 +115,6 @@
   </main>
 </div>
 
-<script src="/landing.js?v=5" defer></script>
+<script src="/landing.js?v=6" defer></script>
 </body>
 </html>

@@ -546,3 +546,15 @@ h2:hover .anchor, h3:hover .anchor, .anchor:focus { opacity: 1; }
 @media (max-width: 900px) {
   .diagram { margin-left: 0; margin-right: 0; }
 }
+
+/* v1.2.0 release notice above the hero: one quiet line, one link. */
+.release_pill { display: inline-flex; align-items: center; gap: 10px; max-width: 100%; margin: 0 0 18px; padding: 5px 14px 5px 5px;
+  border: 1px solid var(--accent_line); border-radius: 999px; background: var(--accent_soft); color: var(--ink_2);
+  font-size: 13px; line-height: 1.35; text-decoration: none; transition: border-color .15s ease, transform .15s ease; }
+.release_pill:hover { border-color: var(--accent); transform: translateY(-1px); }
+.release_tag { flex-shrink: 0; padding: 2px 9px; border-radius: 999px; background: var(--accent); color: var(--accent_ink); font-size: 11.5px; font-weight: 700; }
+.release_arrow { flex-shrink: 0; color: var(--accent); transition: transform .15s ease; }
+.release_pill:hover .release_arrow { transform: translateX(2px); }
+/* Where a search option's jobs come from, listed quietly under it. */
+.card_src { margin-top: 10px !important; padding-top: 10px; border-top: 1px solid var(--line); color: var(--faint) !important; font-size: 12px !important; }
+@media (prefers-reduced-motion: reduce) { .release_pill, .release_arrow { transition: none; } }

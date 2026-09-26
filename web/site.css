@@ -88,8 +88,11 @@ a { color: inherit; }
 
 /* Hero */
 .hero { padding: 84px 0 96px; }
-.hero .wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 520px); gap: 72px; align-items: center; }
-.hero h1 { margin: 0; font-size: clamp(46px, 6.2vw, 80px); line-height: .98; letter-spacing: -.045em; font-weight: 750; max-width: 11ch; }
+.hero .wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 480px); gap: 64px; align-items: center; }
+/* Each sentence starts its own line and only wraps within itself, so the
+   headline never strands a word from the sentence it belongs to. */
+.hero h1 { margin: 0; font-size: clamp(40px, 4.4vw, 60px); line-height: 1.02; letter-spacing: -.04em; font-weight: 750; }
+.hero h1 span { display: block; text-wrap: balance; }
 .hero_lede { margin: 28px 0 0; max-width: 34em; font-size: 19px; line-height: 1.55; color: var(--graphite); }
 .hero_lede strong { color: var(--ink); font-weight: 600; }
 .hero_actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 36px; }
@@ -230,7 +233,7 @@ a { color: inherit; }
   body { font-size: 16px; }
   .wrap { padding: 0 20px; }
   .hero { padding: 48px 0 64px; }
-  .hero h1 { font-size: 44px; }
+  .hero h1 { font-size: 40px; }
   .section { padding: 72px 0; }
   .sources { grid-template-columns: minmax(0, 1fr); }
   .boards3d { display: none; }
@@ -244,6 +247,8 @@ a { color: inherit; }
   .ticket { padding: 20px 18px 16px; }
   .steps li { font-size: 11px; }
 }
+
+@media (max-width: 380px) { .hero h1 { font-size: 34px; } }
 
 /* Reduced motion: the finished application, no playback. */
 @media (prefers-reduced-motion: reduce) {

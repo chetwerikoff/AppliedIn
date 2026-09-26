@@ -95,9 +95,9 @@ a { color: inherit; }
 .hero h1 span { display: block; text-wrap: balance; }
 /* The name leads, as it did on the first site; the two sentences say what it does. */
 .hero_name { font-size: clamp(60px, 7.4vw, 108px); line-height: .92; letter-spacing: -.055em; font-weight: 800; }
-.hero_line { font-size: clamp(28px, 3vw, 42px); line-height: 1.12; letter-spacing: -.03em; font-weight: 700; }
-.hero_name + .hero_line { margin-top: 18px; }
-.hero_lede { margin: 28px 0 0; max-width: 34em; font-size: 19px; line-height: 1.55; color: var(--graphite); }
+.hero_line { font-size: clamp(28px, 3vw, 42px); line-height: 1.12; letter-spacing: -.03em; font-weight: 700; color: var(--green_ink); }
+.hero_name + .hero_line { margin-top: 14px; }
+.hero_lede { margin: 24px 0 0; max-width: 34em; font-size: 19px; line-height: 1.55; color: var(--graphite); }
 .hero_lede strong { color: var(--ink); font-weight: 600; }
 .hero_actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 36px; }
 .hero_actions .btn { height: 48px; padding: 0 22px; font-size: 16px; border-radius: 12px; }
@@ -279,7 +279,7 @@ a { color: inherit; }
 .btn_primary:hover { background: color-mix(in srgb, var(--green) 88%, var(--ink)); border-color: color-mix(in srgb, var(--green) 88%, var(--ink)); }
 :root[data-theme="dark"] .btn_primary { color: #06140d; }
 .hero_kicker { margin: 0 0 18px; color: var(--green_ink); font-size: 15px; font-weight: 600; }
-.hero_lede strong { color: var(--green_ink); }
+.hero_lede strong { color: var(--ink); }
 .source h3 { color: var(--green_ink); }
 .odo { color: var(--green_ink); }
 .rails_list strong { display: flex; gap: 10px; align-items: baseline; }

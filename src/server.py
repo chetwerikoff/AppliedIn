@@ -461,18 +461,20 @@ def create_app() -> FastAPI:
 
     @app.get("/setup-health")
     def setup_health():
-        import os
         import shutil
+
+        from core.llm_access import missing_access
         checks = []
         resume = Path(settings.config_dir).parent / "resume" / "base.tex"
         has_resume = resume.is_file() and bool(resume.read_text().strip())
         checks.append({"name": "Résumé", "state": "ready" if has_resume else "action",
                        "detail": "Base résumé available." if has_resume else
                        "Add your résumé at resume/base.tex before preparing jobs."})
-        has_key = bool(os.environ.get("OPENAI_API_KEY") or getattr(settings, "openai_api_key", ""))
-        checks.append({"name": "Model access", "state": "ready" if has_key else "action",
-                       "detail": "API key configured; validity is checked on use." if has_key else
-                       "Add OPENAI_API_KEY to .env and restart AppliedIn."})
+        access_problems = missing_access(settings)
+        checks.append({"name": "Model access",
+                       "state": "ready" if not access_problems else "action",
+                       "detail": "Model access configured; validity is checked on use."
+                       if not access_problems else " ".join(access_problems)})
         render = bool(shutil.which("tectonic"))
         checks.append({"name": "PDF rendering", "state": "ready" if render else "action",
                        "detail": "PDF renderer installed." if render else

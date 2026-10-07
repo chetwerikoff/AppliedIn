@@ -57,6 +57,12 @@ say "setup complete."
 # every run, so someone who had already done both was told to do them again, and
 # the message stopped being read at exactly the point it started mattering.
 missing=0
-grep -q '^OPENAI_API_KEY=.\+' .env 2>/dev/null || { warn "put OPENAI_API_KEY in .env"; missing=1; }
+# Which credential is missing depends on the configured models: an OpenAI key,
+# a ChatGPT subscription, or neither when a stage points at another provider.
+# A warning only. Setup still finishes; `start` is what refuses to launch.
+if ! access_problems="$(uv run python -m core.llm_access check)"; then
+  warn "${access_problems:-model access check failed}"
+  missing=1
+fi
 [ -f resume/base.tex ] || { warn "save your résumé to resume/base.tex (LaTeX)"; missing=1; }
 [ "$missing" -eq 0 ] && say "ready — run ./appliedin start"

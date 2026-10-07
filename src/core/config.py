@@ -37,6 +37,15 @@ try:
     # ADK path alike, the same way drop_params does.
     litellm.num_retries = 4
 
+    # chatgpt/* only returns the completion on the stream. Without stream=True,
+    # LiteLLM 1.92 raises APIConnectionError from transform_response
+    # ("Unknown items in responses API response: []"), including with
+    # response_format json_object. Relevance, the crawler, field mapping, the
+    # writer, and ADK LiteLlm all call without stream=True.
+    from .chatgpt_stream import install as _install_chatgpt_stream
+
+    _install_chatgpt_stream()
+
     # And a brake shared by every caller. Retrying inside one call does not help
     # against a per-minute budget the whole process shares: four lanes each
     # retrying independently hit the same ceiling four times over. A rate limit

@@ -52,18 +52,59 @@ exclude_keywords:
   - sales engineer
   - account executive
   - recruiter
+  - hardware
+  - manufacturing
+  - supply chain
+  - air vehicle
+  - mission autonomy
+  - defense
+  - itar
+  - security
 
 # Preferred locations. A blank/unknown location on a posting is allowed.
 locations:
-  - Remote (Worldwide)
-  - Remote (APAC)
-  - Remote (Europe)
+  # Plain keywords, matched against the posting's location text as whole words.
+  # "Remote (Worldwide)" style labels never appear verbatim on a posting.
+  - Remote
+  - Anywhere
+  - Worldwide
+  - APAC
+  - Asia
+  - EMEA
   - Europe
-  - Spain
-  - United States
+  - Vietnam
   - Singapore
-  - Remote (UAE)
+  - Spain
+  - Madrid
+  - Barcelona
+  - Portugal
+  - Lisbon
+  - Germany
+  - Berlin
+  - Munich
+  - Netherlands
+  - Amsterdam
+  - Ireland
+  - Dublin
+  - United Kingdom
+  - UK
+  - London
+  - France
+  - Paris
+  - Poland
+  - Warsaw
   - United Arab Emirates
+  - UAE
+  - Dubai
+  - Abu Dhabi
+  - United States
+  - USA
+  - San Francisco
+  - New York
+  - Seattle
+  - Austin
+  - Boston
+  - Los Angeles
 
 remote_only: false
 

@@ -10,9 +10,12 @@
 # Target roles, in priority order — the crawl searches these top-down and the
 # scorer weighs seniority fit.
 titles:
-  - Senior Software Engineer
-  - Staff Software Engineer
-  - Software Engineer
+  - Technical Program Manager
+  - AI Program Manager
+  - AI Delivery Lead
+  - Engineering Program Manager
+  - Senior Project Manager
+  - Delivery Manager
 
 # Soft signals that RAISE fit (not required).
 include_keywords:
@@ -21,8 +24,12 @@ include_keywords:
   - agentic
   - agents
   - llm
-  - large language model
   - generative ai
+  - ai delivery
+  - ai platform
+  - developer productivity
+  - fintech
+  - payments
   - platform
   - infrastructure
   - ai workflows
@@ -30,49 +37,44 @@ include_keywords:
 
 seniority:
   - senior
+  - lead
   - staff
+  - principal
 
-# Never a fit — technical-sounding NON-engineering roles that leak through.
+# Never a fit.
 exclude_keywords:
   - intern
   - internship
   - new grad
   - security clearance
-  - program manager
-  - project manager
-  - product manager
-  - solutions architect
-  - enterprise architect
-  - support engineer
-  - solutions engineer
+  - android engineer
+  - ios engineer
   - sales engineer
-  - customer engineer
-  - android
-  - ios
-  - mobile
+  - account executive
+  - recruiter
 
 # Preferred locations. A blank/unknown location on a posting is allowed.
 locations:
-  - Seattle
-  - Bellevue
-  - Washington
-  - California
-  - Remote (US)
+  - Remote (Worldwide)
+  - Remote (APAC)
+  - Remote (Europe)
+  - Europe
+  - Spain
+  - United States
+  - Singapore
+  - Remote (UAE)
+  - United Arab Emirates
 
 remote_only: false
 
 # Free-text HARD CONSTRAINTS — read by BOTH the title screen and the JD scorer.
 # Anything violating these is rejected (the scorer caps it at <= 2).
 notes: |
-  - No US security clearance: reject any role that REQUIRES an active or obtainable
-    clearance (Secret, Top Secret, TS/SCI, Public Trust, polygraph). If clearance is
-    not mentioned, it is fine.
-  - Location, in order of preference: (1) Seattle / Bellevue / anywhere in Washington
-    — always prefer these; (2) California (SF Bay Area, LA) when there is no
-    Washington option; (3) US-remote. Score a Washington role ABOVE an otherwise
-    identical California one. Reject a role only if its location is CLEARLY a
-    different US state or another country — an unstated, unclear or "multiple
-    locations" listing is ACCEPTABLE and must not be rejected.
+  - Candidate-specific location, work-authorization and relocation constraints
+    live in the private agent instructions (.local/steering.md), not here.
+  - No security clearance roles.
+  - An unstated, unclear or "multiple locations" listing is ACCEPTABLE and must not
+    be rejected on location alone.
 
 # Stage-2: minimum LLM relevance score (0-10) for a job to proceed to apply.
 min_match_score: 7
@@ -83,4 +85,4 @@ max_new_per_run: 15
 
 # Candidate's public GitHub — the tailor reads the repos (names, languages,
 # topics) as extra context to reword bullets toward each JD.
-github: https://github.com/sayantan94
+github: https://github.com/chetwerikoff

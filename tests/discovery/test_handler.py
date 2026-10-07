@@ -26,6 +26,19 @@ def _isolated_seen(tmp_path, monkeypatch):
     monkeypatch.setattr(_seen, "_path", lambda: tmp_path / "seen.json")
 
 
+@pytest.fixture(autouse=True)
+def _offline_relevance(monkeypatch):
+    """Pass every fetched job through the relevance screen without a model call.
+
+    discover_company runs the real screen, which calls the configured LLM. With
+    no reachable model that call failed, and the failure path recorded an
+    llm_error flag in the developer's real Redis, so the running dashboard
+    showed a "Missing credentials" banner that no live request had caused.
+    These tests cover caps and dedup, not screening.
+    """
+    monkeypatch.setattr(h, "relevant", lambda jobs, prefs, **_: list(jobs))
+
+
 class FakeQueue:
     def __init__(self):
         self.messages = []

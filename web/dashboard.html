@@ -12,6 +12,8 @@
     />
     <link rel="stylesheet" href="styles.css" />
     <link rel="stylesheet" href="career-board.css" />
+    <link rel="stylesheet" href="cosign-board.css" />
+    <link rel="stylesheet" href="motion.css" />
     <link
       rel="icon"
       type="image/svg+xml"
@@ -449,11 +451,25 @@
               </button>
             </div>
           </div>
-          <nav id="find-jobs-views" aria-label="Ways to find jobs" hidden>
-            <button type="button" class="chip" data-find-view="fresh" aria-pressed="false">Fresh</button>
-            <button type="button" class="chip" data-find-view="career-ops" aria-pressed="false">Career Ops search</button>
+          <nav id="find-jobs-views" class="fj-options" aria-label="Ways to find jobs" hidden>
+            <button type="button" class="chip fj-opt" data-find-view="fresh" aria-pressed="false">
+              <span class="fj-opt-name">Fresh</span>
+              <span class="fj-opt-desc">New roles from companies you watch</span>
+              <span class="fj-opt-src">Your watchlist · Greenhouse · Lever · Ashby · Workday · career sites</span>
+            </button>
+            <button type="button" class="chip fj-opt" data-find-view="career-ops" aria-pressed="false">
+              <span class="fj-opt-name">Career Ops search</span>
+              <span class="fj-opt-desc">Find companies you don't track yet</span>
+              <span class="fj-opt-src">Greenhouse · Lever · Ashby · Workday · iCIMS</span>
+            </button>
+            <button type="button" class="chip fj-opt" data-find-view="cosign" aria-pressed="false">
+              <span class="fj-opt-name">Cosign network</span>
+              <span class="fj-opt-desc">Search ~70,000 open roles at once</span>
+              <span class="fj-opt-src">Cosign network · postings on Ashby, Greenhouse, Workday</span>
+            </button>
           </nav>
           <career-board id="career-ops-board" hidden></career-board>
+          <cosign-board id="cosign-board" hidden></cosign-board>
           <section id="steering-panel" class="steering-dialog" aria-labelledby="steering-title" hidden></section>
           <section id="pane" class="pane"></section>
         </main>
@@ -505,6 +521,7 @@
 
     <script src="config.js"></script>
     <script src="career-board.js" type="module"></script>
+    <script src="cosign-board.js" type="module"></script>
     <script src="app.js" type="module"></script>
     <div id="qpicker" class="copicker qpicker" role="dialog" aria-label="Browser controls" hidden>
       <div class="cp-role-h">Browser controls<button id="q-close" type="button" class="iconbtn" aria-label="Close browser controls">✕</button></div>

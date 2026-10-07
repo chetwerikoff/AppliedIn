@@ -73,3 +73,20 @@ def test_posting_applied_elsewhere_is_resolved_even_when_board_never_requested_a
     assert visible["state"] == "pipeline"
     assert stores.tracking.get(pk)["status"] == status
     assert "application" not in visible, "Do not invent a Career Ops apply request"
+
+
+def test_a_failed_row_shows_why_it_failed_not_an_old_approval_prompt():
+    # A Cohere role was refused under the employer's own cap, yet the board said
+    # "Ready to apply? Review the résumé first." — the prompt left over from its
+    # preparation — which read as a request for approval.
+    from discovery.career_progress import application_progress
+
+    got = application_progress({
+        "status": "failed", "fail_kind": "application_limit",
+        "fail_reason": "This EMPLOYER refused the submission under its own application cap.",
+        "gate_pending": {"question": "Ready to apply? Review the résumé first."},
+    })
+    assert got["label"] == "Company's application limit"
+    assert got["detail"].startswith("This EMPLOYER refused")
+    asked = application_progress({"status": "needs_human", "gate_pending": {"question": "Which visa?"}})
+    assert asked["detail"] == "Which visa?"

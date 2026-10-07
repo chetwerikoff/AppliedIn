@@ -23,6 +23,7 @@ from core.config import get_settings
 from core.models import JobRecord
 from core.stores import make_stores
 from discovery.career_ops_setup import REVISION
+from tools.ats import detect_ats
 
 ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "scripts/integrations/career-ops.mjs"
@@ -519,7 +520,8 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 jd_url=url,
                 jd_text=row["description"],
                 location=row["location"],
-                ats=row["provider"],
+                # Cosign is an index, not an ATS; the posting URL names the real one.
+                ats=detect_ats(url) if row["provider"] == "cosign" else row["provider"],
                 posted_at=row["posted_at"],
                 discovery_source="career_ops",
                 apply_requested_at=now() if apply_requested else "",
@@ -533,7 +535,8 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 emit(
                     "discovered",
                     pk=job.pk,
-                    detail=f"Career Ops: {job.title} @ {job.company}",
+                    detail=f"{'Cosign network' if row['provider'] == 'cosign' else 'Career Ops'}: "
+                    f"{job.title} @ {job.company}",
                     url=url,
                 )
             else:

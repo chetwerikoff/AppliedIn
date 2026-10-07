@@ -26,11 +26,18 @@ def application_progress(row: dict, event: dict | None = None, *, in_flight=Fals
             "skipped": "Skipped",
             "job_gone": "Posting closed",
         }.get(status, "Could not finish")
+        if row.get("fail_kind") == "application_limit":
+            label = "Company's application limit"
     elif not status:
         phase, label = "unknown", "Status unavailable"
     reason = ""
     if phase == "attention":
-        reason = (row.get("gate_pending") or {}).get("question") or next(
+        # A gate question is only the reason while the row is actually waiting on
+        # it. A failed row can still carry the "Ready to apply?" prompt from the
+        # preparation it passed through, and showing it read as the board asking
+        # for an approval it was never going to act on.
+        question = (row.get("gate_pending") or {}).get("question") if status == "needs_human" else ""
+        reason = question or next(
             (
                 row[k]
                 for k in ("fail_reason", "jd_read_error", "skip_reason", "gate_reason")

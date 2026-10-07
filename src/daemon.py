@@ -246,6 +246,21 @@ def next_dispatchable(q: Any, mode: str) -> dict | None:
     return q.next(priority_only=not auto_dispatch_allowed(mode))
 
 
+def paused_dispatchable(q: Any, reason: str) -> dict | None:
+    """What may start while applying is paused: only roles the owner pressed Apply on.
+
+    Pressing Apply is a manual instruction for that exact role, and it has always
+    run through an owner's pause (see `career_apply.run_selected`). Leaving it to
+    the pause meant a browser fault mid run parked it until someone approved it
+    again, which is how two roles sat for twelve days waiting on a question
+    nobody was asked. A pause the SYSTEM set still holds: `reason` is set only for
+    a disconnected extension or a signed-out CLI, and every attempt would fail.
+    """
+    if reason:
+        return None
+    return q.next(requested_only=True)
+
+
 def _apply_loop() -> None:
     """APPLY worker — its own thread, so a slow browser apply never blocks the
     evaluate worker.
@@ -282,15 +297,23 @@ def _apply_loop() -> None:
         running: set = set()
         while True:
             running = {f for f in running if not f.done()}
-            if flags.paused():
-                time.sleep(POLL_INTERVAL)
-                continue
-
             # Fold in anything the old flat queue still holds, so an upgrade never
-            # strands work someone already approved.
+            # strands work someone already approved. It runs while paused too: a
+            # role requeued after a browser fault arrives here, and it must keep
+            # the mark that the owner asked for it.
             for it in stores.queue.drain(stores.apply_queue):
                 if (pk := it.get("pk")):
-                    q.put(pk, (stores.tracking.get(pk) or {}).get("company", ""))
+                    row = stores.tracking.get(pk) or {}
+                    q.put(pk, row.get("company", ""),
+                          requested=bool(row.get("apply_requested_at")))
+            if flags.paused():
+                item = None
+                if len(running) < flags.apply_concurrency():
+                    item = paused_dispatchable(q, flags.get_flag("paused_reason"))
+                if item:
+                    running.add(pool.submit(_run_one, item))
+                time.sleep(POLL_INTERVAL)
+                continue
 
             # Recovery runs FIRST and in every mode. It used to sit after the
             # dispatch checks, so adding the gated guard above it stranded every

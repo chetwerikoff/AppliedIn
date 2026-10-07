@@ -4452,6 +4452,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 /* Keep the job workflow visible; group secondary views and controls. */
 #find-jobs-views { display:flex; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border); }
 #find-jobs-views[hidden] { display:none; }
+#find-jobs-views .chip.active { background:var(--fg); color:var(--bg); border-color:var(--fg); font-weight:600; }
+/* Cosign has its own composer; the pipeline's company filter and search do nothing there. */
+.cosign-page #co-filter, .cosign-page #search, .cosign-page #refresh-btn { display:none; }
 #tabs { overflow:visible; flex-wrap:wrap; align-items:center; }
 .nav-more { position:relative; }
 .nav-more > summary { list-style:none; display:flex; gap:8px; align-items:center; cursor:pointer; padding:7px 12px; border:1px solid transparent; border-radius:var(--r-md); font-size:13px; color:var(--muted); }
@@ -4494,3 +4497,42 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .steering-status { flex:1; min-width:150px; font-size:12px; line-height:1.5; color:var(--muted); }
 .steering-save { background:var(--scan); color:var(--scan-ink); border-color:var(--scan); }
 @media(max-width:600px) { .steering-dialog header, .steering-dialog footer, .steering-body { padding:14px; } .steering-status { flex-basis:100%; } .steering-meta { flex-wrap:wrap; } }
+
+/* ─── Cosign polish ──────────────────────────────────────────────────────────
+   Quieter surfaces in the Cosign board's style. Amber keeps its meaning (needs
+   attention), so the Needs you section and its cards use it rather than green. */
+
+/* Status breakdown: one slim bar, the counts as a quiet legend under it. */
+.deck-breakdown { display: block; padding: 4px 0 10px; }
+.bd-bar { display: flex; gap: 2px; height: 6px; margin-bottom: 7px; border-radius: 999px; overflow: hidden; background: var(--card-2); }
+.bd-seg { display: block; flex: 0 1 0; min-width: 3px; height: 100%; background: var(--faint);
+  transition: flex-grow .6s cubic-bezier(.16, 1, .3, 1); }
+.bd-seg.s-ok { background: var(--scan); }
+.bd-seg.s-warn, .bd-seg.s-live { background: var(--run); }
+.bd-seg.s-bad { background: var(--bad); }
+.bd-seg.s-found { background: var(--info); }
+.bd-seg.s-work { background: color-mix(in srgb, var(--scan) 55%, var(--faint)); }
+.bd-seg.s-dim { background: var(--border-2); }
+.bd-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px; color: var(--muted); }
+
+/* The how-to line recedes once it has been read a few times. */
+.deck-help { font-size: 12px; color: var(--faint); }
+.deck-help b { color: var(--muted); font-weight: 600; }
+
+/* Link chips as icons. */
+.rowlk { display: inline-flex !important; align-items: center; justify-content: center; width: 26px; height: 24px; padding: 0;
+  border-radius: 7px; font-family: inherit; text-transform: none; letter-spacing: 0; vertical-align: middle;
+  transition: color .15s cubic-bezier(.2, 0, 0, 1), border-color .15s cubic-bezier(.2, 0, 0, 1), background .15s cubic-bezier(.2, 0, 0, 1), transform .12s cubic-bezier(.2, 0, 0, 1); }
+.rowlk:hover { background: var(--card-2); }
+.rowlk:active { transform: scale(.94); }
+.rowlk.off { opacity: .22; }
+
+/* Needs you: white cards on the page, an amber edge for "waiting on you". */
+.ps-needs.has { border-color: color-mix(in srgb, var(--run) 40%, var(--border)); }
+.ps-needs.has > .ps-head { background: color-mix(in srgb, var(--run) 7%, var(--card)); }
+.ncard { background: var(--card); border-left-color: var(--run); border-radius: 10px; padding: 12px 14px; gap: 9px;
+  transition: border-color .15s cubic-bezier(.2, 0, 0, 1), transform .18s cubic-bezier(.16, 1, .3, 1), box-shadow .2s cubic-bezier(.2, 0, 0, 1); }
+.ncard:hover { border-left-color: var(--run); transform: translateY(-2px); box-shadow: var(--shadow-2); }
+.ncard:active { transform: translateY(0) scale(.99); }
+.nc-gate { color: color-mix(in srgb, var(--run) 75%, var(--muted)); border-color: color-mix(in srgb, var(--run) 35%, var(--border)); }
+@media (prefers-reduced-motion: reduce) { .bd-seg, .ncard, .rowlk { transition: none; } }

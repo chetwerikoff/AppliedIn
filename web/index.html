@@ -3,25 +3,25 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>AppliedIn · the agentic workflow for job applications</title>
-<meta name="description" content="An open-source agent graph that discovers jobs, scores fit, tailors truthful resumes, waits for human approval, and completes applications in your browser." />
-<meta property="og:title" content="AppliedIn · the agentic workflow for job applications" />
-<meta property="og:description" content="A practical agentic workflow for job discovery, resume tailoring, human approval, and browser application." />
+<title>AppliedIn · find the right jobs, apply with a tailored résumé</title>
+<meta name="description" content="AppliedIn searches job boards, scores every role against what you want, tailors a truthful résumé for each match, and fills the application in your own Chrome. Open source, runs on your machine." />
+<meta property="og:title" content="AppliedIn · find the right jobs, apply with a tailored résumé" />
+<meta property="og:description" content="Search job boards, tailor a truthful résumé for each match, and apply from your own browser. Open source and local." />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://www.appliedin.dev/" />
-    <meta property="og:image" content="https://www.appliedin.dev/img/social-cover-sketch-v5.jpg" />
+<meta property="og:image" content="https://www.appliedin.dev/img/social-cover-sketch-v5.jpg" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
 <meta property="og:image:alt" content="Whiteboard sketch of the AppliedIn agent graph from job discovery through a verified application" />
 <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:image" content="https://www.appliedin.dev/img/social-cover-sketch-v5.jpg" />
+<meta name="twitter:image" content="https://www.appliedin.dev/img/social-cover-sketch-v5.jpg" />
 <meta name="twitter:image:alt" content="Whiteboard sketch of the AppliedIn agent graph from job discovery through a verified application" />
-<meta name="theme-color" content="#faf9f7" />
+<meta name="theme-color" content="#f6f7f5" />
 <script>
   (function () {
     try {
       var saved = localStorage.getItem("appliedin.theme");
-      var theme = saved || (window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+      var theme = saved === "dark" ? "dark" : "light";
       document.documentElement.dataset.theme = theme;
     } catch (_) {}
   })();
@@ -29,419 +29,235 @@
 <link rel="icon" href="/logo.svg" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link
-  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap"
-  rel="stylesheet" />
-<link rel="stylesheet" href="/landing.css?v=6" />
+<link href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/site.css?v=12" />
 </head>
 <body>
 
-<header class="topbar">
-  <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
-  <nav class="topnav">
-    <a href="#architecture">Workflow</a>
-    <a href="#product">Product</a>
-    <a href="#guarantees">Guardrails</a>
-    <a href="#start">Get started</a>
-    <a href="/notes">Notes</a>
-    <button class="btn btn_quiet theme_toggle" id="theme-toggle" type="button"
-            aria-label="Switch theme">
-      <span class="theme_icon" aria-hidden="true">◐</span>
-      <span class="theme_label">Theme</span>
-    </button>
-    <a class="btn btn_quiet demo_link" href="/demo">Demo</a>
-    <a class="btn btn_primary" href="https://github.com/sayantan94/AppliedIn">GitHub</a>
-  </nav>
-</header>
-
-<section class="site_hero" id="top">
-  <div class="hero_copy">
-    <p class="eyebrow">Open-source agent graph</p>
-    <h1>
-      <span class="hero_name">AppliedIn</span>
-      <span class="hero_title">The agentic workflow for job applications.</span>
-    </h1>
-    <p class="hero_lede">
-      Discover relevant roles, tailor a truthful resume, approve every change,
-      and let the graph complete the application in your browser.
-    </p>
-    <div class="hero_tags" aria-label="AppliedIn principles">
-      <span>Open source</span>
-      <span>Optional human-in-the-loop</span>
-    </div>
-    <div class="btnrow">
-      <a class="btn btn_primary lg" href="https://github.com/sayantan94/AppliedIn">Explore the repository</a>
-      <a class="btn btn_quiet lg" href="/demo">Try the live demo</a>
-    </div>
-    <p class="hero_note">
-      Start with one job URL. Review the tailored resume before browser
-      automation can act in your name.
-    </p>
-  </div>
-
-  <div class="hero_visual" aria-label="AppliedIn workflow and product dashboard">
-    <div class="hero_frame hero_frame_back" aria-hidden="true">
-      <img src="/img/sketch-boundaries-v2.png" width="1672" height="941"
-           decoding="async" alt="" />
-    </div>
-    <div class="hero_frame hero_frame_front">
-      <div class="hero_chrome" aria-hidden="true"><span></span><span></span><span></span></div>
-      <img src="/img/pipeline-dashboard-v2.png"
-           data-light-src="/img/pipeline-dashboard-v2.png"
-           data-dark-src="/img/pipeline-dashboard-dark-v2.png"
-           width="1800" height="1125"
-           decoding="async" fetchpriority="high"
-           alt="AppliedIn dashboard showing jobs moving from discovery through resume tailoring, approval, and application" />
-    </div>
-    <div class="hero_signal">
-      <span class="hero_signal_dot" aria-hidden="true"></span>
-      <span><strong>Human-in-the-loop</strong><small>available before browser action</small></span>
-    </div>
-  </div>
-</section>
-
-<div class="shell">
-
-  <aside class="sidebar">
-    <p class="side_h">Graph engineering</p>
-    <a href="#top">What it solves</a>
-    <a href="#architecture">Step ownership</a>
-    <a href="#workflow">End-to-end graph</a>
-    <a href="#patterns">Agentic patterns</a>
-    <p class="side_h">The product</p>
-    <a href="#product">Pipeline board</a>
-    <a href="#how">One application run</a>
-    <a href="#tailoring">Resume tailoring</a>
-    <a href="#browser">Local tools and accounts</a>
-    <p class="side_h">Safety</p>
-    <a href="#guarantees">Guardrails</a>
-    <a href="#gates">Optional review gates</a>
-    <p class="side_h">Run it</p>
-    <a href="#start">Get started</a>
-    <a href="#requirements">What you need</a>
-    <a href="#caveats">Before auto-submit</a>
-  </aside>
-
-  <main class="doc">
-    <article>
-
-      <div class="callout callout_info">
-        <p>
-          <strong>You decide where the graph pauses.</strong> Use gated mode to
-          approve each application, or allow strong matches to continue. Missing
-          facts, logins, and uncertain outcomes still return to you.
-        </p>
-      </div>
-
-      <h2 id="architecture">Each step has a clear owner</h2>
-      <p>
-        AppliedIn assigns each part of an application to the actor best suited
-        for it. Code handles repeatable rules. Focused agents handle judgment and
-        changing websites. You control identity, missing facts, and submission.
-      </p>
-
-      <figure class="diagram sketch">
-        <img src="/img/sketch-boundaries-v2.png" width="1672" height="941"
-             loading="lazy" decoding="async"
-             alt="Whiteboard sketch showing code handling filtering and validation, agents handling scoring and navigation, and the human handling approval and verification" />
-        <figcaption>
-          Code handles the facts. Focused agents handle uncertainty. You stay in
-          control when the workflow acts in your name.
-        </figcaption>
-      </figure>
-
-      <h3 id="workflow">From job discovery to verified application</h3>
-      <p>
-        Every job follows explicit states. Tools discover and filter it, focused
-        agents score and tailor it, optional review gates can pause it, and the
-        browser agent verifies the final outcome.
-      </p>
-
-      <figure class="diagram">
-        <img id="workflow-image" src="/img/workflow-light.webp"
-             data-light-src="/img/workflow-light.webp"
-             data-dark-src="/img/workflow-dark.webp"
-             width="1672" height="941"
-             decoding="async" fetchpriority="high"
-             alt="AppliedIn agent graph: discovery routes tools into a queue, a scorer returns a typed match result, a tailor and critic loop validates a resume, a human approves, and a browser agent applies and verifies the outcome." />
-        <figcaption>
-          Discover → Score → Tailor ↔ Critique → Approve → Apply → Verify.
-          Full size: <a href="/img/workflow-light.png">light</a> or
-          <a href="/img/workflow-dark.png">dark</a>.
-        </figcaption>
-      </figure>
-
-      <h2 id="patterns">Agentic patterns behind the workflow</h2>
-      <div class="cards cols_2">
-        <div class="card">
-          <h3>Sequential orchestration</h3>
-          <p>
-            Explicit stages keep the business process inspectable and make
-            recovery possible when a long-running step fails.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Structured output</h3>
-          <p>
-            The scorer returns a typed 0–10 MatchScore instead of prose that
-            downstream code has to interpret.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Review and critique</h3>
-          <p>
-            The tailor writes, tools validate, and the critic gets no more than
-            two passes to request one focused revision.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Human-in-the-loop</h3>
-          <p>
-            Approval, unknown facts, logins, and CAPTCHAs pause the workflow and
-            return control to the owner.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Tool routing</h3>
-          <p>
-            Structured feeds handle known job boards. Browser-capable discovery
-            is used only when the deterministic path cannot resolve a page.
-          </p>
-        </div>
-        <div class="card">
-          <h3>Bounded browser autonomy</h3>
-          <p>
-            The browser observes, acts, and verifies, but cannot invent missing
-            answers or retry an uncertain submission blindly.
-          </p>
-        </div>
-      </div>
-
-      <hr />
-
-      <h2 id="product">See every job move through the graph</h2>
-      <p>
-        Jobs move through explicit states on a local board. A role can be found,
-        tailored, waiting for you, submitting, applied, failed, or uncertain.
-      </p>
-
-      <figure class="diagram">
-        <img src="/img/pipeline-dashboard-v2.png"
-             data-light-src="/img/pipeline-dashboard-v2.png"
-             data-dark-src="/img/pipeline-dashboard-dark-v2.png"
-             width="1800" height="1125"
-             loading="lazy" decoding="async"
-             alt="AppliedIn dashboard showing jobs moving from found to tailored, waiting for approval, and applied" />
-        <figcaption>
-          The real dashboard running on sample data.
-          <a href="/demo">Open the interactive demo</a>.
-        </figcaption>
-      </figure>
-
-      <h2 id="how">From one job URL to a completed application</h2>
-      <div class="cards cols_3">
-        <div class="card">
-          <p class="card_n">01</p>
-          <h3>Find and score</h3>
-          <p>
-            Reads the boards you follow, removes obvious mismatches, deduplicates
-            roles, and stops low scores before expensive work begins.
-          </p>
-        </div>
-        <div class="card">
-          <p class="card_n">02</p>
-          <h3>Tailor and validate</h3>
-          <p>
-            Rewords existing resume content toward the role while code preserves
-            every bullet and anchored fact and produces a valid PDF.
-          </p>
-        </div>
-        <div class="card">
-          <p class="card_n">03</p>
-          <h3>Approve and apply</h3>
-          <p>
-            Shows what changed, waits for approval, fills the employer form from
-            approved facts, and verifies the final confirmation.
-          </p>
-        </div>
-      </div>
-
-      <h3 id="tailoring">Tailor the resume without changing the facts</h3>
-      <p>
-        The tailor can adapt wording and emphasis for a role. Validation keeps
-        every source fact anchored, produces a real PDF, and limits the critic
-        to one focused revision across no more than two passes.
-      </p>
-
-      <figure class="diagram sketch">
-        <img src="/img/sketch-tailor-loop-v2.png" width="1672" height="941"
-             loading="lazy" decoding="async"
-             alt="Whiteboard sketch showing a resume tailoring agent, deterministic fact validation, a critic, and a two pass limit" />
-        <figcaption>
-          The agent adapts the resume for relevance. Code protects the source
-          facts and produces the final PDF.
-        </figcaption>
-      </figure>
-
-      <h2 id="gates">Choose where the workflow pauses</h2>
-      <p>
-        In gated mode, you review the tailored resume before the browser acts.
-        In automatic mode, strong matches can continue without that pause.
-        Missing information, logins, CAPTCHAs, and uncertain outcomes always
-        return to you instead of becoming invented answers.
-      </p>
-
-      <figure class="diagram sketch">
-        <img src="/img/sketch-human-browser-v2.png" width="1672" height="941"
-             loading="lazy" decoding="async"
-             alt="Whiteboard sketch showing a tailored resume moving through human approval, browser action, and verified outcomes" />
-        <figcaption>
-          Review can be optional. Confirmation, human questions, and uncertain
-          outcomes always remain separate paths.
-        </figcaption>
-      </figure>
-
-      <p>
-        The same boundaries stay visible on the product board.
-      </p>
-
-      <figure class="diagram">
-        <img src="/img/human-gates-v2.png"
-             data-light-src="/img/human-gates-v2.png"
-             data-dark-src="/img/human-gates-dark-v2.png"
-             width="1800" height="1125"
-             loading="lazy" decoding="async"
-             alt="AppliedIn review queue showing approval, answer, and browser login gates" />
-        <figcaption>
-          Optional approvals, missing information, and browser handoffs use the
-          same durable gate mechanism.
-        </figcaption>
-      </figure>
-
-      <h2 id="browser">What runs locally, and what requires an account</h2>
-      <p>
-        The workflow and application history stay on your machine. Core graph
-        reasoning uses your OpenAI key. Automatic form submission uses Claude
-        Code and its Chrome integration in the browser session you control.
-      </p>
-
-      <div class="cards cols_3 tight">
-        <div class="card">
-          <h3>Core graph</h3>
-          <p class="mono_note">your OpenAI key</p>
-        </div>
-        <div class="card">
-          <h3>Form submission</h3>
-          <p class="mono_note">your Claude subscription</p>
-        </div>
-        <div class="card">
-          <h3>Files and history</h3>
-          <p class="mono_note">your local machine</p>
-        </div>
-      </div>
-
-      <h2 id="guarantees">Safety rules the model cannot bypass</h2>
-      <p>
-        A boundary written only in a prompt is a boundary nobody is enforcing.
-        These rules also live at the tool and state layers.
-      </p>
-
-      <div class="cards cols_2">
-        <div class="card">
-          <h3>Truthful resume</h3>
-          <p>Every bullet and anchored fact is checked before a tailored copy is saved.</p>
-        </div>
-        <div class="card">
-          <h3>No duplicate application</h3>
-          <p>A job already marked applied or applied manually is refused before submission.</p>
-        </div>
-        <div class="card">
-          <h3>No invented answer</h3>
-          <p>An unknown required field becomes a human question instead of a guess.</p>
-        </div>
-        <div class="card">
-          <h3>No unproven success</h3>
-          <p>Without positive confirmation, the result is uncertain—not applied.</p>
-        </div>
-      </div>
-
-      <figure class="diagram">
-        <img src="/img/agent-logs-v2.png"
-             data-light-src="/img/agent-logs-v2.png"
-             data-dark-src="/img/agent-logs-dark-v2.png"
-             width="1800" height="1125"
-             loading="lazy" decoding="async"
-             alt="AppliedIn activity log showing agent steps, tools, human gates, failures, and confirmations" />
-        <figcaption>
-          Every model step, tool call, gate, failure, and confirmed submission is
-          visible and filterable.
-        </figcaption>
-      </figure>
-
-      <hr />
-
-      <h2 id="start">Run AppliedIn locally</h2>
-      <div class="code">
-<pre><code><span class="d"># clone, configure and start</span>
-git clone https://github.com/sayantan94/AppliedIn.git
-cd AppliedIn
-cp .env.example .env
-./appliedin setup
-./appliedin start        <span class="d">→ http://localhost:8787/</span></code></pre>
-      </div>
-      <p>
-        Put the OpenAI API key in <code>.env</code>, add your self-contained
-        LaTeX resume at <code>resume/base.tex</code>, and start with one job URL.
-      </p>
-
-      <h3 id="requirements">What you need</h3>
-      <table class="req">
-        <thead><tr><th>For</th><th>You need</th></tr></thead>
-        <tbody>
-          <tr>
-            <td>Discovery, scoring, and resume tailoring</td>
-            <td>macOS or Linux, Python 3.12, Redis, LaTeX, and an OpenAI API key</td>
-          </tr>
-          <tr>
-            <td>Automatic application submission</td>
-            <td>
-              Everything above, plus Chrome or Edge,
-              <a href="https://code.claude.com">Claude Code</a>, the Chrome
-              integration, and an active direct Claude Pro, Max, Team, or
-              Enterprise subscription
-            </td>
-          </tr>
-        </tbody>
-      </table>
-
-      <h2 id="caveats">Before you enable automatic submission</h2>
-      <div class="callout callout_warn">
-        <p>
-          <strong>Applications go out under your name.</strong> Review the resume,
-          answers, and employer terms before submission.
-        </p>
-        <ul>
-          <li>AppliedIn does not solve CAPTCHAs.</li>
-          <li>An employer may prohibit automated applications.</li>
-          <li>Generated text can still be wrong; inspect it before approving.</li>
-        </ul>
-      </div>
-
-    </article>
-
-    <footer class="doc_foot">
-      <p class="foot_links">
-        <a href="https://github.com/sayantan94/AppliedIn">GitHub</a>
-        <a href="https://github.com/sayantan94/AppliedIn/blob/main/LICENSE">MIT licence</a>
-        <a href="/demo">Demo</a>
-        <a href="https://sayantan.sh/">Contact</a>
-      </p>
-      <p class="muted">For details, visit sayantan.sh</p>
-    </footer>
-
-  </main>
+<div class="announce" id="announce" data-release="v1.2.0" role="region" aria-label="What's new">
+  <a class="announce_link" href="/whats-new">
+    <span class="announce_tag">New</span>
+    <span class="announce_text"><strong>AppliedIn v1.2.0</strong><span class="announce_more">: Cosign network search, one-click apply and live application steps</span></span>
+    <span class="announce_cta">See what's new <span aria-hidden="true">→</span></span>
+  </a>
+  <button class="announce_close" type="button" aria-label="Dismiss announcement">×</button>
 </div>
 
-<script src="/landing.js?v=4" defer></script>
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="/logo.svg" alt="" width="24" height="24" />AppliedIn</a>
+    <nav class="topnav" aria-label="Sections">
+      <a href="#sources">Job boards</a>
+      <a href="#guardrails">Guardrails</a>
+      <a href="#how">How it works</a>
+      <a href="#start">Get started</a>
+      <a href="/whats-new">What's new</a>
+      <a href="/notes">Notes</a>
+    </nav>
+    <div class="topbar_actions">
+      <button class="btn btn_small theme_toggle" id="theme-toggle" type="button" aria-label="Switch theme">
+        <span class="theme_icon" aria-hidden="true">◐</span><span class="theme_label">Theme</span>
+      </button>
+      <a class="btn btn_small demo_link" href="/demo">Demo</a>
+      <a class="btn btn_small btn_primary" href="https://github.com/sayantan94/AppliedIn">GitHub</a>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap">
+      <div>
+        <p class="hero_kicker">Open source, runs on your machine</p>
+        <h1><span class="hero_name">AppliedIn</span> <span class="hero_line">Find the right jobs.</span> <span class="hero_line">Apply with a tailored résumé.</span></h1>
+        <p class="hero_lede">
+          AppliedIn searches job boards, scores every role against what you want,
+          <strong>tailors a truthful résumé for each match</strong>, and fills the
+          application in your own Chrome. Open source, and it runs on your machine.
+        </p>
+        <div class="hero_actions">
+          <a class="btn btn_primary" href="https://github.com/sayantan94/AppliedIn">Get it on GitHub</a>
+          <a class="btn" href="/demo">Try the demo</a>
+        </div>
+        <p class="hero_meta">MIT licensed. Your résumé, answers and logins stay on your computer.</p>
+      </div>
+
+      <figure class="ticket" id="ticket" aria-label="One application moving from search to submitted">
+        <div class="ticket_search" aria-label="Search: Staff AI platform roles in Seattle or remote, $200K+">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+          <span class="ticket_query" aria-hidden="true"><span style="--w:0">Staff</span> <span style="--w:1">AI</span> <span style="--w:2">platform</span> <span style="--w:3">roles</span> <span style="--w:4">in</span> <span style="--w:5">Seattle</span> <span style="--w:6">or</span> <span style="--w:7">remote,</span> <span style="--w:8">$200K+</span></span>
+        </div>
+        <div class="ticket_head">
+          <div>
+            <p class="ticket_role">Senior Staff Software Engineer, AI/ML</p>
+            <p class="ticket_co">Snorkel AI, San Francisco</p>
+          </div>
+          <span class="ticket_state"><span class="is_run">Applying</span><span class="is_done">Applied</span></span>
+        </div>
+        <p class="ticket_score"><b>9</b>/10 match with your preferences</p>
+        <ol class="steps" aria-hidden="true">
+          <li style="--on:1.6s;--done:2.4s"><i></i>Score</li>
+          <li style="--on:2.4s;--done:3.4s"><i></i>Tailor</li>
+          <li style="--on:3.4s;--done:4.2s"><i></i>Check</li>
+          <li style="--on:4.2s;--done:7.2s"><i></i>Apply</li>
+          <li style="--on:7.2s;--done:7.4s"><i></i>Submitted</li>
+        </ol>
+        <ol class="log">
+          <li style="--t:1.6s"><time>10:26</time><span>Found in the Cosign network, posted on Greenhouse</span></li>
+          <li style="--t:2.4s"><time>10:26</time><span>Scored 9 out of 10: agent workflows, LLM evaluation and platform work line up</span></li>
+          <li style="--t:3.4s"><time>10:27</time><span>Résumé tailored for this role</span></li>
+          <li style="--t:4.2s"><time>10:27</time><span>Checked against your original: every fact still true</span></li>
+          <li style="--t:5s"><time>10:27</time><span>Filling the form in your own Chrome</span></li>
+          <li class="good" style="--t:7.2s"><time>10:32</time><span>Submitted. The page said “Thank you for applying.”</span></li>
+        </ol>
+        <div class="ticket_foot">
+          <span>A real run, shown at speed</span>
+          <button class="replay" type="button">Replay</button>
+        </div>
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="sources">
+    <div class="wrap">
+      <h2>Search the boards where jobs are posted.</h2>
+      <p class="section_lede">
+        Three ways to search, all starting from your preferences. Every result shows
+        the board its posting lives on, so you always know where you're applying.
+      </p>
+      <div class="boards3d" id="boards3d" aria-hidden="true"><canvas></canvas></div>
+      <div class="sources">
+        <div class="source">
+          <h3>Fresh</h3>
+          <p>New roles at the companies you watch, read straight from their boards.</p>
+          <p class="source_from">Your watchlist on Greenhouse, Lever, Ashby, Workday and company career sites</p>
+        </div>
+        <div class="source">
+          <h3>Career Ops search</h3>
+          <p>Companies you don't track yet, searched in batches you can stop and continue.</p>
+          <p class="source_from">Greenhouse, Lever, Ashby, Workday and iCIMS</p>
+        </div>
+        <div class="source">
+          <h3>Cosign network</h3>
+          <p>About <span class="odo" data-to="71572">71,572</span> open roles, searched by title, city, salary and remote.</p>
+          <p class="source_from">The Cosign network, with postings on Ashby, Greenhouse and Workday</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="apply">
+    <div class="wrap">
+      <div class="press_head">
+        <h2>Select the roles. Press Apply.</h2>
+        <p class="section_lede">
+          Each role is scored first, and only the ones that clear your bar are tailored
+          and sent, one per company at a time. You're asked only when a form needs an
+          answer it doesn't have. Everything else shows up on one board.
+        </p>
+      </div>
+      <figure class="shot">
+        <img src="/img/dashboard-v3-light.png"
+             data-light-src="/img/dashboard-v3-light.png"
+             data-dark-src="/img/dashboard-v3-dark.png"
+             width="2880" height="1800" loading="lazy" decoding="async"
+             alt="The AppliedIn dashboard on sample data: questions waiting for you, the application queue, and live activity" />
+      </figure>
+      <p class="shot_caption">The dashboard on sample data. <a href="/demo">Open the interactive demo</a></p>
+    </div>
+  </section>
+
+  <section class="section" id="guardrails">
+    <div class="wrap rails">
+      <div>
+        <h2>The rules live in code, not in a prompt.</h2>
+        <p class="section_lede">
+          An application goes out under your name and can't be taken back. These checks
+          run no matter what the model says.
+        </p>
+      </div>
+      <ul class="rails_list">
+        <li><strong>No invented answers</strong><span>Missing facts, logins and CAPTCHAs come back to you instead of being guessed.</span></li>
+        <li><strong>No unconfirmed “applied”</strong><span>If the confirmation page never appears, the application is marked uncertain, not applied.</span></li>
+        <li><strong>Checks for duplicates</strong><span>Checked before the browser opens, and again right before submit.</span></li>
+        <li><strong>No rewritten history</strong><span>The tailor rewords and reorders. Code checks every fact against your original résumé.</span></li>
+        <li><strong>No declared protected traits</strong><span>Disability, veteran status, race and gender can be declined, never affirmed.</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="how">
+    <div class="wrap how">
+      <div>
+        <h2>A graph with clear owners.</h2>
+        <p>
+          Code handles the rules that repeat. Focused agents score roles, tailor the
+          résumé and review the edit. A browser agent fills the form. You keep identity,
+          missing facts and, if you want it, the final say.
+        </p>
+        <a class="how_link" href="/notes">Read the talk notes on graph workflows</a>
+      </div>
+      <figure class="diagram">
+        <img src="/img/workflow-light.webp"
+             data-light-src="/img/workflow-light.webp"
+             data-dark-src="/img/workflow-dark.webp"
+             width="1672" height="941" loading="lazy" decoding="async"
+             alt="AppliedIn workflow: discover, score, tailor with a critic loop, approve, apply and verify" />
+      </figure>
+    </div>
+  </section>
+
+  <section class="section" id="start">
+    <div class="wrap start">
+      <div>
+        <h2>Run it on your machine.</h2>
+        <p class="section_lede">Start with one job link and see a tailored résumé before anything touches a browser.</p>
+        <pre class="term"><span class="c"># clone and install</span>
+git clone https://github.com/sayantan94/AppliedIn.git
+cd AppliedIn && cp .env.example .env
+./appliedin setup
+
+<span class="c"># add your OpenAI key to .env and your résumé to resume/base.tex</span>
+./appliedin start --no-discover</pre>
+      </div>
+      <div>
+        <div class="needs">
+          <h3>What you need</h3>
+          <ul>
+            <li>macOS or Linux, and an <strong>OpenAI API key</strong> for scoring and résumé tailoring.</li>
+            <li><strong>Claude</strong> to apply: Claude Code with its Chrome extension, on a Pro, Max, Team or Enterprise plan.</li>
+            <li>Your résumé in LaTeX, so it can be tailored and rendered to PDF.</li>
+            <li><strong>Codex is optional.</strong> Use it instead of Claude for Career Ops web search if you prefer.</li>
+          </ul>
+          <p class="needs_note">Setup installs the rest: Python, Redis, the LaTeX renderer, Git and Node.js.</p>
+        </div>
+        <div class="caveats">
+          <h3>Before you turn on automatic submission</h3>
+          <ul>
+            <li>Read a few tailored résumés and answered forms first.</li>
+            <li>Fill in your application facts, so forms aren't left to guesswork.</li>
+            <li>Some companies cap applications per period. Pick roles you actually want.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <span>AppliedIn is open source under the MIT license.</span>
+    <nav aria-label="Footer">
+      <a href="https://github.com/sayantan94/AppliedIn">GitHub</a>
+      <a href="/whats-new">What's new</a>
+      <a href="/notes">Notes</a>
+      <a href="/demo">Demo</a>
+    </nav>
+  </div>
+</footer>
+
+<script src="/landing.js?v=6" defer></script>
+<script src="/site.js?v=3" defer></script>
+<script type="module" src="/boards3d.js?v=5"></script>
 </body>
 </html>

@@ -27,31 +27,58 @@ def test_apply_request_is_durable_before_evaluation_can_start(board):
     assert stores.tracking.get("acme#two") is None
 
 
-def test_manual_apply_scores_then_dispatches_only_selected_job_while_paused(board, monkeypatch):
+def test_manual_apply_queues_only_the_selected_job_and_it_runs_while_paused(board, monkeypatch):
+    # An owner's pause stops automatic applying, not the roles they pressed Apply
+    # on: those always ran through it. The worker may start exactly that role
+    # and nothing else waiting at the same company.
     from agent import run
+    from daemon import paused_dispatchable
 
     stores, rows = board
     result = co.prepare([rows[0]["id"]], apply_requested=True)
     pk = result["pks"][0]
     queue = ApplyQueue(stores.tracking.r)
     queue.put("acme#unselected", "Acme")
-    monkeypatch.setattr("core.flags.paused", lambda: True)
 
     def tailor(key, st, **kwargs):
         assert key == pk and kwargs["prepare_only"]
         st.tracking.set_status(pk, Status.TAILORED, resume_s3_key="resume.pdf")
+        return {"result": "prepared"}
 
     monkeypatch.setattr(run, "run_job", tailor)
-
-    def submit(item, q):
-        assert item["pk"] == pk
-        q.done(item)
-
-    submitted = Mock(side_effect=submit)
-    monkeypatch.setattr(run, "run_queued", submitted)
     career_apply.run_selected([pk], stores)
-    assert submitted.call_count == 1
-    assert [item["pk"] for item in queue.pending()] == ["acme#unselected"]
+    item = paused_dispatchable(queue, reason="")
+    assert item["pk"] == pk
+    assert stores.tracking.get(pk)["gate_reason"] == ""  # not waiting on a question
+    queue.done(item)
+    assert paused_dispatchable(queue, reason="") is None  # the unselected role waits
+
+
+def test_a_system_pause_holds_even_requested_roles(board, monkeypatch):
+    # A disconnected extension or signed-out CLI fails every attempt the same
+    # way; the pause it sets must hold until a person fixes it.
+    stores, rows = board
+    queue = ApplyQueue(stores.tracking.r)
+    queue.put("acme#one", "Acme", requested=True)
+    from daemon import paused_dispatchable
+
+    assert paused_dispatchable(queue, reason="the Claude browser extension is disconnected") is None
+
+
+def test_a_browser_fault_keeps_the_owners_apply(board, monkeypatch):
+    # Honeycomb and Docker sat for twelve days: the extension was disconnected,
+    # the role went back as an ordinary queued job, and gated mode parked it
+    # behind an approval nobody was asked for.
+    from agent.run import _requeue_untouched
+
+    stores, rows = board
+    pk = co.prepare([rows[0]["id"]], apply_requested=True)["pks"][0]
+    _requeue_untouched(pk, stores)
+    assert stores.tracking.get(pk)["gate_reason"] == ""
+    folded = []
+    stores.queue.enqueue.side_effect = lambda q, m: folded.append(m)
+    _requeue_untouched(pk, stores)
+    assert folded == [{"pk": pk}]
 
 
 @pytest.mark.parametrize(

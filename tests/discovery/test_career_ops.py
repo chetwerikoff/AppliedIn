@@ -390,6 +390,8 @@ async def test_progress_stream_replays_then_finishes_when_search_ends(board, mon
 def test_network_matches_are_saved_before_failure_and_wait_for_selection(board, monkeypatch):
     from discovery import career_network as network
 
+    # The scan classifies in this same thread. This test is about saving matches.
+    monkeypatch.setattr("discovery.career_fit.classify_search", lambda search_id: None)
     stores, rows = board
     filters = {
         "ats": ["ashby"],
@@ -490,6 +492,8 @@ def test_unified_search_uses_selected_client_and_boards_before_directory_expansi
 ):
     from discovery import career_network as network
 
+    # The scan classifies in this same thread. This test is about the client order.
+    monkeypatch.setattr("discovery.career_fit.classify_search", lambda search_id: None)
     stores, _ = board
     filters = {
         "provider": "codex",

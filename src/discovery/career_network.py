@@ -284,6 +284,15 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
                     data["network_search"] = state
                 co._write(data)
         finally:
+            # Same thread, still holding the scan reservation: the board lock is
+            # in-process only, so another scan must not start until tiers are stored.
+            try:
+                if state.get("id"):
+                    from discovery.career_fit import classify_search
+
+                    classify_search(state["id"])
+            except Exception:
+                co.log.exception("Career domain classification failed")
             with co._LOCK:
                 co._RUNNING = False
                 co._ACTIVE = {}

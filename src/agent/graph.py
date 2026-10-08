@@ -287,9 +287,135 @@ def _skill(name: str) -> SkillToolset:
     return SkillToolset(skills=[load_skill_from_dir(_SKILLS / name)])
 
 
+
+# ADK 2.5.0 validates a final output_schema response before yielding its event.
+# A malformed reply therefore cannot be repaired by the runner's event loop.
+# Keep recovery inside this agent so the sequential graph cannot enter tailoring
+# without a fresh, terminal, schema-validated MatchScore.
+from contextlib import aclosing
+from contextvars import ContextVar
+
+from core import steering as _steering
+
+
+class ScorerInvalidOutput(Exception):
+    """Both scorer generations completed without a valid terminal MatchScore."""
+
+
+class ScorerModelError(RuntimeError):
+    """The scorer model/transport failed; unlike bad content this is an error."""
+
+
+class _ScorerBadContent(Exception):
+    """A normally completed model generation returned invalid score content."""
+
+
+_SCORER_REASK: ContextVar[bool] = ContextVar("scorer_reask", default=False)
+_SCORER_STEERING: ContextVar[str | None] = ContextVar("scorer_steering", default=None)
+_SCORER_FORMAT_CORRECTION = (
+    "Your previous response did not validate as MatchScore. Using the SAME "
+    "résumé, job description, preferences and constraints above, reply with "
+    "ONLY one JSON object: {\"score\": <integer 0..10>, \"reasoning\": "
+    "\"<one-line explanation>\"}. No Markdown or other text."
+)
+
+
+def _scorer_before_model(callback_context, llm_request):
+    # Freeze the existing before_model steering across the two attempts. A
+    # change on disk between calls must not change the candidate being scored.
+    guidance = _SCORER_STEERING.get()
+    if guidance is None:
+        before_model(callback_context, llm_request)
+    elif guidance:
+        llm_request.append_instructions([guidance])
+    if _SCORER_REASK.get():
+        llm_request.append_instructions([_SCORER_FORMAT_CORRECTION])
+
+
+def _scorer_after_model(callback_context, llm_response):
+    # This callback runs before ADK's __maybe_save_output_to_state. Raise our
+    # content-only marker here, not after model_validate_json has already
+    # escaped as an indistinguishable pipeline exception.
+    if llm_response.error_code:
+        raise ScorerModelError("The scorer model reported an error; no score was accepted.")
+    if llm_response.partial:
+        return None
+    parts = getattr(llm_response.content, "parts", None) or ()
+    text = "".join(part.text or "" for part in parts
+                   if not getattr(part, "thought", False))
+    try:
+        MatchScore.model_validate_json(text)
+    except ValueError as exc:
+        raise _ScorerBadContent("Scorer returned no valid terminal score") from exc
+    return None
+
+
+class _SafeScorer(LlmAgent):
+    async def _run_async_impl(self, ctx):
+        # Buffer scorer events until their current-run validated output-key
+        # witness exists. Interim/partial text and stale session state never
+        # unlock the next SequentialAgent stage, even on an empty completion.
+        steering_token = _SCORER_STEERING.set(_steering.instructions())
+        try:
+            for attempt in range(2):
+                reask_token = _SCORER_REASK.set(attempt == 1)
+                try:
+                    events = []
+                    witness = None
+                    async with aclosing(super()._run_async_impl(ctx)) as agen:
+                        async for event in agen:
+                            if event.error_code:
+                                raise ScorerModelError(
+                                    "The scorer model reported an error; no score was accepted."
+                                )
+                            if event.author == self.name and event.is_final_response():
+                                delta = event.actions.state_delta.get(self.output_key)
+                                parts = getattr(event.content, "parts", None) or ()
+                                terminal_text = "".join(
+                                    part.text or "" for part in parts
+                                    if not getattr(part, "thought", False)
+                                )
+                                if terminal_text.strip() and delta is not None:
+                                    try:
+                                        score = MatchScore.model_validate_json(terminal_text)
+                                        if MatchScore.model_validate(delta) != score:
+                                            raise _ScorerBadContent(
+                                                "Terminal score does not match ADK state"
+                                            )
+                                    except ValueError as exc:
+                                        raise _ScorerBadContent(
+                                            "Terminal scorer event is not schema-valid"
+                                        ) from exc
+                                    witness = score
+                            events.append(event)
+                    if witness is not None:
+                        for event in events:
+                            yield event
+                        return
+                except _ScorerBadContent:
+                    # Exactly one same-agent, same-context correction; the
+                    # invalid generation is never exposed to the next agent.
+                    pass
+                except ScorerModelError:
+                    raise
+                except Exception as exc:
+                    # Never turn a provider/transport failure into bad content.
+                    raise ScorerModelError(
+                        "The scorer invocation failed; no score was accepted."
+                    ) from exc
+                finally:
+                    _SCORER_REASK.reset(reask_token)
+            raise ScorerInvalidOutput(
+                "Scorer returned no schema-valid final MatchScore after one correction."
+            )
+        finally:
+            _SCORER_STEERING.reset(steering_token)
+
+
 # --- agents ------------------------------------------------------------------
-scorer = LlmAgent(
-    before_model_callback=before_model,
+scorer = _SafeScorer(
+    before_model_callback=_scorer_before_model,
+    after_model_callback=_scorer_after_model,
     name="scorer", model=_model("scorer"),
     description="Agentic discovery: extract the role and match-score it.",
     instruction=(

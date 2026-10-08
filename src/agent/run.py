@@ -495,6 +495,9 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
     # Terminal states are refused here as well as at dispatch. Queueing an applied
     # row is harmless (the duplicate guard catches it) but it spends that company's
     # turn on a job that cannot run.
+    if row.get("possible_submission"):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") in ("applied", "applied_manual"):
         log.warning("refusing to queue %s: already %s", pk, row.get("status"))
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
@@ -700,6 +703,9 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
 
     stores = stores or make_stores()
     row = stores.tracking.get(pk) or {}
+    if row.get("possible_submission"):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": "possible submission; check the employer portal before retrying"}
     call_id = row.get("gate_call_id")
     if not call_id:
         # Ungated TAILORED rows (tailored before approval gates kept status, or
@@ -771,6 +777,19 @@ def run_queued(item: dict, q: Any) -> dict:
         return result
     except Exception as exc:  # noqa: BLE001 — one bad apply must not kill the worker
         log.exception("apply crashed for %s", pk)
+        try:
+            row = make_stores().tracking.get(pk) or {}
+        except Exception:
+            row = {"possible_submission": True}  # cannot prove it is safe to retry
+        if row.get("possible_submission"):
+            try:
+                make_stores().tracking.set_status(
+                    pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
+                    fail_kind="uncertain", fail_reason="possible submission; check the employer portal before retrying")
+            except Exception:
+                log.exception("could not settle possible submission for %s", pk)
+            return {"result": "failed", "pk": pk, "reason": "uncertain",
+                    "detail": "possible submission; check the employer portal before retrying"}
         q.retry(item, f"crashed: {exc}")
         return {"result": "error", "pk": pk, "reason": str(exc)}
     finally:
@@ -797,6 +816,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # SKIPPED belongs here too. Skipping only set the tracking status and left the
     # pk sitting in the apply queue, so a job the owner had explicitly declined was
     # still dispatched and applied to. "I do not want this one" has to mean it.
+    if row.get("possible_submission"):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") == Status.SKIPPED.value:
         detail = ("Refusing to apply: you skipped this job. Removing it from the "
                   "queue rather than sending it.")
@@ -945,6 +967,19 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source="writer")
 
     status = result.get("status")
+    # The durable pre-click marker outranks a transport return that says
+    # "gate" or "unknown": the browser might already have committed a form.
+    if (stores.tracking.get(pk) or {}).get("possible_submission") and status != "applied":
+        status = "uncertain"
+        result["status"] = status
+    if status == "uncertain":
+        reason = "possible submission; check the employer portal before retrying"
+        stores.tracking.set_status(
+            pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
+            fail_kind="uncertain", fail_reason=reason,
+            gate_pending={"question": reason}, gate_call_id=None)
+        emit("gate", pk=pk, agent="applier", detail=reason, url=jd_url)
+        return {"result": "failed", "pk": pk, "reason": "uncertain", "detail": reason}
     if status == "applied":
         conf = result.get("confirmation") or "submitted"
         stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf)
@@ -1034,7 +1069,10 @@ def _requeue_untouched(pk: str, stores: Any) -> None:
     A role the owner pressed Apply on keeps that instruction: it waits for the
     browser, not for a second go-ahead.
     """
-    requested = bool((stores.tracking.get(pk) or {}).get("apply_requested_at"))
+    row = stores.tracking.get(pk) or {}
+    if row.get("possible_submission"):
+        return
+    requested = bool(row.get("apply_requested_at"))
     stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
                                fail_reason="", fail_kind="")
     stores.queue.enqueue(stores.apply_queue, {"pk": pk})
@@ -1085,6 +1123,9 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return {"result": "missing", "pk": pk}
     # Never let a retry wipe an APPLIED row back to found — that path re-runs the
     # whole pipeline including the submit, i.e. a duplicate application.
+    if row.get("possible_submission"):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") in ("applied", "applied_manual"):
         log.warning("retry refused for pk=%s: already %s", pk, row.get("status"))
         from core.events import emit
@@ -1241,9 +1282,7 @@ def _fail_reason(outcome: dict) -> str:
     if reason in _BOARD_SAID_NO:
         return _BOARD_SAID_NO[reason] + (f" The board said: {detail}" if detail else "")
     if status == "uncertain":
-        return ("The form was filled and submit was clicked, but NO confirmation "
-                "appeared (the page redirected). The application may not have gone "
-                "through — verify it manually, or retry.")
+        return detail or "possible submission; check the employer portal before retrying"
     if status == "unknown":
         if not detail:  # agent produced no final report at all — an internal error
             return ("The browser agent ended without any final report — most likely "

@@ -258,6 +258,25 @@ GPT turns, `coworker` and other external models get code, scrubbed diffs and
 test output only. Check diff, commit messages and GitHub text before every push;
 a leak is a stop condition reported to the operator, never hidden by force-push.
 
+## Browser profiles
+
+Two Chrome profiles exist on the operator's machine and never mix:
+
+- **The application profile** (its own user-data-dir, pinned in
+  `config/browser.local.yaml`) holds the owner's real sign-ins. Everything done
+  in it is done as the owner. Only the daemon's paths drive it: posting reads,
+  browser discovery and approved applications.
+- **The pack profile** (the automation Chrome on CDP 9222) is where managers and
+  firefighters talk to Browser-GPT. It never opens a job site, the dashboard or
+  an application form.
+
+In the application profile agents never browse ad hoc, "warm" history, sign in,
+create accounts, enter passwords or solve CAPTCHAs; a login wall is a human gate.
+No other tool (Orca's browser, `claude --chrome`, the pack Chrome) is pointed at
+it. Never copy, delete or reset its directory, switch the pinned instance, or
+publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run
+by the firefighter or the operator in the primary checkout, never a worktree.
+
 ## Orchestrator-pack target binding
 
 The block between the `orchestrator-pack` markers below is pack-managed: only

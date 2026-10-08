@@ -184,7 +184,40 @@ def can_start(settings=None) -> tuple[bool, str]:
     except (OSError, ValueError, RuntimeError) as exc:
         return False, 'BrowserSkill unavailable: ' + str(exc)
 
+def _fixture_read_only_browser(settings=None) -> tuple[bool, str]:
+    """At the real Session thread hop, NEVER recover a missing daemon/Chrome."""
+    from tools.browser_skill import Unavailable, _sync
+
+    try:
+        cfg = _config(settings)  # Only the existing Session-owned pinned selection.
+        if cfg['engine'] != 'browser_skill' or not cfg['browser']:
+            return False, ('BrowserSkill unavailable: select the pinned BrowserSkill '
+                           'instance using browser-setup; fixture cannot start Chrome.')
+        _sync('status', timeout=7)  # Observe; never call ensure_daemon().
+        rows = _browsers()
+        matches = [r for r in rows if r.get('instance_id') == cfg['browser']
+                   and not r.get('unresponsive') and not r.get('version_skew')]
+        if len(matches) != 1:
+            return False, ('BrowserSkill unavailable: pinned extension is absent, '
+                           'disconnected or ambiguous; reconnect it and rerun fixture.')
+        _owned_profile_pid(cfg)  # One independently observed canonical Chrome argv.
+        if _config(settings) != cfg:
+            return False, ('BrowserSkill unavailable: pinned browser configuration changed; '
+                           'inspect the selection and rerun fixture.')
+        return True, ''
+    except (Unavailable, OSError, ValueError, RuntimeError) as exc:
+        return False, ('BrowserSkill unavailable: read-only fixture preflight failed ('
+                       f'{type(exc).__name__}); check bsk doctor, verify one owned '
+                       'Chrome and rerun fixture.')
+
+
 def ensure_browser(settings=None) -> tuple[bool, str]:
+    # A private per-invocation ContextVar arrives here through Session.__aenter__
+    # -> asyncio.to_thread(ensure_browser), before session start. Without exact
+    # daemon origin/authority, keep the ordinary production recovery unchanged.
+    from tools.browser_skill_fixture import _read_only_entry
+    if _read_only_entry():
+        return _fixture_read_only_browser(settings)
     from tools.browser_skill import ensure_daemon
     try:
         cfg = _config(settings)

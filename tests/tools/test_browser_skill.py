@@ -32,7 +32,8 @@ def target(**values):
 def page(*controls, text=GOOD):
     return {'url': 'https://employer.test/job/1', 'title': 'Program manager',
             'text': text, 'description': GOOD, 'controls': list(controls),
-            'truncated': False, 'unsupported_frames': [], 'shadow_roots': False}
+            'truncated': False, 'unsupported_frames': [], 'shadow_roots': False,
+            'inventory_verified': True, 'opaque_controls': False}
 
 
 def test_private_config_preserves_original_engine_and_rejects_unknown_values(tmp_path):
@@ -75,6 +76,7 @@ async def test_session_pins_profile_and_stops_only_its_own_window(monkeypatch, t
     enable(tmp_path)
     calls = []
     monkeypatch.setattr(bsk, 'available', lambda: (True, ''))
+    monkeypatch.setattr('tools.browser_profile.ensure_browser', lambda: (True, ''))
     async def command(*args, **kw):
         calls.append(args)
         if args[:2] == ('session', 'start'):
@@ -92,6 +94,7 @@ async def test_session_pins_profile_and_stops_only_its_own_window(monkeypatch, t
 async def test_mismatched_profile_is_closed_before_navigation(monkeypatch, tmp_path):
     enable(tmp_path)
     monkeypatch.setattr(bsk, 'available', lambda: (True, ''))
+    monkeypatch.setattr('tools.browser_profile.ensure_browser', lambda: (True, ''))
     command = AsyncMock(side_effect=[{'session_id': 'wrong', 'browser_instance_id': 'other'}, {}])
     monkeypatch.setattr(bsk, 'command', command)
     with pytest.raises(bsk.Unavailable, match='mismatch'):
@@ -151,14 +154,18 @@ def test_safe_declines_and_negative_sanctions_answers_are_not_left_blank(questio
     assert forms.guarded_value(target(label=question), value) == value
 
 
-async def test_model_text_cannot_replace_approved_fact():
+async def test_model_text_cannot_replace_approved_fact(monkeypatch):
     session = SimpleNamespace(call=AsyncMock())
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting',
+        'human_approved_answers': {'First name': 'Approved'}})
     filled = {}
     await forms.execute(session, page(target()),
                         {'action': 'fill', 'selector': '#field', 'fact': 'First name',
                          'value': 'Invented'},
                         facts={'First name': 'Approved'}, filled=filled, resume_path='',
-                        company='Company', jd_text='', resume_tex='', github='')
+                        company='Company', jd_text='', resume_tex='', github='',
+                        pk='Company#1')
     session.call.assert_awaited_once_with('fill', '#field', '--value', 'Approved')
     assert filled == {'#field': 'Approved'}
 
@@ -407,13 +414,23 @@ def test_background_prepare_failure_does_not_leave_an_unclaimed_working_card(mon
 
 
 @pytest.mark.parametrize('destination', [
-    'https://employer.test/next', 'https://job-boards.greenhouse.io/acme/jobs/1',
-    'https://jobs.lever.co/acme/1', 'https://jobs.ashbyhq.com/acme/1',
-    'https://tenant.wd1.myworkdayjobs.com/careers/job/1',
-    'https://jobs.smartrecruiters.com/acme/1', 'https://careers.icims.com/jobs/1',
+    'https://employer.test/job/1',
+    'https://employer.test/job/1/apply',
+    'https://employer.test/job/1/confirmation',
 ])
-def test_navigation_allows_only_employer_and_actual_ats_hosts(destination):
+def test_navigation_stays_within_explicit_job_route(destination):
     assert forms.navigation_allowed(destination, 'https://employer.test/job/1')
+
+
+@pytest.mark.parametrize('destination', [
+    'https://employer.test/job/2', 'https://employer.test/next',
+    'https://job-boards.greenhouse.io/other/jobs/1',
+    'https://jobs.lever.co/other/job/2',
+    'https://tenant.wd1.myworkdayjobs.com/other/job/2',
+    'https://jobs.smartrecruiters.com/other/1',
+])
+def test_host_and_ats_suffix_never_authorize_an_unrelated_job(destination):
+    assert not forms.navigation_allowed(destination, 'https://employer.test/job/1')
 
 
 @pytest.mark.parametrize('destination', [
@@ -425,13 +442,16 @@ def test_lookalike_and_unrelated_hosts_are_not_navigation_permission(destination
     assert not forms.navigation_allowed(destination, 'https://employer.test/job/1')
 
 
-def test_direct_board_host_is_allowed_without_granting_its_entire_domain():
-    assert forms.navigation_allowed(
-        'https://eeho.fa.us2.oraclecloud.com/next',
-        'https://careers.oracle.com/job/1', 'https://eeho.fa.us2.oraclecloud.com/apply')
+def test_direct_board_host_requires_a_job_route_not_domain_wide_access():
+    direct = 'https://eeho.fa.us2.oraclecloud.com/tenant/jobs/role-1'
+    assert forms.navigation_allowed(direct + '/apply',
+                                    'https://careers.oracle.com/job/1', direct)
     assert not forms.navigation_allowed(
-        'https://another.oraclecloud.com/next',
-        'https://careers.oracle.com/job/1', 'https://eeho.fa.us2.oraclecloud.com/apply')
+        'https://eeho.fa.us2.oraclecloud.com/tenant/jobs/role-2',
+        'https://careers.oracle.com/job/1', direct)
+    assert not forms.navigation_allowed(
+        'https://another.oraclecloud.com/tenant/jobs/role-1',
+        'https://careers.oracle.com/job/1', direct)
 
 
 @pytest.mark.parametrize('verb', ['navigate', 'click'])
@@ -462,7 +482,8 @@ async def test_application_gates_external_link_before_the_browser_follows_it(mon
     result = await forms.apply(current['url'], 'Company', {}, 'chatgpt/model',
                                pk='Company#1', resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'known ATS hosts' in result['question']
+    assert 'unrelated' in result['question'] or 'Unproven' in result['question']
+    assert result['status'] == 'gate'
     assert result['step']['url'] == current['url']
     assert calls == [current['url']]
 
@@ -478,13 +499,16 @@ def test_handoff_preserves_step_but_never_reproduces_oauth_tickets():
 
 async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_essay(monkeypatch):
     session = SimpleNamespace(call=AsyncMock())
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting',
+        'human_approved_answers': {'Motivation': 'Approved explanation'}})
     monkeypatch.setattr('tools.narrative.draft_answer',
                         lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
     await forms.execute(
         session, page(target(tag='textarea', type='textarea', label='Motivation')),
         {'action': 'fill', 'selector': '#field', 'fact': '', 'essay': True},
         facts={'Motivation': 'Approved explanation'}, filled={}, resume_path='',
-        company='Company', jd_text='', resume_tex='', github='')
+        company='Company', jd_text='', resume_tex='', github='', pk='Company#1')
     session.call.assert_awaited_once_with('fill', '#field', '--value', 'Approved explanation')
 
 

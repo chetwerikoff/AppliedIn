@@ -517,13 +517,15 @@ test('drawer Force apply routes to preparation and unfamiliar actions never skip
   assert.equal(h.requests.length,1);
 });
 
+const septemberLocalMidday = (day) => new Date(2026, 8, day, 12).toISOString();
+
 function datedReviewHarness() {
   const h=reviewHarness();
   h.state.apps = [
-    {pk:'openai#old',company:'OpenAI',title:'Old',status:'tailored',tailored_at:'2026-09-07T18:00:00Z'},
-    {pk:'beta#new',company:'Beta',title:'New',status:'tailored',tailored_at:'2026-09-09T18:00:00Z'},
-    {pk:'openai#new',company:'OpenAI',title:'New',status:'tailored',tailored_at:'2026-09-09T18:00:00Z'},
-    {pk:'openai#unknown',company:'OpenAI',title:'Unknown',status:'tailored',tailored_at:'invalid',updated_at:'2026-09-10T18:00:00Z'},
+    {pk:'openai#old',company:'OpenAI',title:'Old',status:'tailored',tailored_at:septemberLocalMidday(7)},
+    {pk:'beta#new',company:'Beta',title:'New',status:'tailored',tailored_at:septemberLocalMidday(9)},
+    {pk:'openai#new',company:'OpenAI',title:'New',status:'tailored',tailored_at:septemberLocalMidday(9)},
+    {pk:'openai#unknown',company:'OpenAI',title:'Unknown',status:'tailored',tailored_at:'invalid',updated_at:septemberLocalMidday(10)},
   ];
   return h;
 }
@@ -542,7 +544,7 @@ test('queue sorting orders whole processed days across companies and puts missin
 
 test('processed date uses latest valid résumé completion, never unrelated activity', () => {
   const h=datedReviewHarness(), row=h.state.apps[0];
-  row.retailored_at='2026-09-10T18:00:00Z';
+  row.retailored_at=septemberLocalMidday(10);
   assert.equal(h.context.sortReviewRows(h.state.apps)[0].pk,row.pk);
   assert.equal(h.context.reviewDay(row),'2026-09-10');
   row.retailored_at='invalid';

@@ -38,6 +38,8 @@ def test_batches_are_bounded_and_yield_to_applies(monkeypatch):
         {"postings": [{"url": u, "title": "SWE", "description": GOOD} for u in URLS[:6]]},
         {"postings": [{"url": u, "title": "SWE", "description": GOOD} for u in URLS[6:]]},
     ])
+    # A fake session does not bypass the separate CLI availability precondition.
+    monkeypatch.setattr(jd, "available", lambda: (True, ""))
     monkeypatch.setattr(jd, "run_task", run_task)
 
     got = jd.read_postings(URLS, batch=6)
@@ -53,6 +55,8 @@ def test_an_unrequested_url_is_dropped(monkeypatch):
         {"url": URLS[0], "description": GOOD},
         {"url": "https://www.metacareers.com/profile/job_details/999", "description": GOOD},
     ]}])
+    # A fake session does not bypass the separate CLI availability precondition.
+    monkeypatch.setattr(jd, "available", lambda: (True, ""))
     monkeypatch.setattr(jd, "run_task", run_task)
 
     got = jd.read_postings(URLS[:2], batch=6)
@@ -65,6 +69,8 @@ def test_a_thin_description_is_not_accepted(monkeypatch):
         {"url": URLS[0], "description": "Sorry, something went wrong."},
         {"url": URLS[1], "description": GOOD},
     ]}])
+    # A fake session does not bypass the separate CLI availability precondition.
+    monkeypatch.setattr(jd, "available", lambda: (True, ""))
     monkeypatch.setattr(jd, "run_task", run_task)
 
     got = jd.read_postings(URLS[:2], batch=6)
@@ -78,6 +84,8 @@ def test_a_broken_batch_loses_only_itself(monkeypatch):
             return {}, "The Chrome session ended without a structured result"
         return {"postings": [{"url": u, "description": GOOD} for u in URLS[6:]]}, ""
 
+    # A fake session does not bypass the separate CLI availability precondition.
+    monkeypatch.setattr(jd, "available", lambda: (True, ""))
     monkeypatch.setattr(jd, "run_task", run_task)
 
     got = jd.read_postings(URLS, batch=6)
@@ -146,6 +154,8 @@ def test_a_removed_posting_is_reported_as_gone(monkeypatch):
         {"url": URLS[0], "gone": True, "description": "Sorry, this job is no longer available."},
         {"url": URLS[1], "description": GOOD},
     ]}])
+    # A fake session does not bypass the separate CLI availability precondition.
+    monkeypatch.setattr(jd, "available", lambda: (True, ""))
     monkeypatch.setattr(jd, "run_task", run_task)
 
     got, gone = jd.read_postings(URLS[:2], batch=6, with_gone=True)

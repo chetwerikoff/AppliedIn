@@ -137,14 +137,23 @@ def test_pause_does_not_veto_a_process_pass_the_owner_pressed():
         flags.paused, flags.stop_epoch = real_paused, real_epoch
 
 
-def test_a_reset_voids_work_that_was_already_running():
+def test_a_reset_voids_work_that_was_already_running(monkeypatch):
     """Emptying the store does not stop the workers.
 
     A job the evaluate worker was midway through finishes, writes itself back,
     and reappears on a board the owner just cleared — a zombie they did not ask
     for and cannot explain. Each run carries the epoch it began in.
+
+    In CI there is no Redis service. The flags accessor intentionally swallows
+    connection errors, so mark_reset() otherwise fails silently and both reads
+    return the fallback epoch "0", hiding the stale run.
     """
+    import fakeredis
+
     from core import flags
+
+    fake = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(flags, "_redis", lambda: fake)
 
     started = flags.reset_epoch()
     assert not flags.stale_run(started)

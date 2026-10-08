@@ -109,9 +109,9 @@ class ApplyQueue:
         an item while its lease is still held, and matching on that would silently
         drop every retry.
         """
-        # The existing tracking row is the durable no-replay authority.
+        from tools.submit_hold import blocked
         raw_row = self.r.get(f"app:{pk}")
-        if raw_row and json.loads(raw_row).get("possible_submission"):
+        if blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
             return False
         co = _norm(company)
         for raw in (self.r.lrange(f"{_KEY}:co:{co}", 0, -1) or []):
@@ -155,6 +155,12 @@ class ApplyQueue:
         outage cannot spin — it just does not consume the job's budget.
         """
         from tools.browser_runtime import is_infrastructure
+        from tools.submit_hold import blocked
+
+        pk = item['pk']
+        raw_row = self.r.get(f'app:{pk}')
+        if reason in TERMINAL or blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
+            return False
 
         infra = is_infrastructure(reason)
         attempts = int(item.get("attempts", 0)) + (0 if infra else 1)

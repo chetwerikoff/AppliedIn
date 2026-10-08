@@ -241,6 +241,8 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
 
     class Tracking:
         def __init__(self):
+            import fakeredis
+            self.r = fakeredis.FakeRedis(decode_responses=True)
             self.row = {'pk': pk, 'status': 'submitting'}
 
         def set_status(self, observed_pk, status, **attrs):
@@ -254,6 +256,15 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
             return dict(self.row)
 
     tracking = Tracking()
+    real_set, real_get = tracking.r.set, tracking.r.get
+    def held_set(*args, **kwargs):
+        evidence.append('hold_set')
+        return real_set(*args, **kwargs)
+    def held_get(*args, **kwargs):
+        evidence.append('hold_read')
+        return real_get(*args, **kwargs)
+    monkeypatch.setattr(tracking.r, 'set', held_set)
+    monkeypatch.setattr(tracking.r, 'get', held_get)
     monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw:
                         SimpleNamespace(tracking=tracking))
     monkeypatch.setattr(forms, '_row', tracking.get)
@@ -278,15 +289,14 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
             if args[0] == 'upload':
                 return {}
             if args[0] == 'click':
-                assert tracking.row['possible_submission'] is True
+                evidence.append('click')
+                assert forms.submit_hold.is_held(pk, tracking=tracking)
                 assert tracking.row['status'] == 'needs_human'
                 assert tracking.row['gate_reason'] == 'submit_uncertain'
                 assert tracking.row['fail_kind'] == 'uncertain'
                 assert tracking.row['last_button'] == button
                 assert tracking.row['last_url'] == current['url']
-                assert evidence[-2:] == ['write', 'readback'] if verb == 'submit' else (
-                    evidence[-3:] == ['write', 'readback', 'readback'])
-                evidence.append('click')
+                assert 'possible_submission' not in tracking.row
                 raise bsk.Unavailable('BrowserSkill unavailable: offline')
             pytest.fail('Unexpected browser IPC')
 
@@ -306,7 +316,8 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
     assert button in result['detail'] and current['url'] in result['detail']
     assert 'click' in evidence
     assert evidence.index('write') < evidence.index('click')
-    assert evidence.index('readback', evidence.index('write')) < evidence.index('click')
+    assert evidence.index('hold_set') < evidence.index('hold_read') < evidence.index('click')
+    assert forms.submit_hold.is_held(pk, tracking=tracking)
 
 
 async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
@@ -694,6 +705,7 @@ def test_held_outcome_requires_explicit_portal_verification_and_never_autorequeu
                         possible_submission=True, gate_reason='submit_uncertain',
                         fail_kind='uncertain', last_button='Continue',
                         last_url='https://example.test/job/1')
+    forms.submit_hold.mark(pk, tracking=tracking)
     stores = SimpleNamespace(tracking=tracking)
     monkeypatch.setattr(server, 'make_stores', lambda *args: stores)
     monkeypatch.setattr('tools.browser_skill.applies_running', lambda: 0)
@@ -703,14 +715,14 @@ def test_held_outcome_requires_explicit_portal_verification_and_never_autorequeu
     assert not endpoint(pk, {'outcome': outcome})['ok']
     assert not endpoint(pk, {'portal_checked': True,
                              'outcome': outcome})['ok']
-    assert tracking.get(pk)['possible_submission']
+    assert forms.submit_hold.is_held(pk, tracking=tracking)
     assert not ApplyQueue(redis).pending()
 
     if outcome == 'submitted':
         result = endpoint(pk, {'portal_checked': True, 'outcome': outcome,
                                'confirmation': 'Synthetic portal confirmation'})
         assert result == {'ok': True, 'status': 'applied_manual'}
-        assert tracking.get(pk)['possible_submission'] is True
+        assert tracking.get(pk)['possible_submission'] is False
         assert tracking.get(pk)['confirmation_id'] == 'Synthetic portal confirmation'
     else:
         result = endpoint(pk, {'portal_checked': True, 'outcome': outcome,
@@ -719,6 +731,7 @@ def test_held_outcome_requires_explicit_portal_verification_and_never_autorequeu
         assert tracking.get(pk)['possible_submission'] is False
         assert tracking.get(pk)['gate_reason'] == 'approval'
     assert not ApplyQueue(redis).pending()
+    assert not forms.submit_hold.is_held(pk, tracking=tracking)
 
 
 def test_destructive_reset_refuses_existing_hold_before_any_live_side_effect(monkeypatch):
@@ -743,12 +756,8 @@ def test_destructive_reset_refuses_existing_hold_before_any_live_side_effect(mon
     assert tracking.get('example-co#hold')['possible_submission']
 
 
-def test_existing_tracking_full_row_writer_can_erase_a_read_back_hold():
-    """Known, uncorrected architect blocker: tracking full-row SET is not CAS.
-
-    This deliberately demonstrates the failure, NOT a concurrency-safety PASS.
-    The storage implementation is out of this Issue's approved source scope.
-    """
+def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch):
+    """R05 replaces the erasable row marker without changing shared storage."""
     import fakeredis
     from core.models import Status
     from core.storage.local import RedisTracking
@@ -756,12 +765,109 @@ def test_existing_tracking_full_row_writer_can_erase_a_read_back_hold():
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = 'example-co#interleaved-stale-write'
     tracking.set_status(pk, Status.SUBMITTING, company='example-co')
-    stale_pre_hold_row = tracking.get(pk)  # writer A has already read
-    tracking.set_status(pk, Status.NEEDS_HUMAN, possible_submission=True,
-                        fail_kind='uncertain', gate_reason='submit_uncertain')
-    assert tracking.get(pk)['possible_submission'] is True  # writer B read-back
-
+    stale_pre_hold_row = tracking.get(pk)
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))
+    forms.hold_possible_submission(pk, {'last_button': 'Submit',
+                                       'url': 'https://example.test/job/1'})
     tracking._write(pk, stale_pre_hold_row, prev_status='submitting')
-    # Exact real storage method unconditionally writes the stale full row.
-    assert not tracking.get(pk).get('possible_submission')
     assert tracking.get(pk)['status'] == 'submitting'
+    assert forms.submit_hold.is_held(pk, tracking=tracking)
+    assert forms.submit_hold.blocked(pk, tracking.get(pk), tracking=tracking)
+
+
+def test_jit_approval_revocation_cannot_be_hidden_by_prior_fill_receipt(monkeypatch):
+    row = {'pk': 'example-co#1', 'status': 'submitting',
+           'human_approved_answers': {'Name': 'Test User'}}
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    history = [{'fact': 'Name', 'approved_value': 'Test User'}]
+    forms.check_approvals('example-co#1', history)
+    row['human_approved_answers']['Name'] = 'Changed value'
+    with pytest.raises(forms.Gate, match='human-approved'):
+        forms.check_approvals('example-co#1', history)
+
+
+@pytest.mark.parametrize('kind', ['hidden', 'custom', 'contenteditable', 'combobox'])
+def test_actual_dom_inventory_refuses_hidden_and_opaque_controls(kind):
+    """Exercise PAGE itself, not an invented inventory with flags already set."""
+    import subprocess
+    from tools.browser_skill_dom import PAGE
+    script = r'''
+const kind = process.argv[1];
+const form = {querySelector: () => null, innerText: ''};
+const field = {id: 'field', tagName: kind === 'custom' ? 'X-FOO' : 'INPUT',
+  type: kind === 'hidden' ? 'hidden' : 'text', value: 'unapproved',
+  labels: [], form, name: '', required: true, disabled: false,
+  getClientRects: () => kind === 'hidden' ? [] : [1],
+  closest: q => q === 'form' ? form : null,
+  getAttribute: k => k === 'type' ? field.type :
+    (k === 'role' && kind === 'combobox' ? 'combobox' : null),
+  matches: q => (kind === 'contenteditable' && q.includes('[contenteditable]')) ||
+    (kind === 'combobox' && q.includes('[role="combobox"]'))};
+global.document = {readyState: 'complete', title: 'Synthetic form', body: {innerText: ''},
+  querySelector: () => null, getElementById: () => null,
+  querySelectorAll: q => q === '*' || !q.startsWith('#') ? [field] : [field]};
+global.CSS = {escape: s => s};
+global.location = {href: 'https://example.test/job/1'};
+global.getComputedStyle = () => ({visibility: 'visible'});
+console.log(JSON.stringify(eval(process.argv[2])));
+'''
+    observed = json.loads(subprocess.check_output(['node', '-e', script, kind, PAGE], text=True))
+    if kind == 'hidden':
+        assert observed['controls'][0]['type'] == 'hidden'
+        resume = target(selector='#resume', type='file', label='Resume', files=['Resume.pdf'])
+        observed['controls'].append(resume)
+        with pytest.raises(forms.Gate, match='hidden'):
+            forms.check_form(observed, {}, True, 'Resume.pdf')
+    else:
+        assert observed['opaque_controls']
+        assert not observed['inventory_verified']
+
+
+@pytest.mark.parametrize('query', ['?job_id=other', '?job_id=one&job_id=other', '?tenant=other'])
+def test_added_or_ambiguous_query_identity_never_authorizes_navigation(query):
+    assert not forms.navigation_allowed('https://example.test/job/1' + query,
+                                        'https://example.test/job/1')
+
+
+async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch):
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate, match='inspectable'):
+        await forms.execute(session, {**page(target()), 'opaque_controls': True},
+                            {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+                            facts={'Name': 'Test User'}, filled={}, resume_path='',
+                            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_not_awaited()
+
+
+async def test_human_approved_fact_is_not_authorization_for_another_question(monkeypatch):
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate, match='this question'):
+        await forms.execute(session, page(target(label='Years of experience')),
+                            {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+                            facts={'Name': 'Test User'}, filled={}, resume_path='',
+                            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_not_awaited()
+
+
+async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_path, monkeypatch):
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+    bank = MarkdownAnswerBank(tmp_path / 'synthetic-facts.md')
+    bank.put('Years of experience', '2 years', AnswerScope.GLOBAL, source='dashboard')
+    bank.put('Years of experience', '10 years', AnswerScope.GLOBAL, source='writer')
+    facts = bank.all_facts('example-co')
+    assert facts['Years of experience'] == '10 years'
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting',
+        'human_approved_answers': {'Years of experience': '2 years'}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate, match='human-approved'):
+        await forms.execute(session, page(target(label='Years of experience')),
+                            {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
+                            facts=facts, filled={}, resume_path='', company='example-co',
+                            jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_not_awaited()

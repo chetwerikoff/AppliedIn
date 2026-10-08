@@ -269,3 +269,13 @@ def test_setup_refuses_pin_without_a_process(sandbox, monkeypatch):
     assert outcome['status'] == 'blocked'
     assert 'absent or ambiguous' in outcome['error']
     assert path.read_text() == original
+
+
+@pytest.mark.parametrize('flags', [
+    ['--user-data-dir=/tmp/owned', '--user-data-dir=/tmp/other'],
+    ['--user-data-dir', '/tmp/owned', '--user-data-dir=/tmp/other'],
+    ['--user-data-dir=/tmp/owned', '--user-data-dir=/tmp/owned'],
+])
+def test_conflicting_or_repeated_profile_flags_are_not_process_proof(monkeypatch, flags):
+    monkeypatch.setattr(profile, '_processes', lambda: iter([(123, ['chrome', *flags])]))
+    assert profile.profile_pids('/tmp/owned') == []

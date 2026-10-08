@@ -20,6 +20,7 @@ from core.config import get_settings
 from core.models import Status
 from core.stores import make_stores
 from core.ids import is_internal_pk
+from tools import submit_hold
 
 _WEB = Path(__file__).resolve().parents[1] / "web"
 
@@ -834,6 +835,8 @@ def create_app() -> FastAPI:
         if not profile:
             return {"ok": False, "error": "no such profile"}
         stores = make_stores(settings)
+        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+            return {'ok': False, 'error': submit_hold.REASON}
         out = prof.reapply(pk, profile, stores)
         if not out.get("ok"):
             return out
@@ -1343,7 +1346,7 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         q = ApplyQueue(stores.tracking.r)
         if (row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
-                or row.get("possible_submission")
+                or submit_hold.blocked(pk, row, tracking=stores.tracking)
                 or row.get("confirmation_id") or pk in q.in_flight()
                 or any(item["pk"] == pk for item in q.pending())):
             return {"ok": False, "error": "Force apply is only available for an unsent role skipped for a low match score."}
@@ -1388,7 +1391,7 @@ def create_app() -> FastAPI:
         status = str(row.get("status") or "")
         # Same rule as skip and retry: what has been sent is not reopened. Running
         # it again would tailor and queue a role this employer already has.
-        if row.get("possible_submission"):
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):
             return {"ok": False, "error": "refused",
@@ -1452,7 +1455,7 @@ def create_app() -> FastAPI:
                         jd_url="", jd_text=text, ats="custom")
         pk = job.pk
         if not stores.tracking.put_new(job):
-            if (stores.tracking.get(pk) or {}).get("possible_submission"):
+            if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             stores.tracking.set_status(pk, Status.FOUND, jd_text=text, title=title,
                                        skip_reason="", fail_kind="", fail_reason="")
@@ -1508,7 +1511,7 @@ def create_app() -> FastAPI:
         pk = job.pk
         is_new = stores.tracking.put_new(job)
         if not is_new:  # already tracked — re-tailor it from scratch
-            if (stores.tracking.get(pk) or {}).get("possible_submission"):
+            if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             stores.tracking.set_status(pk, Status.FOUND, skip_reason="", fail_kind="")
 
@@ -1625,7 +1628,8 @@ def create_app() -> FastAPI:
         # Continue the gated run in the background so the click returns instantly;
         # the pipeline's next steps stream to the Logs view as they happen.
         from agent.run import resume_job
-        if (make_stores(settings).tracking.get(pk) or {}).get("possible_submission"):
+        stores = make_stores(settings)
+        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         background.add_task(resume_job, pk, body.get("answer", ""))
         return {"ok": True, "status": "resuming"}
@@ -1641,6 +1645,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "unknown job"}
         stores.tracking.set_status(
             pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
+        if getattr(stores.tracking, 'r', None) is not None:
+            submit_hold.clear(pk, tracking=stores.tracking)
         from core.events import emit
         emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
         return {"ok": True}
@@ -1658,7 +1664,7 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "Explicit submitted/not_submitted outcome required."}
         stores = make_stores(settings)
         row = stores.tracking.get(pk) or {}
-        if not row.get("possible_submission") or row.get("status") != "needs_human":
+        if not submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "This row is not a held uncertain submission."}
         try:
             if pk in ApplyQueue(stores.tracking.r).in_flight() or applies_running():
@@ -1671,7 +1677,9 @@ def create_app() -> FastAPI:
                 return {"ok": False, "error": "Provide the portal confirmation."}
             stores.tracking.set_status(
                 pk, Status.APPLIED_MANUAL, confirmation_id=evidence,
-                gate_reason="", gate_pending=None, gate_call_id=None)
+                gate_reason="", gate_pending=None, gate_call_id=None,
+                possible_submission=False, fail_kind="", fail_reason="")
+            submit_hold.clear(pk, tracking=stores.tracking)
             return {"ok": True, "status": "applied_manual"}
         if body.get("new_apply_decision") is not True:
             return {"ok": False, "error": (
@@ -1682,6 +1690,7 @@ def create_app() -> FastAPI:
             pk, Status.TAILORED, possible_submission=False, fail_kind="",
             fail_reason="", gate_reason="approval", gate_pending=None,
             gate_call_id=None, last_button="", last_url="")
+        submit_hold.clear(pk, tracking=stores.tracking)
         return {"ok": True, "status": "tailored", "queued": False}
 
 
@@ -1928,7 +1937,7 @@ def create_app() -> FastAPI:
             try:
                 run_job(pk, stores)
                 row = stores.tracking.get(pk) or {}
-                if not row.get("possible_submission") and row.get("status") in ("tailored", "needs_human") and q.put(
+                if not submit_hold.blocked(pk, row, tracking=stores.tracking) and row.get("status") in ("tailored", "needs_human") and q.put(
                         pk, row.get("company") or company):
                     done += 1
                     emit("running", pk=pk, agent="workflow",
@@ -1994,7 +2003,7 @@ def create_app() -> FastAPI:
         return company.strip(), list(dict.fromkeys(pks))
 
     def review_eligible(row: dict) -> bool:
-        return not row.get("possible_submission") and (row.get("status") == "tailored" or (
+        return not submit_hold.blocked(row.get('pk', ''), row, tracking=make_stores(settings).tracking) and (row.get("status") == "tailored" or (
             row.get("status") == "needs_human"
             and (
                 row.get("gate_reason") == "approval"
@@ -2059,7 +2068,7 @@ def create_app() -> FastAPI:
                 row = stores.tracking.get(pk) or {}
                 if (row.get("company") or "").strip().lower() != company.lower():
                     raise ValueError("This role does not belong to the selected company.")
-                if pk in q.in_flight() or row.get("possible_submission") or row.get("confirmation_id") or row.get("status") == "submitting":
+                if pk in q.in_flight() or submit_hold.blocked(pk, row, tracking=stores.tracking) or row.get("confirmation_id") or row.get("status") == "submitting":
                     raise ValueError(
                         "This role is applying or submitted; refresh its current state."
                     )
@@ -2174,7 +2183,7 @@ def create_app() -> FastAPI:
 
         pk = ((body or {}).get("pk") or "").strip()
         stores = make_stores(settings)
-        if pk and (stores.tracking.get(pk) or {}).get("possible_submission"):
+        if pk and submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         n = ApplyQueue(stores.tracking.r).revive(pk)
         return {"ok": True, "revived": n}
@@ -2195,7 +2204,7 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": f"no job {pk!r}"}
         # Never re-queue something already submitted — a duplicate under a real
         # name is worse than a missed application.
-        if row.get("possible_submission"):
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
             return {"ok": False, "error": f"already {row.get('status')} — refusing to re-apply"}
@@ -2305,7 +2314,7 @@ def create_app() -> FastAPI:
         # click — or any bulk action reaching this endpoint — could erase the
         # record of something an employer had already received. The row is worth
         # more than the click.
-        if row.get("possible_submission"):
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):
             return {"ok": False, "error": "refused",
@@ -2351,7 +2360,7 @@ def create_app() -> FastAPI:
             # dispatched a run for a pk that does not exist, which then sat in the
             # in-flight set holding that company's turn against nothing.
             return {"ok": False, "error": "No such job."}
-        if row.get("possible_submission"):
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
             return {"ok": False, "error": f"Already {row['status']} — not reapplying."}
@@ -2465,7 +2474,7 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         if not row:
             return {"ok": False, "error": "no such job"}
-        if row.get("possible_submission"):
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if (st := row.get("status")) in ("applied", "applied_manual"):
             return {"ok": False,
@@ -2501,7 +2510,8 @@ def create_app() -> FastAPI:
     def retry(pk: str, background: BackgroundTasks):
         """Re-run a failed/errored job from scratch (clean session, current KB)."""
         from agent.run import retry_job
-        if (make_stores(settings).tracking.get(pk) or {}).get("possible_submission"):
+        stores = make_stores(settings)
+        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
@@ -2569,7 +2579,7 @@ def create_app() -> FastAPI:
             if company != "__all__" and (r.get("company") or "").strip().lower() != company:
                 continue
             q_ = (r.get("gate_pending") or {}).get("question", "")
-            if (not r.get("possible_submission") and (r.get("status") == "tailored"
+            if (not submit_hold.blocked(r['pk'], r, tracking=stores.tracking) and (r.get("status") == "tailored"
                     or r.get("gate_reason") == "approval"
                     or q_.startswith("Ready to apply"))):
                 picked.append((r["pk"], r.get("company") or ""))
@@ -2627,7 +2637,8 @@ def create_app() -> FastAPI:
             stores = make_stores(settings)
             queued = ApplyQueue(stores.tracking.r)
             rows = stores.tracking.all()
-            if (any(r.get("possible_submission") or r.get("status") == "submitting"
+            if (submit_hold.any_held(tracking=stores.tracking)
+                    or any(submit_hold.blocked(r['pk'], r, tracking=stores.tracking) or r.get("status") == "submitting"
                     for r in rows)
                     or queued.in_flight() or applies_running()):
                 return {"ok": False, "note": (
@@ -2772,7 +2783,7 @@ def _recover_stuck(settings) -> None:  # noqa: ANN001
 
         stuck = [r for r in rows if r.get("status") == "submitting"]
         for r in stuck:
-            if r.get("possible_submission"):
+            if submit_hold.blocked(r['pk'], r, tracking=stores.tracking):
                 stores.tracking.set_status(
                     r["pk"], Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
                     fail_kind="uncertain", fail_reason="possible submission; check the employer portal before retrying",

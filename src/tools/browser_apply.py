@@ -83,6 +83,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ""
     posting, "flagged as possible spam" on the next — and a form filled perfectly
     still does not go out. Their browser is not challenged the same way.
     """
+    from core.stores import make_stores
+    from tools import submit_hold
+
+    if pk:
+        stores = make_stores()
+        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+            return {'status': 'uncertain', 'reason': 'uncertain', 'detail': submit_hold.REASON}
     facts = dict(facts)
     full = (facts.get("Full name") or facts.get("Name") or "").strip()
     if full:

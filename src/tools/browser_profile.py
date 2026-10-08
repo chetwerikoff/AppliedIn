@@ -96,12 +96,13 @@ def profile_pids(directory: str) -> list[int]:
     target = Path(directory).expanduser().resolve()
     result = []
     for pid, args in _processes():
-        for i, arg in enumerate(args):
-            value = arg.partition('=')[2] if arg.startswith('--user-data-dir=') else (
-                args[i + 1] if arg == '--user-data-dir' and i + 1 < len(args) else '')
-            if value and Path(value).expanduser().resolve() == target:
-                result.append(pid)
-                break
+        values = [arg.partition('=')[2] if arg.startswith('--user-data-dir=') else (
+            args[i + 1] if i + 1 < len(args) else '')
+            for i, arg in enumerate(args)
+            if arg.startswith('--user-data-dir=') or arg == '--user-data-dir']
+        # Conflicting/repeated flags are ambiguous even if one matches the pin.
+        if len(values) == 1 and values[0] and Path(values[0]).expanduser().resolve() == target:
+            result.append(pid)
     return result
 
 

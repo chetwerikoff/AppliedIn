@@ -84,9 +84,11 @@ def test_startup_orphan_recovery_keeps_a_possible_submission_held(marked):
     pk = "example-co#synthetic-1"
     stores = _Stores([{"pk": pk, "company": "example-co",
                        "status": "submitting",
-                       "possible_submission": marked,
                        "last_button": "Submit",
                        "last_url": "https://example.test/job/1"}], client)
+    if marked:
+        from tools.submit_hold import mark
+        mark(pk, tracking=stores.tracking)
     assert run_mod._claim(pk, stores)
     daemon._recover_orphans(stores)
 

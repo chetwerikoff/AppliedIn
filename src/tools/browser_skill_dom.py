@@ -21,7 +21,7 @@ PAGE = r"""(() => {
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   const nodes = Array.from(document.querySelectorAll(query));
-  const controls = nodes.filter(e => visible(e) || e.type === 'file').map(e => {
+  const controls = nodes.filter(e => visible(e) || e.form || e.closest('form') || e.type === 'file').map(e => {
     const group = e.closest(
       'fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
     const question = clean(group?.querySelector(
@@ -32,7 +32,7 @@ PAGE = r"""(() => {
       type === 'submit' || type === 'image';
     return {selector:selector(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
-      in_form:!!e.closest('form'), name:e.name || '',
+      in_form:!!e.form || !!e.closest('form'), name:e.name || '',
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),
@@ -60,10 +60,10 @@ PAGE = r"""(() => {
   // A closed shadow root cannot be inspected. Detect visible custom hosts and
   // opaque widgets instead of treating 'no open shadow root' as completeness.
   const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>
-    visible(e) && e.tagName !== 'BROWSER-SKILL-OVERLAY' && (
+    (visible(e) || e.closest('form') || e.getAttribute('aria-required') === 'true') &&
+    e.tagName !== 'BROWSER-SKILL-OVERLAY' && (
       e.matches('[contenteditable], [role="combobox"], [role="listbox"], [role="option"]') ||
-      (e.tagName.includes('-') && (
-        e.closest('form') || /form|apply|field|input|widget|select|combo/i.test(e.tagName))) ||
+      e.tagName.includes('-') ||
       (e.closest('form') && e.matches('canvas,object,embed,[aria-controls]'))));
   const inventoryVerified = document.readyState === 'complete' &&
     controls.length <= 500 && !opaqueControls && !siteShadow;

@@ -179,6 +179,9 @@ async def apply_to_job(tool_context: ToolContext) -> dict:
     pk = st.get("pk", "")
     company = st.get("company", "")
     stores = make_stores()
+    from tools import submit_hold
+    if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+        return {'status': 'uncertain', 'reason': 'uncertain', 'detail': submit_hold.REASON}
     facts = stores.answer_bank.all_facts(company)
     # Last call on which address this goes out under. A job tailored before this
     # company started rotating still carries the old one, and this is the last
@@ -242,10 +245,12 @@ async def apply_to_job(tool_context: ToolContext) -> dict:
     if fields and pk:  # the form's real field map (incl. checkboxes) — for the drawer
         cur = stores.tracking.get(pk) or {}
         stores.tracking.set_status(pk, cur.get("status", "submitting"), fields=fields)
-    for q, a in (result.pop("drafted", None) or {}).items():
-        # Bank writer drafts (company scope) so re-runs never redraft from scratch.
-        from core.models import AnswerScope
-        stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source="writer")
+    from tools.browser_runtime import configuration
+    drafted = result.pop('drafted', None) or {}
+    if configuration()['engine'] != 'browser_skill':
+        for q, a in drafted.items():
+            from core.models import AnswerScope
+            stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source='writer')
     return result
 
 

@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from tools import browser_skill as bsk
 from tools.claude_chrome import _SAFE_OPTION_RX, _SANCTIONS_RX, direct_board_url, guard_value
+from tools import submit_hold
 
 _SENSITIVE = re.compile(
     r'disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|'
@@ -58,10 +59,14 @@ def navigation_allowed(href: str, *origins: str) -> bool:
         if not job_path or not (target.path == job_path
                                 or target.path.startswith(job_path + '/')):
             continue
-        former = dict(parse_qsl(source.query, keep_blank_values=True))
-        current = dict(parse_qsl(target.query, keep_blank_values=True))
-        if any(current.get(k) != value for k, value in former.items()
-               if re.search(r'job|req|tenant|position|posting|id$', k, re.I)):
+        former_pairs = parse_qsl(source.query, keep_blank_values=True)
+        current_pairs = parse_qsl(target.query, keep_blank_values=True)
+        identity = lambda k: re.search(r'job|req|tenant|position|posting|id$', k, re.I)
+        former = [(k, v) for k, v in former_pairs if identity(k)]
+        current = [(k, v) for k, v in current_pairs if identity(k)]
+        if (len({k for k, v in former}) != len(former)
+                or len({k for k, v in current}) != len(current)
+                or sorted(former) != sorted(current)):
             continue
         return True
     return False
@@ -168,27 +173,35 @@ def exact_approval(pk: str, key: str, value: str) -> None:
             or not key or grants.get(key) != value):
         raise Gate('An exact human-approved answer is needed for this field.')
 
+def check_approvals(pk: str, history: list, page: dict | None = None) -> None:
+    for receipt in history:
+        if receipt.get('fact'):
+            exact_approval(pk, receipt['fact'], receipt['approved_value'])
+            if page is not None:
+                target = control(page, receipt)
+                if any(target.get(k, '') != receipt.get(k, '') for k in ('label', 'question')):
+                    raise Gate('The approved question changed; human review is required.')
+
 
 def hold_possible_submission(pk: str, step: dict) -> None:
-    """Write/read back an existing-row uncertain hold before any click IPC."""
+    """Mark the independent Redis key and verify it before any browser IPC."""
     from core.models import Status
     from core.stores import make_stores
 
-    context = handoff('possible submission; check the employer portal before retrying', step)['step']
-    tracking = make_stores().tracking
-    tracking.set_status(
-        pk, Status.NEEDS_HUMAN, possible_submission=True, gate_reason='submit_uncertain',
-        gate_pending={'question': 'possible submission; check the employer portal before retrying'},
-        gate_call_id=None, fail_kind='uncertain',
-        fail_reason='possible submission; check the employer portal before retrying',
-        last_button=context['last_button'], last_url=context['url'])
-    persisted = tracking.get(pk) or {}
-    if (persisted.get('pk') != pk or persisted.get('status') != 'needs_human'
-            or persisted.get('possible_submission') is not True
-            or persisted.get('fail_kind') != 'uncertain'
-            or persisted.get('last_button') != context['last_button']
-            or persisted.get('last_url') != context['url']):
-        raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.')
+    context = handoff(submit_hold.REASON, step)['step']
+    try:
+        tracking = make_stores().tracking
+        submit_hold.mark(pk, tracking=tracking)
+        if not submit_hold.is_held(pk, tracking=tracking):
+            raise RuntimeError('Submission hold read-back is missing')
+        # Human-visible context is supplemental; stale row writes cannot erase the key.
+        tracking.set_status(
+            pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain',
+            gate_pending={'question': submit_hold.REASON}, gate_call_id=None,
+            fail_kind='uncertain', fail_reason=submit_hold.REASON,
+            last_button=context['last_button'], last_url=context['url'])
+    except Exception as exc:
+        raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 
 
 def check_dispatch(pk: str, resume_path: str) -> None:
@@ -199,7 +212,7 @@ def check_dispatch(pk: str, resume_path: str) -> None:
     if _duplicate_refusal(pk):
         raise Gate('This job is already applied; no duplicate is permitted.')
     row = _row(pk)
-    if (row.get('possible_submission') or row.get('status') != 'submitting'
+    if (submit_hold.blocked(pk, row) or row.get('status') != 'submitting'
             or row.get('gate_reason') == 'approval'):
         raise Gate('This application is not a fresh approved dispatch.')
     if not row.get('resume_tex_key') or row.get('resume_seed') != seed_fingerprint():
@@ -273,6 +286,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False) -> dict:
     verb = action.get('action')
+    if (page.get('inventory_verified') is not True or page.get('truncated')
+            or page.get('opaque_controls') or page.get('shadow_roots')
+            or page.get('unsupported_frames')):
+        raise Gate('The application form is not inspectable; human review is required.')
     target = control(page, action)
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
@@ -294,6 +311,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         else:
             raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".')
         exact_approval(pk, key, value)
+        if not _same(key, target.get('question') or target.get('label', '')):
+            raise Gate('An exact human-approved answer for this question is required.')
         if not value:
             raise Gate(f'An approved answer is needed for "{target["label"]}".')
         guarded_value(target, value)
@@ -336,7 +355,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The uploaded résumé was not proven in the current file input.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
-        if (not allow_click or not pk or not _row(pk).get('possible_submission')
+        if (not allow_click or not pk or not submit_hold.is_held(pk)
                 or not _NEXT.match(target.get('label', ''))):
             raise Gate('Unproven or JS-backed click requires human inspection.')
         if is_submission(target) or target.get('type') in {'radio', 'checkbox', 'option', 'file'}:
@@ -344,7 +363,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         await session.call('click', target['selector'])
     else:
         raise Gate('Unsupported form action.')
-    return {'action': verb, 'label': target['label'], 'selector': target['selector']}
+    receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],
+               'question': target.get('question', '')}
+    if verb in {'fill', 'select', 'choose'}:
+        receipt.update(fact=key, approved_value=str(facts.get(key, value)).strip())
+    return receipt
 
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',
@@ -440,12 +463,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('The final submission control was not identified.')
                         check_dispatch(pk, resume_path)
                         check_form(page, filled, uploaded, Path(resume_path).name)
+                        check_approvals(pk, history, page)
                         before = page
-                        # A durable existing-row marker is checked before click IPC;
-                        # process-local 'submitted' only controls exception handling.
-                        submitted = True
+                        # The independent hold precedes IPC; only a possible click
+                        # sets the process-local exception classification.
                         step['last_button'] = target['label']
                         hold_possible_submission(pk, step)
+                        submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):
                             await asyncio.sleep(1)
@@ -467,10 +491,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if verb == 'click' and _NEXT.match(target['label']):
                             check_dispatch(pk, resume_path)
                             check_form(page, filled, uploaded, Path(resume_path).name)
+                            check_approvals(pk, history, page)
                             before = page
-                            submitted = True
                             step['last_button'] = target['label']
                             hold_possible_submission(pk, step)
+                            submitted = True
                         elif verb == 'click':
                             raise Gate('Unproven JS-backed or one-click navigation requires a human gate.')
                         elif verb in {'fill', 'select', 'choose', 'upload'}:

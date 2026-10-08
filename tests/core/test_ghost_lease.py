@@ -37,6 +37,7 @@ def world(monkeypatch):
     q = ApplyQueue(fakeredis.FakeRedis(decode_responses=True))
     stores = _Stores([{"pk": "netflix#1", "company": "Netflix", "status": "tailoring"},
                       {"pk": "stripe#1", "company": "Stripe", "status": "submitting"}])
+    stores.tracking.r = q.r
     q.r.sadd("applyq:inflight", "netflix", "stripe")
     q.r.sadd("applyq:inflight:pks", "netflix#1", "stripe#1")
     clock = [1000.0]
@@ -78,8 +79,8 @@ def test_periodic_orphan_reclaim_honors_durable_possible_submission(world, marke
     q.r.srem("applyq:inflight:pks", "stripe#1")
     row = stores.tracking.rows["stripe#1"]
     if marked:
-        row.update(possible_submission=True, fail_kind="uncertain",
-                   last_button="Proceed", last_url="https://example.test/job/1")
+        from tools.submit_hold import mark
+        mark('stripe#1', tracking=stores.tracking)
     daemon._reclaim_orphans(stores, q)
 
     if marked:

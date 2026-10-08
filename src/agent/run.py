@@ -24,6 +24,7 @@ from core.config import get_settings
 from core.logging import get_logger
 from core.models import Status
 from core.stores import make_stores
+from tools import submit_hold
 
 from .graph import root_agent
 
@@ -201,6 +202,9 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
     row = stores.tracking.get(pk)
     if row is None:
         return {"result": "missing", "pk": pk}
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
+                'detail': submit_hold.REASON}
 
     # A job-board import authorizes preparation only. Keep this durable across
     # worker restarts and global mode changes; approval uses resume_job instead.
@@ -495,7 +499,7 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
     # Terminal states are refused here as well as at dispatch. Queueing an applied
     # row is harmless (the duplicate guard catches it) but it spends that company's
     # turn on a job that cannot run.
-    if row.get("possible_submission"):
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") in ("applied", "applied_manual"):
@@ -639,6 +643,9 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
     if not row:
         return {"result": "missing_row", "pk": pk}
     status = row.get("status") or ""
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
+                'detail': submit_hold.REASON}
     if status in _NO_RETAILOR:
         why = ("that application has already gone out — a fresh résumé under this "
                "row would look like the one the employer received"
@@ -703,7 +710,7 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
 
     stores = stores or make_stores()
     row = stores.tracking.get(pk) or {}
-    if row.get("possible_submission"):
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
     call_id = row.get("gate_call_id")
@@ -786,10 +793,11 @@ def run_queued(item: dict, q: Any) -> dict:
     except Exception as exc:  # noqa: BLE001 — one bad apply must not kill the worker
         log.exception("apply crashed for %s", pk)
         try:
-            row = make_stores().tracking.get(pk) or {}
+            failed_stores = make_stores()
+            row = failed_stores.tracking.get(pk) or {}
         except Exception:
             row = {"possible_submission": True}  # cannot prove it is safe to retry
-        if row.get("possible_submission"):
+        if row.get('possible_submission') or submit_hold.blocked(pk, row, tracking=failed_stores.tracking):
             try:
                 make_stores().tracking.set_status(
                     pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
@@ -824,7 +832,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # SKIPPED belongs here too. Skipping only set the tracking status and left the
     # pk sitting in the apply queue, so a job the owner had explicitly declined was
     # still dispatched and applied to. "I do not want this one" has to mean it.
-    if row.get("possible_submission"):
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") == Status.SKIPPED.value:
@@ -968,29 +976,36 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     if fields:  # what the form REALLY held (incl. every checkbox) — for the drawer
         cur = stores.tracking.get(pk) or {}
         stores.tracking.set_status(pk, cur.get("status", "submitting"), fields=fields)
-    for q, a in (result.pop("drafted", None) or {}).items():
-        # Bank writer-drafted answers (company scope) so a re-run or another job at
-        # the same company reuses them instead of redrafting from scratch.
-        from core.models import AnswerScope
-        stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source="writer")
+    from tools.browser_runtime import configuration
+    drafted = result.pop('drafted', None) or {}
+    # BrowserSkill cannot turn a writer draft into future human authorization.
+    if configuration()['engine'] != 'browser_skill':
+        for q, a in drafted.items():
+            from core.models import AnswerScope
+            stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source='writer')
 
     status = result.get("status")
     # The durable pre-click marker outranks a transport return that says
     # "gate" or "unknown": the browser might already have committed a form.
-    if (stores.tracking.get(pk) or {}).get("possible_submission") and status != "applied":
+    if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking) and status != 'applied':
         status = "uncertain"
         result["status"] = status
     if status == "uncertain":
-        reason = "possible submission; check the employer portal before retrying"
+        from tools.browser_skill_apply import handoff
+        context = handoff(submit_hold.REASON, result.get('step') or {})
+        reason = context['text']
         stores.tracking.set_status(
             pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
             fail_kind="uncertain", fail_reason=reason,
-            gate_pending={"question": reason}, gate_call_id=None)
+            gate_pending={'question': reason}, gate_call_id=None,
+            last_button=context['step']['last_button'], last_url=context['step']['url'])
         emit("gate", pk=pk, agent="applier", detail=reason, url=jd_url)
         return {"result": "failed", "pk": pk, "reason": "uncertain", "detail": reason}
     if status == "applied":
         conf = result.get("confirmation") or "submitted"
         stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf)
+        if getattr(stores.tracking, 'r', None) is not None:
+            submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)
         emit("applied", pk=pk, detail=conf, url=jd_url)
         return {"result": "done", "pk": pk, "confirmation": conf}
@@ -1078,7 +1093,7 @@ def _requeue_untouched(pk: str, stores: Any) -> None:
     browser, not for a second go-ahead.
     """
     row = stores.tracking.get(pk) or {}
-    if row.get("possible_submission"):
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return
     requested = bool(row.get("apply_requested_at"))
     stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
@@ -1131,7 +1146,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return {"result": "missing", "pk": pk}
     # Never let a retry wipe an APPLIED row back to found — that path re-runs the
     # whole pipeline including the submit, i.e. a duplicate application.
-    if row.get("possible_submission"):
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
     if row.get("status") in ("applied", "applied_manual"):
@@ -1140,7 +1155,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         emit("response", pk=pk, agent="applier", url=row.get("jd_url"),
              detail=f"🛑 Retry refused — this job is already '{row.get('status')}'.")
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
-    if _claimed(pk, stores):
+    if row.get('status') == 'submitting' or _claimed(pk, stores):
         # Wiping a row to `found` under a run that still owns it leaves the row
         # unrunnable once that run dies: found, claimed, and skipped by recovery.
         from core.events import emit
@@ -1470,11 +1485,18 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
     if outcome.get("status") == "applied":
         confirmation = outcome.get("confirmation") or "submitted"
         stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=confirmation)
+        if getattr(stores.tracking, 'r', None) is not None:
+            submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)
         emit("applied", pk=pk, detail=confirmation, url=final.get("jd_url"),
              screenshot=_art_url(final.get("screenshot_s3_key")))
         return {"result": "done", "pk": pk}
 
+    if submit_hold.blocked(pk, final, tracking=stores.tracking) or outcome.get('status') == 'uncertain':
+        stores.tracking.set_status(
+            pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain', fail_kind='uncertain',
+            fail_reason=submit_hold.REASON, gate_pending={'question': submit_hold.REASON})
+        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain', 'detail': submit_hold.REASON}
     reason = _fail_reason(outcome)
     stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
                                fail_kind=outcome.get("reason") or "")

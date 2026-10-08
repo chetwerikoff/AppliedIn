@@ -155,8 +155,9 @@ _LEASE_SEEN: dict = {}       # pk -> when a lease was first seen with no applica
 
 
 def _hold_possible_submission(stores, row) -> bool:  # noqa: ANN001
-    """Keep an orphan with a durable pre-click marker out of every retry path."""
-    if not row.get("possible_submission"):
+    """Independent pre-click evidence survives stale full-row tracking writes."""
+    from tools.submit_hold import blocked
+    if not blocked(row['pk'], row, tracking=stores.tracking):
         return False
     from core.models import Status
 

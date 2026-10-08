@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from core.config import get_settings
 from core.logging import get_logger
@@ -225,6 +225,44 @@ def web_url(url: str) -> bool:
         parsed.username or parsed.password)
 
 
+# Shared ATS hostnames contain multiple tenants. The first path component
+# identifies the employer; links to other hosts have no code-verifiable mapping.
+_SHARED_DISCOVERY_ATS = {'job-boards.greenhouse.io', 'boards.greenhouse.io',
+                         'jobs.lever.co', 'jobs.ashbyhq.com', 'jobs.smartrecruiters.com'}
+_READ_QUERY_KEYS = {'id', 'job', 'job_id', 'jobid', 'jid', 'gh_jid', 'req',
+                    'requisition', 'role', 'department', 'location', 'search',
+                    'query', 'keyword', 'keywords', 'page', 'offset', 'limit',
+                    'sort', 'lang', 'locale', 'team', 'type', 'board', 'source'}
+_ACTION_ROUTE = re.compile(
+    r'(?:^|[-_])(?:apply|application|quickapply|easyapply|oneclick|submit|send|'
+    r'confirm|confirmation|finish|complete|approve|finalize)(?:$|[-_])', re.I)
+
+
+def discovery_url_allowed(candidate: str, seed: str) -> bool:
+    """Do not trust observed hrefs as authority to navigate or publish jobs."""
+    if not web_url(candidate) or not web_url(seed):
+        return False
+    target, source = urlsplit(candidate), urlsplit(seed)
+    if (target.scheme, target.hostname, target.port) != (
+            source.scheme, source.hostname, source.port):
+        return False
+    if source.hostname in _SHARED_DISCOVERY_ATS:
+        source_parts = [p for p in source.path.split('/') if p]
+        target_parts = [p for p in target.path.split('/') if p]
+        if (not source_parts or not target_parts
+                or source_parts[0].lower() != target_parts[0].lower()):
+            return False
+    if any(_ACTION_ROUTE.search(part) for part in
+           (target.path + '/' + target.fragment).split('/')):
+        return False
+    for key, value in parse_qsl(target.query, keep_blank_values=True):
+        if (_ACTION_ROUTE.search(key) or _ACTION_ROUTE.search(value)
+                or (key.lower() not in _READ_QUERY_KEYS
+                    and not key.lower().startswith('utm_'))):
+            return False
+    return True
+
+
 def applies_running() -> int:
     return sum(1 for _, _, kind in list(_LIVE.values()) if kind == "apply")
 
@@ -303,6 +341,8 @@ async def run_task(task: str, *, report_key: str, model: str = "", timeout_s: in
             urls = [u.rstrip(',') for u in re.findall(pattern, task)]
         if not urls or any(not web_url(url) for url in urls):
             return {}, "Only HTTP(S) posting URLs may be opened"
+        if report_key == "jobs" and not discovery_url_allowed(urls[0], urls[0]):
+            return {}, "Discovery seed has no proven read-only employer tenant"
         async with asyncio.timeout(timeout_s):
             async with Session(kind or "jd") as session:
                 if report_key == "postings":
@@ -321,13 +361,18 @@ async def run_task(task: str, *, report_key: str, model: str = "", timeout_s: in
 
 async def _crawl(session: Session, task: str, url: str) -> dict:
     from tools.browser_skill_apply import control, is_submission
+    if not discovery_url_allowed(url, url):
+        raise ValueError("Discovery seed is not a proven read-only employer route")
     page = await session.navigate(url)
     history, observed, pages = [], {url}, []
     for _ in range(80):
+        if not discovery_url_allowed(page.get('url', ''), url):
+            raise ValueError("Discovery left the selected employer or tenant")
         from discovery.progress import cancelled
         if cancelled():
             raise Unavailable("BrowserSkill stopped: discovery cancelled")
-        observed.update(c["href"] for c in page["controls"] if web_url(c.get("href", "")))
+        observed.update(c["href"] for c in page["controls"]
+                        if discovery_url_allowed(c.get("href", ""), url))
         pages.append({"url": page["url"], "text": page["text"][:24000]})
         action = await decision(task + '\nReturn jobs only with URLs observed on these pages. '
                                 + 'For finish.report use the requested jobs JSON schema. '
@@ -336,13 +381,15 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
         if verb == "finish":
             report = action.get("report") or {}
             report["jobs"] = [j for j in report.get("jobs", [])
-                              if isinstance(j, dict) and j.get("url") in observed]
+                              if isinstance(j, dict) and j.get("url") in observed
+                              and discovery_url_allowed(j.get("url", ""), url)]
             return report
         if verb == "gate":
             raise Unavailable("BrowserSkill operation unavailable: discovery needs human help")
         if verb == "navigate":
-            if action.get("url") not in observed:
-                raise ValueError("Discovery navigation was not observed")
+            if (action.get("url") not in observed
+                    or not discovery_url_allowed(action.get("url", ""), url)):
+                raise ValueError("Discovery navigation has no proven safe employer route")
             page = await session.navigate(action["url"])
         elif verb == "wait":
             await asyncio.sleep(1)

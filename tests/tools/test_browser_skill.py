@@ -337,6 +337,56 @@ async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
     assert result['jobs'] == [{'url': link['href'], 'title': 'Real'}]
 
 
+@pytest.mark.parametrize('unsafe', [
+    'https://foreign.test/job/2',
+    'https://employer.test/jobs/1/quick-apply?send=1',
+    'https://employer.test/jobs/1/confirm',
+    'https://employer.test/jobs/1?submit=true',
+])
+async def test_discovery_never_navigates_foreign_or_action_links(monkeypatch, unsafe):
+    seed = 'https://employer.test/careers'
+    current = {**page(target(tag='a', type='a', href=unsafe)), 'url': seed}
+    visited = []
+    async def navigate(href):
+        visited.append(href)
+        return current
+    session = SimpleNamespace(navigate=navigate)
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'navigate', 'url': unsafe}))
+    with pytest.raises(ValueError, match='safe employer route'):
+        await bsk._crawl(session, 'Find postings', seed)
+    assert visited == [seed]  # no browser navigate IPC to the bad href
+
+
+def test_discovery_enforces_shared_ats_tenant():
+    seed = 'https://job-boards.greenhouse.io/example-co/jobs'
+    assert bsk.discovery_url_allowed(
+        'https://job-boards.greenhouse.io/example-co/jobs/42', seed)
+    assert not bsk.discovery_url_allowed(
+        'https://job-boards.greenhouse.io/another-tenant/jobs/42', seed)
+    assert not bsk.discovery_url_allowed(
+        'https://job-boards.greenhouse.io/', 'https://job-boards.greenhouse.io/')
+
+
+async def test_discovery_never_publishes_foreign_tenant(monkeypatch):
+    seed = 'https://employer.test/careers'
+    good = 'https://employer.test/jobs/123'
+    foreign = 'https://job-boards.greenhouse.io/other-tenant/jobs/999'
+    current = {**page(
+        target(selector='#one', tag='a', type='a', href=good),
+        target(selector='#two', tag='a', type='a', href=foreign)), 'url': seed}
+    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'finish', 'report': {'jobs': [
+            {'url': good, 'title': 'Same employer'},
+            {'url': foreign, 'title': 'Foreign tenant'}]}}))
+    report = await bsk._crawl(session, 'Find postings', seed)
+    assert report['jobs'] == [{'url': good, 'title': 'Same employer'}]
+    session.navigate.assert_awaited_once_with(seed)
+
+
 def test_startup_reuses_shared_daemon_and_never_restarts_it(monkeypatch):
     monkeypatch.setattr(bsk, '_sync', lambda *args: {'ok': True})
     monkeypatch.setattr(bsk.subprocess, 'Popen', lambda *args, **kw: pytest.fail('Shared daemon'))

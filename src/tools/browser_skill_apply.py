@@ -411,7 +411,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         current = control(page, action)
                         if current.get('tag') == 'a' and current.get('href') and not (
                                 navigation_allowed(current['href'], url, direct_url)):
-                            raise Gate('Navigation is limited to the employer and known ATS hosts.')
+                            raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options')):
                             raise Gate('The control changed while planning; review the form.')
@@ -426,7 +426,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if href not in {c.get('href') for c in page['controls']}:
                             raise Gate('Only a link on the current application page may be opened.')
                         if not navigation_allowed(href, url, direct_url):
-                            raise Gate('Navigation is limited to the employer and known ATS hosts.')
+                            raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(c.get('has_value') for c in page['controls'] if c.get('in_form')):
                             raise Gate('Do not navigate away from a populated application.')
                         page = await session.navigate(href)

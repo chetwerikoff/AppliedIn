@@ -1361,7 +1361,67 @@ async def test_external_form_receiver_gates_before_upload_or_submit_click(
     assert result['status'] == 'gate'
     assert 'form destination' in result['question']
     assert 'click' not in calls
-    assert calls == ([] if bad_receiver == 'form_action' else ['upload'])
+    assert calls == []  # even upload is forbidden when any same-form receiver is foreign
+
+
+@pytest.mark.parametrize('declared_submit', [False, True])
+async def test_submit_label_on_js_button_cannot_prove_native_click(
+        monkeypatch, declared_submit):
+    resume = target(selector='#resume', type='file', label='Resume', files=['Resume.pdf'])
+    button = target(selector='#submit', tag='button', type='button',
+                    label='Submit application', submit=declared_submit)
+    current = page(resume, button)
+    calls = []
+
+    class Session:
+        def __init__(self, kind):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def navigate(self, url):
+            return current
+
+        async def page(self):
+            return current
+
+        async def call(self, *args, **kwargs):
+            calls.append(args[0])
+            if args[0] == 'click':
+                pytest.fail('A JS-backed Submit button reached click IPC')
+
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
+    monkeypatch.setattr(bsk, 'Session', Session)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'upload', 'selector': '#resume'},
+        {'action': 'submit', 'selector': '#submit'}]))
+    result = await forms.apply(current['url'], 'example-co', {}, 'synthetic',
+                               pk='example-co#1', resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'native submit control' in result['question']
+    assert calls == ['upload']  # never a committing click
+
+
+def test_form_receiver_preflight_scopes_distinct_native_forms():
+    upload = target(selector='#resume', type='file', label='Resume',
+                    form_selector='#application')
+    submit = target(selector='#submit', tag='button', type='submit',
+                    label='Submit application', submit=True,
+                    form_selector='#application')
+    unrelated = target(selector='#other', tag='button', type='submit',
+                       label='Unrelated', submit=True, form_selector='#other-form',
+                       form_action='https://foreign.test/receive')
+    current = page(upload, submit, unrelated)
+    forms.check_form_destination(current, upload, current['url'])
+    submit['formaction'] = 'https://foreign.test/receive'
+    with pytest.raises(forms.Gate, match='form destination'):
+        forms.check_form_destination(current, upload, current['url'])
 
 
 def test_native_same_job_form_receiver_is_authorized():

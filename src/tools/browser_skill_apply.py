@@ -110,6 +110,13 @@ def is_submission(target: dict) -> bool:
     return bool(target.get('submit') and not _NEXT.search(text))
 
 
+def native_submit(target: dict) -> bool:
+    """A label and safe form.action do not prove a JS button's click effect."""
+    return (target.get('submit') is True
+            and target.get('tag') in {'button', 'input'}
+            and target.get('type') in {'submit', 'image'})
+
+
 def guarded_value(target: dict, value: str) -> str:
     question = label(target)
     value = str(value).strip()
@@ -298,16 +305,24 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str) -> None:
-    """Inspect the effective native receiver before upload or committing click."""
+    """Preflight every receiver on this form before even uploading a document."""
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
-    base = target.get('form_action')
-    override = target.get('formaction')
-    if (not isinstance(base, str) or not base
-            or (override and not isinstance(override, str))
-            or not navigation_allowed(base, *origins)
-            or (override and not navigation_allowed(override, *origins))):
-        raise Gate('The form destination is external or not proven to be this tracked job.')
+    form_selector = target.get('form_selector')
+    # Older inventories lack form identity. Then validating all visible form
+    # destinations is safer than guessing which Submit button owns this input.
+    relevant = [target] + [
+        item for item in page.get('controls', [])
+        if item is not target and item.get('in_form')
+        and (not form_selector or not item.get('form_selector')
+             or item.get('form_selector') == form_selector)]
+    for item in relevant:
+        base, override = item.get('form_action'), item.get('formaction')
+        if (not isinstance(base, str) or not base
+                or (override and not isinstance(override, str))
+                or not navigation_allowed(base, *origins)
+                or (override and not navigation_allowed(override, *origins))):
+            raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
@@ -401,8 +416,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if (not allow_click or not pk or not submit_hold.is_held(pk)
                 or not _NEXT.match(target.get('label', ''))):
             raise Gate('Unproven or JS-backed click requires human inspection.')
-        if (is_submission(target) or not target.get('submit')
-                or target.get('type') in {'radio', 'checkbox', 'option', 'file'}):
+        if is_submission(target) or not native_submit(target):
             raise Gate('A JS-backed or non-native submit destination is unproven.')
         check_form_destination(page, target, job_url or page.get('url', ''))
         await session.call('click', target['selector'])
@@ -507,8 +521,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise Gate('Unproven application navigation may commit; inspect it yourself.')
                     elif verb == 'submit':
                         target = control(page, action)
-                        if not is_submission(target):
-                            raise Gate('The final submission control was not identified.')
+                        if not is_submission(target) or not native_submit(target):
+                            raise Gate('A proven native submit control is required before clicking.')
                         check_dispatch(pk, resume_path)
                         check_form_destination(page, target, url, direct_url)
                         check_form(page, filled, uploaded, Path(resume_path).name)
@@ -538,7 +552,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     else:
                         target = control(page, action)
                         if verb == 'click' and _NEXT.match(target['label']):
-                            if not target.get('submit'):
+                            if not native_submit(target):
                                 raise Gate('A JS-backed Continue has no proven native destination.')
                             check_dispatch(pk, resume_path)
                             check_form_destination(page, target, url, direct_url)

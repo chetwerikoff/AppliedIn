@@ -37,7 +37,8 @@ PAGE = r"""(() => {
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
-      in_form:!!form, form_action:formAction, formaction:override, name:e.name || '',
+      in_form:!!form, form_selector:form ? selector(form) : '',
+       form_action:formAction, formaction:override, name:e.name || '',
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),

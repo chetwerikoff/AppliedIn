@@ -187,7 +187,7 @@ def test_setup_saves_only_after_y_and_keeps_optional_settings(sandbox, monkeypat
 
 
 async def test_session_checks_auto_start_before_starting_bsk(sandbox, monkeypatch):
-    monkeypatch.setattr(bsk, 'available', lambda: (False, 'not connected'))
+    monkeypatch.setattr(bsk, 'available', lambda: (True, ''))
     ensured = []
     monkeypatch.setattr(profile, 'ensure_browser', lambda: (ensured.append(True) or True, ''))
     command = AsyncMock(side_effect=[

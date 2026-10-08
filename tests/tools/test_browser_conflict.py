@@ -19,7 +19,7 @@ import threading
 from tools.claude_chrome import _is_browser_conflict
 
 
-def test_sessions_are_not_serialised():
+def test_sessions_are_not_serialised(monkeypatch):
     """Concurrency is deliberate, and this pins the decision.
 
     A semaphore briefly serialised every Chrome session, on the theory that two
@@ -31,6 +31,8 @@ def test_sessions_are_not_serialised():
     """
     import tools.claude_chrome as cc
 
+    # The fake session still passes through run_task's real availability guard.
+    monkeypatch.setattr(cc, "available", lambda: (True, ""))
     concurrent, live, lock = [], [0], threading.Lock()
 
     async def fake_session(*_a, **_kw):

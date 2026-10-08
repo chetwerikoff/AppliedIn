@@ -528,7 +528,7 @@ async def test_application_gates_external_link_before_the_browser_follows_it(mon
     result = await forms.apply(current['url'], 'Company', {}, 'chatgpt/model',
                                pk='Company#1', resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'unrelated' in result['question'] or 'Unproven' in result['question']
+    assert 'tracked job and tenant' in result['question']
     assert result['status'] == 'gate'
     assert result['step']['url'] == current['url']
     assert calls == [current['url']]

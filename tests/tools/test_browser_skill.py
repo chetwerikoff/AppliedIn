@@ -279,6 +279,8 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
                 return {}
             if args[0] == 'click':
                 assert tracking.row['possible_submission'] is True
+                assert tracking.row['status'] == 'needs_human'
+                assert tracking.row['gate_reason'] == 'submit_uncertain'
                 assert tracking.row['fail_kind'] == 'uncertain'
                 assert tracking.row['last_button'] == button
                 assert tracking.row['last_url'] == current['url']

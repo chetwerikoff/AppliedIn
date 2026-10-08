@@ -213,6 +213,11 @@ def test_success_requires_new_page_evidence_and_no_remaining_submit_control():
 
 
 def test_stale_resume_and_duplicates_are_rechecked_before_submit(monkeypatch, tmp_path):
+    import fakeredis
+    # Faking the row alone leaves the independent-key guard querying localhost.
+    # Keep this résumé/duplicate regression offline, even without a Redis server.
+    tracking = SimpleNamespace(r=fakeredis.FakeRedis(decode_responses=True))
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))
     pdf = tmp_path / 'Resume.pdf'
     pdf.write_bytes(b'pdf')
     row = {'status': 'submitting', 'resume_tex_key': 'r.tex', 'resume_seed': 'old'}

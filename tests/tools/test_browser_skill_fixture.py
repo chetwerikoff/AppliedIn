@@ -695,15 +695,15 @@ async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
         for selector, label, val in (
             ("#name", "Name", "Test User"),
             ("#additional", "Additional question", "Synthetic answer"))]
-    authority.row["status"], authority.row["gate_reason"], authority.hold = (
-        "needs_human", "submit_uncertain", True)
-
-    # Baseline: all checks pass, with actual required control values, staged PDF,
-    # exact receipts and a verified hold. No fake upload or missing-field gate.
+    # Production first validates the exact receipts in SUBMITTING, then records
+    # the possible-submission hold and moves to NEEDS_HUMAN at the JIT edge.
+    # Rechecking approval only after the hold would be a wrong-order test.
     forms.check_form(current, filled, True, "Synthetic-Resume.pdf")
     forms.check_approvals(fixture.PK, history, current,
                           fixture_context=authority)
     forms.check_form_destination(current, cont, fixture.URL)
+    authority.row["status"], authority.row["gate_reason"], authority.hold = (
+        "needs_human", "submit_uncertain", True)
     forms.check_before_committing_click(fixture.PK, fixture_context=authority)
 
     sent = []

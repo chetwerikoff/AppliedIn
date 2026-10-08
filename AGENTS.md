@@ -272,7 +272,7 @@ invariants, the rules above or "The rule that outranks the rest" in `CLAUDE.md`.
   pack `scripts/gh` with `OPK_PROJECT_ID=appliedin`.
 - Verification: the card's `verification.local` in the task's worktree, via
   `scripts/lib/target-context.ts verify --project appliedin --target-worktree
-  <root>` from the pack root. JS tests run with `TZ=UTC`. Required CI:
+  `<root>` from the pack root. Required CI:
   `CI / checks` on the exact PR head.
 - `upstream` (`sayantan94/AppliedIn`) is read-only: no Issues, PRs or pushes.
   Upstream sync is its own task: `./appliedin update` on a clean tree here.

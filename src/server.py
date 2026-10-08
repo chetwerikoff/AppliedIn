@@ -710,7 +710,7 @@ def create_app() -> FastAPI:
         if not stores.tracking.get(pk):
             return {"ok": False, "error": "unknown job"}
         stores.tracking.set_status(
-            pk, Status.APPLIED,
+            pk, Status.APPLIED_MANUAL,
             confirmation_id=str((body or {}).get("confirmation") or
                                 "submitted via the browser extension")[:200],
             gate_pending=None, gate_reason="")
@@ -1343,6 +1343,7 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         q = ApplyQueue(stores.tracking.r)
         if (row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
+                or row.get("possible_submission")
                 or row.get("confirmation_id") or pk in q.in_flight()
                 or any(item["pk"] == pk for item in q.pending())):
             return {"ok": False, "error": "Force apply is only available for an unsent role skipped for a low match score."}
@@ -1451,6 +1452,8 @@ def create_app() -> FastAPI:
                         jd_url="", jd_text=text, ats="custom")
         pk = job.pk
         if not stores.tracking.put_new(job):
+            if (stores.tracking.get(pk) or {}).get("possible_submission"):
+                return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             stores.tracking.set_status(pk, Status.FOUND, jd_text=text, title=title,
                                        skip_reason="", fail_kind="", fail_reason="")
 
@@ -1622,6 +1625,8 @@ def create_app() -> FastAPI:
         # Continue the gated run in the background so the click returns instantly;
         # the pipeline's next steps stream to the Logs view as they happen.
         from agent.run import resume_job
+        if (make_stores(settings).tracking.get(pk) or {}).get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         background.add_task(resume_job, pk, body.get("answer", ""))
         return {"ok": True, "status": "resuming"}
 
@@ -1631,8 +1636,11 @@ def create_app() -> FastAPI:
         / saw the ACK). Marks it applied and clears any gate — the safe fix for a
         mis-detected submit, and it prevents a resubmit."""
         note = ((body or {}).get("note") or "").strip() or "Confirmed by you (email / on-screen ACK)."
-        make_stores(settings).tracking.set_status(
-            pk, Status.APPLIED, confirmation_id=note, gate_reason="", gate_pending=None)
+        stores = make_stores(settings)
+        if not stores.tracking.get(pk):
+            return {"ok": False, "error": "unknown job"}
+        stores.tracking.set_status(
+            pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
         from core.events import emit
         emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
         return {"ok": True}
@@ -2417,6 +2425,8 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         if not row:
             return {"ok": False, "error": "no such job"}
+        if row.get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if (st := row.get("status")) in ("applied", "applied_manual"):
             return {"ok": False,
                     "error": "This application has already gone out. A fresh "
@@ -2451,6 +2461,8 @@ def create_app() -> FastAPI:
     def retry(pk: str, background: BackgroundTasks):
         """Re-run a failed/errored job from scratch (clean session, current KB)."""
         from agent.run import retry_job
+        if (make_stores(settings).tracking.get(pk) or {}).get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
 
@@ -2567,6 +2579,22 @@ def create_app() -> FastAPI:
         from tools import seen
         from tools.browser_runtime import kill_live_sessions
 
+        # Refuse destructive reset if the durable hold or an in-flight attempt
+        # might be the only evidence of a possibly committed submission.
+        from core.apply_queue import ApplyQueue
+        from tools.browser_skill import applies_running
+        try:
+            stores = make_stores(settings)
+            queued = ApplyQueue(stores.tracking.r)
+            rows = stores.tracking.all()
+            if (any(r.get("possible_submission") or r.get("status") == "submitting"
+                    for r in rows)
+                    or queued.in_flight() or applies_running()):
+                return {"ok": False, "note": (
+                    "possible submission or active browser attempt; "
+                    "check the employer portal before reset")}
+        except Exception:
+            return {"ok": False, "note": "Could not verify safe reset conditions."}
         # End the browsers first. Clearing the store while a session is still
         # filling a form leaves the owner watching it work on a job that no
         # longer exists.

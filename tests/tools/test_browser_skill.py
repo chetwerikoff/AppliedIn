@@ -236,18 +236,58 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
                     label=button, submit=True)
     resume = target(selector='#resume', label='Resume', type='file', files=['Resume.pdf'])
     current = page(resume, submit)
+    pk = 'example-co#job-1'
+    evidence = []
+
+    class Tracking:
+        def __init__(self):
+            self.row = {'pk': pk, 'status': 'submitting'}
+
+        def set_status(self, observed_pk, status, **attrs):
+            assert observed_pk == pk
+            evidence.append('write')
+            self.row.update(status=getattr(status, 'value', status), **attrs)
+
+        def get(self, observed_pk):
+            assert observed_pk == pk
+            evidence.append('readback')
+            return dict(self.row)
+
+    tracking = Tracking()
+    monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw:
+                        SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr(forms, '_row', tracking.get)
+
     class FakeSession:
         def __init__(self, kind):
-            error = bsk.Unavailable('BrowserSkill unavailable: offline')
-            self.call = AsyncMock(side_effect=[{}, error])
+            self.kind = kind
+
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *args):
             return False
+
         async def navigate(self, url):
             return current
+
         async def page(self):
             return current
+
+        async def call(self, *args, **kwargs):
+            if args[0] == 'upload':
+                return {}
+            if args[0] == 'click':
+                assert tracking.row['possible_submission'] is True
+                assert tracking.row['fail_kind'] == 'uncertain'
+                assert tracking.row['last_button'] == button
+                assert tracking.row['last_url'] == current['url']
+                assert evidence[-2:] == ['write', 'readback'] if verb == 'submit' else (
+                    evidence[-3:] == ['write', 'readback', 'readback'])
+                evidence.append('click')
+                raise bsk.Unavailable('BrowserSkill unavailable: offline')
+            pytest.fail('Unexpected browser IPC')
+
     monkeypatch.setattr(bsk, 'Session', FakeSession)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args: None)
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: 'Resume.pdf')
@@ -255,13 +295,16 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
         {'action': 'upload', 'selector': '#resume'},
         {'action': verb, 'selector': '#submit'},
     ]))
-    result = await forms.apply('https://employer.test/job/1', 'Company', {}, 'chatgpt/model',
-                               pk='Company#1', resume_path='Resume.pdf')
+    result = await forms.apply('https://employer.test/job/1', 'example-co', {},
+                               'chatgpt/model', pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'uncertain'
     assert not runtime.is_disconnected(result['detail'])
     assert not runtime.is_infrastructure(result['detail'])
     assert result['step'] == {'last_button': button, 'url': current['url']}
     assert button in result['detail'] and current['url'] in result['detail']
+    assert 'click' in evidence
+    assert evidence.index('write') < evidence.index('click')
+    assert evidence.index('readback', evidence.index('write')) < evidence.index('click')
 
 
 async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):

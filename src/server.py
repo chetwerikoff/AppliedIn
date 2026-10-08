@@ -1645,6 +1645,46 @@ def create_app() -> FastAPI:
         emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
         return {"ok": True}
 
+    @app.post("/actions/resolve-uncertain/{pk:path}")
+    def resolve_uncertain(pk: str, body: dict):
+        """Explicit portal-verified human outcome; never an automatic retry."""
+        from core.apply_queue import ApplyQueue
+        from tools.browser_skill import applies_running
+
+        if body.get("portal_checked") is not True:
+            return {"ok": False, "error": "Check the employer portal before resolving."}
+        outcome = body.get("outcome")
+        if outcome not in {"submitted", "not_submitted"}:
+            return {"ok": False, "error": "Explicit submitted/not_submitted outcome required."}
+        stores = make_stores(settings)
+        row = stores.tracking.get(pk) or {}
+        if not row.get("possible_submission") or row.get("status") != "needs_human":
+            return {"ok": False, "error": "This row is not a held uncertain submission."}
+        try:
+            if pk in ApplyQueue(stores.tracking.r).in_flight() or applies_running():
+                return {"ok": False, "error": "An application attempt is still in flight."}
+        except Exception:
+            return {"ok": False, "error": "Cannot prove that the attempt has stopped."}
+        if outcome == "submitted":
+            evidence = str(body.get("confirmation") or "").strip()[:200]
+            if not evidence:
+                return {"ok": False, "error": "Provide the portal confirmation."}
+            stores.tracking.set_status(
+                pk, Status.APPLIED_MANUAL, confirmation_id=evidence,
+                gate_reason="", gate_pending=None, gate_call_id=None)
+            return {"ok": True, "status": "applied_manual"}
+        if body.get("new_apply_decision") is not True:
+            return {"ok": False, "error": (
+                "A fresh explicit owner application decision is required to clear the hold.")}
+        # The explicit portal check says the attempt did NOT submit. No new
+        # application starts here; the row returns to normal approval review.
+        stores.tracking.set_status(
+            pk, Status.TAILORED, possible_submission=False, fail_kind="",
+            fail_reason="", gate_reason="approval", gate_pending=None,
+            gate_call_id=None, last_button="", last_url="")
+        return {"ok": True, "status": "tailored", "queued": False}
+
+
     @app.post("/actions/stop-run")
     def stop_run(body: dict | None = None):
         """Stop the DISCOVERY run, the PROCESS run, or both.

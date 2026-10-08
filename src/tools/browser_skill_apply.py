@@ -43,25 +43,43 @@ _ATS_HOSTS = (
 
 
 def navigation_allowed(href: str, *origins: str) -> bool:
+    """Require a job-scoped route, not a shared ATS/employer hostname."""
     if not bsk.web_url(href):
         return False
-    host = (urlsplit(href).hostname or '').lower().rstrip('.')
-    own = {(urlsplit(origin).hostname or '').lower().rstrip('.') for origin in origins}
-    return host in own or any(host == ats or host.endswith('.' + ats) for ats in _ATS_HOSTS)
-
+    target = urlsplit(href)
+    for origin in origins:
+        if not bsk.web_url(origin):
+            continue
+        source = urlsplit(origin)
+        if (target.scheme, target.hostname, target.port) != (
+                source.scheme, source.hostname, source.port):
+            continue
+        job_path = source.path.rstrip('/')
+        if not job_path or not (target.path == job_path
+                                or target.path.startswith(job_path + '/')):
+            continue
+        former = dict(parse_qsl(source.query, keep_blank_values=True))
+        current = dict(parse_qsl(target.query, keep_blank_values=True))
+        if any(current.get(k) != value for k, value in former.items()
+               if re.search(r'job|req|tenant|position|posting|id$', k, re.I)):
+            continue
+        return True
+    return False
 
 def handoff(message: str, step: dict) -> dict:
-    # Callback URLs can carry OAuth tickets. Preserve the page location without
-    # putting a credential into a gate, daemon log or the owner's status report.
+    """Only safe action context, never browser tokens or URL fragments."""
     parsed = urlsplit(step.get('url', ''))
     query = [(k, v) for k, v in parse_qsl(parsed.query)
-             if not re.search(r'token|code|auth|password|secret|session|key|saml|ticket', k, re.I)]
-    url = urlunsplit((parsed.scheme, parsed.netloc.rsplit('@', 1)[-1], parsed.path,
+             if k.lower() in {'job', 'job_id', 'req', 'requisition', 'id'}
+             and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', v)]
+    path = parsed.path if not re.search(r'/[^/]{120,}', parsed.path) else '/'
+    url = urlunsplit((parsed.scheme, parsed.netloc.rsplit('@', 1)[-1], path,
                      urlencode(query), ''))
-    context = {'last_button': step.get('last_button', ''), 'url': url}
-    button = context['last_button'] or '(none yet)'
+    button = re.sub(r'\s+', ' ', str(step.get('last_button') or ''))[:80]
+    if not re.fullmatch(r'[\w .-]{1,80}', button):
+        button = '(unavailable)'
+    context = {'last_button': button, 'url': url}
     return {'text': f'{message} Last button: {button}. Page: {url}', 'step': context}
-
 
 class Gate(ValueError):
     pass
@@ -141,6 +159,36 @@ def _row(pk: str) -> dict:
     return make_stores().tracking.get(pk) or {}
 
 
+def exact_approval(pk: str, key: str, value: str) -> None:
+    """A bank key or alleged source is not proof of a human-approved answer."""
+    row = _row(pk) if pk else {}
+    grants = row.get('human_approved_answers')
+    if (row.get('pk') != pk or row.get('status') != 'submitting'
+            or row.get('possible_submission') or not isinstance(grants, dict)
+            or not key or grants.get(key) != value):
+        raise Gate('An exact human-approved answer is needed for this field.')
+
+
+def hold_possible_submission(pk: str, step: dict) -> None:
+    """Write/read back an existing-row uncertain hold before any click IPC."""
+    from core.models import Status
+    from core.stores import make_stores
+
+    context = handoff('possible submission; check the employer portal before retrying', step)['step']
+    tracking = make_stores().tracking
+    tracking.set_status(
+        pk, Status.SUBMITTING, possible_submission=True, fail_kind='uncertain',
+        fail_reason='possible submission; check the employer portal before retrying',
+        last_button=context['last_button'], last_url=context['url'])
+    persisted = tracking.get(pk) or {}
+    if (persisted.get('pk') != pk or persisted.get('status') != 'submitting'
+            or persisted.get('possible_submission') is not True
+            or persisted.get('fail_kind') != 'uncertain'
+            or persisted.get('last_button') != context['last_button']
+            or persisted.get('last_url') != context['url']):
+        raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.')
+
+
 def check_dispatch(pk: str, resume_path: str) -> None:
     from agent.run import seed_fingerprint
     from tools.browser_apply import _duplicate_refusal
@@ -149,8 +197,9 @@ def check_dispatch(pk: str, resume_path: str) -> None:
     if _duplicate_refusal(pk):
         raise Gate('This job is already applied; no duplicate is permitted.')
     row = _row(pk)
-    if row.get('status') != 'submitting' or row.get('gate_reason') == 'approval':
-        raise Gate('This application has not been dispatched through the approval gate.')
+    if (row.get('possible_submission') or row.get('status') != 'submitting'
+            or row.get('gate_reason') == 'approval'):
+        raise Gate('This application is not a fresh approved dispatch.')
     if not row.get('resume_tex_key') or row.get('resume_seed') != seed_fingerprint():
         raise Gate('The tailored résumé is missing or its base changed; re-tailor before applying.')
     if not resume_path or not Path(resume_path).is_file():
@@ -158,25 +207,45 @@ def check_dispatch(pk: str, resume_path: str) -> None:
 
 
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -> None:
-    if page.get('truncated'):
+    if page.get('truncated') or page.get('inventory_verified') is not True:
         raise Gate('The form inventory is incomplete; review the full form before submitting.')
+    if page.get('opaque_controls') or page.get('unsupported_frames') or page.get('shadow_roots'):
+        raise Gate('This form has uninspectable components; human inspection is required.')
+    controls = page.get('controls', [])
+    selectors = [c.get('selector') for c in controls]
+    if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
+        raise Gate('The current form controls are not uniquely inventoried.')
     if not uploaded:
         raise Gate('The résumé attachment has not been verified on the form.')
-    if attachment and attachment not in page.get('text', '') and not any(
-            attachment in c.get('files', []) for c in page.get('controls', [])):
-        raise Gate('The résumé attachment is no longer present on the current form.')
-    if page.get('unsupported_frames') or page.get('shadow_roots'):
-        raise Gate('This form has embedded controls outside the verified inventory; review it.')
-    for target in page.get('controls', []):
-        if target.get('disabled') or target.get('type') in {'hidden', 'button', 'submit'}:
-            continue
+    if attachment:
+        attached = [c for c in controls
+                    if c.get('type') == 'file'
+                    and re.search(r'resume|résumé|cv', label(c), re.I)
+                    and attachment in c.get('files', [])]
+        if len(attached) != 1:
+            raise Gate('The résumé attachment is no longer present on the current file input.')
+    for target in controls:
         typ = target.get('type', '')
+        if typ == 'hidden':
+            if target.get('in_form') and (target.get('required') or target.get('has_value')):
+                raise Gate('A hidden form value is not independently authorized.')
+            continue
+        if target.get('disabled') or typ in {'button', 'submit'}:
+            continue
+        if target.get('in_form') and (
+                target.get('tag') not in {'input', 'textarea', 'select', 'button'}
+                or typ in {'combobox', 'contenteditable', 'option'}):
+            raise Gate('Unsupported custom control; human inspection is required.')
         value = target.get('value', '')
+        expected = filled.get(target['selector'])
         if typ in {'radio', 'checkbox'}:
             if target.get('checked'):
                 guarded_value(target, target.get('label', value))
-                if target['selector'] not in filled:
+                if expected is None or not (_same(expected, value)
+                                            or _same(expected, target.get('label', ''))):
                     raise Gate(f'Unverified preselected answer: {target["label"]}')
+            elif expected is not None:
+                raise Gate('A previously verified checkbox/radio choice has changed.')
             elif target.get('required') and typ == 'checkbox':
                 raise Gate(f'Required acknowledgement not completed: {target["label"]}')
             elif typ == 'radio' and target.get('required'):
@@ -184,64 +253,47 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                 if not group or not any(
                         c.get('type') == 'radio' and c.get('checked')
                         and (c.get('name') or c.get('question')) == group
-                        for c in page.get('controls', [])):
+                        for c in controls):
                     raise Gate(f'Required choice is empty: {target["label"]}')
         elif typ != 'file' and target.get('tag') in {'input', 'textarea', 'select'}:
-            # File inputs expose C:\\fakepath values, not an approved text answer.
-            # The attachment receipt and filename are verified separately above.
             if target.get('required') and not target.get('has_value'):
                 raise Gate(f'Required field is empty: {target["label"]}')
             if target.get('has_value'):
-                checked_value = value
+                observed = value
                 if target.get('tag') == 'select':
-                    checked_value = next((o['label'] for o in target.get('options', [])
-                                          if o['value'] == value), value)
-                guarded_value(target, checked_value or filled.get(target['selector'], ''))
-                # Resume parsers can overwrite carefully chosen answers. Values
-                # typed by us must still be there immediately before Submit.
-                expected = filled.get(target['selector'])
+                    observed = next((o['label'] for o in target.get('options', [])
+                                     if o['value'] == value), value)
+                guarded_value(target, observed or expected or '')
                 if expected is None or (value and not _same(value, expected)):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
-
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
-                  github: str) -> dict:
+                  github: str, pk: str = '', allow_click: bool = False) -> dict:
     verb = action.get('action')
     target = control(page, action)
     question = label(target)
-    if target.get('type') == 'option' and getattr(session, 'choice_question', ''):
-        target = {**target, 'question': session.choice_question}
-        question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
     if verb in {'fill', 'select', 'choose'}:
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
-            # The live model requested an essay despite an exact approved answer.
-            # Resolve only literal label matches; do not infer a new fact or answer.
             matches = [k for k in facts if _same(k, target['label'])]
             if len(matches) == 1:
                 key = matches[0]
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
-        elif verb == 'fill' and action.get('essay') and target.get('tag') == 'textarea':
-            from tools.narrative import draft_answer
-            if _SENSITIVE.search(question) or _SANCTIONS_RX.search(question):
-                raise Gate('Sensitive fields cannot be answered as essays.')
-            answer = await asyncio.to_thread(draft_answer, target['label'], company, jd_text,
-                                            resume=resume_tex, github=github)
-            value = answer.get('answer', '')
         elif (verb == 'choose' and target.get('type') == 'checkbox'
               and target.get('required') and _AGREE.match(target.get('label', ''))
               and not _SENSITIVE.search(question) and not _SANCTIONS_RX.search(question)
               and not _FACT_ASSERTION.search(target.get('label', ''))):
-            value = target['label']
+            key, value = target['label'], target['label']
         else:
-            raise Gate(f'An approved answer is needed for {target["label"]}.')
+            raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".')
+        exact_approval(pk, key, value)
         if not value:
-            raise Gate(f'An approved answer is needed for {target["label"]}.')
+            raise Gate(f'An approved answer is needed for "{target["label"]}".')
         guarded_value(target, value)
         if is_submission(target):
             raise Gate('A submission control is not an answer field.')
@@ -252,52 +304,45 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             await session.call('fill', target['selector'], '--value', value)
         elif verb == 'select':
             if target.get('tag') != 'select':
-                raise Gate('Native select required; use an observed option for custom dropdowns.')
+                raise Gate('Native select required; custom dropdowns need human input.')
             value = choose_value(target, value, str(action.get('value', '')))
             await session.call('select', target['selector'], '--value', value)
         else:
             if target.get('type') not in {'radio', 'checkbox', 'option'}:
-                raise Gate('Choose is restricted to observed radio, checkbox or option controls.')
+                raise Gate('Choose is restricted to observed radio/checkbox/option controls.')
             choose_value(target, value, str(action.get('value', '')))
             if not target.get('checked'):
-                await session.call('click', target['selector'])
+                # Onclick can commit unexpectedly; there is no noncommit proof.
+                raise Gate('Choice click is potentially committing; human action required.')
         filled[target['selector']] = value
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
-        except bsk.Unavailable as exc:
-            if exc.file_access_required:
+            observed = await session.page()
+        except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
                            "dedicated profile; inspect the attachment before retrying.") from None
-            if exc.effect_state in {'unknown', 'committed'}:
-                raise Gate('The résumé upload outcome is unclear; inspect the attachment '
-                           'before retrying. No automatic repeat was attempted.') from None
-            raise
-        observed = await session.page()
-        actual = next((c for c in observed['controls'] if c['selector'] == target['selector']), {})
-        if Path(resume_path).name not in actual.get('files', []):
-            raise Gate('The uploaded résumé filename was not confirmed; review before retrying.')
+            raise Gate('The résumé upload outcome is unclear; inspect the attachment '
+                       'before retrying. No automatic repeat was attempted.') from None
+        matches = [c for c in observed.get('controls', [])
+                   if c.get('selector') == target['selector'] and c.get('type') == 'file'
+                   and re.search(r'resume|résumé|cv', label(c), re.I)]
+        if len(matches) != 1 or Path(resume_path).name not in matches[0].get('files', []):
+            raise Gate('The uploaded résumé was not proven in the current file input.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
-        opening = (is_submission(target) and not target.get('in_form') and not filled
-                   and not any(c.get('tag') in {'input', 'textarea', 'select'}
-                               and c.get('type') != 'search' for c in page['controls']))
-        if ((is_submission(target) and not opening)
-                or target.get('type') in {'radio', 'checkbox', 'option', 'file'}):
-            raise Gate('This control needs a guarded answer or the explicit submit action.')
-        link = target.get('tag') == 'a' and bsk.web_url(target.get('href', ''))
-        if (target.get('type') != 'combobox' and not link
-                and not _NAVIGATION.match(target['label'])):
-            raise Gate('This control is not a verified navigation button; use a guarded answer.')
-        if target.get('type') == 'combobox':
-            session.choice_question = label(target)
+        if (not allow_click or not pk or not _row(pk).get('possible_submission')
+                or not _NEXT.match(target.get('label', ''))):
+            raise Gate('Unproven or JS-backed click requires human inspection.')
+        if is_submission(target) or target.get('type') in {'radio', 'checkbox', 'option', 'file'}:
+            raise Gate('This control needs an explicit guarded action.')
         await session.call('click', target['selector'])
     else:
         raise Gate('Unsupported form action.')
     return {'action': verb, 'label': target['label'], 'selector': target['selector']}
-
 
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',

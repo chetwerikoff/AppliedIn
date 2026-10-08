@@ -26,7 +26,15 @@ def enable(tmp_path):
 def target(**values):
     return {'selector': '#field', 'label': 'First name', 'question': '', 'type': 'text',
             'tag': 'input', 'disabled': False, 'has_value': False, 'value': '',
-            'required': False, 'in_form': True, 'submit': False, **values}
+            'required': False, 'in_form': True, 'submit': False,
+            'form_action': 'https://employer.test/job/1', 'formaction': '',
+            **values}
+
+
+def grant(field, value, *, selector='#field',
+          url='https://employer.test/job/1', question=''):
+    return {'value': value, 'selector': selector, 'url': url,
+            'label': field, 'question': question}
 
 
 def page(*controls, text=GOOD):
@@ -158,7 +166,7 @@ async def test_model_text_cannot_replace_approved_fact(monkeypatch):
     session = SimpleNamespace(call=AsyncMock())
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting',
-        'human_approved_answers': {'First name': 'Approved'}})
+        'human_approved_answers': {'First name': grant('First name', 'Approved')}})
     filled = {}
     await forms.execute(session, page(target()),
                         {'action': 'fill', 'selector': '#field', 'fact': 'First name',
@@ -613,7 +621,8 @@ async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_e
     session = SimpleNamespace(call=AsyncMock())
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting',
-        'human_approved_answers': {'Motivation': 'Approved explanation'}})
+        'human_approved_answers': {
+            'Motivation': grant('Motivation', 'Approved explanation')}})
     monkeypatch.setattr('tools.narrative.draft_answer',
                         lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
     await forms.execute(
@@ -832,13 +841,16 @@ def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch
 
 def test_jit_approval_revocation_cannot_be_hidden_by_prior_fill_receipt(monkeypatch):
     row = {'pk': 'example-co#1', 'status': 'submitting',
-           'human_approved_answers': {'Name': 'Test User'}}
+           'human_approved_answers': {'Name': grant('Name', 'Test User')}}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
-    history = [{'fact': 'Name', 'approved_value': 'Test User'}]
-    forms.check_approvals('example-co#1', history)
-    row['human_approved_answers']['Name'] = 'Changed value'
+    history = [{'fact': 'Name', 'approved_value': 'Test User',
+                'selector': '#field', 'label': 'Name', 'question': '',
+                'url': page()['url']}]
+    current = page(target(label='Name'))
+    forms.check_approvals('example-co#1', history, current)
+    row['human_approved_answers']['Name']['value'] = 'Changed value'
     with pytest.raises(forms.Gate, match='human-approved'):
-        forms.check_approvals('example-co#1', history)
+        forms.check_approvals('example-co#1', history, current)
 
 
 @pytest.mark.parametrize('kind', ['hidden', 'custom', 'contenteditable', 'combobox'])
@@ -900,7 +912,7 @@ async def test_human_approved_fact_is_not_authorization_for_another_question(mon
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='this question'):
+    with pytest.raises(forms.Gate, match='human-approved'):
         await forms.execute(session, page(target(label='Years of experience')),
                             {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
                             facts={'Name': 'Test User'}, filled={}, resume_path='',
@@ -1053,7 +1065,8 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
     assert first['result'] == 'gated'
     writes.assert_not_awaited()
     run.resume_job(pk, value, stores)
-    assert stores.tracking.get(pk)['human_approved_answers'] == {field: value}
+    assert stores.tracking.get(pk)['human_approved_answers'] == {
+        field: grant(field, value)}
     await run._apply_direct(pk, stores)
     writes.assert_awaited_once_with('fill', '#field', '--value', value)
 
@@ -1146,7 +1159,7 @@ async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, 
     run, stores, pk = form_gate_world
     current = page(target(label='Email'))
     if corruption == 'ambiguous_label':
-        current['controls'].append(target(selector='#other', label='Email'))
+        current['controls'].append(target(selector='#field', label='Email'))
     with pytest.raises(forms.Gate) as gated:
         await forms.execute(SimpleNamespace(call=AsyncMock()), current,
             {'action': 'fill', 'selector': '#field', 'fact': 'Email'},
@@ -1191,3 +1204,125 @@ async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, for
     assert (await run._apply_direct(pk, stores))['result'] == 'gated'
     run.resume_job(pk, 'test@example.test', stores)
     assert not stores.tracking.get(pk).get('human_approved_answers')
+
+async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch):
+    pk, value = 'example-co#1', '555-0100'
+    row = {'pk': pk, 'status': 'submitting',
+           'human_approved_answers': {
+               'Phone': grant('Phone', value, selector='#primary')}}
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    current = page(target(selector='#primary', label='Phone'),
+                   target(selector='#emergency', label='Phone'))
+    session = SimpleNamespace(call=AsyncMock())
+    kwargs = dict(facts={'Phone': value}, filled={}, resume_path='',
+                  company='example-co', jd_text='', resume_tex='', github='', pk=pk)
+    await forms.execute(session, current,
+                        {'action': 'fill', 'selector': '#primary', 'fact': 'Phone'},
+                        **kwargs)
+    session.call.assert_awaited_once_with('fill', '#primary', '--value', value)
+    session.call.reset_mock()
+    with pytest.raises(forms.Gate, match='human-approved'):
+        await forms.execute(session, current,
+                            {'action': 'fill', 'selector': '#emergency', 'fact': 'Phone'},
+                            **kwargs)
+    session.call.assert_not_awaited()
+
+
+async def test_legacy_label_only_grant_never_writes(monkeypatch):
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting',
+        'human_approved_answers': {'Phone': '555-0100'}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate, match='human-approved'):
+        await forms.execute(
+            session, page(target(label='Phone')),
+            {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
+            facts={'Phone': '555-0100'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk='example-co#1')
+    session.call.assert_not_awaited()
+
+
+async def test_derived_cross_tenant_board_refuses_before_open(monkeypatch):
+    url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
+        'Cross-tenant direct board must be rejected before browser open'))
+    result = await forms.apply(url, 'example-co', {}, 'synthetic',
+                               pk='example-co#1', resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'Derived board tenant or job' in result['question']
+
+
+@pytest.mark.parametrize('bad_receiver', ['form_action', 'formaction'])
+async def test_external_form_receiver_gates_before_upload_or_submit_click(
+        monkeypatch, bad_receiver):
+    resume = target(selector='#resume', type='file', label='Resume',
+                    files=['Resume.pdf'])
+    submit = target(selector='#submit', tag='button', type='submit',
+                    label='Submit application', submit=True)
+    if bad_receiver == 'form_action':
+        resume['form_action'] = 'https://foreign.test/receive'
+        submit['form_action'] = 'https://foreign.test/receive'
+    else:
+        submit['formaction'] = 'https://foreign.test/receive'
+    current = page(resume, submit)
+    calls = []
+    class FakeSession:
+        def __init__(self, kind):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def navigate(self, url):
+            return current
+        async def page(self):
+            return current
+        async def call(self, *args, **kwargs):
+            calls.append(args[0])
+            if args[0] == 'click':
+                pytest.fail('External form receiver reached committing click IPC')
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
+    monkeypatch.setattr(bsk, 'Session', FakeSession)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'upload', 'selector': '#resume'},
+        {'action': 'submit', 'selector': '#submit'}]))
+    result = await forms.apply(current['url'], 'example-co', {}, 'synthetic',
+                               pk='example-co#1', resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'form destination' in result['question']
+    assert 'click' not in calls
+    assert calls == ([] if bad_receiver == 'form_action' else ['upload'])
+
+
+def test_native_same_job_form_receiver_is_authorized():
+    current = page(target(selector='#submit', tag='button', type='submit',
+                          label='Submit application', submit=True))
+    forms.check_form_destination(current, current['controls'][0], current['url'])
+
+
+def test_dom_inventory_exposes_effective_native_action_and_formaction():
+    import subprocess
+    from tools.browser_skill_dom import PAGE
+    script = r"""
+const form = {action:'https://employer.test/job/1/submit', querySelector:()=>null};
+const button = {id:'submit',tagName:'BUTTON',type:'submit',form,formAction:'https://foreign.test/receive',
+  labels:[],name:'',innerText:'Submit application',required:false,disabled:false,value:'',
+  getClientRects:()=>[1],closest:q=>q==='form'?form:null,matches:()=>false,
+  getAttribute:k=>k==='formaction'?'/receive':(k==='type'?'submit':null)};
+global.document={readyState:'complete',title:'Synthetic application',body:{innerText:''},
+  querySelector:()=>null,getElementById:()=>null,querySelectorAll:()=>[button]};
+global.CSS={escape:s=>s};
+global.location={href:'https://employer.test/job/1'};
+global.getComputedStyle=()=>({visibility:'visible'});
+console.log(JSON.stringify(eval(process.argv[1])));
+"""
+    observed = json.loads(subprocess.check_output(['node', '-e', script, PAGE], text=True))
+    control = observed['controls'][0]
+    assert control['form_action'] == 'https://employer.test/job/1/submit'
+    assert control['formaction'] == 'https://foreign.test/receive'
+    with pytest.raises(forms.Gate, match='form destination'):
+        forms.check_form_destination(observed, control, observed['url'])

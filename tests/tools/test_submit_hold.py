@@ -105,9 +105,11 @@ async def test_failed_mark_or_readback_means_gate_and_zero_clicks(world, monkeyp
     stores, _ = world
     current = {'url': URL, 'text': '', 'inventory_verified': True,
                'controls': [{'selector': '#resume', 'type': 'file', 'tag': 'input',
-                             'label': 'Resume', 'files': ['Resume.pdf']},
+                             'label': 'Resume', 'files': ['Resume.pdf'],
+                             'in_form': True, 'form_action': URL},
                             {'selector': '#submit', 'type': 'submit', 'tag': 'button',
-                             'label': button, 'submit': True}]}
+                             'label': button, 'submit': True,
+                             'in_form': True, 'form_action': URL}]}
     calls = []
     class Session:
         def __init__(self, kind):

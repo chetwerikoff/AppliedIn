@@ -698,7 +698,7 @@ def test_held_outcome_requires_explicit_portal_verification_and_never_autorequeu
     monkeypatch.setattr(server, 'make_stores', lambda *args: stores)
     monkeypatch.setattr('tools.browser_skill.applies_running', lambda: 0)
     endpoint = next(r.endpoint for r in server.create_app().routes
-                    if r.path == '/actions/resolve-uncertain/{pk:path}')
+                    if getattr(r, 'path', '') == '/actions/resolve-uncertain/{pk:path}')
 
     assert not endpoint(pk, {'outcome': outcome})['ok']
     assert not endpoint(pk, {'portal_checked': True,
@@ -737,7 +737,7 @@ def test_destructive_reset_refuses_existing_hold_before_any_live_side_effect(mon
     monkeypatch.setattr('tools.browser_runtime.kill_live_sessions',
                         lambda: pytest.fail('Reset must refuse before browser effects'))
     endpoint = next(r.endpoint for r in server.create_app().routes
-                    if r.path == '/actions/reset')
+                    if getattr(r, 'path', '') == '/actions/reset')
     refusal = endpoint()
     assert not refusal['ok']
     assert tracking.get('example-co#hold')['possible_submission']

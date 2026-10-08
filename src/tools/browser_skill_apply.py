@@ -495,11 +495,42 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
 
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',
-                resume_path: str = '') -> dict:
-    from core.events import emit
-    from tools.browser_apply import _site_rules
-    from tools.claude_chrome import _stage_resume
+                resume_path: str = '', fixture_context=None) -> dict:
+    ctx = _synthetic(fixture_context, pk=pk, company=company, url=url)
+    if ctx is not None:
+        if not ctx.matches(url=url, company=company, pk=pk, facts=facts,
+                           model=model, resume_path=resume_path):
+            raise Gate('Synthetic fixture arguments differ from its fixed origin.')
+        emit, _site_rules, _stage_resume = ctx.emit, ctx.site_rules, ctx.stage_resume
+    else:
+        from core.events import emit
+        from tools.browser_apply import _site_rules
+        from tools.claude_chrome import _stage_resume
     submitted = False
+
+    def verify_dispatch():
+        if ctx is not None:
+            check_dispatch(pk, resume_path, fixture_context=ctx)
+        else:
+            check_dispatch(pk, resume_path)
+
+    def verify_history(history, page):
+        if ctx is not None:
+            check_approvals(pk, history, page, fixture_context=ctx)
+        else:
+            check_approvals(pk, history, page)
+
+    def hold_dispatch(step):
+        if ctx is not None:
+            hold_possible_submission(pk, step, fixture_context=ctx)
+        else:
+            hold_possible_submission(pk, step)
+
+    def check_commit():
+        if ctx is not None:
+            check_before_committing_click(pk, fixture_context=ctx)
+        else:
+            check_before_committing_click(pk)
 
     def mark_click_started():
         nonlocal submitted
@@ -510,7 +541,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     filled, history = {}, []
     uploaded = False
     try:
-        check_dispatch(pk, resume_path)
+        verify_dispatch()
         # A query-generated Greenhouse/Oracle alias cannot authorize itself.
         # Without a code-verifiable same-job route, stop before opening Chrome.
         if not navigation_allowed(direct_url, url):
@@ -520,7 +551,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}
-        approved = (_row(pk).get('human_approved_answers') or {})
+        approved = ((_row(pk, fixture_context=ctx) if ctx else _row(pk))
+                    .get('human_approved_answers') or {})
         approved_keys = [k for k, v in facts.items()
                          if isinstance(approved.get(k), dict)
                          and approved[k].get('value') == str(v).strip()]
@@ -536,7 +568,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         emit('running', pk=pk, agent='browser', url=url,
              detail='Applying through BrowserSkill in the dedicated Chrome profile')
         async with asyncio.timeout(2700):
-            async with bsk.Session('apply') as session:
+            async with bsk.Session('apply') as raw_session:
+                session = ctx.facade(raw_session) if ctx else raw_session
                 page = await session.navigate(direct_url)
                 step['url'] = page['url']
                 if not navigation_allowed(page['url'], url, direct_url):
@@ -558,7 +591,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
                                 'values and attachment before submit.')
-                    action = await bsk.decision(task + progress, page, history, model=model)
+                    action = await (ctx.decision if ctx else bsk.decision)(
+                        task + progress, page, history, model=model)
                     verb = action.get('action')
                     if action.get('selector'):
                         old = control(page, action)
@@ -593,16 +627,16 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action)
                         if not is_submission(target) or not native_submit(target):
                             raise Gate('A proven native submit control is required before clicking.')
-                        check_dispatch(pk, resume_path)
+                        verify_dispatch()
                         check_form_destination(page, target, url, direct_url)
                         check_form(page, filled, uploaded, Path(resume_path).name)
-                        check_approvals(pk, history, page)
+                        verify_history(history, page)
                         before = page
                         # The independent hold precedes IPC; only a possible click
                         # sets the process-local exception classification.
                         step['last_button'] = target['label']
-                        hold_possible_submission(pk, step)
-                        check_before_committing_click(pk)
+                        hold_dispatch(step)
+                        check_commit()
                         submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):
@@ -625,23 +659,24 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if verb == 'click' and _NEXT.match(target['label']):
                             if not native_submit(target):
                                 raise Gate('A JS-backed Continue has no proven native destination.')
-                            check_dispatch(pk, resume_path)
+                            verify_dispatch()
                             check_form_destination(page, target, url, direct_url)
                             check_form(page, filled, uploaded, Path(resume_path).name)
-                            check_approvals(pk, history, page)
+                            verify_history(history, page)
                             before = page
                             step['last_button'] = target['label']
-                            hold_possible_submission(pk, step)
+                            hold_dispatch(step)
                         elif verb == 'click':
                             raise Gate('Unproven JS-backed or one-click navigation requires a human gate.')
                         elif verb in {'fill', 'select', 'choose', 'upload'}:
-                            check_dispatch(pk, resume_path)
+                            verify_dispatch()
                         result = await execute(
                             session, page, action, facts=facts, filled=filled,
                             resume_path=resume_path, company=company, jd_text=jd_text,
                             resume_tex=resume_tex, github=github, pk=pk,
                             allow_click=verb == 'click' and bool(_NEXT.match(target['label'])),
-                            job_url=url, on_committing_click=mark_click_started)
+                            job_url=url, on_committing_click=mark_click_started,
+                            **({'fixture_context': ctx} if ctx else {}))
                         if verb == 'click':
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))

@@ -676,3 +676,68 @@ def test_job_id_query_cannot_change_on_same_ats_host():
         'https://tenant.ats.test/company/apply?job_id=one', origin)
     assert not forms.navigation_allowed(
         'https://tenant.ats.test/company/apply?job_id=two', origin)
+
+
+@pytest.mark.parametrize('outcome', ['submitted', 'not_submitted'])
+def test_held_outcome_requires_explicit_portal_verification_and_never_autorequeues(
+        monkeypatch, outcome):
+    import fakeredis
+    import server
+    from core.models import Status
+    from core.storage.local import RedisTracking
+    from core.apply_queue import ApplyQueue
+
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    tracking = RedisTracking(redis)
+    pk = 'example-co#synthetic-role'
+    tracking.set_status(pk, Status.NEEDS_HUMAN, company='example-co',
+                        possible_submission=True, gate_reason='submit_uncertain',
+                        fail_kind='uncertain', last_button='Continue',
+                        last_url='https://example.test/job/1')
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(server, 'make_stores', lambda *args: stores)
+    monkeypatch.setattr('tools.browser_skill.applies_running', lambda: 0)
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if r.path == '/actions/resolve-uncertain/{pk:path}')
+
+    assert not endpoint(pk, {'outcome': outcome})['ok']
+    assert not endpoint(pk, {'portal_checked': True,
+                             'outcome': outcome})['ok']
+    assert tracking.get(pk)['possible_submission']
+    assert not ApplyQueue(redis).pending()
+
+    if outcome == 'submitted':
+        result = endpoint(pk, {'portal_checked': True, 'outcome': outcome,
+                               'confirmation': 'Synthetic portal confirmation'})
+        assert result == {'ok': True, 'status': 'applied_manual'}
+        assert tracking.get(pk)['possible_submission'] is True
+        assert tracking.get(pk)['confirmation_id'] == 'Synthetic portal confirmation'
+    else:
+        result = endpoint(pk, {'portal_checked': True, 'outcome': outcome,
+                               'new_apply_decision': True})
+        assert result == {'ok': True, 'status': 'tailored', 'queued': False}
+        assert tracking.get(pk)['possible_submission'] is False
+        assert tracking.get(pk)['gate_reason'] == 'approval'
+    assert not ApplyQueue(redis).pending()
+
+
+def test_destructive_reset_refuses_existing_hold_before_any_live_side_effect(monkeypatch):
+    import fakeredis
+    import server
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    tracking = RedisTracking(client)
+    tracking.set_status('example-co#hold', Status.NEEDS_HUMAN,
+                        possible_submission=True, fail_kind='uncertain')
+    monkeypatch.setattr(server, 'make_stores',
+                        lambda *args: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('tools.browser_skill.applies_running', lambda: 0)
+    monkeypatch.setattr('tools.browser_runtime.kill_live_sessions',
+                        lambda: pytest.fail('Reset must refuse before browser effects'))
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if r.path == '/actions/reset')
+    refusal = endpoint()
+    assert not refusal['ok']
+    assert tracking.get('example-co#hold')['possible_submission']

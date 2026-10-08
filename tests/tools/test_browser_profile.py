@@ -262,6 +262,9 @@ async def test_connected_session_checks_process_before_browser_ipc(sandbox, monk
 
 def test_setup_refuses_pin_without_a_process(sandbox, monkeypatch):
     path, _directory = sandbox
+    cfg = yaml.safe_load(path.read_text())
+    cfg['browser'] = ''
+    path.write_text(yaml.safe_dump(cfg))
     original = path.read_text()
     state = {'started': False}
     monkeypatch.setattr(profile.subprocess, 'Popen',

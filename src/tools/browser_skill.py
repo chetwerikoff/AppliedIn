@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 from core.config import get_settings
 from core.logging import get_logger
@@ -227,8 +227,12 @@ def web_url(url: str) -> bool:
 
 # Shared ATS hostnames contain multiple tenants. The first path component
 # identifies the employer; links to other hosts have no code-verifiable mapping.
-_SHARED_DISCOVERY_ATS = {'job-boards.greenhouse.io', 'boards.greenhouse.io',
-                         'jobs.lever.co', 'jobs.ashbyhq.com', 'jobs.smartrecruiters.com'}
+_SHARED_DISCOVERY_ATS = {
+    'job-boards.greenhouse.io', 'job-boards.eu.greenhouse.io',
+    'boards.greenhouse.io', 'jobs.lever.co', 'jobs.eu.lever.co',
+    'jobs.ashbyhq.com', 'jobs.smartrecruiters.com', 'careers.smartrecruiters.com',
+    'apply.workable.com', 'jobs.jobvite.com',
+}
 _READ_QUERY_KEYS = {'id', 'job', 'job_id', 'jobid', 'jid', 'gh_jid', 'req',
                     'requisition', 'role', 'department', 'location', 'search',
                     'query', 'keyword', 'keywords', 'page', 'offset', 'limit',
@@ -237,33 +241,76 @@ _ACTION_ROUTE = re.compile(
     # URLs such as /one-click, /instantApply and ?source=submitApplication
     # can commit on GET; exact word boundaries miss those common variants.
     r'apply|application|submit|send|confirm|finish|complete|approve|finaliz|'
-    r'one[-_]?click|one[-_]?tap|withdraw|'
+    r'one[-_]?click|one[-_]?tap|withdraw|delete|remove|cancel|'
+    r'unsubscribe|logout|signout|'
     r'(?:^|[-_])(?:save|register|subscribe|accept)(?:$|[-_])', re.I)
 
 
+def _decoded_route(value: str, *, query: bool = False) -> str | None:
+    """Reject ambiguous percent escapes instead of trusting a rendered URL."""
+    decoded = value
+    try:
+        while '%' in decoded:
+            if re.search(r'%(?![0-9a-fA-F]{2})', decoded):
+                return None
+            next_value = (unquote_plus if query else unquote)(decoded, errors='strict')
+            if next_value == decoded:
+                return None
+            decoded = next_value
+    except UnicodeError:
+        return None
+    # Query plus is a space even when its value has no percent escapes.
+    return decoded.replace('+', ' ') if query else decoded
+
+
+def _discovery_parts(url) -> tuple | None:
+    path = _decoded_route(url.path)
+    fragment = _decoded_route(url.fragment)
+    if (path is None or fragment is None or '\\' in path
+            or any(p in {'.', '..'} for p in path.split('/'))):
+        return None
+    pairs = []
+    for item in url.query.split('&'):
+        if not item:
+            continue
+        raw_key, _, raw_value = item.partition('=')
+        key = _decoded_route(raw_key, query=True)
+        value = _decoded_route(raw_value, query=True)
+        if key is None or value is None:
+            return None
+        pairs.append((key, value))
+    return path, fragment, pairs
+
+
 def discovery_url_allowed(candidate: str, seed: str) -> bool:
-    """Do not trust observed hrefs as authority to navigate or publish jobs."""
-    if not web_url(candidate) or not web_url(seed):
-        return False
-    target, source = urlsplit(candidate), urlsplit(seed)
-    if (target.scheme, target.hostname, target.port) != (
-            source.scheme, source.hostname, source.port):
-        return False
-    if source.hostname in _SHARED_DISCOVERY_ATS:
-        source_parts = [p for p in source.path.split('/') if p]
-        target_parts = [p for p in target.path.split('/') if p]
-        if (not source_parts or not target_parts
-                or source_parts[0].lower() != target_parts[0].lower()):
+    """Navigate/publish only decoded, read-only URLs in the seed employer tenant."""
+    try:
+        if not web_url(candidate) or not web_url(seed):
             return False
-    if any(_ACTION_ROUTE.search(part) for part in
-           (target.path + '/' + target.fragment).split('/')):
-        return False
-    for key, value in parse_qsl(target.query, keep_blank_values=True):
-        if (_ACTION_ROUTE.search(key) or _ACTION_ROUTE.search(value)
-                or (key.lower() not in _READ_QUERY_KEYS
-                    and not key.lower().startswith('utm_'))):
+        target, source = urlsplit(candidate), urlsplit(seed)
+        if (target.scheme, target.hostname, target.port) != (
+                source.scheme, source.hostname, source.port):
             return False
-    return True
+        target_parts, source_parts = _discovery_parts(target), _discovery_parts(source)
+        if target_parts is None or source_parts is None:
+            return False
+        if source.hostname in _SHARED_DISCOVERY_ATS:
+            source_tenant = [p for p in source_parts[0].split('/') if p]
+            target_tenant = [p for p in target_parts[0].split('/') if p]
+            if (not source_tenant or not target_tenant
+                    or source_tenant[0].lower() != target_tenant[0].lower()):
+                return False
+        for path, fragment, query in (source_parts, target_parts):
+            if _ACTION_ROUTE.search(path + '/' + fragment):
+                return False
+            for key, value in query:
+                if (_ACTION_ROUTE.search(key) or _ACTION_ROUTE.search(value)
+                        or (key.lower() not in _READ_QUERY_KEYS
+                            and not key.lower().startswith('utm_'))):
+                    return False
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def applies_running() -> int:

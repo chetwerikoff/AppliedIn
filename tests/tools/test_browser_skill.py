@@ -354,6 +354,18 @@ async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
     'https://employer.test/jobs/1?source=submitApplication',
     'https://employer.test/jobs/1?save=1',
     'https://employer.test/jobs/1?submit=true',
+    'https://employer.test/jobs/%61pply',
+    'https://employer.test/jobs?source=%61pply',
+    'https://employer.test/jobs/%2561pply',
+    'https://employer.test/jobs#%61pply',
+    'https://employer.test/account/delete',
+    'https://employer.test/account/remove',
+    'https://employer.test/account/cancel',
+    'https://employer.test/account/unsubscribe',
+    'https://employer.test/account/logout',
+    'https://employer.test/account/signout',
+    'https://employer.test/jobs/%ZZ',
+    'https://employer.test/jobs/%25',
 ])
 async def test_discovery_never_navigates_foreign_or_action_links(monkeypatch, unsafe):
     seed = 'https://employer.test/careers'
@@ -371,14 +383,64 @@ async def test_discovery_never_navigates_foreign_or_action_links(monkeypatch, un
     assert visited == [seed]  # no browser navigate IPC to the bad href
 
 
-def test_discovery_enforces_shared_ats_tenant():
-    seed = 'https://job-boards.greenhouse.io/example-co/jobs'
-    assert bsk.discovery_url_allowed(
-        'https://job-boards.greenhouse.io/example-co/jobs/42', seed)
+@pytest.mark.parametrize('host', [
+    'job-boards.greenhouse.io', 'job-boards.eu.greenhouse.io',
+    'boards.greenhouse.io', 'jobs.lever.co', 'jobs.eu.lever.co',
+    'jobs.ashbyhq.com', 'jobs.smartrecruiters.com',
+    'careers.smartrecruiters.com', 'apply.workable.com', 'jobs.jobvite.com',
+])
+def test_discovery_enforces_shared_ats_tenant(host):
+    seed = f'https://{host}/example-co/jobs'
+    assert bsk.discovery_url_allowed(f'https://{host}/example-co/jobs/42', seed)
     assert not bsk.discovery_url_allowed(
-        'https://job-boards.greenhouse.io/another-tenant/jobs/42', seed)
-    assert not bsk.discovery_url_allowed(
-        'https://job-boards.greenhouse.io/', 'https://job-boards.greenhouse.io/')
+        f'https://{host}/another-tenant/jobs/42', seed)
+    assert not bsk.discovery_url_allowed(f'https://{host}/', f'https://{host}/')
+
+
+@pytest.mark.parametrize('unsafe', [
+    'https://employer.test/jobs/%61pply',
+    'https://employer.test/jobs?source=%2561pply',
+    'https://employer.test/account/delete',
+])
+async def test_discovery_never_publishes_decoded_action_routes(monkeypatch, unsafe):
+    seed = 'https://employer.test/careers'
+    current = {**page(target(tag='a', type='a', href=unsafe)), 'url': seed}
+    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'finish', 'report': {'jobs': [{'url': unsafe, 'title': 'Unsafe'}]}}))
+    report = await bsk._crawl(session, 'Find postings', seed)
+    assert report['jobs'] == []
+    session.navigate.assert_awaited_once_with(seed)  # zero unsafe navigate IPC
+
+
+@pytest.mark.parametrize('host', [
+    'apply.workable.com', 'jobs.jobvite.com', 'jobs.eu.lever.co',
+    'job-boards.eu.greenhouse.io', 'careers.smartrecruiters.com',
+])
+async def test_discovery_foreign_shared_tenant_has_no_ipc_or_published_job(monkeypatch, host):
+    seed = f'https://{host}/example-co/jobs'
+    foreign = f'https://{host}/other-tenant/jobs/999'
+    current = {**page(target(tag='a', type='a', href=foreign)), 'url': seed}
+    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'finish', 'report': {'jobs': [{'url': foreign, 'title': 'Foreign'}]}}))
+    report = await bsk._crawl(session, 'Find postings', seed)
+    assert report['jobs'] == []
+    session.navigate.assert_awaited_once_with(seed)
+
+
+@pytest.mark.parametrize('unsafe', [
+    'https://employer.test/jobs/%61pply',
+    'https://employer.test/jobs?source=%61pply',
+    'https://employer.test/account/delete',
+])
+async def test_discovery_action_seed_gates_before_any_browser_ipc(monkeypatch, unsafe):
+    monkeypatch.setattr(bsk, 'Session', lambda kind: pytest.fail(
+        'The unsafe discovery seed must not reach the browser session'))
+    result, error = await bsk.run_task('Find roles', report_key='jobs', urls=[unsafe])
+    assert result == {} and error
 
 
 async def test_discovery_never_publishes_foreign_tenant(monkeypatch):

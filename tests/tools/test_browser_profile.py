@@ -29,10 +29,23 @@ def sandbox(tmp_path, monkeypatch):
     return cfgfile, directory
 
 
-def test_already_pinned_instance_needs_no_process_or_launch(sandbox, monkeypatch):
+def test_connected_id_without_dedicated_process_is_refused(sandbox, monkeypatch):
     monkeypatch.setattr(profile, '_browsers', lambda: [{'instance_id': 'pinned'}])
-    monkeypatch.setattr(profile, 'profile_pids', lambda directory: pytest.fail('Already connected'))
-    assert profile.ensure_browser() == (True, '')
+    ready, why = profile.ensure_browser()
+    assert not ready and 'absent or ambiguous' in why
+    assert profile.connection_status()['state'] == 'unavailable'
+
+
+@pytest.mark.parametrize('pids', [[123], [123, 456]])
+def test_connected_id_requires_exactly_one_owned_chrome_process(sandbox, monkeypatch, pids):
+    monkeypatch.setattr(profile, '_browsers', lambda: [{'instance_id': 'pinned'}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda directory: pids)
+    ready, why = profile.ensure_browser()
+    assert ready is (len(pids) == 1)
+    if len(pids) != 1:
+        assert 'ambiguous' in why
+    else:
+        assert profile.can_start() == (True, '')
 
 
 def test_parallel_cold_starts_launch_once_with_only_approved_flags(sandbox, monkeypatch):
@@ -69,6 +82,7 @@ def test_new_foreign_instance_is_rejected_after_one_launch(sandbox, monkeypatch)
     state = {'launched': False}
     def spawn(*a, **kw):
         state['launched'] = True
+        return SimpleNamespace(pid=123)
     monkeypatch.setattr(profile.subprocess, 'Popen', spawn)
     monkeypatch.setattr(profile, '_browsers', lambda: (
         [{'instance_id': 'foreign'}] if state['launched'] else []))
@@ -79,7 +93,8 @@ def test_new_foreign_instance_is_rejected_after_one_launch(sandbox, monkeypatch)
 def test_timeout_is_bounded_without_relaunch(sandbox, monkeypatch):
     launches = []
     clock = {'now': 0}
-    monkeypatch.setattr(profile.subprocess, 'Popen', lambda *a, **kw: launches.append(a))
+    monkeypatch.setattr(profile.subprocess, 'Popen',
+                        lambda *a, **kw: (launches.append(a) or SimpleNamespace(pid=123)))
     monkeypatch.setattr(profile.time, 'monotonic', lambda: clock['now'])
     monkeypatch.setattr(profile.time, 'sleep',
                         lambda seconds: clock.update(now=clock['now'] + seconds))
@@ -133,8 +148,8 @@ def test_process_detection_matches_exact_directory_and_split_flag(tmp_path, monk
 
 
 @pytest.mark.parametrize(('connected', 'pids', 'expected'), [
-    (True, [], 'connected'), (False, [123], 'extension_missing'),
-    (False, [], 'not_running'),
+    (True, [123], 'connected'), (True, [], 'unavailable'),
+    (False, [123], 'extension_missing'), (False, [], 'not_running'),
 ])
 def test_status_distinguishes_connection_states_without_launch(sandbox, monkeypatch,
                                                                connected, pids, expected):
@@ -144,7 +159,8 @@ def test_status_distinguishes_connection_states_without_launch(sandbox, monkeypa
     status = runtime.browser_status()
     assert status['state'] == expected
     check = runtime.setup_check()
-    assert check['state'] == ('ready' if connected else 'check' if not pids else 'action')
+    assert check['state'] == ('ready' if expected == 'connected' else
+                              'check' if expected == 'not_running' else 'action')
 
 
 @pytest.mark.parametrize('answer', ['', 'n', 'y'])
@@ -154,7 +170,10 @@ def test_setup_saves_only_after_y_and_keeps_optional_settings(sandbox, monkeypat
     calls = []
     monkeypatch.setattr(profile, '_browsers', lambda: (
         [{'instance_id': 'new-instance'}] if calls else []))
-    monkeypatch.setattr(profile.subprocess, 'Popen', lambda args, **kw: calls.append(args))
+    monkeypatch.setattr(profile.subprocess, 'Popen',
+                        lambda args, **kw: (calls.append(args) or SimpleNamespace(pid=123)))
+    monkeypatch.setattr(profile, 'profile_pids',
+                        lambda directory: [123] if calls else [])
     monkeypatch.setattr('builtins.input', lambda prompt: answer)
     result = profile.browser_setup(timeout_s=2)
     assert calls[0][-1] == profile.WEB_STORE
@@ -215,3 +234,38 @@ def test_rewritten_quoted_profile_path_preserves_spaces(monkeypatch):
     args = profile._argv(b'/opt/google/chrome/chrome --user-data-dir="/tmp/owned chrome"\0')
     monkeypatch.setattr(profile, '_processes', lambda: iter([(123, args)]))
     assert profile.profile_pids('/tmp/owned chrome') == [123]
+
+
+def test_launched_pid_cannot_be_claimed_without_observable_lineage(sandbox, monkeypatch):
+    _, directory = sandbox
+    monkeypatch.setattr(profile, 'profile_pids', lambda directory: [234])
+    monkeypatch.setattr(profile, '_spawned_lineage', lambda launcher, observed: False)
+    with pytest.raises(ValueError, match='lineage'):
+        profile._owned_profile_pid({'user_data_dir': str(directory)}, launched_pid=123)
+
+
+async def test_connected_session_checks_process_before_browser_ipc(sandbox, monkeypatch):
+    monkeypatch.setattr(profile, '_browsers', lambda: [{'instance_id': 'pinned'}])
+    monkeypatch.setattr(bsk, 'available', lambda: (True, ''))
+    calls = AsyncMock()
+    monkeypatch.setattr(bsk, 'command', calls)
+    with pytest.raises(bsk.Unavailable, match='absent or ambiguous'):
+        async with bsk.Session('apply'):
+            pytest.fail('No session should open without Chrome argv proof')
+    calls.assert_not_awaited()
+
+
+def test_setup_refuses_pin_without_a_process(sandbox, monkeypatch):
+    path, _directory = sandbox
+    original = path.read_text()
+    state = {'started': False}
+    monkeypatch.setattr(profile.subprocess, 'Popen',
+                        lambda *a, **kw: (state.update(started=True)
+                                           or SimpleNamespace(pid=123)))
+    monkeypatch.setattr(profile, '_browsers', lambda: (
+        [{'instance_id': 'new-instance'}] if state['started'] else []))
+    monkeypatch.setattr('builtins.input', lambda _prompt: 'y')
+    outcome = profile.browser_setup(timeout_s=2)
+    assert outcome['status'] == 'blocked'
+    assert 'absent or ambiguous' in outcome['error']
+    assert path.read_text() == original

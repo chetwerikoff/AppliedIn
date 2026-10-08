@@ -57,10 +57,21 @@ PAGE = r"""(() => {
         n.tagName === 'BUTTON' && n.type === 'button' && label(n) === 'Interrupt');
     return !ownOverlay;
   });
+  // A closed shadow root cannot be inspected. Detect visible custom hosts and
+  // opaque widgets instead of treating 'no open shadow root' as completeness.
+  const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>
+    visible(e) && e.tagName !== 'BROWSER-SKILL-OVERLAY' && (
+      e.matches('[contenteditable], [role="combobox"], [role="listbox"], [role="option"]') ||
+      (e.tagName.includes('-') && (
+        e.closest('form') || /form|apply|field|input|widget|select|combo/i.test(e.tagName))) ||
+      (e.closest('form') && e.matches('canvas,object,embed,[aria-controls]'))));
+  const inventoryVerified = document.readyState === 'complete' &&
+    controls.length <= 500 && !opaqueControls && !siteShadow;
   return {url:location.href, title, text:text.slice(0,100000),
     description:description?.innerText || '', controls:controls.slice(0,500),
     truncated:controls.length > 500 || text.length > 100000,
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
-    shadow_roots:siteShadow};
+    shadow_roots:siteShadow, opaque_controls:opaqueControls,
+    inventory_verified:inventoryVerified};
 })()"""

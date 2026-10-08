@@ -212,9 +212,6 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
     if page.get('opaque_controls') or page.get('unsupported_frames') or page.get('shadow_roots'):
         raise Gate('This form has uninspectable components; human inspection is required.')
     controls = page.get('controls', [])
-    selectors = [c.get('selector') for c in controls]
-    if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
-        raise Gate('The current form controls are not uniquely inventoried.')
     if not uploaded:
         raise Gate('The résumé attachment has not been verified on the form.')
     if attachment:
@@ -224,6 +221,9 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                     and attachment in c.get('files', [])]
         if len(attached) != 1:
             raise Gate('The résumé attachment is no longer present on the current file input.')
+    selectors = [c.get('selector') for c in controls]
+    if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
+        raise Gate('The current form controls are not uniquely inventoried.')
     for target in controls:
         typ = target.get('type', '')
         if typ == 'hidden':

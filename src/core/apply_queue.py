@@ -109,6 +109,10 @@ class ApplyQueue:
         an item while its lease is still held, and matching on that would silently
         drop every retry.
         """
+        # The existing tracking row is the durable no-replay authority.
+        raw_row = self.r.get(f"app:{pk}")
+        if raw_row and json.loads(raw_row).get("possible_submission"):
+            return False
         co = _norm(company)
         for raw in (self.r.lrange(f"{_KEY}:co:{co}", 0, -1) or []):
             try:
@@ -431,8 +435,10 @@ class ApplyQueue:
             if pk and rec.get("pk") != pk:
                 kept.append(raw)
                 continue
-            self.put(rec["pk"], rec.get("company", ""), history=rec.get("history"))
-            revived += 1
+            if self.put(rec["pk"], rec.get("company", ""), history=rec.get("history")):
+                revived += 1
+            else:
+                kept.append(raw)
         self.r.delete(_DLQ)
         for raw in kept:
             self.r.rpush(_DLQ, raw)

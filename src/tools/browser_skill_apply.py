@@ -226,6 +226,21 @@ def hold_possible_submission(pk: str, step: dict) -> None:
         raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 
 
+def check_before_committing_click(pk: str) -> None:
+    """A leased worker must re-read the human outcome and hold at the IPC edge."""
+    from core.stores import make_stores
+
+    try:
+        tracking = make_stores().tracking
+        row = tracking.get(pk) or {}
+        held = submit_hold.is_held(pk, tracking=tracking)
+    except Exception as exc:
+        raise Gate('Cannot verify current submission outcome or hold before click.') from exc
+    if (row.get('status') != 'needs_human'
+            or row.get('gate_reason') != 'submit_uncertain' or not held):
+        raise Gate('Human outcome changed or submission hold was cleared; no click is safe.')
+
+
 def check_dispatch(pk: str, resume_path: str) -> None:
     from agent.run import seed_fingerprint
     from tools.browser_apply import _duplicate_refusal
@@ -328,7 +343,7 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
-                  job_url: str = '') -> dict:
+                  job_url: str = '', on_committing_click=None) -> dict:
     verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -419,6 +434,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if is_submission(target) or not native_submit(target):
             raise Gate('A JS-backed or non-native submit destination is unproven.')
         check_form_destination(page, target, job_url or page.get('url', ''))
+        check_before_committing_click(pk)
+        if on_committing_click:
+            on_committing_click()
         await session.call('click', target['selector'])
     else:
         raise Gate('Unsupported form action.')
@@ -435,6 +453,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     from tools.browser_apply import _site_rules
     from tools.claude_chrome import _stage_resume
     submitted = False
+
+    def mark_click_started():
+        nonlocal submitted
+        submitted = True
+
     direct_url = direct_board_url(url) or url
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
@@ -532,6 +555,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # sets the process-local exception classification.
                         step['last_button'] = target['label']
                         hold_possible_submission(pk, step)
+                        check_before_committing_click(pk)
                         submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):
@@ -561,7 +585,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             before = page
                             step['last_button'] = target['label']
                             hold_possible_submission(pk, step)
-                            submitted = True
                         elif verb == 'click':
                             raise Gate('Unproven JS-backed or one-click navigation requires a human gate.')
                         elif verb in {'fill', 'select', 'choose', 'upload'}:
@@ -570,7 +593,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             session, page, action, facts=facts, filled=filled,
                             resume_path=resume_path, company=company, jd_text=jd_text,
                             resume_tex=resume_tex, github=github, pk=pk,
-                            allow_click=verb == 'click' and submitted, job_url=url)
+                            allow_click=verb == 'click' and bool(_NEXT.match(target['label'])),
+                            job_url=url, on_committing_click=mark_click_started)
                         if verb == 'click':
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))

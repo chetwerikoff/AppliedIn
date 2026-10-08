@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -286,3 +287,154 @@ def test_mark_applied_refuses_when_lease_proof_unavailable(world, monkeypatch):
     assert not endpoint(PK, {})['ok']
     assert stores.tracking.get(PK)['status'] == 'needs_human'
     assert submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+@pytest.mark.parametrize('route', ['mark', 'resolve'])
+def test_worker_lease_wins_barrier_before_human_outcome(world, route):
+    """A worker's company lease excludes both manual outcome endpoints."""
+    stores, queue = world
+    assert queue.put(PK, 'example-co')  # a pending item before hold is recorded
+    forms.hold_possible_submission(PK, {'last_button': 'Submit', 'url': URL})
+    acquired = threading.Barrier(2, timeout=10)
+    release = threading.Barrier(2, timeout=10)
+    claimed = []
+
+    def worker():
+        item = queue.next(only='example-co')
+        claimed.append(item)
+        acquired.wait()
+        release.wait()
+        if item is not None:
+            queue.done(item)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    try:
+        acquired.wait()
+        endpoint_path = ('/actions/mark-applied/{pk}' if route == 'mark'
+                         else '/actions/resolve-uncertain/{pk:path}')
+        endpoint = next(r.endpoint for r in server.create_app().routes
+                        if getattr(r, 'path', '') == endpoint_path)
+        body = ({'note': 'Synthetic proof'} if route == 'mark' else {
+            'portal_checked': True, 'outcome': 'submitted',
+            'confirmation': 'Synthetic proof'})
+        result = endpoint(PK, body)
+        assert claimed[0] is not None
+        assert result == {'ok': False, 'error': 'An application attempt is still in flight.'}
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+        assert stores.tracking.get(PK)['status'] == 'needs_human'
+    finally:
+        release.wait()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize('route', ['mark', 'resolve'])
+def test_manual_outcome_lease_wins_barrier_before_worker_claim(world, monkeypatch, route):
+    """An outcome holds the same lease through status recording and hold clearing."""
+    stores, queue = world
+    assert queue.put(PK, 'example-co')
+    forms.hold_possible_submission(PK, {'last_button': 'Submit', 'url': URL})
+    entered = threading.Barrier(2, timeout=10)
+    release = threading.Barrier(2, timeout=10)
+    set_status = stores.tracking.set_status
+
+    def paused_status(pk, status, **attrs):
+        if status == Status.APPLIED_MANUAL:
+            entered.wait()
+            release.wait()
+        return set_status(pk, status, **attrs)
+
+    monkeypatch.setattr(stores.tracking, 'set_status', paused_status)
+    endpoint_path = ('/actions/mark-applied/{pk}' if route == 'mark'
+                     else '/actions/resolve-uncertain/{pk:path}')
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, 'path', '') == endpoint_path)
+    body = ({'note': 'Synthetic proof'} if route == 'mark' else {
+        'portal_checked': True, 'outcome': 'submitted',
+        'confirmation': 'Synthetic proof'})
+    result = {}
+
+    def human():
+        result.update(endpoint(PK, body))
+
+    thread = threading.Thread(target=human)
+    thread.start()
+    try:
+        entered.wait()
+        assert queue.next(only='example-co') is None  # no lease/no worker IPC
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+    finally:
+        release.wait()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result['ok']
+    assert stores.tracking.get(PK)['status'] == 'applied_manual'
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+@pytest.mark.parametrize('human_change', ['applied_manual', 'hold_cleared'])
+async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
+        world, monkeypatch, human_change):
+    """Even a late human reconciliation cannot be overwritten by click IPC."""
+    stores, queue = world
+    assert queue.put(PK, 'example-co')
+    item = queue.next(only='example-co')
+    assert item is not None
+    current = {'url': URL, 'text': '', 'inventory_verified': True,
+               'controls': [
+                   {'selector': '#resume', 'type': 'file', 'tag': 'input',
+                    'label': 'Resume', 'files': ['Resume.pdf'], 'in_form': True,
+                    'form_action': URL},
+                   {'selector': '#submit', 'type': 'submit', 'tag': 'button',
+                    'label': 'Submit application', 'submit': True, 'in_form': True,
+                    'form_action': URL}]}
+    calls = []
+
+    class Session:
+        def __init__(self, kind):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def navigate(self, url):
+            return current
+
+        async def page(self):
+            return current
+
+        async def call(self, *args, **kwargs):
+            calls.append(args[0])
+            if args[0] == 'click':
+                pytest.fail('Changed human outcome reached browser click IPC')
+
+    original_hold = forms.hold_possible_submission
+
+    def interleave_human_change(pk, step):
+        original_hold(pk, step)
+        if human_change == 'applied_manual':
+            stores.tracking.set_status(pk, Status.APPLIED_MANUAL,
+                                       confirmation_id='Synthetic proof')
+        submit_hold.clear(pk, tracking=stores.tracking)
+
+    monkeypatch.setattr(forms, 'hold_possible_submission', interleave_human_change)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
+    monkeypatch.setattr(bsk, 'Session', Session)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'upload', 'selector': '#resume'},
+        {'action': 'submit', 'selector': '#submit'}]))
+    try:
+        result = await forms.apply(URL, 'example-co', {}, 'synthetic',
+                                   pk=PK, resume_path='Resume.pdf')
+        assert result['status'] == 'gate'
+        assert 'no click is safe' in result['question']
+        assert calls == ['upload']
+        if human_change == 'applied_manual':
+            assert stores.tracking.get(PK)['status'] == 'applied_manual'
+    finally:
+        queue.done(item)

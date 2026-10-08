@@ -1635,7 +1635,7 @@ def create_app() -> FastAPI:
         return {"ok": True, "status": "resuming"}
 
     def stopped_application_attempt(pk: str, tracking) -> str:
-        """Both human outcome routes must refuse an active application lease."""
+        """The lease protects writes; a live browser is a second refusal signal."""
         from core.apply_queue import ApplyQueue
         from tools.browser_skill import applies_running
         try:
@@ -1645,61 +1645,88 @@ def create_app() -> FastAPI:
             return "Cannot prove that the attempt has stopped."
         return ""
 
+    def claim_human_outcome(pk: str, tracking):
+        """Acquire the worker's company lease before checking or changing outcome."""
+        from core.apply_queue import ApplyQueue
+        try:
+            row = tracking.get(pk) or {}
+            if not row:
+                return None, "", "unknown job"
+            company = row.get('company')
+            if not isinstance(company, str) or not company.strip():
+                return None, "", "Cannot prove the company lease for this job."
+            queue = ApplyQueue(tracking.r)
+            if not queue.claim_human_outcome(company):
+                return None, "", "An application attempt is still in flight."
+            return queue, company, ""
+        except Exception:
+            return None, "", "Cannot prove that the attempt has stopped."
+
     @app.post("/actions/mark-applied/{pk}")
     def mark_applied(pk: str, body: dict | None = None):
-        """Human confirms an application went through out-of-band (got the email
-        / saw the ACK). Marks it applied and clears any gate — the safe fix for a
-        mis-detected submit, and it prevents a resubmit."""
+        """Human-confirmed submission, serialized with the application worker."""
         note = ((body or {}).get("note") or "").strip() or "Confirmed by you (email / on-screen ACK)."
         stores = make_stores(settings)
-        if not stores.tracking.get(pk):
-            return {"ok": False, "error": "unknown job"}
-        if failure := stopped_application_attempt(pk, stores.tracking):
-            return {"ok": False, "error": failure}
-        stores.tracking.set_status(
-            pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
-        if getattr(stores.tracking, 'r', None) is not None:
+        lease, company, error = claim_human_outcome(pk, stores.tracking)
+        if error:
+            return {"ok": False, "error": error}
+        try:
+            row = stores.tracking.get(pk) or {}
+            if row.get("company") != company:
+                return {"ok": False, "error": "The job company changed; outcome was not recorded."}
+            if failure := stopped_application_attempt(pk, stores.tracking):
+                return {"ok": False, "error": failure}
+            stores.tracking.set_status(
+                pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
             submit_hold.clear(pk, tracking=stores.tracking)
-        from core.events import emit
-        emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
-        return {"ok": True}
+            from core.events import emit
+            emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
+            return {"ok": True}
+        finally:
+            lease.release_human_outcome(company)
 
     @app.post("/actions/resolve-uncertain/{pk:path}")
     def resolve_uncertain(pk: str, body: dict):
-        """Explicit portal-verified human outcome; never an automatic retry."""
+        """Portal-verified human outcome, serialized with the application worker."""
         if body.get("portal_checked") is not True:
             return {"ok": False, "error": "Check the employer portal before resolving."}
         outcome = body.get("outcome")
         if outcome not in {"submitted", "not_submitted"}:
             return {"ok": False, "error": "Explicit submitted/not_submitted outcome required."}
         stores = make_stores(settings)
-        row = stores.tracking.get(pk) or {}
-        if not submit_hold.blocked(pk, row, tracking=stores.tracking):
-            return {"ok": False, "error": "This row is not a held uncertain submission."}
-        if failure := stopped_application_attempt(pk, stores.tracking):
-            return {"ok": False, "error": failure}
-        if outcome == "submitted":
-            evidence = str(body.get("confirmation") or "").strip()[:200]
-            if not evidence:
-                return {"ok": False, "error": "Provide the portal confirmation."}
+        lease, company, error = claim_human_outcome(pk, stores.tracking)
+        if error:
+            return {"ok": False, "error": error}
+        try:
+            row = stores.tracking.get(pk) or {}
+            if row.get("company") != company:
+                return {"ok": False, "error": "The job company changed; outcome was not recorded."}
+            if failure := stopped_application_attempt(pk, stores.tracking):
+                return {"ok": False, "error": failure}
+            if not submit_hold.blocked(pk, row, tracking=stores.tracking):
+                return {"ok": False, "error": "This row is not a held uncertain submission."}
+            if outcome == "submitted":
+                evidence = str(body.get("confirmation") or "").strip()[:200]
+                if not evidence:
+                    return {"ok": False, "error": "Provide the portal confirmation."}
+                stores.tracking.set_status(
+                    pk, Status.APPLIED_MANUAL, confirmation_id=evidence,
+                    gate_reason="", gate_pending=None, gate_call_id=None,
+                    possible_submission=False, fail_kind="", fail_reason="")
+                submit_hold.clear(pk, tracking=stores.tracking)
+                return {"ok": True, "status": "applied_manual"}
+            if body.get("new_apply_decision") is not True:
+                return {"ok": False, "error": (
+                    "A fresh explicit owner application decision is required to clear the hold.")}
+            # No application starts here: the row returns to explicit approval.
             stores.tracking.set_status(
-                pk, Status.APPLIED_MANUAL, confirmation_id=evidence,
-                gate_reason="", gate_pending=None, gate_call_id=None,
-                possible_submission=False, fail_kind="", fail_reason="")
+                pk, Status.TAILORED, possible_submission=False, fail_kind="",
+                fail_reason="", gate_reason="approval", gate_pending=None,
+                gate_call_id=None, last_button="", last_url="")
             submit_hold.clear(pk, tracking=stores.tracking)
-            return {"ok": True, "status": "applied_manual"}
-        if body.get("new_apply_decision") is not True:
-            return {"ok": False, "error": (
-                "A fresh explicit owner application decision is required to clear the hold.")}
-        # The explicit portal check says the attempt did NOT submit. No new
-        # application starts here; the row returns to normal approval review.
-        stores.tracking.set_status(
-            pk, Status.TAILORED, possible_submission=False, fail_kind="",
-            fail_reason="", gate_reason="approval", gate_pending=None,
-            gate_call_id=None, last_button="", last_url="")
-        submit_hold.clear(pk, tracking=stores.tracking)
-        return {"ok": True, "status": "tailored", "queued": False}
-
+            return {"ok": True, "status": "tailored", "queued": False}
+        finally:
+            lease.release_human_outcome(company)
 
     @app.post("/actions/stop-run")
     def stop_run(body: dict | None = None):

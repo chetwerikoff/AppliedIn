@@ -92,6 +92,14 @@ class ApplyQueue:
     def __init__(self, client: Any) -> None:
         self.r = client
 
+    def claim_human_outcome(self, company: str) -> bool:
+        """Compete atomically for the very same company lease as next()."""
+        return bool(company and company.strip()
+                    and self.r.sadd(_BUSY, _norm(company)))
+
+    def release_human_outcome(self, company: str) -> None:
+        self.r.srem(_BUSY, _norm(company))
+
     # --- writing ----------------------------------------------------------
     def put(self, pk: str, company: str, *, attempts: int = 0,
             not_before: float = 0.0, history: list | None = None,

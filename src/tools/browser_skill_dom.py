@@ -26,8 +26,9 @@ PAGE = r"""(() => {
       'fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
     const question = clean(group?.querySelector(
       'legend,[data-automation-id="formLabel"]')?.innerText || group?.innerText || '');
-    const type = e.getAttribute('role') || e.getAttribute('type') ||
-      (e.tagName === 'INPUT' ? e.type : e.tagName.toLowerCase());
+    const type = e.getAttribute('role') ||
+      ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
+        (e.getAttribute('type') || e.tagName.toLowerCase()));
     const submit = e.tagName === 'BUTTON' ? e.type === 'submit' && !!e.form :
       type === 'submit' || type === 'image';
     const form = e.form || e.closest('form');

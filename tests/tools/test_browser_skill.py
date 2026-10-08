@@ -1438,7 +1438,7 @@ const form = {action:'https://employer.test/job/1/submit', querySelector:()=>nul
 const button = {id:'submit',tagName:'BUTTON',type:'submit',form,formAction:'https://foreign.test/receive',
   labels:[],name:'',innerText:'Submit application',required:false,disabled:false,value:'',
   getClientRects:()=>[1],closest:q=>q==='form'?form:null,matches:()=>false,
-  getAttribute:k=>k==='formaction'?'/receive':(k==='type'?'submit':null)};
+  getAttribute:k=>k==='formaction'?'/receive':null};
 global.document={readyState:'complete',title:'Synthetic application',body:{innerText:''},
   querySelector:()=>null,getElementById:()=>null,querySelectorAll:()=>[button]};
 global.CSS={escape:s=>s};
@@ -1450,5 +1450,7 @@ console.log(JSON.stringify(eval(process.argv[1])));
     control = observed['controls'][0]
     assert control['form_action'] == 'https://employer.test/job/1/submit'
     assert control['formaction'] == 'https://foreign.test/receive'
+    assert control['type'] == 'submit'  # default native BUTTON.type without type attribute
+    assert forms.native_submit(control)
     with pytest.raises(forms.Gate, match='form destination'):
         forms.check_form_destination(observed, control, observed['url'])

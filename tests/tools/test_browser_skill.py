@@ -741,3 +741,27 @@ def test_destructive_reset_refuses_existing_hold_before_any_live_side_effect(mon
     refusal = endpoint()
     assert not refusal['ok']
     assert tracking.get('example-co#hold')['possible_submission']
+
+
+def test_existing_tracking_full_row_writer_can_erase_a_read_back_hold():
+    """Known, uncorrected architect blocker: tracking full-row SET is not CAS.
+
+    This deliberately demonstrates the failure, NOT a concurrency-safety PASS.
+    The storage implementation is out of this Issue's approved source scope.
+    """
+    import fakeredis
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    pk = 'example-co#interleaved-stale-write'
+    tracking.set_status(pk, Status.SUBMITTING, company='example-co')
+    stale_pre_hold_row = tracking.get(pk)  # writer A has already read
+    tracking.set_status(pk, Status.NEEDS_HUMAN, possible_submission=True,
+                        fail_kind='uncertain', gate_reason='submit_uncertain')
+    assert tracking.get(pk)['possible_submission'] is True  # writer B read-back
+
+    tracking._write(pk, stale_pre_hold_row, prev_status='submitting')
+    # Exact real storage method unconditionally writes the stale full row.
+    assert not tracking.get(pk).get('possible_submission')
+    assert tracking.get(pk)['status'] == 'submitting'

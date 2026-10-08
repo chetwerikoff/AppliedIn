@@ -242,3 +242,45 @@ def test_reapply_cannot_clone_unresolved_hold(world, monkeypatch):
     endpoint = next(r.endpoint for r in server.create_app().routes
                     if getattr(r, 'path', '') == '/actions/reapply/{pk:path}')
     assert not endpoint(PK, {'profile_id': 'synthetic'}, BackgroundTasks())['ok']
+
+@pytest.mark.parametrize('active', ['lease', 'browser'])
+def test_mark_applied_refuses_inflight_attempt_without_clearing_hold(
+        world, monkeypatch, active):
+    stores, _ = world
+    forms.hold_possible_submission(PK, {'last_button': 'Continue', 'url': URL})
+    before = stores.tracking.get(PK)
+    if active == 'lease':
+        monkeypatch.setattr(ApplyQueue, 'in_flight', lambda self: [PK])
+    else:
+        monkeypatch.setattr(bsk, 'applies_running', lambda: 1)
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, 'path', '') == '/actions/mark-applied/{pk}')
+    response = endpoint(PK, {'note': 'Synthetic portal evidence'})
+    assert response == {'ok': False, 'error': 'An application attempt is still in flight.'}
+    assert stores.tracking.get(PK) == before
+    assert submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+def test_mark_applied_after_attempt_stops_records_outcome_and_clears_hold(world):
+    stores, _ = world
+    forms.hold_possible_submission(PK, {'last_button': 'Submit', 'url': URL})
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, 'path', '') == '/actions/mark-applied/{pk}')
+    result = endpoint(PK, {'note': 'Synthetic portal confirmation'})
+    assert result == {'ok': True}
+    row = stores.tracking.get(PK)
+    assert row['status'] == 'applied_manual'
+    assert row['confirmation_id'] == 'Synthetic portal confirmation'
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+def test_mark_applied_refuses_when_lease_proof_unavailable(world, monkeypatch):
+    stores, _ = world
+    forms.hold_possible_submission(PK, {'last_button': 'Submit', 'url': URL})
+    monkeypatch.setattr(ApplyQueue, 'in_flight', lambda self: (_ for _ in ()).throw(
+        RuntimeError('Synthetic Redis failure')))
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, 'path', '') == '/actions/mark-applied/{pk}')
+    assert not endpoint(PK, {})['ok']
+    assert stores.tracking.get(PK)['status'] == 'needs_human'
+    assert submit_hold.is_held(PK, tracking=stores.tracking)

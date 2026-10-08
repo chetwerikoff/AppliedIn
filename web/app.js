@@ -4167,8 +4167,14 @@ function paneAction(act, pk, el) {
     post(`/actions/retry/${encodeURIComponent(pk)}`);
     toast("Retrying — re-running the pipeline for this job.");
   } else if (act === "mark-applied") {
-    post(`/actions/mark-applied/${encodeURIComponent(pk)}`);
-    toast("Marked applied — won't resubmit.");
+    post(`/actions/mark-applied/${encodeURIComponent(pk)}`).then((r) => {
+      toast(r && r.ok ? "Marked applied — won't resubmit."
+                      : (r && r.error) || "Could not confirm application outcome.");
+      loadApps();
+    }).catch(() => {
+      toast("Could not confirm application outcome.");
+      loadApps();
+    });
   } else if (act === "reopen") {
     post(`/actions/reopen/${encodeURIComponent(pk)}`).then((d) => {
       toast(d && d.ok

@@ -1634,6 +1634,17 @@ def create_app() -> FastAPI:
         background.add_task(resume_job, pk, body.get("answer", ""))
         return {"ok": True, "status": "resuming"}
 
+    def stopped_application_attempt(pk: str, tracking) -> str:
+        """Both human outcome routes must refuse an active application lease."""
+        from core.apply_queue import ApplyQueue
+        from tools.browser_skill import applies_running
+        try:
+            if pk in ApplyQueue(tracking.r).in_flight() or applies_running():
+                return "An application attempt is still in flight."
+        except Exception:
+            return "Cannot prove that the attempt has stopped."
+        return ""
+
     @app.post("/actions/mark-applied/{pk}")
     def mark_applied(pk: str, body: dict | None = None):
         """Human confirms an application went through out-of-band (got the email
@@ -1643,6 +1654,8 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         if not stores.tracking.get(pk):
             return {"ok": False, "error": "unknown job"}
+        if failure := stopped_application_attempt(pk, stores.tracking):
+            return {"ok": False, "error": failure}
         stores.tracking.set_status(
             pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
         if getattr(stores.tracking, 'r', None) is not None:
@@ -1654,9 +1667,6 @@ def create_app() -> FastAPI:
     @app.post("/actions/resolve-uncertain/{pk:path}")
     def resolve_uncertain(pk: str, body: dict):
         """Explicit portal-verified human outcome; never an automatic retry."""
-        from core.apply_queue import ApplyQueue
-        from tools.browser_skill import applies_running
-
         if body.get("portal_checked") is not True:
             return {"ok": False, "error": "Check the employer portal before resolving."}
         outcome = body.get("outcome")
@@ -1666,11 +1676,8 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         if not submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "This row is not a held uncertain submission."}
-        try:
-            if pk in ApplyQueue(stores.tracking.r).in_flight() or applies_running():
-                return {"ok": False, "error": "An application attempt is still in flight."}
-        except Exception:
-            return {"ok": False, "error": "Cannot prove that the attempt has stopped."}
+        if failure := stopped_application_attempt(pk, stores.tracking):
+            return {"ok": False, "error": failure}
         if outcome == "submitted":
             evidence = str(body.get("confirmation") or "").strip()[:200]
             if not evidence:

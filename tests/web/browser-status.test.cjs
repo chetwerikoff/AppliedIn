@@ -44,3 +44,30 @@ test('model errors still surface independently of a connected browser', () => {
   assert.equal(result.banner.hidden, false);
   assert.match(result.message, /Model offline/);
 });
+
+test('mark applied displays refusal instead of claiming success', async () => {
+  const branch = source.match(/} else if \(act === "mark-applied"\) \{([\s\S]*?)\} else if \(act === "reopen"\)/)[1];
+  const messages = [];
+  let reloads = 0;
+  const run = vm.runInNewContext('(function(pk){' + branch + '})', {
+    post: () => Promise.resolve({ok: false, error: 'An application attempt is still in flight.'}),
+    encodeURIComponent, toast: m => messages.push(m),
+    loadApps: () => { reloads++; },
+  });
+  run('example-co#1');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(messages, ['An application attempt is still in flight.']);
+  assert.equal(reloads, 1);
+});
+
+test('mark applied success requires confirmed server response', async () => {
+  const branch = source.match(/} else if \(act === "mark-applied"\) \{([\s\S]*?)\} else if \(act === "reopen"\)/)[1];
+  const messages = [];
+  const run = vm.runInNewContext('(function(pk){' + branch + '})', {
+    post: () => Promise.resolve({ok: true}), encodeURIComponent,
+    toast: m => messages.push(m), loadApps: () => {},
+  });
+  run('example-co#1');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(messages, ["Marked applied — won't resubmit."]);
+});

@@ -30,9 +30,14 @@ PAGE = r"""(() => {
       (e.tagName === 'INPUT' ? e.type : e.tagName.toLowerCase());
     const submit = e.tagName === 'BUTTON' ? e.type === 'submit' && !!e.form :
       type === 'submit' || type === 'image';
+    const form = e.form || e.closest('form');
+    // DOM properties resolve relative actions against document.baseURI.
+    // Do not infer a receiver from the visible button label.
+    const formAction = form?.action || '';
+    const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
-      in_form:!!e.form || !!e.closest('form'), name:e.name || '',
+      in_form:!!form, form_action:formAction, formaction:override, name:e.name || '',
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),

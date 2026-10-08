@@ -570,12 +570,14 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or row.get('gate_source') != 'applier' or row.get('gate_call_id') != 'direct'
             or not isinstance(field, dict) or field.get('pk') != pk
             or any(not isinstance(field.get(k), str) or not field[k].strip()
-                   for k in ('label', 'selector', 'url'))):
+                   for k in ('label', 'selector', 'url', 'control_label'))
+            or not isinstance(field.get('question'), str)
+            or field['label'] != (field['question'] or field['control_label'])):
         return None
     from tools.browser_skill_apply import navigation_allowed
-    from tools.claude_chrome import direct_board_url
     url = row.get('jd_url') or ''
-    if not navigation_allowed(field['url'], url, direct_board_url(url) or url):
+    # A rewritten board URL is not proof of same-employer authorization.
+    if not navigation_allowed(field['url'], url):
         return None
     return field['label']
 
@@ -769,7 +771,12 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # grants. The exact observed direct form question owns the latter.
         if form_label:
             grants = dict(row.get('human_approved_answers') or {})
-            grants[form_label] = answer.strip()
+            observed = row['gate_pending']['form_question']
+            grants[form_label] = {
+                'value': answer.strip(), 'selector': observed['selector'],
+                'url': observed['url'], 'label': observed['control_label'],
+                'question': observed['question'],
+            }
             stores.tracking.set_status(
                 pk, row.get('status') or Status.NEEDS_HUMAN,
                 human_approved_answers=grants)

@@ -166,23 +166,36 @@ def _row(pk: str) -> dict:
     return make_stores().tracking.get(pk) or {}
 
 
-def exact_approval(pk: str, key: str, value: str) -> None:
-    """A bank key or alleged source is not proof of a human-approved answer."""
+def exact_approval(pk: str, key: str, value: str, *,
+                   target: dict | None = None, url: str = '') -> None:
+    """Approval belongs to one observed control, not a reusable bank label."""
     row = _row(pk) if pk else {}
     grants = row.get('human_approved_answers')
+    grant = grants.get(key) if isinstance(grants, dict) else None
     if (row.get('pk') != pk or row.get('status') != 'submitting'
-            or row.get('possible_submission') or not isinstance(grants, dict)
-            or not key or grants.get(key) != value):
-        raise Gate('An exact human-approved answer is needed for this field.')
+            or row.get('possible_submission') or not key or not url or not target
+            or not isinstance(grant, dict)
+            or grant.get('value') != value
+            or any(grant.get(k) != observed for k, observed in (
+                ('selector', target.get('selector')),
+                ('url', url),
+                ('label', target.get('label')),
+                ('question', target.get('question', ''))))):
+        # Old label-only string grants have no control identity and always gate.
+        raise Gate('An exact human-approved answer is needed for this control.')
+
 
 def check_approvals(pk: str, history: list, page: dict | None = None) -> None:
     for receipt in history:
         if receipt.get('fact'):
-            exact_approval(pk, receipt['fact'], receipt['approved_value'])
-            if page is not None:
-                target = control(page, receipt)
-                if any(target.get(k, '') != receipt.get(k, '') for k in ('label', 'question')):
-                    raise Gate('The approved question changed; human review is required.')
+            if page is None or receipt.get('url') != page.get('url'):
+                raise Gate('The approved control URL changed; human review is required.')
+            target = control(page, receipt)
+            if any(target.get(k, '') != receipt.get(k, '')
+                   for k in ('label', 'question')):
+                raise Gate('The approved question changed; human review is required.')
+            exact_approval(pk, receipt['fact'], receipt['approved_value'],
+                           target=target, url=page['url'])
 
 
 def hold_possible_submission(pk: str, step: dict) -> None:
@@ -284,9 +297,23 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                 if expected is None or (value and not _same(value, expected)):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
+def check_form_destination(page: dict, target: dict, *origins: str) -> None:
+    """Inspect the effective native receiver before upload or committing click."""
+    if not target.get('in_form'):
+        raise Gate('The action is not bound to an inspectable native form.')
+    base = target.get('form_action')
+    override = target.get('formaction')
+    if (not isinstance(base, str) or not base
+            or (override and not isinstance(override, str))
+            or not navigation_allowed(base, *origins)
+            or (override and not navigation_allowed(override, *origins))):
+        raise Gate('The form destination is external or not proven to be this tracked job.')
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
-                  github: str, pk: str = '', allow_click: bool = False) -> dict:
+                  github: str, pk: str = '', allow_click: bool = False,
+                  job_url: str = '') -> dict:
     verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -299,12 +326,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if verb in {'fill', 'select', 'choose'}:
         # Only this observed, unique control creates a disclosure question;
         # model gate prose and generic pipeline questions carry no such scope.
-        form_question = {'pk': pk, 'label': target.get('question') or target['label'],
-                         'selector': target['selector'], 'url': page.get('url', '')}
-        if (not form_question['label'] or sum(
-                _same(c.get('question') or c.get('label', ''), form_question['label'])
-                for c in page['controls']) != 1):
-            form_question = None  # a label-only grant cannot distinguish these controls
+        form_question = {
+            'pk': pk, 'label': target.get('question') or target['label'],
+            'selector': target['selector'], 'url': page.get('url', ''),
+            'control_label': target['label'], 'question': target.get('question', ''),
+        }
+        if not form_question['label'] or not form_question['url']:
+            form_question = None
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
@@ -322,7 +350,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
                        form_question=form_question)
         try:
-            exact_approval(pk, key, value)
+            exact_approval(pk, key, value, target=target, url=page.get('url', ''))
         except Gate as exc:
             raise Gate(str(exc), form_question=form_question) from None
         if not _same(key, target.get('question') or target.get('label', '')):
@@ -353,6 +381,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
+        check_form_destination(page, target, job_url or page.get('url', ''))
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
@@ -372,13 +401,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if (not allow_click or not pk or not submit_hold.is_held(pk)
                 or not _NEXT.match(target.get('label', ''))):
             raise Gate('Unproven or JS-backed click requires human inspection.')
-        if is_submission(target) or target.get('type') in {'radio', 'checkbox', 'option', 'file'}:
-            raise Gate('This control needs an explicit guarded action.')
+        if (is_submission(target) or not target.get('submit')
+                or target.get('type') in {'radio', 'checkbox', 'option', 'file'}):
+            raise Gate('A JS-backed or non-native submit destination is unproven.')
+        check_form_destination(page, target, job_url or page.get('url', ''))
         await session.call('click', target['selector'])
     else:
         raise Gate('Unsupported form action.')
     receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],
-               'question': target.get('question', '')}
+               'question': target.get('question', ''), 'url': page.get('url', '')}
     if verb in {'fill', 'select', 'choose'}:
         receipt.update(fact=key, approved_value=str(facts.get(key, value)).strip())
     return receipt
@@ -396,13 +427,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     uploaded = False
     try:
         check_dispatch(pk, resume_path)
+        # A query-generated Greenhouse/Oracle alias cannot authorize itself.
+        # Without a code-verifiable same-job route, stop before opening Chrome.
+        if not navigation_allowed(direct_url, url):
+            raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}
         approved = (_row(pk).get('human_approved_answers') or {})
-        approved_keys = [k for k, v in facts.items() if approved.get(k) == str(v).strip()]
+        approved_keys = [k for k, v in facts.items()
+                         if isinstance(approved.get(k), dict)
+                         and approved[k].get('value') == str(v).strip()]
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '
                 'The server rechecks both exact value and current approval before writing. '
@@ -450,7 +487,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 navigation_allowed(current['href'], url, direct_url)):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
-                               ('label', 'question', 'tag', 'type', 'href', 'options')):
+                               ('label', 'question', 'tag', 'type', 'href', 'options',
+                                'form_action', 'formaction')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
@@ -472,6 +510,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if not is_submission(target):
                             raise Gate('The final submission control was not identified.')
                         check_dispatch(pk, resume_path)
+                        check_form_destination(page, target, url, direct_url)
                         check_form(page, filled, uploaded, Path(resume_path).name)
                         check_approvals(pk, history, page)
                         before = page
@@ -499,7 +538,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     else:
                         target = control(page, action)
                         if verb == 'click' and _NEXT.match(target['label']):
+                            if not target.get('submit'):
+                                raise Gate('A JS-backed Continue has no proven native destination.')
                             check_dispatch(pk, resume_path)
+                            check_form_destination(page, target, url, direct_url)
                             check_form(page, filled, uploaded, Path(resume_path).name)
                             check_approvals(pk, history, page)
                             before = page
@@ -514,7 +556,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             session, page, action, facts=facts, filled=filled,
                             resume_path=resume_path, company=company, jd_text=jd_text,
                             resume_tex=resume_tex, github=github, pk=pk,
-                            allow_click=verb == 'click' and submitted)
+                            allow_click=verb == 'click' and submitted, job_url=url)
                         if verb == 'click':
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))

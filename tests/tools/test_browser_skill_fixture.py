@@ -752,3 +752,63 @@ def test_fixture_hold_readback_missing_blocks_before_row_or_click(authority, mon
             fixture.PK, {"last_button": "Submit", "url": fixture.URL},
             fixture_context=authority)
     assert authority.row == previous and not authority.hold
+
+
+
+def test_ordinary_python_module_daemon_still_enters_workers_and_server(tmp_path):
+    """The non-fixture -m entry follows original startup, entirely with offline fakes."""
+    from textwrap import dedent
+
+    site = tmp_path / "sitecustomize.py"
+    site.write_text(dedent(r'''
+        import builtins
+        import sys
+        import threading
+        from types import ModuleType, SimpleNamespace
+
+        # Server is the only network-owning foreground entry in main().
+        stub_server = ModuleType("server")
+        def serve(*, port):
+            print("ORDINARY_SERVER:" + str(port), flush=True)
+        stub_server.serve = serve
+        sys.modules["server"] = stub_server
+
+        # Recovery imports release_claim regardless of whether rows exist.
+        stub_run = ModuleType("agent.run")
+        stub_run.release_claim = lambda pk, stores: None
+        sys.modules["agent.run"] = stub_run
+
+        stores = SimpleNamespace(
+            queue=SimpleNamespace(drain=lambda *_a, **_kw: []),
+            tracking=SimpleNamespace(all=lambda: []))
+        previous_import = builtins.__import__
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                self.name = kwargs["name"]
+            def start(self):
+                print("ORDINARY_THREAD:" + self.name, flush=True)
+        def import_hook(name, *args, **kwargs):
+            module = previous_import(name, *args, **kwargs)
+            if name == "core.stores":
+                sys.modules["core.stores"].make_stores = lambda *_a, **_kw: stores
+            if name == "server":
+                # Install only after the production daemon has imported normally.
+                threading.Thread = FakeThread
+            return module
+        builtins.__import__ = import_hook
+    '''))
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env.pop("PYTHON_DOTENV_DISABLED", None)
+    env.update(PYTHONPATH=os.pathsep.join([str(tmp_path), str(root / "src")]),
+               APPLIEDIN_DISCOVERY="off", LITELLM_LOCAL_MODEL_COST_MAP="True")
+    result = subprocess.run(
+        [sys.executable, "-m", "daemon"], cwd=tmp_path, env=env,
+        text=True, capture_output=True, timeout=45)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "ORDINARY_SERVER:8787" in result.stdout
+    assert result.stdout.count("ORDINARY_THREAD:") == 3
+    assert "ORDINARY_THREAD:evaluate" in result.stdout
+    assert "ORDINARY_THREAD:apply" in result.stdout
+    assert "ORDINARY_THREAD:heartbeat" in result.stdout
+    assert "ORDINARY_THREAD:discovery" not in result.stdout

@@ -17,7 +17,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_owner_config(monkeypatch):
+def _isolate_owner_config(monkeypatch, tmp_path):
     """Tests must describe the SHIPPED defaults, not this machine's .env.
 
     Settings reads APPLIEDIN_* from the environment, so a developer who has
@@ -36,6 +36,10 @@ def _isolate_owner_config(monkeypatch):
         get_settings.cache_clear()
     except Exception:  # noqa: BLE001
         pass
+    # A private browser profile must never cause offline tests to drive Chrome.
+    from tools import browser_runtime
+    monkeypatch.setattr(browser_runtime, "_config_path",
+                        lambda settings: tmp_path / "browser.local.yaml")
     yield
     try:
         from core.config import get_settings

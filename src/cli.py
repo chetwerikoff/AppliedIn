@@ -237,6 +237,10 @@ def start(no_discover: bool = False) -> dict:
     except Exception as exc:
         return {"status": "setup failed", "error": f"Career Ops: {exc}",
                 "dashboard": _dashboard()}
+    from tools.browser_runtime import ensure_started
+    ready, problem = ensure_started()
+    if not ready:
+        log.warning("%s", problem)
     if (pid := _live_pid()) is not None:
         return {"status": "already running", "pid": pid, "dashboard": _dashboard(),
                 "hint": "use `appliedin stop` first to restart"}
@@ -350,6 +354,7 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("pk")
     r.add_argument("answer")
 
+    sub.add_parser("browser-setup", help="install BrowserSkill manually in a clean Chrome profile")
     args = p.parse_args(argv)
     # Switch instances BEFORE any command reads a setting: the pid file, the log,
     # the artifacts and the Redis connection all hang off this choice.
@@ -366,6 +371,10 @@ def main(argv: list[str] | None = None) -> None:
                               "hint": "appliedin start --port 8788 --fresh"},
                              indent=2))
             return
+    if args.cmd == "browser-setup":
+        from tools.browser_profile import browser_setup
+        print(json.dumps(browser_setup(), indent=2))
+        return
     if args.cmd == "logs":  # streams to the terminal, not JSON
         logs()
         return

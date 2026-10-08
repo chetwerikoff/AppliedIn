@@ -843,7 +843,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # sat on its pre-approval status with no log line and no activity marker, so an
     # approved apply looked like a click that did nothing.
     prior_status = row.get("status") or Status.TAILORED
-    stores.tracking.set_status(pk, Status.SUBMITTING)
+    # The approved queue dispatcher owns this run; clear the pre-dispatch UI gate.
+    stores.tracking.set_status(pk, Status.SUBMITTING, gate_reason="")
     emit("running", pk=pk, agent="applier", detail="reading the posting…", url=jd_url)
 
     try:
@@ -918,6 +919,10 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         pk=pk, jd_text=jd_text, resume_tex=resume_tex,
         github=_github_context(), resume_path=_resume_pdf_path(row),
     )
+    # A manual confirmation can arrive while the browser is filling the form.
+    # A pre-submit duplicate refusal must not turn that applied row into a gate.
+    if (stores.tracking.get(pk) or {}).get("status") in ("applied", "applied_manual"):
+        return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
 
     shot = result.pop("screenshot_b64", None)
     if shot:
@@ -960,7 +965,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # this job: the form was never reached, nothing was filled, and the same job
     # succeeds once the browser is free. Recording it as failed burns a good
     # application and hides it in the Unable lane, so hand it back to the queue.
-    from tools.claude_chrome import _is_browser_conflict, is_disconnected, is_signed_out
+    from tools.browser_runtime import _is_browser_conflict, is_disconnected, is_signed_out
 
     # A signed-out CLI is the same KIND of fault as a busy browser — nothing was
     # reached, nothing was filled — but it differs in one way that matters: it
@@ -991,7 +996,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         _requeue_untouched(pk, stores)
         if not flags.paused():
             flags.set_flag("paused", "yes")
-            flags.set_flag("paused_reason", "the Claude browser extension is disconnected")
+            flags.set_flag("paused_reason", "the selected browser profile is disconnected")
             log.warning("PAUSED applying: the browser extension is not connected")
         emit("gate", pk=pk, agent="applier", url=jd_url, detail=reason)
         return {"result": "requeued", "pk": pk, "reason": "extension_disconnected"}
@@ -1244,7 +1249,7 @@ def _fail_reason(outcome: dict) -> str:
             return ("The browser agent ended without any final report — most likely "
                     "an internal error during the run (check the Logs), or the "
                     "posting has no application form. Retry usually resolves it.")
-        from tools.claude_chrome import is_infrastructure
+        from tools.browser_runtime import is_infrastructure
 
         if is_infrastructure(detail):
             return detail      # already a complete explanation; a prefix saying the

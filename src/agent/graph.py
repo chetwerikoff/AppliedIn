@@ -301,7 +301,10 @@ scorer = LlmAgent(
         "score from the title + résumé rather than refusing. Return the score and a "
         "one-line reasoning. You are NOT applying to anything and need no personal "
         "data or web access — everything required is in this prompt; scoring is a "
-        "pure text-analysis task, so NEVER refuse it."
+        "pure text-analysis task, so NEVER refuse it.\n"
+        "Your complete final response MUST be a JSON object with exactly two keys: "
+        "score (an integer from 0 to 10) and reasoning (a string). "
+        "Do not use Markdown, code fences, or text outside the JSON object."
     ),
     output_schema=MatchScore, output_key="match_score",
 )

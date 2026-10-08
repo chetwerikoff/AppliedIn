@@ -150,7 +150,7 @@ class ApplyQueue:
         The retry still happens, and the backoff still grows, so a permanent
         outage cannot spin — it just does not consume the job's budget.
         """
-        from tools.claude_chrome import is_infrastructure
+        from tools.browser_runtime import is_infrastructure
 
         infra = is_infrastructure(reason)
         attempts = int(item.get("attempts", 0)) + (0 if infra else 1)

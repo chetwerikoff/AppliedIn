@@ -9,6 +9,10 @@
 
 [Release notes](CHANGELOG.md)
 
+**This fork:** [BrowserSkill integration and upstream updates](docs/browser-skill.md).
+The optional integration routes browser reading, discovery and applying through
+your dedicated Chrome profile and the configured model, including ChatGPT subscription access.
+
 AppliedIn turns a job search into a reviewable pipeline:
 
 **discover → score → tailor resume → review → approve → apply**

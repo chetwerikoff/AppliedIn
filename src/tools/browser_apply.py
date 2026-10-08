@@ -1,7 +1,7 @@
 """The apply entry point.
 
 `apply()` fills and submits one application. The work happens in the owner's own
-Chrome (tools.claude_chrome); this module holds the parts that are true whichever
+Chrome (tools.browser_runtime); this module holds the parts that are true whichever
 way that goes: the duplicate guard, the résumé filename, the site-quirk rules, and
 the event emitter.
 """
@@ -90,7 +90,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ""
         facts.setdefault("First name", first)
         facts.setdefault("Last name", " ".join(rest) or first)
 
-    from .claude_chrome import apply_chrome, available
+    from .browser_runtime import apply as apply_chrome, available
 
     ready, why = available()
     if not ready:

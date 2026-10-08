@@ -479,12 +479,8 @@ def create_app() -> FastAPI:
         checks.append({"name": "PDF rendering", "state": "ready" if render else "action",
                        "detail": "PDF renderer installed." if render else
                        "Run ./appliedin setup to install the PDF renderer."})
-        cli = bool(shutil.which("claude"))
-        checks.append({"name": "Chrome connection", "state": "check" if cli else "action",
-                       "detail": "Claude CLI installed. Sign in with your subscription and enable "
-                       "Claude in Chrome; the next browser run verifies the connection."
-                       if cli else "Install Claude Code and sign in with a subscription "
-                       "to scan browser-only boards and apply."})
+        from tools.browser_runtime import setup_check
+        checks.append(setup_check(settings))
         return {"checks": checks}
 
     @app.post("/actions/stop-company")
@@ -506,8 +502,10 @@ def create_app() -> FastAPI:
         applied = counts.get("applied", 0) + counts.get("applied_manual", 0)
         from core import flags
         preparation_runs = preparation.snapshot()
+        from tools.browser_runtime import browser_status
         return {"today_submitted": applied,
                 "llm_error": flags.llm_error(),
+                "browser_status": browser_status(settings),
                 "queue_age_seconds": None, "paused": flags.paused(),
                 "apply_mode": flags.apply_mode(),
                 "headless": flags.browser_headless(),
@@ -1323,9 +1321,14 @@ def create_app() -> FastAPI:
             import logging
 
             from agent.run import run_job
+            stores = make_stores(settings)
             try:
-                run_job(pk, make_stores(settings), prepare_only=True)
-            except Exception:
+                run_job(pk, stores, prepare_only=True)
+            except Exception as exc:
+                # The claim is released on failure; the card must not stay WORKING.
+                if (stores.tracking.get(pk) or {}).get("status") in ("found", "tailoring"):
+                    stores.tracking.set_status(pk, Status.ERROR,
+                                               error=f"Preparation failed: {type(exc).__name__}")
                 logging.getLogger("server").exception("run-job failed for %s", pk)
 
         background.add_task(_run)
@@ -1652,7 +1655,7 @@ def create_app() -> FastAPI:
         import logging
 
         from discovery import handler as _handler
-        from tools.claude_chrome import kill_live_sessions
+        from tools.browser_runtime import kill_live_sessions
 
         log = logging.getLogger("server")
         stores = make_stores(settings)
@@ -2549,7 +2552,7 @@ def create_app() -> FastAPI:
         # first, and anything that started before it is discarded on write.
         from core import flags
         from tools import seen
-        from tools.claude_chrome import kill_live_sessions
+        from tools.browser_runtime import kill_live_sessions
 
         # End the browsers first. Clearing the store while a session is still
         # filling a form leaves the owner watching it work on a job that no

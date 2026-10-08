@@ -27,7 +27,7 @@ def _check_browser_reader() -> None:
 
 
 def _note_browser_problem(problem: str) -> None:
-    from tools.claude_chrome import is_infrastructure
+    from tools.browser_runtime import is_infrastructure
 
     global _browser_retry
     if is_infrastructure(problem):
@@ -164,7 +164,7 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
     worse than one that fails, and it is the failure mode a batch invites. And a
     batch that comes back malformed loses only itself — the sweep carries on.
     """
-    from tools.claude_chrome import TAB_HYGIENE
+    from tools.browser_runtime import TAB_HYGIENE
 
     if not urls:
         return ({}, set()) if with_gone else {}
@@ -191,7 +191,7 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
                 '"gone": false, "description": "<the full posting text, verbatim>"}]}')
         try:
             report, problem = _run(run_task(task, report_key="postings",
-                                            timeout_s=120 * len(chunk), kind=kind))
+                                            timeout_s=120 * len(chunk), kind=kind, urls=chunk))
         except Exception as exc:  # noqa: BLE001 — one bad batch must not stop the sweep
             log.warning("posting batch failed: %s", exc)
             continue
@@ -225,13 +225,13 @@ _GONE_RX = re.compile(r"no longer available|position[- ]not[- ]available|has bee
 
 
 def run_task(*args, **kwargs):
-    from tools.claude_chrome import run_task as _rt
+    from tools.browser_runtime import run_task as _rt
 
     return _rt(*args, **kwargs)
 
 
 def available():
-    from tools.claude_chrome import available as _av
+    from tools.browser_runtime import available as _av
 
     return _av()
 
@@ -251,13 +251,13 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
     """Read the posting in the owner's own browser. Last resort, and slow."""
     import asyncio
 
-    from tools.claude_chrome import available, run_task
+    from tools.browser_runtime import available, run_task
 
     _check_browser_reader()
     ok, why = available()
     if not ok:
         raise PostingReadUnavailable(why)
-    from tools.claude_chrome import TAB_HYGIENE
+    from tools.browser_runtime import TAB_HYGIENE
 
     task = (f"Open {url}, wait for it to load, and read the job posting.\n\n"
             f"{TAB_HYGIENE}\n"
@@ -267,13 +267,13 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
             'verbatim: responsibilities, requirements, everything>"}')
     try:
         report, problem = asyncio.run(
-            run_task(task, report_key="description", timeout_s=300, kind=kind))
+            run_task(task, report_key="description", timeout_s=300, kind=kind, urls=[url]))
     except RuntimeError:  # already inside a loop
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             report, problem = pool.submit(
                 lambda: asyncio.run(run_task(task, report_key="description",
-                                             timeout_s=300, kind=kind))).result()
+                                             timeout_s=300, kind=kind, urls=[url]))).result()
     if problem or not report:
         log.warning("could not read %s in the browser: %s", url, problem)
         why = problem or "The browser reader returned no posting report. Try reading it again."

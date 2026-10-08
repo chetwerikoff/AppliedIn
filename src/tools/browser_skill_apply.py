@@ -177,11 +177,13 @@ def hold_possible_submission(pk: str, step: dict) -> None:
     context = handoff('possible submission; check the employer portal before retrying', step)['step']
     tracking = make_stores().tracking
     tracking.set_status(
-        pk, Status.SUBMITTING, possible_submission=True, fail_kind='uncertain',
+        pk, Status.NEEDS_HUMAN, possible_submission=True, gate_reason='submit_uncertain',
+        gate_pending={'question': 'possible submission; check the employer portal before retrying'},
+        gate_call_id=None, fail_kind='uncertain',
         fail_reason='possible submission; check the employer portal before retrying',
         last_button=context['last_button'], last_url=context['url'])
     persisted = tracking.get(pk) or {}
-    if (persisted.get('pk') != pk or persisted.get('status') != 'submitting'
+    if (persisted.get('pk') != pk or persisted.get('status') != 'needs_human'
             or persisted.get('possible_submission') is not True
             or persisted.get('fail_kind') != 'uncertain'
             or persisted.get('last_button') != context['last_button']

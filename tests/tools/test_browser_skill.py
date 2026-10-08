@@ -519,6 +519,7 @@ async def test_application_gates_external_link_before_the_browser_follows_it(mon
             pytest.fail('A forbidden link must never reach browser click')
     monkeypatch.setattr(bsk, 'Session', FakeSession)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args: None)
+    monkeypatch.setattr(forms, '_row', lambda pk: {})
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *args: 'Resume.pdf')
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
         'action': verb, 'selector': '#outside' if verb == 'click' else '', 'url': outside}))

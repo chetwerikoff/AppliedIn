@@ -634,3 +634,121 @@ def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
     assert actions.count("fill_name") == 1
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
+
+
+
+@pytest.mark.parametrize("drift", ["initial_redirect", "later_page"])
+async def test_closed_facade_rejects_url_drift_before_any_fill(authority, drift):
+    sent = []
+    class Raw:
+        async def navigate(self, url):
+            sent.append(("navigate", url))
+            return synthetic_page(url=fixture.URL + "/wrong" if drift == "initial_redirect"
+                                  else fixture.URL)
+        async def page(self):
+            sent.append(("evaluate", "PAGE"))
+            return synthetic_page(url=fixture.URL + "?redirect=true")
+        async def call(self, *args):
+            pytest.fail("A changed fixture URL must never reach form IPC")
+    edge = authority.facade(Raw())
+    if drift == "initial_redirect":
+        with pytest.raises(PermissionError, match="redirected"):
+            await edge.navigate(fixture.URL)
+        assert sent == [("navigate", fixture.URL)]
+    else:
+        await edge.navigate(fixture.URL)
+        with pytest.raises(PermissionError, match="escaped"):
+            await edge.page()
+        assert sent == [("navigate", fixture.URL), ("evaluate", "PAGE")]
+
+
+@pytest.mark.parametrize("drift", ["receiver", "status"])
+async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
+        authority, monkeypatch, drift):
+    """Pass all other native-form/attachment evidence before changing one guard.
+
+    This is an offline *controller* test: the facade still forbids every click,
+    even if the controller predicates would otherwise allow a native Continue.
+    """
+    current = synthetic_page()
+    current["controls"][0].update(required=True, value="Test User", has_value=True)
+    current["controls"][1].update(
+        required=True, value="Synthetic answer", has_value=True)
+    resume = {
+        "selector": "#resume", "label": "Resume", "question": "", "type": "file",
+        "tag": "input", "required": True, "disabled": False,
+        "in_form": True, "form_selector": "#synthetic-form", "form_action": fixture.URL,
+        "formaction": "", "files": ["Synthetic-Resume.pdf"],
+    }
+    current["controls"].insert(2, resume)
+    cont = current["controls"][-1]
+    cont.update(selector="#continue", label="Continue", type="submit", tag="button",
+                submit=True)
+    filled = {"#name": "Test User", "#additional": "Synthetic answer"}
+    authority.row["human_approved_answers"]["Additional question"] = {
+        "selector": "#additional", "url": fixture.URL, "label": "Additional question",
+        "question": "", "value": "Synthetic answer",
+    }
+    history = [
+        {"selector": selector, "label": label, "question": "", "url": fixture.URL,
+         "fact": label, "approved_value": val}
+        for selector, label, val in (
+            ("#name", "Name", "Test User"),
+            ("#additional", "Additional question", "Synthetic answer"))]
+    authority.row["status"], authority.row["gate_reason"], authority.hold = (
+        "needs_human", "submit_uncertain", True)
+
+    # Baseline: all checks pass, with actual required control values, staged PDF,
+    # exact receipts and a verified hold. No fake upload or missing-field gate.
+    forms.check_form(current, filled, True, "Synthetic-Resume.pdf")
+    forms.check_approvals(fixture.PK, history, current,
+                          fixture_context=authority)
+    forms.check_form_destination(current, cont, fixture.URL)
+    forms.check_before_committing_click(fixture.PK, fixture_context=authority)
+
+    sent = []
+    class Raw:
+        async def navigate(self, url):
+            sent.append(("navigate", url))
+            return current
+        async def page(self):
+            sent.append(("evaluate", "PAGE"))
+            return current
+        async def call(self, *args):
+            pytest.fail("Even a valid native Continue must not commit via fixture facade")
+    edge = authority.facade(Raw())
+    await edge.navigate(fixture.URL)
+    marks = []
+    action = {"action": "click", "selector": "#continue"}
+    kwargs = {
+        "facts": dict(fixture._FACTS), "filled": filled,
+        "resume_path": authority.resume_path, "company": fixture.COMPANY,
+        "jd_text": "", "resume_tex": "", "github": "",
+        "pk": fixture.PK, "allow_click": True, "job_url": fixture.URL,
+        "on_committing_click": lambda: marks.append("reached"),
+        "fixture_context": authority,
+    }
+    with pytest.raises(PermissionError, match="denies"):
+        await forms.execute(edge, current, action, **kwargs)
+    assert marks == ["reached"] and sent == [("navigate", fixture.URL)]
+    marks.clear()
+    if drift == "receiver":
+        cont["form_action"] = "https://foreign.example.test/submit"
+        with pytest.raises(forms.Gate, match="form destination"):
+            await forms.execute(edge, current, action, **kwargs)
+    else:
+        authority.row["status"] = "applied_manual"
+        with pytest.raises(forms.Gate, match="Human outcome changed"):
+            await forms.execute(edge, current, action, **kwargs)
+    assert not marks and sent == [("navigate", fixture.URL)]
+
+
+def test_fixture_hold_readback_missing_blocks_before_row_or_click(authority, monkeypatch):
+    """A synthetic hold SET without its read-back witness is not a safe click."""
+    previous = dict(authority.row)
+    monkeypatch.setattr(fixture._SyntheticRun, "mark_hold", lambda self, pk: None)
+    with pytest.raises(forms.Gate, match="hold could not be confirmed"):
+        forms.hold_possible_submission(
+            fixture.PK, {"last_button": "Submit", "url": fixture.URL},
+            fixture_context=authority)
+    assert authority.row == previous and not authority.hold

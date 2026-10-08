@@ -168,13 +168,19 @@ class _SyntheticRun:
                 if not authorized(state, pk=PK, company=COMPANY, url=URL):
                     raise PermissionError("Fixture authority has expired.")
                 state.navigations += 1
-                return await raw.navigate(url)
+                observed = await raw.navigate(url)
+                if not isinstance(observed, dict) or observed.get("url") != URL:
+                    raise PermissionError("Fixture redirected outside the fixed job URL.")
+                return observed
 
             async def page(self):
                 if not state.navigations or not authorized(state):
                     raise PermissionError("Fixture cannot inspect another session.")
-                # The existing raw Session calls evaluate(PAGE), never model JS.
-                return await raw.page()
+                # Only the existing raw Session's evaluate(PAGE) is permitted.
+                observed = await raw.page()
+                if not isinstance(observed, dict) or observed.get("url") != URL:
+                    raise PermissionError("Fixture page escaped the fixed job URL.")
+                return observed
 
             async def call(self, *args, **kwargs):
                 if (args != ("fill", "#name", "--value", "Test User")

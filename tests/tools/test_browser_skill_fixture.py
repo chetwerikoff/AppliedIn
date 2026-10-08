@@ -400,3 +400,237 @@ def test_normal_daemon_library_import_and_entry_keep_old_import_boundary(tmp_pat
         [sys.executable, "-c", source], cwd=tmp_path, env=env,
         capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
+
+
+
+def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
+        tmp_path):
+    """Drive the whole CLI -> Session -> controller path with fake BSK transport.
+
+    sitecustomize is loaded by the new interpreter before __main__ or core.config.
+    No socket is ever created/bound and no real BSK executable is called.
+    """
+    from textwrap import dedent
+
+    root = Path(__file__).resolve().parents[2]
+    home = tmp_path / "synthetic-home"
+    home.mkdir()
+    config = home / "config"
+    config.mkdir()
+    (config / "browser.local.yaml").write_text(
+        "engine: browser_skill\nbrowser: synthetic-pin\n"
+        f"user_data_dir: {str(home / 'owned-chrome')}\n"
+        "chrome_path: /synthetic/chrome\n"
+    )
+    forbidden = [home / ".env", home / ".local" / "answer-bank.json",
+                 home / "resume" / "base.tex", home / "output" / "candidate.pdf",
+                 config / "watchlist.yaml", config / "preferences.yaml"]
+    for name in forbidden:
+        name.parent.mkdir(parents=True, exist_ok=True)
+        name.write_text("synthetic forbidden sentinel; never read")
+    log = tmp_path / "child-records.jsonl"
+    site = tmp_path / "sitecustomize.py"
+    site.write_text(dedent(r'''
+        import asyncio
+        import builtins
+        import http.server
+        import json
+        import os
+        import shutil
+        import socket
+        import subprocess
+        import sys
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        _logfile = os.environ["SYNTHETIC_TEST_LOG"]
+        _synthetic_home = Path(os.environ["HOME"])
+        _forbidden = {
+            str(_synthetic_home / ".env"),
+            str(_synthetic_home / ".local" / "answer-bank.json"),
+            str(_synthetic_home / "resume" / "base.tex"),
+            str(_synthetic_home / "output" / "candidate.pdf"),
+            str(_synthetic_home / "config" / "watchlist.yaml"),
+            str(_synthetic_home / "config" / "preferences.yaml"),
+        }
+
+        def event(kind, **kwargs):
+            with open(_logfile, "a", encoding="utf-8") as output:
+                output.write(json.dumps({"kind": kind, **kwargs}) + "\n")
+
+        def audit(name, args):
+            if name == "open" and args:
+                target = os.fspath(args[0]) if isinstance(args[0], (str, bytes, os.PathLike)) else ""
+                if isinstance(target, bytes):
+                    target = os.fsdecode(target)
+                if target in _forbidden:
+                    event("forbidden_read", path=str(Path(target).relative_to(_synthetic_home)))
+                    raise AssertionError("Fixture accessed forbidden owner-like synthetic file")
+                if target == str(_synthetic_home / "config" / "browser.local.yaml"):
+                    event("pinned_config_observed")
+        sys.addaudithook(audit)
+
+        def no_socket(*args, **kwargs):
+            event("forbidden_socket")
+            raise AssertionError("No real socket is permitted in fixture offline test")
+        socket.socket.connect = no_socket
+        socket.socket.bind = no_socket
+        socket.create_connection = no_socket
+        socket.getaddrinfo = no_socket
+
+        class OfflineHTTPServer:
+            def __init__(self, address, handler):
+                assert address == ("127.0.0.1", 18789)
+                event("http_handler_selected")
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return None
+            timeout = 1
+            def serve_forever(self):
+                pass
+            def shutdown(self):
+                pass
+        http.server.HTTPServer = OfflineHTTPServer
+
+        original_import = builtins.__import__
+        def checked_import(name, *args, **kwargs):
+            if name in ("core.config", "litellm"):
+                event("config_import_env",
+                      module=name,
+                      dotenv=os.getenv("PYTHON_DOTENV_DISABLED"),
+                      cost=os.getenv("LITELLM_LOCAL_MODEL_COST_MAP"))
+                assert os.getenv("PYTHON_DOTENV_DISABLED") == "1"
+                assert os.getenv("LITELLM_LOCAL_MODEL_COST_MAP") == "True"
+            result = original_import(name, *args, **kwargs)
+            if name == "tools.browser_profile":
+                # Modify only the fake interpreter, after importing this module.
+                # Session.__aenter__ still uses actual ensure_browser in to_thread.
+                module = sys.modules.get("tools.browser_profile")
+                if module is not None:
+                    module.profile_pids = lambda directory: [123]
+            return result
+        builtins.__import__ = checked_import
+
+        original_which = shutil.which
+        def which(command, *args, **kwargs):
+            if command == "bsk":
+                return "/synthetic/bsk"
+            return original_which(command, *args, **kwargs)
+        shutil.which = which
+
+        _connection = {"instance_id": "synthetic-pin",
+                       "unresponsive": False, "version_skew": False}
+        def checked_env(env):
+            assert env["BSK_AUTO_START"] == "0"
+            assert env["PYTHON_DOTENV_DISABLED"] == "1"
+            assert env["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
+            for secret in ("OPENAI_API_KEY", "SYNTHETIC_PROVIDER_SECRET",
+                           "APPLIEDIN_SECRET_SENTINEL"):
+                assert secret not in env
+            event("sanitized_bsk_child")
+
+        def fake_run(argv, **kwargs):
+            assert argv[0] == "/synthetic/bsk"
+            assert argv[1] in ("status", "browsers")
+            assert argv[-1] == "--json"
+            checked_env(kwargs["env"])
+            event("sync_bsk", operation=argv[1])
+            return SimpleNamespace(stdout=json.dumps(
+                {"ok": True, "browsers": [_connection]}), returncode=0)
+        subprocess.run = fake_run
+
+        _url = "http://127.0.0.1:18789/fixture/example-co/job/1"
+        _field = {"selector": "#name", "label": "Name", "question": "",
+                  "type": "text", "tag": "input", "required": False,
+                  "disabled": False, "has_value": False, "value": "",
+                  "submit": False, "in_form": True,
+                  "form_selector": "#synthetic-form", "form_action": _url,
+                  "formaction": "", "files": []}
+        _second = dict(_field, selector="#additional", label="Additional question",
+                       type="textarea", tag="textarea")
+        _submit = dict(_field, selector="#submit", label="Submit application",
+                       type="submit", tag="button", submit=True)
+        _page = {"url": _url, "title": "Synthetic role",
+                 "text": "Synthetic harmless role description. " * 25,
+                 "controls": [_field, _second, _submit],
+                 "inventory_verified": True, "truncated": False,
+                 "opaque_controls": False, "shadow_roots": False,
+                 "unsupported_frames": []}
+
+        class Proc:
+            returncode = 0
+            def __init__(self, payload):
+                self.payload = payload
+            async def communicate(self):
+                return json.dumps(self.payload).encode(), b""
+            def kill(self):
+                raise AssertionError("No real subprocess may be killed")
+            async def wait(self):
+                return 0
+
+        async def fake_async(*argv, **kwargs):
+            assert argv[0] == "/synthetic/bsk" and argv[-1] == "--json"
+            checked_env(kwargs["env"])
+            operation = argv[1]
+            assert operation in ("session", "navigate", "evaluate", "fill")
+            if operation == "session":
+                subcommand = argv[2]
+                assert subcommand in ("start", "stop")
+                if subcommand == "start":
+                    assert "--browser" in argv
+                    assert argv[argv.index("--browser") + 1] == "synthetic-pin"
+                    payload = {"ok": True, "session_id": "fixture-only-session",
+                               "browser_instance_id": "synthetic-pin"}
+                else:
+                    assert "fixture-only-session" in argv
+                    payload = {"ok": True}
+                event("async_bsk", operation="session_" + subcommand)
+            elif operation == "navigate":
+                assert argv[2] == _url
+                event("async_bsk", operation="navigate")
+                payload = {"ok": True}
+            elif operation == "evaluate":
+                from tools.browser_skill_dom import PAGE
+                assert argv[2] == PAGE
+                event("async_bsk", operation="evaluate_page")
+                payload = {"ok": True, "value": _page}
+            else:
+                assert argv[2:6] == ("#name", "--value", "Test User", "--session")
+                assert argv[6] == "fixture-only-session"
+                _field["has_value"], _field["value"] = True, "Test User"
+                event("async_bsk", operation="fill_name")
+                payload = {"ok": True}
+            return Proc(payload)
+        asyncio.create_subprocess_exec = fake_async
+    '''))
+    env = dict(os.environ)
+    env.update(PYTHONPATH=os.pathsep.join([str(tmp_path), str(root / "src")]),
+               HOME=str(home),
+               APPLIEDIN_CONFIG_DIR=str(config),
+               SYNTHETIC_TEST_LOG=str(log),
+               SYNTHETIC_PROVIDER_SECRET="not-a-real-secret",
+               OPENAI_API_KEY="not-a-real-secret",
+               APPLIEDIN_SECRET_SENTINEL="not-a-real-secret",
+               LITELLM_LOCAL_MODEL_COST_MAP="False",
+               PYTHON_DOTENV_DISABLED="0")
+    result = subprocess.run(
+        [sys.executable, "-m", "daemon", "--synthetic-browser-fixture"],
+        cwd=tmp_path, env=env, text=True, capture_output=True, timeout=45)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert '"safe_gate": true' in result.stdout.lower()
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    kinds = [e["kind"] for e in events]
+    assert "http_handler_selected" in kinds
+    assert "pinned_config_observed" in kinds
+    assert not any(k in {"forbidden_read", "forbidden_socket"} for k in kinds)
+    assert not any(e["kind"] == "config_import_env"
+                   and (e["dotenv"], e["cost"]) != ("1", "True")
+                   for e in events)
+    actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
+    assert actions.count("session_start") == actions.count("session_stop") == 1
+    assert actions.count("navigate") == 1
+    assert actions.count("evaluate_page") >= 2
+    assert actions.count("fill_name") == 1
+    assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
+    assert any(e["kind"] == "sanitized_bsk_child" for e in events)

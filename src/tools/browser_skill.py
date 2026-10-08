@@ -154,10 +154,13 @@ class Session:
 
     async def __aenter__(self):
         from tools.browser_runtime import configuration
-        ready, problem = await asyncio.to_thread(available)
+        # A connected CLI ID alone does not prove a dedicated Chrome process.
+        # Check canonical argv on EVERY Session entry, including fast reuse.
+        from tools.browser_profile import ensure_browser
+        ready, problem = await asyncio.to_thread(ensure_browser)
         if not ready:
-            from tools.browser_profile import ensure_browser
-            ready, problem = await asyncio.to_thread(ensure_browser)
+            raise Unavailable(problem)
+        ready, problem = await asyncio.to_thread(available)
         if not ready:
             raise Unavailable(problem)
         self.owner = asyncio.current_task()

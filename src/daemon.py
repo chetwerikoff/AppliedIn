@@ -154,6 +154,19 @@ LEASE_GRACE_S = 20 * 60      # a re-tailor is ~2 min; a model call stuck on a ra
 _LEASE_SEEN: dict = {}       # pk -> when a lease was first seen with no application behind it
 
 
+def _hold_possible_submission(stores, row) -> bool:  # noqa: ANN001
+    """Keep an orphan with a durable pre-click marker out of every retry path."""
+    if not row.get("possible_submission"):
+        return False
+    from core.models import Status
+
+    stores.tracking.set_status(
+        row["pk"], Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
+        fail_kind="uncertain", fail_reason="possible submission; check the employer portal before retrying",
+        gate_pending={"question": "possible submission; check the employer portal before retrying"})
+    return True
+
+
 def _reclaim_orphans(stores, q) -> None:  # noqa: ANN001
     """Re-queue applications the store calls in flight that nobody is running.
 
@@ -185,6 +198,8 @@ def _reclaim_orphans(stores, q) -> None:  # noqa: ANN001
             continue
         if pk in live:
             continue                       # genuinely being filled right now
+        if _hold_possible_submission(stores, r):
+            continue  # no automatic second application after a crash
         stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval")
         q.put(pk, r.get("company", ""))
         n += 1
@@ -498,6 +513,9 @@ def _recover_orphans(stores) -> None:  # noqa: ANN001
             continue
         st = r.get("status")
         if st == "submitting":
+            if _hold_possible_submission(stores, r):
+                release_claim(pk, stores)
+                continue
             stores.tracking.set_status(pk, Status.TAILORED)
             stores.queue.enqueue(stores.apply_queue, {"pk": pk})
             release_claim(pk, stores)

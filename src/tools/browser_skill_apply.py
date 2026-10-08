@@ -92,6 +92,17 @@ class Gate(ValueError):
         self.form_question = form_question
 
 
+def _synthetic(fixture_context, *, pk: str = '', company: str = '',
+               url: str = ''):
+    """Untrusted kwargs cannot activate the daemon's synthetic authority."""
+    if fixture_context is None:
+        return None
+    from tools import browser_skill_fixture as fixture
+    if not fixture.authorized(fixture_context, pk=pk, company=company, url=url):
+        raise Gate('Synthetic fixture authority is invalid; use the exact daemon CLI.')
+    return fixture_context
+
+
 def control(page: dict, action: dict) -> dict:
     matches = [c for c in page.get('controls', []) if c['selector'] == action.get('selector')]
     if len(matches) != 1 or matches[0].get('disabled'):
@@ -168,15 +179,20 @@ def confirmation(before: dict, after: dict) -> str:
     return match.group(0)
 
 
-def _row(pk: str) -> dict:
+def _row(pk: str, *, fixture_context=None) -> dict:
+    ctx = _synthetic(fixture_context, pk=pk)
+    if ctx is not None:
+        return dict(ctx.row)
     from core.stores import make_stores
     return make_stores().tracking.get(pk) or {}
 
 
 def exact_approval(pk: str, key: str, value: str, *,
-                   target: dict | None = None, url: str = '') -> None:
+                   target: dict | None = None, url: str = '',
+                   fixture_context=None) -> None:
     """Approval belongs to one observed control, not a reusable bank label."""
-    row = _row(pk) if pk else {}
+    ctx = _synthetic(fixture_context, pk=pk)
+    row = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
     grants = row.get('human_approved_answers')
     grant = grants.get(key) if isinstance(grants, dict) else None
     if (row.get('pk') != pk or row.get('status') != 'submitting'
@@ -192,7 +208,9 @@ def exact_approval(pk: str, key: str, value: str, *,
         raise Gate('An exact human-approved answer is needed for this control.')
 
 
-def check_approvals(pk: str, history: list, page: dict | None = None) -> None:
+def check_approvals(pk: str, history: list, page: dict | None = None, *,
+                    fixture_context=None) -> None:
+    ctx = _synthetic(fixture_context, pk=pk)
     for receipt in history:
         if receipt.get('fact'):
             if page is None or receipt.get('url') != page.get('url'):
@@ -202,11 +220,27 @@ def check_approvals(pk: str, history: list, page: dict | None = None) -> None:
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
-                           target=target, url=page['url'])
+                           target=target, url=page['url'],
+                           **({'fixture_context': ctx} if ctx else {}))
 
 
-def hold_possible_submission(pk: str, step: dict) -> None:
+def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> None:
     """Mark the independent Redis key and verify it before any browser IPC."""
+    ctx = _synthetic(fixture_context, pk=pk)
+    if ctx is not None:
+        context = handoff(submit_hold.REASON, step)['step']
+        try:
+            ctx.mark_hold(pk)
+            if not ctx.is_held(pk):
+                raise RuntimeError('Synthetic hold read-back missing')
+            ctx.set_status(
+                pk, 'needs_human', gate_reason='submit_uncertain',
+                gate_pending={'question': submit_hold.REASON}, gate_call_id=None,
+                fail_kind='uncertain', fail_reason=submit_hold.REASON,
+                last_button=context['last_button'], last_url=context['url'])
+        except Exception as exc:
+            raise Gate('Durable synthetic hold could not be confirmed; no click is safe.') from exc
+        return
     from core.models import Status
     from core.stores import make_stores
 
@@ -226,14 +260,17 @@ def hold_possible_submission(pk: str, step: dict) -> None:
         raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 
 
-def check_before_committing_click(pk: str) -> None:
+def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     """A leased worker must re-read the human outcome and hold at the IPC edge."""
-    from core.stores import make_stores
-
+    ctx = _synthetic(fixture_context, pk=pk)
     try:
-        tracking = make_stores().tracking
-        row = tracking.get(pk) or {}
-        held = submit_hold.is_held(pk, tracking=tracking)
+        if ctx is not None:
+            row, held = dict(ctx.row), ctx.is_held(pk)
+        else:
+            from core.stores import make_stores
+            tracking = make_stores().tracking
+            row = tracking.get(pk) or {}
+            held = submit_hold.is_held(pk, tracking=tracking)
     except Exception as exc:
         raise Gate('Cannot verify current submission outcome or hold before click.') from exc
     if (row.get('status') != 'needs_human'
@@ -241,18 +278,23 @@ def check_before_committing_click(pk: str) -> None:
         raise Gate('Human outcome changed or submission hold was cleared; no click is safe.')
 
 
-def check_dispatch(pk: str, resume_path: str) -> None:
-    from agent.run import seed_fingerprint
-    from tools.browser_apply import _duplicate_refusal
+def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
+    ctx = _synthetic(fixture_context, pk=pk)
+    # Production ADK/stores imports are deferred until AFTER fixture selection.
+    if ctx is None:
+        from agent.run import seed_fingerprint
+        from tools.browser_apply import _duplicate_refusal
     if not pk:
         raise Gate('BrowserSkill requires a tracked, approved application.')
-    if _duplicate_refusal(pk):
+    if (ctx.duplicate_refusal() if ctx else _duplicate_refusal(pk)):
         raise Gate('This job is already applied; no duplicate is permitted.')
-    row = _row(pk)
-    if (submit_hold.blocked(pk, row) or row.get('status') != 'submitting'
+    row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+    if ((ctx.blocked(pk, row) if ctx else submit_hold.blocked(pk, row))
+            or row.get('status') != 'submitting'
             or row.get('gate_reason') == 'approval'):
         raise Gate('This application is not a fresh approved dispatch.')
-    if not row.get('resume_tex_key') or row.get('resume_seed') != seed_fingerprint():
+    current_seed = ctx.seed_fingerprint() if ctx else seed_fingerprint()
+    if not row.get('resume_tex_key') or row.get('resume_seed') != current_seed:
         raise Gate('The tailored résumé is missing or its base changed; re-tailor before applying.')
     if not resume_path or not Path(resume_path).is_file():
         raise Gate('The tailored PDF is missing; nothing may be submitted without it.')
@@ -343,7 +385,9 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
-                  job_url: str = '', on_committing_click=None) -> dict:
+                  job_url: str = '', on_committing_click=None,
+                  fixture_context=None) -> dict:
+    ctx = _synthetic(fixture_context, pk=pk)
     verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -380,7 +424,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
                        form_question=form_question)
         try:
-            exact_approval(pk, key, value, target=target, url=page.get('url', ''))
+            exact_approval(pk, key, value, target=target, url=page.get('url', ''),
+                           **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
             raise Gate(str(exc), form_question=form_question) from None
         if not _same(key, target.get('question') or target.get('label', '')):
@@ -428,13 +473,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The uploaded résumé was not proven in the current file input.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
-        if (not allow_click or not pk or not submit_hold.is_held(pk)
+        if (not allow_click or not pk
+                or not (ctx.is_held(pk) if ctx else submit_hold.is_held(pk))
                 or not _NEXT.match(target.get('label', ''))):
             raise Gate('Unproven or JS-backed click requires human inspection.')
         if is_submission(target) or not native_submit(target):
             raise Gate('A JS-backed or non-native submit destination is unproven.')
         check_form_destination(page, target, job_url or page.get('url', ''))
-        check_before_committing_click(pk)
+        check_before_committing_click(
+            pk, **({'fixture_context': ctx} if ctx else {}))
         if on_committing_click:
             on_committing_click()
         await session.call('click', target['selector'])

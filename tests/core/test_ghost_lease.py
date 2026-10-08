@@ -69,3 +69,27 @@ def test_a_real_application_is_never_touched(world):
     daemon._reclaim_orphans(stores, q)
     assert "stripe" in q.r.smembers("applyq:inflight")
     assert stores.tracking.rows["stripe#1"]["status"] == "submitting"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_periodic_orphan_reclaim_honors_durable_possible_submission(world, marked):
+    q, stores, _clock = world
+    q.r.srem("applyq:inflight", "stripe")
+    q.r.srem("applyq:inflight:pks", "stripe#1")
+    row = stores.tracking.rows["stripe#1"]
+    if marked:
+        row.update(possible_submission=True, fail_kind="uncertain",
+                   last_button="Proceed", last_url="https://example.test/job/1")
+    daemon._reclaim_orphans(stores, q)
+
+    if marked:
+        assert row["status"] == "needs_human"
+        assert row["gate_reason"] == "submit_uncertain"
+        assert row["fail_kind"] == "uncertain"
+        assert row["fail_reason"] == (
+            "possible submission; check the employer portal before retrying")
+        assert not any(item["pk"] == "stripe#1" for item in q.pending())
+    else:
+        assert row["status"] == "tailored"
+        assert row["gate_reason"] == "approval"
+        assert any(item["pk"] == "stripe#1" for item in q.pending())

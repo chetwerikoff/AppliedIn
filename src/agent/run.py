@@ -237,7 +237,19 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
     emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
          url=row.get("jd_url"))
     try:
-        result = _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+        try:
+            result = _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+        except Exception as exc:
+            from .graph import ScorerModelError
+            if not isinstance(exc, ScorerModelError):
+                raise
+            # Manual Reopen only logs escaping failures, unlike the daemon.
+            # Persist the scorer's genuine fault BEFORE re-raising to either.
+            detail = ("Scorer model/request failed; no valid score was received. "
+                      "Check the error log, then Reopen & re-score.")
+            stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
+            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            raise
         # Career Ops always uses the review graph: it must finish scoring and
         # produce a real PDF before an explicit Apply-selected request advances.
         # The authorization is persisted before the first worker sees the row.
@@ -314,8 +326,27 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     msg = types.Content(role="user", parts=[types.Part(
         text=f"Apply to this job: {row.get('title','')} at {row.get('company','')}. "
              f"URL: {row.get('jd_url','')}")])
-    result = await _drive_async(runner, pk, msg, stores, prepare_only=prepare_only)
-    _save_output(pk, row, jd_text, stores)  # inspection folder: JD + tailored résumé
+    from .graph import ScorerInvalidOutput
+
+    try:
+        result = await _drive_async(runner, pk, msg, stores, prepare_only=prepare_only)
+    except ScorerInvalidOutput:
+        # No new diagnostics or artifacts: a stale score/PDF must not appear
+        # as evidence of this evaluation or enable a downstream approval.
+        from core.events import emit
+
+        detail = ("The scorer did not return a valid score after one correction. "
+                  "Nothing was tailored or queued; use Reopen & re-score to retry.")
+        stores.tracking.set_status(pk, Status.SKIPPED, skip_reason="scorer_invalid_output",
+                                   match_score=None, fail_reason=detail)
+        emit("skipped", pk=pk, detail=detail, url=row.get("jd_url"))
+        return {"result": "skipped", "pk": pk, "reason": "scorer_invalid_output"}
+
+    # The writer gets the current validated score, never the pre-run row's
+    # historical score (which could describe a different evaluation).
+    current = stores.tracking.get(pk) or {}
+    _save_output(pk, {**row, "match_score": current.get("match_score")},
+                 jd_text, stores)
     return result
 
 
@@ -1238,30 +1269,21 @@ def _min_score() -> int:
         return 7
 
 
-def _score_gate(pk: str, text: str, stores: Any) -> dict | None:
-    """Record the scorer's match score on the row (so the UI shows it) and SKIP
-    the job when it's below min_match_score — a weak match shouldn't burn
-    tailoring + your apply approval. Returns a skip verdict, or None to proceed."""
+def _score_gate(pk: str, score_result: Any, stores: Any) -> dict | None:
+    """Only an ADK-validated terminal MatchScore may pass the score gate."""
     from core.events import emit
+    from tools.schema import MatchScore
 
-    t = text.strip()
-    a, b = t.find("{"), t.rfind("}")
-    if a == -1 or b <= a:
-        return None
-    try:
-        score = int(json.loads(t[a : b + 1]).get("score"))
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+    score_result = MatchScore.model_validate(score_result)
+    score, reasoning = score_result.score, score_result.reasoning
 
-    # A weak model sometimes REFUSES ("I'm an AI assistant and don't have a
-    # resume…") instead of scoring; the refusal parses as score 0 and used to
-    # bury a perfectly good job as 'low_score'. Surface it as a retryable,
-    # VISIBLE error instead.
-    import re as _re
-    if score <= 1 and _re.search(
+    # A schema-valid refusal is not evidence of a weak fit and must not be
+    # buried as low_score or consume the malformed-content correction.
+    if score <= 1 and re.search(
             r"i'?m an ai|as an ai|i cannot|i can'?t|unable to (access|assist)"
-            r"|don'?t have (a|any) (resume|r\u00e9sum\u00e9|personal)", t, _re.I):
-        stores.tracking.set_status(pk, Status.ERROR,
+            r"|don'?t have (a|any) (resume|r\u00e9sum\u00e9|personal)",
+            reasoning, re.I):
+        stores.tracking.set_status(pk, Status.ERROR, match_score=None,
                                    error="the scorer model refused the task instead of "
                                          "scoring — hit Retry (or switch the scorer model)")
         emit("error", pk=pk, detail="scorer refused instead of scoring — retry the job")
@@ -1269,7 +1291,7 @@ def _score_gate(pk: str, text: str, stores: Any) -> dict | None:
         return {"result": "error", "pk": pk, "reason": "scorer_refused"}
 
     row = stores.tracking.get(pk) or {}
-    stores.tracking.set_status(pk, row.get("status", "running"), match_score=score)
+    stores.tracking.set_status(pk, Status.TAILORING, match_score=score)
     threshold = _min_score()
     if score < threshold and row.get("score_override") is True:
         emit("response", pk=pk, detail=f"match {score}/10 < {threshold} — owner overrode the score; tailoring for review")
@@ -1397,10 +1419,15 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                 text = " ".join(p.text for p in content.parts if getattr(p, "text", None))
                 if text.strip():
                     emit("response", pk=pk, agent=author, detail=_short(text.strip()))
-                    if author == "scorer":  # record the score; skip if below the bar
-                        verdict = _score_gate(pk, text, stores)
-                        if verdict:
-                            return verdict
+                    if author == "scorer" and event.is_final_response():
+                        # ADK validated this event's output_key before yielding.
+                        # Neither JSON-looking interim text nor an old session
+                        # match_score is a current-run scoring witness.
+                        payload = event.actions.state_delta.get("match_score")
+                        if payload is not None:
+                            verdict = _score_gate(pk, payload, stores)
+                            if verdict:
+                                return verdict
 
             for call in event.get_function_calls() or []:  # tool call = step INPUT
                 if call.name == "ask_human":

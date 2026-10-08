@@ -591,3 +591,85 @@ def test_verified_file_input_is_not_mistaken_for_unapproved_text():
     resume['files'] = []
     with pytest.raises(forms.Gate, match='no longer present'):
         forms.check_form(page(resume), {}, True, 'Resume.pdf')
+
+
+@pytest.mark.parametrize(('field', 'action', 'facts'), [
+    (target(label='Years of experience'), {'action': 'fill', 'selector': '#field',
+                                            'fact': 'Years'}, {'Years': '10 years'}),
+    (target(tag='textarea', type='textarea', label='Why this role?'),
+     {'action': 'fill', 'selector': '#field', 'essay': True}, {}),
+    (target(tag='textarea', type='textarea', label='Why this role?'),
+     {'action': 'fill', 'selector': '#field', 'fact': 'Motivation'},
+     {'Motivation': 'Invented but plausible narrative'}),
+    (target(type='checkbox', label='I consent to share my personal data', required=True),
+     {'action': 'choose', 'selector': '#field'}, {}),
+    (target(type='checkbox', label='I accept marketing messages', required=True),
+     {'action': 'choose', 'selector': '#field'}, {}),
+])
+async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
+        monkeypatch, field, action, facts):
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'human_approved_answers': {}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate, match='human-approved'):
+        await forms.execute(
+            session, page(field), action, facts=facts, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_not_awaited()
+
+
+def test_opaque_and_hidden_form_values_block_final_click():
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        files=['Resume.pdf'])
+    with pytest.raises(forms.Gate, match='uninspectable'):
+        forms.check_form({**page(attachment), 'opaque_controls': True}, {}, True, 'Resume.pdf')
+    with pytest.raises(forms.Gate, match='incomplete'):
+        forms.check_form({**page(attachment), 'inventory_verified': False},
+                         {}, True, 'Resume.pdf')
+    with pytest.raises(forms.Gate, match='hidden'):
+        forms.check_form(page(attachment, target(selector='#private', type='hidden',
+                                                value='unverified', has_value=True)),
+                         {}, True, 'Resume.pdf')
+
+
+def test_stale_page_text_and_fakepath_never_prove_uploaded_pdf():
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        value='C:\\fakepath\\Resume.pdf', has_value=True, files=[])
+    with pytest.raises(forms.Gate, match='no longer present'):
+        forms.check_form(page(attachment, text='Resume.pdf upload completed'),
+                         {}, True, 'Resume.pdf')
+
+
+@pytest.mark.parametrize('error', [
+    TimeoutError('synthetic upload timeout'),
+    bsk.Unavailable('BrowserSkill operation unavailable: synthetic transport'),
+])
+async def test_unknown_or_timeout_upload_is_human_inspection_not_requeue(error):
+    session = SimpleNamespace(call=AsyncMock(side_effect=error))
+    with pytest.raises(forms.Gate, match='No automatic repeat'):
+        await forms.execute(
+            session, page(target(type='file', label='Resume')),
+            {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='')
+    session.call.assert_awaited_once()
+
+
+async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc():
+    for wording in ['View', 'Proceed', 'Apply now', 'Edit']:
+        session = SimpleNamespace(call=AsyncMock())
+        button = target(tag='button', type='button', label=wording)
+        with pytest.raises(forms.Gate):
+            await forms.execute(
+                session, page(button), {'action': 'click', 'selector': '#field'},
+                facts={}, filled={}, resume_path='', company='example-co',
+                jd_text='', resume_tex='', github='', pk='example-co#1')
+        session.call.assert_not_awaited()
+
+
+def test_job_id_query_cannot_change_on_same_ats_host():
+    origin = 'https://tenant.ats.test/company/apply?job_id=one'
+    assert forms.navigation_allowed(
+        'https://tenant.ats.test/company/apply?job_id=one', origin)
+    assert not forms.navigation_allowed(
+        'https://tenant.ats.test/company/apply?job_id=two', origin)

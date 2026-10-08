@@ -59,12 +59,12 @@ def navigation_allowed(href: str, *origins: str) -> bool:
         if not job_path or not (target.path == job_path
                                 or target.path.startswith(job_path + '/')):
             continue
-        former_pairs = parse_qsl(source.query, keep_blank_values=True)
-        current_pairs = parse_qsl(target.query, keep_blank_values=True)
-        identity = lambda k: re.search(r'job|req|tenant|position|posting|id$', k, re.I)
-        former = [(k, v) for k, v in former_pairs if identity(k)]
-        current = [(k, v) for k, v in current_pairs if identity(k)]
-        if (len({k for k, v in former}) != len(former)
+        # Unknown query keys and fragments can be the job identity too. There
+        # is no site witness authorizing their addition, mutation or duplication.
+        former = parse_qsl(source.query, keep_blank_values=True)
+        current = parse_qsl(target.query, keep_blank_values=True)
+        if (source.fragment != target.fragment
+                or len({k for k, v in former}) != len(former)
                 or len({k for k, v in current}) != len(current)
                 or sorted(former) != sorted(current)):
             continue
@@ -87,7 +87,9 @@ def handoff(message: str, step: dict) -> dict:
     return {'text': f'{message} Last button: {button}. Page: {url}', 'step': context}
 
 class Gate(ValueError):
-    pass
+    def __init__(self, message: str, *, form_question: dict | None = None):
+        super().__init__(message)
+        self.form_question = form_question
 
 
 def control(page: dict, action: dict) -> dict:
@@ -295,6 +297,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
     if verb in {'fill', 'select', 'choose'}:
+        # Only this observed, unique control creates a disclosure question;
+        # model gate prose and generic pipeline questions carry no such scope.
+        form_question = {'pk': pk, 'label': target.get('question') or target['label'],
+                         'selector': target['selector'], 'url': page.get('url', '')}
+        if (not form_question['label'] or sum(
+                _same(c.get('question') or c.get('label', ''), form_question['label'])
+                for c in page['controls']) != 1):
+            form_question = None  # a label-only grant cannot distinguish these controls
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
@@ -309,8 +319,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
               and not _FACT_ASSERTION.search(target.get('label', ''))):
             key, value = target['label'], target['label']
         else:
-            raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".')
-        exact_approval(pk, key, value)
+            raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
+                       form_question=form_question)
+        try:
+            exact_approval(pk, key, value)
+        except Gate as exc:
+            raise Gate(str(exc), form_question=form_question) from None
         if not _same(key, target.get('question') or target.get('label', '')):
             raise Gate('An exact human-approved answer for this question is required.')
         if not value:
@@ -450,13 +464,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('Only a link on the current application page may be opened.')
                         if not navigation_allowed(href, url, direct_url):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
-                        if any(c.get('has_value') for c in page['controls'] if c.get('in_form')):
-                            raise Gate('Do not navigate away from a populated application.')
-                        page = await session.navigate(href)
-                        step['url'] = page['url']
-                        if not navigation_allowed(page['url'], url, direct_url):
-                            raise Gate('Navigation reached an unrelated job or tenant.')
-                        continue
+                        # A same-job href may be an authenticated one-click
+                        # application. Observing it does not prove a read-only GET.
+                        raise Gate('Unproven application navigation may commit; inspect it yourself.')
                     elif verb == 'submit':
                         target = control(page, action)
                         if not is_submission(target):
@@ -526,7 +536,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
         context = handoff(str(exc), step)
         return {'status': 'gate', 'reason': 'unknown_field',
-                'question': context['text'], 'step': context['step']}
+                'question': context['text'], 'step': context['step'],
+                'form_question': exc.form_question}
     except (Exception, asyncio.CancelledError) as exc:
         if submitted:
             context = handoff(

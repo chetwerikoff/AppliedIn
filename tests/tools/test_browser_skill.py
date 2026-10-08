@@ -876,3 +876,268 @@ async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_pat
                             facts=facts, filled={}, resume_path='', company='example-co',
                             jd_text='', resume_tex='', github='', pk='example-co#1')
     session.call.assert_not_awaited()
+
+
+@pytest.mark.parametrize('route', ['/apply', '/confirm?send=1'])
+async def test_observed_same_job_action_link_cannot_commit_by_navigation(monkeypatch, route):
+    url = 'https://employer.test/job/1'
+    href = url + route
+    current = page(target(tag='a', type='a', label='Apply now', href=href, in_form=False))
+    navigations = []
+    class Session:
+        def __init__(self, kind):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def navigate(self, destination):
+            navigations.append(destination)
+            return current
+        async def page(self):
+            return current
+        async def call(self, *args, **kwargs):
+            pytest.fail('Unproven link must not click or write')
+    monkeypatch.setattr(bsk, 'Session', Session)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'navigate', 'url': href}, {'action': 'gate', 'question': 'Stop'}]))
+    result = await forms.apply(url, 'example-co', {}, 'synthetic',
+                               pk='example-co#1', resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert navigations == [url]  # initial approved posting read only, never the action href
+
+
+@pytest.mark.parametrize('typ,label,in_form', [
+    ('submit', 'Continue', True), ('button', 'Continue', True),
+    ('button', 'View', False), ('button', 'Proceed', False),
+    ('button', 'Search jobs', True), ('button', 'Next page', False),
+])
+async def test_discovery_ambiguous_buttons_never_issue_click(monkeypatch, typ, label, in_form):
+    current = page(target(tag='button', type=typ, label=label,
+                          in_form=in_form, submit=typ == 'submit'))
+    session = SimpleNamespace(navigate=AsyncMock(return_value=current),
+                              page=AsyncMock(return_value=current), call=AsyncMock())
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'click', 'selector': '#field'},
+        {'action': 'finish', 'report': {'jobs': []}}]))
+    with pytest.raises(ValueError):
+        await bsk._crawl(session, 'Find postings', current['url'])
+    session.call.assert_not_awaited()
+
+
+@pytest.mark.parametrize('before,after', [
+    ('#/jobs/one', '#/jobs/two'), ('#/role/A', '#/role/B'),
+    ('?role=one', '?role=two'), ('', '?role=other'),
+    ('?role=one', '?role=one&role=two'),
+])
+def test_unproven_fragment_and_query_routes_never_authorize_a_different_job(before, after):
+    url = 'https://employer.test/careers'
+    assert not forms.navigation_allowed(url + after, url + before)
+
+
+@pytest.fixture
+def form_gate_world(monkeypatch, tmp_path):
+    import fakeredis
+    from agent import run
+    from core.models import Status
+    from core.storage.local import MarkdownAnswerBank, RedisTracking
+    pk = 'example-co#1'
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    tracking.set_status(pk, Status.TAILORED, company='example-co', jd_url=page()['url'])
+    bank = MarkdownAnswerBank(tmp_path / 'synthetic-facts.md')
+    stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
+    monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw: stores)
+    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value=GOOD))
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Resume.pdf')
+    monkeypatch.setattr('tools.credentials.get_login', lambda *a: None)
+    monkeypatch.setattr('core.rotation.ensure', lambda *a: None)
+    monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
+    monkeypatch.setattr(runtime, 'configuration', lambda: {'engine': 'browser_skill'})
+    monkeypatch.setattr('tools.browser_apply.apply', forms.apply)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
+    def enqueue(pk, stores, **kw):
+        tracking.set_status(pk, Status.TAILORED, gate_reason='')
+        return {'result': 'queued'}
+    monkeypatch.setattr(run, '_enqueue_apply', enqueue)
+    def resume(coro):
+        coro.close()
+        return {'result': 'resumed'}
+    monkeypatch.setattr(run, '_run', resume)
+    return run, stores, pk
+
+
+@pytest.mark.parametrize('field,value', [('Email', 'test@example.test'),
+    ('Name', 'Test User'), ('Phone', '555-0100')])
+@pytest.mark.parametrize('banked', [False, True])
+async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_write(
+        monkeypatch, form_gate_world, field, value, banked):
+    from core.models import AnswerScope
+    run, stores, pk = form_gate_world
+    if banked:
+        stores.answer_bank.put(field, value, AnswerScope.GLOBAL, source='writer')
+    current = page(target(label=field))
+    writes = AsyncMock()
+    class Session:
+        def __init__(self, kind):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def navigate(self, url):
+            return current
+        async def page(self):
+            return current
+        call = writes
+    monkeypatch.setattr(bsk, 'Session', Session)
+    action = {'action': 'fill', 'selector': '#field', 'fact': field}
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        action, action, {'action': 'gate', 'question': 'Stop after the verified write'}]))
+    first = await run._apply_direct(pk, stores)
+    assert first['result'] == 'gated'
+    writes.assert_not_awaited()
+    run.resume_job(pk, value, stores)
+    assert stores.tracking.get(pk)['human_approved_answers'] == {field: value}
+    await run._apply_direct(pk, stores)
+    writes.assert_awaited_once_with('fill', '#field', '--value', value)
+
+
+@pytest.mark.parametrize('source,call_id', [('tailor', 'adk'), ('critic', 'adk'),
+    ('applier', 'direct')])
+async def test_unrelated_or_model_quoted_gate_never_creates_form_disclosure_grant(
+        monkeypatch, form_gate_world, source, call_id):
+    from core.models import Status
+    run, stores, pk = form_gate_world
+    field, value = 'Desired salary range', 'Synthetic range'
+    stores.tracking.set_status(pk, Status.NEEDS_HUMAN, gate_source=source, gate_call_id=call_id,
+        gate_pending={'question': f'For internal planning, answer "{field}".'})
+    run.resume_job(pk, value, stores)
+    assert stores.answer_bank.all_facts('example-co')[field] == value
+    stores.tracking.set_status(pk, Status.SUBMITTING)
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate):
+        await forms.execute(session, page(target(label=field)),
+            {'action': 'fill', 'selector': '#field', 'fact': field},
+            facts=stores.answer_bank.all_facts('example-co'), filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='', pk=pk)
+    session.call.assert_not_awaited()
+    assert not stores.tracking.get(pk).get('human_approved_answers')
+
+
+@pytest.mark.parametrize('stage', ['initial', 'jit'])
+@pytest.mark.parametrize('before,after', [('#/jobs/one', '#/jobs/two'),
+    ('?role=one', '?role=two'), ('?role=one', '?role=one&role=two')])
+async def test_changed_hash_or_query_redirect_stops_before_any_later_form_write(
+        monkeypatch, form_gate_world, stage, before, after):
+    _, stores, pk = form_gate_world
+    url = 'https://employer.test/careers'
+    approved, different = url + before, url + after
+    current = {**page(target(label='Name')), 'url': approved}
+    redirected = {**current, 'url': different}
+    stores.tracking.set_status(pk, 'submitting', jd_url=approved,
+                               human_approved_answers={'Name': 'Test User'})
+    writes = AsyncMock()
+    class Session:
+        def __init__(self, kind):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def navigate(self, url):
+            return redirected if stage == 'initial' else current
+        async def page(self):
+            return redirected
+        call = writes
+    monkeypatch.setattr(bsk, 'Session', Session)
+    decide = AsyncMock(side_effect=[{'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+                                   {'action': 'gate', 'question': 'Stop'}])
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(approved, 'example-co', {'Name': 'Test User'}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert decide.await_count == (0 if stage == 'initial' else 1)
+    writes.assert_not_awaited()
+
+
+@pytest.mark.parametrize('url', ['https://employer.test/careers#/jobs/one',
+    'https://employer.test/careers?role=one',
+    'https://employer.test/careers?role=one&department=engineering'])
+def test_unchanged_fragment_and_full_query_are_still_proven_job_context(url):
+    assert forms.navigation_allowed(url, url)
+
+
+@pytest.mark.parametrize('verb,control,value', [
+    ('fill', target(type='search', label='Search jobs', in_form=False), 'engineering'),
+    ('select', target(tag='select', type='select', label='Location filter',
+                      in_form=False, options=[{'value': 'remote', 'label': 'Remote'}]), 'remote'),
+])
+async def test_discovery_keeps_reading_and_native_search_filter_writes(monkeypatch, verb, control, value):
+    current = page(control)
+    session = SimpleNamespace(navigate=AsyncMock(return_value=current),
+                              page=AsyncMock(return_value=current), call=AsyncMock())
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': verb, 'selector': '#field', 'value': value},
+        {'action': 'finish', 'report': {'jobs': []}}]))
+    assert (await bsk._crawl(session, 'Find postings', current['url']))['jobs'] == []
+    session.call.assert_awaited_once_with(verb, '#field', '--value', value)
+
+
+@pytest.mark.parametrize('corruption', ['source', 'call_id', 'status', 'application',
+    'destination', 'selector', 'ambiguous_label'])
+async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, corruption):
+    run, stores, pk = form_gate_world
+    current = page(target(label='Email'))
+    if corruption == 'ambiguous_label':
+        current['controls'].append(target(selector='#other', label='Email'))
+    with pytest.raises(forms.Gate) as gated:
+        await forms.execute(SimpleNamespace(call=AsyncMock()), current,
+            {'action': 'fill', 'selector': '#field', 'fact': 'Email'},
+            facts={}, filled={}, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=pk)
+    pending = {'question': str(gated.value), 'form_question': gated.value.form_question}
+    attrs = {'gate_source': 'applier', 'gate_call_id': 'direct', 'gate_pending': pending}
+    status = 'needs_human'
+    if corruption == 'source':
+        attrs['gate_source'] = 'tailor'
+    elif corruption == 'call_id':
+        attrs['gate_call_id'] = 'adk'
+    elif corruption == 'status':
+        status = 'tailored'
+    elif corruption == 'application':
+        pending['form_question']['pk'] = 'example-co#other'
+    elif corruption == 'destination':
+        pending['form_question']['url'] = 'https://employer.test/job/other'
+    elif corruption == 'selector':
+        pending['form_question']['selector'] = ''
+    stores.tracking.set_status(pk, status, **attrs)
+    run.resume_job(pk, 'test@example.test', stores)
+    assert not stores.tracking.get(pk).get('human_approved_answers')
+
+
+async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, form_gate_world):
+    run, stores, pk = form_gate_world
+    current = page(target(label='Email'))
+    class Session:
+        def __init__(self, kind):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def navigate(self, url):
+            return current
+    monkeypatch.setattr(bsk, 'Session', Session)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'gate', 'question': 'An exact human-approved answer is needed for "Email".',
+        'form_question': {'pk': pk, 'label': 'Email', 'selector': '#field', 'url': current['url']}}))
+    assert (await run._apply_direct(pk, stores))['result'] == 'gated'
+    run.resume_job(pk, 'test@example.test', stores)
+    assert not stores.tracking.get(pk).get('human_approved_answers')

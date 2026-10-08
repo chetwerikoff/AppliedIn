@@ -356,9 +356,10 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
                     raise ValueError("Discovery can only write search/filter fields")
                 await session.call(verb, target["selector"], "--value",
                                    str(action.get("value", "")))
-            elif (verb == "click"
-                  and target["type"] not in {"radio", "checkbox", "file", "password"}):
-                await session.call("click", target["selector"])
+            elif verb == "click":
+                # Inventory cannot prove an arbitrary native/JS button harmless.
+                # Discovery has no approved application or submission hold.
+                raise ValueError("Discovery cannot prove this click noncommitting; inspect it yourself")
             else:
                 raise ValueError("Unsupported discovery action")
             history.append({"action": verb, "label": target["label"]})

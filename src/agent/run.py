@@ -559,6 +559,27 @@ def _gate_label(question: str) -> str | None:
     return max(asked or spans, key=len)
 
 
+def _direct_form_label(pk: str, row: dict) -> str | None:
+    """Only code-observed direct BrowserSkill field gates authorize disclosure.
+
+    ADK/model gates persist a question only. Neither their source tag nor quoted
+    text proves that the human was answering a current employer form control.
+    """
+    field = (row.get('gate_pending') or {}).get('form_question')
+    if (row.get('pk') != pk or row.get('status') != 'needs_human'
+            or row.get('gate_source') != 'applier' or row.get('gate_call_id') != 'direct'
+            or not isinstance(field, dict) or field.get('pk') != pk
+            or any(not isinstance(field.get(k), str) or not field[k].strip()
+                   for k in ('label', 'selector', 'url'))):
+        return None
+    from tools.browser_skill_apply import navigation_allowed
+    from tools.claude_chrome import direct_board_url
+    url = row.get('jd_url') or ''
+    if not navigation_allowed(field['url'], url, direct_board_url(url) or url):
+        return None
+    return field['label']
+
+
 def _session_state(row: dict, jd_text: str) -> dict:
     """The world the tailor sees, built the same way from either door.
 
@@ -734,7 +755,8 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # desired salary range?" is a fact about the owner and belongs to every
         # employer, even though the paragraph around it said "Replit" three times
         # and would have locked it to Replit alone.
-        label = _gate_label(question) or question
+        form_label = _direct_form_label(pk, row)
+        label = form_label or _gate_label(question) or question
         personal = label.lower().startswith("why") or "this role" in label.lower() \
             or (company and company.lower() in label.lower())
         scope = AnswerScope.COMPANY if personal else AnswerScope.GLOBAL
@@ -743,14 +765,14 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                      pk, label, len(question))
         stores.answer_bank.put(label, answer, scope,
                                company=company or None, source="dashboard")
-        # This answer was entered by a human at this job's live question gate.
-        # Store its exact text on the EXISTING tracking row; an unrelated
-        # answer-bank value or a model-written draft never gets this grant.
-        grants = dict(row.get("human_approved_answers") or {})
-        grants[label] = answer.strip()
-        stores.tracking.set_status(
-            pk, row.get("status") or Status.NEEDS_HUMAN,
-            human_approved_answers=grants)
+        # Internal answers stay reusable bank facts, not employer disclosure
+        # grants. The exact observed direct form question owns the latter.
+        if form_label:
+            grants = dict(row.get('human_approved_answers') or {})
+            grants[form_label] = answer.strip()
+            stores.tracking.set_status(
+                pk, row.get('status') or Status.NEEDS_HUMAN,
+                human_approved_answers=grants)
 
     if approval or row.get("gate_source") == "applier" or call_id == "direct":
         # An answered QUESTION resumes an application that is already under way:
@@ -1013,7 +1035,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         q = result.get("question") or "The applier needs your input to continue."
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
                                    gate_reason=result.get("reason") or "unknown_field",
-                                   gate_pending={"question": q},
+                                   gate_pending={"question": q, 'form_question':
+                                       result.get('form_question') if configuration()['engine'] == 'browser_skill' else None},
                                    gate_call_id="direct", gate_source="applier")
         emit("gate", pk=pk, agent="applier", detail=q, url=jd_url)
         log.info("gated pk=%s: %s", pk, q)

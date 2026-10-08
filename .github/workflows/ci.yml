@@ -1,0 +1,28 @@
+# Fork-local CI. Upstream ships no workflow, so this file merges without conflicts.
+# Tests are offline by design (AGENTS.md -> Tests): no secrets, no network, no browser.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run --frozen python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # Two date-grouping tests depend on the local time zone; pin it.
+      - run: TZ=UTC node --test tests/web/*.test.cjs tests/web/*.test.mjs

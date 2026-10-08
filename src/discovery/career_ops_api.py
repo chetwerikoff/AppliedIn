@@ -54,7 +54,9 @@ class NetworkSearch(BaseModel):
     interests: str = Field(default="", max_length=600)
     positive: list[str] = Field(default_factory=list, max_length=50)
     negative: list[str] = Field(default_factory=list, max_length=50)
-    locations: list[str] = Field(default_factory=list, max_length=50)
+    # Locations are matched as whole words, so a city and its country are separate
+    # entries; a Europe + Asia + US search runs well past fifty.
+    locations: list[str] = Field(default_factory=list, max_length=200)
     ats: list[Literal["greenhouse", "lever", "ashby", "workday", "icims"]] = Field(
         min_length=1, max_length=5
     )
@@ -91,6 +93,20 @@ def stop_network():
     from discovery import career_network
 
     return career_network.stop()
+
+
+@router.post("/network/classify")
+def classify_network(background: BackgroundTasks):
+    """Label unclassified jobs from the latest network search. Does not submit."""
+    from discovery.career_fit import classify_reserved
+
+    if not career_ops.reserve_scan(
+        "classify",
+        message="Classifying unclassified roles from the latest search",
+    ):
+        return {"running": True, "already_running": True}
+    background.add_task(classify_reserved)
+    return {"running": True, "kind": "classify"}
 
 
 @router.get("")

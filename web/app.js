@@ -27,8 +27,8 @@ const state = {
   requests: new Set(), launch: null,
   stats: {},
   events: [],
-  tab: location.hash === "#steering" ? "steering" : location.hash === "#career-ops" ? "career-ops" : location.hash === "#fresh" ? "fresh" : "pipeline",
-  findView: location.hash === "#career-ops" ? "career-ops" : "fresh",
+  tab: ["#steering", "#career-ops", "#cosign", "#fresh"].includes(location.hash) ? location.hash.slice(1) : "pipeline",
+  findView: ["#career-ops", "#cosign"].includes(location.hash) ? location.hash.slice(1) : "fresh",
   filter: "all",      // status chip on the Applications table
   logKind: "all",     // kind chip on the Logs view
   liveState: "off",   // SSE connection state (off | connecting | live | demo)
@@ -589,16 +589,45 @@ function renderLlmBanner() {
   b.hidden = false;
 }
 
+// Small line icons for the application table's links, in place of cv/jd/shot.
+const svg = (d) => `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const ICON = {
+  cv: svg('<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4"/><path d="M9.5 12h5M9.5 15.5h5"/>'),
+  jd: svg('<path d="M14 4h6v6"/><path d="M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>'),
+  shot: svg('<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m4 17 5-5 4 4 3-3 4 4"/>'),
+};
+
+// Where every tracked job stands, as one slim bar with a quiet legend under it.
+// Segments are updated in place so a changed count eases rather than jumps.
+function renderBreakdown(parts) {
+  const box = $("#breakdown");
+  if (!parts.length) { box.innerHTML = `<span class="bd dim">no jobs tracked yet</span>`; return; }
+  const keys = parts.map(([k]) => k).join();
+  if (box.dataset.keys !== keys) {
+    box.dataset.keys = keys;
+    box.innerHTML = `<div class="bd-bar" aria-hidden="true">${parts.map(([k]) =>
+      `<i class="bd-seg ${(STATUS_META[k] || {}).cls || ""}" data-k="${k}"></i>`).join("")}</div><div class="bd-legend"></div>`;
+  }
+  const total = parts.reduce((a, [, , n]) => a + n, 0);
+  for (const [k, l, n] of parts) {
+    const seg = box.querySelector(`.bd-seg[data-k="${k}"]`);
+    seg.style.flexGrow = String(n);
+    seg.title = `${l}: ${n} (${Math.round((100 * n) / total)}%)`;
+  }
+  box.querySelector(".bd-legend").innerHTML = parts
+    .map(([k, l, n]) => `<span class="bd ${(STATUS_META[k] || {}).cls || ""}"><i></i>${l} ${n}</span>`).join("");
+}
+
 function renderDeck() {
   renderLlmBanner();
   const s = state.stats || {};
   const c = s.counts_by_status || {};
   const waiting = s.found_waiting ?? c.found ?? 0;
 
-  $("#v-wait").textContent = waiting;
-  $("#v-cap").textContent = s.today_submitted ?? 0;
+  tick($("#v-wait"), waiting);
+  tick($("#v-cap"), s.today_submitted ?? 0);
   const needs = c.needs_human || 0;
-  $("#v-needs").textContent = needs;
+  tick($("#v-needs"), needs);
   $("#vital-needs").classList.toggle("hot", needs > 0);
 
   const ORDER = [
@@ -607,9 +636,7 @@ function renderDeck() {
     ["failed", "failed"], ["error", "errors"], ["uncertain", "uncertain"],
     ["skipped", "skipped"], ["job_gone", "gone"], ["capped", "capped"],
   ];
-  $("#breakdown").innerHTML = ORDER.filter(([k]) => c[k])
-    .map(([k, l]) => `<span class="bd ${(STATUS_META[k] || {}).cls || ""}"><i></i>${l} ${c[k]}</span>`)
-    .join("") || `<span class="bd dim">no jobs tracked yet</span>`;
+  renderBreakdown(ORDER.filter(([k]) => c[k]).map(([k, l]) => [k, l, c[k]]));
 
   const disc = $("#btn-discover"), proc = $("#btn-process");
   // Per company, not global. Scans claim one company at a time on the server,
@@ -876,14 +903,17 @@ function renderPreparation() {
 }
 
 function renderTabs() {
-  const finding = state.tab === "fresh" || state.tab === "career-ops";
+  const finding = ["fresh", "career-ops", "cosign"].includes(state.tab);
+  const searching = state.tab === "career-ops" || state.tab === "cosign";
   if (finding) state.findView = state.tab;
   $("#find-jobs-views").hidden = !finding;
   $$("#find-jobs-views button").forEach(b => {
     b.classList.toggle("active", b.dataset.findView === state.tab);
     b.setAttribute("aria-pressed", String(b.dataset.findView === state.tab));
   });
-  document.body.classList.toggle("career-search-page", state.tab === "career-ops");
+  if (finding) placeFindPill();
+  document.body.classList.toggle("career-search-page", searching);
+  document.body.classList.toggle("cosign-page", state.tab === "cosign");
   document.body.classList.toggle("steering-page", state.tab === "steering");
   $("#search").placeholder = state.tab === "career-ops" ? "Filter results…" : "Search company or role…";
   renderActivityLayout();
@@ -896,13 +926,14 @@ function renderTabs() {
   const moreLabel = $("#nav-more-label");
   if (moreLabel) moreLabel.textContent = secondary[state.tab] || "More";
   $("#nav-more")?.classList.toggle("active", !!secondary[state.tab]);
+  placeTabPill();  // after the active classes change, so it measures the new tab
   // The Logs tab is the roomy version of the live rail — hide the rail there.
-  $(".board").classList.toggle("logs-open", state.tab === "logs" || state.tab === "career-ops");
+  $(".board").classList.toggle("logs-open", state.tab === "logs" || searching);
   $("#tab-n-apps").textContent = state.apps.length;
   const needs = state.apps.filter((a) => a.status === "needs_human").length;
   const stuck = state.apps.filter(isStuck).length;
-  const nb = $("#tab-n-needs"); nb.hidden = !needs; nb.textContent = needs;
-  const sb = $("#tab-n-stuck"); sb.hidden = !stuck; sb.textContent = stuck;
+  const nb = $("#tab-n-needs"); nb.hidden = !needs; tick(nb, needs);
+  const sb = $("#tab-n-stuck"); sb.hidden = !stuck; tick(sb, stuck);
   renderCoFilter();
 }
 
@@ -2062,14 +2093,14 @@ function viewApps() {
   const rows = allRows.slice(0, shownN);
   const body = rows.map((r) => {
     const cv = (r.resume_url || r.resume_version)
-      ? `<button class="rowlk" data-resume="${esc(r.pk)}" title="View tailored résumé">cv</button>`
-      : `<span class="rowlk off">cv</span>`;
+      ? `<button class="rowlk" data-resume="${esc(r.pk)}" title="View tailored résumé" aria-label="View tailored résumé">${ICON.cv}</button>`
+      : `<span class="rowlk off" title="No tailored résumé yet">${ICON.cv}</span>`;
     const jd = r.jd_url
-      ? `<a class="rowlk" href="${esc(r.jd_url)}" target="_blank" rel="noopener" title="Open job posting">jd</a>`
-      : `<span class="rowlk off">jd</span>`;
+      ? `<a class="rowlk" href="${esc(r.jd_url)}" target="_blank" rel="noopener" title="Open job posting" aria-label="Open job posting">${ICON.jd}</a>`
+      : `<span class="rowlk off" title="No posting link">${ICON.jd}</span>`;
     const sc = r.screenshot_url
-      ? `<a class="rowlk" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener" title="Last screenshot">shot</a>`
-      : `<span class="rowlk off">shot</span>`;
+      ? `<a class="rowlk" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener" title="Last screenshot" aria-label="Last screenshot">${ICON.shot}</a>`
+      : `<span class="rowlk off" title="No screenshot">${ICON.shot}</span>`;
     return `<tr data-pk="${esc(r.pk)}">
       <td>${tagHtml(r.status)}</td>
       <td class="t-co">${esc(r.company)}</td>
@@ -3127,6 +3158,63 @@ function refreshPane() {
   renderPane();
 }
 
+// The Find jobs switcher's highlight is one pill that slides between choices.
+// It is measured from the chosen chip, so it follows any label or font change.
+function placeFindPill() {
+  const nav = $("#find-jobs-views"), chip = nav?.querySelector(".chip.active");
+  if (!nav || nav.hidden || !chip) return;
+  nav.style.setProperty("--seg-x", `${chip.offsetLeft}px`);
+  nav.style.setProperty("--seg-y", `${chip.offsetTop}px`);
+  nav.style.setProperty("--seg-w", `${chip.offsetWidth}px`);
+  nav.style.setProperty("--seg-h", `${chip.offsetHeight}px`);
+  nav.style.setProperty("--seg-on", "1");
+  nav.classList.add("seg-ready");
+}
+
+// A number that changed ticks into place, up or down, the way Cosign's counts do.
+// Background polls rewrite these every few seconds; only a real change moves.
+function tick(el, value) {
+  if (!el) return;
+  const next = String(value), prev = el.textContent;
+  if (prev === next) return;
+  el.textContent = next;
+  if (prev === "" || prev === "—") return;
+  el.classList.remove("tick-up", "tick-down"); void el.offsetWidth;
+  el.classList.add(Number(next) >= Number(prev) ? "tick-up" : "tick-down");
+}
+
+// The main tabs share one pill that slides to the chosen view. A view inside
+// "More" puts it on the More button.
+function placeTabPill() {
+  const bar = $("#tabs");
+  if (!bar) return;
+  let chip = bar.querySelector(":scope > .tab.active");
+  if (!chip) chip = $("#nav-more.active > summary") || $("#nav-more.active");
+  if (!chip || !chip.offsetWidth) { bar.style.setProperty("--tab-on", "0"); return; }
+  const box = bar.getBoundingClientRect(), r = chip.getBoundingClientRect();
+  bar.style.setProperty("--tab-x", `${r.left - box.left + bar.scrollLeft}px`);
+  bar.style.setProperty("--tab-w", `${r.width}px`);
+  bar.style.setProperty("--tab-h", `${r.height}px`);
+  bar.style.setProperty("--tab-y", `${r.top - box.top}px`);
+  bar.style.setProperty("--tab-on", "1");
+  bar.classList.add("tab-ready");
+}
+
+// Entrances play when the owner changes view, never on background repaints.
+const FIND_VIEWS = ["fresh", "career-ops", "cosign"];
+const VIEW_ORDER = ["pipeline", ...FIND_VIEWS, "apps", "needs", "steering", "stuck", "activity", "profiles", "logs"];
+function enterFindView(prev, next) {
+  if (prev === next) return;
+  const target = next === "cosign" ? $("#cosign-board") : next === "career-ops" ? $("#career-ops-board")
+    : next === "steering" ? $("#steering-panel") : $("#pane");
+  if (!target) return;
+  const from = VIEW_ORDER.indexOf(prev), to = VIEW_ORDER.indexOf(next);
+  target.style.setProperty("--fj-dir", from < 0 || to < 0 ? "0" : String(Math.sign(to - from)));
+  target.classList.remove("fj-enter"); void target.offsetWidth; target.classList.add("fj-enter");
+  clearTimeout(target._fjTimer);
+  target._fjTimer = setTimeout(() => target.classList.remove("fj-enter"), 800);
+}
+
 function renderPane() {
   showSteering(state.tab === "steering");
   const careerBoard = $("#career-ops-board");
@@ -3135,6 +3223,8 @@ function renderPane() {
     careerBoard.setAttribute("company", state.coFilter);
     careerBoard.setAttribute("query", state.query);
   }
+  const cosignBoard = $("#cosign-board");
+  if (cosignBoard) cosignBoard.hidden = state.tab !== "cosign";
   // The preservation below is now RARE-PATH insurance, not a per-poll crutch:
   // background repaints only reach here when data genuinely changed (a scan
   // landing rows every few seconds is the common case), and that can still
@@ -3155,7 +3245,7 @@ function renderPane() {
   const fsListEl = $("#fs-list");
   const fsScroll = fsListEl ? fsListEl.scrollTop : 0;
   $("#pane").innerHTML =
-    ["career-ops", "steering"].includes(state.tab) ? "" :
+    ["career-ops", "cosign", "steering"].includes(state.tab) ? "" :
     state.tab === "apps" ? viewApps() :
     state.tab === "needs" ? viewNeeds() :
     state.tab === "stuck" ? viewStuck() :
@@ -4820,6 +4910,7 @@ function wire() {
     renderTabs(); renderPane();
     if (!DEMO) loadApps().then(() => { renderTabs(); renderPane(); });
   });
+  document.addEventListener("cosign-needs", () => $('#tabs .tab[data-tab="needs"]')?.click());
   document.addEventListener("career-sources", (event) => {
     state.careerCompanies = event.detail.companies;
     renderCoFilter();
@@ -5227,11 +5318,12 @@ function wire() {
     if (e.key === "Escape") { more.open = false; more.querySelector("summary").focus(); e.stopPropagation(); }
   });
   const selectView = (next) => {
-    if (next === "career-ops" && !["fresh", "career-ops"].includes(state.tab)) {
+    if (["career-ops", "cosign"].includes(next) && !["fresh", "career-ops", "cosign"].includes(state.tab)) {
       state.coFilter = ""; state.query = ""; $("#co-filter").value = ""; $("#search").value = "";
     }
+    const prev = state.tab;
     state.tab = next;
-    const hash = ["fresh", "career-ops", "steering"].includes(next) ? "#" + next : "";
+    const hash = ["fresh", "career-ops", "cosign", "steering"].includes(next) ? "#" + next : "";
     history.replaceState(null, "", location.pathname + location.search + hash);
     // Cached data renders at once; the fetch refreshes it behind the paint.
     if (state.tab === "activity") loadActivity();
@@ -5239,7 +5331,11 @@ function wire() {
     if (state.tab === "profiles") { loadProfiles(); loadRotation(); }
     renderTabs();
     renderPane();
+    enterFindView(prev, next);
   };
+  window.addEventListener("resize", () => { placeFindPill(); placeTabPill(); });
+  $("#tabs")?.addEventListener("scroll", placeTabPill, {passive: true});
+  document.fonts?.ready.then(() => { placeFindPill(); placeTabPill(); });
   $("#tabs").addEventListener("click", (e) => {
     const t = e.target.closest(".tab");
     if (!t) return;
@@ -6369,8 +6465,11 @@ function wire() {
 
 // --- boot ------------------------------------------------------------------
 async function boot() {
-  const savedTheme = localStorage.getItem("appliedin.theme");
-  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  // Light unless someone chose dark. The stylesheet's base palette is the dark
+  // one, so with nothing saved the demo opened as an all-black board.
+  let savedTheme = null;
+  try { savedTheme = localStorage.getItem("appliedin.theme"); } catch { /* private window */ }
+  document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
   const savedW = Number(localStorage.getItem("appliedin.freshw"));
   if (FRESH_WINDOWS.some(([h]) => h === savedW)) state.freshHours = savedW;
   const savedScan = Number(localStorage.getItem("appliedin.scanw"));
@@ -6386,6 +6485,14 @@ async function boot() {
     console.error(e);
     toast("Could not load data — is the backend running?");
     renderAll();
+  }
+  // `?job=<pk>` opens that application in the pipeline. The Cosign board opens
+  // one in its own window, so following it never costs the search you were on.
+  const deepJob = new URLSearchParams(location.search).get("job");
+  if (deepJob) {
+    state.tab = "pipeline";
+    renderTabs(); renderPane();
+    openDrawer(deepJob);
   }
   loadCompanies().catch(() => {});
   loadTracker();

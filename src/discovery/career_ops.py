@@ -23,6 +23,7 @@ from core.config import get_settings
 from core.models import JobRecord
 from core.stores import make_stores
 from discovery.career_ops_setup import REVISION
+from tools.ats import detect_ats
 
 ROOT = Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "scripts/integrations/career-ops.mjs"
@@ -219,9 +220,12 @@ def snapshot() -> dict:
     with _LOCK:
         data = _read()
     # Keep full descriptions private on disk; list polling should stay small.
-    rows = [{k: v for k, v in j.items() if k != "description"} for j in data["jobs"].values()]
+    # fit_score still reads the description before it is dropped.
+    from discovery.career_fit import public_rows
     from discovery.career_progress import attach_progress
 
+    prefs = search_preferences()
+    rows = public_rows(data["jobs"], prefs.get("include_keywords"))
     attach_progress(rows, make_stores())
     return {
         "sources": sources,
@@ -233,7 +237,7 @@ def snapshot() -> dict:
         "network_filters": (data.get("network_search") or {}).get("filters"),
         "active_search": dict(_ACTIVE),
         "progress": progress_snapshot(),
-        "preferences": search_preferences(),
+        "preferences": prefs,
         "running": _RUNNING,
         "paused": flags.paused(),
         "error": error,
@@ -289,7 +293,7 @@ def report_progress(message: str) -> None:
         del events[:-80]
 
 
-def reserve_scan(kind: str = "feeds", company: str = "") -> bool:
+def reserve_scan(kind: str = "feeds", company: str = "", message: str = "") -> bool:
     global _RUNNING, _ACTIVE
     if not _SCAN.acquire(blocking=False):
         return False
@@ -297,11 +301,13 @@ def reserve_scan(kind: str = "feeds", company: str = "") -> bool:
         _RUNNING = True
         _ACTIVE = {"kind": kind, "company": company, "started_at": now()}
         _PROGRESS.update(run_id=_ACTIVE["started_at"], events=[])
-        report_progress("Search started" + (f" · {company}" if company else ""))
+        report_progress(message or ("Search started" + (f" · {company}" if company else "")))
     return True
 
 
 def _save_results(receipts: list[dict], receipt: dict):
+    from discovery.career_fit import kept_on_rescan
+
     stores = make_stores()
     tracked = {canonical(r["jd_url"]): r["pk"] for r in stores.tracking.all() if r.get("jd_url")}
     from tools import seen
@@ -325,7 +331,18 @@ def _save_results(receipts: list[dict], receipt: dict):
                 old = data["jobs"].get(row["id"])
                 if old:
                     row.update(
-                        {k: old[k] for k in ("state", "pk", "first_seen", "job_id") if k in old}
+                        {
+                            k: old[k]
+                            for k in (
+                                "state",
+                                "pk",
+                                "first_seen",
+                                "job_id",
+                                # The tier is paid for once; a rescan must not wipe it.
+                                *kept_on_rescan(),
+                            )
+                            if k in old
+                        }
                     )
                     if result["provider"] != "web_search" and not raw.get("search_id"):
                         row.update({k: old[k] for k in ("search_id", "why") if k in old})
@@ -519,7 +536,8 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 jd_url=url,
                 jd_text=row["description"],
                 location=row["location"],
-                ats=row["provider"],
+                # Cosign is an index, not an ATS; the posting URL names the real one.
+                ats=detect_ats(url) if row["provider"] == "cosign" else row["provider"],
                 posted_at=row["posted_at"],
                 discovery_source="career_ops",
                 apply_requested_at=now() if apply_requested else "",
@@ -533,7 +551,8 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 emit(
                     "discovered",
                     pk=job.pk,
-                    detail=f"Career Ops: {job.title} @ {job.company}",
+                    detail=f"{'Cosign network' if row['provider'] == 'cosign' else 'Career Ops'}: "
+                    f"{job.title} @ {job.company}",
                     url=url,
                 )
             else:

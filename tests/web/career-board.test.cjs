@@ -5,11 +5,15 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../../web/career-board.js'), 'utf8');
+const fitSource = fs.readFileSync(path.join(__dirname, '../../web/career-fit.js'), 'utf8').replace(/^export /gm, '');
 function harness(fetch) {
   let Board;
   const context = vm.createContext({HTMLElement: class {}, customElements: {define: (_, cls) => Board = cls},
     window: {}, fetch, AbortController, TextDecoder, Date, Set});
-  vm.runInContext(source.replace("import { auth } from './auth.js';", "const auth = {header: () => ({Authorization:'Bearer test'})};"), context);
+  const script = source
+    .replace("import { auth } from './auth.js';", "const auth = {header: () => ({Authorization:'Bearer test'})};")
+    .replace("import { compareMatch, domainBadge, domainClass } from './career-fit.js';\n", fitSource.endsWith('\n') ? fitSource : fitSource + '\n');
+  vm.runInContext(script, context);
   const board = new Board();
   board.data = {running:true}; board.hidden = false;
   board.selected = new Set(['selected-role']); board.busy = false;
@@ -137,4 +141,44 @@ test('role receipts use durable submission status and never mistake a request fo
   const missingDate = board.receiptHtml(row,{status:'applied'},'');
   assert.match(missingDate,/No date recorded/);
   assert.doesNotMatch(missingDate,/Requested on/);
+});
+
+test('best match is the default and orders AI, IT, unclassified, then Not IT', () => {
+  assert.match(source, /<option value="match" selected>Best match<\/option>/);
+  const board = harness(async () => {});
+  board.getAttribute = () => '';
+  board.page = 1;
+  board.selected = new Set();
+  board.detailId = '';
+  board.wide = () => false;
+  board.paintSelection = () => {};
+  const nodes = new Map();
+  board.$ = sel => {
+    if (!nodes.has(sel)) nodes.set(sel, {value: sel === '.cb-sort' ? 'match' : 'all', textContent: '', innerHTML: '', hidden: false, disabled: false, classList: {toggle() {}}});
+    return nodes.get(sel);
+  };
+  board.data = {jobs: [
+    {id:'other', title:'Health', company:'Acme', state:'new', domain:'other', domain_reason:'clinical "program"', fit_score:9, posted_at:'2026-10-01'},
+    {id:'ai-low', title:'ML', company:'Acme', state:'new', domain:'ai', fit_score:1, posted_at:'2026-09-01'},
+    {id:'plain', title:'PM', company:'Acme', state:'new', fit_score:8, posted_at:'2026-10-02'},
+    {id:'it', title:'Platform', company:'Acme', state:'new', domain:'it', fit_score:3, posted_at:'2026-08-01'},
+    {id:'ai-old', title:'Agent', company:'Acme', state:'new', domain:'ai', fit_score:4, posted_at:'2026-01-01'},
+    {id:'ai-new', title:'Agent later', company:'Acme', state:'new', domain:'ai', fit_score:4, posted_at:'2026-06-01'},
+  ]};
+  board.renderRows();
+  const ids = () => [...nodes.get('.cb-list').innerHTML.matchAll(/data-id="([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(ids(), ['ai-new', 'ai-old', 'ai-low', 'it', 'plain', 'other']);
+  const html = nodes.get('.cb-list').innerHTML;
+  const articles = Object.fromEntries(html.split('<article ').slice(1).map(chunk => {
+    const id = chunk.match(/data-id="([^"]+)"/)[1];
+    return [id, chunk];
+  }));
+  assert.match(articles['ai-new'], /cb-domain-ai">AI</);
+  assert.doesNotMatch(articles.it, /cb-domain/);
+  assert.doesNotMatch(articles.plain, /cb-domain/);
+  assert.match(articles.other, /is-other/);
+  assert.match(articles.other, /cb-domain-other" title="clinical &quot;program&quot;">Not IT</);
+  nodes.get('.cb-sort').value = 'posted';
+  board.renderRows();
+  assert.deepEqual(ids(), ['plain', 'other', 'ai-low', 'it', 'ai-new', 'ai-old']);
 });

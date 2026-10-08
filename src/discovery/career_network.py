@@ -42,7 +42,12 @@ def stop() -> dict:
     return {"stopping": False}
 
 
-def events(payload: dict, timeout: int = 1800):
+# A full directory scan including Workday (12,000+ tenants, one site each) runs
+# for hours; at 30 minutes it stopped after 31 Workday companies.
+SCAN_TIMEOUT_S = 5 * 60 * 60
+
+
+def events(payload: dict, timeout: int = SCAN_TIMEOUT_S):
     """Drain output incrementally; timeout/stop cannot erase completed companies."""
     script = co.ROOT / "scripts/integrations/career-network.mjs"
     with tempfile.TemporaryFile() as errors:
@@ -81,7 +86,7 @@ def events(payload: dict, timeout: int = 1800):
                     "kind": "interrupted",
                     "message": "Scan stopped"
                     if STOP.is_set()
-                    else "Scan reached its 30-minute time limit",
+                    else f"Scan reached its {timeout // 3600}-hour time limit",
                 }
             elif proc.returncode:
                 errors.seek(0)
@@ -284,6 +289,15 @@ def run_reserved(filters: dict, resume: bool = False) -> None:
                     data["network_search"] = state
                 co._write(data)
         finally:
+            # Same thread, still holding the scan reservation: the board lock is
+            # in-process only, so another scan must not start until tiers are stored.
+            try:
+                if state.get("id"):
+                    from discovery.career_fit import classify_search
+
+                    classify_search(state["id"])
+            except Exception:
+                co.log.exception("Career domain classification failed")
             with co._LOCK:
                 co._RUNNING = False
                 co._ACTIVE = {}

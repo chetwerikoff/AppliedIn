@@ -6,6 +6,8 @@
 #   ./appliedin stop      stop it
 #   ./appliedin status    is it up? plus the pipeline board
 #   ./appliedin logs      tail the daemon log (Ctrl-C to stop)
+#   ./appliedin update    merge upstream/main and run the test suite
+#   ./appliedin login-chatgpt   sign in with a ChatGPT subscription
 #   ./appliedin discover | work | run | resume <pk> "<answer>"
 #
 # `start` installs anything missing, brings up Redis and checks the config before
@@ -39,11 +41,14 @@ preflight() {
   }
 
   [ -f .env ] || { warn "no .env — run ./appliedin setup"; exit 1; }
-  # Orchestration (discovery, scoring, tailoring, the writer) runs on OpenAI, so
-  # this is the key that actually gates startup. Applying uses the Claude Code
-  # CLI's own subscription session, never an API key.
-  grep -q '^OPENAI_API_KEY=.\+' .env || {
-    warn "paste your key into .env (OPENAI_API_KEY=...) and try again"; exit 1; }
+  # Orchestration needs a credential for the models it will actually call: an
+  # OpenAI key, or a ChatGPT subscription from `./appliedin login-chatgpt`.
+  # Applying still uses the Claude CLI's own session, never this credential.
+  # `uv run` is how `cli` is launched below, so `core` imports the same way.
+  if ! access_problems="$(uv run python -m core.llm_access check)"; then
+    warn "${access_problems:-model access check failed}"
+    exit 1
+  fi
 
   # Warnings, not blockers: everything up to the apply works without these.
   [ -f resume/base.tex ] || warn "no resume/base.tex — tailoring needs it"
@@ -54,6 +59,8 @@ preflight() {
 case "${1:-}" in
   setup) exec ./setup.sh ;;
   start) ensure_env; preflight; ensure_career_ops --tools-only ;;
+  update) exec ./scripts/update-from-upstream.sh ;;
+  login-chatgpt) exec uv run python -m core.llm_access login ;;
 esac
 
 exec uv run python -m cli "$@"

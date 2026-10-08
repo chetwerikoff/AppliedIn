@@ -238,6 +238,74 @@ do not send emails or notifications outside the app. **Settings → Check setup*
 checks configuration and installed tools; live credentials and the Chrome
 connection are verified when those tools are used.
 
+## Find jobs across multiple job boards
+
+Open **Find jobs** to choose how to search. Each option shows where its jobs come
+from, every result is labelled with the board its posting lives on, and all of
+them start from your job preferences.
+
+| Option | What it searches | Sources | Use it to |
+|---|---|---|---|
+| **Fresh** | New postings from the companies you watch | Your watchlist on Greenhouse, Lever, Ashby, Workday and custom career sites | See what is new at companies you already track |
+| **Career Ops search** | Company job boards across a large directory of employers | Greenhouse, Lever, Ashby, Workday, iCIMS | Find companies you don't track yet |
+| **Cosign network** | About 70,000 open roles indexed across company job boards | Cosign network; postings on Ashby, Greenhouse, Workday and others | Search broadly by title, city and salary in seconds |
+
+### Search the Cosign network
+
+1. Open **Find jobs → Cosign network**. The first search uses your preferences:
+   your broadest title across all of the US.
+2. Refine with function, cities (up to five, **All of the US**, **Anywhere**, or
+   **Your cities** from your preferences), minimum salary and **Remote only**.
+3. Results fill to about a hundred roles. Titles that match your excluded keywords
+   are hidden; use **Show excluded** to see them, and **Load more roles** for the
+   next hundred.
+4. Click a role to read it on the right.
+
+### Search company job boards with Career Ops
+
+1. Open **Find jobs → Career Ops search**.
+2. Set interests, roles and locations, choose the search client (Claude or Codex)
+   and which job boards to include, then press **Search jobs**.
+3. Large scans run in batches and save results as they arrive. Press **Continue scan**
+   to check the next set of companies.
+4. Click a role in the list to read it on the right.
+
+### Apply from a search
+
+- Select roles, or use **Select all**.
+- **Score & tailor** prepares a tailored résumé and stops for your review.
+- **Apply** scores, tailors and submits in one press. Only roles that clear your
+  minimum match score are submitted, one application per company at a time. You are
+  asked only when a form needs an answer you haven't given; those appear in **Needs you**.
+- Follow progress in the **Applications** tab on the right. Each role moves through
+  Score → Tailor → Check → Apply → Submitted, with a timeline of what happened.
+  Click an application to open it in the pipeline.
+
+### Add job boards and companies
+
+- **Track a company** (used by **Fresh** and scheduled discovery): add it from the
+  dashboard or in [`config/watchlist.yaml`](config/watchlist.yaml). Give the
+  careers page and AppliedIn detects the job board:
+
+  ```yaml
+  companies:
+    - name: Acme
+      careers_url: https://jobs.ashbyhq.com/acme
+      # discovery: browser   # only for pages that build their listings in the browser
+  ```
+
+  Greenhouse, Lever, Ashby and Workday boards are read directly from their feeds.
+  Custom career sites are read with a plain fetch, or in Chrome when set to
+  `discovery: browser`.
+- **Choose job boards for Career Ops search:** tick them in the search form. Under
+  **Tracked companies & automation**, pick company feeds to monitor and turn on the
+  scheduled search every six hours.
+- **Correct or add a company's board for Career Ops:** add it to
+  [`config/career_ops_sources.yaml`](config/career_ops_sources.yaml) with its
+  `careers_url`. These entries override the directory.
+- **Cosign network:** nothing to configure. It needs a network connection and uses
+  your job preferences.
+
 ## Add application facts
 
 AppliedIn keeps approved form answers in `.local/facts.md`. The file is created

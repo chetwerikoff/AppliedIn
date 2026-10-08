@@ -9,7 +9,7 @@ Everything in this file is a pointer to that one. If the two ever disagree,
 AGENTS.md is right.
 
 **If you are asked to set this repo up and start the server**, follow
-[AGENTS.md → Setup](AGENTS.md#setup-set-this-repo-up-and-start-the-server) exactly.
+[docs/setup.md](docs/setup.md) exactly.
 It is scripted end to end through a single entry point, `./appliedin`. Ask the
 human for the three things only they have (an OpenAI key, their résumé at
 `resume/base.tex`, and a company or two to watch) rather than inventing values,

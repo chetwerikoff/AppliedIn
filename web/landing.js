@@ -43,6 +43,19 @@
 
   syncTheme();
 
+  // The what's-new banner stays dismissed only for the release it announced.
+  var announce = document.getElementById("announce");
+  if (announce) {
+    var key = "appliedin.announce";
+    var release = announce.getAttribute("data-release") || "";
+    try { if (localStorage.getItem(key) === release) announce.hidden = true; } catch (_) {}
+    var close = announce.querySelector(".announce_close");
+    if (close) close.addEventListener("click", function () {
+      announce.hidden = true;
+      try { localStorage.setItem(key, release); } catch (_) {}
+    });
+  }
+
   var headings = Array.prototype.slice.call(
     document.querySelectorAll("article h2[id], article h3[id]")
   );
@@ -90,4 +103,5 @@
     );
     headings.forEach(function (h) { io.observe(h); });
   }
+
 })();

@@ -234,8 +234,11 @@ _READ_QUERY_KEYS = {'id', 'job', 'job_id', 'jobid', 'jid', 'gh_jid', 'req',
                     'query', 'keyword', 'keywords', 'page', 'offset', 'limit',
                     'sort', 'lang', 'locale', 'team', 'type', 'board', 'source'}
 _ACTION_ROUTE = re.compile(
-    r'(?:^|[-_])(?:apply|application|quickapply|easyapply|oneclick|submit|send|'
-    r'confirm|confirmation|finish|complete|approve|finalize)(?:$|[-_])', re.I)
+    # URLs such as /one-click, /instantApply and ?source=submitApplication
+    # can commit on GET; exact word boundaries miss those common variants.
+    r'apply|application|submit|send|confirm|finish|complete|approve|finaliz|'
+    r'one[-_]?click|one[-_]?tap|withdraw|'
+    r'(?:^|[-_])(?:save|register|subscribe|accept)(?:$|[-_])', re.I)
 
 
 def discovery_url_allowed(candidate: str, seed: str) -> bool:

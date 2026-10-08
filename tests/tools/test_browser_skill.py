@@ -349,6 +349,10 @@ async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
     'https://foreign.test/job/2',
     'https://employer.test/jobs/1/quick-apply?send=1',
     'https://employer.test/jobs/1/confirm',
+    'https://employer.test/jobs/1/one-click',
+    'https://employer.test/jobs/1/instantApply',
+    'https://employer.test/jobs/1?source=submitApplication',
+    'https://employer.test/jobs/1?save=1',
     'https://employer.test/jobs/1?submit=true',
 ])
 async def test_discovery_never_navigates_foreign_or_action_links(monkeypatch, unsafe):

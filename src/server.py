@@ -1387,6 +1387,8 @@ def create_app() -> FastAPI:
         status = str(row.get("status") or "")
         # Same rule as skip and retry: what has been sent is not reopened. Running
         # it again would tailor and queue a role this employer already has.
+        if row.get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):
             return {"ok": False, "error": "refused",
                     "note": f"This one is already '{status or 'applied'}'. Reopening "
@@ -1503,6 +1505,8 @@ def create_app() -> FastAPI:
         pk = job.pk
         is_new = stores.tracking.put_new(job)
         if not is_new:  # already tracked — re-tailor it from scratch
+            if (stores.tracking.get(pk) or {}).get("possible_submission"):
+                return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
             stores.tracking.set_status(pk, Status.FOUND, skip_reason="", fail_kind="")
 
         def _run() -> None:
@@ -1876,7 +1880,7 @@ def create_app() -> FastAPI:
             try:
                 run_job(pk, stores)
                 row = stores.tracking.get(pk) or {}
-                if row.get("status") in ("tailored", "needs_human") and q.put(
+                if not row.get("possible_submission") and row.get("status") in ("tailored", "needs_human") and q.put(
                         pk, row.get("company") or company):
                     done += 1
                     emit("running", pk=pk, agent="workflow",
@@ -1942,13 +1946,13 @@ def create_app() -> FastAPI:
         return company.strip(), list(dict.fromkeys(pks))
 
     def review_eligible(row: dict) -> bool:
-        return row.get("status") == "tailored" or (
+        return not row.get("possible_submission") and (row.get("status") == "tailored" or (
             row.get("status") == "needs_human"
             and (
                 row.get("gate_reason") == "approval"
                 or (row.get("gate_pending") or {}).get("question", "").startswith("Ready to apply")
             )
-        )
+        ))
 
     @app.post("/actions/apply-selection")
     def apply_selection(body: dict, background: BackgroundTasks):
@@ -2007,7 +2011,7 @@ def create_app() -> FastAPI:
                 row = stores.tracking.get(pk) or {}
                 if (row.get("company") or "").strip().lower() != company.lower():
                     raise ValueError("This role does not belong to the selected company.")
-                if pk in q.in_flight() or row.get("confirmation_id") or row.get("status") == "submitting":
+                if pk in q.in_flight() or row.get("possible_submission") or row.get("confirmation_id") or row.get("status") == "submitting":
                     raise ValueError(
                         "This role is applying or submitted; refresh its current state."
                     )
@@ -2121,7 +2125,10 @@ def create_app() -> FastAPI:
         from core.apply_queue import ApplyQueue
 
         pk = ((body or {}).get("pk") or "").strip()
-        n = ApplyQueue(make_stores(settings).tracking.r).revive(pk)
+        stores = make_stores(settings)
+        if pk and (stores.tracking.get(pk) or {}).get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        n = ApplyQueue(stores.tracking.r).revive(pk)
         return {"ok": True, "revived": n}
 
     @app.post("/actions/queue-apply/{pk}")
@@ -2140,6 +2147,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": f"no job {pk!r}"}
         # Never re-queue something already submitted — a duplicate under a real
         # name is worse than a missed application.
+        if row.get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
             return {"ok": False, "error": f"already {row.get('status')} — refusing to re-apply"}
         stores.tracking.set_status(pk, Status.TAILORED, fail_reason="", skip_reason="",
@@ -2248,6 +2257,8 @@ def create_app() -> FastAPI:
         # click — or any bulk action reaching this endpoint — could erase the
         # record of something an employer had already received. The row is worth
         # more than the click.
+        if row.get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):
             return {"ok": False, "error": "refused",
                     "note": f"This one is already '{status or 'applied'}' — it went "
@@ -2292,6 +2303,8 @@ def create_app() -> FastAPI:
             # dispatched a run for a pk that does not exist, which then sat in the
             # in-flight set holding that company's turn against nothing.
             return {"ok": False, "error": "No such job."}
+        if row.get("possible_submission"):
+            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
             return {"ok": False, "error": f"Already {row['status']} — not reapplying."}
         company = row.get("company") or ""
@@ -2504,9 +2517,9 @@ def create_app() -> FastAPI:
             if company != "__all__" and (r.get("company") or "").strip().lower() != company:
                 continue
             q_ = (r.get("gate_pending") or {}).get("question", "")
-            if (r.get("status") == "tailored"
+            if (not r.get("possible_submission") and (r.get("status") == "tailored"
                     or r.get("gate_reason") == "approval"
-                    or q_.startswith("Ready to apply")):
+                    or q_.startswith("Ready to apply"))):
                 picked.append((r["pk"], r.get("company") or ""))
 
         q = ApplyQueue(stores.tracking.r)
@@ -2691,6 +2704,13 @@ def _recover_stuck(settings) -> None:  # noqa: ANN001
 
         stuck = [r for r in rows if r.get("status") == "submitting"]
         for r in stuck:
+            if r.get("possible_submission"):
+                stores.tracking.set_status(
+                    r["pk"], Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
+                    fail_kind="uncertain", fail_reason="possible submission; check the employer portal before retrying",
+                    gate_pending={"question": "possible submission; check the employer portal before retrying"})
+                release_claim(r["pk"], stores)
+                continue
             stores.tracking.set_status(r["pk"], Status.TAILORED)
             release_claim(r["pk"], stores)
         # A killed score/tailor leaves the row in 'tailoring' — reset to found.

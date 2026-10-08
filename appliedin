@@ -8,6 +8,7 @@
 #   ./appliedin logs      tail the daemon log (Ctrl-C to stop)
 #   ./appliedin update    merge upstream/main and run the test suite
 #   ./appliedin login-chatgpt   sign in with a ChatGPT subscription
+#   ./appliedin browser-setup  clean dedicated Chrome + manual extension setup
 #   ./appliedin discover | work | run | resume <pk> "<answer>"
 #
 # `start` installs anything missing, brings up Redis and checks the config before
@@ -43,7 +44,7 @@ preflight() {
   [ -f .env ] || { warn "no .env — run ./appliedin setup"; exit 1; }
   # Orchestration needs a credential for the models it will actually call: an
   # OpenAI key, or a ChatGPT subscription from `./appliedin login-chatgpt`.
-  # Applying still uses the Claude CLI's own session, never this credential.
+  # The browser adapter uses its explicitly selected engine and profile.
   # `uv run` is how `cli` is launched below, so `core` imports the same way.
   if ! access_problems="$(uv run python -m core.llm_access check)"; then
     warn "${access_problems:-model access check failed}"
@@ -52,12 +53,12 @@ preflight() {
 
   # Warnings, not blockers: everything up to the apply works without these.
   [ -f resume/base.tex ] || warn "no resume/base.tex — tailoring needs it"
-  command -v claude >/dev/null 2>&1 || \
-    warn "no 'claude' on PATH — Career Ops web search and applying need Claude Code; company feeds and tailoring still work"
+  uv run python -c 'from tools.browser_runtime import configuration; import shutil; c=configuration(); tool="bsk" if c["engine"] == "browser_skill" else "claude"; print("Browser engine: " + c["engine"] + (" — CLI missing: " + tool if not shutil.which(tool) else ""))'
 }
 
 case "${1:-}" in
   setup) exec ./setup.sh ;;
+  browser-setup) ensure_env ;;
   start) ensure_env; preflight; ensure_career_ops --tools-only ;;
   update) exec ./scripts/update-from-upstream.sh ;;
   login-chatgpt) exec uv run python -m core.llm_access login ;;

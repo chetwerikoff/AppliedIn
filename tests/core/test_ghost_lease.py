@@ -37,6 +37,7 @@ def world(monkeypatch):
     q = ApplyQueue(fakeredis.FakeRedis(decode_responses=True))
     stores = _Stores([{"pk": "netflix#1", "company": "Netflix", "status": "tailoring"},
                       {"pk": "stripe#1", "company": "Stripe", "status": "submitting"}])
+    stores.tracking.r = q.r
     q.r.sadd("applyq:inflight", "netflix", "stripe")
     q.r.sadd("applyq:inflight:pks", "netflix#1", "stripe#1")
     clock = [1000.0]
@@ -69,3 +70,27 @@ def test_a_real_application_is_never_touched(world):
     daemon._reclaim_orphans(stores, q)
     assert "stripe" in q.r.smembers("applyq:inflight")
     assert stores.tracking.rows["stripe#1"]["status"] == "submitting"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_periodic_orphan_reclaim_honors_durable_possible_submission(world, marked):
+    q, stores, _clock = world
+    q.r.srem("applyq:inflight", "stripe")
+    q.r.srem("applyq:inflight:pks", "stripe#1")
+    row = stores.tracking.rows["stripe#1"]
+    if marked:
+        from tools.submit_hold import mark
+        mark('stripe#1', tracking=stores.tracking)
+    daemon._reclaim_orphans(stores, q)
+
+    if marked:
+        assert row["status"] == "needs_human"
+        assert row["gate_reason"] == "submit_uncertain"
+        assert row["fail_kind"] == "uncertain"
+        assert row["fail_reason"] == (
+            "possible submission; check the employer portal before retrying")
+        assert not any(item["pk"] == "stripe#1" for item in q.pending())
+    else:
+        assert row["status"] == "tailored"
+        assert row["gate_reason"] == "approval"
+        assert any(item["pk"] == "stripe#1" for item in q.pending())

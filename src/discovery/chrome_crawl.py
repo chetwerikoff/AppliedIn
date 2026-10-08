@@ -253,7 +253,7 @@ def _posted_iso(raw: object) -> str:
 async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
                     model: str = "") -> tuple[list[JobRecord], str, str]:
     """Postings on `careers_url` that fit `prefs`. Returns (jobs, board, note)."""
-    from tools.claude_chrome import available, run_task
+    from tools.browser_runtime import available, run_task
 
     ok, why = available()
     if not ok:
@@ -271,11 +271,11 @@ async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
     # Say so if this is about to wait. A scan that sits silent for ten minutes
     # because an application is being filled looks identical to one that hung.
     from core.events import emit
-    from tools.claude_chrome import applies_running
+    from tools.browser_runtime import applies_running
 
     if (n := applies_running()):
         emit("running", agent="finder", company=company,
-             detail=f"{company}: waiting for {n} application(s) to finish before scanning")
+             detail=f"{company}: {n} application(s) currently active")
 
     from .freshness import run_window
 
@@ -303,7 +303,7 @@ async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
         report, problem = await run_task(
             _task(company, careers_url, _brief(prefs) + _queries(prefs), site_rules,
                   max_age_hours=run_window()),
-            report_key="jobs", model=model, timeout_s=TIMEOUT_S, kind="crawl")
+            report_key="jobs", model=model, timeout_s=TIMEOUT_S, kind="crawl", urls=[careers_url])
     finally:
         beat.cancel()
     if problem:

@@ -572,7 +572,9 @@ function renderSkipPicker() {
 function renderLlmBanner() {
   const b = $("#llm-banner");
   if (!b) return;
-  const err = state.stats.llm_error;
+  const browser = state.stats.browser_status;
+  const err = browser && browser.state !== "connected"
+    ? { where: "browser", msg: browser.detail } : state.stats.llm_error;
   if (!err || !err.msg) { b.hidden = true; return; }
   // Two different problems share this banner and they need opposite reactions.
   // An orchestration outage degrades screening and stays broken until fixed. A
@@ -4165,8 +4167,14 @@ function paneAction(act, pk, el) {
     post(`/actions/retry/${encodeURIComponent(pk)}`);
     toast("Retrying — re-running the pipeline for this job.");
   } else if (act === "mark-applied") {
-    post(`/actions/mark-applied/${encodeURIComponent(pk)}`);
-    toast("Marked applied — won't resubmit.");
+    post(`/actions/mark-applied/${encodeURIComponent(pk)}`).then((r) => {
+      toast(r && r.ok ? "Marked applied — won't resubmit."
+                      : (r && r.error) || "Could not confirm application outcome.");
+      loadApps();
+    }).catch(() => {
+      toast("Could not confirm application outcome.");
+      loadApps();
+    });
   } else if (act === "reopen") {
     post(`/actions/reopen/${encodeURIComponent(pk)}`).then((d) => {
       toast(d && d.ok

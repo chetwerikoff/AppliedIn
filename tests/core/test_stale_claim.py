@@ -32,8 +32,11 @@ class _Tracking:
 
 
 class _Queue:
+    def __init__(self):
+        self.enqueued = []
+
     def enqueue(self, *_a, **_k):
-        pass
+        self.enqueued.append((_a, _k))
 
 
 class _Stores:
@@ -73,3 +76,33 @@ def test_a_refused_run_tells_the_board_why(stores, monkeypatch):
     out = run_mod.run_job("openai deploy co#1", stores)
     assert out["result"] == "already_running"
     assert said and said[-1][0] == "response"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_startup_orphan_recovery_keeps_a_possible_submission_held(marked):
+    client = fakeredis.FakeRedis(decode_responses=True)
+    pk = "example-co#synthetic-1"
+    stores = _Stores([{"pk": pk, "company": "example-co",
+                       "status": "submitting",
+                       "last_button": "Submit",
+                       "last_url": "https://example.test/job/1"}], client)
+    if marked:
+        from tools.submit_hold import mark
+        mark(pk, tracking=stores.tracking)
+    assert run_mod._claim(pk, stores)
+    daemon._recover_orphans(stores)
+
+    row = stores.tracking.get(pk)
+    assert not client.exists(f"lock:job:{pk}")
+    if marked:
+        assert row["status"] == "needs_human"
+        assert row["gate_reason"] == "submit_uncertain"
+        assert row["fail_kind"] == "uncertain"
+        assert row["fail_reason"] == (
+            "possible submission; check the employer portal before retrying")
+        assert stores.queue.enqueued == []
+        assert row["last_button"] == "Submit"
+    else:
+        assert row["status"] == "tailored"
+        assert len(stores.queue.enqueued) == 1
+        assert stores.queue.enqueued[0][0][1] == {"pk": pk}

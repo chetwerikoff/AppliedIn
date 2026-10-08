@@ -92,6 +92,14 @@ class ApplyQueue:
     def __init__(self, client: Any) -> None:
         self.r = client
 
+    def claim_human_outcome(self, company: str) -> bool:
+        """Compete atomically for the very same company lease as next()."""
+        return bool(company and company.strip()
+                    and self.r.sadd(_BUSY, _norm(company)))
+
+    def release_human_outcome(self, company: str) -> None:
+        self.r.srem(_BUSY, _norm(company))
+
     # --- writing ----------------------------------------------------------
     def put(self, pk: str, company: str, *, attempts: int = 0,
             not_before: float = 0.0, history: list | None = None,
@@ -109,6 +117,10 @@ class ApplyQueue:
         an item while its lease is still held, and matching on that would silently
         drop every retry.
         """
+        from tools.submit_hold import blocked
+        raw_row = self.r.get(f"app:{pk}")
+        if blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
+            return False
         co = _norm(company)
         for raw in (self.r.lrange(f"{_KEY}:co:{co}", 0, -1) or []):
             try:
@@ -150,7 +162,13 @@ class ApplyQueue:
         The retry still happens, and the backoff still grows, so a permanent
         outage cannot spin — it just does not consume the job's budget.
         """
-        from tools.claude_chrome import is_infrastructure
+        from tools.browser_runtime import is_infrastructure
+        from tools.submit_hold import blocked
+
+        pk = item['pk']
+        raw_row = self.r.get(f'app:{pk}')
+        if reason in TERMINAL or blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
+            return False
 
         infra = is_infrastructure(reason)
         attempts = int(item.get("attempts", 0)) + (0 if infra else 1)
@@ -431,8 +449,10 @@ class ApplyQueue:
             if pk and rec.get("pk") != pk:
                 kept.append(raw)
                 continue
-            self.put(rec["pk"], rec.get("company", ""), history=rec.get("history"))
-            revived += 1
+            if self.put(rec["pk"], rec.get("company", ""), history=rec.get("history")):
+                revived += 1
+            else:
+                kept.append(raw)
         self.r.delete(_DLQ)
         for raw in kept:
             self.r.rpush(_DLQ, raw)

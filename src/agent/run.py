@@ -1274,8 +1274,14 @@ def _score_gate(pk: str, score_result: Any, stores: Any) -> dict | None:
     from core.events import emit
     from tools.schema import MatchScore
 
-    score_result = MatchScore.model_validate(score_result)
-    score, reasoning = score_result.score, score_result.reasoning
+    # Legacy direct callers pass a complete JSON string; validate it through
+    # the same schema, never by extracting a substring. The live runner passes
+    # ADK's already-validated current-event output-key dictionary instead.
+    original_text = score_result if isinstance(score_result, str) else ""
+    score_result = (MatchScore.model_validate_json(score_result)
+                    if isinstance(score_result, str)
+                    else MatchScore.model_validate(score_result))
+    score, reasoning = score_result.score, (score_result.reasoning + " " + original_text)
 
     # A schema-valid refusal is not evidence of a weak fit and must not be
     # buried as low_score or consume the malformed-content correction.

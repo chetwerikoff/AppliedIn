@@ -736,6 +736,14 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                      pk, label, len(question))
         stores.answer_bank.put(label, answer, scope,
                                company=company or None, source="dashboard")
+        # This answer was entered by a human at this job's live question gate.
+        # Store its exact text on the EXISTING tracking row; an unrelated
+        # answer-bank value or a model-written draft never gets this grant.
+        grants = dict(row.get("human_approved_answers") or {})
+        grants[label] = answer.strip()
+        stores.tracking.set_status(
+            pk, row.get("status") or Status.NEEDS_HUMAN,
+            human_approved_answers=grants)
 
     if approval or row.get("gate_source") == "applier" or call_id == "direct":
         # An answered QUESTION resumes an application that is already under way:

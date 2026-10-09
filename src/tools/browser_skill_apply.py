@@ -289,6 +289,24 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
     if (ctx.duplicate_refusal() if ctx else _duplicate_refusal(pk)):
         raise Gate('This job is already applied; no duplicate is permitted.')
     row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+    if ctx is None:
+        # A queue-owned company lease AND its exact pk are necessary for a
+        # production form to open. Neither witness confers caller identity:
+        # graph.apply_to_job must independently deny all BrowserSkill ADK calls,
+        # including a same-pk worker's already-leased attempt.
+        try:
+            from core.apply_queue import ApplyQueue
+            from core.stores import make_stores
+            company = row.get('company')
+            if not isinstance(company, str) or not company.strip():
+                raise ValueError('Missing company')
+            queue = ApplyQueue(make_stores().tracking.r)
+            if (pk not in queue.in_flight()
+                    or company.strip().lower() not in queue.depth()['running']):
+                raise ValueError('Missing matching queue-owned company/pk lease')
+        except Exception as exc:
+            raise Gate('Cannot verify a leased queue dispatch; obtain explicit '
+                       'approval through the existing ApplyQueue worker.') from exc
     if ((ctx.blocked(pk, row) if ctx else submit_hold.blocked(pk, row))
             or row.get('status') != 'submitting'
             or row.get('gate_reason') == 'approval'):

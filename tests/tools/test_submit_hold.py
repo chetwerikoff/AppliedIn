@@ -246,16 +246,13 @@ def test_reapply_cannot_clone_unresolved_hold(world, monkeypatch):
                     if getattr(r, 'path', '') == '/actions/reapply/{pk:path}')
     assert not endpoint(PK, {'profile_id': 'synthetic'}, BackgroundTasks())['ok']
 
-@pytest.mark.parametrize('active', ['lease', 'browser'])
-def test_mark_applied_refuses_inflight_attempt_without_clearing_hold(
-        world, monkeypatch, active):
+def test_mark_applied_refuses_target_pk_inflight_without_clearing_hold(
+        world, monkeypatch):
     stores, _ = world
     forms.hold_possible_submission(PK, {'last_button': 'Continue', 'url': URL})
     before = stores.tracking.get(PK)
-    if active == 'lease':
-        monkeypatch.setattr(ApplyQueue, 'in_flight', lambda self: [PK])
-    else:
-        monkeypatch.setattr(bsk, 'applies_running', lambda: 1)
+    # A stale exact-pk witness must still deny even when no company lease exists.
+    monkeypatch.setattr(ApplyQueue, 'in_flight', lambda self: [PK])
     endpoint = next(r.endpoint for r in server.create_app().routes
                     if getattr(r, 'path', '') == '/actions/mark-applied/{pk}')
     response = endpoint(PK, {'note': 'Synthetic portal evidence'})
@@ -440,41 +437,65 @@ async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
         queue.done(item)
 
 
-@pytest.mark.parametrize("route", ["mark", "resolve"])
-def test_global_active_apply_refuses_other_company_until_explicit_retry(
-        world, monkeypatch, route):
-    """#13 preserves the global guard; cross-company independence is #15."""
-    stores, _ = world
+@pytest.mark.parametrize("route,witness,outcome", [
+    ("mark", "unheld", "submitted"),
+    ("mark", "key", "submitted"),
+    ("resolve", "key", "submitted"),
+    ("resolve", "legacy", "submitted"),
+    ("resolve", "key", "not_submitted"),
+    ("resolve", "legacy", "not_submitted"),
+])
+def test_other_company_human_outcome_while_a_worker_is_active(
+        world, monkeypatch, route, witness, outcome):
+    """A's real queue lease and BrowserSkill session cannot block stopped B."""
+    stores, queue = world
     other = "other-example-co#synthetic-job"
-    stores.tracking.set_status(other, Status.SUBMITTING,
-                               company="other-example-co", jd_url="https://other.example.test/job/1")
-    forms.hold_possible_submission(
-        other, {"last_button": "Submit", "url": "https://other.example.test/job/1"})
-    before = stores.tracking.get(other)
-    was_held = submit_hold.is_held(other, tracking=stores.tracking)
-    assert was_held
-    active = {"count": 1}
-    monkeypatch.setattr(bsk, "applies_running", lambda: active["count"])
-    path = ("/actions/mark-applied/{pk}" if route == "mark"
-            else "/actions/resolve-uncertain/{pk:path}")
+    assert queue.put(PK, "example-co")
+    item = queue.next(only="example-co")
+    assert item and queue.in_flight() == {PK}
+    a_before = stores.tracking.get(PK)
+    stores.tracking.set_status(other, Status.TAILORED,
+                               company="other-example-co",
+                               jd_url="https://other.example.test/job/1")
+    if witness == "key":
+        stores.tracking.set_status(other, Status.NEEDS_HUMAN)
+        submit_hold.mark(other, tracking=stores.tracking)
+    elif witness == "legacy":
+        stores.tracking.set_status(other, Status.NEEDS_HUMAN,
+                                   fail_kind="uncertain", gate_reason="submit_uncertain")
+    before_b = stores.tracking.get(other)
+    monkeypatch.setattr(bsk, "applies_running", lambda: 1)
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
     endpoint = next(r.endpoint for r in server.create_app().routes
-                    if getattr(r, "path", "") == path)
+                    if getattr(r, "path", "") == endpoint_path)
     payload = ({} if route == "mark" else {
-        "portal_checked": True, "outcome": "submitted",
-        "confirmation": "Synthetic portal receipt"})
-    denied = endpoint(other, payload)
-    assert denied == {"ok": False, "error": "An application attempt is still in flight."}
-    assert stores.tracking.get(other) == before
-    assert submit_hold.is_held(other, tracking=stores.tracking)
-    active["count"] = 0  # A later explicit human retry, never an automatic replay.
-    retried = endpoint(other, payload)
-    assert retried["ok"] and stores.tracking.get(other)["status"] == "applied_manual"
-    assert not submit_hold.is_held(other, tracking=stores.tracking)
-    if route == "mark":
-        assert stores.tracking.get(other)["confirmation_id"] == (
-            "Confirmed by you (email / on-screen ACK).")
-    else:
-        assert stores.tracking.get(other)["confirmation_id"] == "Synthetic portal receipt"
+        "portal_checked": True, "outcome": outcome,
+        "confirmation": "Synthetic portal receipt",
+        "new_apply_decision": True})
+    try:
+        assert queue.in_flight() == {PK}
+        assert queue.depth()["running"] == ["example-co"]
+        result = endpoint(other, payload)
+        assert result["ok"], result
+        if route == "resolve" and outcome == "not_submitted":
+            assert result == {"ok": True, "status": "tailored", "queued": False}
+            assert stores.tracking.get(other)["status"] == "tailored"
+            assert stores.tracking.get(other)["gate_reason"] == "approval"
+        else:
+            assert stores.tracking.get(other)["status"] == "applied_manual"
+            assert stores.tracking.get(other)["confirmation_id"] == (
+                "Confirmed by you (email / on-screen ACK)." if route == "mark"
+                else "Synthetic portal receipt")
+        assert stores.tracking.get(other) != before_b
+        assert not submit_hold.is_held(other, tracking=stores.tracking)
+        assert queue.in_flight() == {PK}
+        assert queue.depth()["running"] == ["example-co"]
+        assert stores.tracking.get(PK) == a_before
+        assert not queue.pending()  # no human resolution may enqueue a job
+    finally:
+        queue.done(item)
+    assert not queue.in_flight()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -485,6 +506,7 @@ def test_resolve_uncertain_needs_key_or_legacy_and_fresh_decision(
                     if getattr(r, "path", "") == "/actions/resolve-uncertain/{pk:path}")
     payload = {"portal_checked": True, "outcome": "not_submitted",
                "new_apply_decision": True}
+    stores.tracking.set_status(PK, Status.NEEDS_HUMAN)
     unheld = endpoint(PK, payload)
     assert unheld == {"ok": False, "error": "This row is not a held uncertain submission."}
     if legacy:
@@ -503,6 +525,7 @@ def test_resolve_uncertain_needs_key_or_legacy_and_fresh_decision(
 
 def test_mark_applied_default_note_does_not_require_hold(world):
     stores, _ = world
+    stores.tracking.set_status(PK, Status.TAILORED)  # a stopped, unheld job
     endpoint = next(r.endpoint for r in server.create_app().routes
                     if getattr(r, "path", "") == "/actions/mark-applied/{pk}")
     assert not submit_hold.is_held(PK, tracking=stores.tracking)

@@ -10,46 +10,38 @@ and cannot be recalled. Every phase keeps the safety guards in code, never in pr
 Personal constraints (location, work authorization, salary, demographics) live only in the
 owner's private files and never appear in this repository.
 
-## Done
+## Done — merged on `main`
 
-| Item | Where |
+| Item | Merged PR |
 |---|---|
-| Upstream sync: `./appliedin update` (merge, abort on conflict, run tests) | PR #1 |
-| Model access through a ChatGPT subscription (`chatgpt/` models, login command, stream shim) | PR #1 |
-| Career Ops search: plain-keyword locations, wider titles and exclusions, 5-hour scan limit | PR #1 |
-| Domain tiers (AI / IT / not IT), "Best match" sort, classify endpoint | PR #1 |
-| Discovery tests no longer write to the real Redis | PR #1 |
-| orchestrator-pack adoption, personal-data rules, CI `CI / checks`, Node 24 | PR #1 |
-| BrowserSkill engine: runtime selector, JD reader, discovery, guarded apply controller (local fixture smoke passed, no real submission) | branch `feat/browser-skill-runtime` |
-| Dedicated application browser: own Chrome user-data-dir launched on demand, pinned BrowserSkill instance, `./appliedin browser-setup` | branch `feat/browser-skill-runtime` |
+| Upstream sync (`./appliedin update`), ChatGPT subscription access and model shim | [PR #1](https://github.com/chetwerikoff/AppliedIn/pull/1) |
+| Career Ops keyword/location search, domain tiers, sorting and scan cap | [PR #1](https://github.com/chetwerikoff/AppliedIn/pull/1) |
+| Discovery test isolation, orchestrator-pack policies, initial CI and Node 24 | [PR #1](https://github.com/chetwerikoff/AppliedIn/pull/1) |
+| BrowserSkill runtime dispatch for reads, discovery and guarded application; dedicated, pinned Chrome profile setup | [PR #3](https://github.com/chetwerikoff/AppliedIn/pull/3) |
+| Web review-day tests independent of time zone; obsolete `TZ=UTC` CI pin removed | [PR #12](https://github.com/chetwerikoff/AppliedIn/pull/12) |
+| Bounded scorer-format correction and strict validated score admission | [PR #14](https://github.com/chetwerikoff/AppliedIn/pull/14) |
+| BrowserSkill exact grants, idempotent setup and synthetic native-form fixture isolation | [PR #16](https://github.com/chetwerikoff/AppliedIn/pull/16) |
+| Unleased ADK/browser apply-entry and independent manual-outcome safeguards | [PR #17](https://github.com/chetwerikoff/AppliedIn/pull/17) |
 
-## Phase 0 — foundation on `main`
+## Phase 0 — foundation on `main` (complete)
 
-1. Issue #2: make the offline test suite pass without the Claude CLI and without a Redis service.
-2. Merge PR #1. Then set the card `roadmap` key to `docs/roadmap.md`.
+1. **Done:** offline test isolation and CLI-free operation from Issue #2, incorporated in [PR #1](https://github.com/chetwerikoff/AppliedIn/pull/1).
+2. **Done:** [PR #1](https://github.com/chetwerikoff/AppliedIn/pull/1) merged into `main` with the roadmap and pack target binding.
 
-## Phase 1 — browser engine lands safely
+## Phase 1 — browser engine (complete in merged code)
 
 Depends on Phase 0.
 
-1. BrowserSkill engine and dedicated browser PR (`feat/browser-skill-runtime`). Required: green CI and an independent pack review
-   focused on the apply controller (value guard on every write, duplicate re-check before
-   submit, confirmation detection, uncertain-after-submit, navigation allow-list, upload
-   receipt). No real application before this PR is merged.
-2. Review findings are fixed in that PR, never by moving a guard into a prompt.
+1. **Done:** the guarded BrowserSkill engine, dedicated browser setup and its review fixes landed in [PR #3](https://github.com/chetwerikoff/AppliedIn/pull/3), with subsequent exact-grant and offline fixture hardening in [PR #16](https://github.com/chetwerikoff/AppliedIn/pull/16).
+2. **Done:** independent outcome/ADK apply-entry protection landed in [PR #17](https://github.com/chetwerikoff/AppliedIn/pull/17). Guards remain enforced by code, not prompts. Operator-only live checks are not asserted here.
 
-## Phase 2 — pipeline reliability
+## Phase 2 — pipeline reliability (items 1 and 2 complete)
 
-May run in parallel with Phase 1 except where noted.
-
-1. Scorer output robustness: a scorer reply that is not valid `MatchScore` JSON must not turn
-   the job into a pipeline error. Use the provider's structured output or one bounded
-   re-ask; the schema check and the score threshold stay. Offline tests with a fake model.
-2. Time-zone-independent web tests: the two date-grouping tests in
-   `tests/web/preferences.test.cjs` pass in any `TZ` without the `TZ=UTC` pin; then drop the pin
-   from CI and the card.
-3. Re-run jobs that failed on the old scorer (operator operation in the primary checkout after
-   item 1 is merged and the daemon restarted; a small batch first). Not a code task.
+1. **Done:** bounded scorer-format correction with validated `MatchScore` admission, merged in [PR #14](https://github.com/chetwerikoff/AppliedIn/pull/14).
+2. **Done:** time-zone-independent web date grouping and removal of the CI `TZ=UTC` pin, merged in [PR #12](https://github.com/chetwerikoff/AppliedIn/pull/12).
+3. **Pending — operator only:** restart the daemon safely and re-run a small initial batch of jobs that failed under the old scorer, followed by the rest as appropriate. The restart/re-run has not been verified as performed.
+4. **Pending — [Issue #18](https://github.com/chetwerikoff/AppliedIn/issues/18):** normalize trusted relative discovery posting URLs and update this roadmap. A task branch or this documentation edit is not evidence of merge/completion.
+5. **Pending — [Issue #19](https://github.com/chetwerikoff/AppliedIn/issues/19), deferred T2 reader-outage work:** bounded per-pk JD-read retry/backoff/attempt and visible manual-attention state, with conditional status-safe completion against concurrent terminal/manual outcomes. This is separate from Issue #18 and does not change application-failure semantics.
 
 ## Phase 3 — first applications (owner-driven)
 

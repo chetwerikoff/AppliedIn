@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 import httpx
 
@@ -42,6 +43,82 @@ log = get_logger(__name__)
 _MAX_HTML = 200_000  # cap the page text we hand the model
 
 
+def _http_url_parts(value: object) -> SplitResult | None:
+    """Reject malformed or non-web URLs before they can enter the posting pipeline."""
+    if not isinstance(value, str) or not value:
+        return None
+    # urlsplit silently strips some controls; reject them before parsing.
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        if (parts.scheme not in ("http", "https") or not parts.netloc
+                or not parts.hostname or parts.username is not None
+                or parts.password is not None or parts.port == 0):
+            return None
+        if parts.hostname.endswith(".") or any(
+                ch in parts.hostname for ch in "%<>^`{|}"):
+            return None
+    except ValueError:  # invalid IPv6 literal or port, among other cases
+        return None
+    return parts
+
+
+def _origin_port(parts: SplitResult) -> int:
+    return parts.port or (443 if parts.scheme == "https" else 80)
+
+
+def _trusted_posting_url(
+    href: object, careers_url: str, *, fetched_url: str | None = None,
+) -> str | None:
+    """Resolve a fresh extracted href against a verified, same-tenant page.
+
+    A response redirect may change the path or upgrade HTTP to HTTPS, but a
+    foreign/downgraded response must not become an authority for relative URLs.
+    An already-absolute ATS URL remains byte-for-byte unchanged.
+    """
+    seed = _http_url_parts(careers_url)
+    if seed is None:
+        return None
+    base = careers_url
+    if fetched_url is not None:
+        final = _http_url_parts(fetched_url)
+        if final is None or final.hostname != seed.hostname:
+            return None
+        upgraded = (seed.scheme == "http" and final.scheme == "https"
+                    and _origin_port(seed) == 80 and _origin_port(final) == 443)
+        if ((seed.scheme == "https" and final.scheme != "https")
+                or (_origin_port(seed) != _origin_port(final) and not upgraded)):
+            return None
+        base = fetched_url
+
+    raw = href.strip() if isinstance(href, str) else ""
+    if not raw or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in raw):
+        return None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    if parts.scheme:
+        return raw if _http_url_parts(raw) is not None else None
+    if not parts.path and not parts.query and not parts.netloc:
+        return None
+    # Only same-origin protocol-relative links are safe. A third-party ATS must
+    # provide a genuine absolute HTTPS URL, rather than borrow the source scheme.
+    if (raw.startswith("///")
+            or (raw.startswith("//") and not parts.netloc)
+            or (parts.netloc and not raw.startswith("//"))):
+        return None
+    result = urljoin(base, raw)
+    resolved = _http_url_parts(result)
+    trusted = _http_url_parts(base)
+    if (resolved is None or trusted is None
+            or resolved.hostname != trusted.hostname
+            or resolved.scheme != trusted.scheme
+            or _origin_port(resolved) != _origin_port(trusted)):
+        return None
+    return result
+
 
 _CRAWL_CEILING_S = 600  # 10 min per company — enterprise portals (Google, Oracle)
 # otherwise grind a full-watchlist sweep for HOURS; a crawl that needs longer is
@@ -56,8 +133,6 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
     hides its listings behind a search box or a "Load more" button — so the
     company looked like it had no openings when it had thirty.
     """
-    from urllib.parse import urljoin
-
     from core.config import get_settings
 
     from .chrome_crawl import find_jobs_sync
@@ -74,10 +149,15 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
     if note:
         progress.record(note=note[:160])
         log.info("%s: %s", company, note[:200])
-    # Relative links normalised so dedup and the clickable URL agree.
-    for j in jobs:
-        j.jd_url = urljoin(url, j.jd_url)
-    return jobs
+    # find_jobs already resolves before JobRecord construction. Keep this
+    # boundary strict as well for other injected browser discovery providers.
+    safe = []
+    for job in jobs:
+        normalized = _trusted_posting_url(job.jd_url, url)
+        if normalized is not None:
+            job.jd_url = normalized
+            safe.append(job)
+    return safe
 
 
 def _render_page(url: str) -> str | None:
@@ -248,7 +328,7 @@ def _enqueue(company: CompanyConfig, jobs: list, stores: Any) -> int:
                              f"on the Pipeline board under Found."))
 
     progress.record(relevant=len(jobs))
-    if progress.cancelled():
+    if not jobs or progress.cancelled():
         return 0
     already = seen.load()
     jobs = [j for j in jobs if j.jd_url not in already]
@@ -263,7 +343,8 @@ def _enqueue(company: CompanyConfig, jobs: list, stores: Any) -> int:
                 url=job.jd_url)
             new_jobs.append(job)
             enqueued += 1
-    seen.mark(new_jobs)
+    if new_jobs:
+        seen.mark(new_jobs)
     if enqueued:
         log.info("%s: enqueued %d new job(s)", company.name, enqueued)
     return enqueued
@@ -308,6 +389,12 @@ def crawl_company(
     sitemap first. An injected extractor keeps tests offline."""
     from core import flags as _flags
 
+    if _http_url_parts(company.careers_url) is None:
+        log.warning("%s: invalid careers URL; skipping discovery", company.name)
+        return 0
+
+    fetched_url: str | None = None
+
     # This company's own preferences, before anything reads them. The feed path
     # did this and the crawl path did not, so a company with overrides was screened
     # on the global rules here and on its own rules there — and the companies most
@@ -331,6 +418,9 @@ def crawl_company(
             resp = client.get(company.careers_url, timeout=20, follow_redirects=True)
             resp.raise_for_status()
             html = resp.text
+            # This is the URL actually fetched after trusted redirects, not
+            # anything inferred by the extractor from page or model text.
+            fetched_url = str(resp.url) if getattr(resp, "url", None) else None
         except httpx.HTTPError as exc:
             # A site that REFUSES the plain fetch is the clearest case for the
             # browser, not a reason to give up. metacareers.com answers 400 and
@@ -387,18 +477,27 @@ def crawl_company(
     from core.events import emit
 
     extract = extractor or _default_extractor
-    extracted = extract(html, company.name)
-    from tools import seen
+    raw_jobs = extract(html, company.name)
+    extracted = []
+    for job in raw_jobs:
+        normalized = _trusted_posting_url(
+            job.jd_url, company.careers_url, fetched_url=fetched_url)
+        if normalized is not None:
+            # Only fresh extractor output is changed: never repair stored rows.
+            job.jd_url = normalized
+            extracted.append(job)
 
     progress.record(found=len(extracted), stage="Matching preferences")
     jobs = relevant(extracted, prefs)
     _note_screened_out(stores, company.name, extracted, jobs)
     # Nothing relevant may mean an unrendered listing; try the browser before
     # concluding the company has no matches. Browser mode already ran above.
-    if extractor is None and not extracted:
+    # A report containing only rejected hrefs is not an empty fetch: retrying
+    # it via sitemap/browser would cause work from rows already deemed unsafe.
+    if extractor is None and not raw_jobs:
         if (listed := _listed_in_sitemap(company, prefs, stores)) is not None:
             return listed
-    if extractor is None and not jobs:
+    if extractor is None and not jobs and (not raw_jobs or extracted):
         log.info("%s: nothing from the plain fetch — reading the full listing "
                  "in the browser", company.name)
         seen_by_browser = _browser_extract(company.careers_url, company.name, prefs)

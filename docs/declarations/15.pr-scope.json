@@ -4,9 +4,11 @@
   "declared_paths": [
     "docs/declarations/15.pr-scope.json",
     "src/agent/graph.py",
+    "src/server.py",
     "src/tools/browser_skill_apply.py",
     "tests/agent/test_apply_entry_lease.py",
-    "tests/tools/test_browser_skill.py"
+    "tests/tools/test_browser_skill.py",
+    "tests/tools/test_submit_hold.py"
   ],
   "denylist": [
     ".claude/**",

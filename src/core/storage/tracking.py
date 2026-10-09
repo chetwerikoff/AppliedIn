@@ -83,6 +83,57 @@ class TrackingStore(AbstractTracking):
             ExpressionAttributeValues=values,
         )
 
+    def update_if_status(self, pk: str, expected_status: Status | str,
+                         updates: dict, *, expected_reader: dict) -> bool:
+        """One conditional partial UpdateItem, matching reader presence exactly.
+
+        Only ConditionalCheckFailedException means a benign conflict. All other
+        Dynamo errors retain their original cause for the caller to diagnose.
+        """
+        fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+                 "jd_text", "jd_read_prepare_only")
+        if set(expected_reader) - set(fixed):
+            raise ValueError("Unexpected reader witness key")
+        names = {"#pk": "pk", "#s": "status"}
+        values = {":old_status": getattr(expected_status, "value", expected_status)}
+        conditions = ["attribute_exists(#pk)", "#s = :old_status"]
+        for i, field in enumerate(fixed):
+            name = f"#r{i}"
+            names[name] = field
+            if field in expected_reader:
+                value = f":r{i}"
+                values[value] = expected_reader[field]
+                conditions.append(f"{name} = {value}")
+            else:
+                conditions.append(f"attribute_not_exists({name})")
+        sets = []
+        for i, (field, value) in enumerate(updates.items()):
+            name, token = f"#u{i}", f":u{i}"
+            names[name] = field
+            values[token] = getattr(value, "value", value) if field == "status" else value
+            sets.append(f"{name} = {token}")
+        next_status = getattr(updates.get("status"), "value", updates.get("status"))
+        if next_status == "tailored" and "tailored_at" not in updates:
+            from datetime import datetime, timezone
+            names["#date"] = "tailored_at"
+            values[":date"] = datetime.now(timezone.utc).isoformat()
+            sets.append("#date = if_not_exists(#date, :date)")
+        if not sets:
+            raise ValueError("Conditional patch must not be empty")
+        try:
+            self._table.update_item(
+                Key={"pk": pk},
+                UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
     def application_notes(self) -> dict:
         out, kwargs = {}, {}
         while True:

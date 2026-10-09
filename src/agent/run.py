@@ -153,8 +153,8 @@ def _github_context() -> str:
 _LOCK_TTL_SECONDS = 1800  # longer than any real score+tailor; frees a killed run
 
 
-def _claim(pk: str, stores: Any) -> bool:
-    """Claim exclusive ownership of this job. False = someone else has it."""
+def _claim(pk: str, stores: Any) -> bool | None:
+    """True = acquired, False = held, None = unsafe claim-store outage."""
     client = getattr(stores.tracking, "r", None)
     if client is None:  # cloud mode / a tracking backend without Redis
         return True
@@ -1407,10 +1407,15 @@ async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> 
 
 def _active_apply_lease(pk: str, stores: Any) -> bool | None:
     """Inspect the existing queue lease; unknown is never proof of inactivity."""
-    client = getattr(stores.tracking, "r", None)
-    if client is None:
-        return None
     try:
+        # Test/cloud callers may already hold an existing queue inspector.
+        # Do not fabricate absence when the backend offers no such surface.
+        inspector = getattr(stores, "queue", None)
+        if callable(getattr(inspector, "in_flight", None)):
+            return pk in inspector.in_flight()
+        client = getattr(stores.tracking, "r", None)
+        if client is None:
+            return None
         from core.apply_queue import ApplyQueue
         return pk in ApplyQueue(client).in_flight()
     except Exception:

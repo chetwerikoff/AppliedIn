@@ -48,7 +48,7 @@ def _http_url_parts(value: object) -> SplitResult | None:
     if not isinstance(value, str) or not value:
         return None
     # urlsplit silently strips some controls; reject them before parsing.
-    if any(ord(ch) <= 32 or ord(ch) == 127 or ch == "\\" for ch in value):
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in value):
         return None
     try:
         parts = urlsplit(value)
@@ -93,7 +93,7 @@ def _trusted_posting_url(
         base = fetched_url
 
     raw = href.strip() if isinstance(href, str) else ""
-    if not raw or any(ord(ch) <= 32 or ord(ch) == 127 or ch == "\\" for ch in raw):
+    if not raw or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\" for ch in raw):
         return None
     try:
         parts = urlsplit(raw)
@@ -105,7 +105,9 @@ def _trusted_posting_url(
         return None
     # Only same-origin protocol-relative links are safe. A third-party ATS must
     # provide a genuine absolute HTTPS URL, rather than borrow the source scheme.
-    if raw.startswith("///") or (parts.netloc and not raw.startswith("//")):
+    if (raw.startswith("///")
+            or (raw.startswith("//") and not parts.netloc)
+            or (parts.netloc and not raw.startswith("//"))):
         return None
     result = urljoin(base, raw)
     resolved = _http_url_parts(result)

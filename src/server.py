@@ -1394,10 +1394,12 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "refused",
                     "note": "Only inactive, closed, unsent jobs can be reopened; "
                             "do not re-open a live or submitted application."}
-        if status == "error" and (
-                int(row.get("jd_read_attempts") or 0) >= 3
-                or row.get("fail_kind") in ("jd_reader_exhausted",
-                                             "jd_tracking_storage_error")):
+        # Skip changes status but intentionally preserves exhausted reader
+        # evidence. Reopen must not produce an ineligible FOUND row from it.
+        if (int(row.get("jd_read_attempts") or 0) >= 3
+                or row.get("fail_kind") in (
+                    "jd_reader_exhausted", "jd_tracking_storage_error",
+                    "jd_retry_session_error")):
             return {"ok": False, "error": "jd_reader_attention",
                     "note": "Reader attention requires Retry, not Reopen."}
         try:

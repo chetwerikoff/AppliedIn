@@ -351,10 +351,11 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
             try:
                 current = stores.tracking.get(pk) or {}
                 if current.get("apply_requested_at"):
-                    if admitted.get("jd_read_prepare_only"):
-                        return _enqueue_apply(pk, stores, priority=True,
-                                              require_request=True)
-                    return _enqueue_apply(pk, stores, priority=True)
+                    # Request authority is checked AGAIN inside the queue entry.
+                    # The first GET can race a cancellation in any prepare-only
+                    # mode, not just a JD-attention recovery.
+                    return _enqueue_apply(pk, stores, priority=True,
+                                          require_request=True)
             except Exception as exc:
                 return _reader_storage_error(pk, stores, admitted, exc)
         return result
@@ -759,15 +760,53 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     # A role the owner pressed Apply on already has its go-ahead. Marking it
     # "approval" is what put it back in front of them as a question.
     requested = bool(row.get("apply_requested_at"))
-    fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
-    stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
-                               **({"gate_pending": {}} if requested else {}),
-                               fail_reason="", fail_kind="")
-    ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
+    try:
+        fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
+        if not fresh:
+            # put() also returns False for an independent durable hold; treating
+            # every False as a duplicate used to overwrite APPLIED_MANUAL with
+            # TAILORED after a concurrent human outcome.
+            latest = stores.tracking.get(pk) or {}
+            if submit_hold.blocked(pk, latest, tracking=stores.tracking):
+                return {"result": "failed", "pk": pk, "reason": "uncertain",
+                        "detail": submit_hold.REASON}
+            if latest.get("confirmation_id"):
+                return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
+            if latest.get("status") in ("applied", "applied_manual"):
+                return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+            if (require_request and
+                    (not latest.get("apply_requested_at") or
+                     latest.get("status") not in ("tailoring", "tailored"))):
+                return {"result": "refused", "pk": pk,
+                        "reason": "apply_request_or_preparation_not_current"}
+            if any(item.get("pk") == pk for item in q.pending()):
+                return {"result": "already_queued", "pk": pk, "queued": False}
+            return {"result": "refused", "pk": pk, "reason": "apply_queue_put_refused"}
+
+        # A fresh queue item does not authorize a stale status write. Keep the
+        # row-local reader generation and exact admitted status as the atomic
+        # precondition; independent hold and confirmation are checked afresh.
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        if require_request and not (stores.tracking.get(pk) or {}).get("apply_requested_at"):
+            return {"result": "refused", "pk": pk,
+                    "reason": "apply_request_or_preparation_not_current"}
+        committed, _ = _reader_patch(pk, row, stores, {
+            "status": Status.TAILORED, "gate_reason": "" if requested else "approval",
+            **({"gate_pending": {}} if requested else {}),
+            "fail_reason": "", "fail_kind": "",
+        })
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
+    except Exception:
+        log.exception("apply queue/tracking operation failed for %s", pk)
+        return {"result": "error", "pk": pk, "reason": "apply_queue_tracking_error"}
     log.info("queued %s for apply%s (%s in that company's queue)",
              pk, " — NEXT, the owner just answered its question" if priority else "",
              ahead)
-    return {"result": "queued", "pk": pk, "queued": fresh, "company_depth": ahead}
+    return {"result": "queued", "pk": pk, "queued": True, "company_depth": ahead}
 
 
 # A quoted span that could be a form field label. The lookbehind/lookahead keep

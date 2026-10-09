@@ -1011,6 +1011,7 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
     # required values, exact receipts, native receiver and attached PDF.
     expected_filled = {"#name": "Test User", "#additional": "Synthetic answer"}
     forms.check_form(current, expected_filled, True, document_name)
+    observed.clear()  # Precondition check is separate from apply() JIT ordering.
     for field in ("Name", "Additional question"):
         approval = authority.row["human_approved_answers"][field]
         assert approval["url"] == fixture.URL

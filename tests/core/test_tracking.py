@@ -152,3 +152,55 @@ def test_redis_atomic_reader_witness_preserves_unrelated_fields_and_indexes():
     assert tracking.get(pk) == newer
     assert not tracking.update_if_status("example-co#missing", Status.FOUND,
                                          {"status": "failed"}, expected_reader={})
+
+
+def test_redis_watch_collision_retries_without_rebasing_reader_witness(monkeypatch):
+    import json
+    import fakeredis
+    from core.storage.local import RedisTracking
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    tracking = RedisTracking(client)
+    pk = "example-co#job-1"
+    tracking.set_status(pk, Status.FOUND, jd_text="", jd_read_revision=4,
+                        company="example-co", note="original")
+    original_pipeline = client.pipeline
+    injected = [False]
+
+    def concurrent_pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        original_execute = pipe.execute
+
+        def execute(*a, **kw):
+            if not injected[0]:
+                injected[0] = True
+                current = tracking.get(pk)
+                current["note"] = "concurrent unrelated edit"
+                # Simulate an unconditional legacy writer during WATCH.
+                client.set(f"app:{pk}", json.dumps(current))
+            return original_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(client, "pipeline", concurrent_pipeline)
+    assert tracking.update_if_status(
+        pk, Status.FOUND,
+        {"status": Status.TAILORING, "jd_read_revision": 5},
+        expected_reader={"jd_text": "", "jd_read_revision": 4})
+    row = tracking.get(pk)
+    assert injected[0] is True
+    assert row["status"] == "tailoring"
+    assert row["jd_read_revision"] == 5
+    assert row["note"] == "concurrent unrelated edit"
+    assert tracking.status_counts()["tailoring"] == 1
+
+    # Presence of false/zero/null is still not the same as absence.
+    tracking.set_status(pk, Status.TAILORING, jd_read_attempts=0,
+                        jd_read_retry_at=None, jd_read_prepare_only=False)
+    last = tracking.get(pk)
+    assert not tracking.update_if_status(pk, Status.TAILORING,
+                                         {"status": Status.FAILED},
+                                         expected_reader={"jd_text": "",
+                                                          "jd_read_revision": 5})
+    assert tracking.get(pk) == last

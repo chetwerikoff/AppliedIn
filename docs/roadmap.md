@@ -41,7 +41,7 @@ Depends on Phase 0.
 2. **Done:** time-zone-independent web date grouping and removal of the CI `TZ=UTC` pin, merged in [PR #12](https://github.com/chetwerikoff/AppliedIn/pull/12).
 3. **Pending — operator only:** restart the daemon safely and re-run a small initial batch of jobs that failed under the old scorer, followed by the rest as appropriate. The restart/re-run has not been verified as performed.
 4. **Pending — [Issue #18](https://github.com/chetwerikoff/AppliedIn/issues/18):** normalize trusted relative discovery posting URLs and update this roadmap. A task branch or this documentation edit is not evidence of merge/completion.
-5. **Pending — deferred T2 reader-outage work; Issue reference PENDING (not yet published):** bounded per-pk JD-read retry/backoff/attempt and visible manual-attention state, with conditional status-safe completion against concurrent terminal/manual outcomes. This is separate from Issue #18 and does not change application-failure semantics.
+5. **Pending — [Issue #19](https://github.com/chetwerikoff/AppliedIn/issues/19), deferred T2 reader-outage work:** bounded per-pk JD-read retry/backoff/attempt and visible manual-attention state, with conditional status-safe completion against concurrent terminal/manual outcomes. This is separate from Issue #18 and does not change application-failure semantics.
 
 ## Phase 3 — first applications (owner-driven)
 

@@ -184,7 +184,40 @@ def can_start(settings=None) -> tuple[bool, str]:
     except (OSError, ValueError, RuntimeError) as exc:
         return False, 'BrowserSkill unavailable: ' + str(exc)
 
+def _fixture_read_only_browser(settings=None) -> tuple[bool, str]:
+    """At the real Session thread hop, NEVER recover a missing daemon/Chrome."""
+    from tools.browser_skill import Unavailable, _sync
+
+    try:
+        cfg = _config(settings)  # Only the existing Session-owned pinned selection.
+        if cfg['engine'] != 'browser_skill' or not cfg['browser']:
+            return False, ('BrowserSkill unavailable: select the pinned BrowserSkill '
+                           'instance using browser-setup; fixture cannot start Chrome.')
+        _sync('status', timeout=7)  # Observe; never call ensure_daemon().
+        rows = _browsers()
+        matches = [r for r in rows if r.get('instance_id') == cfg['browser']
+                   and not r.get('unresponsive') and not r.get('version_skew')]
+        if len(matches) != 1:
+            return False, ('BrowserSkill unavailable: pinned extension is absent, '
+                           'disconnected or ambiguous; reconnect it and rerun fixture.')
+        _owned_profile_pid(cfg)  # One independently observed canonical Chrome argv.
+        if _config(settings) != cfg:
+            return False, ('BrowserSkill unavailable: pinned browser configuration changed; '
+                           'inspect the selection and rerun fixture.')
+        return True, ''
+    except (Unavailable, OSError, ValueError, RuntimeError) as exc:
+        return False, ('BrowserSkill unavailable: read-only fixture preflight failed ('
+                       f'{type(exc).__name__}); check bsk doctor, verify one owned '
+                       'Chrome and rerun fixture.')
+
+
 def ensure_browser(settings=None) -> tuple[bool, str]:
+    # A private per-invocation ContextVar arrives here through Session.__aenter__
+    # -> asyncio.to_thread(ensure_browser), before session start. Without exact
+    # daemon origin/authority, keep the ordinary production recovery unchanged.
+    from tools.browser_skill_fixture import _read_only_entry
+    if _read_only_entry():
+        return _fixture_read_only_browser(settings)
     from tools.browser_skill import ensure_daemon
     try:
         cfg = _config(settings)
@@ -247,14 +280,28 @@ def connection_status(settings=None) -> dict:
     except (OSError, ValueError, RuntimeError) as exc:
         return {'state': 'unavailable', 'detail': str(exc)}
 
-def _save_instance(instance: str, directory: str, settings=None) -> None:
+def _setup_selection_unchanged(initial: dict, executable: str, settings=None) -> None:
+    """Interactive approval cannot overwrite a concurrent change to the pinned selection."""
+    current = _config(settings)
+    for key in ('browser', 'engine', 'user_data_dir', 'chrome_path'):
+        if current[key] != initial[key]:
+            raise ValueError(
+                f'{key} changed during browser-setup; keep the new selection and explicitly rerun setup.')
+    if _chrome(current) != executable:
+        raise ValueError('Chrome executable changed during browser-setup; verify it and rerun setup.')
+
+
+def _save_instance(instance: str, directory: str, settings=None, *,
+                   initial: dict | None = None, executable: str = '') -> None:
     from core.config import get_settings
     from tools.browser_runtime import _config_path
     settings = settings or get_settings()
     path = _config_path(settings)
-    # Re-read immediately before publication: a long interactive setup must not
-    # overwrite unrelated edits made while the human was installing the extension.
-    if _config(settings)['user_data_dir'] != directory:
+    # Re-read immediately before saving, including the pin and engine even when
+    # the directory did not change while the human inspected the extension.
+    if initial is not None:
+        _setup_selection_unchanged(initial, executable, settings)
+    elif _config(settings)['user_data_dir'] != directory:
         raise ValueError('user_data_dir changed during setup; instance was not saved')
     values = yaml.safe_load(path.read_text()) if path.exists() else {}
     values = values or {}
@@ -271,50 +318,108 @@ def _save_instance(instance: str, directory: str, settings=None) -> None:
 
 
 def browser_setup(settings=None, *, timeout_s: int = 900) -> dict:
-    """The owner installs/signs in and confirms the new extension instance."""
+    """Verify an existing ID or explicitly pin the unique owned Chrome extension."""
     from tools.browser_skill import ensure_daemon
     cfg = _config(settings)
+    # A retained pin does not authorize an implicit backend switch. Cold setup
+    # with no saved ID still allows the existing explicit human-confirmed
+    # transition to BrowserSkill when _save_instance() runs.
+    if cfg['browser'] and cfg['engine'] != 'browser_skill':
+        return {'status': 'blocked', 'saved': False,
+                'error': ('The saved browser ID is not the selected apply engine '
+                          '(engine is not browser_skill). Explicitly select '
+                          'engine: browser_skill in browser.local.yaml and rerun '
+                          'browser-setup; no profile or pin was changed.')}
+    try:
+        executable = _chrome(cfg)
+    except (OSError, ValueError) as exc:
+        return {'status': 'blocked', 'error': f'{exc}; configure Chrome and rerun setup.'}
     ready, problem = ensure_daemon()
     if not ready:
-        return {'status': 'blocked', 'error': problem}
-    before = _ids(_browsers())
+        return {'status': 'blocked', 'error': problem or 'Inspect bsk doctor and rerun setup.'}
+
+    def connected_id(rows, instance):
+        return (sum(1 for r in rows if r.get('instance_id') == instance
+                    and not r.get('unresponsive') and not r.get('version_skew')) == 1)
+
+    # A pre-existing connected ID is not "new"; waiting for _ids(rows)-before
+    # used to time out on valid reruns. A saved pin additionally proves ownership.
+    rows = _browsers()
+    if cfg['browser'] and connected_id(rows, cfg['browser']):
+        try:
+            _owned_profile_pid(cfg)
+            _setup_selection_unchanged(cfg, executable, settings)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {'status': 'blocked', 'error': f'{exc}; inspect the owned Chrome and rerun setup.'}
+        return {'status': 'ready', 'browser': cfg['browser'],
+                'user_data_dir': cfg['user_data_dir'], 'saved': False}
+
     with _launch_lock(cfg['user_data_dir']):
         launched = None
-        if not profile_pids(cfg['user_data_dir']):
-            launched = _launch(cfg, WEB_STORE)
-        else:
-            _owned_profile_pid(cfg)
+        try:
+            if not profile_pids(cfg['user_data_dir']):
+                launched = _launch(cfg, WEB_STORE)
+            else:
+                _owned_profile_pid(cfg)
+        except (OSError, ValueError) as exc:
+            return {'status': 'blocked', 'error': f'{exc}; verify the dedicated profile and rerun setup.'}
         print('Dedicated Chrome profile: ' + cfg['user_data_dir'], flush=True)
-        print('Install BrowserSkill manually in the NEW profile; enable Allow access to file URLs. '
-              'Sign in to employer portals yourself. No installation/login is automated.',
-              flush=True)
-        print('Waiting for a NEW instance ID. Verify it in the extension popup.', flush=True)
+        print('Verify BrowserSkill in this dedicated profile yourself; enable file-URL access. '
+              'No extension installation, sign-in or consent is automated.', flush=True)
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rows = _browsers()
-            new = _ids(rows) - before
-            if len(new) > 1:
-                return {'status': 'blocked',
-                        'error': 'Multiple new instances; verify the dedicated profile.'}
-            if new:
-                instance = next(iter(new))
-                if not _connected(rows, instance):
-                    time.sleep(1)
-                    continue
-                print('New instance ID: ' + instance, flush=True)
-                answer = input('Confirm the dedicated profile ID [y/N]: ').strip().lower()
-                if answer != 'y':
-                    return {'status': 'not confirmed', 'saved': False}
-                if not _connected(_browsers(), instance):
-                    return {'status': 'blocked',
-                            'error': 'Confirmed instance disconnected before saving.'}
-                try:
-                    _owned_profile_pid(cfg, launched)
-                except ValueError as exc:
-                    return {'status': 'blocked', 'error': str(exc)}
-                _save_instance(instance, cfg['user_data_dir'], settings)
-                return {'status': 'configured', 'browser': instance,
-                        'user_data_dir': cfg['user_data_dir']}
+            ids = _ids(rows)
+            if cfg['browser']:
+                if connected_id(rows, cfg['browser']):
+                    try:
+                        _owned_profile_pid(cfg, launched)
+                        _setup_selection_unchanged(cfg, executable, settings)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        return {'status': 'blocked',
+                                'error': f'{exc}; verify the pinned profile and rerun setup.'}
+                    return {'status': 'ready', 'browser': cfg['browser'],
+                            'user_data_dir': cfg['user_data_dir'], 'saved': False}
+                if ids - {cfg['browser']}:
+                    return {'status': 'blocked', 'error': (
+                        'Another BrowserSkill instance is visible but not the saved pin. '
+                        'Reconnect the pinned extension or correct configuration explicitly; rerun setup.')}
+            else:
+                if len(ids) > 1:
+                    return {'status': 'blocked', 'error': (
+                        'Multiple BrowserSkill instances are visible; inspect the dedicated '
+                        'Chrome extension and rerun setup without ambiguous candidates.')}
+                if len(ids) == 1:
+                    instance = next(iter(ids))
+                    if not connected_id(rows, instance):
+                        time.sleep(1)
+                        continue
+                    try:
+                        _owned_profile_pid(cfg, launched)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        return {'status': 'blocked',
+                                'error': f'{exc}; verify one owned Chrome and rerun setup.'}
+                    print('Candidate extension ID: ' + instance, flush=True)
+                    answer = input(
+                        'Verify this ID in the dedicated Chrome extension popup and consent to pin [y/N]: '
+                    ).strip().lower()
+                    if answer != 'y':
+                        return {'status': 'not confirmed', 'saved': False,
+                                'hint': 'Verify the dedicated extension and explicitly rerun setup.'}
+                    if not connected_id(_browsers(), instance):
+                        return {'status': 'blocked', 'error': (
+                            'The candidate extension disconnected or became ambiguous; '
+                            'reconnect it and rerun setup.')}
+                    try:
+                        _owned_profile_pid(cfg, launched)
+                        _save_instance(instance, cfg['user_data_dir'], settings,
+                                       initial=cfg, executable=executable)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        return {'status': 'blocked', 'error': (
+                            f'{exc}; inspect the saved selection and explicitly rerun setup.')}
+                    return {'status': 'configured', 'browser': instance,
+                            'user_data_dir': cfg['user_data_dir']}
             time.sleep(1)
     return {'status': 'waiting timed out', 'saved': False,
-            'hint': 'Browser remains open. Complete installation and reconnect for setup.'}
+            'hint': ('No unique responsive pinned extension was proven within the deadline. '
+                     'Inspect/reconnect BrowserSkill in the owned profile and rerun setup.')}

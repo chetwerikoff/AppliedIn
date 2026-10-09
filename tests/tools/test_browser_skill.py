@@ -1454,3 +1454,50 @@ console.log(JSON.stringify(eval(process.argv[1])));
     assert forms.native_submit(control)
     with pytest.raises(forms.Gate, match='form destination'):
         forms.check_form_destination(observed, control, observed['url'])
+
+
+@pytest.mark.parametrize('drift', ['url', 'question'])
+@pytest.mark.parametrize('history_recheck', [False, True])
+async def test_exact_grant_drifts_independently_without_writing(
+        monkeypatch, drift, history_recheck):
+    """Changing only observed URL or only observed question revokes exact authority."""
+    pk, value = 'example-co#synthetic', 'Test User'
+    old_url = 'https://employer.test/job/1'
+    observed = page(target(label='Name', question=''))
+    row = {'pk': pk, 'status': 'submitting',
+           'human_approved_answers': {'Name': grant('Name', value, url=old_url)}}
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    receipt = {'fact': 'Name', 'approved_value': value, 'selector': '#field',
+               'label': 'Name', 'question': '', 'url': old_url}
+    if drift == 'url':
+        observed['url'] = 'https://employer.test/job/2'
+    else:
+        observed['controls'][0]['question'] = 'Middle name'
+    session = SimpleNamespace(call=AsyncMock())
+    action = {'action': 'fill', 'selector': '#field', 'fact': 'Name'}
+    if history_recheck:
+        with pytest.raises(forms.Gate):
+            forms.check_approvals(pk, [receipt], observed)
+    else:
+        with pytest.raises(forms.Gate, match='human-approved'):
+            await forms.execute(
+                session, observed, action, facts={'Name': value}, filled={},
+                resume_path='', company='example-co', jd_text='', resume_tex='',
+                github='', pk=pk)
+    session.call.assert_not_awaited()
+
+
+async def test_exact_grant_unmodified_identity_and_receipt_still_write(
+        monkeypatch):
+    pk, value = 'example-co#synthetic', 'Test User'
+    observed = page(target(label='Name', question=''))
+    row = {'pk': pk, 'status': 'submitting',
+           'human_approved_answers': {'Name': grant('Name', value)}}
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    session = SimpleNamespace(call=AsyncMock())
+    receipt = await forms.execute(
+        session, observed, {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+        facts={'Name': value}, filled={}, resume_path='', company='example-co',
+        jd_text='', resume_tex='', github='', pk=pk)
+    forms.check_approvals(pk, [receipt], observed)
+    session.call.assert_awaited_once_with('fill', '#field', '--value', value)

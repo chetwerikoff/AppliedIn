@@ -1007,3 +1007,79 @@ def test_retry_reset_failure_conflicts_with_new_manual_terminal(monkeypatch):
     assert tracking.get(pk) == snapshots[0]
     assert submit_hold.is_held(pk, tracking=tracking)
     assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_retry_session_setup_failure_settles_after_successful_jd_read(monkeypatch):
+    """Session creation failures must not strand a freshly recovered reader."""
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_read_attempts=3,
+                        jd_read_revision=6, fail_kind="jd_reader_exhausted",
+                        apply_requested_at="")
+    stores = SimpleNamespace(tracking=tracking)
+    events = []
+    monkeypatch.setattr("core.events.emit",
+                        lambda kind, **kw: events.append((kind, kw)))
+    monkeypatch.setattr(run, "_session_state",
+                        lambda row, text: {"base_latex": "Test User synthetic seed"})
+
+    async def reset_ok(target):
+        return None
+
+    async def recovered(row, **kw):
+        return GOOD
+
+    class BrokenSession:
+        async def get_session(self, **kw):
+            raise RuntimeError("synthetic ADK session backend unavailable")
+
+    monkeypatch.setattr(run, "_reset_session", reset_ok)
+    monkeypatch.setattr(run, "_jd_text", recovered)
+    monkeypatch.setattr(run, "_session_service", lambda: BrokenSession())
+    result = run.retry_job(pk, stores)
+    row = tracking.get(pk)
+    assert result["result"] == "error"
+    assert result["reason"] == "jd_retry_session_error"
+    assert result["attention_persisted"] is True
+    assert row["status"] == "error"
+    assert row["jd_read_revision"] == 9  # reset, successful JD, session failure
+    assert row["jd_read_attempts"] == 0
+    assert row["jd_read_prepare_only"] is True
+    assert row["jd_text"] == GOOD
+    assert "Retry" in row["error"]
+    assert [name for name, _ in events if name == "error"] == ["error"]
+    assert ApplyQueue(tracking.r).pending() == []
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_retry_session_attention_storage_fault_is_bounded(monkeypatch):
+    """An unavailable attention write is diagnosed without replaying the CAS."""
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_read_attempts=3,
+                        jd_read_revision=6, fail_kind="jd_reader_exhausted")
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: None)
+    attempts = [0]
+    original = tracking.update_if_status
+
+    def failure_once(pk_value, status, patch, *, expected_reader):
+        if patch.get("fail_kind") == "jd_retry_session_error":
+            attempts[0] += 1
+            raise RuntimeError("synthetic persistence unavailable")
+        return original(pk_value, status, patch,
+                        expected_reader=expected_reader)
+
+    async def reset_failed(target):
+        raise RuntimeError("synthetic session unavailable")
+
+    monkeypatch.setattr(run, "_reset_session", reset_failed)
+    monkeypatch.setattr(tracking, "update_if_status", failure_once)
+    result = run.retry_job(pk, stores)
+    assert attempts == [1]
+    assert result["result"] == "error"
+    assert result["reason"] == "jd_tracking_storage_error"
+    assert result["attention_persisted"] is False
+    assert "could not be persisted" in result["detail"]
+    assert tracking.get(pk)["status"] == "tailoring"
+    assert not tracking.r.exists(f"lock:job:{pk}")

@@ -643,3 +643,120 @@ def test_process_backlog_contains_reader_storage_fault_after_manual_decision(
     assert tracking.get(pk) == terminal[0]
     assert submit_hold.is_held(pk, tracking=tracking)
     assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_requested_queue_put_hold_race_preserves_manual_terminal(monkeypatch):
+    """A refused queue insertion cannot turn a newer APPLIED_MANUAL into TAILORED."""
+    from core.apply_queue import ApplyQueue
+    from tools import submit_hold
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.TAILORING, jd_read_revision=2,
+                        apply_requested_at="2030-01-01T00:00:00+00:00",
+                        resume_s3_key="resumes/synthetic-new.pdf")
+    stores = SimpleNamespace(tracking=tracking)
+    queue = ApplyQueue(tracking.r)
+    pending_before, leases_before = queue.pending(), queue.in_flight()
+    snapshots = []
+    original_put = ApplyQueue.put
+
+    def manual_before_put(self, *args, **kwargs):
+        tracking.set_status(pk, Status.APPLIED_MANUAL,
+                            confirmation_id="synthetic-confirmed",
+                            applied_at="2030-01-02T00:00:00+00:00")
+        submit_hold.mark(pk, tracking=tracking)
+        snapshots.append(tracking.get(pk))
+        # The real put checks the durable hold and refuses without enqueuing.
+        return original_put(self, *args, **kwargs)
+
+    monkeypatch.setattr(ApplyQueue, "put", manual_before_put)
+    result = run._enqueue_apply(pk, stores, require_request=True)
+    assert result["result"] == "failed" and result["reason"] == "uncertain"
+    assert tracking.get(pk) == snapshots[0]
+    assert submit_hold.is_held(pk, tracking=tracking)
+    assert tracking.status_counts().get("applied_manual") == 1
+    assert tracking.status_counts().get("tailored", 0) == 0
+    assert queue.pending() == pending_before
+    assert queue.in_flight() == leases_before
+
+
+def test_requested_queue_duplicate_is_not_a_protection_refusal(monkeypatch):
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.TAILORING, jd_read_revision=3,
+                        apply_requested_at="2030-01-01T00:00:00+00:00")
+    stores = SimpleNamespace(tracking=tracking)
+    queue = ApplyQueue(tracking.r)
+    assert queue.put(pk, "example-co", requested=True)
+    original = tracking.get(pk)
+    pending = queue.pending()
+
+    result = run._enqueue_apply(pk, stores, require_request=True)
+    assert result["result"] == "already_queued" and result["queued"] is False
+    assert tracking.get(pk) == original
+    assert queue.pending() == pending
+
+
+def test_requested_queue_post_put_terminal_wins_atomic_status_cas(monkeypatch):
+    """Even a successful new insertion cannot authorize a stale row write."""
+    from core.apply_queue import ApplyQueue
+    from tools import submit_hold
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.TAILORING,
+                        apply_requested_at="2030-01-01T00:00:00+00:00")
+    stores = SimpleNamespace(tracking=tracking)
+    snapshots = []
+    original_update = tracking.update_if_status
+
+    def manual_before_status_cas(target, expected, patch, *, expected_reader):
+        tracking.set_status(pk, Status.APPLIED_MANUAL, confirmation_id="synthetic")
+        submit_hold.mark(pk, tracking=tracking)
+        snapshots.append(tracking.get(pk))
+        return original_update(target, expected, patch, expected_reader=expected_reader)
+
+    monkeypatch.setattr(tracking, "update_if_status", manual_before_status_cas)
+    outcome = run._enqueue_apply(pk, stores, require_request=True)
+    assert outcome["result"] == "conflict"
+    assert tracking.get(pk) == snapshots[0]
+    assert submit_hold.is_held(pk, tracking=tracking)
+    # The pending item is subject to the existing dispatch/final-submit guards.
+    assert [x["pk"] for x in ApplyQueue(tracking.r).pending()] == [pk]
+
+
+@pytest.mark.parametrize("discovery_source", ["", "career_ops"])
+def test_prepared_authority_revoked_between_wrapper_and_enqueue_get(
+        monkeypatch, discovery_source):
+    """Both ordinary and career_ops prepared results require a CURRENT request."""
+    from core.apply_queue import ApplyQueue
+
+    _quiet(monkeypatch)
+    tracking, pk = _synthetic_tracking()
+    request = "2030-01-01T00:00:00+00:00"
+    tracking.set_status(pk, Status.FOUND, discovery_source=discovery_source,
+                        apply_requested_at=request,
+                        resume_s3_key="resumes/synthetic-new.pdf")
+    stores = SimpleNamespace(tracking=tracking)
+    calls = []
+
+    async def prepared(*args, **kwargs):
+        return {"result": "prepared", "pk": pk}
+
+    original_enqueue = run._enqueue_apply
+
+    def revoke_before_second_read(target, store, **kwargs):
+        calls.append(kwargs)
+        tracking.set_status(target, Status.TAILORING, apply_requested_at="")
+        return original_enqueue(target, store, **kwargs)
+
+    monkeypatch.setattr(run, "_run_job_async", prepared)
+    monkeypatch.setattr(run, "_enqueue_apply", revoke_before_second_read)
+    result = run.run_job(pk, stores, prepare_only=True)
+    assert len(calls) == 1
+    assert result["result"] == "refused"
+    assert result["reason"] == "apply_request_or_preparation_not_current"
+    assert tracking.get(pk)["apply_requested_at"] == ""
+    assert tracking.get(pk)["status"] == "tailoring"
+    assert ApplyQueue(tracking.r).pending() == []
+    assert not tracking.r.exists(f"lock:job:{pk}")

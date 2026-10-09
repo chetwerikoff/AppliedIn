@@ -1635,11 +1635,17 @@ def create_app() -> FastAPI:
         return {"ok": True, "status": "resuming"}
 
     def stopped_application_attempt(pk: str, tracking) -> str:
-        """The lease protects writes; a live browser is a second refusal signal."""
+        """Refuse the target attempt, not an unrelated company's browser session.
+
+        The caller already owns this job's company lease. An orphaned
+        SUBMITTING row is still ambiguous even without a queue pk witness.
+        """
         from core.apply_queue import ApplyQueue
-        from tools.browser_skill import applies_running
         try:
-            if pk in ApplyQueue(tracking.r).in_flight() or applies_running():
+            row = tracking.get(pk) or {}
+            if row.get("status") == Status.SUBMITTING.value:
+                return "Cannot prove that the attempt has stopped."
+            if pk in ApplyQueue(tracking.r).in_flight():
                 return "An application attempt is still in flight."
         except Exception:
             return "Cannot prove that the attempt has stopped."

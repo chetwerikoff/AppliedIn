@@ -26,6 +26,14 @@ class AbstractTracking(ABC):
     @abstractmethod
     def set_status(self, pk: str, status: Status, **attrs: object) -> None: ...
 
+    @abstractmethod
+    def update_if_status(self, pk: str, expected_status: Status | str,
+                         updates: dict, *, expected_reader: dict) -> bool:
+        """Atomically patch an existing row whose status and exact reader
+        witness match. An absent witness key requires attribute absence.
+        Conditional mismatch returns False; storage exceptions propagate.
+        """
+
     def application_notes(self) -> dict:
         raise NotImplementedError
 

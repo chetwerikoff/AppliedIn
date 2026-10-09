@@ -1386,38 +1386,138 @@ async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> 
     return await _drive_async(runner, pk, resp, stores)
 
 
+def _active_apply_lease(pk: str, stores: Any) -> bool | None:
+    """Inspect the existing queue lease; unknown is never proof of inactivity."""
+    client = getattr(stores.tracking, "r", None)
+    if client is None:
+        return None
+    try:
+        from core.apply_queue import ApplyQueue
+        return pk in ApplyQueue(client).in_flight()
+    except Exception:
+        log.exception("apply-queue lease inspection unavailable for %s", pk)
+        return None
+
+
 def retry_job(pk: str, stores: Any = None) -> dict:
-    """Re-run a job from scratch after a failed/errored attempt. Drops the old
-    (completed) ADK session and clears the terminal state so the pipeline runs
-    clean — picking up any facts added to the KB since the last try."""
+    """Recover a closed unsent job under ONE claim and admitted TAILORING row.
+
+    JD attention goes directly ERROR -> TAILORING with durable review-only
+    intent. No intermediate FOUND window can race the session deletion.
+    """
     stores = stores or make_stores()
-    row = stores.tracking.get(pk)
+    try:
+        row = stores.tracking.get(pk)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
-    # Never let a retry wipe an APPLIED row back to found — that path re-runs the
-    # whole pipeline including the submit, i.e. a duplicate application.
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):
-        return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": "possible submission; check the employer portal before retrying"}
-    if row.get("status") in ("applied", "applied_manual"):
-        log.warning("retry refused for pk=%s: already %s", pk, row.get("status"))
-        from core.events import emit
-        emit("response", pk=pk, agent="applier", url=row.get("jd_url"),
-             detail=f"🛑 Retry refused — this job is already '{row.get('status')}'.")
+    status = row.get("status")
+    if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
-    if row.get('status') == 'submitting' or _claimed(pk, stores):
-        # Wiping a row to `found` under a run that still owns it leaves the row
-        # unrunnable once that run dies: found, claimed, and skipped by recovery.
-        from core.events import emit
-        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
+    if status not in ("skipped", "failed", "error", "job_gone", "capped"):
+        return {"result": "already_done", "pk": pk, "status": status}
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        if _claimed(pk, stores):
+            return {"result": "already_running", "pk": pk}
+        lease = _active_apply_lease(pk, stores)
+        if lease is None:
+            return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown",
+                    "detail": "Cannot safely inspect an in-flight application; restore queue inspection."}
+        if lease:
+            return {"result": "already_running", "pk": pk, "reason": "apply_in_flight"}
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+
+    jd_attention = (status == "error" and
+                    (int(row.get("jd_read_attempts") or 0) >= 3
+                     or row.get("fail_kind") in (
+                         "jd_reader_exhausted", "jd_tracking_storage_error")))
+    claim = _claim(pk, stores)
+    if claim is None:
+        return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+                "detail": "Cannot acquire evaluation claim; no session reset performed."}
+    if not claim:
         return {"result": "already_running", "pk": pk}
-    _run(_reset_session(pk))  # drop the finished session so the re-run starts clean
-    stores.tracking.set_status(pk, Status.FOUND, fail_reason="", fail_kind="",
-                               gate_pending=None, gate_call_id=None, skip_reason="")
-    from core.events import emit
-    emit("running", pk=pk, detail=f"retry · {row.get('title','')} @ {row.get('company','')}",
-         url=row.get("jd_url"))
-    return run_job(pk, stores)
+    try:
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            lease = _active_apply_lease(pk, stores)
+            if lease is None or lease:
+                return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown"
+                        if lease is None else "apply_in_flight"}
+            changes = {
+                "status": Status.TAILORING, "fail_reason": "",
+                "fail_kind": "", "skip_reason": "", "gate_pending": None,
+                "gate_call_id": None,
+            }
+            if jd_attention:
+                changes.update({
+                    "jd_read_attempts": 0, "jd_read_retry_at": None,
+                    "jd_read_error": "", "error": "",
+                    "jd_read_prepare_only": True,
+                })
+            else:
+                changes["error"] = ""
+            committed, admitted = _reader_patch(pk, row, stores, changes)
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+
+        # Nothing below re-acquires the claim, and public run_job rejects
+        # TAILORING. The competing evaluator cannot touch this ADK session.
+        try:
+            check = _reader_check(pk, admitted, stores)
+            if check:
+                if check["result"] == "refused":
+                    # Protection appeared after the committed reset. Make the
+                    # interruption visible without clearing its evidence.
+                    try:
+                        _reader_patch(pk, admitted, stores, {
+                            "status": Status.ERROR,
+                            "error": ("Retry stopped by submission protection; "
+                                      "reconcile the outcome before Reopen.")})
+                    except Exception:
+                        log.exception("could not record protected recovery for %s", pk)
+                return check
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, admitted, exc)
+
+        _run(_reset_session(pk))
+        from core.events import emit
+        emit("running", pk=pk,
+             detail=f"retry · {row.get('title','')} @ {row.get('company','')}",
+             url=row.get("jd_url"))
+        prepare_only = bool(admitted.get("jd_read_prepare_only")
+                            or admitted.get("discovery_source") == "career_ops")
+        try:
+            result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
+        except Exception as exc:
+            from .graph import ScorerModelError
+            if not isinstance(exc, ScorerModelError):
+                raise
+            detail = ("Scorer model/request failed; no valid score was received. "
+                      "Check the error log, then Reopen & re-score.")
+            stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
+            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            raise
+        if (result or {}).get("result") == "prepared":
+            try:
+                current = stores.tracking.get(pk) or {}
+                if current.get("apply_requested_at"):
+                    return _enqueue_apply(pk, stores, priority=True,
+                                          require_request=True)
+            except Exception as exc:
+                return _reader_storage_error(pk, stores, admitted, exc)
+        return result
+    finally:
+        _release(pk, stores)
 
 
 def _stale_seed(session: Any, current_base: str) -> bool:

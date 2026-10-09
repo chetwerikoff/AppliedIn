@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -159,9 +160,9 @@ def _claim(pk: str, stores: Any) -> bool:
         return True
     try:
         return bool(client.set(f"lock:job:{pk}", "1", nx=True, ex=_LOCK_TTL_SECONDS))
-    except Exception:  # noqa: BLE001 — a lock outage must not stop the pipeline
-        log.debug("job lock unavailable for %s", pk, exc_info=True)
-        return True
+    except Exception:  # noqa: BLE001 — a lock error is NOT an acquired claim
+        log.warning("job lock unavailable for %s", pk, exc_info=True)
+        return None
 
 
 def _claimed(pk: str, stores: Any) -> bool:
@@ -170,8 +171,9 @@ def _claimed(pk: str, stores: Any) -> bool:
         return False
     try:
         return bool(client.exists(f"lock:job:{pk}"))
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception:  # noqa: BLE001 — uncertainty must refuse recovery
+        log.warning("job claim inspection unavailable for %s", pk, exc_info=True)
+        return True
 
 
 def _release(pk: str, stores: Any) -> None:
@@ -196,65 +198,155 @@ _ALREADY_RUNNING = ("An earlier run is still working on this job. Wait for it to
                     "finish; if it never does, restart the daemon and it frees itself.")
 
 
+_READER_FIELDS = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+                  "jd_text", "jd_read_prepare_only")
+
+
+def _utc_now() -> datetime:
+    """Replaceable clock for deterministic UTC reader deadlines."""
+    return datetime.now(UTC)
+
+
+def _reader_witness(row: dict) -> dict:
+    # Omission means absence in BOTH backends, not a wildcard/None.
+    return {field: row[field] for field in _READER_FIELDS if field in row}
+
+
+def _reader_eligible(row: dict, *, now: datetime | None = None) -> bool:
+    """Persisted FOUND admission; used independently at every entrypoint."""
+    if row.get("status") != "found":
+        return False
+    try:
+        if int(row.get("jd_read_attempts") or 0) >= 3:
+            return False
+        deadline = row.get("jd_read_retry_at")
+        if not deadline:
+            return True
+        cutoff = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+        if cutoff.tzinfo is None:
+            return False
+        return (now or _utc_now()) >= cutoff
+    except (TypeError, ValueError, OverflowError):
+        # Corrupt deadline/budget is not authorization to retry immediately.
+        return False
+
+
+def _reader_patch(pk: str, row: dict, stores: Any, changes: dict) -> tuple[bool, dict]:
+    """One conditional partial commit against the same observed generation."""
+    patch = dict(changes)
+    patch["jd_read_revision"] = int(row.get("jd_read_revision") or 0) + 1
+    ok = stores.tracking.update_if_status(
+        pk, row.get("status"), patch, expected_reader=_reader_witness(row))
+    return ok, {**row, **{key: getattr(value, "value", value) if key == "status" else value
+                         for key, value in patch.items()}}
+
+
+def _reader_check(pk: str, observed: dict, stores: Any) -> dict | None:
+    """Independent fresh confirmation/hold gate plus status/reader comparison.
+
+    This does not claim a transaction with the separate durable hold key.
+    Re-check immediately before preparation and recovery enqueue as well.
+    """
+    current = stores.tracking.get(pk)
+    if not current or current.get("status") != observed.get("status") or (
+            _reader_witness(current) != _reader_witness(observed)):
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    if current.get("confirmation_id") or submit_hold.blocked(
+            pk, current, tracking=stores.tracking):
+        return {"result": "refused", "pk": pk, "reason": "submission_protected"}
+    return None
+
+
+def _reader_storage_error(pk: str, stores: Any, row: dict | None,
+                          exc: Exception) -> dict:
+    """Contain reader-storage faults before either daemon generic ERROR catch.
+
+    At most one conditional attention attempt with the failed operation's
+    ORIGINAL witness. Never re-read/rebase a completed or terminal outcome.
+    """
+    log.error("JD tracking storage error for %s: %s", pk, exc, exc_info=True)
+    detail = ("Reader/tracking storage unavailable; restore storage, then use "
+              "Retry for recorded attention or existing orphan recovery. "
+              f"Cause: {type(exc).__name__}: {exc}")
+    persisted = False
+    if row and row.get("status") == "tailoring":
+        try:
+            persisted, _ = _reader_patch(pk, row, stores, {
+                "status": Status.ERROR, "jd_read_error": "",
+                "fail_kind": "jd_tracking_storage_error",
+                "error": ("Posting reader tracking storage failed; nothing was prepared "
+                          "or sent. Restore storage and use Retry.")})
+        except Exception:
+            log.exception("JD tracking attention could not be persisted for %s", pk)
+    if not persisted:
+        detail += " Attention could not be persisted; restore storage before safe recovery."
+    return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+            "detail": detail, "attention_persisted": persisted}
+
+
 def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
-    """Run the pipeline for one discovered job through the ADK agent graph."""
+    """Conditionally admit a FOUND row, then settle only this reader generation."""
     stores = stores or make_stores()
-    row = stores.tracking.get(pk)
+    try:
+        row = stores.tracking.get(pk)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):
-        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
-                'detail': submit_hold.REASON}
-
-    # A job-board import authorizes preparation only. Keep this durable across
-    # worker restarts and global mode changes; approval uses resume_job instead.
-    prepare_only = prepare_only or row.get("discovery_source") == "career_ops"
-
-    # Already past evaluation? Re-scoring a tailored/applied job wastes an LLM
-    # round trip and can overwrite a good result with a worse one.
-    status = row.get("status")
-    if status not in ("found", "tailoring", None, ""):
-        return {"result": "already_done", "pk": pk, "status": status}
-    from core.events import emit
-    if not _claim(pk, stores):
-        log.info("skipping %s — already being processed", pk)
-        emit("response", pk=pk, url=row.get("jd_url"),
-             detail=_ALREADY_RUNNING)
+    if not _reader_eligible(row):
+        return {"result": "already_done", "pk": pk, "status": row.get("status"),
+                "reason": "jd_read_not_eligible"}
+    try:
+        check = _reader_check(pk, row, stores)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+    if check:
+        return check
+    prepare_only = bool(prepare_only or row.get("jd_read_prepare_only")
+                        or row.get("discovery_source") == "career_ops")
+    claim = _claim(pk, stores)
+    if claim is None:
+        return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+                "detail": "Evaluation claim unavailable; no reader admission occurred."}
+    if not claim:
         return {"result": "already_running", "pk": pk}
-
-    # Mark it in-progress so the board shows it WORKING (yellow, in Tailored)
-    # instead of sitting silently in Found. The graph resets it to
-    # tailored/skipped/gated when it finishes; an orphan (killed mid-run) is
-    # recovered back to found on restart.
-    if status == "found":
-        stores.tracking.set_status(pk, Status.TAILORING)
-    # NOTE: no address is chosen here. Tailoring is not sending, and an address
-    # claimed at tailoring is an address spent on a résumé that may never go
-    # anywhere: one OpenAI backlog burned eight of them before a single
-    # application existed. `rotation.ensure()` picks one at dispatch instead —
-    # the only moment the count of five means what it says — and re-renders the
-    # contact line from the saved .tex so the PDF still matches the form.
-    emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
-         url=row.get("jd_url"))
     try:
         try:
-            result = _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, admitted = _reader_patch(
+                pk, row, stores, {"status": Status.TAILORING})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+
+        from core.events import emit
+        emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
+             url=row.get("jd_url"))
+        try:
+            result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
         except Exception as exc:
             from .graph import ScorerModelError
             if not isinstance(exc, ScorerModelError):
                 raise
-            # Manual Reopen only logs escaping failures, unlike the daemon.
-            # Persist the scorer's genuine fault BEFORE re-raising to either.
+            # Preserve the distinct scorer fault behavior; this is not a
+            # reader-storage exception and is NOT masked by reader containment.
             detail = ("Scorer model/request failed; no valid score was received. "
                       "Check the error log, then Reopen & re-score.")
             stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
             emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
             raise
-        # Career Ops always uses the review graph: it must finish scoring and
-        # produce a real PDF before an explicit Apply-selected request advances.
-        # The authorization is persisted before the first worker sees the row.
-        if (result or {}).get("result") == "prepared" and row.get("apply_requested_at"):
-            return _enqueue_apply(pk, stores, priority=True)
+        # Existing explicit Apply request is NOT created by prepare-only Retry.
+        # Re-fetch within the guarded enqueue path; never trust this old row.
+        if (result or {}).get("result") == "prepared":
+            try:
+                current = stores.tracking.get(pk) or {}
+                if current.get("apply_requested_at"):
+                    return _enqueue_apply(pk, stores, priority=True, require_request=True)
+            except Exception as exc:
+                return _reader_storage_error(pk, stores, admitted, exc)
         return result
     finally:
         _release(pk, stores)

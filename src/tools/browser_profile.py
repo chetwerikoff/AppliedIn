@@ -321,6 +321,15 @@ def browser_setup(settings=None, *, timeout_s: int = 900) -> dict:
     """Verify an existing ID or explicitly pin the unique owned Chrome extension."""
     from tools.browser_skill import ensure_daemon
     cfg = _config(settings)
+    # A retained pin does not authorize an implicit backend switch. Cold setup
+    # with no saved ID still allows the existing explicit human-confirmed
+    # transition to BrowserSkill when _save_instance() runs.
+    if cfg['browser'] and cfg['engine'] != 'browser_skill':
+        return {'status': 'blocked', 'saved': False,
+                'error': ('The saved browser ID is not the selected apply engine '
+                          '(engine is not browser_skill). Explicitly select '
+                          'engine: browser_skill in browser.local.yaml and rerun '
+                          'browser-setup; no profile or pin was changed.')}
     try:
         executable = _chrome(cfg)
     except (OSError, ValueError) as exc:

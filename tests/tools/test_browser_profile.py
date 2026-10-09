@@ -362,3 +362,54 @@ def test_setup_saved_pin_rejects_foreign_candidate_without_repin(
     outcome = profile.browser_setup(timeout_s=2)
     assert outcome['status'] == 'blocked' and 'saved pin' in outcome['error']
     assert path.read_bytes() == initial
+
+
+
+@pytest.mark.parametrize("snapshot", ["connected_at_entry", "reconnecting"])
+def test_setup_retained_pin_with_chrome_engine_never_reports_ready(
+        sandbox, monkeypatch, snapshot):
+    """A connected BSK ID is not readiness while the Claude Chrome engine is selected."""
+    from contextlib import nullcontext
+
+    path, _ = sandbox
+    saved = yaml.safe_load(path.read_text())
+    saved["engine"] = "chrome"
+    path.write_text(yaml.safe_dump(saved))
+    initial = path.read_bytes()
+    snapshots = []
+    def browsers():
+        snapshots.append(True)
+        if snapshot == "reconnecting" and len(snapshots) == 1:
+            return []
+        return [{"instance_id": "pinned"}]
+    monkeypatch.setattr(profile, "_browsers", browsers)
+    monkeypatch.setattr(profile, "profile_pids", lambda _: [123])
+    # For comparison with the old reconnect path, never create a real lock.
+    monkeypatch.setattr(profile, "_launch_lock", lambda _: nullcontext())
+    monkeypatch.setattr(profile, "_save_instance",
+                        lambda *a, **kw: pytest.fail("Wrong engine may not rewrite pin"))
+    monkeypatch.setattr("builtins.input",
+                        lambda *_a: pytest.fail("A saved pin needs no new consent"))
+    result = profile.browser_setup(timeout_s=2)
+    assert result["status"] == "blocked" and result["saved"] is False
+    assert "engine: browser_skill" in result["error"]
+    assert "rerun" in result["error"]
+    assert path.read_bytes() == initial
+    assert not snapshots  # Refuse before even consulting an unrelated backend.
+
+
+def test_first_time_setup_still_allows_explicit_engine_selection_with_consent(
+        sandbox, monkeypatch):
+    """Do not break the unpinned, human-confirmed chrome -> BSK migration."""
+    path, _ = sandbox
+    cfg = yaml.safe_load(path.read_text())
+    cfg["engine"], cfg["browser"] = "chrome", ""
+    path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(profile, "_browsers", lambda: [{"instance_id": "new-synthetic"}])
+    monkeypatch.setattr(profile, "profile_pids", lambda _: [123])
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    result = profile.browser_setup(timeout_s=2)
+    assert result["status"] == "configured"
+    updated = yaml.safe_load(path.read_text())
+    assert updated["browser"] == "new-synthetic"
+    assert updated["engine"] == "browser_skill"

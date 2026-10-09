@@ -224,22 +224,159 @@ def test_stale_resume_and_duplicates_are_rechecked_before_submit(monkeypatch, tm
     import fakeredis
     # Faking the row alone leaves the independent-key guard querying localhost.
     # Keep this résumé/duplicate regression offline, even without a Redis server.
+    from core.apply_queue import ApplyQueue
     tracking = SimpleNamespace(r=fakeredis.FakeRedis(decode_responses=True))
     monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))
     pdf = tmp_path / 'Resume.pdf'
     pdf.write_bytes(b'pdf')
-    row = {'status': 'submitting', 'resume_tex_key': 'r.tex', 'resume_seed': 'old'}
+    row = {'company': 'Company', 'status': 'submitting',
+           'resume_tex_key': 'r.tex', 'resume_seed': 'old'}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
     monkeypatch.setattr('agent.run.seed_fingerprint', lambda: 'current')
     monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: None)
-    with pytest.raises(forms.Gate, match='base changed'):
-        forms.check_dispatch('Company#1', str(pdf))
-    row['resume_seed'] = 'current'
-    forms.check_dispatch('Company#1', str(pdf))
-    monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: {'status': 'failed'})
-    with pytest.raises(forms.Gate, match='duplicate'):
-        forms.check_dispatch('Company#1', str(pdf))
+    queue = ApplyQueue(tracking.r)
+    assert queue.put('company#1', 'Company')
+    item = queue.next(only='Company')
+    assert item is not None
+    try:
+        with pytest.raises(forms.Gate, match='base changed'):
+            forms.check_dispatch('company#1', str(pdf))
+        row['resume_seed'] = 'current'
+        forms.check_dispatch('company#1', str(pdf))
+        monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: {'status': 'failed'})
+        with pytest.raises(forms.Gate, match='duplicate'):
+            forms.check_dispatch('company#1', str(pdf))
+    finally:
+        queue.done(item)
 
+
+@pytest.mark.parametrize('state', [
+    'no_lease', 'pk_only', 'company_only', 'unreadable_lease',
+    'wrong_company', 'stale_status', 'held', 'stale_seed', 'duplicate',
+])
+async def test_production_dispatch_refuses_unproven_worker_before_session(
+        monkeypatch, tmp_path, state):
+    """Lease/status/hold/duplicate/seed failures never reach BrowserSkill IPC."""
+    import fakeredis
+    from core.apply_queue import ApplyQueue
+    from core.models import Status
+    from core.storage.local import RedisTracking
+    from tools import submit_hold
+
+    pk, company, url = 'example-co#job-1', 'example-co', 'https://example.test/jobs/1'
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    tracking.set_status(pk, Status.SUBMITTING,
+                        company='other-example-co' if state == 'wrong_company' else company,
+                        jd_url=url, resume_tex_key='resumes/synthetic.tex',
+                        resume_seed='old-seed' if state == 'stale_seed' else 'current-seed')
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda *a, **kw: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('agent.run.seed_fingerprint', lambda: 'current-seed')
+    monkeypatch.setattr('tools.browser_apply._duplicate_refusal',
+                        lambda pk: {'reason': 'duplicate'} if state == 'duplicate' else None)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume',
+                        lambda *a: pytest.fail('resume staged before dispatch proof'))
+    monkeypatch.setattr(bsk, 'Session',
+                        lambda *a: pytest.fail('BrowserSkill Session/IPC before dispatch proof'))
+    pdf = tmp_path / 'Test-User.pdf'
+    pdf.write_bytes(b'%PDF-1.4 synthetic offline document')
+    queue = ApplyQueue(tracking.r)
+    item = None
+    if state not in {'no_lease', 'pk_only', 'company_only'}:
+        assert queue.put(pk, company)
+        item = queue.next(only=company)
+        assert item
+    elif state == 'pk_only':
+        tracking.r.sadd('applyq:inflight:pks', pk)
+    elif state == 'company_only':
+        tracking.r.sadd('applyq:inflight', company)
+    if state == 'stale_status':
+        tracking.set_status(pk, Status.TAILORED)
+    if state == 'held':
+        submit_hold.mark(pk, tracking=tracking)
+
+    original_smembers = tracking.r.smembers
+    before = tracking.get(pk)
+    try:
+        if state == 'unreadable_lease':
+            monkeypatch.setattr(tracking.r, 'smembers',
+                                lambda *a: (_ for _ in ()).throw(
+                                    OSError('Synthetic lease read unavailable')))
+        result = await forms.apply(url, company, {'Full name': 'Test User'},
+                                   'offline-model', pk=pk, resume_path=str(pdf))
+        assert result['status'] == 'gate'
+        assert tracking.get(pk) == before
+    finally:
+        monkeypatch.setattr(tracking.r, 'smembers', original_smembers)
+        if item is not None:
+            queue.done(item)
+
+
+
+async def test_two_live_company_leases_cannot_splice_a_drifted_row_before_session(
+        monkeypatch, tmp_path):
+    """Independent busy-pk and busy-company sets are not a paired worker lease."""
+    import fakeredis
+    from core.apply_queue import ApplyQueue
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    a, b = 'example-co-a', 'example-co-b'
+    pk_a, pk_b = f'{a}#job-1', f'{b}#job-2'
+    url = 'https://example.test/jobs/job-1'
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    for company, pk in ((a, pk_a), (b, pk_b)):
+        tracking.set_status(pk, Status.SUBMITTING, company=company, jd_url=url,
+                            resume_tex_key='resumes/Test-User.tex',
+                            resume_seed='synthetic-seed')
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda *args, **kw: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('agent.run.seed_fingerprint',
+                        lambda: 'synthetic-seed')
+    monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: None)
+    pdf = tmp_path / 'Test-User.pdf'
+    pdf.write_bytes(b'%PDF-1.4 synthetic offline document')
+    queue = ApplyQueue(tracking.r)
+    assert queue.put(pk_a, a)
+    assert queue.put(pk_b, b)
+    item_a, item_b = queue.next(only=a), queue.next(only=b)
+    assert item_a and item_b
+    try:
+        # Each independent set membership is true, even with B incorrectly
+        # written onto A's tracked row. Neither worker granted this cross-pair.
+        tracking.set_status(pk_a, Status.SUBMITTING, company=b)
+        assert queue.in_flight() == {pk_a, pk_b}
+        assert queue.depth()['running'] == [a, b]
+        before = tracking.get(pk_a)
+        with pytest.raises(forms.Gate, match='leased queue dispatch'):
+            forms.check_dispatch(pk_a, str(pdf))
+
+        ipc = []
+        def session_attempt(*args, **kw):
+            ipc.append('Session')
+            pytest.fail('drifted job opened BrowserSkill Session')
+        monkeypatch.setattr(bsk, 'Session', session_attempt)
+        monkeypatch.setattr(bsk, 'decision', AsyncMock(
+            side_effect=AssertionError('drifted job requested browser/model IPC')))
+        monkeypatch.setattr('tools.claude_chrome._stage_resume',
+                            lambda *args: pytest.fail('drifted job staged a resume'))
+        result = await forms.apply(url, a, {'Full name': 'Test User'},
+                                   'offline-model', pk=pk_a, resume_path=str(pdf))
+        assert result['status'] == 'gate'
+        assert ipc == []  # no Session, navigation, value, click, or submit
+        assert tracking.get(pk_a) == before
+        assert queue.in_flight() == {pk_a, pk_b}
+        assert queue.depth()['running'] == [a, b]
+
+        # Undo only the synthetic drift. Both genuine queue-owned attempts
+        # retain the original production admission and can proceed.
+        tracking.set_status(pk_a, Status.SUBMITTING, company=a)
+        forms.check_dispatch(pk_a, str(pdf))
+        forms.check_dispatch(pk_b, str(pdf))
+    finally:
+        queue.done(item_a)
+        queue.done(item_b)
+    assert not queue.in_flight()
 
 @pytest.mark.parametrize(('verb', 'button'),
                          [('submit', 'Submit application'), ('click', 'Continue')])

@@ -69,22 +69,24 @@ def test_batch_retains_successes_and_stops_on_shared_outage(monkeypatch):
 
 def test_unavailable_reader_keeps_job_found_with_real_reason_and_never_tailors(monkeypatch):
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
-    tracking.set_status('meta#1', Status.FOUND, company='Meta', jd_url='https://x/1', jd_text='Engineer')
+    pk = "example-co#job-1"
+    tracking.set_status(pk, Status.FOUND, company="example-co",
+                        jd_url="https://example.test/jobs/1", jd_text="Test role")
     stores = SimpleNamespace(tracking=tracking)
     def unavailable(*args, **kwargs):
         raise jd.PostingReadUnavailable(LIMIT)
     monkeypatch.setattr(jd, 'fetch_jd', unavailable)
     monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
     monkeypatch.setattr(run, '_session_service', lambda: pytest.fail('No tailoring without a posting'))
-    result = run.run_job('meta#1', stores, prepare_only=True)
-    row = tracking.get('meta#1')
+    result = run.run_job(pk, stores, prepare_only=True)
+    row = tracking.get(pk)
     assert result['result'] == 'deferred'
     assert row['status'] == 'found'
     assert LIMIT in row['jd_read_error']
     assert 'Attempt 1 of 3' in row['jd_read_error']
     assert 'UTC' in row['jd_read_error']
     assert not row.get('fail_kind')
-    assert not tracking.r.exists('lock:job:meta#1')
+    assert not tracking.r.exists(f"lock:job:{pk}")
 
 
 def test_existing_usable_description_survives_reader_outage(monkeypatch):
@@ -235,7 +237,7 @@ def test_same_status_fresh_protection_during_read_blocks_preparation(monkeypatch
     result = run.run_job(pk, stores, prepare_only=True)
     assert result["result"] == "refused"
     assert result["reason"] == "submission_protected"
-    assert tracking.get(pk)["jd_read_attempts"] is None if "jd_read_attempts" not in tracking.get(pk) else tracking.get(pk)["jd_read_attempts"] == 0
+    assert "jd_read_attempts" not in tracking.get(pk)
     assert not tracking.r.exists(f"lock:job:{pk}")
 
 

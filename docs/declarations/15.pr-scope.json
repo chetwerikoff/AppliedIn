@@ -1,0 +1,51 @@
+{
+  "schema_version": "orchestrator-pack/pr-scope-declaration/v1",
+  "issue_number": 15,
+  "declared_paths": [
+    "docs/declarations/15.pr-scope.json",
+    "src/agent/graph.py",
+    "src/tools/browser_skill_apply.py",
+    "tests/agent/test_apply_entry_lease.py",
+    "tests/tools/test_browser_skill.py"
+  ],
+  "denylist": [
+    ".claude/**",
+    ".cursor/**",
+    ".env",
+    ".env.*",
+    ".github/**",
+    ".local-*/**",
+    ".local/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "config/**",
+    "output/**",
+    "packages/core/**",
+    "README.md",
+    "resume/**",
+    "scripts/**",
+    "src/agent/run.py",
+    "src/core/**",
+    "src/daemon.py",
+    "src/discovery/**",
+    "src/tools/browser_apply.py",
+    "src/tools/browser_profile.py",
+    "src/tools/browser_runtime.py",
+    "src/tools/browser_skill_dom.py",
+    "src/tools/browser_skill_fixture.py",
+    "src/tools/browser_skill.py",
+    "src/tools/claude_chrome.py",
+    "src/tools/submit_hold.py",
+    "vendor/**",
+    "web/**"
+  ],
+  "allowed_roots": [
+    "docs/declarations/",
+    "src/agent/graph.py",
+    "src/server.py",
+    "src/tools/browser_skill_apply.py",
+    "tests/agent/test_apply_entry_lease.py",
+    "tests/tools/test_browser_skill.py",
+    "tests/tools/test_submit_hold.py"
+  ]
+}

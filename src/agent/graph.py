@@ -172,12 +172,36 @@ async def apply_to_job(tool_context: ToolContext) -> dict:
     from core.events import emit
     from core.models import Status
     from core.stores import make_stores
-    from tools.browser_apply import apply
-    from tools.credentials import get_login
+    from tools.browser_runtime import configuration
 
     st = tool_context.state
     pk = st.get("pk", "")
     company = st.get("company", "")
+    # This ADK tool has no queue-dispatch ownership. Even when another worker
+    # leased this exact pk, its in-flight membership cannot authorize this call.
+    # The BrowserSkill writer is available only through the explicit, approved
+    # ApplyQueue.next -> run_queued -> _apply_direct route.
+    try:
+        engine = configuration()["engine"]
+    except Exception:  # Unknown configuration cannot select a safe apply path.
+        engine = None
+    if engine != "chrome":
+        detail = (
+            "BrowserSkill ADK apply is not a leased dispatch. Obtain explicit "
+            "approval and use the existing ApplyQueue.next -> run_queued -> "
+            "_apply_direct path; no application was queued or submitted."
+            if engine == "browser_skill" else
+            "The application engine could not be verified. Fix its configuration "
+            "before explicitly approving the existing leased queue dispatch; "
+            "no application was queued or submitted."
+        )
+        return {"status": "gate",
+                "reason": ("leased_dispatch_required" if engine == "browser_skill"
+                           else "browser_engine_unverified"),
+                "question": detail, "detail": detail}
+
+    from tools.browser_apply import apply
+    from tools.credentials import get_login
     stores = make_stores()
     from tools import submit_hold
     if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):

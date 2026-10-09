@@ -21,6 +21,7 @@
     "AGENTS.md",
     "CLAUDE.md",
     "config/**",
+    "docs/**",
     "output/**",
     "packages/core/**",
     "README.md",

@@ -483,6 +483,14 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         log.info("base résumé changed since %s was first seen — starting it fresh", pk)
     if existing is None:
         await sessions.create_session(app_name=_APP, user_id=_USER, session_id=pk, state=state)
+    # Session lookup/create can itself take time. Check the independent hold
+    # key and confirmation again immediately before ADK preparation.
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
     from .graph import review_agent
     runner = Runner(agent=review_agent if prepare_only else root_agent,
                     app_name=_APP, session_service=sessions)
@@ -701,7 +709,8 @@ def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
 
 
 
-def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
+def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
+                   require_request: bool = False) -> dict:
     """Hand an approved job to the apply queue instead of applying it here.
 
     Approving is a decision; dispatching is the queue's job. When ▶ Apply ran the
@@ -716,6 +725,14 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
     from core.apply_queue import ApplyQueue
 
     row = stores.tracking.get(pk) or {}
+    if require_request and (
+            not row.get("apply_requested_at")
+            or row.get("status") not in ("tailoring", "tailored")
+            or row.get("confirmation_id")):
+        return {"result": "refused", "pk": pk,
+                "reason": "apply_request_or_preparation_not_current"}
+    if row.get("confirmation_id"):
+        return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
     # Terminal states are refused here as well as at dispatch. Queueing an applied
     # row is harmless (the duplicate guard catches it) but it spends that company's
     # turn on a job that cannot run.
@@ -727,6 +744,8 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
 
     q = ApplyQueue(stores.tracking.r)
+    if require_request and pk in q.in_flight():
+        return {"result": "refused", "pk": pk, "reason": "apply_in_flight"}
     # A role the owner pressed Apply on already has its go-ahead. Marking it
     # "approval" is what put it back in front of them as a question.
     requested = bool(row.get("apply_requested_at"))
@@ -1778,7 +1797,14 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                     # only goes out when you say so is unchanged; what moved is
                     # where you say it — once per company, not once per card.
                     if reason == "approval":
-                        _enqueue_apply(pk, stores)
+                        if prepare_only:
+                            # Review-only recovery never invents approval.
+                            # An existing current explicit request remains valid.
+                            current = stores.tracking.get(pk) or {}
+                            if current.get("apply_requested_at"):
+                                _enqueue_apply(pk, stores, require_request=True)
+                        else:
+                            _enqueue_apply(pk, stores)
                     emit("gate", pk=pk, agent=author, detail=question, url=row.get("jd_url"),
                          screenshot=_art_url(row.get("screenshot_s3_key")))
                     log.info("gated pk=%s: %s", pk, question)
@@ -1816,10 +1842,11 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                                        fail_reason="No PDF was saved. Retry preparation.")
             return {"result": "failed", "pk": pk, "reason": "no_resume"}
         if row.get("apply_requested_at"):
-            # The owner pressed Apply: the score cleared the bar and the résumé
-            # is saved, so this is not a question for them. It goes to the apply
-            # queue, which starts it even while applying is paused by hand.
-            _enqueue_apply(pk, stores)
+            # Check fresh request/status/hold/confirmation inside enqueue, not
+            # the row read before preparation or a pre-recovery request.
+            queued = _enqueue_apply(pk, stores, require_request=True)
+            if queued.get("result") != "queued":
+                return queued
             emit("running", pk=pk, agent="applier",
                  detail="Résumé ready — queued to apply, as you asked")
             return {"result": "queued_apply", "pk": pk}

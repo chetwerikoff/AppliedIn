@@ -354,8 +354,7 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
                     # Request authority is checked AGAIN inside the queue entry.
                     # The first GET can race a cancellation in any prepare-only
                     # mode, not just a JD-attention recovery.
-                    return _enqueue_apply(pk, stores, priority=True,
-                                          require_request=True)
+                    return _enqueue_apply(pk, stores, priority=True)
             except Exception as exc:
                 return _reader_storage_error(pk, stores, admitted, exc)
         return result
@@ -721,7 +720,7 @@ def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
 
 
 def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
-                   require_request: bool = False) -> dict:
+                   require_request: bool = True) -> dict:
     """Hand an approved job to the apply queue instead of applying it here.
 
     Approving is a decision; dispatching is the queue's job. When ▶ Apply ran the
@@ -1030,7 +1029,7 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # re-queued items) still take the one-click ▶ Apply: approving one means
         # "run the browser apply for it now".
         if row.get("status") == "tailored":
-            return _enqueue_apply(pk, stores)
+            return _enqueue_apply(pk, stores, require_request=False)
         return {"result": "not_gated", "pk": pk}
 
     question = (row.get("gate_pending") or {}).get("question") or ""
@@ -1079,7 +1078,8 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # A bare "Ready to apply?" is the opposite — that IS the decision, and in
         # gated mode the decision belongs to Process. So it queues as ordinary
         # work, exactly as before.
-        return _enqueue_apply(pk, stores, priority=bool(question) and not approval)
+        return _enqueue_apply(pk, stores, priority=bool(question) and not approval,
+                              require_request=False)
     return _run(_resume_job_async(pk, answer, call_id, stores))
 
 
@@ -1868,7 +1868,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                             if current.get("apply_requested_at"):
                                 _enqueue_apply(pk, stores, require_request=True)
                         else:
-                            _enqueue_apply(pk, stores)
+                            _enqueue_apply(pk, stores, require_request=False)
                     emit("gate", pk=pk, agent=author, detail=question, url=row.get("jd_url"),
                          screenshot=_art_url(row.get("screenshot_s3_key")))
                     log.info("gated pk=%s: %s", pk, question)

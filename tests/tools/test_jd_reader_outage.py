@@ -760,3 +760,250 @@ def test_prepared_authority_revoked_between_wrapper_and_enqueue_get(
     assert tracking.get(pk)["status"] == "tailoring"
     assert ApplyQueue(tracking.r).pending() == []
     assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_jd_attention_retry_invalidates_old_pdf_without_new_save(monkeypatch):
+    """A PDF from the previous JD cannot authorize the recovered preparation."""
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    request = "2030-01-01T00:00:00+00:00"
+    tracking.set_status(pk, Status.ERROR, fail_kind="jd_reader_exhausted",
+                        jd_read_attempts=3, jd_read_revision=6,
+                        resume_s3_key="resumes/old-posting.pdf",
+                        resume_seed="synthetic-existing-seed",
+                        apply_requested_at=request)
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr("core.events.emit", lambda *args, **kw: None)
+    monkeypatch.setattr(run, "_session_state",
+                        lambda row, text: {"base_latex": "Test User seed"})
+    monkeypatch.setattr(run, "_save_output", lambda *args: None)
+
+    async def recovered(row, **kwargs):
+        return GOOD
+
+    class EmptySession:
+        async def delete_session(self, **kwargs):
+            return None
+
+        async def get_session(self, **kwargs):
+            return None
+
+        async def create_session(self, **kwargs):
+            return None
+
+    class EmptyReviewRunner:
+        def __init__(self, agent, **kwargs):
+            pass
+
+        async def run_async(self, **kwargs):
+            if False:
+                yield None  # No current-run PDF save or other ADK output.
+
+    monkeypatch.setattr(run, "_session_service", lambda: EmptySession())
+    monkeypatch.setattr(run, "_jd_text", recovered)
+    monkeypatch.setattr(run, "Runner", EmptyReviewRunner)
+    result = run.retry_job(pk, stores)
+    row = tracking.get(pk)
+    assert result["result"] == "failed" and result["reason"] == "no_resume"
+    assert row["resume_s3_key"] == ""
+    assert row["resume_seed"] == "synthetic-existing-seed"
+    assert row["apply_requested_at"] == request
+    assert row["jd_read_prepare_only"] is True
+    assert ApplyQueue(tracking.r).pending() == []
+    assert row["status"] == "failed"
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+@pytest.mark.parametrize("mode", ["auto", "gated"])
+@pytest.mark.parametrize("requested", [False, True])
+def test_actual_skip_then_retry_remains_review_only(
+        monkeypatch, mode, requested):
+    """Skipping an exhausted ERROR must not re-enter the full apply graph."""
+    from agent import graph
+    from core import flags
+    from core.apply_queue import ApplyQueue
+    import server
+
+    tracking, pk = _synthetic_tracking()
+    authority = "2030-01-01T00:00:00+00:00" if requested else ""
+    tracking.set_status(pk, Status.ERROR, fail_kind="jd_reader_exhausted",
+                        jd_read_attempts=3, jd_read_revision=6,
+                        jd_read_retry_at=None, apply_requested_at=authority)
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace())
+    monkeypatch.setattr(server, "make_stores", lambda *a, **kw: stores)
+    app = server.create_app()
+    skip = next(r.endpoint for r in app.routes
+                if getattr(r, "path", "") == "/actions/skip/{pk}")
+    assert skip(pk)["ok"] is True
+    assert tracking.get(pk)["status"] == "skipped"
+    assert tracking.get(pk)["jd_read_attempts"] == 3
+    monkeypatch.setattr(flags, "apply_mode", lambda: mode)
+    monkeypatch.setattr("core.events.emit", lambda *args, **kw: None)
+    monkeypatch.setattr(run, "_session_state",
+                        lambda row, text: {"base_latex": "Test User seed"})
+    monkeypatch.setattr(run, "_save_output", lambda *args: None)
+
+    class NoNetworkSession:
+        async def delete_session(self, **kw):
+            return None
+
+        async def get_session(self, **kw):
+            return None
+
+        async def create_session(self, **kw):
+            return None
+
+    used_agents = []
+
+    class GraphCapture:
+        def __init__(self, agent, **kwargs):
+            used_agents.append(agent)
+
+    async def recovered(row, **kw):
+        return GOOD
+
+    async def prepared(runner, current_pk, message, current_stores, *, prepare_only):
+        assert prepare_only is True
+        current_stores.tracking.set_status(
+            current_pk, Status.TAILORED,
+            resume_s3_key="resumes/synthetic-new.pdf")
+        return {"result": "prepared", "pk": current_pk}
+
+    monkeypatch.setattr(run, "_session_service", lambda: NoNetworkSession())
+    monkeypatch.setattr(run, "_jd_text", recovered)
+    monkeypatch.setattr(run, "Runner", GraphCapture)
+    monkeypatch.setattr(run, "_drive_async", prepared)
+    result = run.retry_job(pk, stores)
+    assert used_agents == [graph.review_agent]
+    row = tracking.get(pk)
+    assert row["status"] == "tailored"
+    assert row["jd_read_attempts"] == 0
+    assert row["jd_read_prepare_only"] is True
+    assert row["apply_requested_at"] == authority
+    queued = [item for item in ApplyQueue(tracking.r).pending()
+              if item["pk"] == pk]
+    if requested:
+        assert result["result"] == "queued" and len(queued) == 1
+    else:
+        assert result["result"] == "prepared" and queued == []
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_actual_reopen_refuses_exhaustion_after_skip(monkeypatch):
+    from fastapi import BackgroundTasks
+    from core.apply_queue import ApplyQueue
+    import server
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_read_attempts=3,
+                        fail_kind="jd_reader_exhausted", jd_read_revision=6)
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(server, "make_stores", lambda *a, **kw: stores)
+    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace())
+    events = []
+    monkeypatch.setattr("core.events.emit", lambda *args, **kw: events.append(args))
+    app = server.create_app()
+    skip = next(r.endpoint for r in app.routes
+                if getattr(r, "path", "") == "/actions/skip/{pk}")
+    reopen = next(r.endpoint for r in app.routes
+                  if getattr(r, "path", "") == "/actions/reopen/{pk:path}")
+    assert skip(pk)["ok"] is True
+    before = tracking.get(pk)
+    counts = tracking.status_counts()
+    queue = ApplyQueue(tracking.r)
+    pending, leases = queue.pending(), queue.in_flight()
+    tasks = BackgroundTasks()
+    result = reopen(pk, tasks)
+    assert result["ok"] is False
+    assert "Retry" in result["note"]
+    assert tracking.get(pk) == before
+    assert tracking.status_counts() == counts
+    assert queue.pending() == pending and queue.in_flight() == leases
+    assert tasks.tasks == [] and events == []
+
+
+def test_retry_session_reset_failure_is_visible_and_second_retry_works(monkeypatch):
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, fail_kind="jd_reader_exhausted",
+                        jd_read_attempts=3, jd_read_revision=6,
+                        resume_s3_key="resumes/old.pdf", apply_requested_at="")
+    stores = SimpleNamespace(tracking=tracking)
+    messages = []
+    monkeypatch.setattr("core.events.emit",
+                        lambda kind, **kw: messages.append((kind, kw)))
+
+    async def reset_failed(target):
+        raise RuntimeError("synthetic session backend unavailable")
+
+    async def no_reader(*args, **kw):
+        pytest.fail("Reader must not run after session reset failure")
+
+    monkeypatch.setattr(run, "_reset_session", reset_failed)
+    monkeypatch.setattr(run, "_run_job_async", no_reader)
+    result = run.retry_job(pk, stores)
+    assert result["result"] == "error"
+    assert result["reason"] == "jd_retry_session_error"
+    row = tracking.get(pk)
+    assert row["status"] == "error"
+    assert row["jd_read_revision"] == 8  # admitted + guarded attention
+    assert row["jd_read_prepare_only"] is True
+    assert row["jd_read_attempts"] == 0
+    assert row["resume_s3_key"] == ""
+    assert "Retry" in row["error"]
+    assert row["apply_requested_at"] == ""
+    assert [event for event, _ in messages] == ["error"]
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+    async def reset_ok(target):
+        return None
+
+    async def private_prepared(target, observed, stores, *, prepare_only):
+        assert prepare_only is True
+        tracking.set_status(target, Status.TAILORED,
+                            resume_s3_key="resumes/new.pdf")
+        return {"result": "prepared", "pk": target}
+
+    monkeypatch.setattr(run, "_reset_session", reset_ok)
+    monkeypatch.setattr(run, "_run_job_async", private_prepared)
+    second = run.retry_job(pk, stores)
+    assert second["result"] == "prepared"
+    assert tracking.get(pk)["status"] == "tailored"
+    assert tracking.get(pk)["jd_read_prepare_only"] is True
+    assert ApplyQueue(tracking.r).pending() == []
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_retry_reset_failure_conflicts_with_new_manual_terminal(monkeypatch):
+    from tools import submit_hold
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_read_attempts=3,
+                        jd_read_revision=6, fail_kind="jd_reader_exhausted")
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: None)
+    snapshots = []
+    original_update = tracking.update_if_status
+
+    def manual_before_error_settlement(target, old_status, patch, *, expected_reader):
+        if patch.get("fail_kind") == "jd_retry_session_error":
+            tracking.set_status(pk, Status.APPLIED_MANUAL,
+                                confirmation_id="synthetic-confirmed")
+            submit_hold.mark(pk, tracking=tracking)
+            snapshots.append(tracking.get(pk))
+        return original_update(target, old_status, patch,
+                               expected_reader=expected_reader)
+
+    async def reset_failed(target):
+        raise RuntimeError("synthetic session failure")
+
+    monkeypatch.setattr(tracking, "update_if_status", manual_before_error_settlement)
+    monkeypatch.setattr(run, "_reset_session", reset_failed)
+    result = run.retry_job(pk, stores)
+    assert result["result"] == "conflict"
+    assert tracking.get(pk) == snapshots[0]
+    assert submit_hold.is_held(pk, tracking=tracking)
+    assert not tracking.r.exists(f"lock:job:{pk}")

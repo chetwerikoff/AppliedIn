@@ -864,3 +864,196 @@ socket.getaddrinfo = no_network
     assert "FORBIDDEN_NETWORK_OPERATION" not in child.stderr
     assert not list(tmp_path.glob("*.lock"))
     assert not (tmp_path / ".local").exists()
+
+
+
+@pytest.mark.parametrize("verb", ["submit", "continue"])
+@pytest.mark.parametrize("change", [
+    "baseline", "form_action", "formaction", "hold_readback", "late_status",
+])
+async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
+        authority, monkeypatch, verb, change):
+    """Reach apply()'s native Submit/Continue JIT using full valid synthetic evidence.
+
+    The actual fixture cannot upload or fill its ungranted second field. For
+    this *late-guard-only* test, a test double supplies verified receipts and a
+    previously staged PDF (never BrowserSkill upload IPC). Name still uses the
+    real exact-grant controller and the closed facade permits its one fill.
+    Every click remains forbidden beneath the controller.
+    """
+    current = synthetic_page()
+    current["controls"][0].update(required=True, has_value=True,
+                                  value="Test User")
+    current["controls"][1].update(required=True, has_value=True,
+                                  value="Synthetic answer")
+    document_name = Path(authority.resume_path).name
+    resume = {
+        "selector": "#resume", "label": "Resume", "question": "",
+        "tag": "input", "type": "file", "required": True,
+        "disabled": False, "in_form": True,
+        "form_selector": "#synthetic-form", "form_action": fixture.URL,
+        "formaction": "", "files": [document_name],
+    }
+    current["controls"].insert(2, resume)
+    button = current["controls"][-1]
+    if verb == "continue":
+        button.update(selector="#continue", label="Continue")
+    button_action = {"action": "submit" if verb == "submit" else "click",
+                     "selector": button["selector"]}
+    # The second control is intentionally granted ONLY in this late-JIT test:
+    # the normal native-positive fixture still gates that exact second fill.
+    authority.row["human_approved_answers"]["Additional question"] = {
+        "selector": "#additional", "label": "Additional question",
+        "question": "", "url": fixture.URL, "value": "Synthetic answer",
+    }
+    observed = []
+    underlying = []
+    staged = []
+    marks = []
+    decisions = iter([
+        {"action": "fill", "selector": "#name", "fact": "Name"},
+        {"action": "fill", "selector": "#additional", "fact": "Additional question"},
+        {"action": "upload", "selector": "#resume"},
+        button_action,
+    ])
+
+    async def synthetic_decision(self, task, page, history, *, model):
+        assert self is authority and model == "synthetic-fixture"
+        choice = next(decisions)
+        observed.append("decision:" + choice["action"])
+        return choice
+
+    monkeypatch.setattr(fixture._SyntheticRun, "decision", synthetic_decision)
+    monkeypatch.setattr(bsk, "decision", _source_denied)
+
+    actual_execute = forms.execute
+    async def prevalidated_receipts(session, page, action, **kwargs):
+        selector, kind = action.get("selector"), action.get("action")
+        if selector == "#additional" and kind == "fill":
+            control = forms.control(page, action)
+            value = "Synthetic answer"
+            forms.exact_approval(
+                fixture.PK, "Additional question", value, target=control,
+                url=page["url"], fixture_context=authority)
+            forms.guarded_value(control, value)
+            kwargs["filled"]["#additional"] = value
+            staged.append("preverified_additional_receipt")
+            return {"action": "fill", "label": control["label"],
+                    "selector": selector, "question": control["question"],
+                    "url": page["url"], "fact": "Additional question",
+                    "approved_value": value}
+        if selector == "#resume" and kind == "upload":
+            control = forms.control(page, action)
+            assert control["type"] == "file" and document_name in control["files"]
+            assert Path(kwargs["resume_path"]).read_bytes().startswith(b"%PDF-")
+            staged.append("preverified_attached_pdf")
+            # Do not perform an upload, a real BSK call, or a premature
+            # receiver check. The *final native button* owns the JIT predicate.
+            return {"action": "upload", "label": "Resume", "uploaded": True}
+        return await actual_execute(session, page, action, **kwargs)
+    monkeypatch.setattr(forms, "execute", prevalidated_receipts)
+
+    class FakeSession:
+        def __init__(self, kind):
+            assert kind == "apply"
+        async def __aenter__(self):
+            underlying.append(("session_start",))
+            return self
+        async def __aexit__(self, *args):
+            underlying.append(("session_stop",))
+        async def navigate(self, url):
+            underlying.append(("navigate", url))
+            return current
+        async def page(self):
+            underlying.append(("evaluate_PAGE",))
+            return current
+        async def call(self, *args, **kwargs):
+            underlying.append(tuple(args))
+            if args == ("fill", "#name", "--value", "Test User") and not kwargs:
+                return {}
+            pytest.fail("Unsafe BrowserSkill IPC escaped the closed fixture facade")
+    monkeypatch.setattr(bsk, "Session", FakeSession)
+
+    # Spies call the REAL predicates: their observed order must be meaningful,
+    # and a removed guard must make the matching one-variable negative fail.
+    checks = [
+        ("receiver", "check_form_destination"),
+        ("inventory", "check_form"),
+        ("receipts", "check_approvals"),
+        ("hold", "hold_possible_submission"),
+        ("status", "check_before_committing_click"),
+    ]
+    for marker, attribute in checks:
+        original = getattr(forms, attribute)
+        def spy(*args, _original=original, _marker=marker, **kwargs):
+            observed.append(_marker)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(forms, attribute, spy)
+
+    if change in {"form_action", "formaction"}:
+        button[change] = "https://foreign.example.test/collect"
+    elif change == "hold_readback":
+        original_read = fixture._SyntheticRun.is_held
+        def fail_readback(self, pk):
+            observed.append("hold_readback")
+            assert self is authority and pk == fixture.PK
+            return False
+        monkeypatch.setattr(fixture._SyntheticRun, "is_held", fail_readback)
+    elif change == "late_status":
+        original_write = fixture._SyntheticRun.set_status
+        def raced_status(self, pk, status, **attrs):
+            original_write(self, pk, status, **attrs)
+            self.row["status"] = "applied_manual"
+            observed.append("synthetic_status_race")
+        monkeypatch.setattr(fixture._SyntheticRun, "set_status", raced_status)
+
+    # For every scenario the form has complete, independently inspectable
+    # required values, exact receipts, native receiver and attached PDF.
+    expected_filled = {"#name": "Test User", "#additional": "Synthetic answer"}
+    forms.check_form(current, expected_filled, True, document_name)
+    for field in ("Name", "Additional question"):
+        approval = authority.row["human_approved_answers"][field]
+        assert approval["url"] == fixture.URL
+    assert Path(authority.resume_path).is_file()
+
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
+        "synthetic-fixture", pk=fixture.PK,
+        resume_path=authority.resume_path, fixture_context=authority)
+    assert staged == ["preverified_additional_receipt", "preverified_attached_pdf"]
+    assert observed.count("decision:" + button_action["action"]) == 1
+    assert authority.fills == 1
+    assert underlying.count(("fill", "#name", "--value", "Test User")) == 1
+    assert underlying.count(("navigate", fixture.URL)) == 1
+    assert underlying.count(("session_start",)) == 1
+    assert underlying.count(("session_stop",)) == 1
+    assert not any(c[0] in {"click", "upload", "select", "choose"}
+                   for c in underlying)
+
+    if change == "baseline":
+        # All real controller JIT checks passed and attempted a click, but
+        # the facade denied it BEFORE raw BSK IPC. No submitted application.
+        assert result["status"] == "uncertain", result
+        assert "receiver" in observed and "inventory" in observed
+        assert "receipts" in observed and "hold" in observed
+        assert "status" in observed
+        assert observed.index("receiver") < observed.index("inventory")
+        assert observed.index("inventory") < observed.index("receipts")
+        assert observed.index("receipts") < observed.index("hold")
+        assert observed.index("hold") < observed.index("status")
+        assert authority.hold and authority.row["status"] == "needs_human"
+    elif change in {"form_action", "formaction"}:
+        assert result["status"] == "gate" and "form destination" in result["question"]
+        assert "receiver" in observed and "hold" not in observed
+        assert not authority.hold and authority.row["status"] == "submitting"
+    elif change == "hold_readback":
+        assert result["status"] == "gate" and "hold could not be confirmed" in result["question"]
+        assert "inventory" in observed and "receipts" in observed
+        assert "hold" in observed and "hold_readback" in observed
+        assert "status" not in observed and authority.row["status"] == "submitting"
+    else:
+        assert result["status"] == "gate" and "Human outcome changed" in result["question"]
+        assert "inventory" in observed and "receipts" in observed
+        assert "hold" in observed and "status" in observed
+        assert "synthetic_status_race" in observed
+        assert authority.row["status"] == "applied_manual"

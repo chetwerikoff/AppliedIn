@@ -70,6 +70,30 @@ class _StrictTracking:
         self.writes.append((status, dict(kwargs)))
         self.row.update(status=status.value, **kwargs)
 
+    def update_if_status(self, pk, expected_status, updates, *, expected_reader):
+        """Model the tracking CAS without relaxing the scorer's real runner."""
+        reader_fields = (
+            "jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+            "jd_text", "jd_read_prepare_only",
+        )
+        if set(expected_reader) - set(reader_fields):
+            raise ValueError("Unexpected reader witness key")
+        status = getattr(expected_status, "value", expected_status)
+        if self.row.get("pk") != pk or self.row.get("status") != status:
+            return False
+        if any(
+            (field in self.row) != (field in expected_reader)
+            or (field in expected_reader
+                and self.row[field] != expected_reader[field])
+            for field in reader_fields
+        ):
+            return False
+        patch = dict(updates)
+        if "status" in patch:
+            patch["status"] = getattr(patch["status"], "value", patch["status"])
+        self.row.update(patch)
+        return True
+
 
 class _NextAgent(BaseAgent):
     tracking: object

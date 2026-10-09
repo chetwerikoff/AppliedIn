@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -152,16 +153,16 @@ def _github_context() -> str:
 _LOCK_TTL_SECONDS = 1800  # longer than any real score+tailor; frees a killed run
 
 
-def _claim(pk: str, stores: Any) -> bool:
-    """Claim exclusive ownership of this job. False = someone else has it."""
+def _claim(pk: str, stores: Any) -> bool | None:
+    """True = acquired, False = held, None = unsafe claim-store outage."""
     client = getattr(stores.tracking, "r", None)
     if client is None:  # cloud mode / a tracking backend without Redis
         return True
     try:
         return bool(client.set(f"lock:job:{pk}", "1", nx=True, ex=_LOCK_TTL_SECONDS))
-    except Exception:  # noqa: BLE001 — a lock outage must not stop the pipeline
-        log.debug("job lock unavailable for %s", pk, exc_info=True)
-        return True
+    except Exception:  # noqa: BLE001 — a lock error is NOT an acquired claim
+        log.warning("job lock unavailable for %s", pk, exc_info=True)
+        return None
 
 
 def _claimed(pk: str, stores: Any) -> bool:
@@ -170,8 +171,9 @@ def _claimed(pk: str, stores: Any) -> bool:
         return False
     try:
         return bool(client.exists(f"lock:job:{pk}"))
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception:  # noqa: BLE001 — uncertainty must refuse recovery
+        log.warning("job claim inspection unavailable for %s", pk, exc_info=True)
+        return True
 
 
 def _release(pk: str, stores: Any) -> None:
@@ -196,65 +198,197 @@ _ALREADY_RUNNING = ("An earlier run is still working on this job. Wait for it to
                     "finish; if it never does, restart the daemon and it frees itself.")
 
 
+_READER_FIELDS = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+                  "jd_text", "jd_read_prepare_only")
+
+
+def _utc_now() -> datetime:
+    """Replaceable clock for deterministic UTC reader deadlines."""
+    return datetime.now(UTC)
+
+
+def _reader_witness(row: dict) -> dict:
+    # Omission means absence in BOTH backends, not a wildcard/None.
+    return {field: row[field] for field in _READER_FIELDS if field in row}
+
+
+def _reader_eligible(row: dict, *, now: datetime | None = None) -> bool:
+    """Persisted FOUND admission; used independently at every entrypoint."""
+    if row.get("status") != "found":
+        return False
+    try:
+        if int(row.get("jd_read_attempts") or 0) >= 3:
+            return False
+        deadline = row.get("jd_read_retry_at")
+        if not deadline:
+            return True
+        cutoff = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+        if cutoff.tzinfo is None:
+            return False
+        return (now or _utc_now()) >= cutoff
+    except (TypeError, ValueError, OverflowError):
+        # Corrupt deadline/budget is not authorization to retry immediately.
+        return False
+
+
+def _reader_patch(pk: str, row: dict, stores: Any, changes: dict) -> tuple[bool, dict]:
+    """One conditional partial commit against the same observed generation."""
+    patch = dict(changes)
+    patch["jd_read_revision"] = int(row.get("jd_read_revision") or 0) + 1
+    ok = stores.tracking.update_if_status(
+        pk, row.get("status"), patch, expected_reader=_reader_witness(row))
+    return ok, {**row, **{key: getattr(value, "value", value) if key == "status" else value
+                         for key, value in patch.items()}}
+
+
+def _reader_check(pk: str, observed: dict, stores: Any) -> dict | None:
+    """Independent fresh confirmation/hold gate plus status/reader comparison.
+
+    This does not claim a transaction with the separate durable hold key.
+    Re-check immediately before preparation and recovery enqueue as well.
+    """
+    current = stores.tracking.get(pk)
+    if not current or current.get("status") != observed.get("status") or (
+            _reader_witness(current) != _reader_witness(observed)):
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    if current.get("confirmation_id") or submit_hold.blocked(
+            pk, current, tracking=stores.tracking):
+        return {"result": "refused", "pk": pk, "reason": "submission_protected"}
+    return None
+
+
+def _reader_storage_error(pk: str, stores: Any, row: dict | None,
+                          exc: Exception) -> dict:
+    """Contain reader-storage faults before either daemon generic ERROR catch.
+
+    At most one conditional attention attempt with the failed operation's
+    ORIGINAL witness. Never re-read/rebase a completed or terminal outcome.
+    """
+    log.error("JD tracking storage error for %s: %s", pk, exc, exc_info=True)
+    detail = ("Reader/tracking storage unavailable; restore storage, then use "
+              "Retry for recorded attention or existing orphan recovery. "
+              f"Cause: {type(exc).__name__}: {exc}")
+    persisted = False
+    if row and row.get("status") == "tailoring":
+        try:
+            persisted, _ = _reader_patch(pk, row, stores, {
+                "status": Status.ERROR, "jd_read_error": "",
+                "fail_kind": "jd_tracking_storage_error",
+                "error": ("Posting reader tracking storage failed; nothing was prepared "
+                          "or sent. Restore storage and use Retry.")})
+        except Exception:
+            log.exception("JD tracking attention could not be persisted for %s", pk)
+    if not persisted:
+        detail += " Attention could not be persisted; restore storage before safe recovery."
+    return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+            "detail": detail, "attention_persisted": persisted}
+
+
+def _retry_session_error(pk: str, stores: Any, admitted: dict,
+                         exc: Exception, *, phase: str) -> dict:
+    """Finish an admitted review-only Retry when its ADK session is unavailable.
+
+    Only one commit is attempted against the invocation's existing witness:
+    neither a newer manual result nor a newer reader generation can be rebased.
+    """
+    log.error("Retry session %s failed for %s: %s", phase, pk, exc, exc_info=True)
+    detail = ("Retry could not reset or set up its preparation session. "
+              "No new application was prepared or sent; restore the session "
+              "service and use Retry.")
+    try:
+        committed, _ = _reader_patch(pk, admitted, stores, {
+            "status": Status.ERROR, "fail_kind": "jd_retry_session_error",
+            "jd_read_error": "", "error": detail})
+    except Exception as storage_exc:
+        log.exception("Could not persist Retry session attention for %s", pk)
+        return {"result": "error", "pk": pk,
+                "reason": "jd_tracking_storage_error",
+                "detail": (detail + " Attention could not be persisted; restore "
+                           "tracking storage before recovery. Cause: "
+                           f"{type(storage_exc).__name__}: {storage_exc}"),
+                "attention_persisted": False}
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    from core.events import emit
+
+    emit("error", pk=pk, url=admitted.get("jd_url"), detail=detail)
+    return {"result": "error", "pk": pk, "reason": "jd_retry_session_error",
+            "detail": detail, "attention_persisted": True}
+
+
 def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
-    """Run the pipeline for one discovered job through the ADK agent graph."""
+    """Conditionally admit a FOUND row, then settle only this reader generation."""
     stores = stores or make_stores()
-    row = stores.tracking.get(pk)
+    try:
+        row = stores.tracking.get(pk)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
+    if not _reader_eligible(row):
+        return {"result": "already_done", "pk": pk, "status": row.get("status"),
+                "reason": "jd_read_not_eligible"}
+    # Keep the existing uncertain-submission response contract. A hold is
+    # checked independently of reader generation and is never cleared.
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
-        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
-                'detail': submit_hold.REASON}
-
-    # A job-board import authorizes preparation only. Keep this durable across
-    # worker restarts and global mode changes; approval uses resume_job instead.
-    prepare_only = prepare_only or row.get("discovery_source") == "career_ops"
-
-    # Already past evaluation? Re-scoring a tailored/applied job wastes an LLM
-    # round trip and can overwrite a good result with a worse one.
-    status = row.get("status")
-    if status not in ("found", "tailoring", None, ""):
-        return {"result": "already_done", "pk": pk, "status": status}
-    from core.events import emit
-    if not _claim(pk, stores):
-        log.info("skipping %s — already being processed", pk)
-        emit("response", pk=pk, url=row.get("jd_url"),
-             detail=_ALREADY_RUNNING)
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": submit_hold.REASON}
+    try:
+        check = _reader_check(pk, row, stores)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+    if check:
+        return check
+    prepare_only = bool(prepare_only or row.get("jd_read_prepare_only")
+                        or row.get("discovery_source") == "career_ops")
+    claim = _claim(pk, stores)
+    if claim is None:
+        return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+                "detail": "Evaluation claim unavailable; no reader admission occurred."}
+    if not claim:
+        from core.events import emit
+        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
         return {"result": "already_running", "pk": pk}
-
-    # Mark it in-progress so the board shows it WORKING (yellow, in Tailored)
-    # instead of sitting silently in Found. The graph resets it to
-    # tailored/skipped/gated when it finishes; an orphan (killed mid-run) is
-    # recovered back to found on restart.
-    if status == "found":
-        stores.tracking.set_status(pk, Status.TAILORING)
-    # NOTE: no address is chosen here. Tailoring is not sending, and an address
-    # claimed at tailoring is an address spent on a résumé that may never go
-    # anywhere: one OpenAI backlog burned eight of them before a single
-    # application existed. `rotation.ensure()` picks one at dispatch instead —
-    # the only moment the count of five means what it says — and re-renders the
-    # contact line from the saved .tex so the PDF still matches the form.
-    emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
-         url=row.get("jd_url"))
     try:
         try:
-            result = _run(_run_job_async(pk, row, stores, prepare_only=prepare_only))
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, admitted = _reader_patch(
+                pk, row, stores, {"status": Status.TAILORING})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+
+        from core.events import emit
+        emit("running", pk=pk, detail=f"{row.get('title','')} @ {row.get('company','')}",
+             url=row.get("jd_url"))
+        try:
+            result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
         except Exception as exc:
             from .graph import ScorerModelError
             if not isinstance(exc, ScorerModelError):
                 raise
-            # Manual Reopen only logs escaping failures, unlike the daemon.
-            # Persist the scorer's genuine fault BEFORE re-raising to either.
+            # Preserve the distinct scorer fault behavior; this is not a
+            # reader-storage exception and is NOT masked by reader containment.
             detail = ("Scorer model/request failed; no valid score was received. "
                       "Check the error log, then Reopen & re-score.")
             stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
             emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
             raise
-        # Career Ops always uses the review graph: it must finish scoring and
-        # produce a real PDF before an explicit Apply-selected request advances.
-        # The authorization is persisted before the first worker sees the row.
-        if (result or {}).get("result") == "prepared" and row.get("apply_requested_at"):
-            return _enqueue_apply(pk, stores, priority=True)
+        # Existing explicit Apply request is NOT created by prepare-only Retry.
+        # Re-fetch within the guarded enqueue path; never trust this old row.
+        if (result or {}).get("result") == "prepared":
+            try:
+                current = stores.tracking.get(pk) or {}
+                if current.get("apply_requested_at"):
+                    # Request authority is checked AGAIN inside the queue entry.
+                    # The first GET can race a cancellation in any prepare-only
+                    # mode, not just a JD-attention recovery.
+                    return _enqueue_apply(pk, stores, priority=True)
+            except Exception as exc:
+                return _reader_storage_error(pk, stores, admitted, exc)
         return result
     finally:
         _release(pk, stores)
@@ -262,63 +396,143 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
 
 async def _run_job_async(pk: str, row: dict, stores: Any, *,
                          prepare_only: bool = False) -> dict:
+    """Settle the actual admitted TAILORING generation, never an old FOUND row."""
     from tools.jd import PostingReadUnavailable
 
     try:
         jd_text = await _jd_text(row)
     except PostingReadUnavailable as exc:
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            attempts = int(row.get("jd_read_attempts") or 0) + 1
+            if attempts >= 3:
+                patch = {
+                    "status": Status.ERROR,
+                    "jd_read_attempts": 3, "jd_read_retry_at": None,
+                    "jd_read_error": "", "fail_kind": "jd_reader_exhausted",
+                    "error": ("Posting reader exhausted three attempts; this read attempt "
+                              "did not prepare or send an application. Restore reader "
+                              "availability and use Retry."),
+                }
+            else:
+                cutoff = _utc_now() + timedelta(seconds=60 if attempts == 1 else 300)
+                cutoff_text = cutoff.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+                patch = {
+                    "status": Status.FOUND, "jd_read_attempts": attempts,
+                    "jd_read_retry_at": cutoff.isoformat(),
+                    "jd_read_error": (
+                        f"Posting reader unavailable: {exc}. Attempt {attempts} of 3; "
+                        f"next eligible not before {cutoff_text}. "
+                        "This read attempt did not prepare or send an application."),
+                    "fail_kind": "", "fail_reason": "", "error": "",
+                }
+            committed, _ = _reader_patch(pk, row, stores, patch)
+        except Exception as fault:
+            return _reader_storage_error(pk, stores, row, fault)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         from core.events import emit
 
-        detail = str(exc)
-        stores.tracking.set_status(pk, Status.FOUND, jd_read_error=detail,
-                                   fail_kind="", fail_reason="")
-        emit("response", pk=pk, detail=f"Posting read deferred: {detail}", url=row.get("jd_url"))
+        if attempts >= 3:
+            detail = patch["error"]
+            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            return {"result": "error", "pk": pk, "reason": "jd_reader_exhausted",
+                    "detail": detail}
+        detail = patch["jd_read_error"]
+        emit("response", pk=pk, detail=detail, url=row.get("jd_url"))
         log.warning("posting read deferred for pk=%s: %s", pk, detail)
-        return {"result": "deferred", "pk": pk, "reason": "jd_reader_unavailable", "detail": detail}
+        return {"result": "deferred", "pk": pk, "reason": "jd_reader_unavailable",
+                "detail": detail}
 
-    if row.get("jd_read_error"):
-        stores.tracking.set_status(pk, Status.TAILORING, jd_read_error="")
+    # This commit is required even on an initially metadata-free row. A later
+    # FAILED exit must use its NEW witness, not the pre-read TAILORING witness.
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        committed, settled = _reader_patch(pk, row, stores, {
+            "jd_text": jd_text, "jd_read_attempts": 0,
+            "jd_read_retry_at": None, "jd_read_error": "",
+        })
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    row = settled
 
+    # Distinguish a known infrastructure outage from a successfully returned
+    # but unreadable/unsponsored page. Both content-derived terminal exits use
+    # the same guarded precondition, including the second post-metadata race.
     if _unreadable(jd_text):
-        # A posting we could not read is a posting we must not tailor for. The
-        # alternative was a résumé written against an error page and queued for
-        # an employer. Closed, not skipped: Retry puts it back through, so a page
-        # that was down for an hour, or a site that needs the browser, gets
-        # another chance once that is fixed.
-        from core.events import emit
         why = ("Could not read the posting — the page returned an error or almost "
                "no text. Nothing was tailored. Retry once the site is reachable.")
-        stores.tracking.set_status(pk, Status.FAILED, fail_reason=why, fail_kind="no_jd")
-        emit("failed", pk=pk, detail="posting unreadable — not tailored", url=row.get("jd_url"))
-        log.warning("unreadable posting for pk=%s (%d chars) — closed as no_jd", pk, len(jd_text or ""))
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.FAILED, "fail_reason": why, "fail_kind": "no_jd"})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        from core.events import emit
+        emit("failed", pk=pk, detail="posting unreadable — not tailored",
+             url=row.get("jd_url"))
         return {"result": "failed", "pk": pk, "reason": "no_jd"}
 
-    if _no_sponsorship(jd_text):  # dead end before we waste tailoring / an application
+    if _no_sponsorship(jd_text):
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.FAILED, "fail_reason": _NO_SPONSOR_REASON,
+                "skip_reason": "no_sponsorship"})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         from core.events import emit
-        stores.tracking.set_status(pk, Status.FAILED, fail_reason=_NO_SPONSOR_REASON,
-                                   skip_reason="no_sponsorship")
-        emit("failed", pk=pk, detail="no visa sponsorship — closed", url=row.get("jd_url"))
-        log.info("no-sponsorship, closing pk=%s", pk)
+        emit("failed", pk=pk, detail="no visa sponsorship — closed",
+             url=row.get("jd_url"))
         return {"result": "failed", "pk": pk, "reason": "no_sponsorship"}
 
-    sessions = _session_service()
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+
     state = _session_state(row, jd_text)
-    # create_session is async; a retry may find it already there.
-    existing = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
-    if existing is not None and _stale_seed(existing, state["base_latex"]):
-        # The session holds the résumé the tailor edits AND the anchors the
-        # truthfulness check validates against. Both come from the state captured
-        # when the session was FIRST created, so a row whose session predates an
-        # edit to base.tex keeps tailoring from the old résumé — and the check
-        # cannot object, because it is comparing against that same old copy. A
-        # project added to base.tex silently never reached an employer, and the
-        # stale-résumé guard could not help: it re-queues for tailoring, but
-        # re-tailoring reused this session and produced the same stale result.
-        await _reset_session(pk)
-        existing = None
-        log.info("base résumé changed since %s was first seen — starting it fresh", pk)
-    if existing is None:
-        await sessions.create_session(app_name=_APP, user_id=_USER, session_id=pk, state=state)
+    try:
+        sessions = _session_service()
+        # create_session is async; a retry may find it already there.
+        existing = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
+        if existing is not None and _stale_seed(existing, state["base_latex"]):
+            # A session seeded from an earlier résumé cannot be reused against
+            # a newer base. Reset and rebuild it, preserving the seed invariant.
+            await _reset_session(pk)
+            existing = None
+            log.info("base résumé changed since %s was first seen — starting it fresh", pk)
+        if existing is None:
+            await sessions.create_session(
+                app_name=_APP, user_id=_USER, session_id=pk, state=state)
+    except Exception as exc:
+        if row.get("jd_read_prepare_only"):
+            return _retry_session_error(pk, stores, row, exc, phase="setup")
+        raise
+    # Session lookup/create can itself take time. Check the independent hold
+    # key and confirmation again immediately before ADK preparation.
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
     from .graph import review_agent
     runner = Runner(agent=review_agent if prepare_only else root_agent,
                     app_name=_APP, session_service=sessions)
@@ -401,19 +615,33 @@ def _watchlist_browser_companies() -> set[str]:
 
 
 def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
-    """Fill in descriptions for browser-only postings before the sweep runs them.
+    """Fill only persisted, presently eligible browser FOUND rows.
 
-    Demand-driven: only rows about to be evaluated, only companies whose site
-    refuses a plain fetch, only rows with nothing usable yet. Read a batch per
-    browser session, and store what came back on the row so the per-row read
-    finds it and skips the browser entirely. Returns how many rows were filled.
+    Results are conditional against the pre-batch reader witness; neither a
+    status-only check nor a fresh post-batch GET can license a stale batch.
+    Missing results do not imply gone or consume a per-pk reader attempt.
     """
     from tools import jd as _jd
 
     browser = _browser_companies()
-    need = [r for r in rows
-            if (r.get("company") or "").strip().lower() in browser
-            and r.get("jd_url") and _unreadable(r.get("jd_text") or "")]
+    need = []
+    for supplied in rows:
+        pk = supplied.get("pk")
+        if not pk:
+            continue
+        try:
+            row = stores.tracking.get(pk)
+            if not row or not _reader_eligible(row) or not row.get("jd_url"):
+                continue
+            if ((row.get("company") or "").strip().lower() not in browser
+                    or not _unreadable(row.get("jd_text") or "")):
+                continue
+            if row.get("confirmation_id") or submit_hold.blocked(
+                    pk, row, tracking=stores.tracking):
+                continue
+            need.append(row)
+        except Exception:
+            log.exception("JD prefetch reader/tracking storage failed during selection for %s", pk)
     if not need:
         return 0
     log.info("reading %d browser-only posting(s) before the sweep", len(need))
@@ -423,22 +651,33 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
         log.warning("browser prefetch deferred: %s", exc)
         return 0
     filled = closed = 0
-    for r in need:
-        if r["jd_url"] in gone:
-            # The browser read the employer's own "no longer available" page.
-            # That is an answer: close the row rather than read it again next
-            # sweep, and rather than tailor for a job that does not exist.
-            stores.tracking.set_status(r["pk"], Status.JOB_GONE,
-                                       fail_reason="The posting has been removed.")
-            closed += 1
+    for observed in need:
+        pk, url = observed["pk"], observed["jd_url"]
+        if url not in gone and not got.get(url):
             continue
-        text = got.get(r["jd_url"])
-        if not text:
+        try:
+            check = _reader_check(pk, observed, stores)
+            if check:
+                continue
+            if url in gone:
+                patch = {"status": Status.JOB_GONE,
+                         "fail_reason": "The posting has been removed."}
+            else:
+                patch = {"jd_text": got[url], "jd_read_attempts": 0,
+                         "jd_read_retry_at": None, "jd_read_error": ""}
+            committed, _ = _reader_patch(pk, observed, stores, patch)
+        except Exception as exc:
+            # Do not let the caller's unconditional generic ERROR catch turn a
+            # late storage fault into an overwrite of a human terminal result.
+            _reader_storage_error(pk, stores, observed, exc)
             continue
-        stores.tracking.set_status(r["pk"], r.get("status") or Status.FOUND,
-                                   jd_text=text, jd_read_error="")
-        filled += 1
-    log.info("browser prefetch filled %d and closed %d of %d posting(s)", filled, closed, len(need))
+        if committed:
+            if url in gone:
+                closed += 1
+            else:
+                filled += 1
+    log.info("browser prefetch filled %d and closed %d of %d posting(s)",
+             filled, closed, len(need))
     return filled
 
 
@@ -512,7 +751,8 @@ def _save_output(pk: str, row: dict, jd_text: str, stores: Any) -> None:
 
 
 
-def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
+def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
+                   require_request: bool = True) -> dict:
     """Hand an approved job to the apply queue instead of applying it here.
 
     Approving is a decision; dispatching is the queue's job. When ▶ Apply ran the
@@ -527,29 +767,76 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False) -> dict:
     from core.apply_queue import ApplyQueue
 
     row = stores.tracking.get(pk) or {}
-    # Terminal states are refused here as well as at dispatch. Queueing an applied
-    # row is harmless (the duplicate guard catches it) but it spends that company's
-    # turn on a job that cannot run.
+    # Submission evidence outranks an absent request. Otherwise a stale row
+    # without approval conceals the durable hold from callers expecting the
+    # established uncertain-result contract.
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": "possible submission; check the employer portal before retrying"}
+                "detail": submit_hold.REASON}
+    if row.get("confirmation_id"):
+        return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
     if row.get("status") in ("applied", "applied_manual"):
         log.warning("refusing to queue %s: already %s", pk, row.get("status"))
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+    if require_request and (
+            not row.get("apply_requested_at")
+            or row.get("status") not in ("tailoring", "tailored")):
+        return {"result": "refused", "pk": pk,
+                "reason": "apply_request_or_preparation_not_current"}
 
     q = ApplyQueue(stores.tracking.r)
+    if require_request and pk in q.in_flight():
+        return {"result": "refused", "pk": pk, "reason": "apply_in_flight"}
     # A role the owner pressed Apply on already has its go-ahead. Marking it
     # "approval" is what put it back in front of them as a question.
     requested = bool(row.get("apply_requested_at"))
-    fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
-    stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
-                               **({"gate_pending": {}} if requested else {}),
-                               fail_reason="", fail_kind="")
-    ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
+    try:
+        fresh = q.put(pk, row.get("company") or "", priority=priority, requested=requested)
+        if not fresh:
+            # put() also returns False for an independent durable hold; treating
+            # every False as a duplicate used to overwrite APPLIED_MANUAL with
+            # TAILORED after a concurrent human outcome.
+            latest = stores.tracking.get(pk) or {}
+            if submit_hold.blocked(pk, latest, tracking=stores.tracking):
+                return {"result": "failed", "pk": pk, "reason": "uncertain",
+                        "detail": submit_hold.REASON}
+            if latest.get("confirmation_id"):
+                return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
+            if latest.get("status") in ("applied", "applied_manual"):
+                return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+            if (require_request and
+                    (not latest.get("apply_requested_at") or
+                     latest.get("status") not in ("tailoring", "tailored"))):
+                return {"result": "refused", "pk": pk,
+                        "reason": "apply_request_or_preparation_not_current"}
+            if any(item.get("pk") == pk for item in q.pending()):
+                return {"result": "already_queued", "pk": pk, "queued": False}
+            return {"result": "refused", "pk": pk, "reason": "apply_queue_put_refused"}
+
+        # A fresh queue item does not authorize a stale status write. Keep the
+        # row-local reader generation and exact admitted status as the atomic
+        # precondition; independent hold and confirmation are checked afresh.
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        if require_request and not (stores.tracking.get(pk) or {}).get("apply_requested_at"):
+            return {"result": "refused", "pk": pk,
+                    "reason": "apply_request_or_preparation_not_current"}
+        committed, _ = _reader_patch(pk, row, stores, {
+            "status": Status.TAILORED, "gate_reason": "" if requested else "approval",
+            **({"gate_pending": {}} if requested else {}),
+            "fail_reason": "", "fail_kind": "",
+        })
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        ahead = q.depth()["queued"].get((row.get("company") or "").strip().lower(), 0)
+    except Exception:
+        log.exception("apply queue/tracking operation failed for %s", pk)
+        return {"result": "error", "pk": pk, "reason": "apply_queue_tracking_error"}
     log.info("queued %s for apply%s (%s in that company's queue)",
              pk, " — NEXT, the owner just answered its question" if priority else "",
              ahead)
-    return {"result": "queued", "pk": pk, "queued": fresh, "company_depth": ahead}
+    return {"result": "queued", "pk": pk, "queued": True, "company_depth": ahead}
 
 
 # A quoted span that could be a form field label. The lookbehind/lookahead keep
@@ -773,7 +1060,7 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # re-queued items) still take the one-click ▶ Apply: approving one means
         # "run the browser apply for it now".
         if row.get("status") == "tailored":
-            return _enqueue_apply(pk, stores)
+            return _enqueue_apply(pk, stores, require_request=False)
         return {"result": "not_gated", "pk": pk}
 
     question = (row.get("gate_pending") or {}).get("question") or ""
@@ -822,7 +1109,8 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # A bare "Ready to apply?" is the opposite — that IS the decision, and in
         # gated mode the decision belongs to Process. So it queues as ordinary
         # work, exactly as before.
-        return _enqueue_apply(pk, stores, priority=bool(question) and not approval)
+        return _enqueue_apply(pk, stores, priority=bool(question) and not approval,
+                              require_request=False)
     return _run(_resume_job_async(pk, answer, call_id, stores))
 
 
@@ -1197,38 +1485,165 @@ async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> 
     return await _drive_async(runner, pk, resp, stores)
 
 
+def _active_apply_lease(pk: str, stores: Any) -> bool | None:
+    """Inspect the existing queue lease; unknown is never proof of inactivity."""
+    try:
+        # Test/cloud callers may already hold an existing queue inspector.
+        # Do not fabricate absence when the backend offers no such surface.
+        inspector = getattr(stores, "queue", None)
+        if callable(getattr(inspector, "in_flight", None)):
+            return pk in inspector.in_flight()
+        client = getattr(stores.tracking, "r", None)
+        if client is None:
+            return None
+        from core.apply_queue import ApplyQueue
+        return pk in ApplyQueue(client).in_flight()
+    except Exception:
+        log.exception("apply-queue lease inspection unavailable for %s", pk)
+        return None
+
+
 def retry_job(pk: str, stores: Any = None) -> dict:
-    """Re-run a job from scratch after a failed/errored attempt. Drops the old
-    (completed) ADK session and clears the terminal state so the pipeline runs
-    clean — picking up any facts added to the KB since the last try."""
+    """Recover a closed unsent job under ONE claim and admitted TAILORING row.
+
+    JD attention goes directly ERROR -> TAILORING with durable review-only
+    intent. No intermediate FOUND window can race the session deletion.
+    """
     stores = stores or make_stores()
-    row = stores.tracking.get(pk)
+    try:
+        row = stores.tracking.get(pk)
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
-    # Never let a retry wipe an APPLIED row back to found — that path re-runs the
-    # whole pipeline including the submit, i.e. a duplicate application.
+    # An independent submit hold is authoritative even if an old writer
+    # restored the row's status to FOUND. The public Retry response must not
+    # downgrade uncertainty into an innocuous "already_done".
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": "possible submission; check the employer portal before retrying"}
-    if row.get("status") in ("applied", "applied_manual"):
-        log.warning("retry refused for pk=%s: already %s", pk, row.get("status"))
-        from core.events import emit
-        emit("response", pk=pk, agent="applier", url=row.get("jd_url"),
-             detail=f"🛑 Retry refused — this job is already '{row.get('status')}'.")
+                "detail": submit_hold.REASON}
+    status = row.get("status")
+    if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
-    if row.get('status') == 'submitting' or _claimed(pk, stores):
-        # Wiping a row to `found` under a run that still owns it leaves the row
-        # unrunnable once that run dies: found, claimed, and skipped by recovery.
+    if status == "tailoring":
         from core.events import emit
         emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
         return {"result": "already_running", "pk": pk}
-    _run(_reset_session(pk))  # drop the finished session so the re-run starts clean
-    stores.tracking.set_status(pk, Status.FOUND, fail_reason="", fail_kind="",
-                               gate_pending=None, gate_call_id=None, skip_reason="")
-    from core.events import emit
-    emit("running", pk=pk, detail=f"retry · {row.get('title','')} @ {row.get('company','')}",
-         url=row.get("jd_url"))
-    return run_job(pk, stores)
+    if status not in ("skipped", "failed", "error", "job_gone", "capped"):
+        return {"result": "already_done", "pk": pk, "status": status}
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        if _claimed(pk, stores):
+            return {"result": "already_running", "pk": pk}
+        lease = _active_apply_lease(pk, stores)
+        if lease is None:
+            return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown",
+                    "detail": "Cannot safely inspect an in-flight application; restore queue inspection."}
+        if lease:
+            return {"result": "already_running", "pk": pk, "reason": "apply_in_flight"}
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+
+    # Skip keeps the original failure evidence. Treat it as reader attention
+    # even when the current closed status is SKIPPED, so Retry cannot fall
+    # back to the full apply graph after an exhausted JD read.
+    jd_attention = (
+        int(row.get("jd_read_attempts") or 0) >= 3
+        or row.get("fail_kind") in (
+            "jd_reader_exhausted", "jd_tracking_storage_error",
+            "jd_retry_session_error"))
+    claim = _claim(pk, stores)
+    if claim is None:
+        return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
+                "detail": "Cannot acquire evaluation claim; no session reset performed."}
+    if not claim:
+        return {"result": "already_running", "pk": pk}
+    try:
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            lease = _active_apply_lease(pk, stores)
+            if lease is None or lease:
+                return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown"
+                        if lease is None else "apply_in_flight"}
+            changes = {
+                "status": Status.TAILORING, "fail_reason": "",
+                "fail_kind": "", "skip_reason": "", "gate_pending": None,
+                "gate_call_id": None,
+            }
+            if jd_attention:
+                changes.update({
+                    "jd_read_attempts": 0, "jd_read_retry_at": None,
+                    "jd_read_error": "", "error": "",
+                    "jd_read_prepare_only": True,
+                    # This prior document was prepared against an older JD.
+                    # Its PDF key is not evidence of a successful NEW tailor.
+                    "resume_s3_key": "",
+                })
+            else:
+                changes["error"] = ""
+            committed, admitted = _reader_patch(pk, row, stores, changes)
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+
+        # Nothing below re-acquires the claim, and public run_job rejects
+        # TAILORING. The competing evaluator cannot touch this ADK session.
+        try:
+            check = _reader_check(pk, admitted, stores)
+            if check:
+                if check["result"] == "refused":
+                    # Protection appeared after the committed reset. Make the
+                    # interruption visible without clearing its evidence.
+                    try:
+                        _reader_patch(pk, admitted, stores, {
+                            "status": Status.ERROR,
+                            "error": ("Retry stopped by submission protection; "
+                                      "reconcile the outcome before Reopen.")})
+                    except Exception:
+                        log.exception("could not record protected recovery for %s", pk)
+                return check
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, admitted, exc)
+
+        try:
+            _run(_reset_session(pk))
+        except Exception as exc:
+            # No FOUND handoff gap and no second attention-write attempt after
+            # a storage failure. A later Retry can recover the recorded ERROR.
+            return _retry_session_error(pk, stores, admitted, exc, phase="reset")
+        from core.events import emit
+        emit("running", pk=pk,
+             detail=f"retry · {row.get('title','')} @ {row.get('company','')}",
+             url=row.get("jd_url"))
+        prepare_only = bool(admitted.get("jd_read_prepare_only")
+                            or admitted.get("discovery_source") == "career_ops")
+        try:
+            result = _run(_run_job_async(pk, admitted, stores, prepare_only=prepare_only))
+        except Exception as exc:
+            from .graph import ScorerModelError
+            if not isinstance(exc, ScorerModelError):
+                raise
+            detail = ("Scorer model/request failed; no valid score was received. "
+                      "Check the error log, then Reopen & re-score.")
+            stores.tracking.set_status(pk, Status.ERROR, match_score=None, error=detail)
+            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            raise
+        if (result or {}).get("result") == "prepared":
+            try:
+                current = stores.tracking.get(pk) or {}
+                if current.get("apply_requested_at"):
+                    return _enqueue_apply(pk, stores, priority=True,
+                                          require_request=True)
+            except Exception as exc:
+                return _reader_storage_error(pk, stores, admitted, exc)
+        return result
+    finally:
+        _release(pk, stores)
 
 
 def _stale_seed(session: Any, current_base: str) -> bool:
@@ -1489,7 +1904,14 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                     # only goes out when you say so is unchanged; what moved is
                     # where you say it — once per company, not once per card.
                     if reason == "approval":
-                        _enqueue_apply(pk, stores)
+                        if prepare_only:
+                            # Review-only recovery never invents approval.
+                            # An existing current explicit request remains valid.
+                            current = stores.tracking.get(pk) or {}
+                            if current.get("apply_requested_at"):
+                                _enqueue_apply(pk, stores, require_request=True)
+                        else:
+                            _enqueue_apply(pk, stores, require_request=False)
                     emit("gate", pk=pk, agent=author, detail=question, url=row.get("jd_url"),
                          screenshot=_art_url(row.get("screenshot_s3_key")))
                     log.info("gated pk=%s: %s", pk, question)
@@ -1527,10 +1949,11 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                                        fail_reason="No PDF was saved. Retry preparation.")
             return {"result": "failed", "pk": pk, "reason": "no_resume"}
         if row.get("apply_requested_at"):
-            # The owner pressed Apply: the score cleared the bar and the résumé
-            # is saved, so this is not a question for them. It goes to the apply
-            # queue, which starts it even while applying is paused by hand.
-            _enqueue_apply(pk, stores)
+            # Check fresh request/status/hold/confirmation inside enqueue, not
+            # the row read before preparation or a pre-recovery request.
+            queued = _enqueue_apply(pk, stores, require_request=True)
+            if queued.get("result") != "queued":
+                return queued
             emit("running", pk=pk, agent="applier",
                  detail="Résumé ready — queued to apply, as you asked")
             return {"result": "queued_apply", "pk": pk}

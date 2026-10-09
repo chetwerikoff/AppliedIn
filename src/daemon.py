@@ -93,9 +93,10 @@ def _sweep_found(stores) -> None:  # noqa: ANN001
     keeps getting scored + tailored 24/7 — the whole backlog gets assessed
     continuously and the good ones queue up to apply."""
     from core.models import Status
+    from agent.run import _reader_eligible
 
     waiting = [r for r in stores.tracking.query_status(Status.FOUND)
-               if not is_internal_pk(r.get("pk", ""))]
+               if not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
     for row in waiting[:3]:  # small batches — pace the LLM spend
         stores.queue.enqueue(stores.tailor_queue, {"pk": row["pk"]})
         log.info("sweep: queued waiting job %s", row["pk"])
@@ -440,7 +441,7 @@ def process_backlog_once(companies: list | None = None,
     loops are running. Blocking — run it in a background thread."""
     import asyncio
 
-    from agent.run import _apply_direct, prefetch_browser_jds, run_job
+    from agent.run import _apply_direct, _reader_eligible, prefetch_browser_jds, run_job
     from core import flags as _flags
     from core.config import get_settings
     from core.models import Status
@@ -458,7 +459,7 @@ def process_backlog_once(companies: list | None = None,
     # 1) EVALUATE — score + tailor every waiting `found` job. Qualifying jobs are
     #    enqueued to the apply queue by run_job; low scorers are skipped there.
     found = [r for r in stores.tracking.query_status(Status.FOUND)
-             if not is_internal_pk(r.get("pk", ""))]
+             if not is_internal_pk(r.get("pk", "")) and _reader_eligible(r)]
     if sel or skipped:
         found = [r for r in found if _in_scope(r.get("company"))]
     from core import preparation

@@ -9,6 +9,7 @@ Artifacts (PDFs) live on disk, not in Redis. Local mode is the real product.
 from __future__ import annotations
 
 import json
+from redis.exceptions import WatchError
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,59 @@ class RedisTracking(AbstractTracking):
             row["applied_at"] = datetime.now(timezone.utc).isoformat()
         row.update(attrs)
         self._write(pk, row, prev_status=prev)
+
+    def update_if_status(self, pk: str, expected_status: Status | str,
+                         updates: dict, *, expected_reader: dict) -> bool:
+        """Atomic current-row partial merge with exact status/reader witness.
+
+        WATCH catches intervening writes before the transaction executes; a
+        same-status reader generation mismatch is a conflict, not contention.
+        """
+        fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+                 "jd_text", "jd_read_prepare_only")
+        if set(expected_reader) - set(fixed):
+            raise ValueError("Unexpected reader witness key")
+        wanted_status = getattr(expected_status, "value", expected_status)
+        key = f"app:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    if raw is None:
+                        pipe.unwatch()
+                        return False
+                    row = json.loads(raw)
+                    if row.get("status") != wanted_status or any(
+                            (field in row) != (field in expected_reader)
+                            or (field in expected_reader
+                                and row[field] != expected_reader[field])
+                            for field in fixed):
+                        pipe.unwatch()
+                        return False
+                    previous = row.get("status")
+                    patch = {k: getattr(v, "value", v) if k == "status" else v
+                             for k, v in updates.items()}
+                    row.update(patch)
+                    status = row.get("status")
+                    if status == "tailored" and previous != "tailored" and not row.get("tailored_at"):
+                        from datetime import datetime
+                        row["tailored_at"] = datetime.now(UTC).isoformat()
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if not is_internal_pk(pk):
+                        if previous and previous != status:
+                            pipe.srem(f"status:{previous}", pk)
+                        if status:
+                            pipe.sadd(f"status:{status}", pk)
+                    if row.get("jd_hash"):
+                        pipe.hset("jdhash", row["jd_hash"], pk)
+                    pipe.execute()
+                    return True
+            except WatchError:
+                # Keep the caller's ORIGINAL expected status and witness.
+                continue
+        raise RuntimeError("Tracking row could not be updated after WATCH contention")
 
     def application_notes(self) -> dict:
         return {pk: json.loads(value) for pk, value in self.r.hgetall("application:notes").items()}

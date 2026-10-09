@@ -305,7 +305,7 @@ def test_retry_owns_session_reset_without_a_found_gap(monkeypatch):
         assert row["jd_read_attempts"] == 0
         assert row["jd_read_prepare_only"] is True
         assert run.run_job(pk, stores)["result"] == "already_done"
-        assert run.retry_job(pk, stores)["result"] == "already_done"
+        assert run.retry_job(pk, stores)["result"] == "already_running"
 
     async def private_run(session_pk, row, fake_stores, *, prepare_only=False):
         calls.append("private")

@@ -157,6 +157,25 @@ def test_verified_same_host_redirect_provides_relative_path_base(offline_pipelin
     )
 
 
+def test_http_to_https_upgrade_uses_verified_final_path(offline_pipeline):
+    stores = _Stores()
+
+    def handler(req):
+        if req.url.scheme == "http":
+            return httpx.Response(301, headers={
+                "Location": "https://example.test/openings/"})
+        return httpx.Response(200, text="<html>listing</html>")
+
+    with _static_client(handler) as client:
+        assert crawler.crawl_company(
+            _company("http://example.test/careers"), Preferences(), stores,
+            client=client, extractor=lambda *_: [_job("123?job_id=123")],
+        ) == 1
+    assert stores.tracking.put_calls[0].jd_url == (
+        "https://example.test/openings/123?job_id=123"
+    )
+
+
 def test_foreign_final_redirect_cannot_become_a_relative_base(offline_pipeline):
     stores = _Stores()
     def handler(req):
@@ -182,8 +201,8 @@ def test_foreign_final_redirect_cannot_become_a_relative_base(offline_pipeline):
     "https:jobs/123", "http:///jobs/123", "http://[broken/jobs/123",
     "https://example.test:bogus/jobs", "http://example.test:99999/jobs",
     "https://user@example.test/jobs/123", "//foreign.example.test/jobs/123",
-    "///foreign.example.test/jobs/123", "/jobs/\n123", "/jobs\\123",
-    "#fragment-only", "https://example.test/jobs/bad url",
+    "///foreign.example.test/jobs/123", "//?job_id=123", "/jobs/\n123", "/jobs\\123",
+    "/jobs/\u00a0bad", "#fragment-only", "https://example.test/jobs/bad url",
 ])
 def test_plain_rejected_extracted_row_causes_no_fallback_or_writes(
     href, offline_pipeline, monkeypatch,

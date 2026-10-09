@@ -1446,6 +1446,12 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
+    # An independent submit hold is authoritative even if an old writer
+    # restored the row's status to FOUND. The public Retry response must not
+    # downgrade uncertainty into an innocuous "already_done".
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": submit_hold.REASON}
     status = row.get("status")
     if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
@@ -1455,9 +1461,6 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return {"result": "already_running", "pk": pk}
     if status not in ("skipped", "failed", "error", "job_gone", "capped"):
         return {"result": "already_done", "pk": pk, "status": status}
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):
-        return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": submit_hold.REASON}
     try:
         check = _reader_check(pk, row, stores)
         if check:

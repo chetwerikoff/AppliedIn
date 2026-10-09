@@ -354,44 +354,116 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
 
 async def _run_job_async(pk: str, row: dict, stores: Any, *,
                          prepare_only: bool = False) -> dict:
+    """Settle the actual admitted TAILORING generation, never an old FOUND row."""
     from tools.jd import PostingReadUnavailable
 
     try:
         jd_text = await _jd_text(row)
     except PostingReadUnavailable as exc:
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            attempts = int(row.get("jd_read_attempts") or 0) + 1
+            if attempts >= 3:
+                patch = {
+                    "status": Status.ERROR,
+                    "jd_read_attempts": 3, "jd_read_retry_at": None,
+                    "jd_read_error": "", "fail_kind": "jd_reader_exhausted",
+                    "error": ("Posting reader exhausted three attempts; this read attempt "
+                              "did not prepare or send an application. Restore reader "
+                              "availability and use Retry."),
+                }
+            else:
+                cutoff = _utc_now() + timedelta(seconds=60 if attempts == 1 else 300)
+                cutoff_text = cutoff.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+                patch = {
+                    "status": Status.FOUND, "jd_read_attempts": attempts,
+                    "jd_read_retry_at": cutoff.isoformat(),
+                    "jd_read_error": (
+                        f"Posting reader unavailable: {exc}. Attempt {attempts} of 3; "
+                        f"next eligible not before {cutoff_text}. "
+                        "This read attempt did not prepare or send an application."),
+                    "fail_kind": "", "fail_reason": "", "error": "",
+                }
+            committed, _ = _reader_patch(pk, row, stores, patch)
+        except Exception as fault:
+            return _reader_storage_error(pk, stores, row, fault)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         from core.events import emit
 
-        detail = str(exc)
-        stores.tracking.set_status(pk, Status.FOUND, jd_read_error=detail,
-                                   fail_kind="", fail_reason="")
-        emit("response", pk=pk, detail=f"Posting read deferred: {detail}", url=row.get("jd_url"))
+        if attempts >= 3:
+            detail = patch["error"]
+            emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+            return {"result": "error", "pk": pk, "reason": "jd_reader_exhausted",
+                    "detail": detail}
+        detail = patch["jd_read_error"]
+        emit("response", pk=pk, detail=detail, url=row.get("jd_url"))
         log.warning("posting read deferred for pk=%s: %s", pk, detail)
-        return {"result": "deferred", "pk": pk, "reason": "jd_reader_unavailable", "detail": detail}
+        return {"result": "deferred", "pk": pk, "reason": "jd_reader_unavailable",
+                "detail": detail}
 
-    if row.get("jd_read_error"):
-        stores.tracking.set_status(pk, Status.TAILORING, jd_read_error="")
+    # This commit is required even on an initially metadata-free row. A later
+    # FAILED exit must use its NEW witness, not the pre-read TAILORING witness.
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+        committed, settled = _reader_patch(pk, row, stores, {
+            "jd_text": jd_text, "jd_read_attempts": 0,
+            "jd_read_retry_at": None, "jd_read_error": "",
+        })
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    row = settled
 
+    # Distinguish a known infrastructure outage from a successfully returned
+    # but unreadable/unsponsored page. Both content-derived terminal exits use
+    # the same guarded precondition, including the second post-metadata race.
     if _unreadable(jd_text):
-        # A posting we could not read is a posting we must not tailor for. The
-        # alternative was a résumé written against an error page and queued for
-        # an employer. Closed, not skipped: Retry puts it back through, so a page
-        # that was down for an hour, or a site that needs the browser, gets
-        # another chance once that is fixed.
-        from core.events import emit
         why = ("Could not read the posting — the page returned an error or almost "
                "no text. Nothing was tailored. Retry once the site is reachable.")
-        stores.tracking.set_status(pk, Status.FAILED, fail_reason=why, fail_kind="no_jd")
-        emit("failed", pk=pk, detail="posting unreadable — not tailored", url=row.get("jd_url"))
-        log.warning("unreadable posting for pk=%s (%d chars) — closed as no_jd", pk, len(jd_text or ""))
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.FAILED, "fail_reason": why, "fail_kind": "no_jd"})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        from core.events import emit
+        emit("failed", pk=pk, detail="posting unreadable — not tailored",
+             url=row.get("jd_url"))
         return {"result": "failed", "pk": pk, "reason": "no_jd"}
 
-    if _no_sponsorship(jd_text):  # dead end before we waste tailoring / an application
+    if _no_sponsorship(jd_text):
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.FAILED, "fail_reason": _NO_SPONSOR_REASON,
+                "skip_reason": "no_sponsorship"})
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
         from core.events import emit
-        stores.tracking.set_status(pk, Status.FAILED, fail_reason=_NO_SPONSOR_REASON,
-                                   skip_reason="no_sponsorship")
-        emit("failed", pk=pk, detail="no visa sponsorship — closed", url=row.get("jd_url"))
-        log.info("no-sponsorship, closing pk=%s", pk)
+        emit("failed", pk=pk, detail="no visa sponsorship — closed",
+             url=row.get("jd_url"))
         return {"result": "failed", "pk": pk, "reason": "no_sponsorship"}
+
+    try:
+        check = _reader_check(pk, row, stores)
+        if check:
+            return check
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, row, exc)
 
     sessions = _session_service()
     state = _session_state(row, jd_text)

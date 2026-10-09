@@ -296,6 +296,11 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
     if not _reader_eligible(row):
         return {"result": "already_done", "pk": pk, "status": row.get("status"),
                 "reason": "jd_read_not_eligible"}
+    # Keep the existing uncertain-submission response contract. A hold is
+    # checked independently of reader generation and is never cleared.
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": submit_hold.REASON}
     try:
         check = _reader_check(pk, row, stores)
     except Exception as exc:
@@ -309,6 +314,8 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
                 "detail": "Evaluation claim unavailable; no reader admission occurred."}
     if not claim:
+        from core.events import emit
+        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
         return {"result": "already_running", "pk": pk}
     try:
         try:
@@ -344,7 +351,10 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
             try:
                 current = stores.tracking.get(pk) or {}
                 if current.get("apply_requested_at"):
-                    return _enqueue_apply(pk, stores, priority=True, require_request=True)
+                    if admitted.get("jd_read_prepare_only"):
+                        return _enqueue_apply(pk, stores, priority=True,
+                                              require_request=True)
+                    return _enqueue_apply(pk, stores, priority=True)
             except Exception as exc:
                 return _reader_storage_error(pk, stores, admitted, exc)
         return result
@@ -1439,8 +1449,15 @@ def retry_job(pk: str, stores: Any = None) -> dict:
     status = row.get("status")
     if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+    if status == "tailoring":
+        from core.events import emit
+        emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
+        return {"result": "already_running", "pk": pk}
     if status not in ("skipped", "failed", "error", "job_gone", "capped"):
         return {"result": "already_done", "pk": pk, "status": status}
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": submit_hold.REASON}
     try:
         check = _reader_check(pk, row, stores)
         if check:

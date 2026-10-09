@@ -735,23 +735,22 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     from core.apply_queue import ApplyQueue
 
     row = stores.tracking.get(pk) or {}
-    if require_request and (
-            not row.get("apply_requested_at")
-            or row.get("status") not in ("tailoring", "tailored")
-            or row.get("confirmation_id")):
-        return {"result": "refused", "pk": pk,
-                "reason": "apply_request_or_preparation_not_current"}
-    if row.get("confirmation_id"):
-        return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
-    # Terminal states are refused here as well as at dispatch. Queueing an applied
-    # row is harmless (the duplicate guard catches it) but it spends that company's
-    # turn on a job that cannot run.
+    # Submission evidence outranks an absent request. Otherwise a stale row
+    # without approval conceals the durable hold from callers expecting the
+    # established uncertain-result contract.
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
-                "detail": "possible submission; check the employer portal before retrying"}
+                "detail": submit_hold.REASON}
+    if row.get("confirmation_id"):
+        return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
     if row.get("status") in ("applied", "applied_manual"):
         log.warning("refusing to queue %s: already %s", pk, row.get("status"))
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+    if require_request and (
+            not row.get("apply_requested_at")
+            or row.get("status") not in ("tailoring", "tailored")):
+        return {"result": "refused", "pk": pk,
+                "reason": "apply_request_or_preparation_not_current"}
 
     q = ApplyQueue(stores.tracking.r)
     if require_request and pk in q.in_flight():

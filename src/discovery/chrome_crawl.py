@@ -253,7 +253,13 @@ def _posted_iso(raw: object) -> str:
 async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
                     model: str = "") -> tuple[list[JobRecord], str, str]:
     """Postings on `careers_url` that fit `prefs`. Returns (jobs, board, note)."""
+    from .crawler import _http_url_parts, _trusted_posting_url
     from tools.browser_runtime import available, run_task
+
+    # The configured listing source, not a model-returned base, is authoritative.
+    # Reject it before starting even the initial browser listing session.
+    if _http_url_parts(careers_url) is None:
+        return [], "", "Invalid careers listing URL"
 
     ok, why = available()
     if not ok:
@@ -315,10 +321,10 @@ async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
         if not isinstance(row, dict):
             continue
         title = str(row.get("title") or "").strip()
-        url = str(row.get("url") or "").strip()
-        # A posting we cannot link to is one the owner cannot apply to, and a
-        # title with no URL is usually the model summarising rather than reading.
-        if not title or not url.startswith("http"):
+        # Relative links belong to the trusted careers listing. Never use a
+        # model-supplied origin, and never reinterpret an absolute external ATS.
+        url = _trusted_posting_url(row.get("url"), careers_url)
+        if not title or url is None:
             continue
         jobs.append(JobRecord(
             company=company,

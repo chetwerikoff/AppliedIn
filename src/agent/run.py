@@ -1515,10 +1515,14 @@ def retry_job(pk: str, stores: Any = None) -> dict:
     except Exception as exc:
         return _reader_storage_error(pk, stores, row, exc)
 
-    jd_attention = (status == "error" and
-                    (int(row.get("jd_read_attempts") or 0) >= 3
-                     or row.get("fail_kind") in (
-                         "jd_reader_exhausted", "jd_tracking_storage_error")))
+    # Skip keeps the original failure evidence. Treat it as reader attention
+    # even when the current closed status is SKIPPED, so Retry cannot fall
+    # back to the full apply graph after an exhausted JD read.
+    jd_attention = (
+        int(row.get("jd_read_attempts") or 0) >= 3
+        or row.get("fail_kind") in (
+            "jd_reader_exhausted", "jd_tracking_storage_error",
+            "jd_retry_session_error"))
     claim = _claim(pk, stores)
     if claim is None:
         return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
@@ -1544,6 +1548,9 @@ def retry_job(pk: str, stores: Any = None) -> dict:
                     "jd_read_attempts": 0, "jd_read_retry_at": None,
                     "jd_read_error": "", "error": "",
                     "jd_read_prepare_only": True,
+                    # This prior document was prepared against an older JD.
+                    # Its PDF key is not evidence of a successful NEW tailor.
+                    "resume_s3_key": "",
                 })
             else:
                 changes["error"] = ""
@@ -1572,7 +1579,29 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         except Exception as exc:
             return _reader_storage_error(pk, stores, admitted, exc)
 
-        _run(_reset_session(pk))
+        try:
+            _run(_reset_session(pk))
+        except Exception as exc:
+            # The ERROR -> TAILORING reset already committed; without a
+            # guarded settlement, a failed ADK session reset leaves this job
+            # unreachable by Retry, direct run_job, and the FOUND sweep.
+            log.exception("Retry session reset failed for %s", pk)
+            detail = ("Retry could not reset its preparation session. No posting "
+                      "was read, prepared or sent; restore the session service "
+                      "and use Retry.")
+            try:
+                committed, _ = _reader_patch(pk, admitted, stores, {
+                    "status": Status.ERROR, "fail_kind": "jd_retry_session_error",
+                    "jd_read_error": "", "error": detail})
+            except Exception as fault:
+                return _reader_storage_error(pk, stores, admitted, fault)
+            if not committed:
+                return {"result": "conflict", "pk": pk,
+                        "reason": "jd_reader_state_changed"}
+            from core.events import emit
+            emit("error", pk=pk, url=row.get("jd_url"), detail=detail)
+            return {"result": "error", "pk": pk,
+                    "reason": "jd_retry_session_error", "detail": detail}
         from core.events import emit
         emit("running", pk=pk,
              detail=f"retry · {row.get('title','')} @ {row.get('company','')}",

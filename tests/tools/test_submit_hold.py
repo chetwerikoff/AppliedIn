@@ -523,6 +523,167 @@ def test_resolve_uncertain_needs_key_or_legacy_and_fresh_decision(
     assert not submit_hold.is_held(PK, tracking=stores.tracking)
 
 
+@pytest.mark.parametrize("route", ["mark", "resolve"])
+def test_other_job_at_same_company_still_cannot_write_during_worker(
+        world, route):
+    """A sibling pk is not independent while its company lease is held."""
+    stores, queue = world
+    sibling = "example-co#job-2"
+    stores.tracking.set_status(sibling, Status.NEEDS_HUMAN,
+                               company="example-co")
+    if route == "resolve":
+        submit_hold.mark(sibling, tracking=stores.tracking)
+    before = stores.tracking.get(sibling)
+    assert queue.put(PK, "example-co")
+    worker = queue.next(only="example-co")
+    assert worker is not None
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == endpoint_path)
+    payload = ({} if route == "mark" else {
+        "portal_checked": True, "outcome": "submitted",
+        "confirmation": "Synthetic receipt"})
+    try:
+        assert endpoint(sibling, payload) == {
+            "ok": False, "error": "An application attempt is still in flight."}
+        assert stores.tracking.get(sibling) == before
+        assert submit_hold.is_held(sibling, tracking=stores.tracking) == (
+            route == "resolve")
+        assert queue.in_flight() == {PK}
+    finally:
+        queue.done(worker)
+
+
+@pytest.mark.parametrize("route", ["mark", "resolve"])
+def test_stale_submitting_status_without_lease_fails_closed(world, route):
+    """Orphan SUBMITTING is not proof that a write-capable run has stopped."""
+    stores, queue = world
+    if route == "resolve":
+        submit_hold.mark(PK, tracking=stores.tracking)
+    before = stores.tracking.get(PK)
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == endpoint_path)
+    payload = ({} if route == "mark" else {
+        "portal_checked": True, "outcome": "submitted",
+        "confirmation": "Synthetic receipt"})
+    assert not queue.in_flight()
+    assert endpoint(PK, payload) == {
+        "ok": False, "error": "Cannot prove that the attempt has stopped."}
+    assert stores.tracking.get(PK) == before
+    assert submit_hold.is_held(PK, tracking=stores.tracking) == (
+        route == "resolve")
+
+
+@pytest.mark.parametrize("route", ["mark", "resolve"])
+def test_human_outcome_refuses_unreadable_target_pk_witness(
+        world, monkeypatch, route):
+    stores, _ = world
+    stores.tracking.set_status(PK, Status.NEEDS_HUMAN)
+    if route == "resolve":
+        submit_hold.mark(PK, tracking=stores.tracking)
+    before = stores.tracking.get(PK)
+    monkeypatch.setattr(ApplyQueue, "in_flight",
+                        lambda self: (_ for _ in ()).throw(
+                            OSError("Synthetic Redis read unavailable")))
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == endpoint_path)
+    payload = ({} if route == "mark" else {
+        "portal_checked": True, "outcome": "submitted",
+        "confirmation": "Synthetic receipt"})
+    assert endpoint(PK, payload) == {
+        "ok": False, "error": "Cannot prove that the attempt has stopped."}
+    assert stores.tracking.get(PK) == before
+    assert submit_hold.is_held(PK, tracking=stores.tracking) == (
+        route == "resolve")
+
+
+@pytest.mark.parametrize("route", ["mark", "resolve"])
+def test_company_change_after_human_claim_refuses_and_releases_lease(
+        world, monkeypatch, route):
+    stores, queue = world
+    stores.tracking.set_status(PK, Status.NEEDS_HUMAN)
+    if route == "resolve":
+        submit_hold.mark(PK, tracking=stores.tracking)
+    before = stores.tracking.get(PK)
+    original_get = stores.tracking.get
+    reads = []
+
+    def changed_second_read(pk):
+        row = original_get(pk)
+        reads.append(pk)
+        return {**row, "company": "other-example-co"} if len(reads) >= 2 else row
+
+    monkeypatch.setattr(stores.tracking, "get", changed_second_read)
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == endpoint_path)
+    payload = ({} if route == "mark" else {
+        "portal_checked": True, "outcome": "submitted",
+        "confirmation": "Synthetic receipt"})
+    result = endpoint(PK, payload)
+    assert result == {
+        "ok": False, "error": "The job company changed; outcome was not recorded."}
+    monkeypatch.setattr(stores.tracking, "get", original_get)
+    assert stores.tracking.get(PK) == before
+    assert queue.depth()["running"] == []
+    assert submit_hold.is_held(PK, tracking=stores.tracking) == (
+        route == "resolve")
+
+
+@pytest.mark.parametrize("route", ["mark", "resolve_submitted", "resolve_not_submitted"])
+def test_human_result_is_persisted_before_existing_hold_cleared(
+        world, monkeypatch, route):
+    stores, queue = world
+    forms.hold_possible_submission(PK, {"last_button": "Submit", "url": URL})
+    expected = "tailored" if route == "resolve_not_submitted" else "applied_manual"
+    original_clear = submit_hold.clear
+    observed = []
+
+    def clear_after_result(pk, *, tracking=None):
+        assert pk == PK
+        assert stores.tracking.get(pk)["status"] == expected
+        assert submit_hold.is_held(pk, tracking=tracking)
+        observed.append(pk)
+        return original_clear(pk, tracking=tracking)
+
+    monkeypatch.setattr(submit_hold, "clear", clear_after_result)
+    endpoint_path = ("/actions/mark-applied/{pk}" if route == "mark"
+                     else "/actions/resolve-uncertain/{pk:path}")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == endpoint_path)
+    payload = ({} if route == "mark" else {
+        "portal_checked": True,
+        "outcome": "not_submitted" if route == "resolve_not_submitted" else "submitted",
+        "confirmation": "Synthetic receipt", "new_apply_decision": True})
+    assert endpoint(PK, payload)["ok"]
+    assert observed == [PK]
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+    assert not queue.pending()
+
+
+@pytest.mark.parametrize("legacy_flag", [
+    {"possible_submission": True},
+    {"fail_kind": "uncertain"},
+    {"gate_reason": "submit_uncertain"},
+])
+def test_legacy_uncertain_witness_is_independently_sufficient(world, legacy_flag):
+    stores, _ = world
+    stores.tracking.set_status(PK, Status.NEEDS_HUMAN, **legacy_flag)
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == "/actions/resolve-uncertain/{pk:path}")
+    assert endpoint(PK, {"portal_checked": True, "outcome": "submitted",
+                         "confirmation": "Synthetic portal receipt"}) == {
+        "ok": True, "status": "applied_manual"}
+    assert stores.tracking.get(PK)["status"] == "applied_manual"
+
+
 def test_mark_applied_default_note_does_not_require_hold(world):
     stores, _ = world
     stores.tracking.set_status(PK, Status.TAILORED)  # a stopped, unheld job

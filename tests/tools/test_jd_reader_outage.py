@@ -423,3 +423,223 @@ def test_storage_fault_after_manual_interleaving_stays_inside_daemon(monkeypatch
 
 async def _synthetic_good():
     return GOOD
+
+
+@pytest.mark.parametrize("mode", ["auto", "gated"])
+@pytest.mark.parametrize("requested", ["", "2030-01-01T00:00:00+00:00"])
+def test_review_only_generic_ready_gate_never_creates_submission_authority(
+        monkeypatch, mode, requested):
+    from core import flags
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.TAILORING,
+                        resume_s3_key="resumes/example-co-job-1.pdf",
+                        apply_requested_at=requested, match_score=9,
+                        jd_read_prepare_only=True)
+    stores = SimpleNamespace(tracking=tracking)
+    emits = []
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: emits.append(a))
+    monkeypatch.setattr(flags, "apply_mode", lambda: mode)
+    monkeypatch.setattr(run, "_auto_decision",
+                        lambda *a: pytest.fail("prepare-only cannot auto-approve"))
+
+    class ReadyEvent:
+        author = "review"
+        content = None
+
+        def get_function_calls(self):
+            return [SimpleNamespace(name="ask_human", id="synthetic-call",
+                                    args={"question": "Ready to apply?"})]
+
+        def get_function_responses(self):
+            return []
+
+    class ReviewRunner:
+        async def run_async(self, **kwargs):
+            yield ReadyEvent()
+
+    result = run._run(run._drive_async(
+        ReviewRunner(), pk, SimpleNamespace(), stores, prepare_only=True))
+    assert result["result"] == "gated"
+    assert tracking.get(pk)["status"] == "tailored"
+    assert tracking.get(pk)["apply_requested_at"] == requested
+    queue = ApplyQueue(tracking.r)
+    pending = [it for it in queue.pending() if it["pk"] == pk]
+    assert bool(pending) is bool(requested)
+    assert all(ev[0] != "applied" for ev in emits)
+
+
+def test_recovered_reader_uses_review_agent_for_ordinary_posting(monkeypatch):
+    from agent import graph
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_read_attempts=3,
+                        fail_kind="jd_reader_exhausted", jd_read_revision=8,
+                        apply_requested_at="")
+    stores = SimpleNamespace(tracking=tracking)
+    agents = []
+    events = []
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: events.append(a))
+    monkeypatch.setattr(run, "_session_state",
+                        lambda row, text: {"base_latex": "Test User synthetic seed"})
+    monkeypatch.setattr(run, "_save_output", lambda *a, **kw: None)
+
+    class Sessions:
+        async def get_session(self, **kwargs):
+            return None
+
+        async def create_session(self, **kwargs):
+            return None
+
+        async def delete_session(self, **kwargs):
+            return None
+
+    monkeypatch.setattr(run, "_session_service", lambda: Sessions())
+
+    async def recovered(row, **kwargs):
+        return GOOD
+
+    monkeypatch.setattr(run, "_jd_text", recovered)
+
+    class FakeRunner:
+        def __init__(self, agent, **kw):
+            agents.append(agent)
+
+    monkeypatch.setattr(run, "Runner", FakeRunner)
+
+    async def prepared(runner, pk, message, stores, *, prepare_only):
+        assert prepare_only
+        stores.tracking.set_status(pk, Status.TAILORED,
+                                   resume_s3_key="resumes/example-co-job-1.pdf")
+        return {"result": "prepared", "pk": pk}
+
+    monkeypatch.setattr(run, "_drive_async", prepared)
+    assert run.retry_job(pk, stores)["result"] == "prepared"
+    assert agents == [graph.review_agent]
+    assert tracking.get(pk)["jd_read_attempts"] == 0
+    assert tracking.get(pk)["jd_read_prepare_only"] is True
+    assert tracking.get(pk)["jd_read_error"] == ""
+    assert tracking.get(pk)["status"] == "tailored"
+    assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+def test_preparation_only_enqueue_rechecks_revoked_request(monkeypatch):
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    stores = SimpleNamespace(tracking=tracking)
+    tracking.set_status(pk, Status.TAILORED,
+                        resume_s3_key="resumes/example-co-job-1.pdf",
+                        jd_read_prepare_only=True, apply_requested_at="")
+    assert run._enqueue_apply(pk, stores, require_request=True)["result"] == "refused"
+    assert not any(item["pk"] == pk for item in ApplyQueue(tracking.r).pending())
+    tracking.set_status(pk, Status.TAILORED,
+                        apply_requested_at="2030-01-01T00:00:00+00:00",
+                        confirmation_id="synthetic-confirmed")
+    assert run._enqueue_apply(pk, stores, require_request=True)["result"] == "refused"
+    assert not ApplyQueue(tracking.r).pending()
+
+
+def test_reopen_safe_closed_row_schedules_once_and_conflicts_stop(monkeypatch):
+    from fastapi import BackgroundTasks
+    import server
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.SKIPPED, skip_reason="synthetic")
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(server, "make_stores", lambda *a, **kw: stores)
+    monkeypatch.setattr(server, "get_settings", lambda: SimpleNamespace())
+    events = []
+    monkeypatch.setattr("core.events.emit", lambda *a, **kw: events.append(a))
+    app = server.create_app()
+    callback = next(r.endpoint for r in app.routes
+                    if getattr(r, "path", "") == "/actions/reopen/{pk:path}")
+    tasks = BackgroundTasks()
+    result = callback(pk, tasks)
+    assert result["ok"] is True
+    assert tracking.get(pk)["status"] == "found"
+    assert tracking.get(pk)["jd_read_revision"] == 1
+    assert len(tasks.tasks) == 1
+    assert len(events) == 1
+
+    tracking.set_status(pk, Status.FAILED, jd_read_attempts=0,
+                        jd_read_retry_at=None)
+    before = tracking.get(pk)
+    orig = tracking.update_if_status
+
+    def manual_wins(*a, **kw):
+        tracking.set_status(pk, Status.APPLIED_MANUAL,
+                            confirmation_id="synthetic-confirmed")
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(tracking, "update_if_status", manual_wins)
+    events.clear()
+    tasks = BackgroundTasks()
+    assert callback(pk, tasks)["error"] == "conflict"
+    assert tracking.get(pk)["status"] == "applied_manual"
+    assert tracking.get(pk)["jd_read_attempts"] == before["jd_read_attempts"]
+    assert not events
+    assert not tasks.tasks
+
+
+def test_process_backlog_contains_reader_storage_fault_after_manual_decision(
+        monkeypatch):
+    from contextlib import nullcontext
+    from tools import submit_hold
+    import daemon
+    from core import flags, preparation
+
+    _quiet(monkeypatch)
+    tracking, pk = _synthetic_tracking()
+    stores = SimpleNamespace(tracking=tracking)
+    monkeypatch.setattr(daemon, "make_stores", lambda: stores)
+    monkeypatch.setattr(flags, "skipped_companies", lambda: set())
+    monkeypatch.setattr(flags, "stop_epoch", lambda: 0)
+    monkeypatch.setattr(daemon, "_pass_cancelled", lambda *a, **kw: False)
+    monkeypatch.setattr(run, "_browser_companies", lambda: set())
+    monkeypatch.setattr(run, "_jd_text", lambda *a, **kw: _synthetic_good())
+    from types import SimpleNamespace as SN
+
+    class Progress:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def start(self, row):
+            pass
+
+        def complete(self, status):
+            pass
+
+    monkeypatch.setattr(preparation, "track", lambda selected: Progress())
+    original = tracking.update_if_status
+    original_set = tracking.set_status
+    writes = []
+    terminal = []
+    counter = [0]
+
+    def set_status(pk, status, **attrs):
+        if status == Status.ERROR:
+            writes.append(attrs)
+        return original_set(pk, status, **attrs)
+
+    def faulty(pk, expected_status, updates, *, expected_reader):
+        counter[0] += 1
+        if counter[0] == 2:
+            original_set(pk, Status.APPLIED_MANUAL, confirmation_id="synthetic")
+            submit_hold.mark(pk, tracking=tracking)
+            terminal.append(tracking.get(pk))
+            raise RuntimeError("synthetic storage error")
+        return original(pk, expected_status, updates, expected_reader=expected_reader)
+
+    monkeypatch.setattr(tracking, "set_status", set_status)
+    monkeypatch.setattr(tracking, "update_if_status", faulty)
+    result = daemon.process_backlog_once(prepare_only=True)
+    assert result["evaluated"] == 1
+    assert not writes
+    assert tracking.get(pk) == terminal[0]
+    assert submit_hold.is_held(pk, tracking=tracking)
+    assert not tracking.r.exists(f"lock:job:{pk}")

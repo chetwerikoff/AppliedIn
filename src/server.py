@@ -1373,42 +1373,69 @@ def create_app() -> FastAPI:
 
     @app.post("/actions/reopen/{pk:path}")
     def reopen(pk: str, background: BackgroundTasks):
-        """Put a closed job back in play so it is scored again from scratch.
+        """Only safely closed, unsent, inactive rows can be reopened.
 
-        The case this exists for: a role was skipped as a low score under
-        preferences that were wrong, and the preferences have since been fixed.
-        `run_job` refuses anything that is not `found`, so "Run now" on a skipped
-        card did nothing at all and looked broken — the job had no way back.
-
-        Reopening clears the verdict, not the history: the score, the skip reason
-        and any failure text are dropped so the next run cannot inherit them, and
-        the row returns to `found` where discovery and scoring can see it again.
+        A suspended reader or an in-flight submit must not be resurrected by a
+        stale status-only reset. Reopen preserves the reader budget and intent.
         """
+        from agent.run import (_active_apply_lease, _claimed, _reader_check,
+                               _reader_patch)
+
         stores = make_stores(settings)
-        row = stores.tracking.get(pk)
+        try:
+            row = stores.tracking.get(pk)
+        except Exception:
+            return {"ok": False, "error": "Tracking storage unavailable; restore it before Reopen."}
         if not row:
             return {"ok": False, "error": "unknown job"}
         status = str(row.get("status") or "")
-        # Same rule as skip and retry: what has been sent is not reopened. Running
-        # it again would tailor and queue a role this employer already has.
-        if submit_hold.blocked(pk, row, tracking=stores.tracking):
-            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
-        if status in ("applied", "applied_manual") or row.get("confirmation_id"):
+        allowed = {"skipped", "failed", "error", "job_gone", "capped"}
+        if status not in allowed:
             return {"ok": False, "error": "refused",
-                    "note": f"This one is already '{status or 'applied'}'. Reopening "
-                            "it would send a second application for the same role."}
-        stores.tracking.set_status(pk, Status.FOUND, skip_reason="", fail_reason="",
-                                   fail_kind="", error="", match_score=None,
-                                   gate_reason="", gate_pending=None, gate_call_id=None)
+                    "note": "Only inactive, closed, unsent jobs can be reopened; "
+                            "do not re-open a live or submitted application."}
+        if status == "error" and (
+                int(row.get("jd_read_attempts") or 0) >= 3
+                or row.get("fail_kind") in ("jd_reader_exhausted",
+                                             "jd_tracking_storage_error")):
+            return {"ok": False, "error": "jd_reader_attention",
+                    "note": "Reader attention requires Retry, not Reopen."}
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return {"ok": False, "error": check["reason"],
+                        "note": "Reconcile the submission or refresh this row before Reopen."}
+            if _claimed(pk, stores):
+                return {"ok": False, "error": "evaluation_active",
+                        "note": "Wait for the active evaluation claim to finish."}
+            active = _active_apply_lease(pk, stores)
+            if active is None:
+                return {"ok": False, "error": "apply_lease_unknown",
+                        "note": "Restore application-queue lease inspection before Reopen."}
+            if active:
+                return {"ok": False, "error": "apply_in_flight",
+                        "note": "Reconcile the active application before Reopen."}
+            check = _reader_check(pk, row, stores)
+            if check:
+                return {"ok": False, "error": check["reason"],
+                        "note": "Protection or tracking state changed; refresh before Reopen."}
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.FOUND, "skip_reason": "", "fail_reason": "",
+                "fail_kind": "", "error": "", "match_score": None,
+                "gate_reason": "", "gate_pending": None, "gate_call_id": None,
+            })
+        except Exception:
+            return {"ok": False, "error": "Tracking/claim/lease inspection failed; "
+                    "restore storage and check the job before Reopen."}
+        if not committed:
+            return {"ok": False, "error": "conflict",
+                    "note": "The job changed during Reopen; refresh before retrying."}
         from core.events import emit
 
         emit("running", pk=pk, agent="workflow", url=row.get("jd_url"),
              detail=f"reopened · {row.get('title','')} @ {row.get('company','')} "
-                    f"(was {status or 'closed'}) — scoring again")
+                    f"(was {status}) — scoring again")
 
-        # Scored immediately rather than left for the next sweep: someone
-        # reopening a job is watching it, and a card that goes quiet for an hour
-        # is the same silence that made this look broken in the first place.
         def _run() -> None:
             import logging
 

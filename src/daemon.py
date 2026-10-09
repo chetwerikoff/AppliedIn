@@ -20,6 +20,15 @@ import time
 from typing import Any
 import sys
 
+# A typo or extra argument in a synthetic-only invocation must NEVER fall
+# through into the production worker/dashboard startup. Library imports are
+# unaffected, and the ordinary no-argument daemon still starts as before.
+if __name__ == "__main__" and sys.argv[1:] not in (
+        [], ["--synthetic-browser-fixture"]):
+    raise SystemExit(
+        "Unsupported daemon arguments: use 'python -m daemon' with no arguments "
+        "or exactly 'python -m daemon --synthetic-browser-fixture'.")
+
 # The one-shot fixture must exit BEFORE core.stores imports core.config, dotenv
 # and LiteLLM. Every normal -m daemon and import daemon retains the old globals.
 if __name__ == "__main__" and sys.argv[1:] == ["--synthetic-browser-fixture"]:

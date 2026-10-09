@@ -812,3 +812,55 @@ def test_ordinary_python_module_daemon_still_enters_workers_and_server(tmp_path)
     assert "ORDINARY_THREAD:apply" in result.stdout
     assert "ORDINARY_THREAD:heartbeat" in result.stdout
     assert "ORDINARY_THREAD:discovery" not in result.stdout
+
+
+@pytest.mark.parametrize("extra_args", [
+    ["--synthetic-browser-fixture", "--help"],
+    ["--synthetic-browser-fixture", "--other"],
+    ["--help"],
+    ["--unknown-option"],
+    ["--synthetic-browser-fixture", "--synthetic-browser-fixture"],
+])
+def test_invalid_daemon_cli_args_refuse_before_any_product_import(
+        tmp_path, extra_args):
+    """The old fallthrough imported stores/workers before noticing extra argv.
+
+    Start a clean Python interpreter; intercept repository imports and socket
+    operations *before* daemon imports. No real workers, BSK, or owner data.
+    """
+    site = tmp_path / "sitecustomize.py"
+    site.write_text(r'''
+import builtins
+import socket
+original_import = builtins.__import__
+def checked_import(name, *args, **kwargs):
+    if name in {"core.logging", "core.stores", "core.ids",
+                "tools.browser_skill_fixture", "server"}:
+        raise AssertionError("FORBIDDEN_PRODUCTION_IMPORT:" + name)
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = checked_import
+def no_network(*args, **kwargs):
+    raise AssertionError("FORBIDDEN_NETWORK_OPERATION")
+socket.socket.connect = no_network
+socket.socket.bind = no_network
+socket.create_connection = no_network
+socket.getaddrinfo = no_network
+''')
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=os.pathsep.join([str(tmp_path), str(root / "src")]),
+        APPLIEDIN_DISCOVERY="on",
+        PYTHON_DOTENV_DISABLED="1",
+        LITELLM_LOCAL_MODEL_COST_MAP="True",
+        OPENAI_API_KEY="synthetic-not-a-real-secret",
+    )
+    child = subprocess.run(
+        [sys.executable, "-m", "daemon", *extra_args],
+        cwd=tmp_path, env=env, text=True, capture_output=True, timeout=25)
+    assert child.returncode != 0
+    assert "Unsupported daemon arguments" in child.stderr
+    assert "FORBIDDEN_PRODUCTION_IMPORT" not in child.stderr
+    assert "FORBIDDEN_NETWORK_OPERATION" not in child.stderr
+    assert not list(tmp_path.glob("*.lock"))
+    assert not (tmp_path / ".local").exists()

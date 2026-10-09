@@ -798,15 +798,27 @@ def test_ordinary_python_module_daemon_still_enters_workers_and_server(tmp_path)
         builtins.__import__ = import_hook
     '''))
     root = Path(__file__).resolve().parents[2]
-    env = dict(os.environ)
-    env.pop("PYTHON_DOTENV_DISABLED", None)
-    env.update(PYTHONPATH=os.pathsep.join([str(tmp_path), str(root / "src")]),
-               APPLIEDIN_DISCOVERY="off", LITELLM_LOCAL_MODEL_COST_MAP="True")
+    synthetic_port = 18793  # Deliberately not the daemon's default port.
+    # Never inherit owner/provider settings or read a repository .env.
+    # The normal daemon entry and its fake stores/server/threads stay unchanged.
+    env = {
+        "HOME": str(tmp_path),
+        "PATH": os.defpath,
+        "PYTHONPATH": os.pathsep.join([str(tmp_path), str(root / "src")]),
+        "PYTHON_DOTENV_DISABLED": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        "APPLIEDIN_MODE": "local",
+        "APPLIEDIN_DISCOVERY": "off",
+        "APPLIEDIN_WEB_PORT": str(synthetic_port),
+        "PYTHONNOUSERSITE": "1",
+    }
     result = subprocess.run(
         [sys.executable, "-m", "daemon"], cwd=tmp_path, env=env,
         text=True, capture_output=True, timeout=45)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    assert "ORDINARY_SERVER:8787" in result.stdout
+    server_lines = [line for line in result.stdout.splitlines()
+                    if line.startswith("ORDINARY_SERVER:")]
+    assert server_lines == [f"ORDINARY_SERVER:{synthetic_port}"]
     assert result.stdout.count("ORDINARY_THREAD:") == 3
     assert "ORDINARY_THREAD:evaluate" in result.stdout
     assert "ORDINARY_THREAD:apply" in result.stdout

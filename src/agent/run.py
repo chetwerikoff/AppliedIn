@@ -565,19 +565,33 @@ def _watchlist_browser_companies() -> set[str]:
 
 
 def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
-    """Fill in descriptions for browser-only postings before the sweep runs them.
+    """Fill only persisted, presently eligible browser FOUND rows.
 
-    Demand-driven: only rows about to be evaluated, only companies whose site
-    refuses a plain fetch, only rows with nothing usable yet. Read a batch per
-    browser session, and store what came back on the row so the per-row read
-    finds it and skips the browser entirely. Returns how many rows were filled.
+    Results are conditional against the pre-batch reader witness; neither a
+    status-only check nor a fresh post-batch GET can license a stale batch.
+    Missing results do not imply gone or consume a per-pk reader attempt.
     """
     from tools import jd as _jd
 
     browser = _browser_companies()
-    need = [r for r in rows
-            if (r.get("company") or "").strip().lower() in browser
-            and r.get("jd_url") and _unreadable(r.get("jd_text") or "")]
+    need = []
+    for supplied in rows:
+        pk = supplied.get("pk")
+        if not pk:
+            continue
+        try:
+            row = stores.tracking.get(pk)
+            if not row or not _reader_eligible(row) or not row.get("jd_url"):
+                continue
+            if ((row.get("company") or "").strip().lower() not in browser
+                    or not _unreadable(row.get("jd_text") or "")):
+                continue
+            if row.get("confirmation_id") or submit_hold.blocked(
+                    pk, row, tracking=stores.tracking):
+                continue
+            need.append(row)
+        except Exception:
+            log.exception("JD prefetch reader/tracking storage failed during selection for %s", pk)
     if not need:
         return 0
     log.info("reading %d browser-only posting(s) before the sweep", len(need))
@@ -587,22 +601,33 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
         log.warning("browser prefetch deferred: %s", exc)
         return 0
     filled = closed = 0
-    for r in need:
-        if r["jd_url"] in gone:
-            # The browser read the employer's own "no longer available" page.
-            # That is an answer: close the row rather than read it again next
-            # sweep, and rather than tailor for a job that does not exist.
-            stores.tracking.set_status(r["pk"], Status.JOB_GONE,
-                                       fail_reason="The posting has been removed.")
-            closed += 1
+    for observed in need:
+        pk, url = observed["pk"], observed["jd_url"]
+        if url not in gone and not got.get(url):
             continue
-        text = got.get(r["jd_url"])
-        if not text:
+        try:
+            check = _reader_check(pk, observed, stores)
+            if check:
+                continue
+            if url in gone:
+                patch = {"status": Status.JOB_GONE,
+                         "fail_reason": "The posting has been removed."}
+            else:
+                patch = {"jd_text": got[url], "jd_read_attempts": 0,
+                         "jd_read_retry_at": None, "jd_read_error": ""}
+            committed, _ = _reader_patch(pk, observed, stores, patch)
+        except Exception as exc:
+            # Do not let the caller's unconditional generic ERROR catch turn a
+            # late storage fault into an overwrite of a human terminal result.
+            _reader_storage_error(pk, stores, observed, exc)
             continue
-        stores.tracking.set_status(r["pk"], r.get("status") or Status.FOUND,
-                                   jd_text=text, jd_read_error="")
-        filled += 1
-    log.info("browser prefetch filled %d and closed %d of %d posting(s)", filled, closed, len(need))
+        if committed:
+            if url in gone:
+                closed += 1
+            else:
+                filled += 1
+    log.info("browser prefetch filled %d and closed %d of %d posting(s)",
+             filled, closed, len(need))
     return filled
 
 

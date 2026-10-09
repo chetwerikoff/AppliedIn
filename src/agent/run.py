@@ -284,6 +284,38 @@ def _reader_storage_error(pk: str, stores: Any, row: dict | None,
             "detail": detail, "attention_persisted": persisted}
 
 
+def _retry_session_error(pk: str, stores: Any, admitted: dict,
+                         exc: Exception, *, phase: str) -> dict:
+    """Finish an admitted review-only Retry when its ADK session is unavailable.
+
+    Only one commit is attempted against the invocation's existing witness:
+    neither a newer manual result nor a newer reader generation can be rebased.
+    """
+    log.error("Retry session %s failed for %s: %s", phase, pk, exc, exc_info=True)
+    detail = ("Retry could not reset or set up its preparation session. "
+              "No new application was prepared or sent; restore the session "
+              "service and use Retry.")
+    try:
+        committed, _ = _reader_patch(pk, admitted, stores, {
+            "status": Status.ERROR, "fail_kind": "jd_retry_session_error",
+            "jd_read_error": "", "error": detail})
+    except Exception as storage_exc:
+        log.exception("Could not persist Retry session attention for %s", pk)
+        return {"result": "error", "pk": pk,
+                "reason": "jd_tracking_storage_error",
+                "detail": (detail + " Attention could not be persisted; restore "
+                           "tracking storage before recovery. Cause: "
+                           f"{type(storage_exc).__name__}: {storage_exc}"),
+                "attention_persisted": False}
+    if not committed:
+        return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    from core.events import emit
+
+    emit("error", pk=pk, url=admitted.get("jd_url"), detail=detail)
+    return {"result": "error", "pk": pk, "reason": "jd_retry_session_error",
+            "detail": detail, "attention_persisted": True}
+
+
 def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
     """Conditionally admit a FOUND row, then settle only this reader generation."""
     stores = stores or make_stores()
@@ -475,24 +507,24 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     except Exception as exc:
         return _reader_storage_error(pk, stores, row, exc)
 
-    sessions = _session_service()
     state = _session_state(row, jd_text)
-    # create_session is async; a retry may find it already there.
-    existing = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
-    if existing is not None and _stale_seed(existing, state["base_latex"]):
-        # The session holds the résumé the tailor edits AND the anchors the
-        # truthfulness check validates against. Both come from the state captured
-        # when the session was FIRST created, so a row whose session predates an
-        # edit to base.tex keeps tailoring from the old résumé — and the check
-        # cannot object, because it is comparing against that same old copy. A
-        # project added to base.tex silently never reached an employer, and the
-        # stale-résumé guard could not help: it re-queues for tailoring, but
-        # re-tailoring reused this session and produced the same stale result.
-        await _reset_session(pk)
-        existing = None
-        log.info("base résumé changed since %s was first seen — starting it fresh", pk)
-    if existing is None:
-        await sessions.create_session(app_name=_APP, user_id=_USER, session_id=pk, state=state)
+    try:
+        sessions = _session_service()
+        # create_session is async; a retry may find it already there.
+        existing = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
+        if existing is not None and _stale_seed(existing, state["base_latex"]):
+            # A session seeded from an earlier résumé cannot be reused against
+            # a newer base. Reset and rebuild it, preserving the seed invariant.
+            await _reset_session(pk)
+            existing = None
+            log.info("base résumé changed since %s was first seen — starting it fresh", pk)
+        if existing is None:
+            await sessions.create_session(
+                app_name=_APP, user_id=_USER, session_id=pk, state=state)
+    except Exception as exc:
+        if row.get("jd_read_prepare_only"):
+            return _retry_session_error(pk, stores, row, exc, phase="setup")
+        raise
     # Session lookup/create can itself take time. Check the independent hold
     # key and confirmation again immediately before ADK preparation.
     try:
@@ -1581,26 +1613,9 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         try:
             _run(_reset_session(pk))
         except Exception as exc:
-            # The ERROR -> TAILORING reset already committed; without a
-            # guarded settlement, a failed ADK session reset leaves this job
-            # unreachable by Retry, direct run_job, and the FOUND sweep.
-            log.exception("Retry session reset failed for %s", pk)
-            detail = ("Retry could not reset its preparation session. No posting "
-                      "was read, prepared or sent; restore the session service "
-                      "and use Retry.")
-            try:
-                committed, _ = _reader_patch(pk, admitted, stores, {
-                    "status": Status.ERROR, "fail_kind": "jd_retry_session_error",
-                    "jd_read_error": "", "error": detail})
-            except Exception as fault:
-                return _reader_storage_error(pk, stores, admitted, fault)
-            if not committed:
-                return {"result": "conflict", "pk": pk,
-                        "reason": "jd_reader_state_changed"}
-            from core.events import emit
-            emit("error", pk=pk, url=row.get("jd_url"), detail=detail)
-            return {"result": "error", "pk": pk,
-                    "reason": "jd_retry_session_error", "detail": detail}
+            # No FOUND handoff gap and no second attention-write attempt after
+            # a storage failure. A later Retry can recover the recorded ERROR.
+            return _retry_session_error(pk, stores, admitted, exc, phase="reset")
         from core.events import emit
         emit("running", pk=pk,
              detail=f"retry · {row.get('title','')} @ {row.get('company','')}",

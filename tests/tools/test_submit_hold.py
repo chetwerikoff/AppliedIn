@@ -1,6 +1,7 @@
 """A stale full-row tracking write must never authorize another application."""
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from types import SimpleNamespace
@@ -435,6 +436,162 @@ async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
             assert stores.tracking.get(PK)['status'] == 'applied_manual'
     finally:
         queue.done(item)
+
+
+
+@pytest.mark.parametrize('route', ['mark', 'resolve'])
+def test_stop_apply_preserves_worker_lease_during_pending_async_click(
+        world, monkeypatch, route):
+    """Stop requests cancellation; q.done alone releases the worker lease.
+
+    A fake async Session holds a synthetic committing click pending. Stopping
+    cannot let a human clear that job's durable uncertainty while IPC can run.
+    """
+    stores, queue = world
+    assert queue.put(PK, 'example-co')
+    item = queue.next(only='example-co')
+    assert item is not None
+    entered = threading.Event()
+    complete = threading.Event()
+    cancelled = threading.Event()
+    torn_down = threading.Event()
+    responses = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            torn_down.set()
+            return False
+
+        async def call(self, command):
+            assert command == 'click'
+            forms.hold_possible_submission(PK, {
+                'last_button': 'Submit', 'url': URL})
+            entered.set()
+            while not complete.is_set():
+                await asyncio.sleep(0.01)
+            return {'ok': True}
+
+    async def pending_apply(pk, stores):
+        assert pk == PK
+        async with Session() as session:
+            await session.call('click')
+        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
+                'detail': 'Synthetic click interrupted; portal check required'}
+
+    monkeypatch.setattr(run, '_apply_direct', pending_apply)
+    monkeypatch.setattr('core.flags.bump_stop_epoch', lambda: 1)
+    monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
+    def schedule_cancel(kind):
+        assert kind == 'apply'
+        cancelled.set()
+        return 1
+    monkeypatch.setattr('tools.browser_runtime.kill_live_sessions', schedule_cancel)
+    stop = next(r.endpoint for r in server.create_app().routes
+                if getattr(r, 'path', '') == '/actions/stop-run')
+    endpoint_path = ('/actions/mark-applied/{pk}' if route == 'mark'
+                     else '/actions/resolve-uncertain/{pk:path}')
+    human = next(r.endpoint for r in server.create_app().routes
+                 if getattr(r, 'path', '') == endpoint_path)
+    body = ({'note': 'Synthetic portal confirmation'} if route == 'mark'
+            else {'portal_checked': True, 'outcome': 'submitted',
+                  'confirmation': 'Synthetic portal receipt'})
+    worker = threading.Thread(
+        target=lambda: responses.append(run.run_queued(item, queue)))
+    worker.start()
+    try:
+        assert entered.wait(timeout=10), 'fake Session never reached pending click'
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+        pending = stores.tracking.get(PK)
+        assert pending['status'] == 'needs_human'
+        stopped = stop({'what': 'apply'})
+        assert stopped['ok'] and stopped['sessions_killed'] == 1
+        assert cancelled.is_set()
+        assert not torn_down.is_set(), 'cancellation is not Session completion'
+        assert queue.in_flight() == {PK}
+        assert queue.depth()['running'] == ['example-co']
+
+        assert human(PK, body) == {
+            'ok': False, 'error': 'An application attempt is still in flight.'}
+        assert stores.tracking.get(PK) == pending
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+        assert queue.in_flight() == {PK}
+    finally:
+        complete.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert torn_down.is_set()
+    assert responses and responses[0]['reason'] == 'uncertain'
+    assert not queue.in_flight()
+    assert queue.depth()['running'] == []
+    assert submit_hold.is_held(PK, tracking=stores.tracking)
+
+    # Only after worker/Session teardown is the explicit human decision safe.
+    assert human(PK, body)['ok']
+    assert stores.tracking.get(PK)['status'] == 'applied_manual'
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+    assert not queue.pending()  # neither stop nor human outcome enqueues
+
+
+@pytest.mark.parametrize('route', ['mark', 'resolve'])
+def test_stop_apply_cannot_steal_human_won_lease_before_outcome_write(
+        world, monkeypatch, route):
+    """A late worker cannot start while a competing human holds company lease."""
+    stores, queue = world
+    assert queue.put(PK, 'example-co')
+    forms.hold_possible_submission(PK, {'last_button': 'Submit', 'url': URL})
+    row_before = stores.tracking.get(PK)
+    arrived = threading.Event()
+    release = threading.Event()
+    original_set_status = stores.tracking.set_status
+
+    def pause_outcome(pk, status, **attrs):
+        if status == Status.APPLIED_MANUAL:
+            arrived.set()
+            assert release.wait(timeout=10), 'synthetic human barrier timed out'
+        return original_set_status(pk, status, **attrs)
+
+    monkeypatch.setattr(stores.tracking, 'set_status', pause_outcome)
+    monkeypatch.setattr('core.flags.bump_stop_epoch', lambda: 1)
+    monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
+    monkeypatch.setattr('tools.browser_runtime.kill_live_sessions',
+                        lambda kind: 0)
+    app = server.create_app()
+    stop = next(r.endpoint for r in app.routes
+                if getattr(r, 'path', '') == '/actions/stop-run')
+    endpoint_path = ('/actions/mark-applied/{pk}' if route == 'mark'
+                     else '/actions/resolve-uncertain/{pk:path}')
+    human = next(r.endpoint for r in app.routes
+                 if getattr(r, 'path', '') == endpoint_path)
+    body = ({'note': 'Synthetic portal confirmation'} if route == 'mark'
+            else {'portal_checked': True, 'outcome': 'submitted',
+                  'confirmation': 'Synthetic portal receipt'})
+    responses = []
+    thread = threading.Thread(target=lambda: responses.append(human(PK, body)))
+    thread.start()
+    try:
+        assert arrived.wait(timeout=10), 'human did not claim lease'
+        assert queue.depth()['running'] == ['example-co']
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+        assert stores.tracking.get(PK) == row_before
+
+        assert stop({'what': 'apply'})['ok']
+        # reset_leases() used to drop the human's lease too: a late worker
+        # could claim the still-pending same-company application mid-write.
+        assert queue.next(only='example-co') is None
+        assert queue.depth()['running'] == ['example-co']
+        assert submit_hold.is_held(PK, tracking=stores.tracking)
+    finally:
+        release.set()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert responses == [{'ok': True}] if route == 'mark' else [
+        {'ok': True, 'status': 'applied_manual'}]
+    assert stores.tracking.get(PK)['status'] == 'applied_manual'
+    assert not submit_hold.is_held(PK, tracking=stores.tracking)
+    assert queue.depth()['running'] == []
 
 
 @pytest.mark.parametrize("route,witness,outcome", [

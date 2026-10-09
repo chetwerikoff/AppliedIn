@@ -235,17 +235,17 @@ def test_stale_resume_and_duplicates_are_rechecked_before_submit(monkeypatch, tm
     monkeypatch.setattr('agent.run.seed_fingerprint', lambda: 'current')
     monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: None)
     queue = ApplyQueue(tracking.r)
-    assert queue.put('Company#1', 'Company')
+    assert queue.put('company#1', 'Company')
     item = queue.next(only='Company')
     assert item is not None
     try:
         with pytest.raises(forms.Gate, match='base changed'):
-            forms.check_dispatch('Company#1', str(pdf))
+            forms.check_dispatch('company#1', str(pdf))
         row['resume_seed'] = 'current'
-        forms.check_dispatch('Company#1', str(pdf))
+        forms.check_dispatch('company#1', str(pdf))
         monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: {'status': 'failed'})
         with pytest.raises(forms.Gate, match='duplicate'):
-            forms.check_dispatch('Company#1', str(pdf))
+            forms.check_dispatch('company#1', str(pdf))
     finally:
         queue.done(item)
 
@@ -311,6 +311,72 @@ async def test_production_dispatch_refuses_unproven_worker_before_session(
         if item is not None:
             queue.done(item)
 
+
+
+async def test_two_live_company_leases_cannot_splice_a_drifted_row_before_session(
+        monkeypatch, tmp_path):
+    """Independent busy-pk and busy-company sets are not a paired worker lease."""
+    import fakeredis
+    from core.apply_queue import ApplyQueue
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    a, b = 'example-co-a', 'example-co-b'
+    pk_a, pk_b = f'{a}#job-1', f'{b}#job-2'
+    url = 'https://example.test/jobs/job-1'
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    for company, pk in ((a, pk_a), (b, pk_b)):
+        tracking.set_status(pk, Status.SUBMITTING, company=company, jd_url=url,
+                            resume_tex_key='resumes/Test-User.tex',
+                            resume_seed='synthetic-seed')
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda *args, **kw: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('agent.run.seed_fingerprint',
+                        lambda: 'synthetic-seed')
+    monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: None)
+    pdf = tmp_path / 'Test-User.pdf'
+    pdf.write_bytes(b'%PDF-1.4 synthetic offline document')
+    queue = ApplyQueue(tracking.r)
+    assert queue.put(pk_a, a)
+    assert queue.put(pk_b, b)
+    item_a, item_b = queue.next(only=a), queue.next(only=b)
+    assert item_a and item_b
+    try:
+        # Each independent set membership is true, even with B incorrectly
+        # written onto A's tracked row. Neither worker granted this cross-pair.
+        tracking.set_status(pk_a, Status.SUBMITTING, company=b)
+        assert queue.in_flight() == {pk_a, pk_b}
+        assert queue.depth()['running'] == [a, b]
+        before = tracking.get(pk_a)
+        with pytest.raises(forms.Gate, match='leased queue dispatch'):
+            forms.check_dispatch(pk_a, str(pdf))
+
+        ipc = []
+        def session_attempt(*args, **kw):
+            ipc.append('Session')
+            pytest.fail('drifted job opened BrowserSkill Session')
+        monkeypatch.setattr(bsk, 'Session', session_attempt)
+        monkeypatch.setattr(bsk, 'decision', AsyncMock(
+            side_effect=AssertionError('drifted job requested browser/model IPC')))
+        monkeypatch.setattr('tools.claude_chrome._stage_resume',
+                            lambda *args: pytest.fail('drifted job staged a resume'))
+        result = await forms.apply(url, a, {'Full name': 'Test User'},
+                                   'offline-model', pk=pk_a, resume_path=str(pdf))
+        assert result['status'] == 'gate'
+        assert ipc == []  # no Session, navigation, value, click, or submit
+        assert tracking.get(pk_a) == before
+        assert queue.in_flight() == {pk_a, pk_b}
+        assert queue.depth()['running'] == [a, b]
+
+        # Undo only the synthetic drift. Both genuine queue-owned attempts
+        # retain the original production admission and can proceed.
+        tracking.set_status(pk_a, Status.SUBMITTING, company=a)
+        forms.check_dispatch(pk_a, str(pdf))
+        forms.check_dispatch(pk_b, str(pdf))
+    finally:
+        queue.done(item_a)
+        queue.done(item_b)
+    assert not queue.in_flight()
 
 @pytest.mark.parametrize(('verb', 'button'),
                          [('submit', 'Submit application'), ('click', 'Continue')])

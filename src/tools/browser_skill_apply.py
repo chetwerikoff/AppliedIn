@@ -297,9 +297,16 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         try:
             from core.apply_queue import ApplyQueue
             from core.stores import make_stores
+            from core.ids import make_pk
             company = row.get('company')
-            if not isinstance(company, str) or not company.strip():
-                raise ValueError('Missing company')
+            _, separator, job_id = pk.partition('#')
+            # _BUSY_PKS and _BUSY are independent Redis sets. With two live
+            # workers, a drifted row could splice A's pk to B's company lease.
+            # The canonical pk binds this tracked job to its leased company.
+            if (not isinstance(company, str) or not company.strip()
+                    or not separator or not job_id.strip()
+                    or make_pk(company, job_id) != pk):
+                raise ValueError('Tracked job/company identity changed')
             queue = ApplyQueue(make_stores().tracking.r)
             if (pk not in queue.in_flight()
                     or company.strip().lower() not in queue.depth()['running']):

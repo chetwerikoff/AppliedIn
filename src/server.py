@@ -1792,16 +1792,17 @@ def create_app() -> FastAPI:
             # confirmation is now unread. It is still the owner's call to make, so
             # the button exists — but nothing else in the product reaches here.
             killed += kill_live_sessions("apply")
-            from core.apply_queue import ApplyQueue
-
-            q = ApplyQueue(stores.tracking.r)
-            freed = q.reset_leases()
-            log.info("apply stopped by owner: %d session(s), %d lease(s) freed",
-                     killed, freed)
+            # Cancellation is scheduled, not completed. Resetting the queue's
+            # lease here would let a human clear an uncertain hold while a
+            # submission-capable browser click can still finish. The existing
+            # run_queued finally/q.done releases the lease after worker unwind.
+            log.info("apply cancellation requested for %d session(s); "
+                     "worker leases remain until teardown", killed)
 
         from core.events import emit
         emit("running", agent="daemon",
-             detail=f"{what} stopped by you — {killed} browser session(s) ended")
+             detail=f"{what} stop requested — cancellation requested for "
+                    f"{killed} browser session(s)")
         return {"ok": True, "what": what, "stopped": was, "sessions_killed": killed}
 
     @app.get("/scan-log")

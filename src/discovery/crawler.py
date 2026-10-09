@@ -490,7 +490,9 @@ def crawl_company(
     _note_screened_out(stores, company.name, extracted, jobs)
     # Nothing relevant may mean an unrendered listing; try the browser before
     # concluding the company has no matches. Browser mode already ran above.
-    if extractor is None and not extracted:
+    # A report containing only rejected hrefs is not an empty fetch: retrying
+    # it via sitemap/browser would cause work from rows already deemed unsafe.
+    if extractor is None and not raw_jobs:
         if (listed := _listed_in_sitemap(company, prefs, stores)) is not None:
             return listed
     if extractor is None and not jobs and (not raw_jobs or extracted):

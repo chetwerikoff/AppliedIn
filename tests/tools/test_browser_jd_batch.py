@@ -104,6 +104,20 @@ class _Tracking:
         self.rows[pk]["status"] = getattr(status, "value", status)
         self.rows[pk].update(kw)
 
+    def update_if_status(self, pk, expected_status, updates, *, expected_reader):
+        fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+                 "jd_text", "jd_read_prepare_only")
+        row = self.rows.get(pk)
+        if row is None or row.get("status") != getattr(expected_status, "value", expected_status):
+            return False
+        if any((field in row) != (field in expected_reader) or
+               (field in expected_reader and row[field] != expected_reader[field])
+               for field in fixed):
+            return False
+        row.update({k: getattr(v, "value", v) if k == "status" else v
+                    for k, v in updates.items()})
+        return True
+
 
 class _Stores:
     def __init__(self, rows):
@@ -179,3 +193,86 @@ def test_prefetch_closes_gone_rows(monkeypatch):
     assert stores.tracking.rows["meta#1"]["status"] == "job_gone"
     assert stores.tracking.rows["meta#2"]["status"] == "found"
     assert stores.tracking.rows["meta#2"]["jd_text"] == GOOD
+
+
+def test_prefetch_uses_persisted_eligibility_not_stale_input(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    pk = "example-co#job-1"
+    url = "https://example.test/jobs/1"
+    rows = [{"pk": pk, "company": "example-co", "status": "found",
+             "jd_url": url, "jd_text": ""}]
+    stores = _Stores(rows)
+    supplied = dict(rows[0])
+    stores.tracking.rows[pk]["jd_read_attempts"] = 1
+    stores.tracking.rows[pk]["jd_read_retry_at"] = (
+        datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    monkeypatch.setattr("agent.run._browser_companies", lambda: {"example-co"})
+    monkeypatch.setattr(jd, "read_postings",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("pending read")))
+    assert prefetch_browser_jds([supplied], stores) == 0
+    assert stores.tracking.rows[pk]["jd_text"] == ""
+
+
+def test_prefetch_loses_both_old_fill_and_gone_to_new_found_generation(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import fakeredis
+
+    from agent import run
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    for outcome in ("fill", "gone"):
+        pk = "example-co#job-1"
+        url = "https://example.test/jobs/1"
+        tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+        tracking.set_status(pk, Status.FOUND, company="example-co",
+                            jd_url=url, jd_text="Test role", attempts=0)
+        stores = SimpleNamespace(tracking=tracking)
+        supplied = tracking.get(pk)
+        monkeypatch.setattr(run, "_browser_companies", lambda: {"example-co"})
+        monkeypatch.setattr("core.events.emit", lambda *a, **kw: None)
+        monkeypatch.setattr(run, "_session_service",
+                            lambda: (_ for _ in ()).throw(AssertionError("no ADK")))
+        from tools.jd import PostingReadUnavailable
+
+        async def unavailable(row, **kw):
+            raise PostingReadUnavailable("synthetic reader unavailable")
+
+        monkeypatch.setattr(run, "_jd_text", unavailable)
+
+        def delayed_batch(urls, *, with_gone):
+            # Actual runner wins a full FOUND -> TAILORING -> FOUND cycle.
+            assert run.run_job(pk, stores)["result"] == "deferred"
+            if outcome == "fill":
+                return {url: GOOD}, set()
+            return {}, {url}
+
+        monkeypatch.setattr(jd, "read_postings", delayed_batch)
+        assert prefetch_browser_jds([supplied], stores) == 0
+        current = tracking.get(pk)
+        assert current["status"] == "found"
+        assert current["jd_read_attempts"] == 1
+        assert current["jd_read_revision"] == 2
+        assert current["jd_read_retry_at"]
+        assert current["jd_text"] == "Test role"
+        assert tracking.status_counts().get("job_gone", 0) == 0
+
+
+def test_prefetch_storage_error_does_not_close_or_fill(monkeypatch, caplog):
+    pk = "example-co#job-1"
+    url = "https://example.test/jobs/1"
+    stores = _Stores([{"pk": pk, "company": "example-co", "status": "found",
+                       "jd_url": url, "jd_text": ""}])
+    monkeypatch.setattr("agent.run._browser_companies", lambda: {"example-co"})
+    monkeypatch.setattr(jd, "read_postings", lambda urls, **kw: ({url: GOOD}, set()))
+
+    def storage_failure(*args, **kwargs):
+        raise RuntimeError("synthetic reader storage fault")
+
+    monkeypatch.setattr(stores.tracking, "update_if_status", storage_failure)
+    assert prefetch_browser_jds([stores.tracking.get(pk)], stores) == 0
+    assert stores.tracking.get(pk)["status"] == "found"
+    assert "storage" in caplog.text.lower()

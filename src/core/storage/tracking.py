@@ -13,7 +13,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 from ..models import JobRecord, Status
-from .base import AbstractTracking
+from .base import (
+    AbstractTracking, REPAIR_PROTECTED_FIELDS, REPAIR_READER_FIELDS,
+    legacy_repair_row_allowed,
+)
 from ..ids import is_internal_pk
 
 JD_HASH_INDEX = "jd_hash-index"
@@ -124,6 +127,80 @@ class TrackingStore(AbstractTracking):
             self._table.update_item(
                 Key={"pk": pk},
                 UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def repair_legacy_jd_url(
+        self, pk: str, company: str, job_id: str, old_url: str,
+        new_url: str, *, expected_status: Status | str, expected_reader: dict,
+    ) -> bool:
+        """Conditional no-upsert partial UpdateItem with exact original witness.
+
+        A strongly consistent observation lets us reject invalid old rows and
+        capture all protected-field presence/values. The conditional write
+        checks that complete observation at commit, so an intervening request,
+        confirmation, hold, status change or reader generation always loses.
+        Unrelated attributes remain untouched by the partial UpdateItem.
+        """
+        row = self._table.get_item(Key={"pk": pk}, ConsistentRead=True).get("Item")
+        if not legacy_repair_row_allowed(
+                row, pk, company, job_id, old_url,
+                expected_status, expected_reader):
+            return False
+
+        names = {
+            "#pk": "pk", "#co": "company", "#job": "job_id",
+            "#url": "jd_url", "#s": "status", "#count": "jd_read_attempts",
+            "#rev": "jd_read_revision",
+        }
+        values = {
+            ":pk": pk, ":co": company, ":job": job_id, ":old": old_url,
+            ":status": getattr(expected_status, "value", expected_status),
+            ":new": new_url, ":found": Status.FOUND.value,
+            ":zero": 0, ":one": 1,
+        }
+        conditions = [
+            "attribute_exists(#pk)", "#pk = :pk", "#co = :co",
+            "#job = :job", "#url = :old", "#s = :status",
+        ]
+
+        # The original five-field witness, including absence versus explicit
+        # NULL/zero/False, must survive until the conditional UpdateItem.
+        for i, field in enumerate(REPAIR_READER_FIELDS):
+            name, value = f"#r{i}", f":r{i}"
+            names[name] = field
+            if field in expected_reader:
+                values[value] = expected_reader[field]
+                conditions.append(f"{name} = {value}")
+            else:
+                conditions.append(f"attribute_not_exists({name})")
+
+        # Explicitly compare every protected field's original presence/value.
+        # A new hold/request/evidence flag cannot appear between read and write.
+        for i, field in enumerate(("fail_kind", "gate_reason") + REPAIR_PROTECTED_FIELDS):
+            name, value = f"#p{i}", f":p{i}"
+            names[name] = field
+            if field in row:
+                values[value] = row[field]
+                conditions.append(f"{name} = {value}")
+            else:
+                conditions.append(f"attribute_not_exists({name})")
+
+        updates = ("SET #url = :new, #s = :found, #count = :zero, "
+                   "#rev = if_not_exists(#rev, :zero) + :one")
+        if row["status"] == Status.ERROR.value:
+            updates += " REMOVE #p0"  # exhausted fail_kind; never clear other kinds
+        try:
+            self._table.update_item(
+                Key={"pk": pk},
+                UpdateExpression=updates,
                 ConditionExpression=" AND ".join(conditions),
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,

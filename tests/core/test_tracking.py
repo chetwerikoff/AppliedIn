@@ -285,7 +285,8 @@ def test_repair_atomic_success_exact_patch_and_reader_fencing(
 ):
     store = repair_backend
     pk, before, job = _repair_seed(store, status=source_status)
-    assert store.put_new(_synthetic_job("other-job"))
+    assert store.put_new(_synthetic_job("other-job").model_copy(
+        update={"jd_text": "an unrelated synthetic JD"}))
     other_pk = "example-co#other-job"
     unrelated_before = deepcopy(store.get(other_pk))
     initial_indexes = _indexes(store, job)

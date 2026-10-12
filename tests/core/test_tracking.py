@@ -285,9 +285,13 @@ def test_repair_atomic_success_exact_patch_and_reader_fencing(
 ):
     store = repair_backend
     pk, before, job = _repair_seed(store, status=source_status)
+    assert store.put_new(_synthetic_job("other-job"))
+    other_pk = "example-co#other-job"
+    unrelated_before = deepcopy(store.get(other_pk))
     initial_indexes = _indexes(store, job)
     assert initial_indexes[1] == pk
     assert _repair_call(store, before)
+    assert store.get(other_pk) == unrelated_before
     after = store.get(pk)
     expected = {
         **before, "status": "found",
@@ -304,7 +308,7 @@ def test_repair_atomic_success_exact_patch_and_reader_fencing(
     assert after["attempts"] == 7
     counts, indexed = _indexes(store, job)
     assert indexed == pk
-    assert counts["found"] == [pk]
+    assert counts["found"] == sorted([pk, other_pk])
     assert counts["error"] == []
     # In FOUND->FOUND, even an old reader seeing the same status must lose.
     assert not store.update_if_status(
@@ -421,6 +425,15 @@ def test_repair_rejects_identity_mismatch_or_corrupt_placeholder(
 ):
     store = repair_backend
     pk, before, job = _repair_seed(store)
+    if field == "pk" and not isinstance(store, RedisTracking):
+        # DynamoDB's primary key cannot be inconsistent with its item key.
+        # Refuse the caller's wrong bound pk/identity instead.
+        wrong = {**before, "company": "different-co"}
+        indexes = _indexes(store, job)
+        assert not _repair_call(store, wrong)
+        assert store.get(pk) == before
+        assert _indexes(store, job) == indexes
+        return
     _write_competing_row(store, pk, {field: change})
     current = store.get(pk)
     indexes = _indexes(store, job)
@@ -632,3 +645,43 @@ def test_repair_storage_faults_propagate_not_benign_conflicts(aws, monkeypatch):
     monkeypatch.setattr(redis.r, "pipeline", error_pipeline)
     with pytest.raises(RuntimeError, match="synthetic Redis outage"):
         _repair_call(redis, before_redis)
+
+
+def test_repair_cannot_upgrade_incomplete_placeholder_row(repair_backend):
+    store = repair_backend
+    pk = "example-co#job-1"
+    if isinstance(store, RedisTracking):
+        store.r.set(f"app:{pk}", json.dumps({"pk": pk, "jd_url": "/jobs/1"}))
+    else:
+        store._table.put_item(Item={"pk": pk, "jd_url": "/jobs/1"})
+    assert not store.repair_legacy_jd_url(
+        pk, "example-co", "job-1", "/jobs/1",
+        "https://example.test/jobs/1", expected_status=Status.FOUND,
+        expected_reader={},
+    )
+    assert store.get(pk) == {"pk": pk, "jd_url": "/jobs/1"}
+
+
+def test_dynamo_found_reader_aba_cycle_defeats_stale_repair(aws, monkeypatch):
+    make_applications_table()
+    store = TrackingStore("applications")
+    pk, before, job = _repair_seed(store, status="found")
+    original_update = store._table.update_item
+    injected = [False]
+
+    def race_update(**kwargs):
+        if not injected[0]:
+            injected[0] = True
+            # The status comes back to FOUND, but the reader witness cannot.
+            _write_competing_row(store, pk, {
+                "status": "tailoring", "jd_read_revision": 5})
+            _write_competing_row(store, pk, {
+                "status": "found", "jd_read_revision": 6})
+        return original_update(**kwargs)
+
+    monkeypatch.setattr(store._table, "update_item", race_update)
+    assert not _repair_call(store, before)
+    assert injected[0]
+    assert store.get(pk)["jd_read_revision"] == 6
+    assert store.get(pk)["jd_url"] == before["jd_url"]
+    assert _indexes(store, job)[0]["found"] == [pk]

@@ -569,7 +569,12 @@ def test_recrawl_refuses_inconsistent_existing_identity_or_url(
     offline_pipeline, change, value,
 ):
     stores = _Stores()
-    pk, before = _seed_legacy(stores, **{change: value})
+    pk, _ = _seed_legacy(stores)
+    # Corrupt only the persisted row at the original primary key. Passing
+    # job_id into _seed_legacy changes the job's identity and correctly allows
+    # an unrelated *new* discovery; that is not the row-mismatch scenario.
+    stores.tracking.persisted[pk][change] = value
+    before = stores.tracking.get(pk)
     assert _crawl_repair(stores) == 0
     assert stores.tracking.get(pk) == before
     assert stores.queue.calls == offline_pipeline.marks == offline_pipeline.emitted == []

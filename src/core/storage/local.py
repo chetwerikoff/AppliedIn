@@ -22,6 +22,7 @@ from .base import (
     AbstractQueue,
     AbstractSecrets,
     AbstractTracking,
+    legacy_repair_row_allowed,
 )
 
 
@@ -183,6 +184,53 @@ class RedisTracking(AbstractTracking):
                 # Keep the caller's ORIGINAL expected status and witness.
                 continue
         raise RuntimeError("Tracking row could not be updated after WATCH contention")
+
+    def repair_legacy_jd_url(
+        self, pk: str, company: str, job_id: str, old_url: str,
+        new_url: str, *, expected_status: Status | str, expected_reader: dict,
+    ) -> bool:
+        """WATCH both the row and the independent durable submit hold.
+
+        Re-read and merge the current row under WATCH; a writer changing an
+        unrelated field is retained on retry, but the caller's original
+        URL/status/reader witness is never rebased after contention.
+        """
+        key, hold_key = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold_key)
+                    raw = pipe.get(key)
+                    # Even an empty/corrupt hold value is not evidence of absence.
+                    hold = pipe.get(hold_key)
+                    if raw is None or hold is not None:
+                        pipe.unwatch()
+                        return False
+                    row = json.loads(raw)
+                    if not legacy_repair_row_allowed(
+                            row, pk, company, job_id, old_url,
+                            expected_status, expected_reader):
+                        pipe.unwatch()
+                        return False
+                    previous = row["status"]
+                    row["jd_url"] = new_url
+                    row["status"] = Status.FOUND.value
+                    row["jd_read_attempts"] = 0
+                    row["jd_read_revision"] = int(row.get("jd_read_revision", 0)) + 1
+                    if previous == Status.ERROR.value:
+                        row.pop("fail_kind")  # guaranteed exhausted by the guard
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if not is_internal_pk(pk):
+                        if previous != Status.FOUND.value:
+                            pipe.srem(f"status:{previous}", pk)
+                        pipe.sadd("status:found", pk)
+                    pipe.execute()
+                    return True
+            except WatchError:
+                # Retry against current data, never a new expected witness.
+                continue
+        raise RuntimeError("Legacy URL repair exhausted Redis WATCH contention")
 
     def application_notes(self) -> dict:
         return {pk: json.loads(value) for pk, value in self.r.hgetall("application:notes").items()}

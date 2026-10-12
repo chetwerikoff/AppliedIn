@@ -9,8 +9,99 @@ concrete set by mode; nothing downstream knows or cares which it got.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
+from decimal import Decimal
+from urllib.parse import urlsplit
 
+from ..ids import make_pk
 from ..models import AnswerScope, JobRecord, Status
+
+
+# The exact five-field, presence-sensitive witness used by the deferred JD reader.
+REPAIR_READER_FIELDS = (
+    "jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
+    "jd_text", "jd_read_prepare_only",
+)
+
+# Existing submission evidence is never cleared or interpreted as reader attention.
+# "attempts" is deliberately omitted: it is an application counter to preserve,
+# not a reader budget or a standalone proof that a submit was attempted.
+REPAIR_PROTECTED_FIELDS = (
+    "apply_requested_at", "confirmation_id", "applied_at",
+    "possible_submission", "submit_hold", "submit_hold_at",
+    "submit_hold_reason", "submit_blocked",
+    "submit_attempted_at", "submission_attempted_at",
+    "submit_attempts", "submission_attempts",
+    "submit_outcome", "submission_outcome",
+    "submit_result", "submission_result",
+    "submitted_at", "application_submitted_at",
+    "submit_receipt", "submission_receipt",
+)
+
+
+def legacy_relative_jd_url(value: object) -> bool:
+    """A real, syntactically safe relative href, not merely a non-HTTP URL."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch == "\\"
+           for ch in value):
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return (not parts.scheme and not parts.netloc and not value.startswith("//")
+            and bool(parts.path or parts.query))
+
+
+def repair_reader_witness(row: dict) -> dict:
+    """Snapshot original reader values *and their presence* for the commit."""
+    return {field: row[field] for field in REPAIR_READER_FIELDS if field in row}
+
+
+def legacy_repair_row_allowed(
+    row: dict | None, pk: str, company: str, job_id: str, old_url: str,
+    expected_status: Status | str, expected_reader: dict,
+) -> bool:
+    """Closed eligibility predicate. Backend commits must also check it atomically."""
+    if set(expected_reader) - set(REPAIR_READER_FIELDS):
+        raise ValueError("Unexpected reader witness key")
+    status = getattr(expected_status, "value", expected_status)
+    if (not isinstance(row, dict) or not isinstance(company, str) or not company
+            or not isinstance(job_id, str) or not job_id
+            or pk != make_pk(company, job_id)
+            or row.get("pk") != pk or row.get("company") != company
+            or row.get("job_id") != job_id
+            or row.get("jd_url") != old_url
+            or not legacy_relative_jd_url(old_url)
+            or row.get("status") != status):
+        return False
+    if (status == "found" and row.get("fail_kind") not in (None, "")):
+        return False
+    if status == "error" and row.get("fail_kind") != "jd_reader_exhausted":
+        return False
+    if status not in ("found", "error"):
+        return False
+    if any(bool(row.get(field)) for field in REPAIR_PROTECTED_FIELDS):
+        return False
+    if row.get("gate_reason") == "submit_uncertain":
+        return False
+    if any((field in row) != (field in expected_reader)
+           or (field in row and row[field] != expected_reader[field])
+           for field in REPAIR_READER_FIELDS):
+        return False
+    deadline = row.get("jd_read_retry_at")
+    if deadline:
+        try:
+            until = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+            if until.tzinfo is None or until > datetime.now(UTC):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    revision = row.get("jd_read_revision", 0)
+    if isinstance(revision, bool) or not isinstance(revision, (int, Decimal)):
+        return False
+    return revision >= 0 and int(revision) == revision
 
 
 class AbstractTracking(ABC):
@@ -32,6 +123,19 @@ class AbstractTracking(ABC):
         """Atomically patch an existing row whose status and exact reader
         witness match. An absent witness key requires attribute absence.
         Conditional mismatch returns False; storage exceptions propagate.
+        """
+
+    @abstractmethod
+    def repair_legacy_jd_url(
+        self, pk: str, company: str, job_id: str, old_url: str,
+        new_url: str, *, expected_status: Status | str, expected_reader: dict,
+    ) -> bool:
+        """Atomically repair only a safe same-pk legacy row.
+
+        The caller supplies an already-normalized absolute URL on the verified
+        company origin. Match exact old href/status/reader presence and values,
+        refuse submission evidence, and advance the reader generation once.
+        Missing rows and conditional conflicts return False; other errors raise.
         """
 
     def application_notes(self) -> dict:

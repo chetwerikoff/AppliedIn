@@ -30,6 +30,7 @@ import httpx
 
 from core.logging import get_logger
 from core.models import DiscoveryMode, JobRecord
+from core.storage.base import legacy_relative_jd_url, repair_reader_witness
 from core.steering import messages
 
 from . import progress
@@ -248,7 +249,46 @@ def _note_screened_out(stores: Any, company: str, before: list, after: list) -> 
                        "did not match your title, seniority or keyword preferences")
 
 
-def _enqueue(company: CompanyConfig, jobs: list, stores: Any) -> int:
+def _repair_origin(careers_url: str, fetched_url: str | None) -> SplitResult | None:
+    """Only the configured careers origin or its *verified* final response.
+
+    _trusted_posting_url checks the same-host/scheme/port redirect contract
+    established by #18. No browser/sitemap upgrade may be inferred from a job
+    URL, and an absolute ATS discovery URL is not repair authority.
+    """
+    base = _trusted_posting_url("/", careers_url, fetched_url=fetched_url)
+    return _http_url_parts(base) if base is not None else None
+
+
+def _repair_duplicate(
+    company: CompanyConfig, job: JobRecord, stores: Any,
+    trusted_origin: SplitResult | None,
+) -> None:
+    """Repair only a same-job legacy href; never enqueue or mark it as new."""
+    candidate = _http_url_parts(job.jd_url)
+    if (trusted_origin is None or candidate is None
+            or job.company != company.name
+            or candidate.scheme != trusted_origin.scheme
+            or candidate.hostname != trusted_origin.hostname
+            or _origin_port(candidate) != _origin_port(trusted_origin)):
+        return
+    original = stores.tracking.get(job.pk)
+    if not original:
+        return
+    old_url = original.get("jd_url")
+    if not legacy_relative_jd_url(old_url):
+        return
+    stores.tracking.repair_legacy_jd_url(
+        job.pk, job.company, job.job_id, old_url, job.jd_url,
+        expected_status=original.get("status"),
+        expected_reader=repair_reader_witness(original),
+    )
+
+
+def _enqueue(
+    company: CompanyConfig, jobs: list, stores: Any, *,
+    fetched_url: str | None = None,
+) -> int:
     """Drop anything too old, dedup against past runs, queue what is genuinely new.
 
     The age check lives HERE because every path arrives here: the feed adapters, the
@@ -331,10 +371,15 @@ def _enqueue(company: CompanyConfig, jobs: list, stores: Any) -> int:
     if not jobs or progress.cancelled():
         return 0
     already = seen.load()
-    jobs = [j for j in jobs if j.jd_url not in already]
+    trusted_origin = _repair_origin(company.careers_url, fetched_url)
 
     enqueued, new_jobs = 0, []
     for job in jobs:
+        if job.jd_url in already:
+            # A past-run URL ledger hit is still eligible for a same-pk
+            # legacy repair. It remains excluded from *new* discoveries.
+            _repair_duplicate(company, job, stores, trusted_origin)
+            continue
         if stores.tracking.put_new(job):
             stores.queue.enqueue(stores.tailor_queue, {"pk": job.pk})
             emit("discovered", pk=job.pk, detail=(
@@ -343,6 +388,8 @@ def _enqueue(company: CompanyConfig, jobs: list, stores: Any) -> int:
                 url=job.jd_url)
             new_jobs.append(job)
             enqueued += 1
+        else:
+            _repair_duplicate(company, job, stores, trusted_origin)
     if new_jobs:
         seen.mark(new_jobs)
     if enqueued:
@@ -529,4 +576,5 @@ def crawl_company(
         log.info("%s: title filter %s kept %d/%d", company.name, kws, len(jobs), before)
 
     progress.record(relevant=len(jobs), stage="Saving new matches")
-    return 0 if progress.cancelled() else _enqueue(company, jobs, stores)
+    return 0 if progress.cancelled() else _enqueue(
+        company, jobs, stores, fetched_url=fetched_url)

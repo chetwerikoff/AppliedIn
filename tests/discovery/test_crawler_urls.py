@@ -368,7 +368,7 @@ def _seed_legacy(stores, *, job_id="123", old_url="/jobs/123?job_id=123",
         "query_id": "keep-query", "confirmation_id": "",
     }
     row.update(overrides)
-    stores.tracking.seed(row)
+    stores.tracking.seed(row, key=job.pk)
     return job.pk, deepcopy(row)
 
 

@@ -894,12 +894,32 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or field.get('tag') not in {'input', 'textarea', 'select'}
             or not isinstance(field.get('type'), str)
             or ((field['tag'] == 'input' and field['type'] not in {
-                    'text', 'email', 'tel', 'url', 'number'})
+                    'text', 'email', 'tel', 'url', 'number', 'checkbox', 'radio'})
                 or (field['tag'] == 'textarea' and field['type'] != 'textarea')
                 or (field['tag'] == 'select' and field['type'] != 'select'))
             or any(not isinstance(field.get(k), str) or not field[k].strip()
                    for k in ('form_selector', 'form_action'))
-            or (field['tag'] == 'select' and (
+            or (field['type'] == 'checkbox' and (
+                 not isinstance(field.get('visible_text'), str)
+                 or not field['visible_text'].strip()
+                 or field['visible_text'] != field['control_label']))
+             or (field['type'] == 'radio' and (
+                 not isinstance(field.get('radio_name'), str)
+                 or not field['radio_name'].strip()
+                 or not field['question'].strip()
+                 or not isinstance(field.get('radio_members'), list)
+                 or len(field['radio_members']) < 2
+                 or any(not isinstance(m, dict) or any(
+                     not isinstance(m.get(k), str) or not m[k].strip()
+                     for k in ('selector', 'caption', 'value'))
+                     for m in field['radio_members'])
+                 or field['radio_members'][0]['selector'] != field['selector']
+                 or field['radio_members'][0]['caption'] != field['control_label']
+                 or len({m['selector'] for m in field['radio_members']}) != len(field['radio_members'])
+                 or len({m['value'] for m in field['radio_members']}) != len(field['radio_members'])
+                 or len({' '.join(m['caption'].casefold().split())
+                         for m in field['radio_members']}) != len(field['radio_members'])))
+             or (field['tag'] == 'select' and (
                 not isinstance(field.get('options'), list) or not field['options']
                 or any(not isinstance(o, dict) or not isinstance(o.get('value'), str)
                        or not isinstance(o.get('label'), str) or not o['label'].strip()
@@ -1092,6 +1112,30 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # employer, even though the paragraph around it said "Replit" three times
         # and would have locked it to Replit alone.
         form_label = _direct_form_label(pk, row)
+        if form_label:
+            observed = row['gate_pending']['form_question']
+            normalized = ' '.join(answer.casefold().split())
+            if observed['type'] == 'checkbox':
+                if normalized == 'no':
+                    detail = ('Cannot proceed with this application without the required '
+                              'acknowledgement: ' + observed['control_label'])
+                    stores.tracking.set_status(
+                        pk, Status.NEEDS_HUMAN, gate_reason='cannot_proceed',
+                        gate_pending={'question': detail, 'form_question': None},
+                        gate_call_id=None)
+                    return {'result': 'gated', 'pk': pk,
+                            'reason': 'cannot_proceed', 'detail': detail}
+                if normalized != 'yes':
+                    return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                            'detail': 'Answer yes or no for the exact checkbox question.'}
+            elif observed['type'] == 'radio':
+                matching = [member for member in observed['radio_members']
+                            if normalized in {
+                                ' '.join(member['caption'].casefold().split()),
+                                ' '.join(member['value'].casefold().split())}]
+                if len(matching) != 1:
+                    return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                            'detail': 'Choose exactly one of the observed radio captions.'}
         label = form_label or _gate_label(question) or question
         personal = label.lower().startswith("why") or "this role" in label.lower() \
             or (company and company.lower() in label.lower())
@@ -1113,6 +1157,11 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 'type': observed['type'], 'form_selector': observed['form_selector'],
                 'form_action': observed['form_action'],
                 **({'options': observed['options']} if observed['tag'] == 'select' else {}),
+                 **({'visible_text': observed['visible_text']}
+                    if observed['type'] == 'checkbox' else {}),
+                 **({'radio_name': observed['radio_name'],
+                     'radio_members': observed['radio_members']}
+                    if observed['type'] == 'radio' else {}),
             }
             stores.tracking.set_status(
                 pk, row.get('status') or Status.NEEDS_HUMAN,

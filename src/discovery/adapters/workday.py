@@ -19,8 +19,8 @@ from ..watchlist import CompanyConfig
 
 log = get_logger(__name__)
 
-_CXS_PATH = re.compile(r"/wday/cxs/([^/]+)/([^/]+)/jobs/?\\Z")
-_HOST = re.compile(r"[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*\\Z")
+_CXS_PATH = re.compile(r"/wday/cxs/([^/]+)/([^/]+)/jobs/?\Z")
+_HOST = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\Z")
 
 
 def _safe_segment(segment: str) -> bool:

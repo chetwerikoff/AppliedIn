@@ -27,6 +27,7 @@ def target(**values):
     return {'selector': '#field', 'label': 'First name', 'question': '', 'type': 'text',
             'tag': 'input', 'disabled': False, 'has_value': False, 'value': '',
             'required': False, 'in_form': True, 'submit': False,
+            'form_selector': '#application',
             'form_action': 'https://employer.test/job/1', 'formaction': '',
             **values}
 
@@ -34,7 +35,9 @@ def target(**values):
 def grant(field, value, *, selector='#field',
           url='https://employer.test/job/1', question=''):
     return {'value': value, 'selector': selector, 'url': url,
-            'label': field, 'question': question}
+            'label': field, 'question': question, 'tag': 'input',
+            'type': 'text', 'form_selector': '#application',
+            'form_action': 'https://employer.test/job/1'}
 
 
 def page(*controls, text=GOOD):
@@ -43,6 +46,19 @@ def page(*controls, text=GOOD):
             'truncated': False, 'unsupported_frames': [], 'shadow_roots': False,
             'inventory_verified': True, 'opaque_controls': False}
 
+
+
+
+@pytest.fixture(autouse=True)
+def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch):
+    """Existing control/submit guards isolate transport; witness regressions
+    exercise the real static-evaluate adapter in test_browser_bootstrap.py.
+    """
+    async def observed(session, current):
+        return current, {c['selector']: {
+            'visible': True, 'readonly': False, 'disabled': bool(c.get('disabled')),
+            'inert': False} for c in current['controls']}
+    monkeypatch.setattr(forms, '_observe_controls', observed)
 
 def test_private_config_preserves_original_engine_and_rejects_unknown_values(tmp_path):
     assert runtime.configuration()['engine'] == 'chrome'
@@ -1417,15 +1433,13 @@ async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch)
     session = SimpleNamespace(call=AsyncMock())
     kwargs = dict(facts={'Phone': value}, filled={}, resume_path='',
                   company='example-co', jd_text='', resume_tex='', github='', pk=pk)
-    await forms.execute(session, current,
-                        {'action': 'fill', 'selector': '#primary', 'fact': 'Phone'},
-                        **kwargs)
-    session.call.assert_awaited_once_with('fill', '#primary', '--value', value)
-    session.call.reset_mock()
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, current,
-                            {'action': 'fill', 'selector': '#emergency', 'fact': 'Phone'},
-                            **kwargs)
+    # A shared question key cannot identify either field's disclosure grant,
+    # including the previously approved selector. Neither is authorized.
+    for selector in ('#primary', '#emergency'):
+        with pytest.raises(forms.Gate, match='same approval question'):
+            await forms.execute(session, current,
+                                {'action': 'fill', 'selector': selector, 'fact': 'Phone'},
+                                **kwargs)
     session.call.assert_not_awaited()
 
 

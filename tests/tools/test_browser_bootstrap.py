@@ -63,6 +63,7 @@ class Browser:
         self.fail = fail
         self.calls = []
         self.pages = 0
+        self.allow_mutations = False
 
     async def __aenter__(self):
         return self
@@ -86,7 +87,27 @@ class Browser:
                 raise RuntimeError('synthetic evaluate failure')
             return {'value': deepcopy(self.result)}
         if args[0] in {'fill', 'select', 'upload', 'click'}:
-            pytest.fail('No mutation belongs in a pre-owner-answer regression')
+            if not self.allow_mutations:
+                pytest.fail('No mutation belongs in a pre-owner-answer regression')
+            matches = [c for c in self.current['controls'] if c['selector'] == args[1]]
+            assert len(matches) == 1
+            target = matches[0]
+            if args[0] in {'fill', 'select'}:
+                target['value'] = args[-1]
+                target['has_value'] = True
+            elif args[0] == 'upload':
+                assert target['type'] == 'file'
+                target['files'] = ['Resume.pdf']
+                target['has_value'] = True
+            else:
+                assert target['tag'] == 'input' and target['type'] in {'radio', 'checkbox'}
+                if target['type'] == 'radio':
+                    for c in self.current['controls']:
+                        if c.get('type') == 'radio' and c.get('name') == target['name']:
+                            c['checked'] = c is target
+                else:
+                    target['checked'] = True
+            return {}
         raise AssertionError(args)
 
 
@@ -211,17 +232,29 @@ async def test_login_and_material_choice_wall_precedes_text_gate(monkeypatch, ex
     p = inventory(field(), extra_control, submit())
     browser, decide, _ = world(monkeypatch, p)
     report = await attempt(p)
-    assert report['form_question'] is None
+    if extra_control.get('type') == 'checkbox':
+        assert report['form_question']['label'] == 'Email'
+    else:
+        assert report['form_question'] is None
     assert not decide.await_count
     assert all(x[0] != 'fill' for x in browser.calls)
 
 
-async def test_ordinary_required_radio_does_not_hide_unrelated_text(monkeypatch):
+async def test_required_radio_group_gates_before_later_text(monkeypatch):
     radio = field('Evenings', '#evenings', tag='input', type='radio',
-                  name='schedule', question='Schedule preference')
-    p = inventory(radio, field(), submit())
+                  name='schedule', question='Schedule preference',
+                  value='evenings', has_value=True)
+    other = field('Mornings', '#mornings', tag='input', type='radio',
+                  name='schedule', question='Schedule preference',
+                  value='mornings', has_value=True)
+    p = inventory(radio, other, field(), submit())
     browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question']['label'] == 'Email'
+    report = await attempt(p)
+    assert report['form_question']['label'] == 'Schedule preference'
+    assert report['form_question']['radio_members'] == [
+        {'selector': '#evenings', 'caption': 'Evenings', 'value': 'evenings'},
+        {'selector': '#mornings', 'caption': 'Mornings', 'value': 'mornings'}]
+    assert 'Evenings\nMornings' in report['question']
     assert not decide.await_count
 
 
@@ -583,19 +616,11 @@ async def test_second_round_standalone_required_checkbox_remains_page_wall(
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='Known liveness blocker: a required privacy checkbox remains a '
-           'generic page-wide gate even after a manual owner check and resume; '
-           'the work-authorization radio also requires non-automated review.',
-)
 async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch):
-    """One real-shaped, offline first-application scenario; never auto-apply.
+    """A native direct ATS form progresses only on per-job owner answers.
 
-    The owner may answer only observed per-control gates through resume_job,
-    and may manually handle non-grantable consent/radio/upload controls.
-    A repeated generic gate after those steps means this liveness contract
-    is NOT proven. This is an intentional strict XFAIL, not a smoke PASS.
+    All browser effects are synthetic and offline. No click on submit is made.
+    In particular there is no manual browser action for required choices.
     """
     from agent import run
 
@@ -615,11 +640,16 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
                required=True, value='no', has_value=True, checked=False)
     page = inventory(name, email, phone, resume, privacy, yes, no, submit())
     browser, decide, row = world(monkeypatch, page)
-    assert row['human_approved_answers'] == {}
-    answers = {'Full name': 'Test User', 'Email': 'test@example.test',
-               'Phone': '+10000000000'}
+    browser.allow_mutations = True
     bank = {}
-    owner_manually_handled = set()
+    answers = [
+        ('Full name', 'Test User', 'fill', '#full-name'),
+        ('Email', 'test@example.test', 'fill', '#email'),
+        ('Phone', '+10000000000', 'fill', '#phone'),
+        ('I agree to privacy policy', 'yes', 'choose', '#privacy'),
+        ('Work authorization', 'Yes', 'choose', '#authorized-yes'),
+    ]
+    filled = {}
 
     class Tracking:
         def get(self, pk):
@@ -638,58 +668,161 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply',
                         lambda *a, **kw: {'result': 'queued'})
-
-    prior_generic = None
-    for _ in range(9):  # bounded, never let an unanswered generic gate spin
+    assert row['human_approved_answers'] == {}
+    for key, answer, verb, selector in answers:
+        mutations = sum(call[0] in {'fill', 'select', 'click', 'upload'}
+                        for call in browser.calls)
         outcome = await attempt(page, facts=bank)
         assert outcome['status'] == 'gate'
-        question = outcome.get('form_question')
-        if question is None:
-            # The only documented response for checkbox/radio consent is
-            # owner inspection/action, NOT an inferred answer or choose IPC.
-            if not owner_manually_handled:
-                privacy['checked'] = True
-                yes['checked'] = True
-                no['checked'] = False
-                resume['files'] = ['Resume.pdf']
-                owner_manually_handled.update(
-                    {'privacy acknowledgement', 'work authorization radio',
-                     'résumé attachment'})
-            else:
-                assert outcome['question'] != prior_generic, (
-                    'Required privacy acknowledgement checkbox repeats the '
-                    'same generic gate after documented manual owner action '
-                    'and resume; no first per-control question was offered.'
-                )
-            prior_generic = outcome['question']
-            answer = 'approved'  # generic prose is NEVER an approval grant
-        else:
-            key = question['label']
-            assert key in answers and key not in row['human_approved_answers']
-            assert question['selector'] in {'#full-name', '#email', '#phone'}
-            answer = answers[key]
-        row.update(
-            status='needs_human', gate_source='applier',
-            gate_call_id='direct', jd_url=URL, company='example-co',
-            gate_pending={'question': outcome['question'],
-                          'form_question': question})
+        question = outcome['form_question']
+        assert question is not None
+        assert (question['label'], question['selector']) == (key, selector)
+        assert not decide.await_count
+        assert sum(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls) == mutations
+        if verb == 'choose' and selector == '#privacy':
+            assert 'Legal acknowledgement:' in outcome['question']
+            assert 'I agree to privacy policy' in outcome['question']
+            assert question['visible_text'] == privacy['label']
+        if verb == 'choose' and selector == '#authorized-yes':
+            assert 'Statement about you:' in outcome['question']
+            assert 'Work authorization' in outcome['question']
+            assert 'Yes\nNo' in outcome['question']
+            assert [o['caption'] for o in question['radio_members']] == ['Yes', 'No']
+        row.update(status='needs_human', gate_source='applier',
+                   gate_call_id='direct', jd_url=URL, company='example-co',
+                   gate_pending={'question': outcome['question'],
+                                 'form_question': question})
         assert run.resume_job(PK, answer, stores)['result'] == 'queued'
+        assert row['human_approved_answers'][key]['value'] == answer
         row['status'] = 'submitting'
-        # Only this owner-answer writer can create a disclosure grant.
-        for key, grant in row['human_approved_answers'].items():
-            assert key in answers and grant['value'] == answers[key]
-        assert all(c[0] not in {'fill', 'select', 'click', 'upload'}
-                   for c in browser.calls)
-        if (set(row['human_approved_answers']) == set(answers)
-                and owner_manually_handled ==
-                {'privacy acknowledgement', 'work authorization radio',
-                 'résumé attachment'}):
-            break
+        action = {'action': verb, 'selector': selector, 'fact': key}
+        receipt = await forms.execute(
+            browser, page, action, facts=bank, filled=filled,
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=PK, job_url=URL)
+        assert receipt['fact'] == key
+        assert browser.calls[-1][0] == ('click' if verb == 'choose' else 'fill')
+        assert sum(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls) == mutations + 1
 
-    assert set(row['human_approved_answers']) == set(answers), (
-        'Required text fields never reached exact owner-answer grants.'
-    )
-    assert owner_manually_handled == {
-        'privacy acknowledgement', 'work authorization radio',
-        'résumé attachment',
-    }
+    attachment = await forms.execute(
+        browser, page, {'action': 'upload', 'selector': '#resume'},
+        facts=bank, filled=filled, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    assert attachment['uploaded']
+    assert resume['files'] == ['Resume.pdf']
+    forms.check_form(page, filled, uploaded=True, attachment='Resume.pdf')
+    forms.check_approvals(PK, [
+        {'selector': selector, 'fact': key, 'approved_value': answer,
+         'url': URL, 'label': next(c['label'] for c in page['controls']
+                                   if c['selector'] == selector),
+         'question': next(c['question'] for c in page['controls']
+                          if c['selector'] == selector)}
+        for key, answer, _, selector in answers], page)
+    assert set(row['human_approved_answers']) == {item[0] for item in answers}
+    assert all(c[0] != 'click' or c[1] in {'#privacy', '#authorized-yes'}
+               for c in browser.calls)
+    # After every required control is resolved, only the model's ordinary
+    # later decision can gate; no checkbox/radio generic wall remains.
+    final = await attempt(page, facts=bank)
+    assert final['form_question'] is None
+    assert decide.await_count == 1
+
+
+async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(monkeypatch):
+    from agent import run
+    from core.models import Status
+
+    privacy = field('I agree to privacy policy', '#privacy',
+                    type='checkbox', required=True, value='on',
+                    has_value=True, checked=False)
+    page = inventory(privacy, submit())
+    browser, decide, row = world(monkeypatch, page)
+    result = await attempt(page)
+    question = result['form_question']
+    assert question['type'] == 'checkbox' and not decide.await_count
+    bank = {}
+    queue = []
+
+    class Tracking:
+        def get(self, pk):
+            return deepcopy(row)
+
+        def set_status(self, pk, status, **changes):
+            row.update(status=status, **changes)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(),
+        answer_bank=SimpleNamespace(put=lambda *a, **kw: bank.update(used=True)))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_enqueue_apply',
+                        lambda *a, **kw: queue.append(True))
+    row.update(status='needs_human', jd_url=URL, gate_source='applier',
+               gate_call_id='direct', company='example-co',
+               gate_pending={'question': result['question'],
+                             'form_question': question})
+    refused = run.resume_job(PK, 'no', stores)
+    assert refused['result'] == 'gated'
+    assert refused['reason'] == 'cannot_proceed'
+    assert 'Cannot proceed' in refused['detail']
+    assert row['status'] == Status.NEEDS_HUMAN
+    assert row['gate_call_id'] is None
+    assert row.get('human_approved_answers') == {}
+    assert bank == {} and queue == []
+    assert run.resume_job(PK, 'no', stores)['result'] == 'not_gated'
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+
+
+async def test_changed_radio_group_after_owner_grant_refuses_write(monkeypatch):
+    yes = field('Yes', '#yes', type='radio', name='work_auth',
+                question='Work authorization', value='yes', has_value=True)
+    no = field('No', '#no', type='radio', name='work_auth',
+               question='Work authorization', value='no', has_value=True)
+    page = inventory(yes, no, submit())
+    browser, _, row = world(monkeypatch, page)
+    q = (await attempt(page))['form_question']
+    row['human_approved_answers'] = {'Work authorization': {
+        'value': 'Yes', 'selector': q['selector'], 'url': q['url'],
+        'label': q['control_label'], 'question': q['question'],
+        'tag': q['tag'], 'type': q['type'],
+        'form_selector': q['form_selector'], 'form_action': q['form_action'],
+        'radio_name': q['radio_name'], 'radio_members': deepcopy(q['radio_members'])}}
+    no['label'] = 'Not sure'
+    browser.result = witness(page)
+    report = await attempt(page, facts={'Work authorization': 'Yes'})
+    assert report['status'] == 'gate' and report['form_question'] is None
+    browser.allow_mutations = True
+    with pytest.raises(forms.Gate):
+        await forms.execute(browser, page,
+            {'action': 'choose', 'selector': '#yes', 'fact': 'Work authorization'},
+            facts={'Work authorization': 'Yes'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL)
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+
+@pytest.mark.parametrize('kind', ['checkbox', 'radio'])
+async def test_bank_only_choice_value_never_becomes_a_grant(monkeypatch, kind):
+    if kind == 'checkbox':
+        controls = [field('I agree to privacy policy', '#privacy',
+                          type='checkbox', value='on', has_value=True)]
+        key, answer = 'I agree to privacy policy', 'yes'
+    else:
+        controls = [
+            field('Yes', '#yes', type='radio', name='work_auth',
+                  question='Work authorization', value='yes', has_value=True),
+            field('No', '#no', type='radio', name='work_auth',
+                  question='Work authorization', value='no', has_value=True)]
+        key, answer = 'Work authorization', 'Yes'
+    page = inventory(*controls, submit())
+    browser, decide, row = world(monkeypatch, page)
+    fact = {key: answer}  # reusable bank value is NOT a per-job owner grant
+    report = await attempt(page, facts=fact)
+    assert report['form_question']['label'] == key
+    assert row['human_approved_answers'] == {}
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)

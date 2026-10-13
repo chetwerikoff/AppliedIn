@@ -88,14 +88,73 @@ def _definition_end(text: str, name: str, at: int) -> int:
     return _group_end(text, i, "{", "}") if i < len(text) and text[i] == "{" else len(text)
 
 
-def _active_content(latex: str) -> str:
-    """Leave only résumé content, not comments, preamble or definitions."""
-    text = _without_comments(latex)
-    for marker in (r"\\begin\s*\{\s*document\s*\}", r"\\end\s*\{\s*document\s*\}"):
-        match = next((m for m in re.finditer(marker, text) if _unescaped(text, m.start())), None)
-        if match:
-            text = text[match.end():] if "begin" in marker else text[:match.start()]
+_OPAQUE_ENV = re.compile(r"\s*\{\s*(comment|verbatim\*?|Verbatim\*?|lstlisting|minted)\s*\}")
 
+
+def _blank(text: str) -> str:
+    return "".join("\n" if char == "\n" else " " for char in text)
+
+
+def _without_disabled_regions(text: str) -> str:
+    """Exclude known non-executing TeX regions from structural witnesses.
+
+    Do not guess which branch of an arbitrary TeX conditional executes. Such
+    content is unverifiable at this narrow boundary, so return no active calls
+    and let the save guards refuse it.
+    """
+    pieces, cursor, scan = [], 0, 0
+    while token := _COMMAND.search(text, scan):
+        if not _unescaped(text, token.start()):
+            scan = token.end()
+            continue
+        name = token.group(1)
+        end = None
+        if name == "iffalse":
+            depth = 1
+            for nested in _COMMAND.finditer(text, token.end()):
+                if not _unescaped(text, nested.start()):
+                    continue
+                command = nested.group(1)
+                if command.startswith("if"):
+                    depth += 1
+                elif command == "fi":
+                    depth -= 1
+                    if depth == 0:
+                        end = nested.end()
+                        break
+                elif command in {"else", "or"} and depth == 1:
+                    # An else branch may execute; never treat its roles as absent.
+                    return ""
+            if end is None:
+                end = len(text)  # Unterminated false branch stays excluded.
+        elif name == "begin":
+            environment = _OPAQUE_ENV.match(text, token.end())
+            if environment:
+                closing = re.compile(
+                    r"\\end\s*\{\s*" + re.escape(environment.group(1)) + r"\s*\}"
+                )
+                marker = next(
+                    (m for m in closing.finditer(text, environment.end())
+                     if _unescaped(text, m.start())), None
+                )
+                end = marker.end() if marker else len(text)
+        elif name.startswith("if") or name in {"else", "fi", "or", "verb"}:
+            # Non-literal conditionals and inline verbatim require TeX execution
+            # to determine visibility. Refuse instead of accepting false facts.
+            return ""
+        if end is None:
+            scan = token.end()
+            continue
+        pieces.append(text[cursor:token.start()])
+        pieces.append(_blank(text[token.start():end]))
+        cursor = scan = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _active_content(latex: str) -> str:
+    """Leave only verifiable active résumé content, not inert TeX witnesses."""
+    text = _without_comments(latex)
     pieces, cursor = [], 0
     for match in _COMMAND.finditer(text):
         if match.start() < cursor or not _unescaped(text, match.start()):
@@ -104,10 +163,25 @@ def _active_content(latex: str) -> str:
             continue
         end = _definition_end(text, match.group(1), match.end())
         pieces.append(text[cursor:match.start()])
-        pieces.append("".join("\n" if c == "\n" else " " for c in text[match.start():end]))
+        pieces.append(_blank(text[match.start():end]))
         cursor = end
     pieces.append(text[cursor:])
-    return "".join(pieces)
+    text = "".join(pieces)
+
+    begin = next(
+        (m for m in re.finditer(r"\\begin\s*\{\s*document\s*\}", text)
+         if _unescaped(text, m.start())), None
+    )
+    if begin:
+        text = text[begin.end():]
+    text = _without_disabled_regions(text)
+    # Do not let a fake \end{document} inside an inactive region truncate the
+    # actual content. It must be searched *after* hiding inactive regions.
+    end = next(
+        (m for m in re.finditer(r"\\end\s*\{\s*document\s*\}", text)
+         if _unescaped(text, m.start())), None
+    )
+    return text[:end.start()] if end else text
 
 
 def active_calls(latex: str, macros: tuple[str, ...]) -> list[tuple[str, str]]:

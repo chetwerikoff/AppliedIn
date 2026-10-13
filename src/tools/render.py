@@ -10,11 +10,27 @@ doesn't render bold, so we strip the former and swap the latter for `newtxtext`
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+
+_DISALLOWED_C0_DEL = {code: None for code in range(32) if code not in (9, 10, 13)}
+_DISALLOWED_C0_DEL[127] = None
+
+
+def _strip_c0_controls(src: str) -> str:
+    """Drop invalid C0/DEL controls without changing surviving LaTeX bytes."""
+    cleaned = src.translate(_DISALLOWED_C0_DEL)
+    removed = len(src) - len(cleaned)
+    if removed:
+        logging.getLogger(__name__).warning(
+            "Removed %d disallowed C0/DEL characters before LaTeX compile", removed
+        )
+    return cleaned
 
 
 def _strip_pdfinfo(src: str) -> str:
@@ -131,6 +147,8 @@ def restore_preamble(seed_latex: str, tailored_latex: str) -> str:
 
 def render_pdf(latex_source: str) -> bytes:
     """Compile LaTeX source to PDF bytes (pdflatex if available, else Tectonic)."""
+    # Both engines require this filter; Tectonic-specific rewrites stay in _sanitize.
+    latex_source = _strip_c0_controls(latex_source)
     if (pdflatex := shutil.which("pdflatex")) is not None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "resume.tex").write_text(latex_source, encoding="utf-8")

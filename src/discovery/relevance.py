@@ -28,18 +28,31 @@ log = get_logger(__name__)
 
 def _intent(prefs: Preferences) -> str:
     """Turn preferences.yaml into a natural-language brief for the agent."""
-    target = ", ".join(prefs.titles) or "Software Engineer"
+    if prefs.titles:
+        target = ", ".join(prefs.titles)
+        target_guidance = (
+            "Match the job functions evident in posting titles to these configured "
+            "roles, including reasonable functional title variants."
+        )
+    else:
+        target = "unspecified (no target titles configured)"
+        target_guidance = (
+            "Do not infer a target job function or require a title/function match. "
+            "Screen using configured hard constraints only; PREFERRED cues, if "
+            "provided, are optional and never mandatory role filters."
+        )
     lines = [
-        f"TARGET ROLE: {target}. These are HANDS-ON engineering roles that write "
-        "code. Count reasonable variants as a fit — Software Development Engineer "
-        "(SDE/SWE), Backend / Frontend / Full-Stack / Platform / Infrastructure / "
-        "Machine Learning / AI / Applied-Science (coding) Engineer at a similar "
-        "level.",
-        "NOT A FIT even though they sound technical: Program Manager (TPM), "
-        "Project Manager, Product Manager, Solutions/Enterprise Architect, Support "
-        "Engineer, Solutions/Sales/Field Engineer, Customer Engineer, Data Analyst, "
-        "Designer, Recruiter, Android / iOS / mobile-app Engineer, and any "
-        "people-management role (Manager/Director of …). Reject these.",
+        f"TARGET ROLE: {target}. {target_guidance}",
+        "ROLE FUNCTION VS RANK: Judge job function using functional evidence "
+        "in each posting title, not corporate-rank tokens. Vice President and AVP "
+        "alone establish neither a job function nor inferred seniority. Rank "
+        "alone is neither a positive function match nor a categorical reason "
+        "to reject. With configured target roles, omit rank-only titles from "
+        "fit_indices when a match to the target function is unestablished due "
+        "to missing functional evidence, not because the rank is disallowed. "
+        "For rank-plus-functional-descriptor titles, assess the descriptor "
+        "against configured target roles, not the corporate rank. An explicitly "
+        "configured rank in PREFERRED remains a soft cue, not proof of function.",
     ]
     preferred = [*prefs.include_keywords, *prefs.seniority]
     if preferred:

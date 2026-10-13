@@ -911,8 +911,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
         else:
-            raise Gate(f'An exact human-approved answer is needed for "{form_question["label"]}".',
-                       form_question=form_question)
+            prompt = (_choice_prompt(target, form_question) if verb == 'choose'
+                      else f'An exact human-approved answer is needed for "{form_question["label"]}".')
+            raise Gate(prompt, form_question=form_question)
         if not _same(key, form_question['label']):
             raise Gate('An exact human-approved fact key for this observed question is required.',
                        form_question=form_question)
@@ -921,7 +922,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                            url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
-            raise Gate(str(exc), form_question=form_question) from None
+            prompt = (_choice_prompt(target, form_question)
+                      if verb == 'choose' else str(exc))
+            raise Gate(prompt, form_question=form_question) from None
         if not value:
             raise Gate('An owner answer is needed for this observed control.',
                        form_question=form_question)

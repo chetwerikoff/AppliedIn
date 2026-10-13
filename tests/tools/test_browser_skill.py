@@ -40,9 +40,16 @@ def grant(field, value, *, selector='#field',
             'form_action': 'https://employer.test/job/1'}
 
 
-def page(*controls, text=GOOD):
+def page(*controls, text=GOOD, application_marker=False):
+    # Fill/select disclosure tests must supply a real structural native marker.
+    # Keep unrelated pages (discovery/confirmation/submit refusal) unchanged.
+    observed = list(controls)
+    if application_marker:
+        observed.append(target(selector='#submit-application', tag='button',
+                               type='submit', label='Submit application',
+                               submit=True, required=False))
     return {'url': 'https://employer.test/job/1', 'title': 'Program manager',
-            'text': text, 'description': GOOD, 'controls': list(controls),
+            'text': text, 'description': GOOD, 'controls': observed,
             'truncated': False, 'unsupported_frames': [], 'shadow_roots': False,
             'inventory_verified': True, 'opaque_controls': False}
 
@@ -184,7 +191,7 @@ async def test_model_text_cannot_replace_approved_fact(monkeypatch):
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {'First name': grant('First name', 'Approved')}})
     filled = {}
-    await forms.execute(session, page(target()),
+    await forms.execute(session, page(target(), application_marker=True),
                         {'action': 'fill', 'selector': '#field', 'fact': 'First name',
                          'value': 'Invented'},
                         facts={'First name': 'Approved'}, filled=filled, resume_path='',
@@ -842,7 +849,8 @@ async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_e
     monkeypatch.setattr('tools.narrative.draft_answer',
                         lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
     await forms.execute(
-        session, page(target(tag='textarea', type='textarea', label='Motivation')),
+        session, page(target(tag='textarea', type='textarea', label='Motivation'),
+                      application_marker=True),
         {'action': 'fill', 'selector': '#field', 'fact': '', 'essay': True},
         facts={'Motivation': 'Approved explanation'}, filled={}, resume_path='',
         company='Company', jd_text='', resume_tex='', github='', pk='Company#1')
@@ -907,7 +915,8 @@ async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
     session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate, match='human-approved'):
         await forms.execute(
-            session, page(field), action, facts=facts, filled={}, resume_path='',
+            session, page(field, application_marker=True), action, facts=facts,
+            filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
     session.call.assert_not_awaited()
 
@@ -1129,7 +1138,8 @@ async def test_human_approved_fact_is_not_authorization_for_another_question(mon
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
     session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience')),
+        await forms.execute(session, page(target(label='Years of experience'),
+                                          application_marker=True),
                             {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
                             facts={'Name': 'Test User'}, filled={}, resume_path='',
                             company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
@@ -1149,7 +1159,8 @@ async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_pat
         'human_approved_answers': {'Years of experience': '2 years'}})
     session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience')),
+        await forms.execute(session, page(target(label='Years of experience'),
+                                          application_marker=True),
                             {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
                             facts=facts, filled={}, resume_path='', company='example-co',
                             jd_text='', resume_tex='', github='', pk='example-co#1')
@@ -1261,7 +1272,7 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
     run, stores, pk = form_gate_world
     if banked:
         stores.answer_bank.put(field, value, AnswerScope.GLOBAL, source='writer')
-    current = page(target(label=field))
+    current = page(target(label=field), application_marker=True)
     writes = AsyncMock()
     class Session:
         def __init__(self, kind):
@@ -1375,7 +1386,7 @@ async def test_discovery_keeps_reading_and_native_search_filter_writes(monkeypat
     'destination', 'selector', 'ambiguous_label'])
 async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, corruption):
     run, stores, pk = form_gate_world
-    current = page(target(label='Email'))
+    current = page(target(label='Email'), application_marker=True)
     if corruption == 'ambiguous_label':
         current['controls'].append(target(selector='#field', label='Email'))
     with pytest.raises(forms.Gate) as gated:
@@ -1405,7 +1416,7 @@ async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, 
 
 async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, form_gate_world):
     run, stores, pk = form_gate_world
-    current = page(target(label='Email'))
+    current = page(target(label='Email'), application_marker=True)
     class Session:
         def __init__(self, kind):
             pass
@@ -1451,7 +1462,7 @@ async def test_legacy_label_only_grant_never_writes(monkeypatch):
     session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate, match='human-approved'):
         await forms.execute(
-            session, page(target(label='Phone')),
+            session, page(target(label='Phone'), application_marker=True),
             {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
             facts={'Phone': '555-0100'}, filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='',
@@ -1613,7 +1624,8 @@ async def test_exact_grant_drifts_independently_without_writing(
     """Changing only observed URL or only observed question revokes exact authority."""
     pk, value = 'example-co#synthetic', 'Test User'
     old_url = 'https://employer.test/job/1'
-    observed = page(target(label='Name', question=''))
+    observed = page(target(label='Name', question=''),
+                    application_marker=True)
     row = {'pk': pk, 'status': 'submitting',
            'human_approved_answers': {'Name': grant('Name', value, url=old_url)}}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
@@ -1640,7 +1652,8 @@ async def test_exact_grant_drifts_independently_without_writing(
 async def test_exact_grant_unmodified_identity_and_receipt_still_write(
         monkeypatch):
     pk, value = 'example-co#synthetic', 'Test User'
-    observed = page(target(label='Name', question=''))
+    observed = page(target(label='Name', question=''),
+                    application_marker=True)
     row = {'pk': pk, 'status': 'submitting',
            'human_approved_answers': {'Name': grant('Name', value)}}
     monkeypatch.setattr(forms, '_row', lambda pk: row)

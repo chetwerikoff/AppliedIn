@@ -196,14 +196,27 @@ def exact_approval(pk: str, key: str, value: str, *,
     grants = row.get('human_approved_answers')
     grant = grants.get(key) if isinstance(grants, dict) else None
     if (row.get('pk') != pk or row.get('status') != 'submitting'
-            or row.get('possible_submission') or not key or not url or not target
-            or not isinstance(grant, dict)
+            or row.get('possible_submission') or not key or not value or not url
+            or not target or not isinstance(grant, dict)
             or grant.get('value') != value
             or any(grant.get(k) != observed for k, observed in (
                 ('selector', target.get('selector')),
                 ('url', url),
                 ('label', target.get('label')),
-                ('question', target.get('question', ''))))):
+                ('question', target.get('question', '')),
+                ('tag', target.get('tag')),
+                ('type', target.get('type')),
+                ('form_selector', target.get('form_selector')),
+                ('form_action', target.get('form_action'))))
+            or (target.get('type') == 'checkbox'
+                and (grant.get('visible_text') != target.get('label')
+                     or not _same(value, 'yes')))
+            or (target.get('type') == 'radio'
+                and (grant.get('radio_name') != target.get('name')
+                     or grant.get('radio_members') != target.get('radio_members')
+                     or not isinstance(target.get('radio_members'), list)))
+            or (target.get('tag') == 'select'
+                and grant.get('options') != target.get('options'))):
         # Old label-only string grants have no control identity and always gate.
         raise Gate('An exact human-approved answer is needed for this control.')
 
@@ -220,7 +233,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
-                           target=target, url=page['url'],
+                           target=_bound_target(page, target), url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
 
 
@@ -407,6 +420,477 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
             raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
+
+# No model/page text is executable here. This code-owned read uses the same
+# selector rules as PAGE and independently establishes DOM editability/ownership.
+_FIXED_CONTROL_WITNESS = r"""(() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const selector = e => {
+    if (e.id && document.querySelectorAll('#'+CSS.escape(e.id)).length === 1)
+      return '#'+CSS.escape(e.id);
+    const parts = [];
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      const siblings = n.parentElement ? Array.from(n.parentElement.children)
+        .filter(x=>x.tagName===n.tagName) : [n];
+      parts.unshift(n.tagName.toLowerCase()+':nth-of-type('+(siblings.indexOf(n)+1)+')');
+    }
+    return parts.join(' > ');
+  };
+  const visible = e => {
+    if (!e.getClientRects().length) return false;
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      const style = getComputedStyle(n);
+      if (!style || style.display === 'none' ||
+          style.visibility === 'hidden' || style.visibility === 'collapse' ||
+          !(Number(style.opacity) > 0))
+        return false;
+    }
+    return true;
+  };
+  // PAGE.label can fall back to input.name; choices need actual visible
+  // caption text rather than that non-visible fallback.
+  const visibleText = e => {
+    const labels = Array.from(e.labels || []).filter(visible)
+      .map(n=>n.innerText).join(' ');
+    const aria = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id=>document.getElementById(id)).filter(n=>n && visible(n))
+      .map(n=>n.innerText).join(' ');
+    return clean(labels || aria);
+  };
+  const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
+    '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
+  return {url: location.href, controls: Array.from(document.querySelectorAll(query))
+    .filter(e => (!!e.getClientRects().length &&
+      getComputedStyle(e).visibility !== 'hidden') ||
+      e.form || e.closest('form') || e.type === 'file')
+    .map(e => {
+      const form = e.form || e.closest('form');
+      const type = e.getAttribute('role') ||
+        ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
+          (e.getAttribute('type') || e.tagName.toLowerCase()));
+      const ownSelector = selector(e), formSelector = form ? selector(form) : '';
+      return {selector:ownSelector, unique:document.querySelectorAll(ownSelector).length === 1,
+        tag:e.tagName.toLowerCase(), type, in_form:!!form,
+        form_selector:formSelector,
+        unique_form:!form || document.querySelectorAll(formSelector).length === 1,
+        form_action:form?.action || '',
+        formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
+        disabled:!!e.disabled || e.matches(':disabled') ||
+          e.getAttribute('aria-disabled') === 'true',
+        readonly:!!e.readOnly || e.hasAttribute('readonly'),
+        inert:!!e.closest('[inert]'), visible:visible(e),
+        visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
+        options:e.options ? Array.from(e.options)
+          .map(o=>({value:o.value,label:clean(o.textContent)})) : []};
+    })};
+})()"""
+
+_APP_SUBMIT_LABELS = frozenset({
+    'submit application', 'send application', 'complete application',
+    'finish application', 'apply now',
+})
+_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number'})
+_ACCOUNT_PURPOSE = re.compile(
+    r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
+    r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
+_MATERIAL_ASSENT = re.compile(
+    r'\b(?:agree(?:ment)?|consent|acknowledg|certif|authori[sz]|'
+    r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
+    r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
+
+
+def _submitter_texts(target: dict) -> tuple[str, ...]:
+    """An input[type=submit] displays its value, even when its name becomes PAGE.label."""
+    if not native_submit(target):
+        return ()
+    texts = [target.get('label', '')]
+    if target.get('tag') == 'input' and target.get('type') == 'submit':
+        texts.append(target.get('value', ''))
+    return tuple(t for t in texts if isinstance(t, str) and t.strip())
+
+
+def _material_select_options(target: dict) -> bool:
+    """Native option values and captions can encode assent behind a bland label."""
+    options = target.get('options')
+    return (target.get('tag') == 'select' and isinstance(options, list)
+            and any(isinstance(o, dict) and any(
+                isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
+                for k in ('value', 'label')) for o in options))
+
+
+def _unrelated_search_form(controls: list[dict]) -> bool:
+    """Ignore only a proven search-only form, not a second plausible application."""
+    searches = [c for c in controls
+                if c.get('tag') == 'input' and c.get('type') == 'search']
+    return (len(searches) == 1 and all(
+        c is searches[0] or
+        (native_submit(c) and any(
+            _same(t, 'Search') or _same(t, 'Search jobs')
+            for t in _submitter_texts(c)))
+        for c in controls))
+
+
+def _inventory_ok(page: dict) -> None:
+    if (page.get('inventory_verified') is not True or page.get('truncated')
+            or page.get('opaque_controls') or page.get('shadow_roots')
+            or page.get('unsupported_frames')):
+        raise Gate('The current form inventory is incomplete; human inspection is required.')
+    controls = page.get('controls')
+    if (not isinstance(controls, list) or
+            any(not isinstance(c, dict) or not isinstance(c.get('selector'), str)
+                or not c['selector'] for c in controls)):
+        raise Gate('The current form control inventory is malformed.')
+
+
+def _identity(target: dict) -> tuple:
+    return tuple(target.get(k) for k in (
+        'selector', 'label', 'question', 'tag', 'type', 'in_form',
+        'form_selector', 'form_action', 'formaction', 'options', 'disabled',
+        'required', 'has_value', 'value', 'checked', 'name'))
+
+
+def _page_identity(page: dict) -> tuple:
+    return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
+            page.get('opaque_controls'), page.get('shadow_roots'),
+            page.get('unsupported_frames'),
+            tuple(repr(_identity(c)) for c in page.get('controls', [])))
+
+
+async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
+    """A missing or malformed real evaluate result never authorizes disclosure."""
+    _inventory_ok(page)
+    try:
+        result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
+        value = result.get('value') if isinstance(result, dict) else None
+        if (not isinstance(value, dict) or value.get('url') != page.get('url')
+                or not isinstance(value.get('controls'), list)
+                or len(value['controls']) != len(page['controls'])):
+            raise ValueError('The fixed DOM witness does not match PAGE')
+        lookup = {}
+        for original, observed in zip(page['controls'], value['controls']):
+            if not isinstance(observed, dict):
+                raise ValueError('Malformed DOM witness entry')
+            sel = original['selector']
+            if (sel in lookup or observed.get('selector') != sel
+                    or observed.get('unique') is not True
+                    or observed.get('unique_form') is not True
+                    or any(original.get(k) != observed.get(k) for k in (
+                        'tag', 'type', 'in_form', 'form_selector',
+                        'form_action', 'formaction', 'disabled'))
+                    or (original.get('type') in {'radio', 'checkbox'}
+                        and (not isinstance(observed.get('visible_text'), str)
+                             or not observed['visible_text'].strip()
+                             or observed['visible_text'] != original.get('label')))
+                    or (original.get('tag') == 'select'
+                        and original.get('options') != observed.get('options'))
+                    or any(not isinstance(observed.get(k), bool)
+                           for k in ('visible', 'readonly', 'inert'))):
+                raise ValueError('Control identity differs from the DOM witness')
+            lookup[sel] = observed
+        current = await session.page()
+        _inventory_ok(current)
+        if _page_identity(current) != _page_identity(page):
+            raise ValueError('The current inventory changed during observation')
+        return current, lookup
+    except (Exception, asyncio.CancelledError) as exc:
+        raise Gate('The current DOM witness is unavailable or changed; '
+                   'inspect this form before answering or writing.') from None
+
+
+def _radio_group(page: dict, target: dict) -> list[dict]:
+    """One native form/name group, with distinct observed captions and values."""
+    name, form = target.get('name'), target.get('form_selector')
+    if (target.get('tag') != 'input' or target.get('type') != 'radio'
+            or not isinstance(name, str) or not name.strip()
+            or not isinstance(form, str) or not form.strip()
+            or not isinstance(target.get('question'), str)
+            or not target['question'].strip()):
+        raise Gate('A native radio group needs a form, name and visible question.')
+    members = [c for c in page['controls']
+               if c.get('type') == 'radio' and c.get('name') == name
+               and c.get('form_selector') == form]
+    if (len(members) < 2 or any(
+            c.get('tag') != 'input' or c.get('in_form') is not True
+            or c.get('question') != target['question']
+            or c.get('form_action') != target.get('form_action')
+            or not isinstance(c.get('selector'), str) or not c['selector']
+            or not isinstance(c.get('label'), str) or not c['label'].strip()
+            or not isinstance(c.get('value'), str) or not c['value'].strip()
+            for c in members)
+            or len({c['selector'] for c in members}) != len(members)
+            or len({c['value'] for c in members}) != len(members)
+            or len({_same_key(c['label']) for c in members}) != len(members)):
+        raise Gate('Radio group members or captions are incomplete or ambiguous.')
+    return members
+
+
+def _bound_target(page: dict, target: dict) -> dict:
+    """Grant identity for a radio is its entire group, never one model option."""
+    if target.get('type') != 'radio':
+        return target
+    members = _radio_group(page, target)
+    return {**members[0], 'radio_name': members[0]['name'],
+            'radio_members': [
+                {'selector': c['selector'], 'caption': c['label'],
+                 'value': c['value']} for c in members]}
+
+
+def _key(page: dict, target: dict) -> str:
+    key = target.get('question') or target.get('label')
+    if not isinstance(key, str) or not key.strip():
+        raise Gate('The observed field has no distinct approval question.')
+    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
+    if any(_same(key, c.get('question') or c.get('label') or '')
+           for c in page['controls'] if all(c is not member for member in own)):
+        raise Gate('More than one control uses the same approval question; review manually.')
+    return key
+
+
+def _unanswered(page: dict, target: dict) -> bool:
+    if target.get('type') == 'checkbox':
+        return bool(target.get('required')) and not target.get('checked')
+    if target.get('type') == 'radio':
+        members = _radio_group(page, target)
+        return any(c.get('required') for c in members) and not any(
+            c.get('checked') for c in members)
+    return bool(target.get('required')) and not target.get('has_value')
+
+
+def _choice_prompt(target: dict, question: dict) -> str:
+    """Show original question, radio captions and native select options verbatim."""
+    subject = label(target)
+    prefix = ('Legal acknowledgement: ' if _MATERIAL_ASSENT.search(subject)
+              else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
+              else '')
+    observed = question['question'] or question['control_label']
+    if (question['control_label'] != observed
+            and question['type'] in {'checkbox', 'select'}):
+        observed += '\n' + question['control_label']
+    if question['type'] == 'radio':
+        observed += '\nOptions:\n' + '\n'.join(
+            member['caption'] for member in question['radio_members'])
+    elif question.get('tag') == 'select':
+        observed += '\nOptions:\n' + '\n'.join(
+            option['label'] for option in question['options'])
+    else:
+        observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
+    return prefix + observed
+
+
+def _native_answer(target: dict) -> bool:
+    return ((target.get('tag') == 'input' and target.get('type') in _TEXT_TYPES)
+            or (target.get('tag') == 'textarea' and target.get('type') == 'textarea')
+            or (target.get('tag') == 'select' and target.get('type') == 'select'))
+
+
+def _require_native_choice(target: dict) -> None:
+    if (target.get('tag') != 'input'
+            or target.get('type') not in {'checkbox', 'radio'}
+            or target.get('disabled') or target.get('checked')):
+        raise Gate('Only an unchecked, enabled native checkbox/radio can be chosen.')
+
+
+def _require_native_action(target: dict, verb: str) -> None:
+    """Never dispatch fill to a select or select to a text-entry field."""
+    if verb == 'fill':
+        allowed = ((target.get('tag') == 'input' and
+                    target.get('type') in _TEXT_TYPES)
+                   or (target.get('tag') == 'textarea' and
+                       target.get('type') == 'textarea'))
+    elif verb == 'select':
+        allowed = target.get('tag') == 'select' and target.get('type') == 'select'
+    else:
+        return
+    if not allowed:
+        raise Gate('The requested form action does not match this native control.')
+
+
+def _form_subject(page: dict, target: dict) -> list[dict]:
+    form = target.get('form_selector')
+    if (target.get('in_form') is not True or not isinstance(form, str)
+            or not form.strip() or not isinstance(target.get('form_action'), str)
+            or not target.get('form_action')):
+        raise Gate('A uniquely identified native owning form is required.')
+    siblings = [c for c in page['controls']
+                if c.get('in_form') and c.get('form_selector') == form]
+    if not siblings:
+        raise Gate('The native form owner is no longer present.')
+    if any((_ACCOUNT_PURPOSE.search(label(c)) or _LOGIN.search(label(c))
+            or any(_ACCOUNT_PURPOSE.search(text) or _LOGIN.search(text)
+                   for text in _submitter_texts(c)))
+           for c in siblings):
+        raise Gate('This field belongs to a sign-in, account or subscription form.')
+    if any(c.get('type') == 'password' for c in siblings):
+        raise Gate('A password field makes this owning form unsafe for disclosure.')
+    forms = {c.get('form_selector') for c in page['controls']
+             if c.get('in_form') and c.get('form_selector')
+             and (c.get('tag') in {'input', 'textarea', 'select'} or c.get('submit'))}
+    for other in forms - {form}:
+        other_controls = [c for c in page['controls']
+                          if c.get('in_form') and c.get('form_selector') == other]
+        if not _unrelated_search_form(other_controls):
+            raise Gate('Competing native form purposes require human inspection.')
+    return siblings
+
+def _native_options(target: dict) -> list:
+    options = target.get('options')
+    if (not isinstance(options, list) or not options
+            or any(not isinstance(o, dict)
+                   or not isinstance(o.get('value'), str)
+                   or not isinstance(o.get('label'), str)
+                   or not o['label'].strip() for o in options)
+            or len({o['value'] for o in options}) != len(options)
+            or len({_same_key(o['label']) for o in options}) != len(options)):
+        raise Gate('The native select options are incomplete or ambiguous.')
+    return [{'value': o['value'], 'label': o['label']} for o in options]
+
+
+def _same_key(value: str) -> str:
+    return ' '.join(value.casefold().split())
+
+
+def _disclosure_question(page: dict, target: dict, witness: dict,
+                         *origins: str, bootstrap: bool = False) -> dict:
+    choice = target.get('type') in {'radio', 'checkbox'}
+    if choice:
+        if target.get('tag') != 'input':
+            raise Gate('A grantable choice must be a native input.')
+        members = (_radio_group(page, target)
+                   if target.get('type') == 'radio' else [target])
+        target = members[0]
+    elif _native_answer(target):
+        members = [target]
+    else:
+        raise Gate('Only observed native text, select or choice controls may request a grant.')
+    if any(not isinstance(c.get('label'), str) or not c['label'].strip()
+           or not isinstance(c.get('question'), str) for c in members):
+        raise Gate('Complete native labels and questions are required.')
+    for member in members:
+        dom = witness.get(member['selector'])
+        if (not dom or dom.get('visible') is not True
+                or dom.get('readonly') is True or dom.get('disabled') is True
+                or dom.get('inert') is True or member.get('disabled')
+                or (choice and dom.get('visible_text') != member['label'])):
+            raise Gate('This control is not visibly editable.')
+    subject = label(target)
+    if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
+        raise Gate('This control requires human sign-in or account review.')
+    if not choice and (_MATERIAL_ASSENT.search(subject)
+                       or _material_select_options(target)):
+        raise Gate('Legal or material assent requires direct human review.')
+    key = _key(page, target)
+    siblings = _form_subject(page, target)
+    if bootstrap and (not _unanswered(page, target)
+                      or (not choice and bool(str(target.get('value') or '').strip()))):
+        raise Gate('This is not a required unanswered field.')
+    marked = any(
+        (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
+                                   for t in _submitter_texts(c)))
+        or (c.get('type') == 'file'
+            and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
+        for c in siblings)
+    if not marked:
+        raise Gate('No positive native application-form marker was observed.')
+    check_form_destination(page, target, *origins)
+    question = {
+        'pk': '', 'label': key, 'selector': target['selector'],
+        'url': page['url'], 'control_label': target['label'],
+        'question': target.get('question', ''),
+        'tag': target['tag'], 'type': target['type'],
+        'form_selector': target['form_selector'],
+        'form_action': target['form_action'],
+    }
+    if target.get('tag') == 'select':
+        question['options'] = _native_options(target)
+    if target.get('type') == 'checkbox':
+        question['visible_text'] = witness[target['selector']]['visible_text']
+    if target.get('type') == 'radio':
+        bound = _bound_target(page, target)
+        question['radio_name'] = bound['radio_name']
+        question['radio_members'] = bound['radio_members']
+    return question
+
+
+def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
+    for c in page['controls']:
+        subject = label(c)
+        if (c.get('type') == 'password'
+                or (c.get('in_form') and (
+                    _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject)
+                    or any(_ACCOUNT_PURPOSE.search(t) or _LOGIN.search(t)
+                           for t in _submitter_texts(c))))):
+            raise Gate('Login or account form requires human inspection.')
+        if c.get('type') in {'radio', 'checkbox'}:
+            if _unanswered(page, c):
+                try:
+                    _disclosure_question(page, c, witness, *origins, bootstrap=True)
+                except Gate:
+                    raise Gate('An uninspectable required choice needs human review.') from None
+            continue
+        if c.get('in_form') and (
+                _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
+            raise Gate('Material assent outside a bound choice needs human inspection.')
+        if (c.get('required') and c.get('in_form')
+                and c.get('tag') not in {'input', 'textarea', 'select', 'button'}):
+            raise Gate('An uninspectable required choice needs human review.')
+
+
+async def _bootstrap(session, page: dict, pk: str, facts: dict,
+                     *origins: str, fixture_context=None) -> dict:
+    _inventory_ok(page)
+    if not navigation_allowed(page['url'], *origins):
+        raise Gate('The current form is not on the tracked job route.')
+    candidate = [c for c in page['controls']
+                 if (_native_answer(c) or c.get('type') in {'radio', 'checkbox'})
+                 and _unanswered(page, c)]
+    if not candidate and not any(
+            c.get('type') in {'radio', 'checkbox', 'password'}
+            or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
+            for c in page['controls']):
+        return page
+    page, witness = await _observe_controls(session, page)
+    _bootstrap_wall(page, witness, *origins)
+    for item in page['controls']:
+        if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
+                and _unanswered(page, item)):
+            continue
+        if (item.get('type') == 'radio'
+                and _radio_group(page, item)[0] is not item):
+            continue
+        if item.get('disabled') or (
+                item.get('type') not in {'radio', 'checkbox'}
+                and str(item.get('value') or '').strip()):
+            continue
+        try:
+            question = _disclosure_question(page, item, witness, *origins, bootstrap=True)
+        except Gate:
+            continue
+        question['pk'] = pk
+        key = question['label']
+        value = str(facts.get(key) or '').strip()
+        grant = (_row(pk, fixture_context=fixture_context) if fixture_context
+                 else _row(pk)).get('human_approved_answers') or {}
+        previous = grant.get(key) if isinstance(grant, dict) else None
+        if (item.get('type') == 'radio' and isinstance(previous, dict)
+                and isinstance(previous.get('radio_members'), list)
+                and previous['radio_members'] != question['radio_members']):
+            raise Gate('The previously approved radio group has changed; inspect it again.')
+        if value:
+            try:
+                exact_approval(pk, key, value, target=_bound_target(page, item),
+                               url=page['url'], **({'fixture_context': fixture_context}
+                                                  if fixture_context else {}))
+                continue
+            except Gate:
+                pass
+        prompt = (_choice_prompt(item, question)
+                  if (item.get('type') in {'radio', 'checkbox'}
+                      or item.get('tag') == 'select')
+                  else f'An exact human-approved answer is needed for "{key}".')
+        raise Gate(prompt, form_question=question)
+    return page
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -423,15 +907,27 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
     if verb in {'fill', 'select', 'choose'}:
-        # Only this observed, unique control creates a disclosure question;
-        # model gate prose and generic pipeline questions carry no such scope.
-        form_question = {
-            'pk': pk, 'label': target.get('question') or target['label'],
-            'selector': target['selector'], 'url': page.get('url', ''),
-            'control_label': target['label'], 'question': target.get('question', ''),
-        }
-        if not form_question['label'] or not form_question['url']:
-            form_question = None
+        if verb == 'choose':
+            _require_native_choice(target)
+        else:
+            _require_native_action(target, verb)
+        observed, witness = await _observe_controls(session, page)
+        target = control(observed, action)
+        if verb == 'choose':
+            _require_native_choice(target)
+            if not _unanswered(observed, target):
+                raise Gate('Only required, unanswered native choices can be selected.')
+        else:
+            _require_native_action(target, verb)
+        if _identity(target) != _identity(control(page, action)):
+            raise Gate('The selected field changed before human authorization.')
+        page = observed
+        form_question = _disclosure_question(
+            page, target, witness, job_url or page['url'])
+        form_question['pk'] = pk
+        gate_prompt = (_choice_prompt(target, form_question)
+                       if verb in {'choose', 'select'}
+                       else f'An exact human-approved answer is needed for "{form_question["label"]}".')
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
@@ -440,44 +936,82 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 key = matches[0]
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
-        elif (verb == 'choose' and target.get('type') == 'checkbox'
-              and target.get('required') and _AGREE.match(target.get('label', ''))
-              and not _SENSITIVE.search(question) and not _SANCTIONS_RX.search(question)
-              and not _FACT_ASSERTION.search(target.get('label', ''))):
-            key, value = target['label'], target['label']
         else:
-            raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
-                       form_question=form_question)
+            raise Gate(gate_prompt, form_question=form_question)
+        if not _same(key, form_question['label']):
+            detail = 'An exact human-approved fact key for this observed question is required.'
+            if verb == 'select':
+                detail += '\n' + gate_prompt
+            raise Gate(detail, form_question=form_question)
         try:
-            exact_approval(pk, key, value, target=target, url=page.get('url', ''),
+            exact_approval(pk, key, value, target=_bound_target(page, target),
+                           url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
-            raise Gate(str(exc), form_question=form_question) from None
-        if not _same(key, target.get('question') or target.get('label', '')):
-            raise Gate('An exact human-approved answer for this question is required.')
+            prompt = (_choice_prompt(target, form_question)
+                      if verb == 'choose' else str(exc))
+            if verb == 'select':
+                prompt += '\n' + gate_prompt
+            raise Gate(prompt, form_question=form_question) from None
         if not value:
-            raise Gate(f'An approved answer is needed for "{target["label"]}".')
-        guarded_value(target, value)
-        if is_submission(target):
-            raise Gate('A submission control is not an answer field.')
-        if verb == 'fill':
-            if (target.get('type') in {'file', 'radio', 'checkbox', 'option'}
-                    or target.get('tag') not in {'input', 'textarea'}):
-                raise Gate('Fill is restricted to text inputs and textareas.')
-            await session.call('fill', target['selector'], '--value', value)
-        elif verb == 'select':
-            if target.get('tag') != 'select':
-                raise Gate('Native select required; custom dropdowns need human input.')
-            value = choose_value(target, value, str(action.get('value', '')))
-            await session.call('select', target['selector'], '--value', value)
+            raise Gate(gate_prompt, form_question=form_question)
+        if verb == 'choose':
+            if target['type'] == 'checkbox':
+                if not _same(value, 'yes'):
+                    raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
+                guarded_value(target, value)
+                write_value = target.get('value') or target['label']
+            else:
+                members = _radio_group(page, target)
+                chosen = [c for c in members
+                          if (_same(value, c['label']) or _same(value, c['value']))]
+                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
+                    raise Gate('The selected radio does not match the exact owner answer.')
+                guarded_value(target, value)
+                write_value = target['value']
         else:
-            if target.get('type') not in {'radio', 'checkbox', 'option'}:
-                raise Gate('Choose is restricted to observed radio/checkbox/option controls.')
-            choose_value(target, value, str(action.get('value', '')))
-            if not target.get('checked'):
-                # Onclick can commit unexpectedly; there is no noncommit proof.
-                raise Gate('Choice click is potentially committing; human action required.')
-        filled[target['selector']] = value
+            guarded_value(target, value)
+            write_value = (choose_value(target, value, str(action.get('value', '')))
+                           if verb == 'select' else value)
+        # A second independent PAGE and fixed witness precede every browser write.
+        latest, latest_witness = await _observe_controls(session, page)
+        current = control(latest, action)
+        if verb == 'choose':
+            _require_native_choice(current)
+            if not _unanswered(latest, current):
+                raise Gate('The required choice is no longer unanswered.')
+        else:
+            _require_native_action(current, verb)
+        if _identity(current) != _identity(target):
+            raise Gate('The approved form control changed before a browser write.')
+        fresh_question = _disclosure_question(
+            latest, current, latest_witness, job_url or latest['url'])
+        fresh_question['pk'] = pk
+        if fresh_question != form_question:
+            raise Gate('The original authorized control identity is no longer current.')
+        exact_approval(pk, key, str(facts[key]).strip(),
+                       target=_bound_target(latest, current), url=latest['url'],
+                       **({'fixture_context': ctx} if ctx else {}))
+        if verb == 'fill':
+            guarded_value(current, write_value)
+            await session.call('fill', current['selector'], '--value', write_value)
+        elif verb == 'select':
+            write_value = choose_value(current, str(facts[key]).strip(),
+                                       str(action.get('value', '')))
+            await session.call('select', current['selector'], '--value', write_value)
+        else:
+            if current['type'] == 'checkbox':
+                if not _same(str(facts[key]).strip(), 'yes'):
+                    raise Gate('Checkbox grant no longer contains an explicit owner yes.')
+            else:
+                matches = [c for c in _radio_group(latest, current)
+                           if (_same(str(facts[key]).strip(), c['label'])
+                               or _same(str(facts[key]).strip(), c['value']))]
+                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
+                    raise Gate('The bound radio answer no longer matches this member.')
+            guarded_value(current, str(facts[key]).strip())
+            await session.call('click', current['selector'])
+        filled[current['selector']] = write_value
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
@@ -616,6 +1150,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
                                 'values and attachment before submit.')
+                    verify_dispatch()
+                    page = await _bootstrap(
+                        session, page, pk, facts, url, direct_url,
+                        **({'fixture_context': ctx} if ctx else {}))
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, page, history, model=model)
                     verb = action.get('action')
@@ -631,7 +1169,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options',
-                                'form_action', 'formaction')):
+                                'form_action', 'formaction', 'form_selector', 'in_form',
+                                 'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
                         raise Gate(str(action.get('question') or 'This form needs your input.'))

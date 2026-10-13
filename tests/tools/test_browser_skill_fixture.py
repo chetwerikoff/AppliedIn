@@ -123,16 +123,12 @@ async def test_controller_generated_second_field_gate_after_exactly_one_name_fil
                                       "Additional question": "Synthetic answer"},
         "synthetic-fixture", pk=fixture.PK, resume_path=authority.resume_path,
         fixture_context=authority)
-    assert result["status"] == "gate", result
-    gate = result["form_question"]
-    assert gate == {
-        "pk": fixture.PK, "label": "Additional question",
-        "selector": "#additional", "url": fixture.URL,
-        "control_label": "Additional question", "question": "",
-    }
-    assert authority.fills == 1 and authority.decisions == 2
-    assert commands.count(("fill", "#name", "--value", "Test User")) == 1
-    assert not any(c[0] in {"click", "upload", "select", "choose", "evaluate"}
+    # The exclusive legacy fixture supplies neither full saved provenance
+    # nor the controller's new fixed read-only witness. It must now fail closed;
+    # it cannot be upgraded as evidence for Issue #31's new bootstrap.
+    assert result["status"] == "gate" and result["form_question"] is None
+    assert authority.fills == 0 and authority.decisions == 1
+    assert not any(c[0] in {"fill", "click", "upload", "select", "choose", "evaluate"}
                    for c in commands)
     assert commands[0] == ("start",) and commands[-1] == ("stop",)
     assert commands.count(("navigate", fixture.URL)) == 1
@@ -311,6 +307,10 @@ def test_fixture_manual_jit_and_hold_evidence_never_needs_owner_store(
                 "question": "", "fact": "Name", "approved_value": "Test User",
                 "url": fixture.URL}]
     page = synthetic_page()
+    # This late JIT-only check uses a synthetic full-identity owner grant.
+    authority.row["human_approved_answers"]["Name"].update(
+        tag="input", type="text", form_selector="#synthetic-form",
+        form_action=fixture.URL)
     forms.check_approvals(fixture.PK, history, page,
                           fixture_context=authority)
     forms.hold_possible_submission(
@@ -617,8 +617,11 @@ def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
     result = subprocess.run(
         [sys.executable, "-m", "daemon", "--synthetic-browser-fixture"],
         cwd=tmp_path, env=env, text=True, capture_output=True, timeout=45)
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    assert '"safe_gate": true' in result.stdout.lower()
+    # The old exclusive fixture intentionally denies the NEW fixed evaluate
+    # IPC and carries a legacy five-key grant. The daemon must reject it before
+    # writing, not pretend its earlier positive path proves the new witness.
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert '"safe_gate": false' in result.stdout.lower()
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
     assert "http_handler_selected" in kinds
@@ -631,7 +634,7 @@ def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
     assert actions.count("session_start") == actions.count("session_stop") == 1
     assert actions.count("navigate") == 1
     assert actions.count("evaluate_page") >= 2
-    assert actions.count("fill_name") == 1
+    assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
 
@@ -685,9 +688,14 @@ async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
     cont.update(selector="#continue", label="Continue", type="submit", tag="button",
                 submit=True)
     filled = {"#name": "Test User", "#additional": "Synthetic answer"}
+    authority.row["human_approved_answers"]["Name"].update(
+        tag="input", type="text", form_selector="#synthetic-form",
+        form_action=fixture.URL)
     authority.row["human_approved_answers"]["Additional question"] = {
         "selector": "#additional", "url": fixture.URL, "label": "Additional question",
         "question": "", "value": "Synthetic answer",
+        "tag": "textarea", "type": "textarea", "form_selector": "#synthetic-form",
+        "form_action": fixture.URL,
     }
     history = [
         {"selector": selector, "label": label, "question": "", "url": fixture.URL,
@@ -914,10 +922,22 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
                      "selector": button["selector"]}
     # The second control is intentionally granted ONLY in this late-JIT test:
     # the normal native-positive fixture still gates that exact second fill.
+    authority.row["human_approved_answers"]["Name"].update(
+        tag="input", type="text", form_selector="#synthetic-form",
+        form_action=fixture.URL)
     authority.row["human_approved_answers"]["Additional question"] = {
         "selector": "#additional", "label": "Additional question",
         "question": "", "url": fixture.URL, "value": "Synthetic answer",
+        "tag": "textarea", "type": "textarea", "form_selector": "#synthetic-form",
+        "form_action": fixture.URL,
     }
+    # This late JIT-order test supplies a separate, test-only control witness.
+    # The production JS and any zero-grant fixture remain unverified by it.
+    async def witnessed(_session, current):
+        return current, {c["selector"]: {"visible": True, "readonly": False,
+            "disabled": bool(c.get("disabled")), "inert": False}
+            for c in current["controls"]}
+    monkeypatch.setattr(forms, "_observe_controls", witnessed)
     observed = []
     underlying = []
     staged = []
@@ -1033,6 +1053,16 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
         "synthetic-fixture", pk=fixture.PK,
         resume_path=authority.resume_path, fixture_context=authority)
+    if change in {"form_action", "formaction"}:
+        # Fresh receiver validation before the first fill now precedes all
+        # staged effects; an unsafe current override cannot be postponed to JIT.
+        assert staged == [] and authority.fills == 0
+        assert result["status"] == "gate" and "form destination" in result["question"]
+        assert "receiver" in observed and "hold" not in observed
+        assert not authority.hold and authority.row["status"] == "submitting"
+        assert not any(c[0] in {"fill", "click", "upload", "select", "choose"}
+                       for c in underlying)
+        return
     assert staged == ["preverified_additional_receipt", "preverified_attached_pdf"]
     assert observed.count("decision:" + button_action["action"]) == 1
     assert authority.fills == 1

@@ -251,7 +251,7 @@ class CDP:
             if url == self.fixture_url and verb == "GET" and kind == "Document":
                 self.call("Fetch.continueRequest", {"requestId": args["requestId"]}, session)
             else:
-                self.forbidden.append(f"Fetch rejected {verb} {kind} destination")
+                self.forbidden.append(f"Fetch rejected {verb} {kind} destination {url[:200]!r}")
                 self.call("Fetch.failRequest", {"requestId": args["requestId"],
                                                  "errorReason": "BlockedByClient"}, session)
         elif method == "Network.requestWillBeSent":
@@ -260,9 +260,9 @@ class CDP:
             kind = args.get("type", "")
             self.network.append((url, verb, kind))
             if args.get("redirectResponse") is not None:
-                self.redirects.append(url)
+                self.redirects.append(url[:200])
             if url != self.fixture_url or verb != "GET" or kind != "Document":
-                self.forbidden.append(f"Network observed {verb} {kind} destination")
+                self.forbidden.append(f"Network observed {verb} {kind} destination {url[:200]!r}")
         elif method == "Page.frameNavigated" and session == self.page_session:
             frame = args.get("frame") or {}
             if not frame.get("parentId"):
@@ -337,6 +337,18 @@ def _assert_matrix(observed: dict, truth: dict, fixture, url: str):
     require(isinstance(controls, list) and len(controls) == len(cases)
             and isinstance(actual, list) and len(actual) == len(cases),
             "witness omitted, duplicated or added native controls")
+    zero = actual[ids.index("zero-area")]
+    off = actual[ids.index("offcanvas")]
+    below = actual[ids.index("below-fold-scrollable")]
+    layout = truth["scroll"]
+    require(zero["width"] * zero["height"] == 0,
+            "zero-area: decoy unexpectedly has layout area")
+    require(off["width"] > 0 and off["height"] > 0 and off["right"] < 0
+            and off["position"] == "fixed" and layout["width"] <= layout["client"],
+            "offcanvas: decoy is not completely non-scrollable off-canvas")
+    require(below["top"] > layout["viewport"] and
+            layout["height"] > layout["viewport"],
+            "below-fold-scrollable: ordinary scrolling cannot reach the control")
     flags = {
         "readonly-input": "readonly", "disabled-input": "disabled",
         "inert-input": "inert", "inert-parent": "inert",
@@ -383,18 +395,6 @@ def _assert_matrix(observed: dict, truth: dict, fixture, url: str):
         require(dom.get("options") == expected_options
                 and got.get("options") == expected_options,
                 f"{id_}: full ordered select options mismatch")
-    zero = actual[ids.index("zero-area")]
-    off = actual[ids.index("offcanvas")]
-    below = actual[ids.index("below-fold-scrollable")]
-    layout = truth["scroll"]
-    require(zero["width"] * zero["height"] == 0,
-            "zero-area: decoy unexpectedly has layout area")
-    require(off["width"] > 0 and off["height"] > 0 and off["right"] < 0
-            and off["position"] == "fixed" and layout["width"] <= layout["client"],
-            "offcanvas: decoy is not completely non-scrollable off-canvas")
-    require(below["top"] > layout["viewport"] and
-            layout["height"] > layout["viewport"],
-            "below-fold-scrollable: ordinary scrolling cannot reach the control")
     require(len([c for c in controls if c.get("type") == "radio"]) == 2,
             "native radio group membership incomplete")
     require("grantable" not in observed and all("grantable" not in c for c in controls),
@@ -468,7 +468,7 @@ def _run_chrome(fixture, production_script: str, browser: str):
                             "Chrome refused the synthetic fixture navigation")
                     cdp.until_loaded()
                     require(not cdp.forbidden and not cdp.redirects,
-                            "forbidden page request, redirect or detached target")
+                            (cdp.forbidden or cdp.redirects or ["unverified network attempt"])[0])
                     ids = [case[0] for case in fixture.CASES]
                     dom_truth = cdp.evaluate(_DOM_TRUTH.replace("__IDS__", json.dumps(ids)))
                     # Imported production JS is evaluated verbatim, not wrapped or copied.
@@ -481,7 +481,7 @@ def _run_chrome(fixture, production_script: str, browser: str):
                         for info in active if info.get("type") in types),
                         "active page/frame/worker target was not intercepted")
                     require(not cdp.forbidden and not cdp.redirects,
-                            "forbidden page destination or unobserved redirect")
+                            (cdp.forbidden or cdp.redirects or ["unverified network attempt"])[0])
                     require(set(cdp.discovered) <= cdp.intercepted_targets,
                             "a page/frame/worker target lacked pre-navigation interception")
                     require(len(cdp.fetch) == len(cdp.network) == 1

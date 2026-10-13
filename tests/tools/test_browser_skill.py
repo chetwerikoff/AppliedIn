@@ -64,7 +64,9 @@ def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch):
     async def observed(session, current):
         return current, {c['selector']: {
             'visible': True, 'readonly': False, 'disabled': bool(c.get('disabled')),
-            'inert': False} for c in current['controls']}
+            'inert': False,
+            'visible_text': c['label'] if c.get('type') in {'checkbox', 'radio'} else ''}
+            for c in current['controls']}
     monkeypatch.setattr(forms, '_observe_controls', observed)
 
 def test_private_config_preserves_original_engine_and_rejects_unknown_values(tmp_path):

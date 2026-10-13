@@ -564,6 +564,15 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
             # No browser IPC, navigation, DOM reload or wait for a refused proposal.
             continue
         history.append({"action": verb, "label": target["label"] if target else ""})
+    # The last permitted effect has already been URL- and inventory-checked.
+    # Its freshly witnessed anchors count too, even without an 81st decision.
+    observed.update(c["href"] for c in page["controls"]
+                    if isinstance(c.get("href"), str)
+                    and discovery_url_allowed(c["href"], url))
+    for c in page["controls"]:
+        witness = titled_anchor(c, page)
+        if witness is not None:
+            witnessed.append(witness)
     return fallback("discovery step limit reached after 80 decisions")
 
 async def apply_chrome(*args, **kwargs) -> dict:

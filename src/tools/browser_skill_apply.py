@@ -568,8 +568,8 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
                 if c.get('in_form') and c.get('form_selector') == form]
     if not siblings:
         raise Gate('The native form owner is no longer present.')
-    if any(_ACCOUNT_PURPOSE.search(label(c)) for c in siblings
-           if c.get('submit') or c.get('type') == 'password'):
+    if any(_ACCOUNT_PURPOSE.search(label(c)) or _LOGIN.search(label(c))
+           for c in siblings):
         raise Gate('This field belongs to a sign-in, account or subscription form.')
     if any(c.get('type') == 'password' for c in siblings):
         raise Gate('A password field makes this owning form unsafe for disclosure.')
@@ -643,8 +643,9 @@ def _bootstrap_wall(page: dict, witness: dict) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
-                or (c.get('submit') and _ACCOUNT_PURPOSE.search(subject))
-                or (c.get('in_form') and _MATERIAL_ASSENT.search(subject))):
+                or (c.get('in_form') and (_ACCOUNT_PURPOSE.search(subject)
+                                         or _LOGIN.search(subject)
+                                         or _MATERIAL_ASSENT.search(subject)))):
             raise Gate('Login or material consent requires human inspection.')
         if c.get('in_form') and c.get('required') and c.get('type') == 'checkbox' \
                 and not c.get('checked'):

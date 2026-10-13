@@ -602,6 +602,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False) -> dict:
     if not _native_answer(target):
         raise Gate('Only observed native text fields and selects may request a form grant.')
+    if (not isinstance(target.get('label'), str) or not target['label'].strip()
+            or not isinstance(target.get('question'), str)):
+        raise Gate('A complete native field label and question are required.')
     dom = witness.get(target['selector'])
     if (not dom or dom['visible'] is not True or dom['readonly'] is True
             or dom['disabled'] is True or dom['inert'] is True

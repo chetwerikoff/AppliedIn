@@ -5,10 +5,10 @@ description: Tailor an existing LaTeX résumé substantively to a job using only
 
 # Résumé tailoring
 
-Edit the unchanged same-run LaTeX seed supplied in state \`base_latex\`
-for the JD in \`jd_text\`; save the complete result using
-\`save_tailored_resume\`. The **seed is the sole factual authority**.
-The JD, \`github_context\` and owner/tailoring notes can direct relevance,
+Edit the unchanged same-run LaTeX seed supplied in state `base_latex`
+for the JD in `jd_text`; save the complete result using
+`save_tailored_resume`. The **seed is the sole factual authority**.
+The JD, `github_context` and owner/tailoring notes can direct relevance,
 ordering and vocabulary **only for seed-supported work**. They must never
 introduce a project, employment fact, skill, tool, result, metric, outcome,
 scale, beneficiary, or seniority not present in the seed — even if the
@@ -50,7 +50,7 @@ claiming that tool or project. Do not turn a description of an exercise,
 investigation or refactor into an unseeded production result.
 
 For more emphasis techniques, see
-\`references/emphasis-techniques.md\`. Its suggestions are subordinate to
+`references/emphasis-techniques.md`. Its suggestions are subordinate to
 the seed-only factual rule, existing sections and role attribution.
 
 ## When outcomes are not supported
@@ -63,9 +63,9 @@ a newly quantified result.
 
 ## Save and correct
 
-Call \`save_tailored_resume(tailored_latex=<complete edited .tex>)\`.
+Call `save_tailored_resume(tailored_latex=<complete edited .tex>)`.
 Retain every base-used bullet and role anchor. If the tool reports
-\`missing_facts\` or dropped bullets, restore the original anchor/bullet
+`missing_facts` or dropped bullets, restore the original anchor/bullet
 content and re-save. If the seed format is unrecognized, report the need
 for a supported seed rather than manufacturing a different format.
 

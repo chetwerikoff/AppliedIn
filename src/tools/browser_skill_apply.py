@@ -208,6 +208,13 @@ def exact_approval(pk: str, key: str, value: str, *,
                 ('type', target.get('type')),
                 ('form_selector', target.get('form_selector')),
                 ('form_action', target.get('form_action'))))
+            or (target.get('type') == 'checkbox'
+                and (grant.get('visible_text') != target.get('label')
+                     or not _same(value, 'yes')))
+            or (target.get('type') == 'radio'
+                and (grant.get('radio_name') != target.get('name')
+                     or grant.get('radio_members') != target.get('radio_members')
+                     or not isinstance(target.get('radio_members'), list)))
             or (target.get('tag') == 'select'
                 and grant.get('options') != target.get('options'))):
         # Old label-only string grants have no control identity and always gate.
@@ -226,7 +233,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
-                           target=target, url=page['url'],
+                           target=_bound_target(page, target), url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
 
 
@@ -528,7 +535,7 @@ def _identity(target: dict) -> tuple:
     return tuple(target.get(k) for k in (
         'selector', 'label', 'question', 'tag', 'type', 'in_form',
         'form_selector', 'form_action', 'formaction', 'options', 'disabled',
-        'required', 'has_value', 'value', 'checked'))
+        'required', 'has_value', 'value', 'checked', 'name'))
 
 
 def _page_identity(page: dict) -> tuple:
@@ -575,20 +582,93 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
                    'inspect this form before answering or writing.') from None
 
 
+def _radio_group(page: dict, target: dict) -> list[dict]:
+    """One native form/name group, with distinct observed captions and values."""
+    name, form = target.get('name'), target.get('form_selector')
+    if (target.get('tag') != 'input' or target.get('type') != 'radio'
+            or not isinstance(name, str) or not name.strip()
+            or not isinstance(form, str) or not form.strip()
+            or not isinstance(target.get('question'), str)
+            or not target['question'].strip()):
+        raise Gate('A native radio group needs a form, name and visible question.')
+    members = [c for c in page['controls']
+               if c.get('type') == 'radio' and c.get('name') == name
+               and c.get('form_selector') == form]
+    if (len(members) < 2 or any(
+            c.get('tag') != 'input' or c.get('in_form') is not True
+            or c.get('question') != target['question']
+            or c.get('form_action') != target.get('form_action')
+            or not isinstance(c.get('selector'), str) or not c['selector']
+            or not isinstance(c.get('label'), str) or not c['label'].strip()
+            or not isinstance(c.get('value'), str) or not c['value'].strip()
+            for c in members)
+            or len({c['selector'] for c in members}) != len(members)
+            or len({c['value'] for c in members}) != len(members)
+            or len({_same_key(c['label']) for c in members}) != len(members)):
+        raise Gate('Radio group members or captions are incomplete or ambiguous.')
+    return members
+
+
+def _bound_target(page: dict, target: dict) -> dict:
+    """Grant identity for a radio is its entire group, never one model option."""
+    if target.get('type') != 'radio':
+        return target
+    members = _radio_group(page, target)
+    return {**members[0], 'radio_name': members[0]['name'],
+            'radio_members': [
+                {'selector': c['selector'], 'caption': c['label'],
+                 'value': c['value']} for c in members]}
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
         raise Gate('The observed field has no distinct approval question.')
-    if sum(_same(key, c.get('question') or c.get('label') or '')
-           for c in page['controls']) != 1:
+    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
+    if any(_same(key, c.get('question') or c.get('label') or '')
+           for c in page['controls'] if all(c is not member for member in own)):
         raise Gate('More than one control uses the same approval question; review manually.')
     return key
+
+
+def _unanswered(page: dict, target: dict) -> bool:
+    if target.get('type') == 'checkbox':
+        return bool(target.get('required')) and not target.get('checked')
+    if target.get('type') == 'radio':
+        members = _radio_group(page, target)
+        return any(c.get('required') for c in members) and not any(
+            c.get('checked') for c in members)
+    return bool(target.get('required')) and not target.get('has_value')
+
+
+def _choice_prompt(target: dict, question: dict) -> str:
+    """Show original control/question strings and every radio caption verbatim."""
+    subject = label(target)
+    prefix = ('Legal acknowledgement: ' if _MATERIAL_ASSENT.search(subject)
+              else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
+              else '')
+    observed = question['question'] or question['control_label']
+    if question['control_label'] != observed and question['type'] == 'checkbox':
+        observed += '\n' + question['control_label']
+    if question['type'] == 'radio':
+        observed += '\nOptions:\n' + '\n'.join(
+            member['caption'] for member in question['radio_members'])
+    else:
+        observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
+    return prefix + observed
 
 
 def _native_answer(target: dict) -> bool:
     return ((target.get('tag') == 'input' and target.get('type') in _TEXT_TYPES)
             or (target.get('tag') == 'textarea' and target.get('type') == 'textarea')
             or (target.get('tag') == 'select' and target.get('type') == 'select'))
+
+
+def _require_native_choice(target: dict) -> None:
+    if (target.get('tag') != 'input'
+            or target.get('type') not in {'checkbox', 'radio'}
+            or target.get('disabled') or target.get('checked')):
+        raise Gate('Only an unchecked, enabled native checkbox/radio can be chosen.')
 
 
 def _require_native_action(target: dict, verb: str) -> None:

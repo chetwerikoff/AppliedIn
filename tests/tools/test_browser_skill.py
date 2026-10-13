@@ -473,7 +473,7 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
 async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
     link = target(selector='#job', tag='a', type='a', href='https://employer.test/job/1')
     current = page(link)
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={'action': 'finish', 'report': {
         'jobs': [{'url': link['href'], 'title': 'Real'},
@@ -507,17 +507,13 @@ async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
 async def test_discovery_never_navigates_foreign_or_action_links(monkeypatch, unsafe):
     seed = 'https://employer.test/careers'
     current = {**page(target(tag='a', type='a', href=unsafe)), 'url': seed}
-    visited = []
-    async def navigate(href):
-        visited.append(href)
-        return current
-    session = SimpleNamespace(navigate=navigate)
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
-        'action': 'navigate', 'url': unsafe}))
-    with pytest.raises(ValueError, match='safe employer route'):
-        await bsk._crawl(session, 'Find postings', seed)
-    assert visited == [seed]  # no browser navigate IPC to the bad href
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'navigate', 'url': unsafe},
+        {'action': 'finish', 'report': {'jobs': []}}]))
+    assert (await bsk._crawl(session, 'Find postings', seed))['jobs'] == []
+    session.call.assert_awaited_once_with('navigate', seed)  # refused href had no IPC
 
 
 @pytest.mark.parametrize('host', [
@@ -542,13 +538,13 @@ def test_discovery_enforces_shared_ats_tenant(host):
 async def test_discovery_never_publishes_decoded_action_routes(monkeypatch, unsafe):
     seed = 'https://employer.test/careers'
     current = {**page(target(tag='a', type='a', href=unsafe)), 'url': seed}
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
         'action': 'finish', 'report': {'jobs': [{'url': unsafe, 'title': 'Unsafe'}]}}))
     report = await bsk._crawl(session, 'Find postings', seed)
     assert report['jobs'] == []
-    session.navigate.assert_awaited_once_with(seed)  # zero unsafe navigate IPC
+    session.call.assert_awaited_once_with('navigate', seed)  # zero unsafe navigate IPC
 
 
 @pytest.mark.parametrize('host', [
@@ -559,13 +555,13 @@ async def test_discovery_foreign_shared_tenant_has_no_ipc_or_published_job(monke
     seed = f'https://{host}/example-co/jobs'
     foreign = f'https://{host}/other-tenant/jobs/999'
     current = {**page(target(tag='a', type='a', href=foreign)), 'url': seed}
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
         'action': 'finish', 'report': {'jobs': [{'url': foreign, 'title': 'Foreign'}]}}))
     report = await bsk._crawl(session, 'Find postings', seed)
     assert report['jobs'] == []
-    session.navigate.assert_awaited_once_with(seed)
+    session.call.assert_awaited_once_with('navigate', seed)
 
 
 @pytest.mark.parametrize('unsafe', [
@@ -587,7 +583,7 @@ async def test_discovery_never_publishes_foreign_tenant(monkeypatch):
     current = {**page(
         target(selector='#one', tag='a', type='a', href=good),
         target(selector='#two', tag='a', type='a', href=foreign)), 'url': seed}
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current))
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
         'action': 'finish', 'report': {'jobs': [
@@ -595,7 +591,7 @@ async def test_discovery_never_publishes_foreign_tenant(monkeypatch):
             {'url': foreign, 'title': 'Foreign tenant'}]}}))
     report = await bsk._crawl(session, 'Find postings', seed)
     assert report['jobs'] == [{'url': good, 'title': 'Same employer'}]
-    session.navigate.assert_awaited_once_with(seed)
+    session.call.assert_awaited_once_with('navigate', seed)
 
 
 def test_startup_reuses_shared_daemon_and_never_restarts_it(monkeypatch):
@@ -1181,18 +1177,20 @@ async def test_observed_same_job_action_link_cannot_commit_by_navigation(monkeyp
     ('button', 'Search jobs', True), ('button', 'Next page', False),
 ])
 async def test_discovery_ambiguous_buttons_never_issue_click(monkeypatch, typ, label, in_form):
-    current = page(target(tag='button', type=typ, label=label,
-                          in_form=in_form, submit=typ == 'submit'))
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current),
-                              page=AsyncMock(return_value=current), call=AsyncMock())
+    seed = 'https://employer.test/careers'
+    current = {**page(target(tag='button', type=typ, label=label,
+                             in_form=in_form, submit=typ == 'submit')), 'url': seed}
+    session = SimpleNamespace(call=AsyncMock(), page=AsyncMock(return_value=current))
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': 'click', 'selector': '#field'},
         {'action': 'finish', 'report': {'jobs': []}}]))
-    with pytest.raises(ValueError):
-        await bsk._crawl(session, 'Find postings', current['url'])
-    session.call.assert_not_awaited()
-
+    if typ == 'submit':
+        with pytest.raises(ValueError, match='submit'):
+            await bsk._crawl(session, 'Find postings', seed)
+    else:
+        assert (await bsk._crawl(session, 'Find postings', seed))['jobs'] == []
+    session.call.assert_awaited_once_with('navigate', seed)
 
 @pytest.mark.parametrize('before,after', [
     ('#/jobs/one', '#/jobs/two'), ('#/role/A', '#/role/B'),
@@ -1346,15 +1344,15 @@ def test_unchanged_fragment_and_full_query_are_still_proven_job_context(url):
 ])
 async def test_discovery_keeps_reading_and_native_search_filter_writes(monkeypatch, verb, control, value):
     current = page(control)
-    session = SimpleNamespace(navigate=AsyncMock(return_value=current),
-                              page=AsyncMock(return_value=current), call=AsyncMock())
+    session = SimpleNamespace(page=AsyncMock(return_value=current), call=AsyncMock())
     monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': verb, 'selector': '#field', 'value': value},
         {'action': 'finish', 'report': {'jobs': []}}]))
     assert (await bsk._crawl(session, 'Find postings', current['url']))['jobs'] == []
-    session.call.assert_awaited_once_with(verb, '#field', '--value', value)
-
+    assert session.call.await_count == 2
+    session.call.assert_any_await('navigate', current['url'])
+    session.call.assert_any_await(verb, '#field', '--value', value)
 
 @pytest.mark.parametrize('corruption', ['source', 'call_id', 'status', 'application',
     'destination', 'selector', 'ambiguous_label'])

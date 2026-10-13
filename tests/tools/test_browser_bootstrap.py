@@ -581,3 +581,115 @@ async def test_second_round_standalone_required_checkbox_remains_page_wall(
     assert (await attempt(p))['form_question'] is None
     assert not decide.await_count
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Known liveness blocker: a required privacy checkbox remains a '
+           'generic page-wide gate even after a manual owner check and resume; '
+           'the work-authorization radio also requires non-automated review.',
+)
+async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch):
+    """One real-shaped, offline first-application scenario; never auto-apply.
+
+    The owner may answer only observed per-control gates through resume_job,
+    and may manually handle non-grantable consent/radio/upload controls.
+    A repeated generic gate after those steps means this liveness contract
+    is NOT proven. This is an intentional strict XFAIL, not a smoke PASS.
+    """
+    from agent import run
+
+    name = field('Full name', '#full-name')
+    email = field('Email', '#email')
+    phone = field('Phone', '#phone', type='tel')
+    resume = field('Upload résumé', '#resume', tag='input', type='file',
+                   required=True)
+    privacy = field('I agree to privacy policy', '#privacy',
+                    tag='input', type='checkbox', required=True,
+                    value='on', has_value=True, checked=False)
+    yes = field('Yes', '#authorized-yes', tag='input', type='radio',
+                name='work_authorization', question='Work authorization',
+                required=True, value='yes', has_value=True, checked=False)
+    no = field('No', '#authorized-no', tag='input', type='radio',
+               name='work_authorization', question='Work authorization',
+               required=True, value='no', has_value=True, checked=False)
+    page = inventory(name, email, phone, resume, privacy, yes, no, submit())
+    browser, decide, row = world(monkeypatch, page)
+    assert row['human_approved_answers'] == {}
+    answers = {'Full name': 'Test User', 'Email': 'test@example.test',
+               'Phone': '+10000000000'}
+    bank = {}
+    owner_manually_handled = set()
+
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return deepcopy(row)
+
+        def set_status(self, pk, status, **changes):
+            assert pk == PK
+            row.update(status=status, **changes)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(),
+        answer_bank=SimpleNamespace(put=lambda label, value, *args, **kwargs:
+                                    bank.update({label: value})),
+    )
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_enqueue_apply',
+                        lambda *a, **kw: {'result': 'queued'})
+
+    prior_generic = None
+    for _ in range(9):  # bounded, never let an unanswered generic gate spin
+        outcome = await attempt(page, facts=bank)
+        assert outcome['status'] == 'gate'
+        question = outcome.get('form_question')
+        if question is None:
+            # The only documented response for checkbox/radio consent is
+            # owner inspection/action, NOT an inferred answer or choose IPC.
+            if not owner_manually_handled:
+                privacy['checked'] = True
+                yes['checked'] = True
+                no['checked'] = False
+                resume['files'] = ['Resume.pdf']
+                owner_manually_handled.update(
+                    {'privacy acknowledgement', 'work authorization radio',
+                     'résumé attachment'})
+            else:
+                assert outcome['question'] != prior_generic, (
+                    'Required privacy acknowledgement checkbox repeats the '
+                    'same generic gate after documented manual owner action '
+                    'and resume; no first per-control question was offered.'
+                )
+            prior_generic = outcome['question']
+            answer = 'approved'  # generic prose is NEVER an approval grant
+        else:
+            key = question['label']
+            assert key in answers and key not in row['human_approved_answers']
+            assert question['selector'] in {'#full-name', '#email', '#phone'}
+            answer = answers[key]
+        row.update(
+            status='needs_human', gate_source='applier',
+            gate_call_id='direct', jd_url=URL, company='example-co',
+            gate_pending={'question': outcome['question'],
+                          'form_question': question})
+        assert run.resume_job(PK, answer, stores)['result'] == 'queued'
+        row['status'] = 'submitting'
+        # Only this owner-answer writer can create a disclosure grant.
+        for key, grant in row['human_approved_answers'].items():
+            assert key in answers and grant['value'] == answers[key]
+        assert all(c[0] not in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+        if (set(row['human_approved_answers']) == set(answers)
+                and owner_manually_handled ==
+                {'privacy acknowledgement', 'work authorization radio',
+                 'résumé attachment'}):
+            break
+
+    assert set(row['human_approved_answers']) == set(answers), (
+        'Required text fields never reached exact owner-answer grants.'
+    )
+    assert owner_manually_handled == {
+        'privacy acknowledgement', 'work authorization radio',
+        'résumé attachment',
+    }

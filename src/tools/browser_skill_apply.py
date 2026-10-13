@@ -473,12 +473,16 @@ _APP_SUBMIT_LABELS = frozenset({
 })
 _TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number'})
 _ACCOUNT_PURPOSE = re.compile(
-    r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
-    r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
+    r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create[\s-]*account|'
+    r'account|register|subscribe|subscription|password|forgot[\s-]*password)\b', re.I)
 _MATERIAL_ASSENT = re.compile(
-    r'\b(?:agree(?:ment)?|consent|acknowledg|certif|authori[sz]|'
+    r'\b(?:agree(?:ment)?|consent|'
+    r'acknowledg(?:e(?:d|s|ment|ments)?|ment|ments|ing)|'
+    r'certif(?:y|ies|ied|ying)|'
+    r'authori[sz](?:e(?:d|s)?|ation(?:s)?|ing)|'
+    r'attest(?:ation(?:s)?|s|ed|ing)?|accept(?:s|ed|ing|ance(?:s)?)?|'
     r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
-    r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
+    r'ai[\s-]*(?:use|policy)|waiver|release|signature)\b', re.I)
 
 
 def _submitter_texts(target: dict) -> tuple[str, ...]:
@@ -489,6 +493,21 @@ def _submitter_texts(target: dict) -> tuple[str, ...]:
     if target.get('tag') == 'input' and target.get('type') == 'submit':
         texts.append(target.get('value', ''))
     return tuple(t for t in texts if isinstance(t, str) and t.strip())
+
+
+def _account_purpose(text: str) -> bool:
+    return bool(_ACCOUNT_PURPOSE.search(text) or _LOGIN.search(text))
+
+
+def _purpose_button_texts(target: dict) -> tuple[str, ...]:
+    # This must not be reused as a bootstrap application marker:
+    # input[type=button] has no native submit destination.
+    texts = _submitter_texts(target)
+    if target.get('tag') == 'input' and target.get('type') == 'button':
+        value = target.get('value')
+        if isinstance(value, str):
+            return (*texts, value)
+    return texts
 
 
 def _material_select_options(target: dict) -> bool:
@@ -528,7 +547,7 @@ def _identity(target: dict) -> tuple:
     return tuple(target.get(k) for k in (
         'selector', 'label', 'question', 'tag', 'type', 'in_form',
         'form_selector', 'form_action', 'formaction', 'options', 'disabled',
-        'required', 'has_value', 'value', 'checked'))
+        'required', 'has_value', 'value', 'checked', 'name'))
 
 
 def _page_identity(page: dict) -> tuple:
@@ -606,6 +625,22 @@ def _require_native_action(target: dict, verb: str) -> None:
         raise Gate('The requested form action does not match this native control.')
 
 
+def _radio_group_question(page: dict, target: dict) -> bool:
+    """A radio name or bare option captions do not prove what is being asked."""
+    question = target.get('question')
+    if not isinstance(question, str) or not question.strip():
+        return False
+    siblings = [c for c in page['controls']
+                if c.get('type') == 'radio'
+                and c.get('form_selector') == target.get('form_selector')
+                and (c.get('name') == target.get('name') if target.get('name')
+                     else c.get('question') == question)]
+    choice_words = set(re.findall(r'\w+', ' '.join(
+        str(c.get('label') or '') for c in siblings).casefold()))
+    question_words = set(re.findall(r'\w+', question.casefold()))
+    return bool(question_words - choice_words)
+
+
 def _form_subject(page: dict, target: dict) -> list[dict]:
     form = target.get('form_selector')
     if (target.get('in_form') is not True or not isinstance(form, str)
@@ -616,11 +651,24 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
                 if c.get('in_form') and c.get('form_selector') == form]
     if not siblings:
         raise Gate('The native form owner is no longer present.')
-    if any((_ACCOUNT_PURPOSE.search(label(c)) or _LOGIN.search(label(c))
-            or any(_ACCOUNT_PURPOSE.search(text) or _LOGIN.search(text)
-                   for text in _submitter_texts(c)))
+    if _account_purpose(form.replace('_', '-')):
+        raise Gate('This field belongs to a sign-in, account or subscription form.')
+    if any(_account_purpose(label(c)) or any(
+            _account_purpose(text) for text in _purpose_button_texts(c))
            for c in siblings):
         raise Gate('This field belongs to a sign-in, account or subscription form.')
+    for c in siblings:
+        for receiver in (c.get('form_action'), c.get('formaction')):
+            if not receiver:
+                continue
+            if not isinstance(receiver, str):
+                raise Gate('The owning form destination is malformed.')
+            try:
+                path = urlsplit(receiver).path
+            except ValueError:
+                raise Gate('The owning form destination is malformed.') from None
+            if _account_purpose(path):
+                raise Gate('This native form has an account or subscription destination.')
     if any(c.get('type') == 'password' for c in siblings):
         raise Gate('A password field makes this owning form unsafe for disclosure.')
     forms = {c.get('form_selector') for c in page['controls']
@@ -698,29 +746,35 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
 def _bootstrap_wall(page: dict, witness: dict) -> None:
     for c in page['controls']:
         subject = label(c)
+        # Visible independent acknowledgements can still be page-wide walls:
+        # membership in a native <form> is not required for a required choice.
+        choice = c.get('required') and c.get('type') in {'checkbox', 'radio', 'select'}
         if (c.get('type') == 'password'
-                or (c.get('in_form') and (_ACCOUNT_PURPOSE.search(subject)
-                                         or _LOGIN.search(subject)
-                                         or _MATERIAL_ASSENT.search(subject)
-                                         or _material_select_options(c)
-                                         or any(_ACCOUNT_PURPOSE.search(t) or _LOGIN.search(t)
-                                                for t in _submitter_texts(c))))):
+                or ((c.get('in_form') or choice)
+                    and (_account_purpose(subject)
+                         or _MATERIAL_ASSENT.search(subject)
+                         or _material_select_options(c)
+                         or any(_account_purpose(t)
+                                for t in _purpose_button_texts(c))))):
             raise Gate('Login or material consent requires human inspection.')
-        if c.get('in_form') and c.get('required') and c.get('type') == 'checkbox' \
-                and not c.get('checked'):
+        if c.get('required') and c.get('type') == 'checkbox' and not c.get('checked'):
             raise Gate('A required acknowledgement needs direct human review.')
-        if c.get('type') == 'radio' and c.get('in_form'):
+        if c.get('type') == 'radio' and (c.get('in_form') or c.get('required')):
             dom = witness.get(c['selector'])
+            name = c.get('name')
+            name = name if isinstance(name, str) else ''
             if (not dom or not dom.get('visible') or dom.get('inert')
-                    or not (c.get('question') or c.get('name'))
+                    or not _radio_group_question(page, c)
+                    or _MATERIAL_ASSENT.search(name)
+                    or _account_purpose(name)
+                    or _FACT_ASSERTION.search(name)
                     or _MATERIAL_ASSENT.search(subject)
-                    or _ACCOUNT_PURPOSE.search(subject)
+                    or _account_purpose(subject)
                     or _FACT_ASSERTION.search(subject)):
                 raise Gate('An uncertain native choice needs direct human review.')
         if (c.get('required') and c.get('in_form')
                 and c.get('tag') not in {'input', 'textarea', 'select', 'button'}):
             raise Gate('An uninspectable required choice needs human review.')
-
 
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None) -> dict:

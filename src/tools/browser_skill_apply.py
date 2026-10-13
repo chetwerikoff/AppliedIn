@@ -885,15 +885,17 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
-    if verb == 'choose':
-        # Choice clicks can commit; neither model text nor a checkbox label
-        # establishes a safe disclosure identity for the existing grant writer.
-        raise Gate('A choice requires direct human action and a human-approved answer.')
-    if verb in {'fill', 'select'}:
-        _require_native_action(target, verb)
+    if verb in {'fill', 'select', 'choose'}:
+        if verb == 'choose':
+            _require_native_choice(target)
+        else:
+            _require_native_action(target, verb)
         observed, witness = await _observe_controls(session, page)
         target = control(observed, action)
-        _require_native_action(target, verb)
+        if verb == 'choose':
+            _require_native_choice(target)
+        else:
+            _require_native_action(target, verb)
         if _identity(target) != _identity(control(page, action)):
             raise Gate('The selected field changed before human authorization.')
         page = observed
@@ -909,27 +911,45 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
         else:
-            raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
+            raise Gate(f'An exact human-approved answer is needed for "{form_question["label"]}".',
                        form_question=form_question)
         if not _same(key, form_question['label']):
             raise Gate('An exact human-approved fact key for this observed question is required.',
                        form_question=form_question)
         try:
-            exact_approval(pk, key, value, target=target, url=page['url'],
+            exact_approval(pk, key, value, target=_bound_target(page, target),
+                           url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
             raise Gate(str(exc), form_question=form_question) from None
         if not value:
-            raise Gate(f'An approved answer is needed for "{target["label"]}".',
+            raise Gate('An owner answer is needed for this observed control.',
                        form_question=form_question)
-        guarded_value(target, value)
-        if verb == 'select':
-            value = choose_value(target, value, str(action.get('value', '')))
-        # The final pre-write observation is independent of the planning read;
-        # any witnessed identity/receiver/option change disables all writes.
+        if verb == 'choose':
+            if target['type'] == 'checkbox':
+                if not _same(value, 'yes'):
+                    raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
+                guarded_value(target, value)
+                write_value = target.get('value') or target['label']
+            else:
+                members = _radio_group(page, target)
+                chosen = [c for c in members
+                          if (_same(value, c['label']) or _same(value, c['value']))]
+                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
+                    raise Gate('The selected radio does not match the exact owner answer.')
+                guarded_value(target, value)
+                write_value = target['value']
+        else:
+            guarded_value(target, value)
+            write_value = (choose_value(target, value, str(action.get('value', '')))
+                           if verb == 'select' else value)
+        # A second independent PAGE and fixed witness precede every browser write.
         latest, latest_witness = await _observe_controls(session, page)
         current = control(latest, action)
-        _require_native_action(current, verb)
+        if verb == 'choose':
+            _require_native_choice(current)
+        else:
+            _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
         fresh_question = _disclosure_question(
@@ -937,17 +957,29 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
-        exact_approval(pk, key, str(facts[key]).strip(), target=current,
-                       url=latest['url'],
+        exact_approval(pk, key, str(facts[key]).strip(),
+                       target=_bound_target(latest, current), url=latest['url'],
                        **({'fixture_context': ctx} if ctx else {}))
         if verb == 'fill':
-            guarded_value(current, value)
-            await session.call('fill', current['selector'], '--value', value)
+            guarded_value(current, write_value)
+            await session.call('fill', current['selector'], '--value', write_value)
+        elif verb == 'select':
+            write_value = choose_value(current, str(facts[key]).strip(),
+                                       str(action.get('value', '')))
+            await session.call('select', current['selector'], '--value', write_value)
         else:
-            value = choose_value(current, str(facts[key]).strip(),
-                                 str(action.get('value', '')))
-            await session.call('select', current['selector'], '--value', value)
-        filled[current['selector']] = value
+            if current['type'] == 'checkbox':
+                if not _same(str(facts[key]).strip(), 'yes'):
+                    raise Gate('Checkbox grant no longer contains an explicit owner yes.')
+            else:
+                matches = [c for c in _radio_group(latest, current)
+                           if (_same(str(facts[key]).strip(), c['label'])
+                               or _same(str(facts[key]).strip(), c['value']))]
+                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
+                    raise Gate('The bound radio answer no longer matches this member.')
+            guarded_value(current, str(facts[key]).strip())
+            await session.call('click', current['selector'])
+        filled[current['selector']] = write_value
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')

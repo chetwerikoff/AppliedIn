@@ -411,6 +411,7 @@ async def run_task(task: str, *, report_key: str, model: str = "", timeout_s: in
 
 async def _crawl(session: Session, task: str, url: str) -> dict:
     from tools.browser_skill_apply import control, is_submission
+    from discovery.progress import cancelled
     if not discovery_url_allowed(url, url):
         raise ValueError("Discovery seed is not a proven read-only employer route")
 
@@ -460,6 +461,7 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
                              r"open positions|open roles|see|explore|more)\b", title, re.I)
                 or re.search(r"\b(?:jobs|openings|opportunities|departments|"
                              r"categories|vacancies)\b", title, re.I)
+                 or re.search(r"\b(?:roles|positions|teams|departments?)$", title, re.I)
                 or not re.search(r"\b(?:engineer|developer|designer|manager|analyst|"
                                  r"architect|director|lead|specialist|scientist|"
                                  r"administrator|consultant|coordinator|recruiter|"
@@ -475,6 +477,9 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
     previous_refusal = None
 
     def fallback(note: str) -> dict:
+        # Stop can arrive while the final model decision or browser effect awaits.
+        if cancelled():
+            raise Unavailable("BrowserSkill stopped: discovery cancelled")
         # Multiple different titles for a URL (or URLs for one title) do not
         # prove a unique posting/title association. Reject such candidates.
         by_url: dict[str, set[str]] = {}
@@ -490,7 +495,6 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
 
     page = await navigate_checked(url)
     for _ in range(80):
-        from discovery.progress import cancelled
         if cancelled():
             raise Unavailable("BrowserSkill stopped: discovery cancelled")
         observed.update(c["href"] for c in page["controls"]
@@ -507,6 +511,8 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
         if not isinstance(action, dict):
             raise Unavailable("BrowserSkill operation unavailable: invalid discovery decision")
         verb = action.get("action")
+        if not isinstance(verb, str):
+            raise Unavailable("BrowserSkill operation unavailable: invalid discovery decision")
         if verb == "finish":
             report = action.get("report") or {}
             report["jobs"] = [j for j in report.get("jobs", [])

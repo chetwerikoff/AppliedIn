@@ -1988,3 +1988,108 @@ async def test_discovery_final_allowed_navigation_salvages_newly_witnessed_posti
     assert decide.await_count == 80
     assert session.calls == [('navigate', seed), ('navigate', next_page)]
     assert session.reads[-1] == next_page
+
+@pytest.mark.parametrize('invalid_action', [[], {}], ids=['list', 'dict'])
+async def test_discovery_nonstring_action_is_sanitized_failure(monkeypatch, invalid_action):
+    seed = 'https://employer.test/careers'
+    session = DiscoveryFakeSession(discovery_listing(discovery_posting()))
+    decide = AsyncMock(return_value={'action': invalid_action})
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'Session', lambda kind: session)
+    monkeypatch.setattr(bsk, 'decision', decide)
+
+    report, problem = await bsk.run_task('Find roles', report_key='jobs', urls=[seed])
+    assert report == {}
+    assert problem == 'BrowserSkill operation unavailable: invalid discovery decision'
+    assert session.calls == [('navigate', seed)]
+    assert session.reads == [seed]
+    decide.assert_awaited_once()
+
+
+async def test_discovery_fallback_excludes_collective_role_category_anchors(monkeypatch):
+    seed = 'https://employer.test/careers'
+    job = discovery_posting()
+    another_job = target(selector='#lead', tag='a', type='a', in_form=False,
+                         label='Lead Product Manager', href=seed + '/jobs/lead')
+    categories = [
+        target(selector=f'#category-{index}', tag='a', type='a', in_form=False,
+               label=label, href=seed + f'/browse/{index}')
+        for index, label in enumerate((
+            'Product Manager Roles', 'Data Engineer Positions',
+            'Design Manager Teams', 'Technical Director Department',
+            'Senior Analyst Departments'))
+    ]
+    block = target(selector='#block', tag='button', type='button',
+                   label='Next', in_form=False)
+    session = DiscoveryFakeSession(discovery_listing(job, *categories, another_job, block))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'click', 'selector': '#block'}))
+
+    report = await bsk._crawl(session, 'Find roles', seed)
+    assert report == {
+        'jobs': [{'url': job['href'], 'title': job['label']},
+                 {'url': another_job['href'], 'title': another_job['label']}],
+        'note': 'discovery stopped after repeated refused actions'}
+    assert session.calls == [('navigate', seed)]
+    assert session.reads == [seed]
+
+
+@pytest.mark.parametrize('last_decision', ['repeat', 'limit'])
+async def test_discovery_cancellation_during_final_decision_preempts_fallback(
+        monkeypatch, last_decision):
+    seed = 'https://employer.test/careers'
+    block = target(selector='#block', tag='button', type='button',
+                   label='Next', in_form=False)
+    session = DiscoveryFakeSession(discovery_listing(discovery_posting(), block))
+    state = {'cancelled': False, 'decisions': 0}
+
+    async def decide(*args, **kwargs):
+        state['decisions'] += 1
+        last = 2 if last_decision == 'repeat' else 80
+        if state['decisions'] == last:
+            state['cancelled'] = True
+        return ({'action': 'click', 'selector': '#block'} if last_decision == 'repeat'
+                else {'action': 'wait'})
+
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: state['cancelled'])
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=decide))
+    monkeypatch.setattr(bsk, 'Session', lambda kind: session)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+
+    report, problem = await bsk.run_task('Find roles', report_key='jobs', urls=[seed])
+    assert report == {}
+    assert problem == 'BrowserSkill stopped: discovery cancelled'
+    assert state['decisions'] == (2 if last_decision == 'repeat' else 80)
+    assert session.calls == [('navigate', seed)]
+
+
+async def test_discovery_cancellation_during_final_browser_effect_preempts_fallback(
+        monkeypatch):
+    seed = 'https://employer.test/careers'
+    state = {'cancelled': False}
+
+    class StopAfterFilterWrite(DiscoveryFakeSession):
+        async def call(self, *args):
+            result = await super().call(*args)
+            if args[0] == 'fill':
+                state['cancelled'] = True
+            return result
+
+    search = target(selector='#search', tag='input', type='search',
+                    label='Search jobs', in_form=False)
+    session = StopAfterFilterWrite(discovery_listing(discovery_posting(), search))
+    decide = AsyncMock(side_effect=[{'action': 'wait'}] * 79 + [
+        {'action': 'fill', 'selector': '#search', 'value': 'engineer'}])
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: state['cancelled'])
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(bsk, 'Session', lambda kind: session)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+
+    report, problem = await bsk.run_task('Find roles', report_key='jobs', urls=[seed])
+    assert report == {}
+    assert problem == 'BrowserSkill stopped: discovery cancelled'
+    assert decide.await_count == 80
+    assert session.calls == [('navigate', seed),
+                             ('fill', '#search', '--value', 'engineer')]
+    assert session.reads[-1] == seed

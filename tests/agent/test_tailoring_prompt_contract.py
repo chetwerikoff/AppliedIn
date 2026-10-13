@@ -81,12 +81,12 @@ async def test_tailor_assembled_prompt_uses_only_shared_seed_selected_macros(see
     assert seed in prompt and JD in prompt and GITHUB_ONLY in prompt and NOTE in prompt
     assert "{base_latex}" not in prompt
     assert "Edit only sections actually present in the seed" in prompt
-    assert "do not introduce new sections" in prompt
+    assert "do not introduce new sections" in " ".join(prompt.split())
     assert "If the seed contains a summary, rewrite the FULL existing summary" in prompt
     assert "Within EACH existing employment role" in prompt
     assert "including older roles" in prompt
     assert "Shorten less relevant" in prompt
-    assert "without deleting" not in prompt or "delete, or lose" in prompt
+    assert "merge, delete, or lose any original bullet" in " ".join(prompt.split())
 
 
 @pytest.mark.asyncio
@@ -132,7 +132,7 @@ async def test_critic_receives_same_seed_saved_draft_and_jd_and_requests_fact_co
     assert "Compare ALL tailored factual claims and each bullet-to-role attribution" in prompt
     assert "unsupported skill, tool, project," in prompt
     assert "outcome, beneficiary, scale, seniority" in prompt
-    assert "a bullet assigning one role's work to another role" in prompt
+    assert "bullet assigning one role's work to another role" in prompt
     assert "DO NOT call exit_loop" in prompt
     assert "ONE-tweak feedback channel" in prompt
     assert "specific removal, return to" in prompt
@@ -149,7 +149,7 @@ async def test_critic_precedence_over_loaded_review_skill_when_seed_has_no_outco
             / "src/agent/skills/resume-review/SKILL.md")
     review_skill = path.read_text(encoding="utf-8")
     assert "truthfulness is enforced separately and is not your concern" in review_skill
-    assert "what the system now does, at what scale, for whom" in review_skill
+    assert "the system now does, at what scale, for whom" in review_skill
 
     bare_seed = r"\role{example-co}{Engineer}{2023--2024}" + "\n" + r"\item Maintained queue consumers."
     ctx = _context(bare_seed, tailored=bare_seed)

@@ -333,3 +333,14 @@ def test_direct_writer_refuses_malformed_control_provenance(monkeypatch, missing
            'gate_call_id': 'direct', 'jd_url': URL,
            'gate_pending': {'form_question': q}}
     assert _direct_form_label(PK, row) is None
+
+
+async def test_missing_control_label_cannot_create_unwritable_owner_grant(monkeypatch):
+    # Even a unique question is insufficient if the writer cannot bind
+    # an original control_label to the current PAGE observation.
+    p = inventory(field('', '#email', question='Email address'), submit())
+    browser, decide, _ = world(monkeypatch, p)
+    report = await attempt(p)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert decide.await_count == 1
+    assert not any(x[0] in {'fill', 'select'} for x in browser.calls)

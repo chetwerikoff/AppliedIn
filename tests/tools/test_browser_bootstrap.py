@@ -19,10 +19,10 @@ URL = 'http://127.0.0.1/fixture/example-co/job/1'
 PK = 'example-co#1'
 
 
-def field(name='Email', selector='#email', *, required=True, **extra):
+def field(label='Email', selector='#email', *, required=True, **extra):
     return {
-        'selector': selector, 'label': name, 'question': '',
-        'tag': 'input', 'type': 'email' if name == 'Email' else 'text',
+        'selector': selector, 'label': label, 'question': '',
+        'tag': 'input', 'type': 'email' if label == 'Email' else 'text',
         'required': required, 'disabled': False, 'value': '', 'has_value': False,
         'in_form': True, 'form_selector': '#application', 'form_action': URL,
         'formaction': '', 'submit': False, 'checked': False, 'options': [],

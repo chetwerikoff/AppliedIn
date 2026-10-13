@@ -1966,3 +1966,25 @@ async def test_discovery_run_task_repeat_reports_note_or_explicit_problem(monkey
     else:
         assert report == {} and 'repeated refused' in problem
     assert session.calls == [('navigate', seed)]
+
+
+async def test_discovery_final_allowed_navigation_salvages_newly_witnessed_posting(monkeypatch):
+    seed = 'https://employer.test/careers'
+    next_page = seed + '/openings'
+    index_link = target(selector='#all', tag='a', type='a', in_form=False,
+                        label='All jobs', href=next_page)
+    landing = {**discovery_listing(discovery_posting()), 'url': next_page}
+    session = DiscoveryFakeSession(discovery_listing(index_link),
+                                   nav_results={next_page: landing})
+    decide = AsyncMock(side_effect=[{'action': 'wait'}] * 79 + [
+        {'action': 'navigate', 'url': next_page}])
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+    report = await bsk._crawl(session, 'Find roles', seed)
+    assert report == {'jobs': [{'url': discovery_posting()['href'],
+                               'title': discovery_posting()['label']}],
+                      'note': 'discovery step limit reached after 80 decisions'}
+    assert decide.await_count == 80
+    assert session.calls == [('navigate', seed), ('navigate', next_page)]
+    assert session.reads[-1] == next_page

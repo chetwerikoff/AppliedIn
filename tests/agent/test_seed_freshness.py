@@ -199,3 +199,51 @@ def test_save_unrecognized_format_wins_over_dropped_bullet(_save_offline):
     assert "You dropped" not in result["message"]
     assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
 
+
+
+@pytest.mark.parametrize("opening,closing", [
+    (r"\iffalse", r"\fi"),
+    (r"\begin{verbatim}", r"\end{verbatim}"),
+    (r"\begin{comment}", r"\end{comment}"),
+])
+@pytest.mark.parametrize("hidden_kind", ["role", "bullet"])
+def test_save_rejects_inactive_tex_witness_without_side_effects(
+    _save_offline, opening, closing, hidden_kind
+):
+    """Review regression: unchanged source text must represent active content."""
+    base = _save_doc(_SAVE_HEAD + "\n" + r"\item One")
+    if hidden_kind == "role":
+        body = "\n".join([opening, _SAVE_HEAD, closing, r"\item One"])
+    else:
+        body = "\n".join([_SAVE_HEAD, opening, r"\item One", closing])
+    result, state, effects = _save_offline(base, _save_doc(body))
+    assert result["ok"] is False
+    if hidden_kind == "role":
+        assert result["missing_facts"] == [_SAVE_HEAD]
+    else:
+        assert "You dropped 1 bullet(s)" in result["message"]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert set(state) == {"base_latex", "pk"}
+
+
+def test_save_rejects_nested_false_branch_hiding_anchor(_save_offline):
+    base = _save_doc(_SAVE_HEAD + "\n" + r"\item One")
+    tailored = _save_doc("\n".join([
+        r"\iffalse", r"\iftrue", r"\fi", _SAVE_HEAD, r"\fi", r"\item One",
+    ]))
+    result, state, effects = _save_offline(base, tailored)
+    assert result["ok"] is False
+    assert result["missing_facts"] == [_SAVE_HEAD]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert set(state) == {"base_latex", "pk"}
+
+
+def test_save_rejects_unverifiable_conditional_seed_as_unknown_format(_save_offline):
+    base = _save_doc("\n".join([
+        r"\iffalse", r"\role{Ignored}", r"\else", _SAVE_HEAD, r"\item One", r"\fi",
+    ]))
+    result, state, effects = _save_offline(base, base)
+    assert result["ok"] is False
+    assert "unrecognized" in result["message"].lower()
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert set(state) == {"base_latex", "pk"}

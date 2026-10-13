@@ -894,6 +894,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         target = control(observed, action)
         if verb == 'choose':
             _require_native_choice(target)
+            if not _unanswered(observed, target):
+                raise Gate('Only required, unanswered native choices can be selected.')
         else:
             _require_native_action(target, verb)
         if _identity(target) != _identity(control(page, action)):
@@ -951,6 +953,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         current = control(latest, action)
         if verb == 'choose':
             _require_native_choice(current)
+            if not _unanswered(latest, current):
+                raise Gate('The required choice is no longer unanswered.')
         else:
             _require_native_action(current, verb)
         if _identity(current) != _identity(target):

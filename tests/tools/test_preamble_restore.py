@@ -141,3 +141,66 @@ def test_truthfulness_legacy_subheading_variants_are_independent():
     assert validate(multi + "\n" + single, multi) == [single]
     assert validate(multi + "\n" + single, single) == [multi]
 
+
+
+# Inactive TeX must not supply apparent "live" structural witnesses.
+import pytest
+
+
+@pytest.mark.parametrize("opening,closing", [
+    (r"\iffalse", r"\fi"),
+    (r"\begin{verbatim}", r"\end{verbatim}"),
+    (r"\begin{comment}", r"\end{comment}"),
+])
+def test_truthfulness_inactive_regions_cannot_witness_roles_or_bullets(opening, closing):
+    base = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item Active")
+    hidden = _truth_doc(opening + "\n" + _TRUTH_ROLE_A + "\n"
+                        + r"\item Active" + "\n" + closing)
+    assert validate(base, hidden) == [_TRUTH_ROLE_A]
+    assert active_calls(hidden, MACROS["bullets"]) == []
+    assert used_macros(hidden) == {"anchors": (), "bullets": ()}
+
+
+def test_truthfulness_nested_false_condition_preserves_visible_bullets_only():
+    base = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item Active")
+    hidden = _truth_doc("\n".join([
+        r"\iffalse", r"\iftrue", r"\fi", _TRUTH_ROLE_A, r"\fi",
+        r"\item Active",
+    ]))
+    assert validate(base, hidden) == [_TRUTH_ROLE_A]
+    assert active_calls(hidden, MACROS["bullets"]) == [(r"\item", r"\item Active")]
+
+
+def test_truthfulness_false_else_and_dynamic_condition_fail_closed():
+    base = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item Active")
+    for hidden_body in [
+        "\n".join([r"\iffalse", r"\item hidden", r"\else", _TRUTH_ROLE_A,
+                   r"\item Active", r"\fi"]),
+        "\n".join([r"\iftrue", _TRUTH_ROLE_A, r"\else", r"\fi",
+                   r"\item Active"]),
+        r"\verb|\role{Test User, example-co}{2022--2024}|" + "\n" + r"\item Active",
+    ]:
+        hidden = _truth_doc(hidden_body)
+        assert validate(base, hidden) == [_TRUTH_ROLE_A]
+        assert active_calls(hidden, MACROS["bullets"]) == []
+
+
+def test_truthfulness_inert_end_document_marker_cannot_hide_later_live_call():
+    body = "\n".join([
+        _TRUTH_ROLE_A, r"\iffalse", r"\end{document}", r"\fi",
+        r"\item Active",
+    ])
+    assert used_macros(_truth_doc(body)) == {
+        "anchors": (r"\role",), "bullets": (r"\item",),
+    }
+
+
+def test_truthfulness_conditional_definition_body_is_not_an_active_guard():
+    body = "\n".join([
+        r"\newcommand{\unused}[1]{\iffalse \role{Ghost} \fi}",
+        _TRUTH_ROLE_A, r"\item Active",
+        r"% \iffalse \role{comment} \fi",
+    ])
+    assert used_macros(_truth_doc(body)) == {
+        "anchors": (r"\role",), "bullets": (r"\item",),
+    }

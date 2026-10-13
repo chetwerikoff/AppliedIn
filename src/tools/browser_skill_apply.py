@@ -644,9 +644,7 @@ def _bootstrap_wall(page: dict, witness: dict) -> None:
         subject = label(c)
         if (c.get('type') == 'password'
                 or (c.get('submit') and _ACCOUNT_PURPOSE.search(subject))
-                or (c.get('in_form') and _MATERIAL_ASSENT.search(subject)
-                    and (c.get('required') or c.get('type') in {
-                        'radio', 'checkbox', 'select'} or c.get('submit')))):
+                or (c.get('in_form') and _MATERIAL_ASSENT.search(subject))):
             raise Gate('Login or material consent requires human inspection.')
         if c.get('in_form') and c.get('required') and c.get('type') == 'checkbox' \
                 and not c.get('checked'):
@@ -726,7 +724,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if verb == 'choose':
         # Choice clicks can commit; neither model text nor a checkbox label
         # establishes a safe disclosure identity for the existing grant writer.
-        raise Gate('A choice requires a human action and exact approved answer.')
+        raise Gate('A choice requires direct human action and a human-approved answer.')
     if verb in {'fill', 'select'}:
         observed, witness = await _observe_controls(session, page)
         target = control(observed, action)
@@ -748,7 +746,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
                        form_question=form_question)
         if not _same(key, form_question['label']):
-            raise Gate('The proposed fact key does not match this observed question.',
+            raise Gate('An exact human-approved fact key for this observed question is required.',
                        form_question=form_question)
         try:
             exact_approval(pk, key, value, target=target, url=page['url'],
@@ -940,7 +938,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options',
-                                'form_action', 'formaction')):
+                                'form_action', 'formaction', 'form_selector', 'in_form',
+                                 'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
                         raise Gate(str(action.get('question') or 'This form needs your input.'))

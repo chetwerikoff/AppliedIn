@@ -732,28 +732,37 @@ def _same_key(value: str) -> str:
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False) -> dict:
-    if not _native_answer(target):
-        raise Gate('Only observed native text fields and selects may request a form grant.')
-    if (not isinstance(target.get('label'), str) or not target['label'].strip()
-            or not isinstance(target.get('question'), str)):
-        raise Gate('A complete native field label and question are required.')
-    dom = witness.get(target['selector'])
-    if (not dom or dom['visible'] is not True or dom['readonly'] is True
-            or dom['disabled'] is True or dom['inert'] is True
-            or target.get('disabled')):
-        raise Gate('This control is not visibly editable.')
+    choice = target.get('type') in {'radio', 'checkbox'}
+    if choice:
+        if target.get('tag') != 'input':
+            raise Gate('A grantable choice must be a native input.')
+        members = (_radio_group(page, target)
+                   if target.get('type') == 'radio' else [target])
+        target = members[0]
+    elif _native_answer(target):
+        members = [target]
+    else:
+        raise Gate('Only observed native text, select or choice controls may request a grant.')
+    if any(not isinstance(c.get('label'), str) or not c['label'].strip()
+           or not isinstance(c.get('question'), str) for c in members):
+        raise Gate('Complete native labels and questions are required.')
+    for member in members:
+        dom = witness.get(member['selector'])
+        if (not dom or dom.get('visible') is not True
+                or dom.get('readonly') is True or dom.get('disabled') is True
+                or dom.get('inert') is True or member.get('disabled')):
+            raise Gate('This control is not visibly editable.')
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if _MATERIAL_ASSENT.search(subject) or _material_select_options(target):
+    if not choice and (_MATERIAL_ASSENT.search(subject)
+                       or _material_select_options(target)):
         raise Gate('Legal or material assent requires direct human review.')
     key = _key(page, target)
     siblings = _form_subject(page, target)
-    if bootstrap and (target.get('required') is not True or target.get('has_value')
-                      or bool(str(target.get('value') or '').strip())):
+    if bootstrap and (not _unanswered(page, target)
+                      or (not choice and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
-    # Architect amendment #31: positive native application-form proof is a
-    # structural precondition of ANY grant, not a model-continuation exception.
     marked = any(
         (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
                                    for t in _submitter_texts(c)))
@@ -773,31 +782,34 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     }
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
+    if target.get('type') == 'checkbox':
+        question['visible_text'] = target['label']
+    if target.get('type') == 'radio':
+        bound = _bound_target(page, target)
+        question['radio_name'] = bound['radio_name']
+        question['radio_members'] = bound['radio_members']
     return question
 
 
-def _bootstrap_wall(page: dict, witness: dict) -> None:
+def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
-                or (c.get('in_form') and (_ACCOUNT_PURPOSE.search(subject)
-                                         or _LOGIN.search(subject)
-                                         or _MATERIAL_ASSENT.search(subject)
-                                         or _material_select_options(c)
-                                         or any(_ACCOUNT_PURPOSE.search(t) or _LOGIN.search(t)
-                                                for t in _submitter_texts(c))))):
-            raise Gate('Login or material consent requires human inspection.')
-        if c.get('required') and c.get('type') == 'checkbox' \
-                and not c.get('checked'):
-            raise Gate('A required acknowledgement needs direct human review.')
-        if c.get('type') == 'radio' and c.get('in_form'):
-            dom = witness.get(c['selector'])
-            if (not dom or not dom.get('visible') or dom.get('inert')
-                    or not (c.get('question') or c.get('name'))
-                    or _MATERIAL_ASSENT.search(subject)
-                    or _ACCOUNT_PURPOSE.search(subject)
-                    or _FACT_ASSERTION.search(subject)):
-                raise Gate('An uncertain native choice needs direct human review.')
+                or (c.get('in_form') and (
+                    _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject)
+                    or any(_ACCOUNT_PURPOSE.search(t) or _LOGIN.search(t)
+                           for t in _submitter_texts(c))))):
+            raise Gate('Login or account form requires human inspection.')
+        if c.get('type') in {'radio', 'checkbox'}:
+            if _unanswered(page, c):
+                try:
+                    _disclosure_question(page, c, witness, *origins, bootstrap=True)
+                except Gate:
+                    raise Gate('An uninspectable required choice needs human review.') from None
+            continue
+        if c.get('in_form') and (
+                _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
+            raise Gate('Material assent outside a bound choice needs human inspection.')
         if (c.get('required') and c.get('in_form')
                 and c.get('tag') not in {'input', 'textarea', 'select', 'button'}):
             raise Gate('An uninspectable required choice needs human review.')
@@ -809,41 +821,52 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if not navigation_allowed(page['url'], *origins):
         raise Gate('The current form is not on the tracked job route.')
     candidate = [c for c in page['controls']
-                 if (c.get('required') and not c.get('has_value')
-                     and _native_answer(c))]
-    # The read-only witness verifies even an otherwise invisible required
-    # control. No model decision may evade an observed wall on that page.
+                 if (_native_answer(c) or c.get('type') in {'radio', 'checkbox'})
+                 and _unanswered(page, c)]
     if not candidate and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
     page, witness = await _observe_controls(session, page)
-    _bootstrap_wall(page, witness)
+    _bootstrap_wall(page, witness, *origins)
     for item in page['controls']:
-        if not (item.get('required') and not item.get('has_value')
-                and _native_answer(item)):
+        if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
+                and _unanswered(page, item)):
             continue
-        if item.get('disabled') or str(item.get('value') or '').strip():
+        if (item.get('type') == 'radio'
+                and _radio_group(page, item)[0] is not item):
+            continue
+        if item.get('disabled') or (
+                item.get('type') not in {'radio', 'checkbox'}
+                and str(item.get('value') or '').strip()):
             continue
         try:
             question = _disclosure_question(page, item, witness, *origins, bootstrap=True)
         except Gate:
-            # A colliding question does not suppress an unrelated, distinct key.
             continue
         question['pk'] = pk
         key = question['label']
         value = str(facts.get(key) or '').strip()
+        grant = (_row(pk, fixture_context=fixture_context) if fixture_context
+                 else _row(pk)).get('human_approved_answers') or {}
+        previous = grant.get(key) if isinstance(grant, dict) else None
+        if (item.get('type') == 'radio' and isinstance(previous, dict)
+                and isinstance(previous.get('radio_members'), list)
+                and previous['radio_members'] != question['radio_members']):
+            raise Gate('The previously approved radio group has changed; inspect it again.')
         if value:
             try:
-                exact_approval(pk, key, value, target=item, url=page['url'],
-                               **({'fixture_context': fixture_context}
-                                  if fixture_context else {}))
+                exact_approval(pk, key, value, target=_bound_target(page, item),
+                               url=page['url'], **({'fixture_context': fixture_context}
+                                                  if fixture_context else {}))
                 continue
             except Gate:
                 pass
-        raise Gate(f'An exact human-approved answer is needed for "{key}".',
-                   form_question=question)
+        prompt = (_choice_prompt(item, question)
+                  if item.get('type') in {'radio', 'checkbox'}
+                  else f'An exact human-approved answer is needed for "{key}".')
+        raise Gate(prompt, form_question=question)
     return page
 
 

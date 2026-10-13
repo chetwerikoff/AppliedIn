@@ -656,7 +656,9 @@ async def test_untyped_role_button_cannot_bypass_self_id_guards():
 async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact():
     session = SimpleNamespace(call=AsyncMock())
     control = target(type='checkbox', label='I certify I am a US citizen', required=True)
-    with pytest.raises(forms.Gate, match='approved answer'):
+    # An isolated checkbox without an owning application marker cannot mint
+    # a disclosure grant, even when its caption makes a factual assertion.
+    with pytest.raises(forms.Gate, match='application-form marker'):
         await forms.execute(session, page(control),
                             {'action': 'choose', 'selector': '#field'}, facts={}, filled={},
                             resume_path='', company='Company', jd_text='',

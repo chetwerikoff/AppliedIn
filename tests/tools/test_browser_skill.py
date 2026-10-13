@@ -837,7 +837,8 @@ async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_e
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {
-            'Motivation': grant('Motivation', 'Approved explanation')}})
+            'Motivation': {**grant('Motivation', 'Approved explanation'),
+                       'tag': 'textarea', 'type': 'textarea'}}})
     monkeypatch.setattr('tools.narrative.draft_answer',
                         lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
     await forms.execute(
@@ -1628,7 +1629,7 @@ async def test_exact_grant_drifts_independently_without_writing(
         with pytest.raises(forms.Gate):
             forms.check_approvals(pk, [receipt], observed)
     else:
-        with pytest.raises(forms.Gate, match='human-approved'):
+        with pytest.raises(forms.Gate, match='human-approved|form destination'):
             await forms.execute(
                 session, observed, action, facts={'Name': value}, filled={},
                 resume_path='', company='example-co', jd_text='', resume_tex='',

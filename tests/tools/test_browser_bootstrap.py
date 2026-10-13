@@ -242,13 +242,16 @@ async def test_duplicate_form_question_never_authorizes_either_sibling(monkeypat
         assert exc.value.form_question is None
 
 
-@pytest.mark.parametrize('kind', ['sign-in', 'subscribe'])
+@pytest.mark.parametrize('kind', ['sign-in', 'subscribe', 'account-sibling'])
 async def test_selected_email_on_own_login_or_subscription_form_is_not_grantable(
         monkeypatch, kind):
-    button = submit('Sign in' if kind == 'sign-in' else 'Subscribe')
+    button = submit('Sign in' if kind == 'sign-in' else
+                    'Subscribe' if kind == 'subscribe' else 'Next')
     siblings = [field(), button]
     if kind == 'sign-in':
         siblings.insert(1, field('Password', '#password', type='password'))
+    if kind == 'account-sibling':
+        siblings.insert(1, field('Create account', '#account', required=False))
     p = inventory(*siblings)
     browser, _, row = world(monkeypatch, p)
     with pytest.raises(forms.Gate) as exc:

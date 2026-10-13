@@ -411,23 +411,108 @@ async def run_task(task: str, *, report_key: str, model: str = "", timeout_s: in
 
 async def _crawl(session: Session, task: str, url: str) -> dict:
     from tools.browser_skill_apply import control, is_submission
+    from discovery.progress import cancelled
     if not discovery_url_allowed(url, url):
         raise ValueError("Discovery seed is not a proven read-only employer route")
-    page = await session.navigate(url)
-    history, observed, pages = [], {url}, []
-    for _ in range(80):
-        if not discovery_url_allowed(page.get('url', ''), url):
+
+    def checked_page(value: dict) -> dict:
+        if (not isinstance(value, dict) or not isinstance(value.get("url"), str)
+                or not value["url"]):
+            raise Unavailable("BrowserSkill operation unavailable: invalid discovery inventory")
+        # This URL check precedes any inspection of a redirected page's controls/text.
+        if not discovery_url_allowed(value["url"], url):
             raise ValueError("Discovery left the selected employer or tenant")
-        from discovery.progress import cancelled
+        controls = value.get("controls")
+        if (not isinstance(controls, list) or not isinstance(value.get("text"), str)
+                or any(not isinstance(c, dict) or not isinstance(c.get("selector"), str)
+                       or not isinstance(c.get("label"), str)
+                       or not isinstance(c.get("tag"), str) for c in controls)):
+            raise Unavailable("BrowserSkill operation unavailable: invalid discovery inventory")
+        return value
+
+    async def navigate_checked(href: str) -> dict:
+        # Session.navigate() polls internally without validating each redirected URL.
+        await session.call("navigate", href)
+        current = checked_page(await session.page())
+        for _ in range(29):
+            if len(current["text"]) >= 400 or _GONE.search(current["text"]):
+                break
+            await asyncio.sleep(1)
+            current = checked_page(await session.page())
+        return current
+
+    def titled_anchor(c: dict, current: dict) -> tuple[str, str] | None:
+        # The PAGE inventory includes visible controls, controls inside forms,
+        # and file inputs. Only an ordinary out-of-form anchor of type 'a'
+        # cannot have entered through either of the latter two exceptions.
+        if (current.get("inventory_verified") is not True
+                or current.get("truncated") is not False
+                or c.get("tag") != "a" or c.get("type") != "a"
+                or c.get("in_form") is not False):
+            return None
+        href, title = c.get("href"), c.get("label")
+        if (not isinstance(href, str) or href == url or href not in observed
+                or not discovery_url_allowed(href, url)
+                or not isinstance(title, str)):
+            return None
+        title = " ".join(title.split())
+        if (len(title) > 120 or len(title.split()) < 2
+                or re.search(r"^(?:all|browse|view|learn|next|previous|careers|jobs|"
+                             r"open positions|open roles|see|explore|more)\b", title, re.I)
+                or re.search(r"\b(?:jobs|openings|opportunities|departments|"
+                             r"categories|vacancies)\b", title, re.I)
+                 or re.search(r"\b(?:roles|positions|teams|departments?)$", title, re.I)
+                or not re.search(r"\b(?:engineer|developer|designer|manager|analyst|"
+                                 r"architect|director|lead|specialist|scientist|"
+                                 r"administrator|consultant|coordinator|recruiter|"
+                                 r"representative|technician|intern|officer|"
+                                 r"executive|researcher|owner|accountant|nurse|"
+                                 r"teacher|writer|strategist|tester|associate|"
+                                 r"operator|advisor)\b", title, re.I)):
+            return None
+        return href, title
+
+    history, observed, pages = [], {url}, []
+    witnessed: list[tuple[str, str]] = []
+    previous_refusal = None
+
+    def fallback(note: str) -> dict:
+        # Stop can arrive while the final model decision or browser effect awaits.
+        if cancelled():
+            raise Unavailable("BrowserSkill stopped: discovery cancelled")
+        # Multiple different titles for a URL (or URLs for one title) do not
+        # prove a unique posting/title association. Reject such candidates.
+        by_url: dict[str, set[str]] = {}
+        by_title: dict[str, set[str]] = {}
+        for href, title in witnessed:
+            by_url.setdefault(href, set()).add(title)
+            by_title.setdefault(title.casefold(), set()).add(href)
+        jobs = [{"url": href, "title": title} for href, title in dict.fromkeys(witnessed)
+                if len(by_url[href]) == 1 and len(by_title[title.casefold()]) == 1]
+        if not jobs:
+            raise Unavailable("BrowserSkill operation unavailable: " + note)
+        return {"jobs": jobs, "note": note}
+
+    page = await navigate_checked(url)
+    for _ in range(80):
         if cancelled():
             raise Unavailable("BrowserSkill stopped: discovery cancelled")
         observed.update(c["href"] for c in page["controls"]
-                        if discovery_url_allowed(c.get("href", ""), url))
+                        if isinstance(c.get("href"), str)
+                        and discovery_url_allowed(c["href"], url))
+        for c in page["controls"]:
+            witness = titled_anchor(c, page)
+            if witness is not None:
+                witnessed.append(witness)
         pages.append({"url": page["url"], "text": page["text"][:24000]})
         action = await decision(task + '\nReturn jobs only with URLs observed on these pages. '
                                 + 'For finish.report use the requested jobs JSON schema. '
                                 + json.dumps(pages[-4:]), page, history)
+        if not isinstance(action, dict):
+            raise Unavailable("BrowserSkill operation unavailable: invalid discovery decision")
         verb = action.get("action")
+        if not isinstance(verb, str):
+            raise Unavailable("BrowserSkill operation unavailable: invalid discovery decision")
         if verb == "finish":
             report = action.get("report") or {}
             report["jobs"] = [j for j in report.get("jobs", [])
@@ -436,33 +521,65 @@ async def _crawl(session: Session, task: str, url: str) -> dict:
             return report
         if verb == "gate":
             raise Unavailable("BrowserSkill operation unavailable: discovery needs human help")
-        if verb == "navigate":
-            if (action.get("url") not in observed
-                    or not discovery_url_allowed(action.get("url", ""), url)):
-                raise ValueError("Discovery navigation has no proven safe employer route")
-            page = await session.navigate(action["url"])
+        if verb == "submit":
+            raise ValueError("Discovery cannot submit an application")
+
+        reason = ""
+        target = None
+        if verb not in {"navigate", "wait", "click", "fill", "select"}:
+            reason = "Unsupported discovery action"
+        elif verb == "navigate":
+            if (not isinstance(action.get("url"), str)
+                    or action["url"] not in observed
+                    or not discovery_url_allowed(action["url"], url)):
+                reason = "Discovery navigation has no proven safe employer route"
+            else:
+                previous_refusal = None
+                page = await navigate_checked(action["url"])
         elif verb == "wait":
+            previous_refusal = None
             await asyncio.sleep(1)
+            page = checked_page(await session.page())
         else:
+            # A missing/ambiguous/disabled control raises Gate and remains fatal.
             target = control(page, action)
-            if is_submission(target) and not re.search(r"search|find jobs", target["label"], re.I):
+            # A search-like label is not a submission permission exception.
+            if is_submission(target) or target.get("submit") is True:
                 raise ValueError("Discovery cannot submit an application")
-            if verb in {"fill", "select"}:
-                if not re.search(r"search|keyword|location|filter|role|sort|department",
-                                 target["label"], re.I):
-                    raise ValueError("Discovery can only write search/filter fields")
+            if verb == "click":
+                reason = "Discovery cannot prove this click noncommitting; inspect it yourself"
+            elif not re.search(r"search|keyword|location|filter|role|sort|department",
+                               target["label"], re.I):
+                reason = "Discovery can only write search/filter fields"
+            else:
+                previous_refusal = None
                 await session.call(verb, target["selector"], "--value",
                                    str(action.get("value", "")))
-            elif verb == "click":
-                # Inventory cannot prove an arbitrary native/JS button harmless.
-                # Discovery has no approved application or submission hold.
-                raise ValueError("Discovery cannot prove this click noncommitting; inspect it yourself")
-            else:
-                raise ValueError("Unsupported discovery action")
-            history.append({"action": verb, "label": target["label"]})
-        page = await session.page()
-    raise Unavailable("BrowserSkill operation unavailable: discovery step limit reached")
-
+                page = checked_page(await session.page())
+        if reason:
+            context = json.dumps(page["controls"], sort_keys=True, ensure_ascii=False)
+            identity = (json.dumps(action, sort_keys=True, ensure_ascii=False),
+                        reason, page["url"], context)
+            history.append({"action": verb, "selector": action.get("selector"),
+                            "url": action.get("url"),
+                            "label": target.get("label") if target else None,
+                            "reason": reason, "page_url": page["url"]})
+            if previous_refusal == identity:
+                return fallback("discovery stopped after repeated refused actions")
+            previous_refusal = identity
+            # No browser IPC, navigation, DOM reload or wait for a refused proposal.
+            continue
+        history.append({"action": verb, "label": target["label"] if target else ""})
+    # The last permitted effect has already been URL- and inventory-checked.
+    # Its freshly witnessed anchors count too, even without an 81st decision.
+    observed.update(c["href"] for c in page["controls"]
+                    if isinstance(c.get("href"), str)
+                    and discovery_url_allowed(c["href"], url))
+    for c in page["controls"]:
+        witness = titled_anchor(c, page)
+        if witness is not None:
+            witnessed.append(witness)
+    return fallback("discovery step limit reached after 80 decisions")
 
 async def apply_chrome(*args, **kwargs) -> dict:
     # Same public shape as upstream's engine, while policy stays in our guarded

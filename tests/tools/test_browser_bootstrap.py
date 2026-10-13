@@ -344,3 +344,178 @@ async def test_missing_control_label_cannot_create_unwritable_owner_grant(monkey
     assert report['status'] == 'gate' and report['form_question'] is None
     assert decide.await_count == 1
     assert not any(x[0] in {'fill', 'select'} for x in browser.calls)
+
+
+# Settled PR #38 findings: every test is PAGE-shaped and uses a separate
+# fake evaluate result. None drives the production JavaScript in a browser.
+async def selected_gate(browser, page, *, verb='fill', selector='#email',
+                        key='Email', facts=None):
+    with pytest.raises(forms.Gate) as exc:
+        await forms.execute(
+            browser, page, {'action': verb, 'selector': selector, 'fact': key},
+            facts=facts or {}, filled={}, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
+    return exc.value
+
+
+@pytest.mark.parametrize('visible_label', ['', 'go'])
+@pytest.mark.parametrize('submit_value', ['Sign in', 'Subscribe'])
+async def test_input_submit_value_reveals_account_purpose(
+        monkeypatch, visible_label, submit_value):
+    submitter = field(visible_label, '#submit', required=False, tag='input',
+                      type='submit', submit=True, value=submit_value,
+                      has_value=True)
+    p = inventory(field(), submitter)
+    browser, decide, _ = world(monkeypatch, p)
+    report = await attempt(p)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert not decide.await_count  # bootstrap's page-wide login wall
+    exc = await selected_gate(browser, p)
+    assert exc.form_question is None  # own-form model-selected safety
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+@pytest.mark.parametrize('option', [
+    {'value': 'arbitration-accept', 'label': 'I agree to arbitration'},
+    {'value': 'privacy consent', 'label': 'Accept'},
+])
+@pytest.mark.parametrize('with_text', [True, False])
+async def test_material_native_select_options_block_all_grant_routes(
+        monkeypatch, option, with_text):
+    material = field('Response', '#response', tag='select', type='select',
+                     options=[{'value': 'decline', 'label': 'Decline'}, option])
+    controls = ([field()] if with_text else []) + [material, submit()]
+    p = inventory(*controls)
+    browser, decide, _ = world(monkeypatch, p)
+    report = await attempt(p)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert not decide.await_count
+    exc = await selected_gate(browser, p, verb='select',
+                              selector='#response', key='Response')
+    assert exc.form_question is None
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+async def test_safe_native_select_options_remain_grantable(monkeypatch):
+    location = field('Location', '#location', tag='select', type='select',
+                     options=[{'value': '', 'label': 'Choose location'},
+                              {'value': 'remote', 'label': 'Remote'}])
+    p = inventory(location, submit())
+    browser, decide, _ = world(monkeypatch, p)
+    q = (await attempt(p))['form_question']
+    assert q['label'] == 'Location' and q['options'] == location['options']
+    assert not decide.await_count
+    exc = await selected_gate(browser, p, verb='select',
+                              selector='#location', key='Location')
+    assert exc.form_question['options'] == location['options']
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+@pytest.mark.parametrize('case,attribute,value', [
+    ('opacity-zero-ancestor', 'visible', False),
+    ('disabled-fieldset', 'disabled', True),
+])
+async def test_invisible_or_effectively_disabled_witness_refuses_grant(
+        monkeypatch, case, attribute, value):
+    p = inventory(field(), submit())
+    evidence = witness(p)
+    evidence['controls'][0][attribute] = value
+    browser, _, _ = world(monkeypatch, p, result=evidence)
+    report = await attempt(p)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    exc = await selected_gate(browser, p)
+    assert exc.form_question is None
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+def test_fixed_read_only_script_contains_effective_dom_predicates():
+    # Static unit coverage, not the outstanding real 127.0.0.1 smoke.
+    script = forms._FIXED_CONTROL_WITNESS
+    assert "for (let n=e; n && n.nodeType===1; n=n.parentElement)" in script
+    assert 'Number(style.opacity) > 0' in script
+    assert "e.matches(':disabled')" in script
+
+
+async def test_unrelated_native_search_does_not_veto_application(monkeypatch):
+    search = field('Search jobs', '#search', required=False, type='search',
+                   form_selector='#site-search')
+    search_submit = submit('Search', selector='#search-submit',
+                           form_selector='#site-search')
+    p = inventory(search, search_submit, field(), submit())
+    browser, decide, _ = world(monkeypatch, p)
+    report = await attempt(p)
+    assert report['form_question']['label'] == 'Email'
+    assert not decide.await_count
+    exc = await selected_gate(browser, p)
+    assert exc.form_question['label'] == 'Email'
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+async def test_plausible_competing_native_form_stays_generic(monkeypatch):
+    other = field('Candidate reference', '#other', required=False,
+                  form_selector='#other-form')
+    p = inventory(other, field(), submit())
+    browser, decide, _ = world(monkeypatch, p)
+    assert (await attempt(p))['form_question'] is None
+    assert decide.await_count == 1
+    assert (await selected_gate(browser, p)).form_question is None
+
+
+@pytest.mark.parametrize('value,eligible', [
+    ('Apply now', True),
+    ('  apply   NOW  ', True),
+    ('Submit application', True),
+    ('Submit', False),
+    ('Apply now!', False),
+    ('Apply', False),
+    ('Next', False),
+])
+async def test_input_submit_marker_uses_only_exact_closed_allowlist(
+        monkeypatch, value, eligible):
+    native = field('go', '#native-submit', required=False, tag='input',
+                   type='submit', submit=True, value=value, has_value=True)
+    p = inventory(field(), native)
+    browser, decide, _ = world(monkeypatch, p)
+    report = await attempt(p)
+    if eligible:
+        assert report['form_question']['label'] == 'Email'
+        assert not decide.await_count
+    else:
+        assert report['form_question'] is None
+        assert decide.await_count == 1
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+@pytest.mark.parametrize('receiver', ['form_action', 'formaction'])
+async def test_input_submit_marker_requires_safe_native_receiver(
+        monkeypatch, receiver):
+    native = field('go', '#native-submit', required=False, tag='input',
+                   type='submit', submit=True, value='Apply now', has_value=True)
+    native[receiver] = 'https://foreign.test/submit'
+    p = inventory(field(), native)
+    browser, _, _ = world(monkeypatch, p)
+    assert (await attempt(p))['form_question'] is None
+    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+@pytest.mark.parametrize('verb,key,answer,control', [
+    ('fill', 'Location', 'Remote',
+     field('Location', '#location', tag='select', type='select',
+           options=[{'value': '', 'label': 'Choose'},
+                    {'value': 'remote', 'label': 'Remote'}])),
+    ('select', 'Email', 'synthetic@example.test', field()),
+])
+async def test_native_action_must_match_native_target_before_any_grant_or_ipc(
+        monkeypatch, verb, key, answer, control):
+    grant = {k: deepcopy(control.get(k)) for k in (
+        'selector', 'label', 'question', 'tag', 'type',
+        'form_selector', 'form_action')}
+    grant.update(value=answer, url=URL)
+    if control['tag'] == 'select':
+        grant['options'] = deepcopy(control['options'])
+    p = inventory(control, submit())
+    browser, _, row = world(monkeypatch, p, grants={key: grant})
+    exc = await selected_gate(browser, p, verb=verb, key=key,
+                              selector=control['selector'], facts={key: answer})
+    assert exc.form_question is None
+    assert not browser.calls  # no evaluate and especially no mutating IPC

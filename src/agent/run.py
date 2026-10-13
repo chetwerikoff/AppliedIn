@@ -890,7 +890,23 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or any(not isinstance(field.get(k), str) or not field[k].strip()
                    for k in ('label', 'selector', 'url', 'control_label'))
             or not isinstance(field.get('question'), str)
-            or field['label'] != (field['question'] or field['control_label'])):
+            or field['label'] != (field['question'] or field['control_label'])
+            or field.get('tag') not in {'input', 'textarea', 'select'}
+            or not isinstance(field.get('type'), str)
+            or ((field['tag'] == 'input' and field['type'] not in {
+                    'text', 'email', 'tel', 'url', 'number'})
+                or (field['tag'] == 'textarea' and field['type'] != 'textarea')
+                or (field['tag'] == 'select' and field['type'] != 'select'))
+            or any(not isinstance(field.get(k), str) or not field[k].strip()
+                   for k in ('form_selector', 'form_action'))
+            or (field['tag'] == 'select' and (
+                not isinstance(field.get('options'), list) or not field['options']
+                or any(not isinstance(o, dict) or not isinstance(o.get('value'), str)
+                       or not isinstance(o.get('label'), str) or not o['label'].strip()
+                       for o in field['options'])
+                or len({o['value'] for o in field['options']}) != len(field['options'])
+                or len({' '.join(o['label'].casefold().split())
+                        for o in field['options']}) != len(field['options'])))):
         return None
     from tools.browser_skill_apply import navigation_allowed
     url = row.get('jd_url') or ''
@@ -1093,7 +1109,10 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
             grants[form_label] = {
                 'value': answer.strip(), 'selector': observed['selector'],
                 'url': observed['url'], 'label': observed['control_label'],
-                'question': observed['question'],
+                'question': observed['question'], 'tag': observed['tag'],
+                'type': observed['type'], 'form_selector': observed['form_selector'],
+                'form_action': observed['form_action'],
+                **({'options': observed['options']} if observed['tag'] == 'select' else {}),
             }
             stores.tracking.set_status(
                 pk, row.get('status') or Status.NEEDS_HUMAN,

@@ -196,14 +196,20 @@ def exact_approval(pk: str, key: str, value: str, *,
     grants = row.get('human_approved_answers')
     grant = grants.get(key) if isinstance(grants, dict) else None
     if (row.get('pk') != pk or row.get('status') != 'submitting'
-            or row.get('possible_submission') or not key or not url or not target
-            or not isinstance(grant, dict)
+            or row.get('possible_submission') or not key or not value or not url
+            or not target or not isinstance(grant, dict)
             or grant.get('value') != value
             or any(grant.get(k) != observed for k, observed in (
                 ('selector', target.get('selector')),
                 ('url', url),
                 ('label', target.get('label')),
-                ('question', target.get('question', ''))))):
+                ('question', target.get('question', '')),
+                ('tag', target.get('tag')),
+                ('type', target.get('type')),
+                ('form_selector', target.get('form_selector')),
+                ('form_action', target.get('form_action'))))
+            or (target.get('tag') == 'select'
+                and grant.get('options') != target.get('options'))):
         # Old label-only string grants have no control identity and always gate.
         raise Gate('An exact human-approved answer is needed for this control.')
 
@@ -407,6 +413,301 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
             raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
+
+# No model/page text is executable here. This code-owned read uses the same
+# selector rules as PAGE and independently establishes DOM editability/ownership.
+_FIXED_CONTROL_WITNESS = r"""(() => {
+  const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+  const selector = e => {
+    if (e.id && document.querySelectorAll('#'+CSS.escape(e.id)).length === 1)
+      return '#'+CSS.escape(e.id);
+    const parts = [];
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      const siblings = n.parentElement ? Array.from(n.parentElement.children)
+        .filter(x=>x.tagName===n.tagName) : [n];
+      parts.unshift(n.tagName.toLowerCase()+':nth-of-type('+(siblings.indexOf(n)+1)+')');
+    }
+    return parts.join(' > ');
+  };
+  const visible = e => {
+    if (!e.getClientRects().length) return false;
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      const style = getComputedStyle(n);
+      if (!style || style.display === 'none' ||
+          style.visibility === 'hidden' || style.visibility === 'collapse')
+        return false;
+    }
+    return true;
+  };
+  const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
+    '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
+  return {url: location.href, controls: Array.from(document.querySelectorAll(query))
+    .filter(e => (!!e.getClientRects().length &&
+      getComputedStyle(e).visibility !== 'hidden') ||
+      e.form || e.closest('form') || e.type === 'file')
+    .map(e => {
+      const form = e.form || e.closest('form');
+      const type = e.getAttribute('role') ||
+        ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
+          (e.getAttribute('type') || e.tagName.toLowerCase()));
+      const ownSelector = selector(e), formSelector = form ? selector(form) : '';
+      return {selector:ownSelector, unique:document.querySelectorAll(ownSelector).length === 1,
+        tag:e.tagName.toLowerCase(), type, in_form:!!form,
+        form_selector:formSelector,
+        unique_form:!form || document.querySelectorAll(formSelector).length === 1,
+        form_action:form?.action || '',
+        formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
+        disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
+        readonly:!!e.readOnly || e.hasAttribute('readonly'),
+        inert:!!e.closest('[inert]'), visible:visible(e),
+        options:e.options ? Array.from(e.options)
+          .map(o=>({value:o.value,label:clean(o.textContent)})) : []};
+    })};
+})()"""
+
+_APP_SUBMIT_LABELS = frozenset({
+    'submit application', 'send application', 'complete application',
+    'finish application', 'apply now',
+})
+_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number'})
+_ACCOUNT_PURPOSE = re.compile(
+    r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
+    r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
+_MATERIAL_ASSENT = re.compile(
+    r'\b(?:agree(?:ment)?|consent|acknowledg|certif|authori[sz]|'
+    r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
+    r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
+
+
+def _inventory_ok(page: dict) -> None:
+    if (page.get('inventory_verified') is not True or page.get('truncated')
+            or page.get('opaque_controls') or page.get('shadow_roots')
+            or page.get('unsupported_frames')):
+        raise Gate('The current form inventory is incomplete; human inspection is required.')
+    controls = page.get('controls')
+    if (not isinstance(controls, list) or
+            any(not isinstance(c, dict) or not isinstance(c.get('selector'), str)
+                or not c['selector'] for c in controls)):
+        raise Gate('The current form control inventory is malformed.')
+
+
+def _identity(target: dict) -> tuple:
+    return tuple(target.get(k) for k in (
+        'selector', 'label', 'question', 'tag', 'type', 'in_form',
+        'form_selector', 'form_action', 'formaction', 'options', 'disabled',
+        'required', 'has_value', 'value', 'checked'))
+
+
+def _page_identity(page: dict) -> tuple:
+    return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
+            page.get('opaque_controls'), page.get('shadow_roots'),
+            page.get('unsupported_frames'),
+            tuple(repr(_identity(c)) for c in page.get('controls', [])))
+
+
+async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
+    """A missing or malformed real evaluate result never authorizes disclosure."""
+    _inventory_ok(page)
+    try:
+        result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
+        value = result.get('value') if isinstance(result, dict) else None
+        if (not isinstance(value, dict) or value.get('url') != page.get('url')
+                or not isinstance(value.get('controls'), list)
+                or len(value['controls']) != len(page['controls'])):
+            raise ValueError('The fixed DOM witness does not match PAGE')
+        lookup = {}
+        for original, observed in zip(page['controls'], value['controls']):
+            if not isinstance(observed, dict):
+                raise ValueError('Malformed DOM witness entry')
+            sel = original['selector']
+            if (sel in lookup or observed.get('selector') != sel
+                    or observed.get('unique') is not True
+                    or observed.get('unique_form') is not True
+                    or any(original.get(k) != observed.get(k) for k in (
+                        'tag', 'type', 'in_form', 'form_selector',
+                        'form_action', 'formaction', 'disabled'))
+                    or (original.get('tag') == 'select'
+                        and original.get('options') != observed.get('options'))
+                    or any(not isinstance(observed.get(k), bool)
+                           for k in ('visible', 'readonly', 'inert'))):
+                raise ValueError('Control identity differs from the DOM witness')
+            lookup[sel] = observed
+        current = await session.page()
+        _inventory_ok(current)
+        if _page_identity(current) != _page_identity(page):
+            raise ValueError('The current inventory changed during observation')
+        return current, lookup
+    except (Exception, asyncio.CancelledError) as exc:
+        raise Gate('The current DOM witness is unavailable or changed; '
+                   'inspect this form before answering or writing.') from None
+
+
+def _key(page: dict, target: dict) -> str:
+    key = target.get('question') or target.get('label')
+    if not isinstance(key, str) or not key.strip():
+        raise Gate('The observed field has no distinct approval question.')
+    if sum(_same(key, c.get('question') or c.get('label') or '')
+           for c in page['controls']) != 1:
+        raise Gate('More than one control uses the same approval question; review manually.')
+    return key
+
+
+def _native_answer(target: dict) -> bool:
+    return ((target.get('tag') == 'input' and target.get('type') in _TEXT_TYPES)
+            or (target.get('tag') == 'textarea' and target.get('type') == 'textarea')
+            or (target.get('tag') == 'select' and target.get('type') == 'select'))
+
+
+def _form_subject(page: dict, target: dict) -> list[dict]:
+    form = target.get('form_selector')
+    if (target.get('in_form') is not True or not isinstance(form, str)
+            or not form.strip() or not isinstance(target.get('form_action'), str)
+            or not target.get('form_action')):
+        raise Gate('A uniquely identified native owning form is required.')
+    siblings = [c for c in page['controls']
+                if c.get('in_form') and c.get('form_selector') == form]
+    if not siblings:
+        raise Gate('The native form owner is no longer present.')
+    if any(_ACCOUNT_PURPOSE.search(label(c)) for c in siblings
+           if c.get('submit') or c.get('type') == 'password'):
+        raise Gate('This field belongs to a sign-in, account or subscription form.')
+    if any(c.get('type') == 'password' for c in siblings):
+        raise Gate('A password field makes this owning form unsafe for disclosure.')
+    forms = {c.get('form_selector') for c in page['controls']
+             if c.get('in_form') and c.get('form_selector')
+             and (c.get('tag') in {'input', 'textarea', 'select'} or c.get('submit'))}
+    if len(forms) > 1:
+        raise Gate('Competing native form purposes require human inspection.')
+    return siblings
+
+
+def _native_options(target: dict) -> list:
+    options = target.get('options')
+    if (not isinstance(options, list) or not options
+            or any(not isinstance(o, dict)
+                   or not isinstance(o.get('value'), str)
+                   or not isinstance(o.get('label'), str)
+                   or not o['label'].strip() for o in options)
+            or len({o['value'] for o in options}) != len(options)
+            or len({_same_key(o['label']) for o in options}) != len(options)):
+        raise Gate('The native select options are incomplete or ambiguous.')
+    return [{'value': o['value'], 'label': o['label']} for o in options]
+
+
+def _same_key(value: str) -> str:
+    return ' '.join(value.casefold().split())
+
+
+def _disclosure_question(page: dict, target: dict, witness: dict,
+                         *origins: str, bootstrap: bool = False) -> dict:
+    if not _native_answer(target):
+        raise Gate('Only observed native text fields and selects may request a form grant.')
+    dom = witness.get(target['selector'])
+    if (not dom or dom['visible'] is not True or dom['readonly'] is True
+            or dom['disabled'] is True or dom['inert'] is True
+            or target.get('disabled')):
+        raise Gate('This control is not visibly editable.')
+    subject = label(target)
+    if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
+        raise Gate('This control requires human sign-in or account review.')
+    if _MATERIAL_ASSENT.search(subject):
+        raise Gate('Legal or material assent requires direct human review.')
+    key = _key(page, target)
+    siblings = _form_subject(page, target)
+    if bootstrap:
+        if (target.get('required') is not True or target.get('has_value')
+                or bool(str(target.get('value') or '').strip())):
+            raise Gate('This is not a required unanswered field.')
+        marked = any(
+            (native_submit(c) and _same_key(c.get('label', '')) in _APP_SUBMIT_LABELS)
+            or (c.get('type') == 'file'
+                and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
+            for c in siblings)
+        if not marked:
+            raise Gate('No positive native application-form marker was observed.')
+    check_form_destination(page, target, *origins)
+    question = {
+        'pk': '', 'label': key, 'selector': target['selector'],
+        'url': page['url'], 'control_label': target['label'],
+        'question': target.get('question', ''),
+        'tag': target['tag'], 'type': target['type'],
+        'form_selector': target['form_selector'],
+        'form_action': target['form_action'],
+    }
+    if target.get('tag') == 'select':
+        question['options'] = _native_options(target)
+    return question
+
+
+def _bootstrap_wall(page: dict, witness: dict) -> None:
+    for c in page['controls']:
+        subject = label(c)
+        if (c.get('type') == 'password'
+                or (c.get('submit') and _ACCOUNT_PURPOSE.search(subject))
+                or (c.get('in_form') and _MATERIAL_ASSENT.search(subject)
+                    and (c.get('required') or c.get('type') in {
+                        'radio', 'checkbox', 'select'} or c.get('submit')))):
+            raise Gate('Login or material consent requires human inspection.')
+        if c.get('in_form') and c.get('required') and c.get('type') == 'checkbox' \
+                and not c.get('checked'):
+            raise Gate('A required acknowledgement needs direct human review.')
+        if c.get('type') == 'radio' and c.get('in_form'):
+            dom = witness.get(c['selector'])
+            if (not dom or not dom.get('visible') or dom.get('inert')
+                    or not (c.get('question') or c.get('name'))
+                    or _MATERIAL_ASSENT.search(subject)
+                    or _ACCOUNT_PURPOSE.search(subject)
+                    or _FACT_ASSERTION.search(subject)):
+                raise Gate('An uncertain native choice needs direct human review.')
+        if (c.get('required') and c.get('in_form')
+                and c.get('tag') not in {'input', 'textarea', 'select', 'button'}):
+            raise Gate('An uninspectable required choice needs human review.')
+
+
+async def _bootstrap(session, page: dict, pk: str, facts: dict,
+                     *origins: str, fixture_context=None) -> dict:
+    _inventory_ok(page)
+    if not navigation_allowed(page['url'], *origins):
+        raise Gate('The current form is not on the tracked job route.')
+    candidate = [c for c in page['controls']
+                 if (c.get('required') and not c.get('has_value')
+                     and _native_answer(c))]
+    # The read-only witness verifies even an otherwise invisible required
+    # control. No model decision may evade an observed wall on that page.
+    if not candidate and not any(
+            c.get('type') in {'radio', 'checkbox', 'password'}
+            or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
+            for c in page['controls']):
+        return page
+    page, witness = await _observe_controls(session, page)
+    _bootstrap_wall(page, witness)
+    for item in page['controls']:
+        if not (item.get('required') and not item.get('has_value')
+                and _native_answer(item)):
+            continue
+        if item.get('disabled') or str(item.get('value') or '').strip():
+            continue
+        try:
+            question = _disclosure_question(page, item, witness, *origins, bootstrap=True)
+        except Gate:
+            # A colliding question does not suppress an unrelated, distinct key.
+            continue
+        question['pk'] = pk
+        key = question['label']
+        value = str(facts.get(key) or '').strip()
+        if value:
+            try:
+                exact_approval(pk, key, value, target=item, url=page['url'],
+                               **({'fixture_context': fixture_context}
+                                  if fixture_context else {}))
+                continue
+            except Gate:
+                pass
+        raise Gate(f'An exact human-approved answer is needed for "{key}".',
+                   form_question=question)
+    return page
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -422,16 +723,19 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
-    if verb in {'fill', 'select', 'choose'}:
-        # Only this observed, unique control creates a disclosure question;
-        # model gate prose and generic pipeline questions carry no such scope.
-        form_question = {
-            'pk': pk, 'label': target.get('question') or target['label'],
-            'selector': target['selector'], 'url': page.get('url', ''),
-            'control_label': target['label'], 'question': target.get('question', ''),
-        }
-        if not form_question['label'] or not form_question['url']:
-            form_question = None
+    if verb == 'choose':
+        # Choice clicks can commit; neither model text nor a checkbox label
+        # establishes a safe disclosure identity for the existing grant writer.
+        raise Gate('A choice requires a human action and exact approved answer.')
+    if verb in {'fill', 'select'}:
+        observed, witness = await _observe_controls(session, page)
+        target = control(observed, action)
+        if _identity(target) != _identity(control(page, action)):
+            raise Gate('The selected field changed before human authorization.')
+        page = observed
+        form_question = _disclosure_question(
+            page, target, witness, job_url or page['url'])
+        form_question['pk'] = pk
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
@@ -440,44 +744,45 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 key = matches[0]
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
-        elif (verb == 'choose' and target.get('type') == 'checkbox'
-              and target.get('required') and _AGREE.match(target.get('label', ''))
-              and not _SENSITIVE.search(question) and not _SANCTIONS_RX.search(question)
-              and not _FACT_ASSERTION.search(target.get('label', ''))):
-            key, value = target['label'], target['label']
         else:
             raise Gate(f'An exact human-approved answer is needed for "{target["label"]}".',
                        form_question=form_question)
+        if not _same(key, form_question['label']):
+            raise Gate('The proposed fact key does not match this observed question.',
+                       form_question=form_question)
         try:
-            exact_approval(pk, key, value, target=target, url=page.get('url', ''),
+            exact_approval(pk, key, value, target=target, url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
             raise Gate(str(exc), form_question=form_question) from None
-        if not _same(key, target.get('question') or target.get('label', '')):
-            raise Gate('An exact human-approved answer for this question is required.')
         if not value:
-            raise Gate(f'An approved answer is needed for "{target["label"]}".')
+            raise Gate(f'An approved answer is needed for "{target["label"]}".',
+                       form_question=form_question)
         guarded_value(target, value)
-        if is_submission(target):
-            raise Gate('A submission control is not an answer field.')
-        if verb == 'fill':
-            if (target.get('type') in {'file', 'radio', 'checkbox', 'option'}
-                    or target.get('tag') not in {'input', 'textarea'}):
-                raise Gate('Fill is restricted to text inputs and textareas.')
-            await session.call('fill', target['selector'], '--value', value)
-        elif verb == 'select':
-            if target.get('tag') != 'select':
-                raise Gate('Native select required; custom dropdowns need human input.')
+        if verb == 'select':
             value = choose_value(target, value, str(action.get('value', '')))
-            await session.call('select', target['selector'], '--value', value)
+        # The final pre-write observation is independent of the planning read;
+        # any witnessed identity/receiver/option change disables all writes.
+        latest, latest_witness = await _observe_controls(session, page)
+        current = control(latest, action)
+        if _identity(current) != _identity(target):
+            raise Gate('The approved form control changed before a browser write.')
+        fresh_question = _disclosure_question(
+            latest, current, latest_witness, job_url or latest['url'])
+        fresh_question['pk'] = pk
+        if fresh_question != form_question:
+            raise Gate('The original authorized control identity is no longer current.')
+        exact_approval(pk, key, str(facts[key]).strip(), target=current,
+                       url=latest['url'],
+                       **({'fixture_context': ctx} if ctx else {}))
+        if verb == 'fill':
+            guarded_value(current, value)
+            await session.call('fill', current['selector'], '--value', value)
         else:
-            if target.get('type') not in {'radio', 'checkbox', 'option'}:
-                raise Gate('Choose is restricted to observed radio/checkbox/option controls.')
-            choose_value(target, value, str(action.get('value', '')))
-            if not target.get('checked'):
-                # Onclick can commit unexpectedly; there is no noncommit proof.
-                raise Gate('Choice click is potentially committing; human action required.')
-        filled[target['selector']] = value
+            value = choose_value(current, str(facts[key]).strip(),
+                                 str(action.get('value', '')))
+            await session.call('select', current['selector'], '--value', value)
+        filled[current['selector']] = value
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
@@ -616,6 +921,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
                                 'values and attachment before submit.')
+                    verify_dispatch()
+                    page = await _bootstrap(
+                        session, page, pk, facts, url, direct_url,
+                        **({'fixture_context': ctx} if ctx else {}))
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, page, history, model=model)
                     verb = action.get('action')

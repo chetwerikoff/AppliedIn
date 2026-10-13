@@ -51,7 +51,7 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
     restore them (emphasis only) and re-save."""
     from core.stores import make_stores
     from tools.render import render_pdf, restore_preamble
-    from tools.truthfulness import validate
+    from tools.truthfulness import active_calls, used_macros, validate
 
     base_latex = tool_context.state.get("base_latex") or ""
     # Without the seed there is nothing to validate against, and both checks below
@@ -65,6 +65,16 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
                 "message": "The seed résumé is missing from this run, so nothing "
                            "can be checked against it. Stop and report this rather "
                            "than saving."}
+    # A non-empty seed with no recognizable live structure or bullets is just
+    # as unverifiable as a missing one. Refuse it before competing diagnostics.
+    base_used = used_macros(base_latex)
+    if not base_used["anchors"] or not base_used["bullets"]:
+        return {"ok": False,
+                "message": "Unrecognized seed résumé format: no active supported "
+                           "structural anchors or résumé-body bullets found. "
+                           "Use a seed with supported role/heading and bullet calls, "
+                           "then re-save."}
+
     # Nothing above \begin{document} is the tailor's to write, and a slip there is
     # invisible to every check below — a doubled backslash in the \resumeSubheading
     # macro once put the literal word "textit" in front of every job title on a PDF
@@ -76,12 +86,15 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
                     tool_context.state.get("pk", "?"))
         tailored_latex = restored
 
-    # Keep every bullet: dropping \resumeItem lines is the #1 over-tailoring failure.
-    base_items, new_items = base_latex.count("\\resumeItem"), tailored_latex.count("\\resumeItem")
+    # Count only active calls to types actually used by the base. A new macro
+    # type cannot hide a dropped bullet, but mixed-base totals remain aggregate.
+    base_items = len(active_calls(base_latex, base_used["bullets"]))
+    new_items = len(active_calls(tailored_latex, base_used["bullets"]))
     if new_items < base_items:
+        macros = " / ".join(base_used["bullets"])
         return {"ok": False,
                 "message": f"You dropped {base_items - new_items} bullet(s) "
-                           f"({new_items} vs {base_items}). Keep EVERY \\resumeItem — "
+                           f"({new_items} vs {base_items}). Keep EVERY {macros} — "
                            "restore the missing ones (reword, never delete) and re-save."}
     violations = validate(base_latex, tailored_latex)
     if violations:

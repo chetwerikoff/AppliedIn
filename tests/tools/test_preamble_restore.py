@@ -61,3 +61,83 @@ def test_a_document_without_the_marker_is_left_alone():
     """No \\begin{document} on either side means we cannot tell head from body."""
     assert restore_preamble(SEED, "fragment") == "fragment"
     assert restore_preamble("fragment", SEED) == SEED
+
+
+# Issue #26: the guards must see calls in résumé content, not declarations.
+from tools.truthfulness import MACROS, active_calls, used_macros, validate
+
+_TRUTH_PREAMBLE = (
+    r"\documentclass{article}" "\n"
+    r"\newcommand{\resumeItem}[1]{\item #1}" "\n"
+    r"\newcommand{\role}[2]{\item \textbf{#1} \textit{#2}}" "\n"
+    r"\begin{document}" "\n"
+)
+_TRUTH_ROLE_A = r"\role{Test User, example-co}{2022--2024}"
+_TRUTH_ROLE_B = r"\role{Test User, example-co}{2024--2026}"
+
+
+def _truth_doc(body):
+    return _TRUTH_PREAMBLE + body + "\n" + r"\end{document}"
+
+
+def test_truthfulness_selects_only_active_body_macros_not_preamble_definitions():
+    doc = _truth_doc(_TRUTH_ROLE_A)
+    assert used_macros(doc) == {"anchors": (r"\role",), "bullets": ()}
+    doc = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\resumeItem{One}")
+    assert used_macros(doc)["bullets"] == (r"\resumeItem",)
+    doc = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item One")
+    assert used_macros(doc)["bullets"] == (r"\item",)
+    doc = _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item One" + "\n" + r"\resumeItem{Two}")
+    assert used_macros(doc)["bullets"] == (r"\resumeItem", r"\item")
+
+
+def test_truthfulness_ignores_comments_definitions_and_command_near_names():
+    seed = _truth_doc("\n".join([
+        _TRUTH_ROLE_A, r"\resumeItem{One}", r"% \resumeItem{ghost}",
+        r"\resumeItemExtra{ghost}", r"\itemize", r"\itemsep", r"\roles{ghost}",
+        r"\% literal percent % \item ghost",
+        r"\newcommand{\testhelper}[1]{\resumeItem{ghost} \item ghost}",
+        r"\item Two",
+    ]))
+    assert len(active_calls(seed, MACROS["anchors"])) == 1
+    assert len(active_calls(seed, MACROS["bullets"])) == 2
+
+
+def test_truthfulness_fragment_definitions_do_not_create_call_sites():
+    fragment = (
+        r"\newcommand{\resumeItem}[1]{\item #1}" "\n"
+        r"\newcommand{\helper}[1]{" "\n"
+        r"  \role{Not a role} \resumeItem{Not a bullet}" "\n"
+        "}" "\n"
+        r"\role{X}" "\n"
+        r"\item Real bullet"
+    )
+    assert used_macros(fragment) == {"anchors": (r"\role",), "bullets": (r"\item",)}
+
+
+def test_truthfulness_preserves_reordered_roles_and_detects_date_changes():
+    base = _truth_doc(_TRUTH_ROLE_A + "\n" + _TRUTH_ROLE_B + "\n" + r"\item One")
+    assert validate(base, _truth_doc(_TRUTH_ROLE_B + "\n" + _TRUTH_ROLE_A + "\n" + r"\item One")) == []
+    assert validate(base, _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item One")) == [_TRUTH_ROLE_B]
+    changed = _TRUTH_ROLE_A.replace("2022", "2021")
+    assert validate(base, _truth_doc(_TRUTH_ROLE_B + "\n" + changed + "\n" + r"\item One")) == [_TRUTH_ROLE_A]
+    assert validate(base, _truth_doc(_TRUTH_ROLE_B + "\n% " + _TRUTH_ROLE_A + "\n" + r"\item One")) == [_TRUTH_ROLE_A]
+
+
+def test_truthfulness_short_role_exact_token_and_duplicate_multiplicity():
+    assert used_macros(r"\roles{X}" + "\n" + r"\role{X}")["anchors"] == (r"\role",)
+    assert validate(r"\role{X}", r"\roles{X}") == [r"\role{X}"]
+    base = _truth_doc(_TRUTH_ROLE_A + "\n" + _TRUTH_ROLE_A + "\n" + r"\item One")
+    assert validate(base, _truth_doc(_TRUTH_ROLE_A + "\n" + r"\item One")) == [_TRUTH_ROLE_A]
+    assert validate(r"\role{Test User}{2024}", r"\role{test    user}{2024}") == []
+
+
+def test_truthfulness_legacy_subheading_variants_are_independent():
+    multi = r"\resumeSubheading{example-co}{2022--2024}{Tester}{Remote}"
+    single = r"\resumeSubheadingSingle{Synthetic Project}{2024}"
+    assert used_macros(multi + "\n" + single)["anchors"] == (
+        r"\resumeSubheading", r"\resumeSubheadingSingle"
+    )
+    assert validate(multi + "\n" + single, multi) == [single]
+    assert validate(multi + "\n" + single, single) == [multi]
+

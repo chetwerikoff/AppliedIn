@@ -915,11 +915,18 @@ async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
+    with pytest.raises(forms.Gate) as refusal:
         await forms.execute(
             session, page(field, application_marker=True), action, facts=facts,
             filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    if field['type'] == 'checkbox':
+        # A required native acknowledgement now gets a verbatim question;
+        # model selection and an empty bank alone still authorize no write.
+        assert 'Answer yes or no' in str(refusal.value)
+        assert refusal.value.form_question['control_label'] == field['label']
+    else:
+        assert 'human-approved' in str(refusal.value)
     session.call.assert_not_awaited()
 
 

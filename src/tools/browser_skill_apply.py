@@ -657,17 +657,21 @@ def _unanswered(page: dict, target: dict) -> bool:
 
 
 def _choice_prompt(target: dict, question: dict) -> str:
-    """Show original control/question strings and every radio caption verbatim."""
+    """Show original question, radio captions and native select options verbatim."""
     subject = label(target)
     prefix = ('Legal acknowledgement: ' if _MATERIAL_ASSENT.search(subject)
               else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
               else '')
     observed = question['question'] or question['control_label']
-    if question['control_label'] != observed and question['type'] == 'checkbox':
+    if (question['control_label'] != observed
+            and question['type'] in {'checkbox', 'select'}):
         observed += '\n' + question['control_label']
     if question['type'] == 'radio':
         observed += '\nOptions:\n' + '\n'.join(
             member['caption'] for member in question['radio_members'])
+    elif question.get('tag') == 'select':
+        observed += '\nOptions:\n' + '\n'.join(
+            option['label'] for option in question['options'])
     else:
         observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
     return prefix + observed
@@ -880,7 +884,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             except Gate:
                 pass
         prompt = (_choice_prompt(item, question)
-                  if item.get('type') in {'radio', 'checkbox'}
+                  if (item.get('type') in {'radio', 'checkbox'}
+                      or item.get('tag') == 'select')
                   else f'An exact human-approved answer is needed for "{key}".')
         raise Gate(prompt, form_question=question)
     return page
@@ -920,6 +925,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         form_question = _disclosure_question(
             page, target, witness, job_url or page['url'])
         form_question['pk'] = pk
+        gate_prompt = (_choice_prompt(target, form_question)
+                       if verb in {'choose', 'select'}
+                       else f'An exact human-approved answer is needed for "{form_question["label"]}".')
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
@@ -929,12 +937,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
         else:
-            prompt = (_choice_prompt(target, form_question) if verb == 'choose'
-                      else f'An exact human-approved answer is needed for "{form_question["label"]}".')
-            raise Gate(prompt, form_question=form_question)
+            raise Gate(gate_prompt, form_question=form_question)
         if not _same(key, form_question['label']):
-            raise Gate('An exact human-approved fact key for this observed question is required.',
-                       form_question=form_question)
+            detail = 'An exact human-approved fact key for this observed question is required.'
+            if verb == 'select':
+                detail += '\n' + gate_prompt
+            raise Gate(detail, form_question=form_question)
         try:
             exact_approval(pk, key, value, target=_bound_target(page, target),
                            url=page['url'],
@@ -942,10 +950,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         except Gate as exc:
             prompt = (_choice_prompt(target, form_question)
                       if verb == 'choose' else str(exc))
+            if verb == 'select':
+                prompt += '\n' + gate_prompt
             raise Gate(prompt, form_question=form_question) from None
         if not value:
-            raise Gate('An owner answer is needed for this observed control.',
-                       form_question=form_question)
+            raise Gate(gate_prompt, form_question=form_question)
         if verb == 'choose':
             if target['type'] == 'checkbox':
                 if not _same(value, 'yes'):

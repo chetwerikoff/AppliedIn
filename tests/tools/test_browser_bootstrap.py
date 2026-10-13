@@ -353,6 +353,65 @@ def test_only_actual_direct_owner_reply_persists_complete_identity(monkeypatch):
     assert not forms.exact_approval(PK, 'Email', answer, target=p['controls'][0], url=URL)
 
 
+async def test_radio_approved_caption_creates_exact_owner_grant(monkeypatch):
+    from agent import run
+    approved = field('Approved', '#approved', type='radio', name='review_status',
+                     question='Review status', required=True,
+                     value='approved', has_value=True, checked=False)
+    pending = field('Pending', '#pending', type='radio', name='review_status',
+                    question='Review status', required=True,
+                    value='pending', has_value=True, checked=False)
+    page = inventory(approved, pending, submit())
+    evidence = witness(page)
+    observed = {item['selector']: item for item in evidence['controls']}
+    question = forms._disclosure_question(
+        page, approved, observed, URL, bootstrap=True)
+    question['pk'] = PK
+    row = {'pk': PK, 'status': 'needs_human', 'jd_url': URL,
+           'company': 'example-co', 'gate_source': 'applier',
+           'gate_call_id': 'direct', 'possible_submission': False,
+           'human_approved_answers': {},
+           'gate_pending': {'question': 'Review status',
+                            'form_question': question}}
+    bank = {}
+    queued = []
+
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return deepcopy(row)
+
+        def set_status(self, pk, status, **changes):
+            assert pk == PK
+            row.update(status=status, **changes)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(),
+        answer_bank=SimpleNamespace(put=lambda label, value, *args, **kwargs:
+                                    bank.update({label: value})))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_enqueue_apply',
+                        lambda *a, **kw: (queued.append(kw) or {'result': 'queued'}))
+    assert run.resume_job(PK, 'Approved', stores)['result'] == 'queued'
+    grant = row['human_approved_answers']['Review status']
+    assert grant['value'] == 'Approved'
+    assert grant['radio_name'] == 'review_status'
+    assert grant['radio_members'] == question['radio_members']
+    assert bank['Review status'] == 'Approved'
+    assert queued and queued[0]['priority'] is True
+
+    browser, _, apply_row = world(monkeypatch, page, facts=bank,
+                                  grants=row['human_approved_answers'])
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, page, {'action': 'choose', 'selector': '#approved',
+                       'fact': 'Review status'},
+        facts=bank, filled={}, resume_path='Resume.pdf', company='example-co',
+        jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
+    assert receipt['fact'] == 'Review status'
+    assert browser.calls[-1] == ('click', '#approved')
+    assert apply_row['human_approved_answers']['Review status']['value'] == 'Approved'
+
 @pytest.mark.parametrize('missing', ['tag', 'type', 'form_selector',
                                      'form_action', 'options'])
 def test_direct_writer_refuses_malformed_control_provenance(monkeypatch, missing):
@@ -433,18 +492,40 @@ async def test_material_native_select_options_block_all_grant_routes(
 
 
 async def test_safe_native_select_options_remain_grantable(monkeypatch):
-    location = field('Location', '#location', tag='select', type='select',
-                     options=[{'value': '', 'label': 'Choose location'},
-                              {'value': 'remote', 'label': 'Remote'}])
+    options = [{'value': '', 'label': 'Choose one'},
+               {'value': 'remote', 'label': 'Remote'},
+               {'value': 'onsite', 'label': 'On-site'}]
+    location = field('Work location', '#location', tag='select', type='select',
+                     question='Where can you work?', options=options)
     p = inventory(location, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    q = (await attempt(p))['form_question']
-    assert q['label'] == 'Location' and q['options'] == location['options']
+    browser, decide, row = world(monkeypatch, p)
+    expected = chr(10).join([
+        'Where can you work?', 'Work location', 'Options:',
+        'Choose one', 'Remote', 'On-site'])
+    # A bank candidate still requires owner confirmation and shows every
+    # native option in DOM order before any grant or browser write.
+    report = await attempt(p, facts={'Work location': 'Remote'})
+    q = report['form_question']
+    assert q['label'] == 'Where can you work?' and q['options'] == options
+    assert report['question'].startswith(expected)
+    assert row['human_approved_answers'] == {}
     assert not decide.await_count
-    exc = await selected_gate(browser, p, verb='select',
-                              selector='#location', key='Location')
-    assert exc.form_question['options'] == location['options']
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+    # Model-selected select gates show the same exact question and options.
+    missing = await selected_gate(
+        browser, p, verb='select', selector='#location', key='Work location')
+    assert str(missing) == expected
+    # A matching bank value without a per-job grant still gates with options.
+    exc = await selected_gate(browser, p, verb='select', selector='#location',
+                              key='Work location', facts={'Work location': 'Remote'})
+    assert str(exc).endswith(expected)
+    assert exc.form_question['options'] == options
+    wrong_key = await selected_gate(
+        browser, p, verb='select', selector='#location', key='Other field',
+        facts={'Other field': 'Remote'})
+    assert str(wrong_key).endswith(expected)
+    assert 'exact human-approved fact key' in str(wrong_key)
+    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
 
 
 @pytest.mark.parametrize('case,attribute,value', [
@@ -732,18 +813,23 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
     assert decide.await_count == 1
 
 
-async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(monkeypatch):
+@pytest.mark.parametrize('checkbox_label', [
+    'I agree to privacy policy', 'Ready to apply?',
+])
+async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(
+        monkeypatch, checkbox_label):
     from agent import run
     from core.models import Status
 
-    privacy = field('I agree to privacy policy', '#privacy',
-                    type='checkbox', required=True, value='on',
-                    has_value=True, checked=False)
+    privacy = field(checkbox_label, '#privacy', type='checkbox', required=True,
+                    value='on', has_value=True, checked=False)
     page = inventory(privacy, submit())
     browser, decide, row = world(monkeypatch, page)
     result = await attempt(page)
     question = result['form_question']
     assert question['type'] == 'checkbox' and not decide.await_count
+    if checkbox_label == 'Ready to apply?':
+        assert result['question'].startswith('Ready to apply?')
     bank = {}
     queue = []
 
@@ -773,7 +859,8 @@ async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(monke
     assert row.get('human_approved_answers') == {}
     assert bank == {} and queue == []
     assert run.resume_job(PK, 'no', stores)['result'] == 'not_gated'
-    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 
 async def test_changed_radio_group_after_owner_grant_refuses_write(monkeypatch):

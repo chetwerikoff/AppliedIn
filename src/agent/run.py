@@ -1100,18 +1100,22 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         return {"result": "not_gated", "pk": pk}
 
     question = (row.get("gate_pending") or {}).get("question") or ""
-    approval = question.startswith("Ready to apply")
-    if question and not approval and answer.strip().lower() not in ("", "approved"):
+    form_label = _direct_form_label(pk, row)
+    approval = form_label is None and question.startswith("Ready to apply")
+    if (form_label is not None
+            or (question and not approval
+                and answer.strip().lower() not in ("", "approved"))):
+        if form_label is not None and not answer.strip():
+            return {"result": "gated", "pk": pk, "reason": "invalid_answer",
+                    "detail": "Answer the exact observed field question."}
         # Bank real answers so the same question never gates again. Facts (name,
-        # work auth, …) are GLOBAL; company/role-specific prose ("why this role?")
-        # stays scoped to THIS company.
+        # work auth, …) are GLOBAL; company/role-specific prose stays scoped.
         company = row.get("company", "")
         # File it under the FIELD the gate named, not the paragraph the gate was
         # written in. Scope is then judged on the label too: "What is your
         # desired salary range?" is a fact about the owner and belongs to every
         # employer, even though the paragraph around it said "Replit" three times
         # and would have locked it to Replit alone.
-        form_label = _direct_form_label(pk, row)
         if form_label:
             observed = row['gate_pending']['form_question']
             normalized = ' '.join(answer.casefold().split())

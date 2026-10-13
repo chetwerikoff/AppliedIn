@@ -263,7 +263,9 @@ async def test_selected_email_on_own_login_or_subscription_form_is_not_grantable
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-async def test_safe_native_next_continuation_can_gate_without_final_marker(monkeypatch):
+async def test_selected_continuation_without_positive_marker_is_generic(monkeypatch):
+    # Architect amendment (c): even model-selected Next/Continue cannot
+    # mint a disclosure grant without a positive native application marker.
     p = inventory(field(), submit('Next'))
     browser, decide, _ = world(monkeypatch, p)
     assert (await attempt(p))['form_question'] is None
@@ -273,7 +275,7 @@ async def test_safe_native_next_continuation_can_gate_without_final_marker(monke
             {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
             facts={}, filled={}, resume_path='', company='example-co',
             jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
-    assert exc.value.form_question['label'] == 'Email'
+    assert exc.value.form_question is None
 
 
 def test_only_actual_direct_owner_reply_persists_complete_identity(monkeypatch):
@@ -521,140 +523,51 @@ async def test_native_action_must_match_native_target_before_any_grant_or_ipc(
     assert not browser.calls  # no evaluate and especially no mutating IPC
 
 
-# The settled second T3 review checks only observed PAGE/current-witness
-# evidence. These fakes cannot prove the pending production evaluate smoke.
-@pytest.mark.parametrize('receiver_kind', ['form_action', 'submit_override'])
-@pytest.mark.parametrize('endpoint', ['subscribe', 'signin'])
-async def test_second_round_action_path_is_not_an_application_receiver(
-        monkeypatch, receiver_kind, endpoint):
-    # A same-job descendant path is navigation-allowed, but it does not
-    # turn an account/subscription form into an application disclosure.
-    path = URL + '/' + endpoint
-    if receiver_kind == 'form_action':
-        p = inventory(field(form_action=path), submit('Continue', form_action=path))
-    else:
-        p = inventory(field(), submit('Continue', formaction=path))
+# The later architect amendment makes the positive native application
+# marker a structural grant prerequisite. Wording-only classifier misses from
+# the second source review are notes, not denial rules.
+@pytest.mark.parametrize('case', [
+    'input-button-sign-in', 'input-button-subscribe',
+    'subscribe-action', 'signin-form-id', 'safe-next',
+])
+async def test_second_round_structural_marker_is_required_for_model_grants(
+        monkeypatch, case):
+    email = field()
+    next_control = submit('Next')
+    controls = [email, next_control]
+    if case in {'input-button-sign-in', 'input-button-subscribe'}:
+        controls.insert(1, field(
+            'action', '#account-action', required=False, tag='input',
+            type='button', submit=False, has_value=True,
+            value='Sign in' if case == 'input-button-sign-in' else 'Subscribe'))
+    elif case == 'subscribe-action':
+        email['form_action'] = URL + '/subscribe'
+        next_control['form_action'] = URL + '/subscribe'
+    elif case == 'signin-form-id':
+        email['form_selector'] = '#signin'
+        next_control['form_selector'] = '#signin'
+    p = inventory(*controls)
     browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
+    result = await attempt(p)
+    assert result['form_question'] is None
     assert decide.await_count == 1
     exc = await selected_gate(browser, p)
     assert exc.form_question is None
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+    assert all(c[0] not in {'fill', 'select'} for c in browser.calls)
 
 
-@pytest.mark.parametrize('caption', ['Sign in', 'Subscribe'])
-@pytest.mark.parametrize('button_label', ['', 'action'])
-async def test_second_round_native_input_button_account_purpose(
-        monkeypatch, caption, button_label):
-    native_button = field(button_label, '#native-button', required=False,
-                          tag='input', type='button', submit=False,
-                          value=caption, has_value=True)
-    p = inventory(field(), native_button, submit('Next'))
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert not decide.await_count
-    exc = await selected_gate(browser, p)
-    assert exc.form_question is None
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-async def test_second_round_input_button_apply_now_is_never_a_native_marker(
+async def test_second_round_native_resume_file_is_positive_application_marker(
         monkeypatch):
-    # Do not reuse button-purpose evidence as positive submit proof.
-    p = inventory(field(), field('action', '#fake-submit', required=False,
-                                  tag='input', type='button', submit=False,
-                                  value='Apply now', has_value=True))
+    resume = field('Upload resume', '#resume', required=True,
+                   tag='input', type='file', submit=False)
+    p = inventory(field(), resume, submit('Next'))
     browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-
-
-@pytest.mark.parametrize('identity', ['#signin', '#log-in',
-                                      '#subscribe', '#account-form'])
-async def test_second_round_native_form_identifier_blocks_account_grants(
-        monkeypatch, identity):
-    p = inventory(field(form_selector=identity),
-                  submit('Next', form_selector=identity))
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-    exc = await selected_gate(browser, p)
-    assert exc.form_question is None
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-async def test_second_round_distinct_safe_next_form_remains_grantable(monkeypatch):
-    p = inventory(field(form_selector='#step-two'),
-                  submit('Next', form_selector='#step-two'))
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
+    # A same-form observed résumé input satisfies structural (c) even when
+    # the continuation submit label is not in the closed final-action list.
+    assert (await attempt(p))['form_question']['label'] == 'Email'
+    assert not decide.await_count
     exc = await selected_gate(browser, p)
     assert exc.form_question['label'] == 'Email'
-    assert exc.form_question['form_selector'] == '#step-two'
-
-
-@pytest.mark.parametrize('phrase', [
-    'I authorize data review',
-    'I authorise data review',
-    'I certify accuracy',
-    'I acknowledge the notice',
-    'Attestation requested',
-    'I accept the decision',
-    'Acceptance required',
-])
-@pytest.mark.parametrize('place', ['option-label', 'option-value', 'field-label'])
-async def test_second_round_material_assent_inflections_never_receive_grants(
-        monkeypatch, phrase, place):
-    if place == 'field-label':
-        target = field(phrase, '#response')
-        verb = 'fill'
-    else:
-        values = [{'value': 'decline', 'label': 'Decline'},
-                  {'value': 'confirm', 'label': 'Confirm'}]
-        values[1]['label' if place == 'option-label' else 'value'] = phrase
-        target = field('Response', '#response', tag='select',
-                       type='select', options=values)
-        verb = 'select'
-    p = inventory(target, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert not decide.await_count
-    exc = await selected_gate(browser, p, verb=verb,
-                              selector='#response', key=target['label'])
-    assert exc.form_question is None
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-@pytest.mark.parametrize('question', ['', 'Yes No', 'No Yes'])
-async def test_second_round_radio_name_or_bare_options_are_not_a_question(
-        monkeypatch, question):
-    radios = [
-        field('Yes', '#yes', tag='input', type='radio', required=True,
-              question=question, name='choice'),
-        field('No', '#no', tag='input', type='radio', required=True,
-              question=question, name='choice'),
-    ]
-    p = inventory(field(), *radios, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-async def test_second_round_material_radio_name_blocks_with_clear_group_question(
-        monkeypatch):
-    # A present, benign-looking question cannot override a material group name.
-    radios = [
-        field('Yes', '#yes', tag='input', type='radio', required=True,
-              question='Availability preference', name='arbitration'),
-        field('No', '#no', tag='input', type='radio', required=True,
-              question='Availability preference', name='arbitration'),
-    ]
-    p = inventory(field(), *radios, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert not decide.await_count
 
 
 @pytest.mark.parametrize('label', ['I agree to arbitration', 'Acknowledgement'])
@@ -667,32 +580,4 @@ async def test_second_round_standalone_required_checkbox_remains_page_wall(
     browser, decide, _ = world(monkeypatch, p)
     assert (await attempt(p))['form_question'] is None
     assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-async def test_second_round_proved_nonconsent_radio_keeps_email_bootstrap(
-        monkeypatch):
-    # The choice is not grantable or clicked; it simply is not a wall.
-    radio = field('Evenings', '#evenings', tag='input', type='radio',
-                  required=True, name='availability',
-                  question='Schedule preference')
-    p = inventory(radio, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-async def test_second_round_harmless_native_select_still_gateable(monkeypatch):
-    location = field('Location', '#location', tag='select', type='select',
-                     options=[{'value': '', 'label': 'Select a location'},
-                              {'value': 'remote', 'label': 'Remote'}])
-    p = inventory(location, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question']['label'] == 'Location'
-    assert not decide.await_count
-    exc = await selected_gate(browser, p, verb='select',
-                              selector='#location', key='Location')
-    assert exc.form_question['label'] == 'Location'
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)

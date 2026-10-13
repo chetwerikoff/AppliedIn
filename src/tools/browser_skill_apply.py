@@ -434,7 +434,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
       const style = getComputedStyle(n);
       if (!style || style.display === 'none' ||
-          style.visibility === 'hidden' || style.visibility === 'collapse')
+          style.visibility === 'hidden' || style.visibility === 'collapse' ||
+          !(Number(style.opacity) > 0))
         return false;
     }
     return true;
@@ -457,7 +458,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
         formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
-        disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
+        disabled:!!e.disabled || e.matches(':disabled') ||
+          e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
         options:e.options ? Array.from(e.options)
@@ -477,6 +479,37 @@ _MATERIAL_ASSENT = re.compile(
     r'\b(?:agree(?:ment)?|consent|acknowledg|certif|authori[sz]|'
     r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
     r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
+
+
+def _submitter_texts(target: dict) -> tuple[str, ...]:
+    """An input[type=submit] displays its value, even when its name becomes PAGE.label."""
+    if not native_submit(target):
+        return ()
+    texts = [target.get('label', '')]
+    if target.get('tag') == 'input' and target.get('type') == 'submit':
+        texts.append(target.get('value', ''))
+    return tuple(t for t in texts if isinstance(t, str) and t.strip())
+
+
+def _material_select_options(target: dict) -> bool:
+    """Native option values and captions can encode assent behind a bland label."""
+    options = target.get('options')
+    return (target.get('tag') == 'select' and isinstance(options, list)
+            and any(isinstance(o, dict) and any(
+                isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
+                for k in ('value', 'label')) for o in options))
+
+
+def _unrelated_search_form(controls: list[dict]) -> bool:
+    """Ignore only a proven search-only form, not a second plausible application."""
+    searches = [c for c in controls
+                if c.get('tag') == 'input' and c.get('type') == 'search']
+    return (len(searches) == 1 and all(
+        c is searches[0] or
+        (native_submit(c) and any(
+            _same(t, 'Search') or _same(t, 'Search jobs')
+            for t in _submitter_texts(c)))
+        for c in controls))
 
 
 def _inventory_ok(page: dict) -> None:
@@ -558,6 +591,21 @@ def _native_answer(target: dict) -> bool:
             or (target.get('tag') == 'select' and target.get('type') == 'select'))
 
 
+def _require_native_action(target: dict, verb: str) -> None:
+    """Never dispatch fill to a select or select to a text-entry field."""
+    if verb == 'fill':
+        allowed = ((target.get('tag') == 'input' and
+                    target.get('type') in _TEXT_TYPES)
+                   or (target.get('tag') == 'textarea' and
+                       target.get('type') == 'textarea'))
+    elif verb == 'select':
+        allowed = target.get('tag') == 'select' and target.get('type') == 'select'
+    else:
+        return
+    if not allowed:
+        raise Gate('The requested form action does not match this native control.')
+
+
 def _form_subject(page: dict, target: dict) -> list[dict]:
     form = target.get('form_selector')
     if (target.get('in_form') is not True or not isinstance(form, str)
@@ -568,7 +616,9 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
                 if c.get('in_form') and c.get('form_selector') == form]
     if not siblings:
         raise Gate('The native form owner is no longer present.')
-    if any(_ACCOUNT_PURPOSE.search(label(c)) or _LOGIN.search(label(c))
+    if any((_ACCOUNT_PURPOSE.search(label(c)) or _LOGIN.search(label(c))
+            or any(_ACCOUNT_PURPOSE.search(text) or _LOGIN.search(text)
+                   for text in _submitter_texts(c)))
            for c in siblings):
         raise Gate('This field belongs to a sign-in, account or subscription form.')
     if any(c.get('type') == 'password' for c in siblings):
@@ -576,10 +626,12 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
     forms = {c.get('form_selector') for c in page['controls']
              if c.get('in_form') and c.get('form_selector')
              and (c.get('tag') in {'input', 'textarea', 'select'} or c.get('submit'))}
-    if len(forms) > 1:
-        raise Gate('Competing native form purposes require human inspection.')
+    for other in forms - {form}:
+        other_controls = [c for c in page['controls']
+                          if c.get('in_form') and c.get('form_selector') == other]
+        if not _unrelated_search_form(other_controls):
+            raise Gate('Competing native form purposes require human inspection.')
     return siblings
-
 
 def _native_options(target: dict) -> list:
     options = target.get('options')
@@ -613,7 +665,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if _MATERIAL_ASSENT.search(subject):
+    if _MATERIAL_ASSENT.search(subject) or _material_select_options(target):
         raise Gate('Legal or material assent requires direct human review.')
     key = _key(page, target)
     siblings = _form_subject(page, target)
@@ -622,7 +674,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                 or bool(str(target.get('value') or '').strip())):
             raise Gate('This is not a required unanswered field.')
         marked = any(
-            (native_submit(c) and _same_key(c.get('label', '')) in _APP_SUBMIT_LABELS)
+            (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
+                                       for t in _submitter_texts(c)))
             or (c.get('type') == 'file'
                 and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
             for c in siblings)
@@ -648,7 +701,10 @@ def _bootstrap_wall(page: dict, witness: dict) -> None:
         if (c.get('type') == 'password'
                 or (c.get('in_form') and (_ACCOUNT_PURPOSE.search(subject)
                                          or _LOGIN.search(subject)
-                                         or _MATERIAL_ASSENT.search(subject)))):
+                                         or _MATERIAL_ASSENT.search(subject)
+                                         or _material_select_options(c)
+                                         or any(_ACCOUNT_PURPOSE.search(t) or _LOGIN.search(t)
+                                                for t in _submitter_texts(c))))):
             raise Gate('Login or material consent requires human inspection.')
         if c.get('in_form') and c.get('required') and c.get('type') == 'checkbox' \
                 and not c.get('checked'):
@@ -730,8 +786,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         # establishes a safe disclosure identity for the existing grant writer.
         raise Gate('A choice requires direct human action and a human-approved answer.')
     if verb in {'fill', 'select'}:
+        _require_native_action(target, verb)
         observed, witness = await _observe_controls(session, page)
         target = control(observed, action)
+        _require_native_action(target, verb)
         if _identity(target) != _identity(control(page, action)):
             raise Gate('The selected field changed before human authorization.')
         page = observed
@@ -767,6 +825,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         # any witnessed identity/receiver/option change disables all writes.
         latest, latest_witness = await _observe_controls(session, page)
         current = control(latest, action)
+        _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
         fresh_question = _disclosure_question(

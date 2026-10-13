@@ -1636,3 +1636,333 @@ async def test_exact_grant_unmodified_identity_and_receipt_still_write(
         jd_text='', resume_tex='', github='', pk=pk)
     forms.check_approvals(pk, [receipt], observed)
     session.call.assert_awaited_once_with('fill', '#field', '--value', value)
+
+
+_DISCOVERY_UNCHANGED = object()
+
+
+class DiscoveryFakeSession:
+    """Isolated DOM inventories; no browser, daemon, network or owner state."""
+    def __init__(self, current, *, nav_results=None, write_result=_DISCOVERY_UNCHANGED):
+        self.current = current
+        self.nav_results = nav_results or {}
+        self.write_result = write_result
+        self.calls = []
+        self.reads = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def call(self, *args):
+        self.calls.append(args)
+        if args[0] == 'navigate':
+            self.current = self.nav_results.get(args[1], self.current)
+        elif args[0] in {'fill', 'select'}:
+            if self.write_result is not _DISCOVERY_UNCHANGED:
+                self.current = self.write_result
+        else:
+            pytest.fail('Unexpected discovery browser IPC')
+        return {}
+
+    async def page(self):
+        self.reads.append(self.current.get('url', '<missing>')
+                          if isinstance(self.current, dict) else '<invalid>')
+        return self.current
+
+
+def discovery_listing(*links, more=()):
+    seed = 'https://employer.test/careers'
+    return {**page(*links, *more), 'url': seed}
+
+
+def discovery_posting():
+    return target(selector='#job', tag='a', type='a', in_form=False,
+                  label='Senior Data Engineer', href='https://employer.test/jobs/42')
+
+
+@pytest.mark.parametrize('proposed,reason', [
+    ({'action': 'click', 'selector': '#block'}, 'cannot prove this click'),
+    ({'action': 'dance'}, 'Unsupported discovery action'),
+    ({'action': 'navigate', 'url': 'https://foreign.test/jobs/99'},
+     'no proven safe employer route'),
+    ({'action': 'fill', 'selector': '#block', 'value': 'Test User'},
+     'search/filter fields'),
+    ({'action': 'select', 'selector': '#block', 'value': 'one'},
+     'search/filter fields'),
+])
+async def test_discovery_refusal_before_ipc_then_safe_finish(monkeypatch, proposed, reason):
+    seed = 'https://employer.test/careers'
+    current = discovery_listing(discovery_posting(),
+                                target(selector='#block', tag='button',
+                                       type='button', label='Next', in_form=False))
+    session = DiscoveryFakeSession(current)
+    finish = {'action': 'finish', 'report': {'jobs': [
+        {'url': discovery_posting()['href'], 'title': 'Model supplied title'}]}}
+    decide = AsyncMock(side_effect=[proposed, finish])
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    assert (await bsk._crawl(session, 'Find roles', seed))['jobs'] == finish['report']['jobs']
+    assert session.calls == [('navigate', seed)]
+    assert session.reads == [seed]
+    assert decide.await_count == 2
+    history = decide.await_args_list[1].args[2]
+    assert len(history) == 1 and reason in history[0]['reason']
+    assert history[0]['action'] == proposed['action']
+    assert history[0]['page_url'] == seed
+    assert (history[0]['selector'] == proposed.get('selector')
+            and history[0]['url'] == proposed.get('url'))
+    assert decide.await_args_list[1].args[1]['url'] == seed
+
+
+@pytest.mark.parametrize('target_control', [
+    target(selector='#block', tag='button', type='submit', label='Search jobs', submit=True),
+    target(selector='#block', tag='button', type='submit', label='Next', submit=True),
+    target(selector='#block', tag='button', type='button',
+           label='Submit application', submit=False),
+])
+async def test_discovery_submission_control_remains_fatal(monkeypatch, target_control):
+    seed = 'https://employer.test/careers'
+    session = DiscoveryFakeSession(discovery_listing(target_control))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'click', 'selector': '#block'}))
+    with pytest.raises(ValueError, match='submit'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.calls == [('navigate', seed)]
+
+
+@pytest.mark.parametrize('control_count,disabled', [(0, False), (2, False), (1, True)])
+async def test_discovery_control_gate_is_not_a_refusal(monkeypatch, control_count, disabled):
+    seed = 'https://employer.test/careers'
+    controls = [target(selector='#block', tag='button', type='button',
+                       label='Next', disabled=disabled) for _ in range(control_count)]
+    session = DiscoveryFakeSession(discovery_listing(*controls))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'click', 'selector': '#block'}))
+    with pytest.raises(forms.Gate, match='absent, disabled or ambiguous'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.calls == [('navigate', seed)]
+
+
+@pytest.mark.parametrize('action,exception', [
+    ({'action': 'submit'}, ValueError),
+    ({'action': 'gate', 'question': 'Inspect'}, bsk.Unavailable),
+])
+async def test_discovery_literal_submit_and_human_gate_are_fatal(monkeypatch, action, exception):
+    seed = 'https://employer.test/careers'
+    session = DiscoveryFakeSession(discovery_listing())
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value=action))
+    with pytest.raises(exception):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.calls == [('navigate', seed)]
+
+
+async def test_discovery_finish_retains_url_only_provenance_not_title_proof(monkeypatch):
+    seed = 'https://employer.test/careers'
+    navigation = target(selector='#all', tag='a', type='a', in_form=False,
+                        label='All jobs', href=seed + '/all')
+    role = discovery_posting()
+    session = DiscoveryFakeSession(discovery_listing(navigation, role))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    bogus = [{'url': seed, 'title': 'Invented for seed'},
+             {'url': navigation['href'], 'title': 'Invented for navigation'},
+             {'url': role['href'], 'title': 'Model supplied title'},
+             {'url': 'https://foreign.test/jobs/9', 'title': 'Unsafe'},
+             {'url': seed + '/apply', 'title': 'Commit route'}]
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'finish', 'report': {'jobs': bogus}}))
+    assert (await bsk._crawl(session, 'Find roles', seed))['jobs'] == bogus[:3]
+
+
+async def test_discovery_repeated_refusal_fallback_only_unambiguous_title_anchor(monkeypatch):
+    seed = 'https://employer.test/careers'
+    job = discovery_posting()
+    page_controls = [job,
+                     target(selector='#all', tag='a', type='a', in_form=False,
+                            label='All jobs', href=seed + '/all'),
+                     target(selector='#details', tag='a', type='a', in_form=False,
+                            label='View details', href=seed + '/jobs/43'),
+                     target(selector='#blank', tag='a', type='a', in_form=False,
+                            label='', href=seed + '/jobs/44'),
+                     target(selector='#block', tag='button', type='button',
+                            label='Next', in_form=False)]
+    session = DiscoveryFakeSession(discovery_listing(*page_controls))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'click', 'selector': '#block'}] * 2))
+    report = await bsk._crawl(session, 'Find roles', seed)
+    assert report == {'jobs': [{'url': job['href'], 'title': job['label']}],
+                      'note': 'discovery stopped after repeated refused actions'}
+    assert session.calls == [('navigate', seed)]
+    assert session.reads == [seed]
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda c, p: c.update(in_form=True),
+    lambda c, p: c.pop('in_form'),
+    lambda c, p: c.update(in_form='false'),
+    lambda c, p: c.update(in_form=0),
+    lambda c, p: c.update(type='file'),
+    lambda c, p: p.update(inventory_verified=False),
+    lambda c, p: p.update(truncated=True),
+    lambda c, p: c.update(label='View details'),
+    lambda c, p: c.update(label='All Senior Engineer Jobs'),
+])
+async def test_discovery_repeated_refusal_excludes_uncertain_anchor(monkeypatch, mutate):
+    seed = 'https://employer.test/careers'
+    job = discovery_posting()
+    current = discovery_listing(job,
+        target(selector='#block', tag='button', type='button', label='Next', in_form=False))
+    mutate(job, current)
+    session = DiscoveryFakeSession(current)
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'click', 'selector': '#block'}))
+    with pytest.raises(bsk.Unavailable, match='repeated refused'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.calls == [('navigate', seed)]
+
+
+async def test_discovery_repeated_proposal_after_verified_page_change_is_not_false_repeat(monkeypatch):
+    seed = 'https://employer.test/careers'
+    next_page = seed + '/all'
+    block = target(selector='#block', tag='button', type='button', label='Next', in_form=False)
+    link = target(selector='#all', tag='a', type='a', in_form=False,
+                  label='All jobs', href=next_page)
+    first = discovery_listing(block, link, discovery_posting())
+    second = {**discovery_listing(block, discovery_posting()), 'url': next_page}
+    session = DiscoveryFakeSession(first, nav_results={next_page: second})
+    decide = AsyncMock(side_effect=[
+        {'action': 'click', 'selector': '#block'},
+        {'action': 'navigate', 'url': next_page},
+        {'action': 'click', 'selector': '#block'},
+        {'action': 'finish', 'report': {'jobs': []}}])
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    assert (await bsk._crawl(session, 'Find roles', seed))['jobs'] == []
+    assert decide.await_count == 4
+    assert session.calls == [('navigate', seed), ('navigate', next_page)]
+
+
+@pytest.mark.parametrize('with_witness', [False, True])
+async def test_discovery_80_decisions_provide_evidenced_or_explicit_empty(monkeypatch, with_witness):
+    seed = 'https://employer.test/careers'
+    session = DiscoveryFakeSession(discovery_listing(*([discovery_posting()] if with_witness else [])))
+    decide = AsyncMock(return_value={'action': 'wait'})
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+    if with_witness:
+        report = await bsk._crawl(session, 'Find roles', seed)
+        assert report == {'jobs': [{'url': discovery_posting()['href'],
+                                   'title': discovery_posting()['label']}],
+                          'note': 'discovery step limit reached after 80 decisions'}
+    else:
+        with pytest.raises(bsk.Unavailable, match='step limit'):
+            await bsk._crawl(session, 'Find roles', seed)
+    assert decide.await_count == 80
+    assert session.calls == [('navigate', seed)]
+
+
+@pytest.mark.parametrize('decision_number', [1, 80])
+async def test_discovery_redirect_first_foreign_inventory_no_subsequent_read(monkeypatch,
+                                                                                decision_number):
+    seed = 'https://employer.test/careers'
+    allowed = seed + '/all'
+    foreign = {'url': 'https://foreign.test/x', 'text': '', 'controls': []}
+    link = target(selector='#all', tag='a', type='a', in_form=False,
+                  label='All jobs', href=allowed)
+    session = DiscoveryFakeSession(discovery_listing(discovery_posting(), link),
+                                   nav_results={allowed: foreign})
+    proposed = [{'action': 'wait'}] * (decision_number - 1) + [
+        {'action': 'navigate', 'url': allowed}]
+    decide = AsyncMock(side_effect=proposed)
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+    with pytest.raises(ValueError, match='employer or tenant'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert decide.await_count == decision_number
+    assert session.calls == [('navigate', seed), ('navigate', allowed)]
+    assert session.reads.count(foreign['url']) == 1
+    assert session.reads[-1] == foreign['url']
+
+
+async def test_discovery_initial_seed_redirect_stops_first_foreign_read(monkeypatch):
+    seed = 'https://employer.test/careers'
+    foreign = {'url': 'https://foreign.test/', 'text': '', 'controls': []}
+    session = DiscoveryFakeSession(discovery_listing(), nav_results={seed: foreign})
+    decide = AsyncMock()
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    with pytest.raises(ValueError, match='employer or tenant'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.reads == [foreign['url']]
+    assert session.calls == [('navigate', seed)]
+    decide.assert_not_awaited()
+
+
+async def test_discovery_80th_filter_effect_foreign_page_preempts_fallback(monkeypatch):
+    seed = 'https://employer.test/careers'
+    search = target(selector='#search', tag='input', type='search',
+                    label='Search jobs', in_form=False)
+    foreign = {'url': 'https://foreign.test/', 'text': '', 'controls': []}
+    session = DiscoveryFakeSession(discovery_listing(discovery_posting(), search),
+                                   write_result=foreign)
+    decide = AsyncMock(side_effect=[{'action': 'wait'}] * 79 + [
+        {'action': 'fill', 'selector': '#search', 'value': 'data'}])
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(bsk.asyncio, 'sleep', AsyncMock())
+    with pytest.raises(ValueError, match='employer or tenant'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert decide.await_count == 80
+    assert session.calls == [('navigate', seed), ('fill', '#search', '--value', 'data')]
+    assert session.reads.count(foreign['url']) == 1
+    assert session.reads[-1] == foreign['url']
+
+
+@pytest.mark.parametrize('corrupt', [None, {}, {'url': 'https://employer.test/careers',
+                                                'text': GOOD, 'controls': None},
+    {'url': 'https://employer.test/careers', 'text': GOOD, 'controls': [None]}])
+async def test_discovery_malformed_inventory_fatal_despite_prior_witness(monkeypatch, corrupt):
+    seed = 'https://employer.test/careers'
+    search = target(selector='#search', tag='input', type='search',
+                    label='Search jobs', in_form=False)
+    session = DiscoveryFakeSession(discovery_listing(discovery_posting(), search),
+                                   write_result=corrupt)
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'fill', 'selector': '#search', 'value': 'data'},
+        {'action': 'finish', 'report': {'jobs': []}}]))
+    with pytest.raises(bsk.Unavailable, match='invalid discovery inventory'):
+        await bsk._crawl(session, 'Find roles', seed)
+    assert session.calls == [('navigate', seed), ('fill', '#search', '--value', 'data')]
+    assert len(session.reads) == 2
+
+
+@pytest.mark.parametrize('with_witness', [False, True])
+async def test_discovery_run_task_repeat_reports_note_or_explicit_problem(monkeypatch, with_witness):
+    seed = 'https://employer.test/careers'
+    block = target(selector='#block', tag='button', type='button',
+                   label='Next', in_form=False)
+    session = DiscoveryFakeSession(discovery_listing(block, *(
+        [discovery_posting()] if with_witness else [])))
+    monkeypatch.setattr('discovery.progress.cancelled', lambda: False)
+    monkeypatch.setattr(bsk, 'Session', lambda kind: session)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
+        'action': 'click', 'selector': '#block'}))
+    report, problem = await bsk.run_task('Find roles', report_key='jobs', urls=[seed])
+    if with_witness:
+        assert problem == ''
+        assert report == {'jobs': [{'url': discovery_posting()['href'],
+                                   'title': discovery_posting()['label']}],
+                          'note': 'discovery stopped after repeated refused actions'}
+    else:
+        assert report == {} and 'repeated refused' in problem
+    assert session.calls == [('navigate', seed)]

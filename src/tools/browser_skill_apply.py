@@ -447,6 +447,16 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     }
     return true;
   };
+  // PAGE.label can fall back to input.name; choices need actual visible
+  // caption text rather than that non-visible fallback.
+  const visibleText = e => {
+    const labels = Array.from(e.labels || []).filter(visible)
+      .map(n=>n.innerText).join(' ');
+    const aria = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id=>document.getElementById(id)).filter(n=>n && visible(n))
+      .map(n=>n.innerText).join(' ');
+    return clean(labels || aria);
+  };
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   return {url: location.href, controls: Array.from(document.querySelectorAll(query))
@@ -469,6 +479,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
+        visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : []};
     })};
@@ -566,6 +577,10 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
                     or any(original.get(k) != observed.get(k) for k in (
                         'tag', 'type', 'in_form', 'form_selector',
                         'form_action', 'formaction', 'disabled'))
+                    or (original.get('type') in {'radio', 'checkbox'}
+                        and (not isinstance(observed.get('visible_text'), str)
+                             or not observed['visible_text'].strip()
+                             or observed['visible_text'] != original.get('label')))
                     or (original.get('tag') == 'select'
                         and original.get('options') != observed.get('options'))
                     or any(not isinstance(observed.get(k), bool)
@@ -750,7 +765,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         dom = witness.get(member['selector'])
         if (not dom or dom.get('visible') is not True
                 or dom.get('readonly') is True or dom.get('disabled') is True
-                or dom.get('inert') is True or member.get('disabled')):
+                or dom.get('inert') is True or member.get('disabled')
+                or (choice and dom.get('visible_text') != member['label'])):
             raise Gate('This control is not visibly editable.')
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
@@ -783,7 +799,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
     if target.get('type') == 'checkbox':
-        question['visible_text'] = target['label']
+        question['visible_text'] = witness[target['selector']]['visible_text']
     if target.get('type') == 'radio':
         bound = _bound_target(page, target)
         question['radio_name'] = bound['radio_name']

@@ -161,6 +161,7 @@ class CDP:
         self.redirects: list[str] = []
         self.forbidden: list[str] = []
         self.loaded = False
+        self.main_frame_url = ""
         self.deadline = time.monotonic() + 25
 
     def _read(self) -> dict:
@@ -262,8 +263,13 @@ class CDP:
                 self.redirects.append(url)
             if url != self.fixture_url or verb != "GET" or kind != "Document":
                 self.forbidden.append(f"Network observed {verb} {kind} destination")
+        elif method == "Page.frameNavigated" and session == self.page_session:
+            frame = args.get("frame") or {}
+            if not frame.get("parentId"):
+                self.main_frame_url = frame.get("url", "")
         elif method == "Page.loadEventFired" and session == self.page_session:
-            self.loaded = True
+            if self.main_frame_url == self.fixture_url:
+                self.loaded = True
         elif method in {"Inspector.targetCrashed", "Target.targetCrashed"}:
             self.forbidden.append("browser page target crashed")
 
@@ -455,7 +461,11 @@ def _run_chrome(fixture, production_script: str, browser: str):
                     require(bool(cdp.page_session) and cdp.page_target == target
                             and cdp.page_session in cdp.prepared,
                             "page was not intercepted before navigation")
-                    cdp.call("Page.navigate", {"url": url}, cdp.page_session)
+                    cdp.loaded = False
+                    cdp.main_frame_url = ""
+                    navigation = cdp.call("Page.navigate", {"url": url}, cdp.page_session)
+                    require(not navigation.get("errorText"),
+                            "Chrome refused the synthetic fixture navigation")
                     cdp.until_loaded()
                     require(not cdp.forbidden and not cdp.redirects,
                             "forbidden page request, redirect or detached target")

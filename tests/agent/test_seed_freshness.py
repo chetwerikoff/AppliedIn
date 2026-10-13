@@ -247,3 +247,33 @@ def test_save_rejects_unverifiable_conditional_seed_as_unknown_format(_save_offl
     assert "unrecognized" in result["message"].lower()
     assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
     assert set(state) == {"base_latex", "pk"}
+
+
+def test_issue27_within_role_rewording_and_reordering_pass_inherited_guard(_save_offline):
+    """#26 guards roles and total bullets; #27 prompts own factual attribution.
+
+    Both roles retain their own bullet facts but change wording and relevance
+    order, including the older role. A structural guard must permit this; the
+    adjacent refusal regressions already cover an altered date and a loss of
+    base-used bullets before any side effect.
+    """
+    base = _save_doc("\n".join([
+        r"\role{example-co}{Engineer}{2022--2024}",
+        r"\item Maintained Python queue consumers.",
+        r"\item Documented queue retries.",
+        r"\role{example-co-lab}{Technician}{2020--2022}",
+        r"\item Coordinated synthetic QA runs.",
+        r"\item Maintained SQL reporting.",
+    ]))
+    tailored = _save_doc("\n".join([
+        r"\role{example-co}{Engineer}{2022--2024}",
+        r"\item Documented retry behavior for queue consumers.",
+        r"\item Kept Python queue consumers running.",
+        r"\role{example-co-lab}{Technician}{2020--2022}",
+        r"\item Supported SQL reports.",
+        r"\item Coordinated QA execution for synthetic runs.",
+    ]))
+    result, state, effects = _save_offline(base, tailored)
+    assert result["ok"] is True
+    assert state["tailored"] == tailored
+    assert effects == {"make_stores": 1, "render": 1, "artifact": 2, "tracking": 1}

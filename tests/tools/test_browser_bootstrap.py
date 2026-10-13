@@ -52,6 +52,7 @@ def witness(page):
          'form_action': c.get('form_action', ''),
          'formaction': c.get('formaction', ''), 'disabled': c['disabled'],
          'readonly': False, 'inert': False, 'visible': True,
+         'visible_text': c['label'] if c.get('type') in {'radio', 'checkbox'} else '',
          'options': deepcopy(c.get('options', []))}
         for c in page['controls']]}
 
@@ -824,5 +825,29 @@ async def test_bank_only_choice_value_never_becomes_a_grant(monkeypatch, kind):
     assert report['form_question']['label'] == key
     assert row['human_approved_answers'] == {}
     assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+
+@pytest.mark.parametrize('kind', ['checkbox', 'radio'])
+async def test_choice_caption_mismatch_in_dom_witness_gates_without_grant(
+        monkeypatch, kind):
+    if kind == 'checkbox':
+        controls = [field('I agree to privacy policy', '#privacy',
+                          type='checkbox', value='on', has_value=True)]
+    else:
+        controls = [
+            field('Yes', '#yes', type='radio', name='work_auth',
+                  question='Work authorization', value='yes', has_value=True),
+            field('No', '#no', type='radio', name='work_auth',
+                  question='Work authorization', value='no', has_value=True)]
+    page = inventory(*controls, submit())
+    evidence = witness(page)
+    evidence['controls'][0]['visible_text'] = 'Different displayed caption'
+    browser, decide, row = world(monkeypatch, page, result=evidence)
+    report = await attempt(page)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert not decide.await_count
+    assert row['human_approved_answers'] == {}
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)

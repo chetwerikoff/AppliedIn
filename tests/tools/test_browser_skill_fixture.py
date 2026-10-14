@@ -119,13 +119,10 @@ async def test_controller_generated_second_field_gate_after_exactly_one_name_fil
     monkeypatch.setattr(forms.submit_hold, "is_held", _source_denied)
     monkeypatch.setattr("core.events.emit", _source_denied)
     result = await forms.apply(
-        fixture.URL, fixture.COMPANY, {"Name": "Test User",
-                                      "Additional question": "Synthetic answer"},
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
         "synthetic-fixture", pk=fixture.PK, resume_path=authority.resume_path,
         fixture_context=authority)
-    # The exclusive legacy fixture supplies neither full saved provenance
-    # nor the controller's new fixed read-only witness. It must now fail closed;
-    # it cannot be upgraded as evidence for Issue #31's new bootstrap.
+    # A partial legacy grant cannot be upgraded into the current witnessed form path.
     assert result["status"] == "gate" and result["form_question"] is None
     assert authority.fills == 0 and authority.decisions == 1
     assert not any(c[0] in {"fill", "click", "upload", "select", "choose", "evaluate"}
@@ -176,8 +173,10 @@ def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
     def request(method, path, host):
         handler = object.__new__(fixture._FixtureHandler)
         handler.path = path
-        handler.headers = {"Host": host}
+        handler.headers = {"Host": host, "Content-Length": "0"}
+        handler.rfile = io.BytesIO()
         handler.wfile = io.BytesIO()
+        handler.server = SimpleNamespace(synthetic_run=None)
         captured = []
         handler.send_response = lambda status: captured.append(("status", status))
         handler.send_header = lambda key, value: captured.append((key, value))
@@ -198,9 +197,69 @@ def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
         ("PUT", fixture._PATH, "127.0.0.1:18789"),
     ]:
         headers, response = request(method, path, host)
-        assert headers[0][1] in {404, 405}
+        assert headers[0][1] in {400, 404, 405}
         assert not response and not any(key.lower() == "location" for key, _ in headers)
 
+
+def test_loopback_post_requires_every_committed_fact_and_the_staged_pdf(
+        monkeypatch, tmp_path):
+    """A success response is earned only by one exact synthetic multipart POST."""
+    document = tmp_path / "Synthetic-Resume.pdf"
+    document.write_bytes(fixture._RESUME_BYTES)
+    state = fixture._SyntheticRun(str(document))
+    state.enable_positive_fixture()
+    state.uploaded = True
+    state.input_values.update({
+        # The receiver independently checks typed text as well as committed captions.
+        "#name": fixture._FACTS["Name"],
+        "#additional": fixture._FACTS["Additional question"],
+        "#location": fixture._FACTS["Where are you located?"],
+        "#phone-country": fixture._FACTS["What is your phone country?"],
+    })
+    state.committed = {key: (fixture._FACTS[key], value)
+                       for key, value in fixture._MACHINE_VALUES.items()}
+    monkeypatch.setattr(fixture, "_daemon_origin", lambda: True)
+    boundary = b"synthetic-boundary"
+    parts = []
+    for name, value in fixture._POST_FIELDS.items():
+        parts.extend([b"--" + boundary,
+                      f'Content-Disposition: form-data; name="{name}"'.encode(),
+                      b"", value.encode("utf-8")])
+    parts.extend([b"--" + boundary,
+                  b'Content-Disposition: form-data; name="resume"; filename="Synthetic-Resume.pdf"',
+                  b"Content-Type: application/pdf", b"", fixture._RESUME_BYTES,
+                  b"--" + boundary + b"--", b""])
+    body = bytes([13, 10]).join(parts)
+    handler = object.__new__(fixture._FixtureHandler)
+    handler.path = fixture._PATH
+    handler.headers = {
+        "Host": "127.0.0.1:18789",
+        "Content-Length": str(len(body)),
+        "Content-Type": "multipart/form-data; boundary=synthetic-boundary",
+    }
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    handler.server = SimpleNamespace(synthetic_run=state)
+    statuses = []
+    handler.send_response = statuses.append
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    state.input_values["#location"] = "Unapproved Synthetic City"
+    handler.do_POST()
+    assert statuses == [405] and state.post_count == 0
+    state.input_values["#location"] = fixture._FACTS["Where are you located?"]
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    statuses.clear()
+    handler.do_POST()
+    assert statuses == [200]
+    assert b"Thank you for applying" in handler.wfile.getvalue()
+    assert state.post_count == 1 and state.post_payload == fixture._POST_FIELDS
+    handler.rfile = io.BytesIO(body)
+    handler.wfile = io.BytesIO()
+    statuses.clear()
+    handler.do_POST()
+    assert statuses == [405] and not handler.wfile.getvalue()
 
 async def test_real_session_thread_context_and_read_only_connected_path(
         authority, monkeypatch):
@@ -403,12 +462,12 @@ def test_normal_daemon_library_import_and_entry_keep_old_import_boundary(tmp_pat
 
 
 
-def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
+def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
         tmp_path):
-    """Drive the whole CLI -> Session -> controller path with fake BSK transport.
+    """The daemon refuses incomplete offline BSK evidence before any form write.
 
-    sitecustomize is loaded by the new interpreter before __main__ or core.config.
-    No socket is ever created/bound and no real BSK executable is called.
+    sitecustomize runs before daemon imports. Its fake BSK never completes the
+    linked-control witness, and no socket or owner-like file may be reached.
     """
     from textwrap import dedent
 
@@ -617,11 +676,11 @@ def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
     result = subprocess.run(
         [sys.executable, "-m", "daemon", "--synthetic-browser-fixture"],
         cwd=tmp_path, env=env, text=True, capture_output=True, timeout=45)
-    # The old exclusive fixture intentionally denies the NEW fixed evaluate
-    # IPC and carries a legacy five-key grant. The daemon must reject it before
-    # writing, not pretend its earlier positive path proves the new witness.
+    # The offline transport supplies an incomplete inventory, not a false
+    # success receipt; the controller must gate before any mutating operation.
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert '"safe_gate": false' in result.stdout.lower()
+    assert '"submitted": false' in result.stdout.lower()
+    assert '"status": "gate"' in result.stdout.lower()
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
     assert "http_handler_selected" in kinds

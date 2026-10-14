@@ -1,8 +1,8 @@
-"""Exclusive daemon-origin, one-shot synthetic native form proof.
+"""Daemon-exclusive synthetic application form and loopback submission proof.
 
-Not an application API, alternate browser driver, or general fixture framework.
-The caller must be the exact daemon -m entry, before production configuration
-imports. All controller state is disposable and no committing BSK IPC is exposed.
+No alternative browser driver or general fixture framework. The caller must be
+the exact daemon -m entry before production configuration imports. Its closed
+controller edge permits only fixed synthetic fields and one validated loopback POST.
 """
 from __future__ import annotations
 
@@ -19,25 +19,123 @@ from tempfile import TemporaryDirectory
 URL = "http://127.0.0.1:18789/fixture/example-co/job/1"
 _PATH = "/fixture/example-co/job/1"
 PK = "example-co#synthetic-job"
+_RESUME_BYTES = (b"%PDF-1.4" + bytes([10])
+                 + b"% synthetic fixture; never submitted" + bytes([10])
+                 + b"%%EOF" + bytes([10]))
 COMPANY = "example-co"
-_FACTS = {"Name": "Test User", "Additional question": "Synthetic answer"}
-_FORM = ('''<!doctype html><html lang="en"><head><title>Synthetic application</title></head>
-<body><h1>Synthetic role at example-co</h1>
-<p>Offline fixture for a synthetic example-co job. No real person or employer.
-Only the approved Name field may be written. This deliberately repetitive
-synthetic job description helps the ordinary PAGE reader see a complete page.
-This fixture does not ask for a real application, account, login or credentials.
-Only a fake form is presented here; it is not associated with any live ATS.
-Reviewing the page reveals exactly two native text controls and a native Submit.
-The browser controller is expected to stop before any unapproved disclosure.
-No external links, cross-origin resources or redirects are provided.</p>
-<form id="synthetic-form" method="POST"
-  action="http://127.0.0.1:18789/fixture/example-co/job/1">
-<label for="name">Name</label><input id="name" name="name" type="text">
-<label for="additional">Additional question</label>
-<textarea id="additional" name="additional"></textarea>
-<button id="submit" type="submit">Submit application</button>
-</form></body></html>''').encode("utf-8")
+_FACTS = {
+    "Name": "Test User",
+    "Additional question": "Synthetic answer",
+    "Where are you located?": "Synthetic Example City",
+    "What is your phone country?": "Example Country",
+    "Are you authorized to work?": "Yes",
+}
+_MACHINE_VALUES = {
+    "Where are you located?": "SYNTHETIC_CITY",
+    "What is your phone country?": "EX",
+    "Are you authorized to work?": "yes",
+}
+_POST_FIELDS = {
+    "name": _FACTS["Name"],
+    "additional": _FACTS["Additional question"],
+    "location": _FACTS["Where are you located?"],
+    "location_value": _MACHINE_VALUES["Where are you located?"],
+    "phone_country": _FACTS["What is your phone country?"],
+    "phone_country_value": _MACHINE_VALUES["What is your phone country?"],
+    "work_authorization": _FACTS["Are you authorized to work?"],
+    "work_authorization_value": _MACHINE_VALUES["Are you authorized to work?"],
+}
+_OPTION_SELECTORS = {
+    "#location-option-city": "Where are you located?",
+    "#phone-country-option-example": "What is your phone country?",
+    "#work-authorization-option-yes": "Are you authorized to work?",
+}
+_FORM = ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Synthetic application</title>
+<style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
+</head><body><h1>Synthetic role at example-co</h1>
+<p>Offline fixture for synthetic example-co facts only. No real person or employer.
+This form is served only by the daemon's --synthetic-browser-fixture mode.
+It has no external links, cross-origin resources, redirects or real ATS connection.</p>
+<form id="synthetic-form" method="POST" enctype="multipart/form-data"
+ action="http://127.0.0.1:18789/fixture/example-co/job/1">
+<div class="form-group"><label for="name">Name</label>
+<input id="name" name="name" type="text"></div>
+<div class="form-group"><label for="additional">Additional question</label>
+<textarea id="additional" name="additional"></textarea></div>
+<div class="form-group"><label for="resume">Résumé</label>
+<input id="resume" name="resume" type="file" required></div>
+<div class="form-group"><div id="location-question" data-automation-id="formLabel">
+Where are you located?</div>
+<input id="location" name="location" type="text" role="combobox"
+ aria-labelledby="location-question" aria-controls="location-options"
+ aria-autocomplete="list" aria-expanded="false" aria-required="true"
+ data-value-input="location-code">
+<input id="location-code" name="location_value" type="hidden"></div>
+<div id="location-options" role="listbox" hidden>
+<div id="location-option-city" role="option" data-value="SYNTHETIC_CITY"
+ aria-selected="false">Synthetic Example City</div>
+<div id="location-option-other" role="option" data-value="OTHER_CITY"
+ aria-selected="false">Other Synthetic City</div></div>
+<div class="form-group"><div id="phone-country-question" data-automation-id="formLabel">
+What is your phone country?</div>
+<input id="phone-country" name="phone_country" type="text" role="combobox"
+ aria-labelledby="phone-country-question" aria-controls="phone-country-options"
+ aria-autocomplete="list" aria-expanded="false" aria-required="true"
+ data-value-input="phone-country-code">
+<input id="phone-country-code" name="phone_country_value" type="hidden"></div>
+<div id="phone-country-options" role="listbox" hidden>
+<div id="phone-country-option-example" role="option" data-value="EX"
+ aria-selected="false">Example Country</div>
+<div id="phone-country-option-other" role="option" data-value="OT"
+ aria-selected="false">Other Synthetic Country</div></div>
+<div class="form-group"><div id="work-authorization-question" data-automation-id="formLabel">
+Are you authorized to work?</div>
+<div id="work-authorization" role="combobox" tabindex="0"
+ aria-labelledby="work-authorization-question"
+ aria-controls="work-authorization-options" aria-expanded="false"
+ aria-required="true" data-value-input="work-authorization-code">Choose an answer</div>
+<input id="work-authorization-code" name="work_authorization_value" type="hidden">
+</div>
+<div id="work-authorization-options" role="listbox" hidden>
+<div id="work-authorization-option-yes" role="option" data-value="yes"
+ aria-selected="false">Yes</div>
+<div id="work-authorization-option-no" role="option" data-value="no"
+ aria-selected="false">No</div></div>
+<button id="submit" type="submit">Submit application</button></form>
+<script>
+function bindPicker(comboId,listId,asyncFilter){
+ const combo=document.getElementById(comboId), list=document.getElementById(listId);
+ const options=Array.from(list.querySelectorAll('[role="option"]'));
+ const show=()=>{list.hidden=false;combo.setAttribute('aria-expanded','true');};
+ combo.addEventListener('click',show);
+ if(combo.tagName==='INPUT'){
+  combo.addEventListener('focus',show);
+  combo.addEventListener('input',()=>{
+   list.hidden=true;
+   const update=()=>{
+    const needle=combo.value.trim().toLowerCase();
+    options.forEach(o=>{o.hidden=!!needle&&!o.innerText.toLowerCase().includes(needle)});
+    show();
+   };
+   if(asyncFilter)window.setTimeout(update,60);else update();
+  });
+ }
+ options.forEach(option=>option.addEventListener('click',()=>{
+  const caption=option.innerText.trim(), value=option.getAttribute('data-value');
+  if(combo.tagName==='INPUT')combo.value=caption;else combo.innerText=caption;
+  combo.setAttribute('aria-valuetext',caption);
+  combo.setAttribute('data-selected-label',caption);
+  combo.setAttribute('data-selected-value',value);
+  options.forEach(o=>o.setAttribute('aria-selected',String(o===option)));
+  document.getElementById(combo.getAttribute('data-value-input')).value=value;
+  list.hidden=true;combo.setAttribute('aria-expanded','false');
+ }));
+}
+bindPicker('location','location-options',true);
+bindPicker('phone-country','phone-country-options',false);
+bindPicker('work-authorization','work-authorization-options',false);
+</script></body></html>''').encode("utf-8")
 
 # This context carries ONLY a one-shot object minted in run(). It is not a flag,
 # user input, serialized token, request parameter or globally installed patch.
@@ -76,8 +174,9 @@ _ORIGIN = object()
 
 class _SyntheticRun:
     __slots__ = ("_origin", "resume_path", "row", "events", "hold", "fills",
-                 "navigations", "decisions", "status_writes")
-
+                 "navigations", "decisions", "status_writes", "positive",
+                 "ipc_index", "open_controls", "input_values", "committed",
+                 "post_count", "post_payload", "submit_ipc", "uploaded")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -96,7 +195,71 @@ class _SyntheticRun:
         self.navigations = 0
         self.decisions = 0
         self.status_writes = []
+        self.positive = False
+        self.ipc_index = 0
+        self.open_controls = set()
+        self.input_values = {}
+        self.committed = {}
+        self.post_count = 0
+        self.post_payload = None
+        self.submit_ipc = 0
+        self.uploaded = False
 
+    def enable_positive_fixture(self) -> None:
+        self.positive = True
+        specs = {
+            "Name": ("#name", "Name", "", "input", "text"),
+            "Additional question": ("#additional", "Additional question", "",
+                                    "textarea", "textarea"),
+            "Where are you located?": ("#location", "Where are you located?",
+                                        "Where are you located?", "input", "combobox"),
+            "What is your phone country?": ("#phone-country",
+                "What is your phone country?", "What is your phone country?",
+                "input", "combobox"),
+            "Are you authorized to work?": ("#work-authorization",
+                "Are you authorized to work?", "Are you authorized to work?",
+                "div", "combobox"),
+        }
+        for key, (selector, label, question, tag, typ) in specs.items():
+            self.row["human_approved_answers"][key] = {
+                "value": _FACTS[key], "selector": selector, "label": label,
+                "question": question, "url": URL, "tag": tag, "type": typ,
+                "form_selector": "#synthetic-form", "form_action": URL,
+            }
+
+    def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
+        return (
+            ("fill", "#name", "--value", _FACTS["Name"]),
+            ("fill", "#additional", "--value", _FACTS["Additional question"]),
+            ("click", "#location"),
+            ("fill", "#location", "--value", _FACTS["Where are you located?"]),
+            ("click", "#location-option-city"),
+            ("click", "#phone-country"),
+            ("fill", "#phone-country", "--value", _FACTS["What is your phone country?"]),
+            ("click", "#phone-country-option-example"),
+            ("click", "#work-authorization"),
+            ("click", "#work-authorization-option-yes"),
+            ("upload", "#resume", "--file", self.resume_path),
+            ("click", "#submit"),
+        )
+
+    def record_post(self, payload: dict[str, str], *, resume_name: str,
+                    resume_bytes: bytes) -> bool:
+        expected_commits = {key: (_FACTS[key], value)
+                             for key, value in _MACHINE_VALUES.items()}
+        if (not self.positive or not self.uploaded or self._origin is not _ORIGIN
+                or not _daemon_origin() or self.post_count or payload != _POST_FIELDS
+                or self.committed != expected_commits
+                or self.input_values.get("#name") != _FACTS["Name"]
+                or self.input_values.get("#additional") != _FACTS["Additional question"]
+                or self.input_values.get("#location") != _FACTS["Where are you located?"]
+                or self.input_values.get("#phone-country") != _FACTS["What is your phone country?"]
+                or resume_name != "Synthetic-Resume.pdf"
+                or resume_bytes != _RESUME_BYTES):
+            return False
+        self.post_count = 1
+        self.post_payload = dict(payload)
+        return True
     def matches(self, *, url: str, company: str, pk: str, facts: dict,
                 model: str, resume_path: str) -> bool:
         return (authorized(self, pk=pk, company=company, url=url)
@@ -128,11 +291,18 @@ class _SyntheticRun:
         self.events.append({"kind": kind, "pk": details.get("pk")})
 
     async def decision(self, task: str, page: dict, history: list, *, model: str):
-        # The second fact exists. The *controller* must reject its missing exact
-        # approval, not a fabricated model Gate or an earlier missing-fact Gate.
         actions = (
             {"action": "fill", "selector": "#name", "fact": "Name"},
-            {"action": "fill", "selector": "#additional", "fact": "Additional question"},
+            {"action": "fill", "selector": "#additional",
+             "fact": "Additional question"},
+            {"action": "combobox", "selector": "#location",
+             "fact": "Where are you located?"},
+            {"action": "combobox", "selector": "#phone-country",
+             "fact": "What is your phone country?"},
+            {"action": "combobox", "selector": "#work-authorization",
+             "fact": "Are you authorized to work?"},
+            {"action": "upload", "selector": "#resume"},
+            {"action": "submit", "selector": "#submit"},
         )
         if model != "synthetic-fixture" or self.decisions >= len(actions):
             raise ValueError("Synthetic decision sequence exhausted; rerun fixture.")
@@ -156,7 +326,7 @@ class _SyntheticRun:
         self.status_writes.append(value)
 
     def facade(self, raw):
-        """A closed, tiny edge. The controller never receives the raw Session."""
+        """A closed edge exposing only the original controller's exact fixture path."""
         state = self
 
         class _Closed:
@@ -176,21 +346,75 @@ class _SyntheticRun:
             async def page(self):
                 if not state.navigations or not authorized(state):
                     raise PermissionError("Fixture cannot inspect another session.")
-                # Only the existing raw Session's evaluate(PAGE) is permitted.
                 observed = await raw.page()
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture page escaped the fixed job URL.")
                 return observed
 
             async def call(self, *args, **kwargs):
-                if (args != ("fill", "#name", "--value", "Test User")
-                        or kwargs or not state.navigations or state.fills
-                        or not authorized(state, pk=PK, url=URL)):
-                    # Every click (including Submit/Continue), upload, select,
-                    # choose, evaluate/JS and second/wrong fill stops BEFORE IPC.
+                if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")
-                state.fills += 1
-                return await raw.call(*args)
+                if state.positive and args and args[0] == "evaluate":
+                    from tools.browser_skill_apply import _FIXED_CONTROL_WITNESS
+                    if args != ("evaluate", _FIXED_CONTROL_WITNESS) or kwargs:
+                        raise PermissionError("Fixture denies this browser operation.")
+                    return await raw.call(*args)
+                if not state.positive:
+                    if (args != ("fill", "#name", "--value", "Test User")
+                            or kwargs or state.fills):
+                        raise PermissionError("Fixture denies this browser operation.")
+                    state.fills += 1
+                    return await raw.call(*args)
+                sequence = state._positive_ipc()
+                if (state.ipc_index >= len(sequence) or args != sequence[state.ipc_index]
+                        or (args[0] == "upload" and kwargs != {"timeout": 130})
+                        or (args[0] != "upload" and kwargs)):
+                    raise PermissionError("Fixture denies this browser operation.")
+                if args[0] == "upload" and (
+                        args[3] != state.resume_path
+                        or Path(state.resume_path).read_bytes() != _RESUME_BYTES):
+                    raise PermissionError("Fixture attachment is not the staged synthetic PDF.")
+                if args[0] == "click" and args[1] in _OPTION_SELECTORS:
+                    key = _OPTION_SELECTORS[args[1]]
+                    selector = {
+                        "Where are you located?": "#location",
+                        "What is your phone country?": "#phone-country",
+                        "Are you authorized to work?": "#work-authorization",
+                    }[key]
+                    if selector not in state.open_controls:
+                        raise PermissionError("Fixture option was not opened by its combobox.")
+                    if selector != "#work-authorization" and state.input_values.get(selector) != _FACTS[key]:
+                        raise PermissionError("Fixture filter did not equal its approved fact.")
+                if args == ("click", "#submit"):
+                    expected_commits = {key: (_FACTS[key], value)
+                                         for key, value in _MACHINE_VALUES.items()}
+                    if (not state.hold or not state.uploaded
+                            or state.committed != expected_commits
+                            or state.input_values.get("#name") != _FACTS["Name"]
+                            or state.input_values.get("#additional")
+                               != _FACTS["Additional question"]):
+                        raise PermissionError("Fixture submit lacks exact committed synthetic facts.")
+                await raw.call(*args, **kwargs)
+                state.ipc_index += 1
+                if args[0] == "fill":
+                    state.fills += 1
+                    state.input_values[args[1]] = args[3]
+                elif args[0] == "upload":
+                    state.uploaded = True
+                elif args[0] == "click" and args[1] in {
+                        "#location", "#phone-country", "#work-authorization"}:
+                    state.open_controls.add(args[1])
+                elif args[0] == "click" and args[1] in _OPTION_SELECTORS:
+                    key = _OPTION_SELECTORS[args[1]]
+                    selector = {
+                        "Where are you located?": "#location",
+                        "What is your phone country?": "#phone-country",
+                        "Are you authorized to work?": "#work-authorization",
+                    }[key]
+                    state.open_controls.discard(selector)
+                    state.committed[key] = (_FACTS[key], _MACHINE_VALUES[key])
+                elif args == ("click", "#submit"):
+                    state.submit_ipc += 1
 
         return _Closed()
 
@@ -207,14 +431,57 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(_FORM)))
         self.end_headers()
         self.wfile.write(_FORM)
 
     def do_POST(self) -> None:
-        self._reject(405)
+        if (self.path != _PATH or self.headers.get("Host") != "127.0.0.1:18789"):
+            self._reject()
+            return
+        state = getattr(getattr(self, "server", None), "synthetic_run", None)
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not content_type.lower().startswith("multipart/form-data;") or not 0 < length <= 16384:
+                raise ValueError("Invalid synthetic form encoding")
+            body = self.rfile.read(length)
+            from email import policy
+            from email.parser import BytesParser
+            envelope = (b"Content-Type: " + content_type.encode("ascii")
+                        + bytes([13, 10]) + b"MIME-Version: 1.0" + bytes([13, 10, 13, 10]))
+            message = BytesParser(policy=policy.default).parsebytes(envelope + body)
+            if not message.is_multipart():
+                raise ValueError("Synthetic POST is not multipart")
+            payload, resume_name, resume_bytes = {}, "", b""
+            for part in message.iter_parts():
+                if part.get_content_disposition() != "form-data":
+                    raise ValueError("Invalid multipart field")
+                name = part.get_param("name", header="content-disposition")
+                value = part.get_payload(decode=True) or b""
+                if name == "resume" and not resume_name:
+                    resume_name = part.get_filename() or ""
+                    resume_bytes = value
+                elif isinstance(name, str) and name not in payload:
+                    payload[name] = value.decode("utf-8", errors="strict")
+                else:
+                    raise ValueError("Duplicate synthetic form field")
+        except (ValueError, UnicodeDecodeError, LookupError):
+            self._reject(400)
+            return
+        if type(state) is not _SyntheticRun or not state.record_post(
+                payload, resume_name=resume_name, resume_bytes=resume_bytes):
+            self._reject(405)
+            return
+        response = b"<h1>Thank you for applying</h1>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
 
     do_HEAD = do_POST
     do_PUT = do_POST
@@ -223,7 +490,6 @@ class _FixtureHandler(BaseHTTPRequestHandler):
     do_OPTIONS = do_POST
     do_CONNECT = do_POST
     do_TRACE = do_POST
-
     def log_message(self, *args) -> None:
         pass  # Never log request headers, URLs or session data.
 
@@ -241,8 +507,10 @@ def run() -> int:
         try:
             with TemporaryDirectory(prefix="appliedin-synthetic-fixture-") as root:
                 document = Path(root) / "Synthetic-Resume.pdf"
-                document.write_bytes(b"%PDF-1.4\n% synthetic fixture; never submitted\n%%EOF\n")
+                document.write_bytes(_RESUME_BYTES)
                 state = _SyntheticRun(str(document))
+                state.enable_positive_fixture()
+                server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
                 try:
                     # Imports only AFTER daemon sanitized its environment. The
@@ -253,11 +521,18 @@ def run() -> int:
                         resume_path=state.resume_path, fixture_context=state))
                 finally:
                     _SESSION_ENTRY.reset(token)
-                ok = (result.get("status") == "gate"
-                      and (result.get("form_question") or {}).get("selector") == "#additional"
-                      and state.fills == 1 and state.decisions == 2)
-                print(json.dumps({"fixture": "native-form", "safe_gate": ok,
-                                  "status": result.get("status")}))
+                expected_commits = {key: (_FACTS[key], value)
+                                     for key, value in _MACHINE_VALUES.items()}
+                ok = (result.get("status") == "applied"
+                      and state.fills == 4 and state.decisions == 7
+                      and state.committed == expected_commits
+                      and state.uploaded and state.submit_ipc == 1
+                      and state.post_count == 1
+                      and state.post_payload == _POST_FIELDS)
+                print(json.dumps({"fixture": "native-form", "submitted": ok,
+                                  "status": result.get("status"),
+                                  "comboboxes": len(state.committed),
+                                  "post_received": state.post_count == 1}))
                 return 0 if ok else 1
         finally:
             server.shutdown()

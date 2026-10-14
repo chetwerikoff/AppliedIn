@@ -154,6 +154,7 @@ class CDP:
         self.prepared: set[str] = set()
         self.discovered: dict[str, str] = {}
         self.intercepted_targets: set[str] = set()
+        self.background_sessions: set[str] = set()
         self.page_session: str | None = None
         self.page_target: str | None = None
         self.fetch: list[tuple[str, str, str]] = []
@@ -202,9 +203,11 @@ class CDP:
 
     def _prepare(self, session: str, target_type: str, waiting: bool, target: str):
         require(target_type in {"page", "iframe", "worker", "shared_worker",
-                                "service_worker"},
+                                "service_worker", "background_page"},
                 f"unverifiable child target type {target_type}")
         require(session not in self.prepared, "duplicate CDP child-target session")
+        if target_type == "background_page":
+            self.background_sessions.add(session)
         # Both domains must ACK *before* target release or first navigation.
         self.call("Network.enable", session=session)
         self.call("Fetch.enable", {"patterns": [{"urlPattern": "*",
@@ -234,7 +237,8 @@ class CDP:
         if method == "Target.targetCreated":
             info = args.get("targetInfo") or {}
             if info.get("type") in {"page", "iframe", "worker",
-                                    "shared_worker", "service_worker"}:
+                                    "shared_worker", "service_worker",
+                                    "background_page"}:
                 self.discovered[info.get("targetId", "")] = info["type"]
         elif method == "Target.attachedToTarget":
             info = args.get("targetInfo") or {}
@@ -248,7 +252,8 @@ class CDP:
             url, verb = req.get("url", ""), req.get("method", "")
             kind = args.get("resourceType", "")
             self.fetch.append((url, verb, kind))
-            if url == self.fixture_url and verb == "GET" and kind == "Document":
+            if (session not in self.background_sessions and url == self.fixture_url
+                    and verb == "GET" and kind == "Document"):
                 self.call("Fetch.continueRequest", {"requestId": args["requestId"]}, session)
             else:
                 self.forbidden.append(f"Fetch rejected {verb} {kind} destination {url[:200]!r}")
@@ -261,7 +266,8 @@ class CDP:
             self.network.append((url, verb, kind))
             if args.get("redirectResponse") is not None:
                 self.redirects.append(url[:200])
-            if url != self.fixture_url or verb != "GET" or kind != "Document":
+            if (session in self.background_sessions or url != self.fixture_url
+                    or verb != "GET" or kind != "Document"):
                 self.forbidden.append(f"Network observed {verb} {kind} destination {url[:200]!r}")
         elif method == "Page.frameNavigated" and session == self.page_session:
             frame = args.get("frame") or {}
@@ -423,6 +429,7 @@ def _run_chrome(fixture, production_script: str, browser: str):
 
                 command = [browser, "--headless=new", "--no-sandbox",
                     "--disable-background-networking", "--disable-extensions",
+                    "--disable-component-extensions-with-background-pages",
                     "--disable-component-update", "--disable-sync",
                     "--no-first-run", "--no-default-browser-check",
                     "--no-proxy-server", "--disable-gpu", "--disable-breakpad",
@@ -475,7 +482,8 @@ def _run_chrome(fixture, production_script: str, browser: str):
                     witness = cdp.evaluate(production_script)
                     # An extra protocol round-trip pumps pending request/target events.
                     active = cdp.call("Target.getTargets").get("targetInfos", [])
-                    types = {"page", "iframe", "worker", "shared_worker", "service_worker"}
+                    types = {"page", "iframe", "worker", "shared_worker",
+                             "service_worker", "background_page"}
                     require(isinstance(active, list) and all(
                         info.get("targetId") in cdp.intercepted_targets
                         for info in active if info.get("type") in types),

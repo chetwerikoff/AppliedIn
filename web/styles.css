@@ -1082,6 +1082,23 @@ table.data tbody tr:hover { background: var(--card-2); }
 .t-co { font-weight: 600; white-space: nowrap; }
 .applications-table .t-co { overflow: hidden; text-overflow: ellipsis; }
 .applications-table td, .applications-table th { padding-left: 10px; padding-right: 10px; }
+.applications-table .app-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.applications-table .app-sort:hover,
+.applications-table th[aria-sort] .app-sort { color: var(--fg); }
+.applications-table .app-sort-arrow { font-size: 13px; letter-spacing: 0; }
 .applications-table .t-applied { color: var(--muted); }
 .applications-table .rowlk { padding-left: 4px; padding-right: 4px; }
 .applications-table .t-links { gap: 3px; }

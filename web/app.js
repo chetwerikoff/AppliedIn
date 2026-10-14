@@ -2150,6 +2150,7 @@ function sortApplications(rows, key, direction) {
 }
 function chooseAppsSort(key) {
   if (!APPS_SORT_KEYS.includes(key)) return;
+  const headerHadFocus = document.activeElement?.dataset?.appSort === key;
   const direction = state.appsSort?.key === key
     ? (state.appsSort.direction === "asc" ? "desc" : "asc")
     : (["status", "company", "role"].includes(key) ? "asc" : "desc");
@@ -2157,6 +2158,9 @@ function chooseAppsSort(key) {
   localSet(APPS_SORT_KEY, JSON.stringify(state.appsSort));
   delete state.page.appsTable;
   renderPane();
+  if (headerHadFocus) {
+    $(`.applications-table [data-app-sort="${key}"]`)?.focus({ preventScroll: true });
+  }
 }
 function appsSortHead(key, label) {
   const active = state.appsSort?.key === key;

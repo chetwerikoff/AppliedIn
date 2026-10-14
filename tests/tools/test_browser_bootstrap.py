@@ -132,6 +132,23 @@ async def attempt(current, *, facts=None):
                              pk=PK, resume_path='Resume.pdf')
 
 
+async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monkeypatch):
+    url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+
+    def unavailable_row(*args, **kwargs):
+        raise OSError('tracking unavailable')
+
+    # The cross-tenant gate must not depend on tracking storage being reachable.
+    monkeypatch.setattr(forms, '_row', unavailable_row)
+    monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
+        'Cross-tenant direct board must be rejected before browser open'))
+    result = await forms.apply(url, 'example-co', {}, 'synthetic',
+                               pk=PK, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'Derived board tenant or job' in result['question']
+
+
 @pytest.mark.parametrize('extra,selected', [
     ({}, '#email'),
     ({'type': 'tel'}, '#email'),
@@ -1512,3 +1529,707 @@ async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
         'question': '', 'selector': '#country', 'url': URL, 'tag': tag,
         'type': 'combobox', 'form_selector': '#application', 'form_action': URL}
     assert [call[0] for call in browser.calls] == ['evaluate']
+
+
+@pytest.mark.parametrize('ats,canonical,target,status', [
+    ('teamtailor', 'https://example-co.teamtailor.com/jobs/backend-123',
+     'https://careers.example-co.test/jobs/backend-123', 301),
+    ('recruitee', 'https://example-co.recruitee.com/o/backend-123',
+     'https://careers.example-co.test/o/backend-123', 302),
+])
+async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_witness(
+        monkeypatch, ats, canonical, target, status):
+    import httpx
+    from core.ids import make_pk
+    from agent import run
+
+    pk = make_pk('example-co', 'backend-123')
+    page = inventory(field(form_action=target), submit(form_action=target), url=target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(pk=pk, company='example-co', job_id='backend-123', ats=ats,
+               jd_url=canonical, status='submitting')
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    calls = []
+
+    def response(request):
+        calls.append(request)
+        assert str(request.url) == canonical
+        return httpx.Response(status, headers={'Location': target}, request=request)
+
+    async_client = httpx.AsyncClient
+    def client_factory(**kwargs):
+        assert kwargs['follow_redirects'] is False
+        return async_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
+    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kwargs: None)
+    result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+
+    assert result['status'] == 'gate', result
+    question = result['form_question']
+    assert question['verified_redirect_url'] == target
+    assert question['origin_row'] == {
+        'jd_url': canonical, 'company': 'example-co', 'ats': ats,
+        'pk': pk, 'job_id': 'backend-123'}
+    assert len(calls) == 1
+    assert browser.calls[0] == ('navigate', target)
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+    row.update(status='needs_human', gate_source='applier', gate_call_id='direct',
+               gate_pending={'form_question': question})
+    assert run._direct_form_label(pk, row) == question['label']
+    tampered = deepcopy(question)
+    tampered['verified_redirect_url'] = 'https://careers.other.test/jobs/backend-123'
+    row['gate_pending'] = {'form_question': tampered}
+    assert run._direct_form_label(pk, row) is None
+    tampered = deepcopy(question)
+    tampered['form_action'] = 'https://careers.other.test/jobs/backend-123'
+    row['gate_pending'] = {'form_question': tampered}
+    assert run._direct_form_label(pk, row) is None
+    row['gate_pending'] = {'form_question': question}
+
+    class Tracking:
+        def get(self, _pk):
+            return deepcopy(row)
+
+        def set_status(self, _pk, status, **changes):
+            row.update(status=status, **changes)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(),
+        answer_bank=SimpleNamespace(put=lambda *args, **kwargs: None))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
+    monkeypatch.setattr(run, '_enqueue_apply', lambda *args, **kwargs: {'result': 'queued'})
+    assert run.resume_job(pk, 'approved synthetic answer', stores)['result'] == 'queued'
+    assert row['human_approved_answers'][question['label']][
+        'verified_redirect_url'] == target
+
+
+
+@pytest.mark.parametrize('location', [
+    'https://careers.example-co.test/jobs/backend-123#fragment',
+    'https://careers.example-co.test/jobs/backend-123#',
+    'https://careers.example-co.test/jobs/backend-123\t',
+    'https://careers.example-co.test/jobs/backend-123\n',
+    'https://careers.example-co.test/jobs/backend-123?',
+    'https://careers.example-co.test: /jobs/backend-123',
+    'https://careers.example-co.test:/jobs/backend-123',
+    'https://careers.example-co.test:443/jobs/backend-123',
+    'https://careers.example-co.test./jobs/backend-123',
+    'https://LOCALHOST/jobs/backend-123',
+    'https://localhost/jobs/backend-123',
+    'https://careers.local/jobs/backend-123',
+    'https://careers.localhost/jobs/backend-123',
+    'https://0177.0.0.1/jobs/backend-123',
+    'https://127.1/jobs/backend-123',
+    'https://2130706433/jobs/backend-123',
+    'https://127.0.0.1/jobs/backend-123',
+    'https://user@careers.example-co.test/jobs/backend-123',
+    'http://careers.example-co.test/jobs/backend-123',
+    'https://careers.example-co.test/jobs/backend-123?extra=1',
+    'https://careers.example-co.test/jobs/other',
+    r'https://careers.example-co.test/jobs\backend-123',
+    'https://careers%2Eexample-co.test/jobs/backend-123',
+    'https://Careers.example-co.test/jobs/backend-123',
+    'https://other-co.teamtailor.com/jobs/backend-123',
+    'https://other-co.recruitee.com/o/backend-123',
+])
+def test_vendor_location_is_raw_exact_dns_and_job_scoped(location):
+    assert not forms._literal_redirect_target(
+        'https://example-co.teamtailor.com/jobs/backend-123', location)
+
+
+def test_redirect_navigation_rejects_return_to_vendor_and_other_custom_host():
+    row = {'pk': 'example-co#backend-123', 'company': 'example-co',
+           'job_id': 'backend-123', 'ats': 'teamtailor',
+           'jd_url': 'https://example-co.teamtailor.com/jobs/backend-123'}
+    proven = forms.redirect_provenance(
+        row, row['pk'], 'https://careers.example-co.test/jobs/backend-123')
+    assert proven is not None
+    assert forms.navigation_allowed(proven.target_url, provenance=proven)
+    assert not forms.navigation_allowed(row['jd_url'], provenance=proven)
+    assert not forms.navigation_allowed(
+        'https://careers.other.test/jobs/backend-123', provenance=proven)
+    assert forms.navigation_allowed(
+        'https://careers.example-co.test/jobs/backend-123/step', provenance=proven)
+    assert not forms.navigation_allowed(
+        proven.target_url + r'/..\other', provenance=proven)
+    assert not forms.navigation_allowed(
+        'https://careers.example-co.test/jobs/backend-123' + chr(9),
+        provenance=proven)
+
+@pytest.mark.parametrize('observed_url', [
+    'https://example-co.teamtailor.com/jobs/backend-123',
+    'https://careers.other.test/jobs/backend-123',
+    'https://careers.example-co.test/jobs/backend-123/step',
+    r'https://careers.example-co.test/jobs/backend-123/..\other',
+])
+async def test_vendor_initial_page_must_equal_exact_redirect_target(
+        monkeypatch, observed_url):
+    import httpx
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    page = inventory(field(form_action=target), submit(form_action=target),
+                     url=observed_url)
+    browser, _, row = world(monkeypatch, page)
+    row.update(pk=pk, company='example-co', job_id='backend-123',
+               ats='teamtailor', jd_url=canonical)
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    async_client = httpx.AsyncClient
+    def client_factory(**kwargs):
+        return async_client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                301, headers={'Location': target}, request=request)), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'Initial page did not match the exact vendor-verified target' in result['question']
+    assert browser.calls == [('navigate', target)]
+    if observed_url.endswith('/step'):
+        proven = forms.redirect_provenance(row, pk, target)
+        assert forms.navigation_allowed(observed_url, provenance=proven)
+@pytest.mark.parametrize('status,locations', [
+    (200, [('Location', 'https://careers.example-co.test/jobs/backend-123')]),
+    (307, [('Location', 'https://careers.example-co.test/jobs/backend-123')]),
+    (301, []),
+    (302, [('Location', 'https://careers.example-co.test/jobs/backend-123'),
+           ('Location', 'https://careers.example-co.test/jobs/backend-123')]),
+    (301, [('Location', 'https://careers.example-co.test/jobs/other')]),
+    (301, [('Location', ' https://careers.example-co.test/jobs/backend-123')]),
+    (None, []),
+])
+async def test_vendor_redirect_rejections_gate_before_browser(
+        monkeypatch, status, locations):
+    import httpx
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    browser, _, row = world(monkeypatch, inventory(field(), submit()))
+    row.update(pk=pk, company='example-co', job_id='backend-123',
+               ats='teamtailor', jd_url=canonical)
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    requests = []
+
+    def response(request):
+        requests.append(request)
+        if status is None:
+            raise httpx.ConnectError('synthetic network failure', request=request)
+        return httpx.Response(status, headers=locations, request=request)
+    async_client = httpx.AsyncClient
+    def client_factory(**kwargs):
+        assert kwargs['follow_redirects'] is False
+        return async_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert len(requests) == 1 and str(requests[0].url) == canonical
+    assert browser.calls == []
+
+
+@pytest.mark.parametrize('drift_field,drift_value', [
+    ('pk', 'other#job'), ('company', 'other-company'),
+    ('ats', 'recruitee'), ('job_id', 'other-job'),
+    ('jd_url', 'https://example-co.teamtailor.com/jobs/other'),
+])
+async def test_vendor_redirect_row_drift_after_http_response_stops_before_browser(
+        monkeypatch, drift_field, drift_value):
+    import httpx
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    browser, _, row = world(monkeypatch, inventory(field(), submit()))
+    row.update(pk=pk, company='example-co', job_id='backend-123',
+               ats='teamtailor', jd_url=canonical)
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+
+    class RevokingSession:
+        async def __aenter__(self):
+            row[drift_field] = drift_value
+            return browser
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(bsk, 'Session', lambda kind: RevokingSession())
+    async_client = httpx.AsyncClient
+    def client_factory(**kwargs):
+        return async_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(
+                301, headers={'Location': target}, request=request)), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert browser.calls == []
+
+
+@pytest.mark.parametrize('drift_field,drift_value', [
+    ('pk', 'other#job'), ('company', 'other-company'),
+    ('ats', 'recruitee'), ('job_id', 'other-job'),
+    ('jd_url', 'https://example-co.teamtailor.com/jobs/other'),
+])
+async def test_vendor_row_drift_during_dom_witness_prevents_field_gate(
+        monkeypatch, drift_field, drift_value):
+    import httpx
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    browser, _, row = world(
+        monkeypatch, inventory(field(form_action=target), submit(form_action=target),
+                             url=target))
+    row.update(pk=pk, company='example-co', job_id='backend-123',
+               ats='teamtailor', jd_url=canonical)
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    original = browser.call
+
+    async def revoke_after_witness(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        row[drift_field] = drift_value
+        return result
+
+    monkeypatch.setattr(browser, 'call', revoke_after_witness)
+    async_client = httpx.AsyncClient
+    def client_factory(**kwargs):
+        return async_client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                301, headers={'Location': target}, request=request)), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
+                               pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert result['form_question'] is None
+    assert 'job/tenant mapping changed during native control inspection' in result['question']
+    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
+
+
+@pytest.mark.parametrize('matches_fresh_target', [True, False])
+async def test_vendor_resume_requires_grant_for_exact_fresh_probe_target(
+        monkeypatch, matches_fresh_target):
+    import httpx
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    old_target = 'https://careers.example-co.test/jobs/backend-123'
+    current_target = 'https://careers-alt.example-co.test/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    page = inventory(
+        field(form_action=current_target), submit(form_action=current_target),
+        url=current_target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(
+        pk=pk, company='example-co', job_id='backend-123', ats='teamtailor',
+        jd_url=canonical, status='submitting',
+        human_approved_answers={'Email': {
+            'value': 'test@example.test', 'selector': '#email',
+            'url': current_target, 'label': 'Email', 'question': '',
+            'tag': 'input', 'type': 'email', 'form_selector': '#application',
+            'form_action': current_target,
+            'verified_redirect_url': current_target if matches_fresh_target else old_target}})
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    browser.allow_mutations = True
+    decisions = AsyncMock(side_effect=[
+        {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        {'action': 'finish'}])
+    monkeypatch.setattr(bsk, 'decision', decisions)
+    async_client = httpx.AsyncClient
+    requests = []
+    def response(request):
+        requests.append(request)
+        return httpx.Response(
+            301, headers={'Location': current_target}, request=request)
+
+    def client_factory(**kwargs):
+        return async_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
+    result = await forms.apply(
+        canonical, 'example-co', {'Email': 'test@example.test'}, 'synthetic',
+        pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert len(requests) == 1
+    writes = [call for call in browser.calls
+              if call[0] in {'fill', 'select', 'click', 'upload'}]
+    if matches_fresh_target:
+        assert writes == [('fill', '#email', '--value', 'test@example.test')]
+        assert 'application has not been submitted' in result['question']
+    else:
+        assert not writes
+        assert result['form_question']['verified_redirect_url'] == current_target
+        assert result['form_question']['url'] == current_target
+
+
+def _vendor_row(pk, canonical, ats='teamtailor'):
+
+    return {'pk': pk, 'company': 'example-co', 'job_id': 'backend-123',
+            'ats': ats, 'jd_url': canonical, 'status': 'submitting',
+            'possible_submission': False, 'human_approved_answers': {}}
+
+
+def _install_vendor_redirect(monkeypatch, target, *, status=301, after_response=None):
+    import httpx
+
+    requests = []
+    async_client = httpx.AsyncClient
+    def respond(request):
+        requests.append(request)
+        response = httpx.Response(
+            status, headers={'Location': target}, request=request)
+        if after_response:
+            after_response()
+        return response
+    def factory(**kwargs):
+        assert kwargs['follow_redirects'] is False
+        return async_client(transport=httpx.MockTransport(respond), **kwargs)
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', factory)
+    return requests
+
+
+def _redirect_question(row, pk, target):
+    return {
+        'pk': pk, 'label': 'Email', 'control_label': 'Email', 'question': '',
+        'selector': '#email', 'url': target, 'tag': 'input', 'type': 'email',
+        'form_selector': '#application', 'form_action': target, 'formaction': '',
+        'origin_row': {'jd_url': row['jd_url'], 'company': row['company'],
+                       'ats': row['ats'], 'pk': pk, 'job_id': row['job_id']},
+        'verified_redirect_url': target,
+    }
+
+
+@pytest.mark.parametrize('raw_url', [
+    chr(9) + 'https://example-co.teamtailor.com/jobs/backend-123',
+    'https://example-co.teamtailor.com/jobs/backend-123' + chr(10),
+    'https://example-co.team' + chr(10) + 'tailor.com/jobs/backend-123',
+])
+async def test_noncanonical_vendor_url_refuses_before_http_client(monkeypatch, raw_url):
+    from core.ids import make_pk
+
+    pk = make_pk('example-co', 'backend-123')
+    row = _vendor_row(pk, raw_url)
+    original_urlsplit = forms.urlsplit
+    def refuse_parser_normalization(candidate, *args, **kwargs):
+        if candidate == raw_url:
+            pytest.fail('Noncanonical tracked URL reached URL parsing')
+        return original_urlsplit(candidate, *args, **kwargs)
+    monkeypatch.setattr(forms, 'urlsplit', refuse_parser_normalization)
+    monkeypatch.setattr(forms.httpx, 'AsyncClient', lambda **kwargs: pytest.fail(
+        'Noncanonical tracked URL reached HTTP client construction'))
+    assert await forms._probe_vendor_redirect(row, pk, 'example-co', raw_url) is None
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing_target', 'company', 'job_id', 'jd_url', 'ats', 'formaction',
+    'leading_tab', 'trailing_newline', 'embedded_newline',
+])
+def test_direct_redirect_label_revalidates_literal_target_and_current_row(mutation):
+    from agent import run
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    row = _vendor_row(pk, canonical, 'teamtailor')
+    row.update(status='needs_human', gate_source='applier', gate_call_id='direct')
+    question = _redirect_question(row, pk, target)
+    if mutation == 'missing_target':
+        question.pop('verified_redirect_url')
+    elif mutation == 'company':
+        row['company'] = 'other-company'
+    elif mutation == 'job_id':
+        row['job_id'] = 'other-job'
+    elif mutation == 'jd_url':
+        row['jd_url'] = 'https://example-co.teamtailor.com/jobs/other'
+    elif mutation == 'ats':
+        row['ats'] = 'recruitee'
+    elif mutation == 'formaction':
+        question['formaction'] = 'https://foreign.test/submit'
+    elif mutation == 'leading_tab':
+        row['jd_url'] = chr(9) + canonical
+        question['origin_row']['jd_url'] = row['jd_url']
+    elif mutation == 'trailing_newline':
+        row['jd_url'] = canonical + chr(10)
+        question['origin_row']['jd_url'] = row['jd_url']
+    else:
+        row['jd_url'] = canonical.replace('teamtailor', chr(10) + 'teamtailor')
+        question['origin_row']['jd_url'] = row['jd_url']
+    row['gate_pending'] = {'form_question': question}
+    assert run._direct_form_label(pk, row) is None
+
+
+async def test_recruitee_cross_tenant_redirect_gates_at_apply_before_browser(monkeypatch):
+    from core.ids import make_pk
+
+    canonical = 'https://example-co.recruitee.com/o/backend-123'
+    target = 'https://other-co.recruitee.com/o/backend-123'
+    pk = make_pk('example-co', 'backend-123')
+    page = inventory(field(form_action=target), submit(form_action=target), url=target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(_vendor_row(pk, canonical, 'recruitee'))
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    requests = _install_vendor_redirect(monkeypatch, target, status=302)
+    result = await forms.apply(
+        canonical, 'example-co', {}, 'synthetic', pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'did not prove one safe same-job redirect' in result['question']
+    assert len(requests) == 1
+    assert browser.calls == []
+
+
+async def test_vendor_row_drift_during_resume_staging_gates_before_chrome(monkeypatch):
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = 'example-co#backend-123'
+    browser, _, row = world(
+        monkeypatch, inventory(field(form_action=target), submit(form_action=target),
+                             url=target))
+    row.update(_vendor_row(pk, canonical))
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    requests = _install_vendor_redirect(
+        monkeypatch, target, after_response=lambda: None)
+    sessions = []
+    def stage(path, owner):
+        row['jd_url'] = 'https://example-co.teamtailor.com/jobs/other'
+        return path
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', stage)
+    monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: None)
+    def session(kind):
+        sessions.append(kind)
+        return browser
+    monkeypatch.setattr(bsk, 'Session', session)
+    result = await forms.apply(
+        canonical, 'example-co', {}, 'synthetic', pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'changed before BrowserSkill startup' in result['question']
+    assert len(requests) == 1
+    assert sessions == []
+    assert browser.calls == []
+
+
+@pytest.mark.parametrize('verb', ['fill', 'select', 'choose', 'combobox', 'upload', 'submit'])
+async def test_vendor_row_drift_after_decision_gates_before_each_write(
+        monkeypatch, verb):
+    import httpx
+
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = 'example-co#backend-123'
+    if verb == 'fill':
+        action = {'action': verb, 'selector': '#email', 'fact': 'Email'}
+        controls = [field('Email', '#email', required=False, form_action=target)]
+    elif verb == 'select':
+        action = {'action': verb, 'selector': '#country', 'fact': 'Country', 'value': 'EX'}
+        controls = [field('Country', '#country', required=False, tag='select',
+                          type='select', form_action=target,
+                          options=[{'label': 'Example', 'value': 'EX'}])]
+    elif verb == 'choose':
+        action = {'action': verb, 'selector': '#updates', 'fact': 'Updates'}
+        controls = [field('Updates', '#updates', required=False, type='checkbox',
+                          form_action=target)]
+    elif verb == 'combobox':
+        action = {'action': verb, 'selector': '#country', 'fact': 'Country'}
+        controls = [field('Country', '#country', required=False, type='combobox',
+                          form_action=target, combobox={
+                              'linked': True, 'link_id': 'country-list',
+                              'listbox_selector': '#country-list',
+                              'options': [{'selector': '#country-example',
+                                           'unique': True, 'label': 'Example',
+                                           'value': 'EX'}],
+                              'selected_text': '', 'displayed_text': '',
+                              'selected_value': '', 'hidden_selector': '',
+                              'hidden_value': ''})]
+    elif verb == 'upload':
+        action = {'action': verb, 'selector': '#resume'}
+        controls = [field('Resume', '#resume', required=False, type='file',
+                          form_action=target)]
+    else:
+        action = {'action': 'submit', 'selector': '#submit'}
+        controls = []
+    page_controls = controls + [submit(form_action=target)]
+    page = inventory(*page_controls, url=target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(_vendor_row(pk, canonical))
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    requests = _install_vendor_redirect(monkeypatch, target)
+    async def decide(*args, **kwargs):
+        row['jd_url'] = 'https://example-co.teamtailor.com/jobs/other'
+        return action
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(
+        canonical, 'example-co', {}, 'synthetic', pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'Destination changed to an unrelated job or tenant' in result['question']
+    assert len(requests) == 1
+    mutating = {'fill', 'select', 'choose', 'combobox', 'upload', 'click'}
+    assert not any(call[0] in mutating for call in browser.calls)
+
+
+async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(monkeypatch):
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = 'example-co#backend-123'
+    combo = field('Country', '#country', required=False, type='combobox',
+                  form_action=target, combobox={
+                      'linked': True, 'link_id': 'country-list',
+                      'listbox_selector': '#country-list',
+                      'options': [{'selector': '#country-example', 'unique': True,
+                                   'label': 'Example Country', 'value': 'EX'}],
+                      'selected_text': '', 'displayed_text': '',
+                      'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = inventory(combo, submit(form_action=target), url=target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(_vendor_row(pk, canonical))
+    row['human_approved_answers'] = {'Country': {
+        'value': 'Example Country', 'selector': '#country', 'url': target,
+        'label': 'Country', 'question': '', 'tag': 'input', 'type': 'combobox',
+        'form_selector': '#application', 'form_action': target,
+        'verified_redirect_url': target}}
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    _install_vendor_redirect(monkeypatch, target)
+    decision_returned = False
+    page_refreshes = 0
+    original_page = browser.page
+    async def refresh_page():
+        nonlocal page_refreshes
+        if decision_returned:
+            page_refreshes += 1
+            if page_refreshes == 2:
+                browser.current['controls'][1]['formaction'] = 'https://foreign.test/submit'
+        return await original_page()
+    monkeypatch.setattr(browser, 'page', refresh_page)
+    original_call = browser.call
+    async def live_witness(*args, **kwargs):
+        if args[0] == 'evaluate':
+            evidence = witness(browser.current)
+            for source, observed in zip(browser.current['controls'], evidence['controls']):
+                if source.get('type') == 'combobox':
+                    observed['combobox'] = deepcopy(source['combobox'])
+            browser.result = evidence
+        if args[0] == 'click' and args[1] == '#country-example':
+            browser.calls.append(args)
+            return {}
+        return await original_call(*args, **kwargs)
+    monkeypatch.setattr(browser, 'call', live_witness)
+    async def decide(*args, **kwargs):
+        nonlocal decision_returned
+        decision_returned = True
+        return {'action': 'combobox', 'selector': '#country', 'fact': 'Country'}
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(
+        canonical, 'example-co', {'Country': 'Example Country'}, 'synthetic',
+        pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'form destination is external' in result['question']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_vendor_combobox_row_drift_after_initial_observation_has_no_question(monkeypatch):
+    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
+    target = 'https://careers.example-co.test/jobs/backend-123'
+    pk = 'example-co#backend-123'
+    combo = field('Country', '#country', required=False, type='combobox',
+                  form_action=target, combobox={
+                      'linked': True, 'link_id': 'country-list',
+                      'listbox_selector': '#country-list',
+                      'options': [{'selector': '#country-example', 'unique': True,
+                                   'label': 'Example Country', 'value': 'EX'}],
+                      'selected_text': '', 'displayed_text': '',
+                      'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = inventory(combo, submit(form_action=target), url=target)
+    browser, _, row = world(monkeypatch, page)
+    row.update(_vendor_row(pk, canonical))
+    row['human_approved_answers'] = {'Country': {
+        'value': 'Example Country', 'selector': '#country', 'url': target,
+        'label': 'Country', 'question': '', 'tag': 'input', 'type': 'combobox',
+        'form_selector': '#application', 'form_action': target,
+        'verified_redirect_url': target}}
+    evidence = witness(page)
+    evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
+    browser.result = evidence
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    _install_vendor_redirect(monkeypatch, target)
+    evaluations = 0
+    original_call = browser.call
+    async def drift_after_execute_observation(*args, **kwargs):
+        nonlocal evaluations
+        result = await original_call(*args, **kwargs)
+        if args[0] == 'evaluate':
+            evaluations += 1
+            if evaluations == 1:
+                row['jd_url'] = 'https://example-co.teamtailor.com/jobs/other'
+        return result
+    monkeypatch.setattr(browser, 'call', drift_after_execute_observation)
+    async def decide(*args, **kwargs):
+        return {'action': 'combobox', 'selector': '#country', 'fact': 'Country'}
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(
+        canonical, 'example-co', {'Country': 'Example Country'}, 'synthetic',
+        pk=pk, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert result['form_question'] is None
+    assert 'changed during combobox observation' in result['question']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_apply_without_synthetic_context_checks_approved_history_before_submit(monkeypatch):
+    current = inventory(field('Resume', '#resume', required=False, type='file',
+                              form_action=URL),
+                        field(form_action=URL), submit(form_action=URL))
+    approval = {'value': 'test@example.test', 'selector': '#email',
+                'url': URL, 'label': 'Email', 'question': '', 'tag': 'input',
+                'type': 'email', 'form_selector': '#application',
+                'form_action': URL}
+    row = {'pk': PK, 'company': 'example-co', 'job_id': '1',
+           'jd_url': URL, 'ats': 'other', 'status': 'submitting',
+           'possible_submission': False, 'human_approved_answers': {'Email': approval}}
+
+    class SubmitBrowser(Browser):
+        async def call(self, *args, **kwargs):
+            if args[0] == 'click' and args[1] == '#submit':
+                self.calls.append(args)
+                self.current['text'] += ' Thank you for applying'
+                for control in self.current['controls']:
+                    if control['selector'] == '#submit':
+                        control['disabled'] = True
+                return {}
+            return await super().call(*args, **kwargs)
+
+    browser = SubmitBrowser(current)
+    monkeypatch.setattr(bsk, 'Session', lambda kind: browser)
+    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
+    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
+    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
+    browser.allow_mutations = True
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'upload', 'selector': '#resume'},
+        {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        {'action': 'submit', 'selector': '#submit'}]))
+    result = await forms.apply(
+        URL, 'example-co', {'Email': 'test@example.test'}, 'synthetic',
+        pk=PK, resume_path='Resume.pdf')
+    assert result['status'] == 'uncertain', result
+    assert 'Submission clicked' in result['detail']
+    assert any(call[0] == 'fill' for call in browser.calls)
+    assert ('click', '#submit') in browser.calls

@@ -93,6 +93,7 @@ def is_infrastructure(detail: str) -> bool:
     return claude_chrome.is_infrastructure(detail) or (detail or "").startswith((
         "BrowserSkill unavailable:", "BrowserSkill configuration unavailable:",
         "BrowserSkill model unavailable:", "BrowserSkill operation unavailable:",
+        "BrowserSkill model returned invalid JSON",
         "BrowserSkill stopped:", "Browser configuration unavailable:",
     ))
 

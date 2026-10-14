@@ -117,3 +117,42 @@ async def test_parsed_non_object_is_invalid_without_decoder_position(
     assert "NonObjectJSON" in caplog.text
     assert "position=None" in caplog.text
     assert banners == []
+
+
+def test_invalid_json_banner_is_infrastructure_in_apply_fail_reason():
+    from agent import run
+    from tools.browser_runtime import is_infrastructure
+
+    invalid_json = "BrowserSkill model returned invalid JSON"
+    provider_unavailable = "BrowserSkill model unavailable: X"
+    assert is_infrastructure(invalid_json)
+    assert is_infrastructure(provider_unavailable)
+    for detail in (invalid_json, provider_unavailable):
+        assert run._fail_reason({"status": "unknown", "detail": detail}) == detail
+
+
+def test_invalid_json_infrastructure_retry_keeps_attempt_budget():
+    from unittest.mock import MagicMock
+
+    from core.apply_queue import ApplyQueue, MAX_ATTEMPTS
+
+    redis = MagicMock()
+    redis.get.return_value = None
+    redis.lrange.return_value = []
+    queue = ApplyQueue(redis)
+    item = {"pk": "example-co#json", "company": "example-co",
+            "attempts": MAX_ATTEMPTS - 1}
+    banner = "BrowserSkill model returned invalid JSON"
+
+    # At the retry ceiling, a misclassified format fault would dead-letter
+    # immediately instead of re-queuing without spending the attempt.
+    for retry_index in range(MAX_ATTEMPTS + 1):
+        assert queue.retry(item, banner) is True
+        assert redis.rpush.call_args.args[0] == "applyq:co:example-co"
+        item = json.loads(redis.rpush.call_args.args[1])
+        assert item["attempts"] == MAX_ATTEMPTS - 1
+        assert len(item["history"]) == retry_index + 1
+
+    assert redis.rpush.call_count == MAX_ATTEMPTS + 1
+    assert not any(call.args[0] == "applyq:dlq"
+                   for call in redis.rpush.call_args_list)

@@ -977,8 +977,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
-                  fixture_context=None) -> dict:
+                  fixture_context=None,
+                  provenance: GreenhouseJobAlias | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
+    if provenance is not None:
+        if (not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(page.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('This page lacks current same-job Greenhouse provenance.')
     verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -1005,7 +1011,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The selected field changed before human authorization.')
         page = observed
         form_question = _disclosure_question(
-            page, target, witness, job_url or page['url'])
+            page, target, witness, job_url or page['url'],
+            provenance=provenance)
         form_question['pk'] = pk
         gate_prompt = (_choice_prompt(target, form_question)
                        if verb in {'choose', 'select'}
@@ -1073,8 +1080,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
+        if provenance is not None and not _alias_current(
+                provenance, fixture_context=ctx):
+            raise Gate('The same-job alias changed before disclosure.')
         fresh_question = _disclosure_question(
-            latest, current, latest_witness, job_url or latest['url'])
+            latest, current, latest_witness, job_url or latest['url'],
+            provenance=provenance)
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
@@ -1104,7 +1115,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
-        check_form_destination(page, target, job_url or page.get('url', ''))
+        if pk and not job_url:
+            raise Gate('The original tracked job route is missing; upload denied.')
+        if provenance is not None:
+            page, target = await _fresh_native_receiver(
+                session, page, action, target, provenance, fixture_context=ctx)
+        check_form_destination(page, target, job_url or page.get('url', ''),
+                               provenance=provenance)
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
@@ -1127,7 +1144,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('Unproven or JS-backed click requires human inspection.')
         if is_submission(target) or not native_submit(target):
             raise Gate('A JS-backed or non-native submit destination is unproven.')
-        check_form_destination(page, target, job_url or page.get('url', ''))
+        if pk and not job_url:
+            raise Gate('The original tracked job route is missing; click denied.')
+        if provenance is not None:
+            page, target = await _fresh_native_receiver(
+                session, page, action, target, provenance, fixture_context=ctx)
+        check_form_destination(page, target, job_url or page.get('url', ''),
+                               provenance=provenance)
         check_before_committing_click(
             pk, **({'fixture_context': ctx} if ctx else {}))
         if on_committing_click:

@@ -50,6 +50,16 @@ _OPTION_SELECTORS = {
     "#phone-country-option-example": "What is your phone country?",
     "#work-authorization-option-yes": "Are you authorized to work?",
 }
+_COMBO_SELECTORS = {
+    "Where are you located?": "#location",
+    "What is your phone country?": "#phone-country",
+    "Are you authorized to work?": "#work-authorization",
+}
+_HIDDEN_SELECTORS = {
+    "Where are you located?": "#location-code",
+    "What is your phone country?": "#phone-country-code",
+    "Are you authorized to work?": "#work-authorization-code",
+}
 _FORM = ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Synthetic application</title>
 <style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
@@ -94,8 +104,10 @@ Are you authorized to work?</div>
 <div id="work-authorization" role="combobox" tabindex="0"
  aria-labelledby="work-authorization-question"
  aria-controls="work-authorization-options" aria-expanded="false"
- aria-required="true" data-value-input="work-authorization-code">Choose an answer</div>
+ aria-required="true" data-value-input="work-authorization-code"
+ data-label-input="work-authorization-caption">Choose an answer</div>
 <input id="work-authorization-code" name="work_authorization_value" type="hidden">
+<input id="work-authorization-caption" name="work_authorization" type="hidden">
 </div>
 <div id="work-authorization-options" role="listbox" hidden>
 <div id="work-authorization-option-yes" role="option" data-value="yes"
@@ -129,6 +141,8 @@ function bindPicker(comboId,listId,asyncFilter){
   combo.setAttribute('data-selected-value',value);
   options.forEach(o=>o.setAttribute('aria-selected',String(o===option)));
   document.getElementById(combo.getAttribute('data-value-input')).value=value;
+  const labelInput=combo.getAttribute('data-label-input');
+  if(labelInput)document.getElementById(labelInput).value=caption;
   list.hidden=true;combo.setAttribute('aria-expanded','false');
  }));
 }
@@ -177,7 +191,8 @@ class _SyntheticRun:
                  "navigations", "decisions", "status_writes", "positive",
                  "ipc_index", "open_controls", "input_values", "committed",
                  "post_count", "post_payload", "submit_ipc", "uploaded",
-                 "last_page")
+                 "last_page", "combo_observations", "submit_call_entered",
+                 "submit_guard", "post_attempts", "post_rejection", "post_receipts")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -206,6 +221,13 @@ class _SyntheticRun:
         self.submit_ipc = 0
         self.uploaded = False
         self.last_page = None
+        self.combo_observations = {}
+        self.submit_call_entered = 0
+        self.submit_guard = "not_reached"
+        self.post_attempts = 0
+        self.post_rejection = ""
+        self.post_receipts = []
+
 
     def enable_positive_fixture(self) -> None:
         self.positive = True
@@ -245,23 +267,79 @@ class _SyntheticRun:
             ("click", "#submit"),
         )
 
+    def observe_page(self, observed: dict) -> None:
+        """Retain browser-read caption/value pairs as committed fixture state."""
+        self.last_page = observed
+        self.committed = {}
+        self.combo_observations = {}
+        controls = observed.get("controls", []) if isinstance(observed, dict) else []
+        for key, selector in _COMBO_SELECTORS.items():
+            matches = [c for c in controls
+                       if isinstance(c, dict) and c.get("selector") == selector]
+            if len(matches) != 1:
+                self.combo_observations[key] = {
+                    "outcome": "not_committed",
+                    "visible_text": "", "selected_value": "", "hidden_value": "",
+                    "reason": f"expected one observed control, found {len(matches)}",
+                }
+                continue
+            combo = matches[0].get("combobox") or {}
+            visible = combo.get("selected_text") or ""
+            selected = combo.get("selected_value") or ""
+            hidden_selector = combo.get("hidden_selector") or ""
+            hidden = combo.get("hidden_value") or ""
+            reasons = []
+            if visible != _FACTS[key]:
+                reasons.append("visible caption did not match the approved answer")
+            if selected != _MACHINE_VALUES[key]:
+                reasons.append("selected machine value did not match the expected value")
+            if hidden_selector != _HIDDEN_SELECTORS[key]:
+                reasons.append("linked hidden-value control was missing or changed")
+            if hidden != _MACHINE_VALUES[key]:
+                reasons.append("hidden machine value did not match the selected value")
+            observation = {
+                "outcome": "committed" if not reasons else "not_committed",
+                "visible_text": visible, "selected_value": selected,
+                "hidden_value": hidden,
+                "reason": "; ".join(reasons),
+            }
+            self.combo_observations[key] = observation
+            if not reasons:
+                self.committed[key] = (_FACTS[key], _MACHINE_VALUES[key])
+
     def record_post(self, payload: dict[str, str], *, resume_name: str,
                     resume_bytes: bytes) -> bool:
-        expected_commits = {key: (_FACTS[key], value)
-                             for key, value in _MACHINE_VALUES.items()}
-        if (not self.positive or not self.uploaded or self._origin is not _ORIGIN
-                or not _daemon_origin() or self.post_count or payload != _POST_FIELDS
-                or self.committed != expected_commits
-                or self.input_values.get("#name") != _FACTS["Name"]
-                or self.input_values.get("#additional") != _FACTS["Additional question"]
-                or self.input_values.get("#location") != _FACTS["Where are you located?"]
-                or self.input_values.get("#phone-country") != _FACTS["What is your phone country?"]
-                or resume_name != "Synthetic-Resume.pdf"
-                or resume_bytes != _RESUME_BYTES):
-            return False
+        checks = (
+            (self.positive and self._origin is _ORIGIN and _daemon_origin(),
+             "fixture authority or positive run state was invalid"),
+            (self.uploaded, "synthetic résumé upload was not verified"),
+            (not self.post_count, "a duplicate form POST was rejected"),
+            (payload == _POST_FIELDS,
+             "submitted field names or values did not match the expected form"),
+            (self.committed == {key: (_FACTS[key], value)
+                                for key, value in _MACHINE_VALUES.items()},
+             "combobox caption/value readback was incomplete"),
+            (self.input_values.get("#name") == _FACTS["Name"],
+             "the observed name field did not match the synthetic answer"),
+            (self.input_values.get("#additional") == _FACTS["Additional question"],
+             "the observed additional-answer field did not match the synthetic answer"),
+            (self.input_values.get("#location") == _FACTS["Where are you located?"],
+             "the observed location field did not match the synthetic answer"),
+            (self.input_values.get("#phone-country")
+             == _FACTS["What is your phone country?"],
+             "the observed phone-country field did not match the synthetic answer"),
+            (resume_name == "Synthetic-Resume.pdf" and resume_bytes == _RESUME_BYTES,
+             "the staged synthetic résumé did not match"),
+        )
+        self.post_rejection = ""
+        for passed, reason in checks:
+            if not passed:
+                self.post_rejection = reason
+                return False
         self.post_count = 1
         self.post_payload = dict(payload)
         return True
+
     def matches(self, *, url: str, company: str, pk: str, facts: dict,
                 model: str, resume_path: str) -> bool:
         return (authorized(self, pk=pk, company=company, url=url)
@@ -341,7 +419,7 @@ class _SyntheticRun:
                     raise PermissionError("Fixture authority has expired.")
                 state.navigations += 1
                 observed = await raw.navigate(url)
-                state.last_page = observed
+                state.observe_page(observed)
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture redirected outside the fixed job URL.")
                 return observed
@@ -350,7 +428,7 @@ class _SyntheticRun:
                 if not state.navigations or not authorized(state):
                     raise PermissionError("Fixture cannot inspect another session.")
                 observed = await raw.page()
-                state.last_page = observed
+                state.observe_page(observed)
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture page escaped the fixed job URL.")
                 return observed
@@ -390,6 +468,7 @@ class _SyntheticRun:
                     if selector != "#work-authorization" and state.input_values.get(selector) != _FACTS[key]:
                         raise PermissionError("Fixture filter did not equal its approved fact.")
                 if args == ("click", "#submit"):
+                    state.submit_call_entered += 1
                     expected_commits = {key: (_FACTS[key], value)
                                          for key, value in _MACHINE_VALUES.items()}
                     if (not state.hold or not state.uploaded
@@ -397,7 +476,9 @@ class _SyntheticRun:
                             or state.input_values.get("#name") != _FACTS["Name"]
                             or state.input_values.get("#additional")
                                != _FACTS["Additional question"]):
+                        state.submit_guard = "failed: required fixture state was not read back"
                         raise PermissionError("Fixture submit lacks exact committed synthetic facts.")
+                    state.submit_guard = "passed"
                 await raw.call(*args, **kwargs)
                 state.ipc_index += 1
                 if args[0] == "fill":
@@ -416,7 +497,6 @@ class _SyntheticRun:
                         "Are you authorized to work?": "#work-authorization",
                     }[key]
                     state.open_controls.discard(selector)
-                    state.committed[key] = (_FACTS[key], _MACHINE_VALUES[key])
                 elif args == ("click", "#submit"):
                     state.submit_ipc += 1
 
@@ -441,11 +521,25 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(_FORM)
 
+    def _record_post_receipt(self, state, status: int) -> None:
+        if type(state) is _SyntheticRun:
+            state.post_receipts.append({
+                "request_line": getattr(self, "requestline", f"POST {self.path}"),
+                "host": self.headers.get("Host", ""),
+                "content_type": self.headers.get("Content-Type", ""),
+                "response_status": status,
+            })
+
     def do_POST(self) -> None:
+        state = getattr(getattr(self, "server", None), "synthetic_run", None)
+        if type(state) is _SyntheticRun:
+            state.post_attempts += 1
         if (self.path != _PATH or self.headers.get("Host") != "127.0.0.1:18789"):
+            if type(state) is _SyntheticRun:
+                state.post_rejection = "request target or Host did not match the fixed fixture"
+            self._record_post_receipt(state, 404)
             self._reject()
             return
-        state = getattr(getattr(self, "server", None), "synthetic_run", None)
         content_type = self.headers.get("Content-Type", "")
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -473,13 +567,18 @@ class _FixtureHandler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("Duplicate synthetic form field")
         except (ValueError, UnicodeDecodeError, LookupError):
+            if type(state) is _SyntheticRun:
+                state.post_rejection = "invalid multipart request encoding or fields"
+            self._record_post_receipt(state, 400)
             self._reject(400)
             return
         if type(state) is not _SyntheticRun or not state.record_post(
                 payload, resume_name=resume_name, resume_bytes=resume_bytes):
+            self._record_post_receipt(state, 405)
             self._reject(405)
             return
         response = b"<h1>Thank you for applying</h1>"
+        self._record_post_receipt(state, 200)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -543,12 +642,13 @@ def run() -> int:
                     for key, selector in field_selectors.items()
                 ]
                 for key in _MACHINE_VALUES:
-                    committed = state.committed.get(key) == (
-                        _FACTS[key], _MACHINE_VALUES[key])
-                    outcomes.append({
-                        "field": key,
-                        "outcome": "option_click_sent" if committed else "not_reached",
+                    observation = state.combo_observations.get(key, {
+                        "outcome": "not_committed",
+                        "visible_text": "", "selected_value": "",
+                        "hidden_value": "",
+                        "reason": "no BrowserSkill page readback was available",
                     })
+                    outcomes.append({"field": key, **observation})
                 outcomes.append({
                     "field": "Résumé",
                     "outcome": "uploaded" if state.uploaded else "not_reached",
@@ -559,12 +659,15 @@ def run() -> int:
                 if isinstance(state.last_page, dict):
                     for target in state.last_page.get("controls", []):
                         if (not isinstance(target, dict)
-                                or target.get("type") == "radio"):
+                                or target.get("type") in {"radio", "hidden"}):
                             continue
                         question = target.get("question") or target.get("label")
                         if not isinstance(question, str) or not question.strip():
                             continue
-                        others = _approval_question_collisions(state.last_page, target)
+                        others = [
+                            c for c in _approval_question_collisions(
+                                state.last_page, target)
+                            if c.get("type") != "hidden"]
                         pair = [target, *others]
                         selectors = tuple(sorted(
                             c.get("selector", "") for c in pair))
@@ -594,7 +697,15 @@ def run() -> int:
                                   "comboboxes": len(state.committed),
                                   "post_received": state.post_count == 1,
                                   "gate": gate, "fields": outcomes,
-                                  "approval_question_collisions": collisions}))
+                                  "approval_question_collisions": collisions,
+                                  "submit": {
+                                      "guard": state.submit_guard,
+                                      "call_entered": state.submit_call_entered > 0,
+                                      "ipc_returned": state.submit_ipc > 0,
+                                      "post_attempts": state.post_attempts,
+                                      "post_rejection": state.post_rejection,
+                                      "receipts": state.post_receipts,
+                                  }}))
                 return 0 if ok else 1
         finally:
             server.shutdown()

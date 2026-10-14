@@ -65,7 +65,7 @@ class _ServedFormInventory(HTMLParser):
                       or attrs.get("role") == "combobox"):
             selector = "#" + attrs["id"] if attrs.get("id") else tag
             self.controls.append({
-                "selector": selector,
+                "selector": selector, "name": attrs.get("name"),
                 "label": group["question"] or attrs.get("name", ""),
                 "question": group["question"],
                 "type": typ, "tag": tag, "required": False,
@@ -178,6 +178,44 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     assert forms._approval_question_collisions(page, location) == [hidden]
 
     assert forms._key(page, location) == "Where are you located?"
+
+
+def test_served_form_has_a_successful_control_for_each_expected_post_field():
+    """A div combobox needs a named hidden caption control for native POST."""
+    page = served_fixture_page()
+    names = {control["name"] for control in page["controls"] if control["name"]}
+    assert names == set(fixture._POST_FIELDS) | {"resume"}
+    assert 'data-label-input="work-authorization-caption"' in fixture._FORM.decode()
+    assert ('if(labelInput)document.getElementById(labelInput).value=caption;'
+            in fixture._FORM.decode())
+
+
+def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    page = served_fixture_page()
+    for key, selector in fixture._COMBO_SELECTORS.items():
+        control = next(c for c in page["controls"] if c["selector"] == selector)
+        control["combobox"] = {
+            "selected_text": fixture._FACTS[key],
+            "selected_value": fixture._MACHINE_VALUES[key],
+            "hidden_selector": fixture._HIDDEN_SELECTORS[key],
+            "hidden_value": fixture._MACHINE_VALUES[key],
+        }
+    state.observe_page(page)
+    assert state.committed == {
+        key: (fixture._FACTS[key], fixture._MACHINE_VALUES[key])
+        for key in fixture._MACHINE_VALUES
+    }
+    assert all(item["outcome"] == "committed"
+               for item in state.combo_observations.values())
+
+    location = next(c for c in page["controls"] if c["selector"] == "#location")
+    location["combobox"]["hidden_value"] = "OTHER_CITY"
+    state.observe_page(page)
+    assert "Where are you located?" not in state.committed
+    assert state.combo_observations["Where are you located?"]["reason"] == (
+        "hidden machine value did not match the selected value")
+
 
 
 async def test_controller_generated_second_field_gate_after_exactly_one_name_fill(
@@ -326,6 +364,7 @@ def test_loopback_post_requires_every_committed_fact_and_the_staged_pdf(
     body = bytes([13, 10]).join(parts)
     handler = object.__new__(fixture._FixtureHandler)
     handler.path = fixture._PATH
+    handler.requestline = f"POST {fixture._PATH} HTTP/1.1"
     handler.headers = {
         "Host": "127.0.0.1:18789",
         "Content-Length": str(len(body)),
@@ -354,6 +393,13 @@ def test_loopback_post_requires_every_committed_fact_and_the_staged_pdf(
     statuses.clear()
     handler.do_POST()
     assert statuses == [405] and not handler.wfile.getvalue()
+    assert state.post_attempts == 3
+    assert [receipt["response_status"] for receipt in state.post_receipts] == [405, 200, 405]
+    assert all(receipt["request_line"] == f"POST {fixture._PATH} HTTP/1.1"
+               and receipt["host"] == "127.0.0.1:18789"
+               and receipt["content_type"].startswith("multipart/form-data;")
+               for receipt in state.post_receipts)
+
 
 async def test_real_session_thread_context_and_read_only_connected_path(
         authority, monkeypatch):

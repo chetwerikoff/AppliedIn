@@ -203,10 +203,10 @@ class CDP:
 
     def _prepare(self, session: str, target_type: str, waiting: bool, target: str):
         require(target_type in {"page", "iframe", "worker", "shared_worker",
-                                "service_worker", "background_page"},
+                                "service_worker", "background_page", "browser_ui"},
                 f"unverifiable child target type {target_type}")
         require(session not in self.prepared, "duplicate CDP child-target session")
-        if target_type == "background_page":
+        if target_type in {"background_page", "browser_ui"}:
             self.background_sessions.add(session)
         # Both domains must ACK *before* target release or first navigation.
         self.call("Network.enable", session=session)
@@ -238,7 +238,7 @@ class CDP:
             info = args.get("targetInfo") or {}
             if info.get("type") in {"page", "iframe", "worker",
                                     "shared_worker", "service_worker",
-                                    "background_page"}:
+                                    "background_page", "browser_ui"}:
                 self.discovered[info.get("targetId", "")] = info["type"]
         elif method == "Target.attachedToTarget":
             info = args.get("targetInfo") or {}
@@ -483,7 +483,7 @@ def _run_chrome(fixture, production_script: str, browser: str):
                     # An extra protocol round-trip pumps pending request/target events.
                     active = cdp.call("Target.getTargets").get("targetInfos", [])
                     types = {"page", "iframe", "worker", "shared_worker",
-                             "service_worker", "background_page"}
+                             "service_worker", "background_page", "browser_ui"}
                     require(isinstance(active, list) and all(
                         info.get("targetId") in cdp.intercepted_targets
                         for info in active if info.get("type") in types),

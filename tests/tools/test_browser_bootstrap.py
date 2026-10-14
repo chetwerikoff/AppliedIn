@@ -1055,10 +1055,16 @@ def test_unicode_company_collisions_do_not_authorize_alias():
 def test_only_one_exact_literal_gh_jid_is_new_alias(query):
     from tools.claude_chrome import greenhouse_alias_candidate
 
+    from tools.claude_chrome import verified_greenhouse_alias
+    from discovery.watchlist import CompanyConfig
+
     row = {**_greenhouse_row(), 'jd_url': GH_WRAP.split('?')[0] + '?' + query}
-    if query.startswith('gh_jid=123456&'):
-        assert not greenhouse_alias_candidate(row['jd_url'])
-    assert _greenhouse_provenance(row) is None
+    assert not greenhouse_alias_candidate(row['jd_url']) or query == 'gh_jid=654321'
+    assert verified_greenhouse_alias(
+        row, pk=GH_PK, company='example-co', url=row['jd_url'],
+        configs=[CompanyConfig(
+            name='example-co', ats='greenhouse', board='example-co',
+            careers_url='https://careers.example-co.test/openings')]) is None
 
 
 def test_alias_effective_route_guard_is_job_scoped_and_legacy_unchanged():
@@ -1162,9 +1168,9 @@ async def test_alias_unsafe_native_receiver_never_mutates(
             'email': {}, 'select': {'tag': 'select', 'type': 'select',
                                     'options': [{'value': 'a', 'label': 'Alpha'}]},
             'checkbox': {'type': 'checkbox', 'value': 'yes', 'has_value': True},
-            'file': {'type': 'file', 'label': 'Upload résumé'},
+            'file': {'type': 'file'},
         }[kind]
-        chosen = field('Email', '#chosen',
+        chosen = field('Upload résumé' if kind == 'file' else 'Email', '#chosen',
                        form_action='https://foreign.test/job/123456',
                        **selected)
     p = inventory(chosen, submit(form_action=GH_DIRECT), url=GH_DIRECT)

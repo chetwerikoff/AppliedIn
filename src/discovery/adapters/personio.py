@@ -1,4 +1,4 @@
-"""Personio native XML jobs."""
+"""Personio native XML jobs. The same incremental XML safety reader serves RSS."""
 
 from __future__ import annotations
 

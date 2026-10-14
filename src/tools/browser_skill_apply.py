@@ -210,7 +210,8 @@ def _configured_alias(pk: str, company: str, url: str, *,
     try:
         from core.config import get_settings
         from discovery.watchlist import load_watchlist
-        row = _row(pk, fixture_context=fixture_context)
+        row = (_row(pk, fixture_context=fixture_context) if fixture_context
+               else _row(pk))
         configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
         return verified_greenhouse_alias(
             row, pk=pk, company=company, url=url, configs=configs)
@@ -896,8 +897,9 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
                      provenance: GreenhouseJobAlias | None = None) -> dict:
-    if provenance is not None and not _alias_current(
-            provenance, fixture_context=fixture_context):
+    if provenance is not None and (
+            provenance.pk != pk
+            or not _alias_current(provenance, fixture_context=fixture_context)):
         raise Gate('The configured job/tenant correspondence changed; review the form.')
     _inventory_ok(page)
     if not navigation_allowed(page['url'], *origins, provenance=provenance):
@@ -981,7 +983,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   provenance: GreenhouseJobAlias | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     if provenance is not None:
-        if (not _alias_current(provenance, fixture_context=ctx)
+        if (pk != provenance.pk or company != provenance.company
+                or job_url != provenance.wrapper
+                or not _alias_current(provenance, fixture_context=ctx)
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job Greenhouse provenance.')
@@ -1231,7 +1235,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
 
         # A query-generated Greenhouse/Oracle alias cannot authorize itself.
         # Without a code-verifiable same-job route, stop before opening Chrome.
-        if not allowed(direct_url):
+        # The initial check must never let the derived URL authorize itself.
+        # Only the original tracked wrapper (or verified provenance) is authority.
+        if not navigation_allowed(direct_url, url, provenance=provenance):
             raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)

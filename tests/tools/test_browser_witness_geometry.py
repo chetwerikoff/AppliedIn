@@ -252,12 +252,17 @@ def no_mutation(session):
 
 
 def grant(c, value):
-    return {
+    approved = {
         'value': value, 'selector': c['selector'], 'url': URL,
         'label': c['label'], 'question': c['question'], 'tag': c['tag'],
         'type': c['type'], 'form_selector': c['form_selector'],
         'form_action': c['form_action'],
     }
+    if c['tag'] == 'select':
+        approved['options'] = deepcopy(c['options'])
+    if c['type'] == 'checkbox':
+        approved['visible_text'] = c['label']
+    return approved
 
 
 def row_with_grant(c, value):
@@ -313,14 +318,24 @@ async def test_old_grant_does_not_authorize_now_invisible_write(
                 'Newsletter' if kind == 'checkbox' else 'Name',
                 '#target', tag=tag, type=kind, options=options)
     current = page(c)
+    previously_visible = production_observation(current)
+    assert previously_visible['controls'][0]['visible'] is True
+    witness = {item['selector']: item for item in previously_visible['controls']}
+    assert forms._disclosure_question(current, c, witness, URL)['selector'] == c['selector']
+
     evidence = production_observation(
         current, overrides={'#target': {'rects': [rect(width=0)]}})
     assert evidence['controls'][0]['visible'] is False
     session = Session(current, evidence)
     monkeypatch.setattr(forms, '_row', lambda pk: row_with_grant(c, value))
+    # The grant was genuinely usable before the control became invisible.
+    # Otherwise an unrelated approval mismatch could falsely satisfy this Gate.
+    forms.exact_approval(PK, c['label'], value,
+                         target=forms._bound_target(current, c), url=URL)
     with pytest.raises(forms.Gate) as raised:
         await execute(session, current, c, verb, value)
     assert raised.value.form_question is None
+    assert [call[0] for call in session.calls] == ['evaluate']
     no_mutation(session)
 
 

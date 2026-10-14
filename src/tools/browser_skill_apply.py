@@ -70,6 +70,10 @@ _DNS_LABEL = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
 
 def _tenant_job(row: dict, pk: str, company: str, url: str):
     """Bind eligible canonical vendor URLs to one coherent tracked identity."""
+    if (not isinstance(url, str)
+            or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159
+                   or c == '\\' for c in url)):
+        return None
     try:
         from core.ids import make_pk
 
@@ -80,7 +84,10 @@ def _tenant_job(row: dict, pk: str, company: str, url: str):
         vendor, route = _VENDOR_PATH[row['ats']]
         parsed = urlsplit(url)
         labels = parsed.hostname.split('.') if parsed.hostname else []
+        canonical = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                                parsed.query, parsed.fragment))
         if (parsed.scheme != 'https' or parsed.netloc != parsed.hostname
+                or canonical != url
                 or parsed.query or parsed.fragment or '?' in url or '#' in url
                 or len(labels) != 3 or labels[1:] != vendor.split('.')
                 or not all(_DNS_LABEL.fullmatch(label) for label in labels)
@@ -94,16 +101,20 @@ def _tenant_job(row: dict, pk: str, company: str, url: str):
 def _literal_redirect_target(canonical: str, location: str) -> bool:
     """Reject parser normalization before a vendor Location gains authority."""
     if (not isinstance(location, str) or not location
-            or any(ord(c) <= 32 or ord(c) == 127 or c == '\\\\' for c in location)
+            or any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159
+                   or c == '\\' for c in location)
             or '#' in location or location.endswith('?')):
         return False
     try:
         source, target = urlsplit(canonical), urlsplit(location)
         host = target.hostname or ''
         labels = host.split('.')
+        vendor_hosts = tuple(vendor for vendor, _route in _VENDOR_PATH.values())
         if (target.scheme != 'https' or target.netloc != host
                 or target.username is not None or target.password is not None
                 or target.port is not None or not host or host != host.lower()
+                or any(host == vendor or host.endswith('.' + vendor)
+                       for vendor in vendor_hosts)
                 or len(labels) < 2 or host == 'localhost'
                 or host.endswith(('.local', '.localhost'))
                 or not all(_DNS_LABEL.fullmatch(part) for part in labels)):
@@ -170,7 +181,7 @@ def navigation_allowed(href: str, *origins: str,
     """Require a proven job route, independent of untrusted observed origins."""
     if isinstance(provenance, VendorRedirectProvenance):
         if (not isinstance(href, str) or href == provenance.wrapper
-                or any(ord(c) <= 32 or ord(c) == 127 or c == '\\\\' for c in href)
+                or any(ord(c) <= 32 or ord(c) == 127 or c == '\\' for c in href)
                 or '#' in href):
             return False
         try:
@@ -1309,6 +1320,9 @@ def _combobox_stable_identity(target: dict) -> tuple:
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
     observed, witness = await _observe_controls(session, page)
+    if provenance is not None and not _alias_current(
+            provenance, fixture_context=ctx):
+        raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action)
     form_question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
@@ -1393,12 +1407,20 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     before_page = await session.page()
     before_page, before_witness = await _observe_controls(session, before_page)
     before_target = control(before_page, action)
+    if provenance is not None and not _alias_current(
+            provenance, fixture_context=ctx):
+        raise Gate('The verified posting changed before combobox selection.')
     if (_combobox_stable_identity(before_target) != stable
             or not navigation_allowed(before_page.get('url', ''),
                                       job_url or observed['url'], provenance=provenance)):
         raise Gate('The approved combobox changed before selecting its option.')
     before_options = [o for o in _combobox_options(before_target)
                       if o.get('selector') == option.get('selector')]
+    check_form_destination(
+        before_page, before_target, job_url or observed['url'], provenance=provenance)
+    exact_approval(pk, key, answer, target=before_target, url=before_page['url'],
+                   provenance=provenance,
+                   **({'fixture_context': ctx} if ctx else {}))
     if (len(before_options) != 1
             or before_options[0].get('label') != option.get('label')
             or before_options[0].get('value') != option.get('value')):
@@ -1706,7 +1728,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             check_approvals(pk, history, page, fixture_context=ctx,
                             provenance=provenance)
         else:
-            check_approvals(pk, history, provenance=provenance)
+            check_approvals(pk, history, page, provenance=provenance)
 
     def hold_dispatch(step):
         if ctx is not None:

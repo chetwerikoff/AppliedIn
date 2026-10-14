@@ -759,13 +759,22 @@ def _bound_target(page: dict, target: dict) -> dict:
                  'value': c['value']} for c in members]}
 
 
+def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
+    key = target.get('question') or target.get('label')
+    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
+    return [c for c in page['controls']
+            if all(c is not member for member in own)
+            and _same(key, c.get('question') or c.get('label') or '')]
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
         raise Gate('The observed field has no distinct approval question.')
-    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
-    if any(_same(key, c.get('question') or c.get('label') or '')
-           for c in page['controls'] if all(c is not member for member in own)):
+    # Hidden machine-value inputs repeat their visible control's group question,
+    # but cannot receive a separate human answer or approval grant.
+    if any(c.get('type') != 'hidden'
+           for c in _approval_question_collisions(page, target)):
         raise Gate('More than one control uses the same approval question; review manually.')
     return key
 

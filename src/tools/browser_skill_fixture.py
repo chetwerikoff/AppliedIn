@@ -176,7 +176,8 @@ class _SyntheticRun:
     __slots__ = ("_origin", "resume_path", "row", "events", "hold", "fills",
                  "navigations", "decisions", "status_writes", "positive",
                  "ipc_index", "open_controls", "input_values", "committed",
-                 "post_count", "post_payload", "submit_ipc", "uploaded")
+                 "post_count", "post_payload", "submit_ipc", "uploaded",
+                 "last_page")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -204,6 +205,7 @@ class _SyntheticRun:
         self.post_payload = None
         self.submit_ipc = 0
         self.uploaded = False
+        self.last_page = None
 
     def enable_positive_fixture(self) -> None:
         self.positive = True
@@ -339,6 +341,7 @@ class _SyntheticRun:
                     raise PermissionError("Fixture authority has expired.")
                 state.navigations += 1
                 observed = await raw.navigate(url)
+                state.last_page = observed
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture redirected outside the fixed job URL.")
                 return observed
@@ -347,6 +350,7 @@ class _SyntheticRun:
                 if not state.navigations or not authorized(state):
                     raise PermissionError("Fixture cannot inspect another session.")
                 observed = await raw.page()
+                state.last_page = observed
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture page escaped the fixed job URL.")
                 return observed
@@ -515,7 +519,8 @@ def run() -> int:
                 try:
                     # Imports only AFTER daemon sanitized its environment. The
                     # ordinary controller runs with its original F1-F5 checks.
-                    from tools.browser_skill_apply import apply
+                    from tools.browser_skill_apply import (
+                        apply, _approval_question_collisions)
                     result = asyncio.run(apply(
                         URL, COMPANY, dict(_FACTS), "synthetic-fixture", pk=PK,
                         resume_path=state.resume_path, fixture_context=state))
@@ -549,6 +554,31 @@ def run() -> int:
                     "outcome": "uploaded" if state.uploaded else "not_reached",
                 })
                 form_question = result.get("form_question") or {}
+                collisions = []
+                seen_collision_sets = set()
+                if isinstance(state.last_page, dict):
+                    for target in state.last_page.get("controls", []):
+                        if (not isinstance(target, dict)
+                                or target.get("type") == "radio"):
+                            continue
+                        question = target.get("question") or target.get("label")
+                        if not isinstance(question, str) or not question.strip():
+                            continue
+                        others = _approval_question_collisions(state.last_page, target)
+                        pair = [target, *others]
+                        selectors = tuple(sorted(
+                            c.get("selector", "") for c in pair))
+                        if len(pair) < 2 or selectors in seen_collision_sets:
+                            continue
+                        seen_collision_sets.add(selectors)
+                        collisions.append({
+                            "question": question,
+                            "controls": [{
+                                "selector": c.get("selector"),
+                                "label": c.get("label"),
+                                "type": c.get("type"),
+                            } for c in pair],
+                        })
                 gate = None if result.get("status") == "applied" else {
                     "kind": result.get("reason") or result.get("status"),
                     "field": {selector: field for field, selector in (
@@ -563,7 +593,8 @@ def run() -> int:
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),
                                   "post_received": state.post_count == 1,
-                                  "gate": gate, "fields": outcomes}))
+                                  "gate": gate, "fields": outcomes,
+                                  "approval_question_collisions": collisions}))
                 return 0 if ok else 1
         finally:
             server.shutdown()

@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -36,6 +37,64 @@ def authority(tmp_path, monkeypatch):
         yield state
     finally:
         fixture._SESSION_ENTRY.reset(token)
+
+
+class _ServedFormInventory(HTMLParser):
+    """Project fixture form groups the same way PAGE exposes control questions."""
+    def __init__(self):
+        super().__init__()
+        self.div_depth = 0
+        self.groups = []
+        self.label_group = None
+        self.label_parts = []
+        self.controls = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "div":
+            self.div_depth += 1
+            if "form-group" in attrs.get("class", "").split():
+                self.groups.append({"depth": self.div_depth, "question": ""})
+        group = self.groups[-1] if self.groups else None
+        if attrs.get("data-automation-id") == "formLabel" and group:
+            self.label_group = group
+            self.label_parts = []
+        typ = attrs.get("role") or (
+            attrs.get("type", "text") if tag == "input" else tag)
+        if group and (tag in {"input", "textarea", "select", "button"}
+                      or attrs.get("role") == "combobox"):
+            selector = "#" + attrs["id"] if attrs.get("id") else tag
+            self.controls.append({
+                "selector": selector,
+                "label": group["question"] or attrs.get("name", ""),
+                "question": group["question"],
+                "type": typ, "tag": tag, "required": False,
+                "in_form": True, "form_selector": "#synthetic-form",
+                "form_action": fixture.URL,
+            })
+
+    def handle_data(self, data):
+        if self.label_group is not None:
+            self.label_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if self.label_group is not None:
+            self.label_group["question"] = " ".join(
+                " ".join(self.label_parts).split())
+            self.label_group = None
+            self.label_parts = []
+        if tag == "div":
+            if self.groups and self.groups[-1]["depth"] == self.div_depth:
+                self.groups.pop()
+            self.div_depth -= 1
+
+
+def served_fixture_page():
+    """Read the exact response body and retain hidden controls in PAGE inventory."""
+    inventory = _ServedFormInventory()
+    inventory.feed(fixture._FORM.decode("utf-8"))
+    return {"url": fixture.URL, "controls": inventory.controls}
+
 
 
 def synthetic_page(*, url=fixture.URL, receiver=fixture.URL, extra_granted=False):
@@ -107,6 +166,18 @@ def test_positive_approval_grants_match_live_group_question(authority, key, sele
         forms.exact_approval(
             fixture.PK, key, fixture._FACTS[key], target=stale_question,
             url=fixture.URL, fixture_context=authority)
+
+
+def test_served_form_hidden_machine_input_does_not_collide_with_approval_question():
+    """Hidden receiver fields share group text but are not answerable controls."""
+    page = served_fixture_page()
+    location = next(c for c in page["controls"] if c["selector"] == "#location")
+    hidden = next(c for c in page["controls"]
+                  if c["selector"] == "#location-code")
+    assert location["question"] == hidden["question"] == "Where are you located?"
+    assert forms._approval_question_collisions(page, location) == [hidden]
+
+    assert forms._key(page, location) == "Where are you located?"
 
 
 async def test_controller_generated_second_field_gate_after_exactly_one_name_fill(

@@ -10,11 +10,25 @@ from core.logging import get_logger
 from core.models import JobRecord
 
 from ..watchlist import CompanyConfig
-from . import (_SEGMENT, _board_token, _careers_base, _clean, _feed,
+from .personio import (_SEGMENT, _board_token, _careers_base, _clean, _feed,
                _json_rows, _location_text, _locations, _nonempty_or_error,
                _posting_url, _published, _remote_cues, _url_parts)
 
 log = get_logger(__name__)
+
+
+def _source_links_match(row: dict, host: str, account: str, code: str) -> bool:
+    """Every populated link is evidence and must agree with the account feed."""
+    paths = (f"/j/{code}", f"/{account}/j/{code}")
+    for key in ("url", "application_url", "shortlink", "link"):
+        raw_link = row.get(key)
+        if raw_link is None or raw_link == "":
+            continue
+        parsed = _url_parts(raw_link)
+        if (parsed is None or parsed.hostname != host
+                or parsed.path not in paths):
+            return False
+    return True
 
 
 class WorkableAdapter:
@@ -37,14 +51,8 @@ class WorkableAdapter:
 
             # The global /j/<shortcode> link carries no tenant identity. The
             # validated account endpoint is the only authority for re-homing it.
-            raw_link = next(
-                (row[k] for k in ("url", "application_url", "shortlink", "link")
-                 if k in row), None)
-            if raw_link not in (None, ""):
-                parsed = _url_parts(raw_link)
-                if (parsed is None or parsed.hostname != host
-                        or parsed.path not in (f"/j/{code}", f"/{account}/j/{code}")):
-                    continue
+            if not _source_links_match(row, host, account, code):
+                continue
             candidate = f"https://{host}/{account}/j/{code}"
             link = _posting_url(
                 candidate, host,

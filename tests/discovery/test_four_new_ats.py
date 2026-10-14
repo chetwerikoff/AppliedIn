@@ -368,6 +368,38 @@ def test_workable_accountless_and_bound_url_union_hidden_and_siblings():
     assert "Secret" not in results[0].location
 
 
+@pytest.mark.parametrize("primary", ["", "https://apply.workable.com/j/SHORT1"])
+@pytest.mark.parametrize("secondary_field", ["application_url", "shortlink", "link"])
+@pytest.mark.parametrize("bad_link", [
+    "https://apply.workable.com/other-account/j/SHORT1",
+    "https://apply.workable.com/j/OTHER2",
+    "https://evil.example/j/SHORT1",
+    "not-a-url",
+])
+def test_workable_rejects_any_conflicting_populated_source_link(
+        primary, secondary_field, bad_link):
+    bad = workable_row()
+    bad["url"] = primary
+    bad[secondary_field] = bad_link
+    sibling = workable_row()
+    sibling["shortcode"] = "SAFE2"
+    sibling["url"] = "https://apply.workable.com/j/SAFE2"
+    sibling["title"] = "Safe Engineer"
+    jobs = fetch_fixture("workable", httpx.Response(
+        200, json={"jobs": [bad, sibling]}))
+    assert [(j.job_id, j.jd_url) for j in jobs] == [
+        ("SAFE2", "https://apply.workable.com/example-co/j/SAFE2")]
+
+
+def test_workable_accepts_multiple_consistent_source_links():
+    row = workable_row()
+    row.update(application_url="https://apply.workable.com/example-co/j/SHORT1",
+               shortlink="https://apply.workable.com/j/SHORT1",
+               link="https://apply.workable.com/example-co/j/SHORT1")
+    jobs = fetch_fixture("workable", httpx.Response(200, json={"jobs": [row]}))
+    assert [j.job_id for j in jobs] == ["SHORT1"]
+
+
 def test_workable_conflict_and_overflow_groups_skip_but_sibling_survives(monkeypatch):
     from discovery.adapters import workable
     warnings = []

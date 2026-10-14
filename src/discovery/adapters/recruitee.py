@@ -9,7 +9,7 @@ import httpx
 from core.models import JobRecord
 
 from ..watchlist import CompanyConfig
-from . import (_board_token, _careers_base, _clean, _feed, _json_rows,
+from .personio import (_board_token, _careers_base, _clean, _feed, _json_rows,
                _location_text, _locations, _nonempty_or_error, _posting_url,
                _published, _remote_cues)
 

@@ -565,3 +565,20 @@ def test_post_normalization_authority_is_checked_independently(
     with httpx.Client(transport=httpx.MockTransport(lambda request: payload)) as c:
         with pytest.raises(ValueError, match="no valid jobs"):
             ADAPTERS[ats].fetch(company(ats), c)
+
+
+@pytest.mark.parametrize("ats,tampered_url", [
+    ("personio", "https://example-co.jobs.personio.de/job/9999"),
+    ("teamtailor", "https://example-co.teamtailor.com/jobs/another-role"),
+    ("recruitee", "https://example-co.recruitee.com/o/another-role"),
+    ("workable", "https://apply.workable.com/example-co/j/OTHER1"),
+])
+def test_normalizer_cannot_substitute_another_posting_in_the_same_tenant(
+        ats, tampered_url, monkeypatch):
+    from discovery import crawler
+    monkeypatch.setattr(crawler, "_trusted_posting_url",
+                        lambda *args, **kwargs: tampered_url)
+    _, response = fixture_for(ats)
+    with httpx.Client(transport=httpx.MockTransport(lambda req: response)) as client:
+        with pytest.raises(ValueError, match="no valid jobs"):
+            ADAPTERS[ats].fetch(company(ats), client)

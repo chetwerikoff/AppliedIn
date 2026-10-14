@@ -115,7 +115,8 @@ def _posting_url(candidate: object, host: str, path_pattern: str, base: str) -> 
 
     result = _trusted_posting_url(candidate, base)
     checked = _url_parts(result)
-    if checked is None or checked.hostname != host or not re.fullmatch(path_pattern, checked.path):
+    if (checked is None or checked.hostname != host or checked.path != raw.path
+            or not re.fullmatch(path_pattern, checked.path)):
         return None
     # Stable canonical identity: DNS case and :443 do not affect the job key;
     # the job-path case is significant and must not be lowercased.

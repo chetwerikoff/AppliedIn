@@ -12,7 +12,11 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from tools import browser_skill as bsk
-from tools.claude_chrome import _SAFE_OPTION_RX, _SANCTIONS_RX, direct_board_url, guard_value
+from tools.claude_chrome import (
+    _SAFE_OPTION_RX, _SANCTIONS_RX, _alias_https_parts, GreenhouseJobAlias,
+    direct_board_url, greenhouse_alias_candidate, guard_value,
+    verified_greenhouse_alias,
+)
 from tools import submit_hold
 
 _SENSITIVE = re.compile(
@@ -43,8 +47,20 @@ _ATS_HOSTS = (
 )
 
 
-def navigation_allowed(href: str, *origins: str) -> bool:
-    """Require a job-scoped route, not a shared ATS/employer hostname."""
+def navigation_allowed(href: str, *origins: str,
+                       provenance: GreenhouseJobAlias | None = None) -> bool:
+    """Require a proven job route, independent of untrusted observed origins."""
+    if provenance is not None:
+        if not isinstance(provenance, GreenhouseJobAlias):
+            return False
+        if href == provenance.wrapper:
+            return True
+        route = _alias_https_parts(href)
+        if not route or route[0] != 'job-boards.greenhouse.io':
+            return False
+        job_path = f'/{provenance.board}/jobs/{provenance.job_id}'
+        path = route[1]
+        return path == job_path or path.startswith(job_path + '/')
     if not bsk.web_url(href):
         return False
     target = urlsplit(href)
@@ -185,6 +201,30 @@ def _row(pk: str, *, fixture_context=None) -> dict:
         return dict(ctx.row)
     from core.stores import make_stores
     return make_stores().tracking.get(pk) or {}
+
+
+
+def _configured_alias(pk: str, company: str, url: str, *,
+                      fixture_context=None) -> GreenhouseJobAlias | None:
+    """Reload only the explicit watchlist and the authoritative tracked row."""
+    try:
+        from core.config import get_settings
+        from discovery.watchlist import load_watchlist
+        row = _row(pk, fixture_context=fixture_context)
+        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        return verified_greenhouse_alias(
+            row, pk=pk, company=company, url=url, configs=configs)
+    except Exception:
+        # A broken/missing watchlist or unavailable row is not new host authority.
+        return None
+
+
+def _alias_current(provenance: GreenhouseJobAlias, *,
+                   fixture_context=None) -> bool:
+    return (isinstance(provenance, GreenhouseJobAlias)
+            and _configured_alias(provenance.pk, provenance.company,
+                                  provenance.wrapper,
+                                  fixture_context=fixture_context) == provenance)
 
 
 def exact_approval(pk: str, key: str, value: str, *,
@@ -399,7 +439,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                 if expected is None or (value and not _same(value, expected)):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
-def check_form_destination(page: dict, target: dict, *origins: str) -> None:
+def check_form_destination(page: dict, target: dict, *origins: str,
+                           provenance: GreenhouseJobAlias | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
@@ -415,8 +456,9 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
         base, override = item.get('form_action'), item.get('formaction')
         if (not isinstance(base, str) or not base
                 or (override and not isinstance(override, str))
-                or not navigation_allowed(base, *origins)
-                or (override and not navigation_allowed(override, *origins))):
+                or not navigation_allowed(base, *origins, provenance=provenance)
+                or (override and not navigation_allowed(
+                    override, *origins, provenance=provenance))):
             raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
@@ -758,7 +800,8 @@ def _same_key(value: str) -> str:
 
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
-                         *origins: str, bootstrap: bool = False) -> dict:
+                         *origins: str, bootstrap: bool = False,
+                         provenance: GreenhouseJobAlias | None = None) -> dict:
     choice = target.get('type') in {'radio', 'checkbox'}
     if choice:
         if target.get('tag') != 'input':
@@ -799,7 +842,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         for c in siblings)
     if not marked:
         raise Gate('No positive native application-form marker was observed.')
-    check_form_destination(page, target, *origins)
+    check_form_destination(page, target, *origins, provenance=provenance)
     question = {
         'pk': '', 'label': key, 'selector': target['selector'],
         'url': page['url'], 'control_label': target['label'],
@@ -808,6 +851,11 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
+    if provenance is not None:
+        question['origin_row'] = {
+            'jd_url': provenance.wrapper, 'company': provenance.company,
+            'ats': provenance.ats,
+        }
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
     if target.get('type') == 'checkbox':
@@ -819,7 +867,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     return question
 
 
-def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
+def _bootstrap_wall(page: dict, witness: dict, *origins: str,
+                    provenance: GreenhouseJobAlias | None = None) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
@@ -831,7 +880,8 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
         if c.get('type') in {'radio', 'checkbox'}:
             if _unanswered(page, c):
                 try:
-                    _disclosure_question(page, c, witness, *origins, bootstrap=True)
+                    _disclosure_question(page, c, witness, *origins, bootstrap=True,
+                                         provenance=provenance)
                 except Gate:
                     raise Gate('An uninspectable required choice needs human review.') from None
             continue
@@ -844,9 +894,13 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
 
 
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
-                     *origins: str, fixture_context=None) -> dict:
+                     *origins: str, fixture_context=None,
+                     provenance: GreenhouseJobAlias | None = None) -> dict:
+    if provenance is not None and not _alias_current(
+            provenance, fixture_context=fixture_context):
+        raise Gate('The configured job/tenant correspondence changed; review the form.')
     _inventory_ok(page)
-    if not navigation_allowed(page['url'], *origins):
+    if not navigation_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox'})
@@ -857,7 +911,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             for c in page['controls']):
         return page
     page, witness = await _observe_controls(session, page)
-    _bootstrap_wall(page, witness, *origins)
+    _bootstrap_wall(page, witness, *origins, provenance=provenance)
     for item in page['controls']:
         if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
                 and _unanswered(page, item)):
@@ -870,7 +924,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 and str(item.get('value') or '').strip()):
             continue
         try:
-            question = _disclosure_question(page, item, witness, *origins, bootstrap=True)
+            question = _disclosure_question(
+                page, item, witness, *origins, bootstrap=True,
+                provenance=provenance)
         except Gate:
             continue
         question['pk'] = pk
@@ -897,6 +953,24 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                   else f'An exact human-approved answer is needed for "{key}".')
         raise Gate(prompt, form_question=question)
     return page
+
+
+
+async def _fresh_native_receiver(session, page: dict, action: dict,
+                                 original: dict, provenance: GreenhouseJobAlias,
+                                 *, fixture_context=None) -> tuple[dict, dict]:
+    """An alias needs a current native receiver before *every* mutating IPC."""
+    if not _alias_current(provenance, fixture_context=fixture_context):
+        raise Gate('The original same-job tenant mapping is no longer current.')
+    observed, _ = await _observe_controls(session, page)
+    if not navigation_allowed(observed.get('url', ''), provenance=provenance):
+        raise Gate('The current native receiver is not on the tracked job route.')
+    current = control(observed, action)
+    if _identity(current) != _identity(original):
+        raise Gate('The native receiver changed before disclosure.')
+    check_form_destination(observed, current, provenance.wrapper,
+                           provenance=provenance)
+    return observed, current
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,

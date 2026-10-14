@@ -1,8 +1,9 @@
-"""Daemon-exclusive synthetic application form and loopback submission proof.
+"""Daemon-exclusive synthetic application form and read-only safety proof.
 
 No alternative browser driver or general fixture framework. The caller must be
-the exact daemon -m entry before production configuration imports. Its closed
-controller edge permits only fixed synthetic fields and one validated loopback POST.
+the exact daemon -m entry before production configuration imports. No committing
+BSK IPC is permitted; only the fixed form GET is served and every form method
+is refused with 405.
 """
 from __future__ import annotations
 
@@ -34,16 +35,6 @@ _MACHINE_VALUES = {
     "Where are you located?": "SYNTHETIC_CITY",
     "What is your phone country?": "EX",
     "Are you authorized to work?": "yes",
-}
-_POST_FIELDS = {
-    "name": _FACTS["Name"],
-    "additional": _FACTS["Additional question"],
-    "location": _FACTS["Where are you located?"],
-    "location_value": _MACHINE_VALUES["Where are you located?"],
-    "phone_country": _FACTS["What is your phone country?"],
-    "phone_country_value": _MACHINE_VALUES["What is your phone country?"],
-    "work_authorization": _FACTS["Are you authorized to work?"],
-    "work_authorization_value": _MACHINE_VALUES["Are you authorized to work?"],
 }
 _OPTION_SELECTORS = {
     "#location-option-city": "Where are you located?",
@@ -104,10 +95,8 @@ Are you authorized to work?</div>
 <div id="work-authorization" role="combobox" tabindex="0"
  aria-labelledby="work-authorization-question"
  aria-controls="work-authorization-options" aria-expanded="false"
- aria-required="true" data-value-input="work-authorization-code"
- data-label-input="work-authorization-caption">Choose an answer</div>
+ aria-required="true" data-value-input="work-authorization-code">Choose an answer</div>
 <input id="work-authorization-code" name="work_authorization_value" type="hidden">
-<input id="work-authorization-caption" name="work_authorization" type="hidden">
 </div>
 <div id="work-authorization-options" role="listbox" hidden>
 <div id="work-authorization-option-yes" role="option" data-value="yes"
@@ -141,8 +130,6 @@ function bindPicker(comboId,listId,asyncFilter){
   combo.setAttribute('data-selected-value',value);
   options.forEach(o=>o.setAttribute('aria-selected',String(o===option)));
   document.getElementById(combo.getAttribute('data-value-input')).value=value;
-  const labelInput=combo.getAttribute('data-label-input');
-  if(labelInput)document.getElementById(labelInput).value=caption;
   list.hidden=true;combo.setAttribute('aria-expanded','false');
  }));
 }
@@ -233,8 +220,6 @@ class _SyntheticRun:
         self.positive = True
         specs = {
             "Name": ("#name", "Name", "Name", "input", "text"),
-            "Additional question": ("#additional", "Additional question",
-                                    "Additional question", "textarea", "textarea"),
             "Where are you located?": ("#location", "Where are you located?",
                                         "Where are you located?", "input", "combobox"),
             "What is your phone country?": ("#phone-country",
@@ -254,7 +239,6 @@ class _SyntheticRun:
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
         return (
             ("fill", "#name", "--value", _FACTS["Name"]),
-            ("fill", "#additional", "--value", _FACTS["Additional question"]),
             ("click", "#location"),
             ("fill", "#location", "--value", _FACTS["Where are you located?"]),
             ("click", "#location-option-city"),
@@ -263,8 +247,6 @@ class _SyntheticRun:
             ("click", "#phone-country-option-example"),
             ("click", "#work-authorization"),
             ("click", "#work-authorization-option-yes"),
-            ("upload", "#resume", "--file", self.resume_path),
-            ("click", "#submit"),
         )
 
     def observe_page(self, observed: dict) -> None:
@@ -307,38 +289,6 @@ class _SyntheticRun:
             if not reasons:
                 self.committed[key] = (_FACTS[key], _MACHINE_VALUES[key])
 
-    def record_post(self, payload: dict[str, str], *, resume_name: str,
-                    resume_bytes: bytes) -> bool:
-        checks = (
-            (self.positive and self._origin is _ORIGIN and _daemon_origin(),
-             "fixture authority or positive run state was invalid"),
-            (self.uploaded, "synthetic résumé upload was not verified"),
-            (not self.post_count, "a duplicate form POST was rejected"),
-            (payload == _POST_FIELDS,
-             "submitted field names or values did not match the expected form"),
-            (self.committed == {key: (_FACTS[key], value)
-                                for key, value in _MACHINE_VALUES.items()},
-             "combobox caption/value readback was incomplete"),
-            (self.input_values.get("#name") == _FACTS["Name"],
-             "the observed name field did not match the synthetic answer"),
-            (self.input_values.get("#additional") == _FACTS["Additional question"],
-             "the observed additional-answer field did not match the synthetic answer"),
-            (self.input_values.get("#location") == _FACTS["Where are you located?"],
-             "the observed location field did not match the synthetic answer"),
-            (self.input_values.get("#phone-country")
-             == _FACTS["What is your phone country?"],
-             "the observed phone-country field did not match the synthetic answer"),
-            (resume_name == "Synthetic-Resume.pdf" and resume_bytes == _RESUME_BYTES,
-             "the staged synthetic résumé did not match"),
-        )
-        self.post_rejection = ""
-        for passed, reason in checks:
-            if not passed:
-                self.post_rejection = reason
-                return False
-        self.post_count = 1
-        self.post_payload = dict(payload)
-        return True
 
     def matches(self, *, url: str, company: str, pk: str, facts: dict,
                 model: str, resume_path: str) -> bool:
@@ -375,14 +325,6 @@ class _SyntheticRun:
             {"action": "fill", "selector": "#name", "fact": "Name"},
             {"action": "fill", "selector": "#additional",
              "fact": "Additional question"},
-            {"action": "combobox", "selector": "#location",
-             "fact": "Where are you located?"},
-            {"action": "combobox", "selector": "#phone-country",
-             "fact": "What is your phone country?"},
-            {"action": "combobox", "selector": "#work-authorization",
-             "fact": "Are you authorized to work?"},
-            {"action": "upload", "selector": "#resume"},
-            {"action": "submit", "selector": "#submit"},
         )
         if model != "synthetic-fixture" or self.decisions >= len(actions):
             raise ValueError("Synthetic decision sequence exhausted; rerun fixture.")
@@ -447,6 +389,10 @@ class _SyntheticRun:
                         raise PermissionError("Fixture denies this browser operation.")
                     state.fills += 1
                     return await raw.call(*args)
+                if args == ("click", "#submit"):
+                    state.submit_call_entered += 1
+                    state.submit_guard = "denied: fixture forbids committing BSK IPC"
+                    raise PermissionError("Fixture never permits submission-capable IPC.")
                 sequence = state._positive_ipc()
                 if (state.ipc_index >= len(sequence) or args != sequence[state.ipc_index]
                         or (args[0] == "upload" and kwargs != {"timeout": 130})
@@ -467,18 +413,6 @@ class _SyntheticRun:
                         raise PermissionError("Fixture option was not opened by its combobox.")
                     if selector != "#work-authorization" and state.input_values.get(selector) != _FACTS[key]:
                         raise PermissionError("Fixture filter did not equal its approved fact.")
-                if args == ("click", "#submit"):
-                    state.submit_call_entered += 1
-                    expected_commits = {key: (_FACTS[key], value)
-                                         for key, value in _MACHINE_VALUES.items()}
-                    if (not state.hold or not state.uploaded
-                            or state.committed != expected_commits
-                            or state.input_values.get("#name") != _FACTS["Name"]
-                            or state.input_values.get("#additional")
-                               != _FACTS["Additional question"]):
-                        state.submit_guard = "failed: required fixture state was not read back"
-                        raise PermissionError("Fixture submit lacks exact committed synthetic facts.")
-                    state.submit_guard = "passed"
                 await raw.call(*args, **kwargs)
                 state.ipc_index += 1
                 if args[0] == "fill":
@@ -497,8 +431,6 @@ class _SyntheticRun:
                         "Are you authorized to work?": "#work-authorization",
                     }[key]
                     state.open_controls.discard(selector)
-                elif args == ("click", "#submit"):
-                    state.submit_ipc += 1
 
         return _Closed()
 
@@ -534,58 +466,9 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         state = getattr(getattr(self, "server", None), "synthetic_run", None)
         if type(state) is _SyntheticRun:
             state.post_attempts += 1
-        if (self.path != _PATH or self.headers.get("Host") != "127.0.0.1:18789"):
-            if type(state) is _SyntheticRun:
-                state.post_rejection = "request target or Host did not match the fixed fixture"
-            self._record_post_receipt(state, 404)
-            self._reject()
-            return
-        content_type = self.headers.get("Content-Type", "")
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not content_type.lower().startswith("multipart/form-data;") or not 0 < length <= 16384:
-                raise ValueError("Invalid synthetic form encoding")
-            body = self.rfile.read(length)
-            from email import policy
-            from email.parser import BytesParser
-            envelope = (b"Content-Type: " + content_type.encode("ascii")
-                        + bytes([13, 10]) + b"MIME-Version: 1.0" + bytes([13, 10, 13, 10]))
-            message = BytesParser(policy=policy.default).parsebytes(envelope + body)
-            if not message.is_multipart():
-                raise ValueError("Synthetic POST is not multipart")
-            payload, resume_name, resume_bytes = {}, "", b""
-            for part in message.iter_parts():
-                if part.get_content_disposition() != "form-data":
-                    raise ValueError("Invalid multipart field")
-                name = part.get_param("name", header="content-disposition")
-                value = part.get_payload(decode=True) or b""
-                if name == "resume" and not resume_name:
-                    resume_name = part.get_filename() or ""
-                    resume_bytes = value
-                elif isinstance(name, str) and name not in payload:
-                    payload[name] = value.decode("utf-8", errors="strict")
-                else:
-                    raise ValueError("Duplicate synthetic form field")
-        except (ValueError, UnicodeDecodeError, LookupError):
-            if type(state) is _SyntheticRun:
-                state.post_rejection = "invalid multipart request encoding or fields"
-            self._record_post_receipt(state, 400)
-            self._reject(400)
-            return
-        if type(state) is not _SyntheticRun or not state.record_post(
-                payload, resume_name=resume_name, resume_bytes=resume_bytes):
-            self._record_post_receipt(state, 405)
-            self._reject(405)
-            return
-        response = b"<h1>Thank you for applying</h1>"
-        self._record_post_receipt(state, 200)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(response)))
-        self.end_headers()
-        self.wfile.write(response)
-
+            state.post_rejection = "Synthetic fixture refuses every non-GET form method."
+        self._record_post_receipt(state, 405)
+        self._reject(405)
     do_HEAD = do_POST
     do_PUT = do_POST
     do_DELETE = do_POST
@@ -625,14 +508,34 @@ def run() -> int:
                         resume_path=state.resume_path, fixture_context=state))
                 finally:
                     _SESSION_ENTRY.reset(token)
+                form_question = result.get("form_question") or {}
                 expected_commits = {key: (_FACTS[key], value)
                                      for key, value in _MACHINE_VALUES.items()}
-                ok = (result.get("status") == "applied"
-                      and state.fills == 4 and state.decisions == 7
+                # One fill writes Name; the second decision reaches #additional,
+                # but that field has no exact fixture grant and must Gate before IPC.
+                expected_fills = 1
+                # Those two decisions are the name write and the unapproved gate request.
+                expected_decisions = 2
+                ok = (result.get("status") == "gate"
+                      and form_question.get("selector") == "#additional"
+                      and state.fills == expected_fills
+                      and state.decisions == expected_decisions
                       and state.committed == expected_commits
-                      and state.uploaded and state.submit_ipc == 1
-                      and state.post_count == 1
-                      and state.post_payload == _POST_FIELDS)
+                      and all(state.combo_observations.get(key, {}).get("outcome")
+                              == "committed"
+                              and state.combo_observations[key].get("visible_text")
+                              == _FACTS[key]
+                              and state.combo_observations[key].get("selected_value")
+                              == _MACHINE_VALUES[key]
+                              and state.combo_observations[key].get("hidden_value")
+                              == _MACHINE_VALUES[key]
+                              for key in _MACHINE_VALUES)
+                      and not state.uploaded
+                      and state.submit_call_entered == 0
+                      and state.submit_guard == "not_reached"
+                      and state.submit_ipc == 0
+                      and state.post_attempts == 0
+                      and state.post_count == 0)
                 field_selectors = {"Name": "#name",
                                    "Additional question": "#additional"}
                 outcomes = [
@@ -653,7 +556,6 @@ def run() -> int:
                     "field": "Résumé",
                     "outcome": "uploaded" if state.uploaded else "not_reached",
                 })
-                form_question = result.get("form_question") or {}
                 collisions = []
                 seen_collision_sets = set()
                 if isinstance(state.last_page, dict):
@@ -692,7 +594,9 @@ def run() -> int:
                     )}.get(form_question.get("selector")),
                     "reason": result.get("question") or result.get("detail"),
                 }
-                print(json.dumps({"fixture": "native-form", "submitted": ok,
+                print(json.dumps({"fixture": "native-form",
+                                  "safe_gate": ok,
+                                  "submitted": state.submit_ipc > 0,
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),
                                   "post_received": state.post_count == 1,

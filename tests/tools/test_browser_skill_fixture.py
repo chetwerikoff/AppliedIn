@@ -145,27 +145,28 @@ async def test_forged_context_refused_before_store_or_browser(monkeypatch, conte
                           resume_path="/fake/pdf", fixture_context=context)
 
 
-@pytest.mark.parametrize(("key", "selector"), [
-    ("Name", "#name"),
-    ("Additional question", "#additional"),
-])
-def test_positive_approval_grants_match_live_group_question(authority, key, selector):
-    """The live PAGE inventory uses form-group text when no explicit question exists."""
+def test_positive_approval_grants_match_live_group_question(authority):
+    """The live PAGE inventory uses the exact form-group question."""
     authority.enable_positive_fixture()
     page = synthetic_page()
     target = next(item for item in page["controls"]
-                  if item["selector"] == selector)
-    target.update(question=key, form_selector="#synthetic-form",
+                  if item["selector"] == "#name")
+    target.update(question="Name", form_selector="#synthetic-form",
                   form_action=fixture.URL)
     forms.exact_approval(
-        fixture.PK, key, fixture._FACTS[key], target=target, url=fixture.URL,
-        fixture_context=authority)
+        fixture.PK, "Name", fixture._FACTS["Name"], target=target,
+        url=fixture.URL, fixture_context=authority)
 
     stale_question = {**target, "question": ""}
     with pytest.raises(forms.Gate, match="exact human-approved answer"):
         forms.exact_approval(
-            fixture.PK, key, fixture._FACTS[key], target=stale_question,
+            fixture.PK, "Name", fixture._FACTS["Name"], target=stale_question,
             url=fixture.URL, fixture_context=authority)
+
+
+def test_fixture_does_not_grant_the_additional_question(authority):
+    authority.enable_positive_fixture()
+    assert "Additional question" not in authority.row["human_approved_answers"]
 
 
 def test_served_form_hidden_machine_input_does_not_collide_with_approval_question():
@@ -180,15 +181,11 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     assert forms._key(page, location) == "Where are you located?"
 
 
-def test_served_form_has_a_successful_control_for_each_expected_post_field():
-    """A div combobox needs a named hidden caption control for native POST."""
+def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
     page = served_fixture_page()
-    names = {control["name"] for control in page["controls"] if control["name"]}
-    assert names == set(fixture._POST_FIELDS) | {"resume"}
-    assert 'data-label-input="work-authorization-caption"' in fixture._FORM.decode()
-    assert ('if(labelInput)document.getElementById(labelInput).value=caption;'
-            in fixture._FORM.decode())
-
+    assert 'data-label-input="work-authorization-caption"' not in fixture._FORM.decode()
+    assert not any(control["selector"] == "#work-authorization-caption"
+                   for control in page["controls"])
 
 def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
     state = fixture._SyntheticRun("/synthetic/resume.pdf")
@@ -300,11 +297,13 @@ async def test_closed_facade_denies_all_extra_ipc_below_controller(authority):
     ]
 
 
-def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
+def test_fixture_handler_rejects_wrong_host_path_and_every_non_get_method():
     # Construct BaseHTTPRequestHandler without a socket or network transport.
     def request(method, path, host):
         handler = object.__new__(fixture._FixtureHandler)
         handler.path = path
+        handler.command = method
+        handler.requestline = f"{method} {path} HTTP/1.1"
         handler.headers = {"Host": host, "Content-Length": "0"}
         handler.rfile = io.BytesIO()
         handler.wfile = io.BytesIO()
@@ -327,78 +326,40 @@ def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
         ("POST", fixture._PATH, "127.0.0.1:18789"),
         ("HEAD", fixture._PATH, "127.0.0.1:18789"),
         ("PUT", fixture._PATH, "127.0.0.1:18789"),
+        ("DELETE", fixture._PATH, "127.0.0.1:18789"),
+        ("PATCH", fixture._PATH, "127.0.0.1:18789"),
+        ("OPTIONS", fixture._PATH, "127.0.0.1:18789"),
+        ("CONNECT", fixture._PATH, "127.0.0.1:18789"),
+        ("TRACE", fixture._PATH, "127.0.0.1:18789"),
     ]:
         headers, response = request(method, path, host)
-        assert headers[0][1] in {400, 404, 405}
+        expected = 404 if method == "GET" else 405
+        assert ("status", expected) in headers
         assert not response and not any(key.lower() == "location" for key, _ in headers)
 
 
-def test_loopback_post_requires_every_committed_fact_and_the_staged_pdf(
-        monkeypatch, tmp_path):
-    """A success response is earned only by one exact synthetic multipart POST."""
-    document = tmp_path / "Synthetic-Resume.pdf"
-    document.write_bytes(fixture._RESUME_BYTES)
-    state = fixture._SyntheticRun(str(document))
-    state.enable_positive_fixture()
-    state.uploaded = True
-    state.input_values.update({
-        # The receiver independently checks typed text as well as committed captions.
-        "#name": fixture._FACTS["Name"],
-        "#additional": fixture._FACTS["Additional question"],
-        "#location": fixture._FACTS["Where are you located?"],
-        "#phone-country": fixture._FACTS["What is your phone country?"],
-    })
-    state.committed = {key: (fixture._FACTS[key], value)
-                       for key, value in fixture._MACHINE_VALUES.items()}
-    monkeypatch.setattr(fixture, "_daemon_origin", lambda: True)
-    boundary = b"synthetic-boundary"
-    parts = []
-    for name, value in fixture._POST_FIELDS.items():
-        parts.extend([b"--" + boundary,
-                      f'Content-Disposition: form-data; name="{name}"'.encode(),
-                      b"", value.encode("utf-8")])
-    parts.extend([b"--" + boundary,
-                  b'Content-Disposition: form-data; name="resume"; filename="Synthetic-Resume.pdf"',
-                  b"Content-Type: application/pdf", b"", fixture._RESUME_BYTES,
-                  b"--" + boundary + b"--", b""])
-    body = bytes([13, 10]).join(parts)
+def test_fixture_records_post_but_always_refuses_with_405():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
     handler = object.__new__(fixture._FixtureHandler)
     handler.path = fixture._PATH
+    handler.command = "POST"
     handler.requestline = f"POST {fixture._PATH} HTTP/1.1"
-    handler.headers = {
-        "Host": "127.0.0.1:18789",
-        "Content-Length": str(len(body)),
-        "Content-Type": "multipart/form-data; boundary=synthetic-boundary",
-    }
-    handler.rfile = io.BytesIO(body)
+    handler.headers = {"Host": "127.0.0.1:18789", "Content-Length": "0",
+                       "Content-Type": "multipart/form-data; boundary=synthetic"}
+    handler.rfile = io.BytesIO(b"an otherwise plausible form body")
     handler.wfile = io.BytesIO()
     handler.server = SimpleNamespace(synthetic_run=state)
     statuses = []
     handler.send_response = statuses.append
     handler.send_header = lambda *_args: None
     handler.end_headers = lambda: None
-    state.input_values["#location"] = "Unapproved Synthetic City"
-    handler.do_POST()
-    assert statuses == [405] and state.post_count == 0
-    state.input_values["#location"] = fixture._FACTS["Where are you located?"]
-    handler.rfile = io.BytesIO(body)
-    handler.wfile = io.BytesIO()
-    statuses.clear()
-    handler.do_POST()
-    assert statuses == [200]
-    assert b"Thank you for applying" in handler.wfile.getvalue()
-    assert state.post_count == 1 and state.post_payload == fixture._POST_FIELDS
-    handler.rfile = io.BytesIO(body)
-    handler.wfile = io.BytesIO()
-    statuses.clear()
     handler.do_POST()
     assert statuses == [405] and not handler.wfile.getvalue()
-    assert state.post_attempts == 3
-    assert [receipt["response_status"] for receipt in state.post_receipts] == [405, 200, 405]
-    assert all(receipt["request_line"] == f"POST {fixture._PATH} HTTP/1.1"
-               and receipt["host"] == "127.0.0.1:18789"
-               and receipt["content_type"].startswith("multipart/form-data;")
-               for receipt in state.post_receipts)
+    assert state.post_attempts == 1 and state.post_count == 0
+    assert state.post_rejection == (
+        "Synthetic fixture refuses every non-GET form method.")
+    assert state.post_receipts[0]["response_status"] == 405
+
 
 
 async def test_real_session_thread_context_and_read_only_connected_path(

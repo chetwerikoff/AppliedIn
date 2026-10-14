@@ -18,7 +18,7 @@ from agent import run as R
 from core.models import Status
 from tools.schema import MatchScore
 
-from test_scorer_invalid_output import (
+from tests.agent.test_scorer_invalid_output import (
     JD, SEED, SYNTHETIC_STATE, _material, _response, harness,
 )
 

@@ -226,7 +226,8 @@ def test_authorization_claim_never_adds_code_cap(
     assert len(h.fake.requests) == 1
     if score == 2:
         # A low raw model fit still skips; the code has added no further cap.
-        assert result["reason"] == "low_score"
+        assert result["result"] == "skipped"
+        assert h.stores.tracking.row["skip_reason"] == "low_score"
     else:
         assert h.saved[0]["match_score"] == 8
 

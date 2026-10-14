@@ -59,9 +59,9 @@ This form is served only by the daemon's --synthetic-browser-fixture mode.
 It has no external links, cross-origin resources, redirects or real ATS connection.</p>
 <form id="synthetic-form" method="POST" enctype="multipart/form-data"
  action="http://127.0.0.1:18789/fixture/example-co/job/1">
-<div class="form-group"><label for="name">Name</label>
+<div class="form-group"><label for="name" data-automation-id="formLabel">Name</label>
 <input id="name" name="name" type="text"></div>
-<div class="form-group"><label for="additional">Additional question</label>
+<div class="form-group"><label for="additional" data-automation-id="formLabel">Additional question</label>
 <textarea id="additional" name="additional"></textarea></div>
 <div class="form-group"><label for="resume">Résumé</label>
 <input id="resume" name="resume" type="file" required></div>
@@ -208,9 +208,9 @@ class _SyntheticRun:
     def enable_positive_fixture(self) -> None:
         self.positive = True
         specs = {
-            "Name": ("#name", "Name", "", "input", "text"),
-            "Additional question": ("#additional", "Additional question", "",
-                                    "textarea", "textarea"),
+            "Name": ("#name", "Name", "Name", "input", "text"),
+            "Additional question": ("#additional", "Additional question",
+                                    "Additional question", "textarea", "textarea"),
             "Where are you located?": ("#location", "Where are you located?",
                                         "Where are you located?", "input", "combobox"),
             "What is your phone country?": ("#phone-country",
@@ -529,10 +529,41 @@ def run() -> int:
                       and state.uploaded and state.submit_ipc == 1
                       and state.post_count == 1
                       and state.post_payload == _POST_FIELDS)
+                field_selectors = {"Name": "#name",
+                                   "Additional question": "#additional"}
+                outcomes = [
+                    {"field": key, "outcome": (
+                        "filled" if state.input_values.get(selector) == _FACTS[key]
+                        else "not_reached")}
+                    for key, selector in field_selectors.items()
+                ]
+                for key in _MACHINE_VALUES:
+                    committed = state.committed.get(key) == (
+                        _FACTS[key], _MACHINE_VALUES[key])
+                    outcomes.append({
+                        "field": key,
+                        "outcome": "option_click_sent" if committed else "not_reached",
+                    })
+                outcomes.append({
+                    "field": "Résumé",
+                    "outcome": "uploaded" if state.uploaded else "not_reached",
+                })
+                form_question = result.get("form_question") or {}
+                gate = None if result.get("status") == "applied" else {
+                    "kind": result.get("reason") or result.get("status"),
+                    "field": {selector: field for field, selector in (
+                        *field_selectors.items(),
+                        ("Where are you located?", "#location"),
+                        ("What is your phone country?", "#phone-country"),
+                        ("Are you authorized to work?", "#work-authorization"),
+                    )}.get(form_question.get("selector")),
+                    "reason": result.get("question") or result.get("detail"),
+                }
                 print(json.dumps({"fixture": "native-form", "submitted": ok,
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),
-                                  "post_received": state.post_count == 1}))
+                                  "post_received": state.post_count == 1,
+                                  "gate": gate, "fields": outcomes}))
                 return 0 if ok else 1
         finally:
             server.shutdown()

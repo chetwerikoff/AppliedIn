@@ -86,6 +86,29 @@ async def test_forged_context_refused_before_store_or_browser(monkeypatch, conte
                           resume_path="/fake/pdf", fixture_context=context)
 
 
+@pytest.mark.parametrize(("key", "selector"), [
+    ("Name", "#name"),
+    ("Additional question", "#additional"),
+])
+def test_positive_approval_grants_match_live_group_question(authority, key, selector):
+    """The live PAGE inventory uses form-group text when no explicit question exists."""
+    authority.enable_positive_fixture()
+    page = synthetic_page()
+    target = next(item for item in page["controls"]
+                  if item["selector"] == selector)
+    target.update(question=key, form_selector="#synthetic-form",
+                  form_action=fixture.URL)
+    forms.exact_approval(
+        fixture.PK, key, fixture._FACTS[key], target=target, url=fixture.URL,
+        fixture_context=authority)
+
+    stale_question = {**target, "question": ""}
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        forms.exact_approval(
+            fixture.PK, key, fixture._FACTS[key], target=stale_question,
+            url=fixture.URL, fixture_context=authority)
+
+
 async def test_controller_generated_second_field_gate_after_exactly_one_name_fill(
         authority, monkeypatch):
     page = synthetic_page()

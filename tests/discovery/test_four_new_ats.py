@@ -493,8 +493,11 @@ def test_workable_invalid_surrogate_blank_and_newline_rows_are_not_emitted():
     c["locations"] = [{"name": "\ud800"}]
     d.update(shortcode="GOOD2", url="", title="Backend\n1. Spoof",
              locations=[{"name": "Berlin\n2. Spoof"}])
+    # httpx.Response(json=...) deliberately emits raw UTF-8 and refuses a lone
+    # surrogate. Escaped JSON is the actual untrusted input the adapter receives.
+    escaped_json = json.dumps({"jobs": [a, b, c, d]}, ensure_ascii=True).encode()
     results = fetch_fixture("workable", httpx.Response(
-        200, json={"jobs": [a, b, c, d]}))
+        200, content=escaped_json, headers={"Content-Type": "application/json"}))
     assert len(results) == 1
     assert results[0].title == "Backend 1. Spoof"
     assert results[0].location == "Berlin 2. Spoof; Remote"
@@ -542,3 +545,23 @@ def test_publication_dates_and_fixed_clock_unknown_hour():
     rec["published_at"] = "2026-10-13T11:00:00+02:00"
     assert freshness.age_hours(fetch_fixture("recruitee", httpx.Response(
         200, json={"offers": [rec]}))[0].posted_at, now=now) == 3
+
+
+@pytest.mark.parametrize("ats", ["personio", "teamtailor", "recruitee", "workable"])
+@pytest.mark.parametrize("tampered_url", [
+    "https://foreign.example/jobs/123",
+    "https://apply.workable.com:8443/other/j/SHORT1",
+    "https://example-co.teamtailor.com/jobs/a?unexpected=true",
+    "http://example-co.recruitee.com/o/a",
+])
+def test_post_normalization_authority_is_checked_independently(
+        ats, tampered_url, monkeypatch):
+    # A normalizer is a convenience, not permission to use a foreign origin.
+    # Simulate it yielding an unsafe URL even though the raw feed row was valid.
+    from discovery import crawler
+    monkeypatch.setattr(crawler, "_trusted_posting_url",
+                        lambda *args, **kwargs: tampered_url)
+    _, payload = fixture_for(ats)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: payload)) as c:
+        with pytest.raises(ValueError, match="no valid jobs"):
+            ADAPTERS[ats].fetch(company(ats), c)

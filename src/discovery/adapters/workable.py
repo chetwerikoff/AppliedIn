@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import httpx
 
 from core.logging import get_logger
@@ -46,7 +48,7 @@ class WorkableAdapter:
             candidate = f"https://{host}/{account}/j/{code}"
             link = _posting_url(
                 candidate, host,
-                rf"/{__import__('re').escape(account)}/j/[A-Za-z0-9][A-Za-z0-9_-]{{0,127}}",
+                rf"/{re.escape(account)}/j/[A-Za-z0-9][A-Za-z0-9_-]{{0,127}}",
                 base)
             if link is None:
                 continue

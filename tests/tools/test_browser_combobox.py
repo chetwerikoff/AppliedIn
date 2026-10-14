@@ -138,16 +138,22 @@ def test_resume_job_mints_the_exact_combobox_grant_from_direct_gate(monkeypatch)
     from agent import run
     current = page()
     target = current['controls'][0]
-    question = forms._disclosure_question(
-        current, target, {'#country': {'visible': True, 'readonly': False,
-                                        'disabled': False, 'inert': False,
-                                        'combobox': target['combobox']}}, URL)
-    question['pk'] = PK
-    row = {'pk': PK, 'status': 'needs_human', 'jd_url': URL,
-           'company': 'example-co', 'gate_source': 'applier',
-           'gate_call_id': 'direct',
-           'gate_pending': {'question': 'Answer the observed field.',
-                            'form_question': question}}
+    row = {'pk': PK, 'status': 'submitting', 'jd_url': URL,
+           'company': 'example-co', 'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    with pytest.raises(forms.Gate) as raised:
+        asyncio.run(forms.execute(
+            Session(current), current, {'action': 'combobox',
+                                        'selector': '#country',
+                                        'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL))
+    question = raised.value.form_question
+    assert question['selector'] == '#country'
+    row.update(status='needs_human', gate_source='applier', gate_call_id='direct',
+               gate_pending={'question': 'Answer the observed field.',
+                             'form_question': question})
 
     class Tracking:
         def get(self, pk):
@@ -400,6 +406,9 @@ def test_typed_visible_combobox_drift_gates_pre_submit():
 
 def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypatch):
     current = page()
+    current['controls'][0]['combobox']['options'] = [{
+        'selector': '#country-example', 'unique': True,
+        'label': 'Other Country', 'value': 'Example Country', 'selected': False}]
     monkeypatch.setattr(forms, '_row', lambda _pk: {
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant('Example Country')}})
@@ -408,7 +417,7 @@ def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypat
         asyncio.run(forms.execute(
             session, current, {'action': 'combobox', 'selector': '#country',
                                'fact': 'What country?'},
-            facts={'What country?': 'EX'}, filled={}, resume_path='',
+            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='',
             pk=PK, job_url=URL))
     assert not any(call == ('click', '#country-example') for call in session.calls)
@@ -446,3 +455,64 @@ async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
             pk=PK, job_url=URL)
     assert not any(call[0] == 'click' and call[1] != '#country'
                    for call in session.calls)
+
+async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
+    closed = control()
+    closed['combobox'].update(linked=False, listbox_selector='', options=[])
+    opened = page()
+    committed = page(control(selected_text='Example Country', selected_value='EX',
+                            hidden_value='EX'))
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    from types import SimpleNamespace
+    token = SimpleNamespace(pk=PK, company='example-co', wrapper=URL, url=URL, ats='greenhouse')
+    monkeypatch.setattr(forms, '_alias_current', lambda *args, **kwargs: True)
+    checked = []
+    def route(_destination, *_origins, provenance=None):
+        checked.append(provenance)
+        return provenance is token
+    monkeypatch.setattr(forms, 'navigation_allowed', route)
+    session = DynamicSession(page(closed), opened, committed)
+    receipt = await forms.execute(
+        session, page(closed), {'action': 'combobox', 'selector': '#country',
+                                'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='', pk=PK,
+        job_url=URL, provenance=token)
+    assert receipt['action'] == 'combobox'
+    assert checked and all(item is token for item in checked)
+    assert ('click', '#country-example') in session.calls
+
+async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
+    from tools import browser_skill as bsk
+    from unittest.mock import AsyncMock
+    calls = []
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kwargs: calls.append('dispatch'))
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'possible_submission': False,
+        'human_approved_answers': {'What country?': grant()}})
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
+    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
+    monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: None)
+    initial = page()
+    committed = page(control(selected_text='Example Country', selected_value='EX',
+                             hidden_value='EX'))
+    class ApplySession(Session):
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def navigate(self, _url):
+            return deepcopy(self.current)
+    session = ApplySession(initial, committed)
+    monkeypatch.setattr(bsk, 'Session', lambda _kind: session)
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        {'action': 'gate', 'question': 'Stop after the synthetic committed choice.'}]))
+    outcome = await forms.apply(
+        URL, 'example-co', {'What country?': 'Example Country'}, 'synthetic',
+        pk=PK, resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate'
+    assert ('click', '#country-example') in session.calls
+    assert calls.count('dispatch') >= 4

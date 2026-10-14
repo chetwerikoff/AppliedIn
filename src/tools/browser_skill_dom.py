@@ -87,8 +87,10 @@ PAGE = r"""(() => {
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
         return {linked:!!list, link_id:linkId(e),
+          listbox_selector:list ? selector(list) : '', options,
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
+          displayed_text:clean(e.value || e.innerText || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:receivers.length === 1 ? selector(receivers[0]) : '',
           hidden_value:receivers.length === 1 ? receivers[0].value : ''};

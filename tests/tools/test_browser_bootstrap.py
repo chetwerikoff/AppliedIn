@@ -1487,3 +1487,26 @@ async def test_alias_revoked_during_session_acquisition_prevents_navigation(
     assert outcome['status'] == 'gate' and outcome['form_question'] is None
     assert browser.calls == []
     assert not decide.await_count
+
+@pytest.mark.parametrize('tag', ['input', 'div'])
+async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(tag):
+    combo = field(
+        'Country', '#country', tag=tag, type='combobox', required=True,
+        combobox={'linked': True, 'link_id': 'country-list',
+                  'listbox_selector': '#country-list',
+                  'options': [{'selector': '#country-example', 'unique': True,
+                               'label': 'Example Country', 'value': 'EX',
+                               'selected': False}],
+                  'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    current = inventory(combo, submit())
+    evidence = witness(current)
+    evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
+    browser = Browser(current, result=evidence)
+    with pytest.raises(forms.Gate) as gated:
+        await forms._bootstrap(browser, current, PK, {}, URL)
+    assert gated.value.form_question == {
+        'pk': PK, 'label': 'Country', 'control_label': 'Country',
+        'question': '', 'selector': '#country', 'url': URL, 'tag': tag,
+        'type': 'combobox', 'form_selector': '#application', 'form_action': URL}
+    assert [call[0] for call in browser.calls] == ['evaluate']

@@ -891,10 +891,11 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                    for k in ('label', 'selector', 'url', 'control_label'))
             or not isinstance(field.get('question'), str)
             or field['label'] != (field['question'] or field['control_label'])
-            or field.get('tag') not in {'input', 'textarea', 'select'}
+            or field.get('tag') not in {'input', 'textarea', 'select', 'div'}
             or not isinstance(field.get('type'), str)
             or ((field['tag'] == 'input' and field['type'] not in {
-                    'text', 'email', 'tel', 'url', 'number', 'checkbox', 'radio'})
+                    'text', 'email', 'tel', 'url', 'number', 'checkbox', 'radio', 'combobox'})
+                or (field['tag'] == 'div' and field['type'] != 'combobox')
                 or (field['tag'] == 'textarea' and field['type'] != 'textarea')
                 or (field['tag'] == 'select' and field['type'] != 'select'))
             or any(not isinstance(field.get(k), str) or not field[k].strip()

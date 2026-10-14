@@ -75,9 +75,12 @@ PAGE = r"""(() => {
           .map(o=>({selector:selector(o),unique:document.querySelectorAll(selector(o)).length === 1,
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',
             label:clean(o.innerText),selected:o.getAttribute('aria-selected') === 'true'})) : [];
-        const hidden = e.getAttribute('data-value-input');
-        const receivers = hidden ? Array.from(document.querySelectorAll('input[type="hidden"]'))
-          .filter(h=>h.id === hidden && h.form === form) : [];
+        const hiddenId = e.getAttribute('data-value-input');
+        const hiddenName = e.getAttribute('data-value-name');
+        const receivers = Array.from(document.querySelectorAll('input[type="hidden"]'))
+          .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
+            (typeof e.contains === 'function' && e.contains(h)) ||
+            (hiddenName && h.name === hiddenName)));
         return {linked:!!list, link_id:linkId(e),
           listbox_selector:list ? selector(list) : '',
           options, selected_text:clean(e.getAttribute('aria-valuetext') ||

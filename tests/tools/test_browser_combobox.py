@@ -16,7 +16,8 @@ OPTIONS = [
      'value': 'OT', 'selected': False},
 ]
 
-def control(*, selected_text='', selected_value='', hidden_value=''):
+def control(*, selected_text='', selected_value='', hidden_value='',
+            hidden_selector='#country-code'):
     return {
         'selector': '#country', 'label': 'Country', 'question': 'What country?',
         'tag': 'input', 'type': 'combobox', 'required': True, 'disabled': False,
@@ -27,7 +28,7 @@ def control(*, selected_text='', selected_value='', hidden_value=''):
             'linked': True, 'link_id': 'country-list',
             'listbox_selector': '#country-list',
             'options': deepcopy(OPTIONS), 'selected_text': selected_text,
-            'selected_value': selected_value, 'hidden_selector': '#country-code',
+            'selected_value': selected_value, 'hidden_selector': hidden_selector,
             'hidden_value': hidden_value,
         },
     }
@@ -42,13 +43,16 @@ def button():
 def page(combo=None):
     target = combo or control()
     controls = [target, button()]
-    if target['combobox'] and target['combobox'].get('hidden_value'):
+    if target['combobox'] and target['combobox'].get('hidden_selector'):
+        value = target['combobox']['hidden_value']
         controls.append({
-            'selector': '#country-code', 'label': 'Country code', 'question': '',
+            'selector': target['combobox']['hidden_selector'],
+            'label': 'Country code', 'question': '',
             'tag': 'input', 'type': 'hidden', 'required': False, 'disabled': False,
-            'value': target['combobox']['hidden_value'], 'has_value': True,
+            'value': value, 'has_value': bool(value),
             'in_form': True, 'form_selector': '#application', 'form_action': URL,
-            'formaction': '', 'submit': False, 'checked': False, 'options': [],
+            'formaction': '', 'submit': False, 'checked': False, 'name': 'country_code',
+            'options': [],
         })
     return {'url': URL, 'text': 'Synthetic form', 'controls': controls,
             'inventory_verified': True, 'truncated': False, 'opaque_controls': False,
@@ -198,16 +202,65 @@ async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypat
         resume_path='', company='example-co', jd_text='', resume_tex='',
         github='', pk=PK, job_url=URL)
     assert receipt['approved_value'] == 'Example Country'
+    assert receipt['hidden_value_before'] == ''
+    assert receipt['hidden_value'] == receipt['committed_value'] == 'EX'
     assert filled == {'#country': 'Example Country'}
     assert ('click', '#country-example') in session.calls
-    forms.check_form(page(committed['controls'][0]), filled, True)
-
+    forms.check_form(page(committed['controls'][0]), filled, True,
+                     receipts=[receipt])
     forms.check_approvals(PK, [receipt], committed)
+
+    changed_hidden = page(control(selected_text='Example Country',
+                                selected_value='EX', hidden_value='OTHER'))
+    with pytest.raises(forms.Gate, match='A hidden form value is not independently authorized'):
+        forms.check_form(changed_hidden, filled, True, receipts=[receipt])
 
     changed_machine_value = page(control(
         selected_text='Example Country', selected_value='OT', hidden_value='OT'))
     with pytest.raises(forms.Gate, match='committed combobox value changed'):
         forms.check_approvals(PK, [receipt], changed_machine_value)
+
+
+@pytest.mark.parametrize(('before', 'after'), [
+    ('EX', 'EX'),  # A pre-existing value unchanged by this selection is not authority.
+    ('', 'OTHER'),  # A changed value must equal the selected option's machine value.
+])
+async def test_hidden_value_must_change_to_the_selected_machine_value(
+        monkeypatch, before, after):
+    current = page(control(hidden_value=before))
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_value=after))
+    row = {'pk': PK, 'status': 'submitting',
+           'human_approved_answers': {'What country?': grant()}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    session = Session(current, committed)
+    with pytest.raises(forms.Gate,
+                       match='A hidden form value is not independently authorized'):
+        await forms.execute(
+            session, current, {'action': 'combobox', 'selector': '#country',
+                               'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL)
+
+
+def test_unlinked_or_changed_without_selection_hidden_values_gate():
+    unlinked = page(control(hidden_value='EX', hidden_selector=''))
+    unlinked['controls'].append({
+        'selector': '#country-code', 'label': 'Unrelated country value',
+        'question': '', 'tag': 'input', 'type': 'hidden', 'required': False,
+        'disabled': False, 'value': 'EX', 'has_value': True, 'in_form': True,
+        'form_selector': '#application', 'form_action': URL, 'formaction': '',
+        'submit': False, 'checked': False, 'name': 'country_value', 'options': [],
+    })
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
+        forms.check_form(unlinked, {'#country': 'Example Country'}, True)
+
+    changed_without_selection = page(control(hidden_value='EX'))
+    with pytest.raises(forms.Gate,
+                       match='A hidden form value is not independently authorized'):
+        forms.check_form(changed_without_selection, {}, True)
+
 
 
 async def test_closed_picker_loads_options_after_exact_approved_filter(monkeypatch):
@@ -239,7 +292,7 @@ async def test_closed_picker_loads_options_after_exact_approved_filter(monkeypat
 def test_combobox_pre_submit_requires_persistent_matching_commit(caption, value, hidden):
     current = page(control(selected_text=caption, selected_value=value,
                            hidden_value=hidden))
-    with pytest.raises(forms.Gate, match='combobox'):
+    with pytest.raises(forms.Gate, match='hidden form value|combobox'):
         forms.check_form(current, {'#country': 'Example Country'}, True)
 
 

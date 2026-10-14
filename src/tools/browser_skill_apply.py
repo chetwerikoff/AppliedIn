@@ -389,7 +389,8 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         raise Gate('The tailored PDF is missing; nothing may be submitted without it.')
 
 
-def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -> None:
+def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
+               receipts: list | None = None) -> None:
     if page.get('truncated') or page.get('inventory_verified') is not True:
         raise Gate('The form inventory is incomplete; review the full form before submitting.')
     if page.get('opaque_controls') or page.get('unsupported_frames') or page.get('shadow_roots'):
@@ -410,14 +411,35 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
     for target in controls:
         typ = target.get('type', '')
         if typ == 'hidden':
-            owners = [c for c in controls if c.get('type') == 'combobox'
-                      and (c.get('combobox') or {}).get('hidden_selector') == target.get('selector')]
-            if len(owners) == 1:
-                combo = owners[0].get('combobox') or {}
-                if combo.get('hidden_value') != combo.get('selected_value'):
-                    raise Gate('A linked combobox value changed before submission.')
-            elif target.get('in_form') and (target.get('required') or target.get('has_value')):
-                raise Gate('A hidden form value is not independently authorized.')
+            if target.get('in_form') is True:
+                owners = [c for c in controls if c.get('type') == 'combobox'
+                          and c.get('in_form') is True
+                          and c.get('form_selector') == target.get('form_selector')
+                          and (c.get('combobox') or {}).get('hidden_selector')
+                          == target.get('selector')]
+                authorized = False
+                if len(owners) == 1:
+                    owner = owners[0]
+                    combo = owner.get('combobox') or {}
+                    linked_receipts = [r for r in receipts or []
+                                       if r.get('action') == 'combobox'
+                                       and r.get('selector') == owner.get('selector')
+                                       and r.get('hidden_selector') == target.get('selector')]
+                    if len(linked_receipts) == 1:
+                        receipt = linked_receipts[0]
+                        before = receipt.get('hidden_value_before')
+                        after = receipt.get('hidden_value')
+                        authorized = (
+                            bool(owner.get('form_selector'))
+                            and owner.get('form_action') == target.get('form_action')
+                            and isinstance(before, str) and isinstance(after, str)
+                            and before != after and bool(after)
+                            and after == receipt.get('committed_value')
+                            and after == combo.get('selected_value')
+                            and after == combo.get('hidden_value')
+                            and after == target.get('value'))
+                if not authorized:
+                    raise Gate('A hidden form value is not independently authorized.')
             continue
         if target.get('disabled') or typ in {'button', 'submit'}:
             continue
@@ -429,6 +451,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                     or not combo.get('selected_value')
                     or (combo.get('hidden_selector')
                         and combo.get('hidden_value') != combo.get('selected_value'))):
+                if combo.get('hidden_selector') and combo.get('hidden_value') != combo.get('selected_value'):
+                    raise Gate('A hidden form value is not independently authorized.')
                 raise Gate(f'Unverified or changed combobox value: {target["label"]}')
             guarded_value(target, expected)
             continue
@@ -575,8 +599,11 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           value:o.getAttribute('data-value') || o.getAttribute('value') || '',
           selected:o.getAttribute('aria-selected') === 'true'})) : [];
       const hiddenId = e.getAttribute('data-value-input');
-      const hidden = hiddenId ? Array.from(document.querySelectorAll('input[type="hidden"]'))
-        .filter(h=>h.id === hiddenId && h.form === form) : [];
+      const hiddenName = e.getAttribute('data-value-name');
+      const hidden = Array.from(document.querySelectorAll('input[type="hidden"]'))
+        .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
+          (typeof e.contains === 'function' && e.contains(h)) ||
+          (hiddenName && h.name === hiddenName)));
       return {selector:ownSelector, unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
@@ -886,7 +913,9 @@ def _combobox_options(target: dict) -> list:
                    or not isinstance(o.get('value'), str) for o in options)
             or len({o['selector'] for o in options}) != len(options)
             or len({_same_key(o['label']) for o in options}) != len(options)
-            or (combo.get('hidden_selector') and not isinstance(combo.get('hidden_value'), str))):
+            or (combo.get('hidden_selector') and (
+                not isinstance(combo.get('hidden_selector'), str)
+                or not isinstance(combo.get('hidden_value'), str)))):
         raise Gate('The combobox option linkage is incomplete or ambiguous.')
     return options
 
@@ -1190,6 +1219,39 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     exact_approval(pk, key, answer, target=current, url=latest['url'],
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
+    # Refresh immediately before the option click so hidden-value authorization
+    # compares the receiver on both sides of this exact selection action.
+    before_page = await session.page()
+    before_page, before_witness = await _observe_controls(session, before_page)
+    before_target = control(before_page, action)
+    if (_combobox_stable_identity(before_target) != stable
+            or not navigation_allowed(before_page.get('url', ''),
+                                      job_url or observed['url'])):
+        raise Gate('The approved combobox changed before selecting its option.')
+    before_options = [o for o in _combobox_options(before_target)
+                      if o.get('selector') == option.get('selector')]
+    if (len(before_options) != 1
+            or before_options[0].get('label') != option.get('label')
+            or before_options[0].get('value') != option.get('value')):
+        raise Gate('The approved option changed before selection.')
+    option = before_options[0]
+    latest, latest_witness, current = before_page, before_witness, before_target
+    combo_before = current.get('combobox') or {}
+    hidden_selector = combo_before.get('hidden_selector', '')
+    hidden_value_before = combo_before.get('hidden_value', '')
+    if hidden_selector:
+        linked_inputs = [c for c in latest.get('controls', [])
+                         if c.get('selector') == hidden_selector
+                         and c.get('type') == 'hidden'
+                         and c.get('in_form') is True
+                         and c.get('form_selector') == current.get('form_selector')]
+        if (len(linked_inputs) != 1
+                or not isinstance(hidden_value_before, str)
+                or linked_inputs[0].get('value') != hidden_value_before):
+            raise Gate('A hidden form value is not independently authorized.')
+    exact_approval(pk, key, answer, target=current, url=latest['url'],
+                   **({'fixture_context': ctx} if ctx else {}))
+    guarded_value(current, answer)
     await session.call('click', option['selector'])
     committed = await session.page()
     committed, committed_witness = await _observe_controls(session, committed)
@@ -1202,19 +1264,33 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     witnessed = committed_witness.get(current['selector'], {}).get('combobox')
     if _combobox_stable_identity(after) != stable:
         raise Gate('The combobox identity changed during selection.')
+    if (hidden_selector and (not option['value']
+            or hidden_value_before == combo.get('hidden_value')
+            or combo.get('hidden_value') != option['value']
+            or witnessed != combo)):
+        raise Gate('A hidden form value is not independently authorized.')
     if (not _same(combo.get('selected_text', ''), option['label'])
             or not _same(combo.get('selected_value', ''), option['value'])
-            or (combo.get('hidden_selector')
-                and combo.get('hidden_value') != option['value'])
+            or combo.get('hidden_selector', '') != hidden_selector
             or witnessed != combo):
         raise Gate('The combobox did not expose an independently verified committed selection.')
+    if hidden_selector:
+        linked_inputs = [c for c in committed.get('controls', [])
+                         if c.get('selector') == hidden_selector
+                         and c.get('type') == 'hidden'
+                         and c.get('in_form') is True
+                         and c.get('form_selector') == after.get('form_selector')]
+        if (len(linked_inputs) != 1
+                or linked_inputs[0].get('value') != combo.get('hidden_value')):
+            raise Gate('A hidden form value is not independently authorized.')
     filled[current['selector']] = option['label']
     return {'action': 'combobox', 'label': current['label'],
             'selector': current['selector'], 'question': current.get('question', ''),
             'url': latest['url'], 'fact': key, 'approved_value': answer,
             'committed_caption': option['label'],
             'committed_value': combo['selected_value'],
-            'hidden_selector': combo.get('hidden_selector', ''),
+            'hidden_selector': hidden_selector,
+            'hidden_value_before': hidden_value_before,
             'hidden_value': combo.get('hidden_value', '')}
 
 
@@ -1598,7 +1674,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 fixture_context=ctx)
                         check_form_destination(page, target, *trusted_origins,
                                                provenance=provenance)
-                        check_form(page, filled, uploaded, Path(resume_path).name)
+                        check_form(page, filled, uploaded, Path(resume_path).name, history)
                         verify_history(history, page)
                         before = page
                         # The independent hold precedes IPC; only a possible click
@@ -1635,7 +1711,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     fixture_context=ctx)
                             check_form_destination(page, target, *trusted_origins,
                                                    provenance=provenance)
-                            check_form(page, filled, uploaded, Path(resume_path).name)
+                            check_form(page, filled, uploaded, Path(resume_path).name, history)
                             verify_history(history, page)
                             before = page
                             step['last_button'] = target['label']

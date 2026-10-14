@@ -944,6 +944,7 @@ async def test_choice_caption_mismatch_in_dom_witness_gates_without_grant(
 GH_PK = 'example-co#123456'
 GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
 GH_DIRECT = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+GH_CAREERS = 'https://careers.example-co.test/openings'
 
 
 def _greenhouse_row():
@@ -953,22 +954,22 @@ def _greenhouse_row():
             'possible_submission': False}
 
 
-def _greenhouse_config(monkeypatch, tmp_path):
+def _greenhouse_config(monkeypatch, tmp_path, *, careers_url=GH_CAREERS):
     from agent import run
 
     config = tmp_path / 'watchlist.yaml'
     config.write_text(
         'companies:\n  - name: example-co\n    ats: greenhouse\n'
         '    board: example-co\n'
-        '    careers_url: https://careers.example-co.test/openings\n')
+        f'    careers_url: {careers_url}\n')
     settings = SimpleNamespace(config_dir=str(tmp_path))
     monkeypatch.setattr('core.config.get_settings', lambda: settings)
     monkeypatch.setattr(run, 'get_settings', lambda: settings)
     return config
 
 
-def _greenhouse_session(monkeypatch, tmp_path, page=None):
-    _greenhouse_config(monkeypatch, tmp_path)
+def _greenhouse_session(monkeypatch, tmp_path, page=None, *, careers_url=GH_CAREERS):
+    _greenhouse_config(monkeypatch, tmp_path, careers_url=careers_url)
     if page is None:
         page = inventory(field(form_action=GH_DIRECT),
                          submit(form_action=GH_DIRECT), url=GH_DIRECT)
@@ -1011,6 +1012,12 @@ def test_explicit_greenhouse_tenant_requires_canonical_row_and_config():
         assert _greenhouse_provenance(row, [good.model_copy(
             update={'board': board})]) is None
     for careers in ('http://careers.example-co.test/openings',
+                    'http://careers.example-co.test',
+                    'https://user@careers.example-co.test',
+                    'https://careers.example-co.test:443',
+                    'https://careers.example-co.test?x=1',
+                    'https://careers.example-co.test?',
+                    'https://careers.example-co.test#fragment',
                     'https://careers.example-co.test:443/openings',
                     'https://user@careers.example-co.test/openings',
                     'https://careers.example-co.test/openings?x=1',
@@ -1025,6 +1032,38 @@ def test_explicit_greenhouse_tenant_requires_canonical_row_and_config():
     assert _greenhouse_provenance(row, []) is None
     assert _greenhouse_provenance(row, [good.model_copy(
         update={'ats': 'custom'})]) is None
+
+
+def test_configured_greenhouse_origin_keeps_literal_provenance():
+    from discovery.watchlist import CompanyConfig
+
+    row = _greenhouse_row()
+    aliases = []
+    for careers_url in ('https://careers.example-co.test',
+                        'https://careers.example-co.test/'):
+        config = CompanyConfig(name='example-co', ats='greenhouse',
+                               board='example-co', careers_url=careers_url)
+        alias = _greenhouse_provenance(row, [config])
+        assert alias is not None
+        assert (alias.pk, alias.company, alias.job_id, alias.ats,
+                alias.wrapper, alias.board, alias.url) == (
+                    GH_PK, 'example-co', '123456', 'greenhouse',
+                    GH_WRAP, 'example-co', GH_DIRECT)
+        assert alias.careers_url == careers_url
+        aliases.append(alias)
+    # Rechecking a changed configured spelling must not reuse its old proof.
+    assert aliases[0] != aliases[1]
+
+
+def test_empty_path_greenhouse_wrapper_stays_rejected_for_origin_config():
+    from discovery.watchlist import CompanyConfig
+
+    config = CompanyConfig(name='example-co', ats='greenhouse',
+                           board='example-co',
+                           careers_url='https://careers.example-co.test')
+    row = {**_greenhouse_row(),
+           'jd_url': 'https://careers.example-co.test?gh_jid=123456'}
+    assert _greenhouse_provenance(row, [config]) is None
 
 
 def test_unicode_company_collisions_do_not_authorize_alias():
@@ -1086,10 +1125,16 @@ def test_alias_effective_route_guard_is_job_scoped_and_legacy_unchanged():
         assert not forms.navigation_allowed(route, provenance=alias), route
 
 
-async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(monkeypatch, tmp_path):
+@pytest.mark.parametrize('careers_url', [
+    GH_CAREERS, 'https://careers.example-co.test',
+    'https://careers.example-co.test/',
+])
+async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
+        monkeypatch, tmp_path, careers_url):
     from agent import run
 
-    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path)
+    browser, decide, row = _greenhouse_session(
+        monkeypatch, tmp_path, careers_url=careers_url)
     response = await forms.apply(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')

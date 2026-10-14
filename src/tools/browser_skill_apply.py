@@ -437,15 +437,23 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     return parts.join(' > ');
   };
   const visible = e => {
-    if (!e.getClientRects().length) return false;
+    const rects = e.getClientRects();
+    if (!rects.length) return false;
+    let fixed = false;
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
       const style = getComputedStyle(n);
       if (!style || style.display === 'none' ||
           style.visibility === 'hidden' || style.visibility === 'collapse' ||
           !(Number(style.opacity) > 0))
         return false;
+      if (style.position === 'fixed') fixed = true;
     }
-    return true;
+    // Scroll offsets preserve ordinary below-fold controls, but a fixed control
+    // (including one inside a fixed ancestor) also needs viewport-positive edges.
+    return Array.from(rects).some(rect =>
+      rect.width > 0 && rect.height > 0 &&
+      rect.right + scrollX > 0 && rect.bottom + scrollY > 0 &&
+      (!fixed || (rect.right > 0 && rect.bottom > 0)));
   };
   // PAGE.label can fall back to input.name; choices need actual visible
   // caption text rather than that non-visible fallback.
@@ -971,8 +979,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 write_value = target['value']
         else:
             guarded_value(target, value)
-            write_value = (choose_value(target, value, str(action.get('value', '')))
-                           if verb == 'select' else value)
+            if verb == 'select':
+                try:
+                    write_value = choose_value(target, value, str(action.get('value', '')))
+                except Gate as exc:
+                    if str(exc) != 'No unambiguous option matches the approved answer.':
+                        raise
+                    raise Gate(gate_prompt, form_question=form_question) from None
+            else:
+                write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
         latest, latest_witness = await _observe_controls(session, page)
         current = control(latest, action)

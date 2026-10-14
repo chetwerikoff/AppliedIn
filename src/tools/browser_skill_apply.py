@@ -1740,6 +1740,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             direct_url = provenance.url
             trusted_origins = (url,)
         else:
+            # A query-derived Greenhouse tenant is untrusted; reject it before
+            # reading tracking, which can be unavailable and would mask the gate.
+            if (direct_url != url
+                    and urlsplit(direct_url).hostname == 'job-boards.greenhouse.io'
+                    and not navigation_allowed(direct_url, url, provenance=provenance)):
+                raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
             tracked = ((_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {})
             if tracked.get('ats') in _VENDOR_PATH:
                 provenance = await _probe_vendor_redirect(tracked, pk, company, url)

@@ -1611,6 +1611,10 @@ async def test_legacy_label_only_grant_never_writes(monkeypatch):
 async def test_derived_cross_tenant_board_refuses_before_open(monkeypatch):
     url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
+    def unavailable_row(*args, **kwargs):
+        raise OSError('tracking unavailable')
+    # The cross-tenant gate must not depend on tracking storage being reachable.
+    monkeypatch.setattr(forms, '_row', unavailable_row)
     monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
         'Cross-tenant direct board must be rejected before browser open'))
     result = await forms.apply(url, 'example-co', {}, 'synthetic',

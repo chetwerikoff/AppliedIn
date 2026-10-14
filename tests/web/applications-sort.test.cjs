@@ -276,7 +276,7 @@ test('all Applications filters retain selected column, direction and filtered or
   assert.match(h.rendered(), /aria-sort="descending"/);
   await paneChange(h, 'appOutcome', 'offer');
   assert.deepEqual(keys(h.rendered()), []);
-  assert.match(h.rendered(), /Nothing under this status filter/);
+  assert.match(h.rendered(), /Nothing matches your current filters/);
   assert.equal(h.state.appsSort.key, 'match');
 });
 

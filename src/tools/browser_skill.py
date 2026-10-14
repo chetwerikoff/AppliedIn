@@ -339,6 +339,8 @@ async def decision(task: str, page: dict, history: list, *, model: str = "") -> 
         "selector: string, fact: approved fact KEY or empty, value: option/search text, "
         "essay: boolean, url: observed href, report: object, question: string}. "
         "Use fill for text, select for native select, choose for radio/checkbox. "
+        "For an APPLICATION native select, leave value empty: the server chooses the option "
+        "from the exact human-approved answer. "
         "For a linked ARIA combobox, use combobox with its selector and exact approved fact KEY; "
         "the server selects only the uniquely linked option matching the approved visible caption. "
         "Discovery filters use actual option values. Never click or type into custom controls. "

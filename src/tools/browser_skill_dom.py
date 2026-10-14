@@ -35,9 +35,10 @@ PAGE = r"""(() => {
   };
   const linkedListbox = e => {
     const id = linkId(e);
-    const list = id ? document.getElementById(id) : null;
-    return list?.getAttribute('role') === 'listbox'
-      && document.querySelectorAll('#'+CSS.escape(id)).length === 1 ? list : null;
+    const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
+    if (!id || !matches.length) return null;
+    return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
+      ? matches[0] : null;
   };
   const controls = nodes.filter(e => (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
@@ -73,6 +74,10 @@ PAGE = r"""(() => {
         const options = list ? Array.from(list.querySelectorAll('[role="option"]'))
           .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
           .map(o=>({selector:selector(o),unique:document.querySelectorAll(selector(o)).length === 1,
+            tag:o.tagName.toLowerCase(), native_type:o.type || '',
+            submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
+              o.type === 'submit' || o.type === 'image',
+            navigates:o.tagName === 'A' && !!o.href,
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',
             label:clean(o.innerText),selected:o.getAttribute('aria-selected') === 'true'})) : [];
         const hiddenId = e.getAttribute('data-value-input');
@@ -82,8 +87,7 @@ PAGE = r"""(() => {
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
         return {linked:!!list, link_id:linkId(e),
-          listbox_selector:list ? selector(list) : '',
-          options, selected_text:clean(e.getAttribute('aria-valuetext') ||
+          selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:receivers.length === 1 ? selector(receivers[0]) : '',
@@ -114,9 +118,8 @@ PAGE = r"""(() => {
       const list = linkedListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;
-      // A unique explicit link inventories a closed picker; writes still require
-      // a freshly observed, unambiguous mounted option list.
-      if (!list) return true;
+      // Only a genuinely absent target is a provisional closed picker.
+      if (!list) return document.getElementById(linkId(e)) === null;
       const options = Array.from(list.querySelectorAll('[role="option"]'));
       if (options.some(o => o.closest('[role="listbox"]') !== list)) return false;
       linkedParts.add(list); options.forEach(o=>linkedParts.add(o));

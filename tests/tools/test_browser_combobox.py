@@ -17,10 +17,10 @@ OPTIONS = [
 ]
 
 def control(*, selected_text='', selected_value='', hidden_value='',
-            hidden_selector='#country-code'):
+            hidden_selector='#country-code', required=True):
     return {
         'selector': '#country', 'label': 'Country', 'question': 'What country?',
-        'tag': 'input', 'type': 'combobox', 'required': True, 'disabled': False,
+        'tag': 'input', 'type': 'combobox', 'required': required, 'disabled': False,
         'value': 'Example Country' if selected_text else '', 'has_value': bool(selected_text),
         'in_form': True, 'form_selector': '#application', 'form_action': URL,
         'formaction': '', 'submit': False, 'checked': False, 'name': 'country',
@@ -28,11 +28,10 @@ def control(*, selected_text='', selected_value='', hidden_value='',
             'linked': True, 'link_id': 'country-list',
             'listbox_selector': '#country-list',
             'options': deepcopy(OPTIONS), 'selected_text': selected_text,
-            'selected_value': selected_value, 'hidden_selector': hidden_selector,
-            'hidden_value': hidden_value,
+            'displayed_text': selected_text, 'selected_value': selected_value,
+            'hidden_selector': hidden_selector, 'hidden_value': hidden_value,
         },
     }
-
 
 def button():
     return {**control(), 'selector': '#submit', 'label': 'Submit application',
@@ -169,6 +168,20 @@ def test_resume_job_mints_the_exact_combobox_grant_from_direct_gate(monkeypatch)
     monkeypatch.setattr(forms, '_row', lambda _pk: {**row, 'status': 'submitting'})
     forms.exact_approval(PK, 'What country?', 'Example Country',
                          target=target, url=URL)
+    current = page()
+    committed = page(control(selected_text='Example Country', selected_value='EX',
+                             hidden_value='EX'))
+    session = Session(current, committed)
+    filled = {}
+    receipt = asyncio.run(forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL))
+    forms.check_form(page(committed['controls'][0]), filled, True,
+                     receipts=[receipt])
+    forms.check_approvals(PK, [receipt], committed)
 
 
 def test_combobox_choice_requires_caption_not_machine_value_and_exact_grant(monkeypatch):
@@ -313,3 +326,123 @@ def test_orphan_or_ambiguous_combobox_link_gates_before_option_ipc(monkeypatch):
             company='example-co', jd_text='', resume_tex='', github='', pk=PK,
             job_url=URL))
     assert not any(call[0] == 'click' for call in session.calls)
+
+@pytest.mark.parametrize('options', [
+    [{'selector': '#only', 'unique': True, 'label': 'Other Country', 'value': 'OT'}],
+    [OPTIONS[0], {**OPTIONS[0], 'selector': '#duplicate'}],
+    [{**OPTIONS[0], 'submit': True}],
+    [{**OPTIONS[0], 'navigates': True}],
+])
+async def test_unmatched_ambiguous_or_dangerous_option_never_clicks(monkeypatch, options):
+    current = page()
+    current['controls'][0]['combobox']['options'] = deepcopy(options)
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            session, current, {'action': 'combobox', 'selector': '#country',
+                               'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL)
+    assert not any(call == ('click', '#country-example') for call in session.calls)
+
+@pytest.mark.parametrize('field', ['label', 'value'])
+def test_combobox_material_assent_options_require_human_review(field):
+    current = page()
+    target = current['controls'][0]
+    target['combobox']['options'] = [
+        {'selector': '#yes', 'unique': True,
+         'label': 'I consent to arbitration' if field == 'label' else 'Other',
+         'value': 'I consent to arbitration' if field == 'value' else 'YES'},
+    ]
+    witness = {'#country': {'visible': True, 'readonly': False,
+                            'disabled': False, 'inert': False,
+                            'combobox': target['combobox']}}
+    with pytest.raises(forms.Gate, match='Legal or material assent'):
+        forms._disclosure_question(current, target, witness, URL)
+
+
+def test_optional_empty_combobox_and_hidden_control_keep_native_availability():
+    combo = control(required=False, hidden_selector='')
+    combo['combobox'].update(linked=False, link_id='optional-list',
+                             listbox_selector='', options=[])
+    hidden = {'selector': '#optional-hidden', 'label': 'Optional code',
+              'question': '', 'tag': 'input', 'type': 'hidden',
+              'required': False, 'disabled': False, 'value': '',
+              'has_value': False, 'in_form': True,
+              'form_selector': '#application', 'form_action': URL,
+              'formaction': '', 'submit': False, 'checked': False,
+              'name': 'optional_code', 'options': []}
+    current = page(combo)
+    current['controls'].append(hidden)
+    forms.check_form(current, {}, uploaded=True)
+
+
+def test_typed_visible_combobox_drift_gates_pre_submit():
+    target = control(selected_text='Example Country', selected_value='EX',
+                     hidden_value='EX')
+    target['combobox']['displayed_text'] = 'Different Country'
+    current = page(target)
+    receipt = {'action': 'combobox', 'selector': '#country', 'label': 'Country',
+               'question': 'What country?', 'url': URL, 'fact': 'What country?',
+               'approved_value': 'Example Country', 'committed_caption': 'Example Country',
+               'committed_value': 'EX', 'hidden_selector': '#country-code',
+               'hidden_value_before': '', 'hidden_value': 'EX'}
+    with pytest.raises(forms.Gate, match='combobox'):
+        forms.check_form(current, {'#country': 'Example Country'},
+                         uploaded=True, receipts=[receipt])
+    with pytest.raises(forms.Gate, match='committed combobox value changed'):
+        forms.check_approvals(PK, [receipt], current)
+
+
+def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypatch):
+    current = page()
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant('Example Country')}})
+    session = Session(current)
+    with pytest.raises(forms.Gate):
+        asyncio.run(forms.execute(
+            session, current, {'action': 'combobox', 'selector': '#country',
+                               'fact': 'What country?'},
+            facts={'What country?': 'EX'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL))
+    assert not any(call == ('click', '#country-example') for call in session.calls)
+
+async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
+    closed = control()
+    closed['combobox'].update(linked=False, listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    async def no_wait(_seconds):
+        return None
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+    class TimeoutSession:
+        def __init__(self):
+            self.current = page(closed)
+            self.calls = []
+        async def call(self, *args, **kwargs):
+            self.calls.append(args)
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(self.current)}
+            if args in {('click', '#country'),
+                        ('fill', '#country', '--value', 'Example Country')}:
+                return {}
+            pytest.fail(f'Unexpected browser IPC: {args}')
+        async def page(self):
+            return deepcopy(self.current)
+    session = TimeoutSession()
+    with pytest.raises(forms.Gate, match='did not expose current selectable options'):
+        await forms.execute(
+            session, page(closed), {'action': 'combobox', 'selector': '#country',
+                                    'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL)
+    assert not any(call[0] == 'click' and call[1] != '#country'
+                   for call in session.calls)

@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
+
+
+class Dealbreaker(BaseModel):
+    """Optional model-proposed constraint, not a code-proven incompatibility."""
+
+    kind: Literal["location", "authorization", "other"]
+    quote: str | None = None
 
 
 class MatchScore(BaseModel):
@@ -10,6 +19,7 @@ class MatchScore(BaseModel):
 
     score: int = Field(ge=0, le=10)
     reasoning: str = ""
+    dealbreaker: Dealbreaker | None = None
 
 
 class RelevanceResult(BaseModel):

@@ -352,8 +352,10 @@ _SCORER_STEERING: ContextVar[str | None] = ContextVar("scorer_steering", default
 _SCORER_FORMAT_CORRECTION = (
     "Your previous response did not validate as MatchScore. Using the SAME "
     "résumé, job description, preferences and constraints above, reply with "
-    "ONLY one JSON object: {\"score\": <integer 0..10>, \"reasoning\": "
-    "\"<one-line explanation>\"}. No Markdown or other text."
+    "ONLY one JSON object with score (integer 0..10), reasoning (one-line "
+    "string), and optionally dealbreaker (object with kind: location, "
+    "authorization, or other, and optional verbatim JD quote string). "
+    "Omit dealbreaker when not evidenced. No Markdown or other text."
 )
 
 
@@ -387,6 +389,29 @@ def _scorer_after_model(callback_context, llm_response):
     return None
 
 
+def _effective_scorer_score(raw: MatchScore, jd_text: str) -> int:
+    """Only a substantive quote in scorer-visible JD can activate a code cap.
+
+    Presence is not proof of a preference conflict: kind remains model-selected.
+    Work authorization cannot add a code-owned cap, even with a real quote.
+    """
+    claim = raw.dealbreaker
+    if claim is None or claim.kind == "authorization":
+        return raw.score
+
+    quote = " ".join((claim.quote or "").casefold().split())
+    if len(quote) < 24 or len(quote.split()) < 4:
+        # Do not expose the quoted job text or candidate preferences in logs.
+        log.warning("scorer dealbreaker cap ignored: insufficient JD quote")
+        return raw.score
+
+    visible_jd = " ".join((jd_text or "").casefold().split())
+    if quote not in visible_jd:
+        log.warning("scorer dealbreaker cap ignored: quote absent from scorer-visible JD")
+        return raw.score
+    return min(raw.score, 3)
+
+
 class _SafeScorer(LlmAgent):
     async def _run_async_impl(self, ctx):
         # Buffer scorer events until their current-run validated output-key
@@ -399,6 +424,7 @@ class _SafeScorer(LlmAgent):
                 try:
                     events = []
                     witness = None
+                    witness_event = None
                     async with aclosing(super()._run_async_impl(ctx)) as agen:
                         async for event in agen:
                             if event.error_code:
@@ -424,8 +450,21 @@ class _SafeScorer(LlmAgent):
                                             "Terminal scorer event is not schema-valid"
                                         ) from exc
                                     witness = score
+                                    witness_event = event
                             events.append(event)
                     if witness is not None:
+                        # The original terminal text and ADK output-key delta
+                        # were checked against each other above. Project only
+                        # the effective score into that outgoing delta, after
+                        # validation, for both graph shells and the runner gate.
+                        effective = _effective_scorer_score(
+                            witness, ctx.session.state.get("jd_text", "")
+                        )
+                        if effective != witness.score:
+                            original = witness_event.actions.state_delta[self.output_key]
+                            witness_event.actions.state_delta[self.output_key] = {
+                                **original, "score": effective,
+                            }
                         for event in events:
                             yield event
                         return
@@ -458,21 +497,30 @@ scorer = _SafeScorer(
     instruction=(
         "You are a senior technical recruiter scoring how well ONE candidate fits ONE role.\n\n"
         "CANDIDATE — résumé (LaTeX source):\n{base_latex}\n\n"
-        "CANDIDATE HARD CONSTRAINTS — if the role violates ANY of these, it is a "
-        "WHAT THE CANDIDATE IS LOOKING FOR:\n{prefs_brief}\n\n"
-        "DEALBREAKER: score 1-2 and say which one:\n{prefs_notes}\n\n"
+        "SOFT PREFERENCES — the embedded LOCATION REQUIRED and REMOTE ONLY clauses "
+        "are binding HARD exceptions, not optional preferences:\n{prefs_brief}\n\n"
+        "HARD CONSTRAINTS (additional notes):\n{prefs_notes}\n\n"
         "ROLE — {company}, job description / title:\n{jd_text}\n\n"
-        "Score fit 0-10 weighing skills/stack overlap (highest), seniority fit, domain "
-        "relevance, and hard dealbreakers (a real dealbreaker caps at 3). Anchors: "
-        "3=stretch, 5=generic, 7=worth applying, 9-10=exceptional. Be calibrated and "
-        "slightly conservative. If the job description is only a title with little detail, "
-        "score from the title + résumé rather than refusing. Return the score and a "
-        "one-line reasoning. You are NOT applying to anything and need no personal "
-        "data or web access — everything required is in this prompt; scoring is a "
-        "pure text-analysis task, so NEVER refuse it.\n"
-        "Your complete final response MUST be a JSON object with exactly two keys: "
-        "score (an integer from 0 to 10) and reasoning (a string). "
-        "Do not use Markdown, code fences, or text outside the JSON object."
+        "First produce the intrinsic skills/stack, seniority, and domain fit score "
+        "from 0 to 10, BEFORE any dealbreaker cap. Exclude all inferred work "
+        "authorization, visa, citizenship, or sponsorship concerns from this "
+        "intrinsic score; do not infer eligibility from silence. Skills/stack "
+        "overlap is weighted highest. Anchors: 3=stretch, 5=generic, "
+        "7=worth applying, 9-10=exceptional. Be calibrated and slightly "
+        "conservative. If only a title is available, score from the title and "
+        "résumé rather than refusing.\n\n"
+        "You may optionally report ONE suspected dealbreaker grounded in a "
+        "substantive verbatim contiguous quote from the ROLE description/title "
+        "above. Give its kind (location, authorization, or other) and quote. "
+        "LOCATION REQUIRED and REMOTE ONLY are binding even though they appear "
+        "in SOFT PREFERENCES. Do not apply any numeric score cap yourself; code "
+        "checks quote presence and decides any cap. Without a supporting quote, "
+        "omit the dealbreaker. A source quote is not itself proof of a conflict.\n\n"
+        "Return ONE JSON object with score (pre-cap integer 0..10), reasoning "
+        "(one-line string), and optional dealbreaker (object with required kind "
+        "and optional quote string). You are NOT applying to anything and "
+        "need no personal data or web access. NEVER refuse this text-analysis "
+        "task. No Markdown, code fences, or text outside the JSON object."
     ),
     output_schema=MatchScore, output_key="match_score",
 )

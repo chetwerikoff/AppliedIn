@@ -586,6 +586,20 @@ def _heartbeat_loop() -> None:
         time.sleep(10)
 
 
+def _start_imap_poller(stores, settings=None) -> bool:
+    from core import reply_ingest
+    from core.config import get_settings
+
+    settings = settings or get_settings()
+    if (settings.mode != "local" or not reply_ingest.enabled()
+            or not reply_ingest.poll_interval()
+            or not reply_ingest.local_credentials(settings, stores.secrets)):
+        return False
+    threading.Thread(target=reply_ingest.run_poller, daemon=True,
+                     name="imap-replies").start()
+    return True
+
+
 def main() -> None:
     # Discovery and the pipeline worker run as SEPARATE background threads (so
     # neither blocks the other); the web server runs in the foreground.
@@ -606,13 +620,8 @@ def main() -> None:
     threading.Thread(target=_worker_loop, daemon=True, name="evaluate").start()
     threading.Thread(target=_apply_loop, daemon=True, name="apply").start()
     threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
-    from core import reply_ingest
     from core.config import get_settings
-    settings = get_settings()
-    interval = reply_ingest.poll_interval()
-    if (settings.mode == "local" and reply_ingest.enabled() and interval
-            and reply_ingest.local_credentials(settings, stores.secrets)):
-        threading.Thread(target=reply_ingest.run_poller, daemon=True, name="imap-replies").start()
+    _start_imap_poller(stores, get_settings())
     log.info("dashboard: http://127.0.0.1:%d", WEB_PORT)
     try:
         serve(port=WEB_PORT)

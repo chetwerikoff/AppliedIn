@@ -496,7 +496,7 @@ def create_app() -> FastAPI:
                 checks.append({"name": "IMAP replies", "state": "ready",
                                "detail": "Read-only IMAP authentication succeeded."})
             except Exception:
-                checks.append({"name": "IMAP replies", "state": "check",
+                checks.append({"name": "IMAP replies", "state": "action",
                                "detail": "IMAP authentication failed; verify local setup."})
         return {"checks": checks}
 

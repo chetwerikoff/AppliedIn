@@ -876,7 +876,11 @@ def verified_greenhouse_alias(row: dict, *, pk: str, company: str, url: str,
     if (getattr(cfg, 'ats', None) != 'greenhouse'
             or not isinstance(board, str) or not _ALIAS_BOARD.fullmatch(board)):
         return None
-    configured = _alias_https_parts(careers)
+    # Only a pathless configured HTTPS origin borrows the already-accepted root path.
+    configured_url = careers
+    if isinstance(careers, str) and re.fullmatch(r'https://[^/?#]+', careers):
+        configured_url += '/'
+    configured = _alias_https_parts(configured_url)
     wrapped = _alias_https_parts(url, query=True)
     if not configured or not wrapped:
         return None

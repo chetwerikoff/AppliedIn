@@ -145,16 +145,21 @@ def _decode_text_prefix(headers: bytes, fragment: bytes) -> str:
     """Return inline text only; MIME headers and attachment parts stay out of the model input."""
     try:
         message = email.message_from_bytes(headers + fragment, policy=email.policy.default)
-        parts = message.walk() if message.is_multipart() else (message,)
         texts = []
-        for part in parts:
-            if part.is_multipart() or part.get_content_disposition() == "attachment" or part.get_filename():
-                continue
+        def collect(part):
+            if (part.get_content_disposition() == "attachment" or part.get_filename()
+                    or part.get_content_type() == "message/rfc822"):
+                return
+            if part.is_multipart():
+                for child in part.iter_parts():
+                    collect(child)
+                return
             if part.get_content_type() not in ("text/plain", "text/html"):
-                continue
+                return
             value = part.get_content()
             if isinstance(value, str) and value:
                 texts.append(value)
+        collect(message)
         return "\n".join(texts)
     except Exception:
         return ""
@@ -249,13 +254,6 @@ def _processed(path: Path, key: str, validity: str, uid: int) -> bool:
         account = _read_state(path).get("accounts", {}).get(key, {})
         return f"{validity}:{uid}" in account.get("processed", [])
 
-def _known_message_id(path: Path, key: str, message_id: str) -> bool:
-    if not message_id:
-        return False
-    with WRITE_LOCK:
-        account = _read_state(path).get("accounts", {}).get(key, {})
-        return message_id in account.get("message_ids", [])
-
 
 
 def _commit_uid(path: Path, key: str, validity: str, uid: int,
@@ -343,23 +341,15 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
                 pk = "UNASSIGNED" if parse_failed else match_message(raw, candidates, alias_snapshot)
             except Exception:
                 pk = "UNASSIGNED"
-            if _known_message_id(state_path, key, fields["message_id"]):
-                duplicate = {"record_id": str(uuid.uuid4()), **fields, "label": "other", "pk": pk}
-                _commit_uid(state_path, key, validity, uid, duplicate, fields["message_id"])
-                _advance_cursor(state_path, key, validity, uid)
-                continue
             text = client.fetch_text_prefix(uid)
-            try:
-                from core.reply_classifier import classify, validated_label
-
-                if classifier:
-                    candidate = classifier(fields, text)
-                else:
+            label = None
+            if classifier is not None:
+                try:
+                    from core.reply_classifier import validated_label
                     fragment = _decode_text_prefix(raw, text) if isinstance(text, bytes) else str(text or "")
-                    candidate = classify(fragment)
-                label = validated_label(candidate)
-            except Exception:
-                label = None if classifier else "other"
+                    label = validated_label(classifier(fields, fragment))
+                except Exception:
+                    label = None
             record = {"record_id": str(uuid.uuid4()), **fields, "label": label, "pk": pk}
             inserted = _commit_uid(state_path, key, validity, uid, record, fields["message_id"])
             _advance_cursor(state_path, key, validity, uid)
@@ -368,6 +358,10 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
     finally:
         client.logout()
     return processed_count
+
+def _production_classifier(_fields: dict, text: str) -> str:
+    from core.reply_classifier import classify
+    return classify(text)
 
 
 def run_poller(stop_event=None) -> None:
@@ -381,7 +375,7 @@ def run_poller(stop_event=None) -> None:
             settings = get_settings()
             creds = local_credentials(settings)
             if settings.mode == "local" and enabled() and creds:
-                ingest_pass(settings, creds, make_stores(settings))
+                ingest_pass(settings, creds, make_stores(settings), classifier=_production_classifier)
         except Exception:
             logger.warning("IMAP poll failed; will retry on next interval")
         interval = poll_interval() or 60

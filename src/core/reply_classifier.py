@@ -36,6 +36,8 @@ def classify(text: str) -> str:
                 )},
                 {"role": "user", "content": str(text)},
             ],
+            timeout=10,
+            max_tokens=16,
         )
         candidate = response.choices[0].message.content
         return validated_label(candidate)

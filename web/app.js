@@ -2177,6 +2177,10 @@ function replySummaryHtml(reply) {
     <span>${esc(reply.sender || "Unknown sender")}</span>
     <span>${esc(reply.subject || "No subject")}</span></div>`;
 }
+function replyTime(value) {
+  const time = Date.parse(value || "");
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
 // --- Applications table ----------------------------------------------------
 function viewApps() {
   const base = byCompany(state.apps);
@@ -2209,8 +2213,8 @@ function viewApps() {
     return `<tr data-pk="${esc(r.pk)}">
       <td>${tagHtml(r.status)}</td>
       <td class="t-co">${esc(r.company)}</td>
-      <td>${scoreHtml(r.match_score)}</td>
       <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
+      <td>${scoreHtml(r.match_score)}</td>
       <td><span class="t-links">${cv}${jd}${sc}</span></td>
       <td class="t-when t-applied">${["applied", "applied_manual"].includes(r.status)
         ? appliedDateHtml(r.applied_at) : "—"}</td>
@@ -2264,7 +2268,7 @@ function viewNeeds() {
   const items = visible(all);
   const matched = visible(state.apps).filter((app) => (app.replies || []).length)
     .flatMap((app) => app.replies.map((reply) => ({ app, reply })))
-    .sort((a, b) => String(b.reply.date || "").localeCompare(String(a.reply.date || "")));
+    .sort((a, b) => replyTime(b.reply.date) - replyTime(a.reply.date));
   const matchedPage = state.page.needsReplies || 50;
   const shownMatched = matched.slice(0, matchedPage);
   const matchedHtml = shownMatched.length ? `<section class="reply-section"><h3>Recruiter replies</h3>
@@ -3102,9 +3106,10 @@ function appsSig() {
        + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
        + (a.jd_read_error || "") + "\u0001" + (a.score_override ? "o" : "") + "\u0001"
-       + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "") + "\n";
+       + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "")
+       + "\u0001" + JSON.stringify(a.replies || []) + "\n";
   }
-  return s;
+  return s + "\u0001" + JSON.stringify(state.unassignedReplies || []);
 }
 
 const coKey = (c) => String(c || "").trim().toLowerCase();
@@ -3749,7 +3754,12 @@ async function assignReply(recordId) {
   renderPane();
   const result = await post(`/replies/${encodeURIComponent(recordId)}/assign`, { pk: target.value });
   state.replyAssigning.delete(recordId);
-  if (!result?.ok) { toast(result?.error || "Could not assign this reply."); renderPane(); return; }
+  if (!result?.ok) {
+    await loadUnassigned();
+    toast(result?.error || "Could not assign this reply.");
+    refreshPane();
+    return;
+  }
   await Promise.all([loadApps(), loadUnassigned()]);
   toast("Reply assigned.");
 }

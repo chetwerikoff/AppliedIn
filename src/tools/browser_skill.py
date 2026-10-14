@@ -348,21 +348,71 @@ async def decision(task: str, page: dict, history: list, *, model: str = "") -> 
         f"TASK:\n{task}\n\nPAGE DATA:\n{json.dumps(page, ensure_ascii=False)}\n\n"
         f"RECENT ACTION RESULTS:\n{json.dumps(history[-8:], ensure_ascii=False)}"
     )
-    try:
-        response = await asyncio.to_thread(completion, model=chosen, messages=messages(prompt),
-                                           response_format={"type": "json_object"})
-        value = json.loads(response["choices"][0]["message"]["content"])
-        if not isinstance(value, dict):
-            raise ValueError("expected object")
-        return value
-    except Exception as exc:
-        # Provider exceptions often reproduce the prompt. Keep private facts out
-        # of logs while still giving the dashboard an actionable failure class.
-        problem = f"BrowserSkill model unavailable: {type(exc).__name__}"
-        from core import flags
-        flags.note_llm_error("browser", problem)
-        raise Unavailable(problem) from None
+    request_messages = None
+    for attempt in range(2):
+        try:
+            # Freeze steering and the original inventory across both attempts.
+            if request_messages is None:
+                request_messages = messages(prompt)
+            response = await asyncio.to_thread(
+                completion, model=chosen, messages=request_messages,
+                response_format={"type": "json_object"})
+            choice = response["choices"][0]
+            content = choice["message"]["content"]
+            finish_reason = (choice.get("finish_reason") if isinstance(choice, dict)
+                             else getattr(choice, "finish_reason", None))
+            if not isinstance(content, str):
+                raise TypeError("completion content is not text")
+        except Exception as exc:
+            # Provider/transport and response-envelope failures are not JSON
+            # syntax failures, including on the correction call.
+            problem = f"BrowserSkill model unavailable: {type(exc).__name__}"
+            from core import flags
+            flags.note_llm_error("browser", problem)
+            raise Unavailable(problem) from None
 
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError as exc:
+            error_class, position = type(exc).__name__, exc.pos
+        else:
+            if isinstance(value, dict):
+                return value
+            error_class, position = "NonObjectJSON", None
+
+        # JSONDecodeError messages/doc can contain the private completion.
+        # Log only stable scalar metadata, never the response or request.
+        reason = finish_reason if isinstance(finish_reason, str) else None
+        log.warning("BrowserSkill invalid JSON (error=%s position=%s finish_reason=%s "
+                    "content_length=%d model=%s)",
+                    error_class, position, reason, len(content), chosen)
+        if attempt == 0:
+            correction = (
+                "Your previous response did not validate as one BrowserSkill action JSON "
+                "object. Using the SAME task, page inventory, recent action results and "
+                "safety constraints above, reply with ONLY one JSON object using the "
+                "original action schema. No Markdown, invented hrefs or selectors."
+            )
+            if reason in {"length", "max_tokens"}:
+                if "For finish.report use the requested jobs JSON schema." in task:
+                    correction += (
+                        " The previous completion was truncated. If finishing the crawl, "
+                        "make the nested finish.report SHORTER while retaining report.jobs "
+                        "with observed URLs and job details, report.board and report.note "
+                        "inside the outer action object."
+                    )
+                else:
+                    correction += (
+                        " The previous completion was truncated. Return a shorter, "
+                        "concise single action object."
+                    )
+            # Do not replay invalid generated text or refresh owner steering.
+            request_messages = [*request_messages, {"role": "user", "content": correction}]
+
+    problem = "BrowserSkill model returned invalid JSON"
+    from core import flags
+    flags.note_llm_error("browser", problem)
+    raise Unavailable(problem) from None
 
 async def _read(session: Session, url: str) -> dict:
     page = await session.navigate(url)

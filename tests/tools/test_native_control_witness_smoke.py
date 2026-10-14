@@ -106,13 +106,49 @@ def test_unobserved_target_type_stays_fail_closed():
     assert not cdp.calls
 
 
-def test_missing_fetch_interception_of_chrome_ui_request_cannot_pass():
+def test_network_only_page_fixture_get_fails_equality():
     cdp = RecordingCDP()
     record_request(cdp, "page", FIXTURE, kind="Document")
+    # A page's exact fixture GET still needs a matching Fetch observation.
+    cdp._dispatch({"method": "Network.requestWillBeSent", "sessionId": "page",
+                   "params": {"request": {"url": FIXTURE, "method": "GET"},
+                              "type": "Document"}})
+
+    assert not cdp.forbidden
+    assert len(cdp.fetch) == 1 and len(cdp.network) == 2
+    assert not cdp.fixture_requests_verified()
+
+
+@pytest.mark.parametrize("host", ["resources", "theme", "omnibox-popup.top-chrome"])
+def test_network_only_allowed_browser_ui_chrome_requests_pass_equality(host):
+    cdp = RecordingCDP()
+    record_request(cdp, "page", FIXTURE, kind="Document")
+    internal = f"chrome://{host}/x"
     cdp._dispatch({"method": "Network.requestWillBeSent", "sessionId": "ui",
-                   "params": {"request": {"url": "chrome://resources/x",
-                                          "method": "GET"},
+                   "params": {"request": {"url": internal, "method": "GET"},
                               "type": "Stylesheet"}})
 
     assert not cdp.forbidden
+    assert cdp.fetch == [("page", FIXTURE, "GET", "Document")]
+    assert cdp.network[-1] == ("ui", internal, "GET", "Stylesheet")
+    assert cdp.fixture_requests_verified()
+
+
+@pytest.mark.parametrize(("session", "url"), [
+    ("ui", "chrome://other-host/x"),
+    ("ui", "chrome://resources.example/x"),
+    ("ui", "chrome-untrusted://resources/x"),
+    ("ui", "https://example.com"),
+    ("page", "chrome://resources/x"),
+    ("background", "chrome://resources/x"),
+    ("worker", "chrome://resources/x"),
+])
+def test_network_only_nonexempt_request_still_requires_fetch(session, url):
+    cdp = RecordingCDP()
+    record_request(cdp, "page", FIXTURE, kind="Document")
+    # Exercise equality separately from the already-tested forbidden-event gate.
+    cdp.network.append((session, url, "GET", "Script"))
+
+    assert not cdp.forbidden
+    assert cdp.fetch == [("page", FIXTURE, "GET", "Document")]
     assert not cdp.fixture_requests_verified()

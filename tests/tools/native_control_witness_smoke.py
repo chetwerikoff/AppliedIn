@@ -252,7 +252,7 @@ class CDP:
         regular_network = [request for request in self.network
                            if not self._browser_ui_chrome_request(request[0], request[1])]
         return (regular_fetch == expected and regular_network == expected
-                and Counter(self.fetch) == Counter(self.network))
+                and Counter(regular_fetch) == Counter(regular_network))
 
     def _dispatch(self, message: dict):
         if isinstance(message.get("id"), int):

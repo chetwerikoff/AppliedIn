@@ -972,6 +972,8 @@ async def _fresh_native_receiver(session, page: dict, action: dict,
     if not _alias_current(provenance, fixture_context=fixture_context):
         raise Gate('The original same-job tenant mapping is no longer current.')
     observed, _ = await _observe_controls(session, page)
+    if not _alias_current(provenance, fixture_context=fixture_context):
+        raise Gate('The original same-job tenant mapping changed during native inspection.')
     if not navigation_allowed(observed.get('url', ''), provenance=provenance):
         raise Gate('The current native receiver is not on the tracked job route.')
     current = control(observed, action)
@@ -1285,6 +1287,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
                 session = ctx.facade(raw_session) if ctx else raw_session
+                if provenance is not None and not _alias_current(
+                        provenance, fixture_context=ctx):
+                    raise Gate('The original same-job tenant mapping changed before navigation.')
                 page = await session.navigate(direct_url)
                 step['url'] = page['url']
                 if not allowed(page['url']):

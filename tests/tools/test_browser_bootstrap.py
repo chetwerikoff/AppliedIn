@@ -1386,3 +1386,59 @@ async def test_alias_safe_native_continue_stays_under_existing_hold(
     assert receipt['action'] == 'click'
     assert [c for c in browser.calls if c[0] == 'click'] == [
         ('click', '#next')]
+
+@pytest.mark.parametrize('verb', ['upload', 'click'])
+async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
+        monkeypatch, tmp_path, verb):
+    # Evaluate may yield while the explicit board mapping is revoked. The
+    # receiver's pre-await provenance check cannot authorize the later IPC.
+    receiver = (field('Upload résumé', '#resume', type='file',
+                      form_action=GH_DIRECT)
+                if verb == 'upload' else
+                submit('Continue', selector='#next', form_action=GH_DIRECT))
+    page = inventory(receiver, url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, page)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: pk == GH_PK)
+    monkeypatch.setattr(forms, 'check_before_committing_click',
+                        lambda *args, **kwargs: None)
+    original = browser.call
+
+    async def revoke_during_evaluate(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if args[0] == 'evaluate':
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+        return result
+
+    monkeypatch.setattr(browser, 'call', revoke_during_evaluate)
+    with pytest.raises(forms.Gate, match='mapping'):
+        await forms.execute(
+            browser, page,
+            {'action': verb, 'selector': '#resume' if verb == 'upload' else '#next'},
+            facts={}, filled={}, resume_path='Resume.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=GH_PK, job_url=GH_WRAP, allow_click=verb == 'click',
+            provenance=_greenhouse_provenance(row))
+    assert [call[0] for call in browser.calls] == ['evaluate']
+
+
+async def test_alias_revoked_during_session_acquisition_prevents_navigation(
+        monkeypatch, tmp_path):
+    # Session acquisition is awaited after the first provenance proof, so
+    # revocation during __aenter__ must deny even the first navigate IPC.
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+
+    class RevokingSession:
+        async def __aenter__(self):
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+            return browser
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(bsk, 'Session', lambda kind: RevokingSession())
+    outcome = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate' and outcome['form_question'] is None
+    assert browser.calls == []
+    assert not decide.await_count

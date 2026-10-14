@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import socket
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,13 +104,19 @@ def _literal_redirect_target(canonical: str, location: str) -> bool:
         if (target.scheme != 'https' or target.netloc != host
                 or target.username is not None or target.password is not None
                 or target.port is not None or not host or host != host.lower()
-                or len(labels) < 2 or host == 'localhost' or host.endswith('.local')
+                or len(labels) < 2 or host == 'localhost'
+                or host.endswith(('.local', '.localhost'))
                 or not all(_DNS_LABEL.fullmatch(part) for part in labels)):
             return False
         try:
             ipaddress.ip_address(host)
             return False
         except ValueError:
+            pass
+        try:
+            socket.inet_aton(host)
+            return False
+        except OSError:
             pass
         rebuilt = urlunsplit((target.scheme, target.netloc, target.path, target.query, ''))
         return (rebuilt == location and target.path == source.path

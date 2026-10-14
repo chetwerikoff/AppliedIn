@@ -1208,14 +1208,30 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         submitted = True
 
     direct_url = direct_board_url(url) or url
+    provenance = None
+    trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
     uploaded = False
     try:
         verify_dispatch()
+        if greenhouse_alias_candidate(url):
+            provenance = _configured_alias(
+                pk, company, url, fixture_context=ctx)
+            if provenance is None:
+                raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.')
+            direct_url = provenance.url
+            trusted_origins = (url,)
+
+        def allowed(href: str) -> bool:
+            return ((provenance is None
+                     or _alias_current(provenance, fixture_context=ctx))
+                    and navigation_allowed(href, *trusted_origins,
+                                           provenance=provenance))
+
         # A query-generated Greenhouse/Oracle alias cannot authorize itself.
         # Without a code-verifiable same-job route, stop before opening Chrome.
-        if not navigation_allowed(direct_url, url):
+        if not allowed(direct_url):
             raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
@@ -1243,7 +1259,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 session = ctx.facade(raw_session) if ctx else raw_session
                 page = await session.navigate(direct_url)
                 step['url'] = page['url']
-                if not navigation_allowed(page['url'], url, direct_url):
+                if not allowed(page['url']):
                     raise Gate('Initial redirect is not proven to be the same employer job.')
                 for _ in range(100):
                     if submitted:
@@ -1252,7 +1268,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             'Check the employer portal before retrying.', step)
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
-                    if not navigation_allowed(page['url'], url, direct_url):
+                    if not allowed(page['url']):
                         raise Gate('Current page is not proven to be the same tracked job.')
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
@@ -1264,7 +1280,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'values and attachment before submit.')
                     verify_dispatch()
                     page = await _bootstrap(
-                        session, page, pk, facts, url, direct_url,
+                        session, page, pk, facts, *trusted_origins,
+                        provenance=provenance,
                         **({'fixture_context': ctx} if ctx else {}))
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, page, history, model=model)
@@ -1273,11 +1290,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         old = control(page, action)
                         page = await session.page()
                         step['url'] = page['url']
-                        if not navigation_allowed(page['url'], url, direct_url):
+                        if not allowed(page['url']):
                             raise Gate('Destination changed to an unrelated job or tenant.')
                         current = control(page, action)
                         if current.get('tag') == 'a' and current.get('href') and not (
-                                navigation_allowed(current['href'], url, direct_url)):
+                                allowed(current['href'])):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options',
@@ -1294,7 +1311,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         href = action.get('url', '')
                         if href not in {c.get('href') for c in page['controls']}:
                             raise Gate('Only a link on the current application page may be opened.')
-                        if not navigation_allowed(href, url, direct_url):
+                        if not allowed(href):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         # A same-job href may be an authenticated one-click
                         # application. Observing it does not prove a read-only GET.
@@ -1304,7 +1321,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if not is_submission(target) or not native_submit(target):
                             raise Gate('A proven native submit control is required before clicking.')
                         verify_dispatch()
-                        check_form_destination(page, target, url, direct_url)
+                        if provenance is not None:
+                            page, target = await _fresh_native_receiver(
+                                session, page, action, target, provenance,
+                                fixture_context=ctx)
+                        check_form_destination(page, target, *trusted_origins,
+                                               provenance=provenance)
                         check_form(page, filled, uploaded, Path(resume_path).name)
                         verify_history(history, page)
                         before = page
@@ -1319,7 +1341,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             await asyncio.sleep(1)
                             after = await session.page()
                             step['url'] = after['url']
-                            if navigation_allowed(after['url'], url, direct_url) and (phrase := confirmation(before, after)):
+                            if allowed(after['url']) and (phrase := confirmation(before, after)):
                                 return {'status': 'applied', 'confirmation': phrase,
                                         'fields': [{'label': r['label'],
                                                     'value': filled[r['selector']]}
@@ -1336,7 +1358,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             if not native_submit(target):
                                 raise Gate('A JS-backed Continue has no proven native destination.')
                             verify_dispatch()
-                            check_form_destination(page, target, url, direct_url)
+                            if provenance is not None:
+                                page, target = await _fresh_native_receiver(
+                                    session, page, action, target, provenance,
+                                    fixture_context=ctx)
+                            check_form_destination(page, target, *trusted_origins,
+                                                   provenance=provenance)
                             check_form(page, filled, uploaded, Path(resume_path).name)
                             verify_history(history, page)
                             before = page
@@ -1352,6 +1379,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             resume_tex=resume_tex, github=github, pk=pk,
                             allow_click=verb == 'click' and bool(_NEXT.match(target['label'])),
                             job_url=url, on_committing_click=mark_click_started,
+                            provenance=provenance,
                             **({'fixture_context': ctx} if ctx else {}))
                         if verb == 'click':
                             step['last_button'] = target['label']
@@ -1359,9 +1387,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         history.append(result)
                     page = await session.page()
                     step['url'] = page['url']
-                    if not navigation_allowed(page['url'], url, direct_url):
+                    if not allowed(page['url']):
                         raise Gate('Click redirected to an unrelated job or tenant.')
-                    if submitted and navigation_allowed(page['url'], url, direct_url) and (phrase := confirmation(before, page)):
+                    if submitted and allowed(page['url']) and (phrase := confirmation(before, page)):
                         return {'status': 'applied', 'confirmation': phrase,
                                 'fields': [{'label': r['label'], 'value': filled[r['selector']]}
                                            for r in history if r.get('selector') in filled]}

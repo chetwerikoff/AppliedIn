@@ -482,6 +482,22 @@ def create_app() -> FastAPI:
                        "Run ./appliedin setup to install the PDF renderer."})
         from tools.browser_runtime import setup_check
         checks.append(setup_check(settings))
+        from core import reply_ingest
+        credentials = reply_ingest.local_credentials(settings)
+        if settings.mode != "local" or not reply_ingest.enabled() or not credentials:
+            checks.append({"name": "IMAP replies", "state": "check",
+                           "detail": "Optional local IMAP reply ingest is not configured."})
+        else:
+            try:
+                from core.imap_readonly import ReadOnlyIMAP
+                with ReadOnlyIMAP(credentials["host"], credentials["username"],
+                                   credentials["password"], credentials["mailbox"]):
+                    pass
+                checks.append({"name": "IMAP replies", "state": "ready",
+                               "detail": "Read-only IMAP authentication succeeded."})
+            except Exception:
+                checks.append({"name": "IMAP replies", "state": "action",
+                               "detail": "IMAP authentication failed; verify local setup."})
         return {"checks": checks}
 
     @app.post("/actions/stop-company")

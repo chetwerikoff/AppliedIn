@@ -12,7 +12,11 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from tools import browser_skill as bsk
-from tools.claude_chrome import _SAFE_OPTION_RX, _SANCTIONS_RX, direct_board_url, guard_value
+from tools.claude_chrome import (
+    _SAFE_OPTION_RX, _SANCTIONS_RX, _alias_https_parts, GreenhouseJobAlias,
+    direct_board_url, greenhouse_alias_candidate, guard_value,
+    verified_greenhouse_alias,
+)
 from tools import submit_hold
 
 _SENSITIVE = re.compile(
@@ -43,8 +47,20 @@ _ATS_HOSTS = (
 )
 
 
-def navigation_allowed(href: str, *origins: str) -> bool:
-    """Require a job-scoped route, not a shared ATS/employer hostname."""
+def navigation_allowed(href: str, *origins: str,
+                       provenance: GreenhouseJobAlias | None = None) -> bool:
+    """Require a proven job route, independent of untrusted observed origins."""
+    if provenance is not None:
+        if not isinstance(provenance, GreenhouseJobAlias):
+            return False
+        if href == provenance.wrapper:
+            return True
+        route = _alias_https_parts(href)
+        if not route or route[0] != 'job-boards.greenhouse.io':
+            return False
+        job_path = f'/{provenance.board}/jobs/{provenance.job_id}'
+        path = route[1]
+        return path == job_path or path.startswith(job_path + '/')
     if not bsk.web_url(href):
         return False
     target = urlsplit(href)
@@ -185,6 +201,31 @@ def _row(pk: str, *, fixture_context=None) -> dict:
         return dict(ctx.row)
     from core.stores import make_stores
     return make_stores().tracking.get(pk) or {}
+
+
+
+def _configured_alias(pk: str, company: str, url: str, *,
+                      fixture_context=None) -> GreenhouseJobAlias | None:
+    """Reload only the explicit watchlist and the authoritative tracked row."""
+    try:
+        from core.config import get_settings
+        from discovery.watchlist import load_watchlist
+        row = (_row(pk, fixture_context=fixture_context) if fixture_context
+               else _row(pk))
+        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        return verified_greenhouse_alias(
+            row, pk=pk, company=company, url=url, configs=configs)
+    except Exception:
+        # A broken/missing watchlist or unavailable row is not new host authority.
+        return None
+
+
+def _alias_current(provenance: GreenhouseJobAlias, *,
+                   fixture_context=None) -> bool:
+    return (isinstance(provenance, GreenhouseJobAlias)
+            and _configured_alias(provenance.pk, provenance.company,
+                                  provenance.wrapper,
+                                  fixture_context=fixture_context) == provenance)
 
 
 def exact_approval(pk: str, key: str, value: str, *,
@@ -399,7 +440,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
                 if expected is None or (value and not _same(value, expected)):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
-def check_form_destination(page: dict, target: dict, *origins: str) -> None:
+def check_form_destination(page: dict, target: dict, *origins: str,
+                           provenance: GreenhouseJobAlias | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
@@ -415,8 +457,9 @@ def check_form_destination(page: dict, target: dict, *origins: str) -> None:
         base, override = item.get('form_action'), item.get('formaction')
         if (not isinstance(base, str) or not base
                 or (override and not isinstance(override, str))
-                or not navigation_allowed(base, *origins)
-                or (override and not navigation_allowed(override, *origins))):
+                or not navigation_allowed(base, *origins, provenance=provenance)
+                or (override and not navigation_allowed(
+                    override, *origins, provenance=provenance))):
             raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
@@ -758,7 +801,8 @@ def _same_key(value: str) -> str:
 
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
-                         *origins: str, bootstrap: bool = False) -> dict:
+                         *origins: str, bootstrap: bool = False,
+                         provenance: GreenhouseJobAlias | None = None) -> dict:
     choice = target.get('type') in {'radio', 'checkbox'}
     if choice:
         if target.get('tag') != 'input':
@@ -799,7 +843,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         for c in siblings)
     if not marked:
         raise Gate('No positive native application-form marker was observed.')
-    check_form_destination(page, target, *origins)
+    check_form_destination(page, target, *origins, provenance=provenance)
     question = {
         'pk': '', 'label': key, 'selector': target['selector'],
         'url': page['url'], 'control_label': target['label'],
@@ -808,6 +852,11 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
+    if provenance is not None:
+        question['origin_row'] = {
+            'jd_url': provenance.wrapper, 'company': provenance.company,
+            'ats': provenance.ats,
+        }
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
     if target.get('type') == 'checkbox':
@@ -819,7 +868,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     return question
 
 
-def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
+def _bootstrap_wall(page: dict, witness: dict, *origins: str,
+                    provenance: GreenhouseJobAlias | None = None) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
@@ -831,7 +881,8 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
         if c.get('type') in {'radio', 'checkbox'}:
             if _unanswered(page, c):
                 try:
-                    _disclosure_question(page, c, witness, *origins, bootstrap=True)
+                    _disclosure_question(page, c, witness, *origins, bootstrap=True,
+                                         provenance=provenance)
                 except Gate:
                     raise Gate('An uninspectable required choice needs human review.') from None
             continue
@@ -844,9 +895,14 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str) -> None:
 
 
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
-                     *origins: str, fixture_context=None) -> dict:
+                     *origins: str, fixture_context=None,
+                     provenance: GreenhouseJobAlias | None = None) -> dict:
+    if provenance is not None and (
+            provenance.pk != pk
+            or not _alias_current(provenance, fixture_context=fixture_context)):
+        raise Gate('The configured job/tenant correspondence changed; review the form.')
     _inventory_ok(page)
-    if not navigation_allowed(page['url'], *origins):
+    if not navigation_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox'})
@@ -857,7 +913,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             for c in page['controls']):
         return page
     page, witness = await _observe_controls(session, page)
-    _bootstrap_wall(page, witness, *origins)
+    if provenance is not None and (
+            not _alias_current(provenance, fixture_context=fixture_context)
+            or not navigation_allowed(page.get('url', ''), provenance=provenance)):
+        raise Gate('The job/tenant mapping changed during native control inspection.')
+    _bootstrap_wall(page, witness, *origins, provenance=provenance)
     for item in page['controls']:
         if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
                 and _unanswered(page, item)):
@@ -870,7 +930,12 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 and str(item.get('value') or '').strip()):
             continue
         try:
-            question = _disclosure_question(page, item, witness, *origins, bootstrap=True)
+            if provenance is not None and not _alias_current(
+                    provenance, fixture_context=fixture_context):
+                raise Gate('The trusted alias is no longer current.')
+            question = _disclosure_question(
+                page, item, witness, *origins, bootstrap=True,
+                provenance=provenance)
         except Gate:
             continue
         question['pk'] = pk
@@ -899,13 +964,49 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     return page
 
 
+
+async def _fresh_native_receiver(session, page: dict, action: dict,
+                                 original: dict, provenance: GreenhouseJobAlias,
+                                 *, fixture_context=None) -> tuple[dict, dict]:
+    """An alias needs a current native receiver before *every* mutating IPC."""
+    if not _alias_current(provenance, fixture_context=fixture_context):
+        raise Gate('The original same-job tenant mapping is no longer current.')
+    observed, _ = await _observe_controls(session, page)
+    if not _alias_current(provenance, fixture_context=fixture_context):
+        raise Gate('The original same-job tenant mapping changed during native inspection.')
+    if not navigation_allowed(observed.get('url', ''), provenance=provenance):
+        raise Gate('The current native receiver is not on the tracked job route.')
+    current = control(observed, action)
+    if _identity(current) != _identity(original):
+        raise Gate('The native receiver changed before disclosure.')
+    check_form_destination(observed, current, provenance.wrapper,
+                           provenance=provenance)
+    return observed, current
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
-                  fixture_context=None) -> dict:
+                  fixture_context=None,
+                  provenance: GreenhouseJobAlias | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     verb = action.get('action')
+    if provenance is not None:
+        if (pk != provenance.pk or company != provenance.company
+                or job_url != provenance.wrapper
+                or not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(page.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('This page lacks current same-job Greenhouse provenance.')
+    elif pk and (verb in {'fill', 'select', 'choose', 'upload'}
+                 or (verb == 'click' and allow_click)):
+        # A non-committing, unapproved click is refused on existing local
+        # guards and must not fetch stores merely to repeat that refusal.
+        tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
+        if greenhouse_alias_candidate(tracked.get('jd_url')):
+            # Direct calls cannot borrow a page URL as alias provenance.
+            raise Gate('This Greenhouse wrapper needs a verified alias context.')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
             or page.get('unsupported_frames')):
@@ -920,6 +1021,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         else:
             _require_native_action(target, verb)
         observed, witness = await _observe_controls(session, page)
+        if provenance is not None and (
+                not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(observed.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('The same-job page or mapping changed before a field gate.')
         target = control(observed, action)
         if verb == 'choose':
             _require_native_choice(target)
@@ -931,7 +1037,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The selected field changed before human authorization.')
         page = observed
         form_question = _disclosure_question(
-            page, target, witness, job_url or page['url'])
+            page, target, witness, job_url or page['url'],
+            provenance=provenance)
         form_question['pk'] = pk
         gate_prompt = (_choice_prompt(target, form_question)
                        if verb in {'choose', 'select'}
@@ -999,8 +1106,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
+        if provenance is not None and (
+                not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(latest.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('The same-job page or mapping changed before disclosure.')
         fresh_question = _disclosure_question(
-            latest, current, latest_witness, job_url or latest['url'])
+            latest, current, latest_witness, job_url or latest['url'],
+            provenance=provenance)
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
@@ -1030,7 +1143,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
             raise Gate('Upload must target the résumé/CV file input.')
-        check_form_destination(page, target, job_url or page.get('url', ''))
+        if pk and not job_url:
+            raise Gate('The original tracked job route is missing; upload denied.')
+        if provenance is not None:
+            page, target = await _fresh_native_receiver(
+                session, page, action, target, provenance, fixture_context=ctx)
+        check_form_destination(page, target, job_url or page.get('url', ''),
+                               provenance=provenance)
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
@@ -1053,7 +1172,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('Unproven or JS-backed click requires human inspection.')
         if is_submission(target) or not native_submit(target):
             raise Gate('A JS-backed or non-native submit destination is unproven.')
-        check_form_destination(page, target, job_url or page.get('url', ''))
+        if pk and not job_url:
+            raise Gate('The original tracked job route is missing; click denied.')
+        if provenance is not None:
+            page, target = await _fresh_native_receiver(
+                session, page, action, target, provenance, fixture_context=ctx)
+        check_form_destination(page, target, job_url or page.get('url', ''),
+                               provenance=provenance)
         check_before_committing_click(
             pk, **({'fixture_context': ctx} if ctx else {}))
         if on_committing_click:
@@ -1111,14 +1236,32 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         submitted = True
 
     direct_url = direct_board_url(url) or url
+    provenance = None
+    trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
     uploaded = False
     try:
         verify_dispatch()
+        if greenhouse_alias_candidate(url):
+            provenance = _configured_alias(
+                pk, company, url, fixture_context=ctx)
+            if provenance is None:
+                raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.')
+            direct_url = provenance.url
+            trusted_origins = (url,)
+
+        def allowed(href: str) -> bool:
+            return ((provenance is None
+                     or _alias_current(provenance, fixture_context=ctx))
+                    and navigation_allowed(href, *trusted_origins,
+                                           provenance=provenance))
+
         # A query-generated Greenhouse/Oracle alias cannot authorize itself.
         # Without a code-verifiable same-job route, stop before opening Chrome.
-        if not navigation_allowed(direct_url, url):
+        # The initial check must never let the derived URL authorize itself.
+        # Only the original tracked wrapper (or verified provenance) is authority.
+        if not navigation_allowed(direct_url, url, provenance=provenance):
             raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
@@ -1144,9 +1287,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
                 session = ctx.facade(raw_session) if ctx else raw_session
+                if provenance is not None and not _alias_current(
+                        provenance, fixture_context=ctx):
+                    raise Gate('The original same-job tenant mapping changed before navigation.')
                 page = await session.navigate(direct_url)
                 step['url'] = page['url']
-                if not navigation_allowed(page['url'], url, direct_url):
+                if not allowed(page['url']):
                     raise Gate('Initial redirect is not proven to be the same employer job.')
                 for _ in range(100):
                     if submitted:
@@ -1155,7 +1301,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             'Check the employer portal before retrying.', step)
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
-                    if not navigation_allowed(page['url'], url, direct_url):
+                    if not allowed(page['url']):
                         raise Gate('Current page is not proven to be the same tracked job.')
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
@@ -1167,7 +1313,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'values and attachment before submit.')
                     verify_dispatch()
                     page = await _bootstrap(
-                        session, page, pk, facts, url, direct_url,
+                        session, page, pk, facts, *trusted_origins,
+                        provenance=provenance,
                         **({'fixture_context': ctx} if ctx else {}))
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, page, history, model=model)
@@ -1176,11 +1323,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         old = control(page, action)
                         page = await session.page()
                         step['url'] = page['url']
-                        if not navigation_allowed(page['url'], url, direct_url):
+                        if not allowed(page['url']):
                             raise Gate('Destination changed to an unrelated job or tenant.')
                         current = control(page, action)
                         if current.get('tag') == 'a' and current.get('href') and not (
-                                navigation_allowed(current['href'], url, direct_url)):
+                                allowed(current['href'])):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options',
@@ -1197,7 +1344,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         href = action.get('url', '')
                         if href not in {c.get('href') for c in page['controls']}:
                             raise Gate('Only a link on the current application page may be opened.')
-                        if not navigation_allowed(href, url, direct_url):
+                        if not allowed(href):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
                         # A same-job href may be an authenticated one-click
                         # application. Observing it does not prove a read-only GET.
@@ -1207,7 +1354,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if not is_submission(target) or not native_submit(target):
                             raise Gate('A proven native submit control is required before clicking.')
                         verify_dispatch()
-                        check_form_destination(page, target, url, direct_url)
+                        if provenance is not None:
+                            page, target = await _fresh_native_receiver(
+                                session, page, action, target, provenance,
+                                fixture_context=ctx)
+                        check_form_destination(page, target, *trusted_origins,
+                                               provenance=provenance)
                         check_form(page, filled, uploaded, Path(resume_path).name)
                         verify_history(history, page)
                         before = page
@@ -1222,7 +1374,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             await asyncio.sleep(1)
                             after = await session.page()
                             step['url'] = after['url']
-                            if navigation_allowed(after['url'], url, direct_url) and (phrase := confirmation(before, after)):
+                            if allowed(after['url']) and (phrase := confirmation(before, after)):
                                 return {'status': 'applied', 'confirmation': phrase,
                                         'fields': [{'label': r['label'],
                                                     'value': filled[r['selector']]}
@@ -1239,7 +1391,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             if not native_submit(target):
                                 raise Gate('A JS-backed Continue has no proven native destination.')
                             verify_dispatch()
-                            check_form_destination(page, target, url, direct_url)
+                            if provenance is not None:
+                                page, target = await _fresh_native_receiver(
+                                    session, page, action, target, provenance,
+                                    fixture_context=ctx)
+                            check_form_destination(page, target, *trusted_origins,
+                                                   provenance=provenance)
                             check_form(page, filled, uploaded, Path(resume_path).name)
                             verify_history(history, page)
                             before = page
@@ -1255,6 +1412,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             resume_tex=resume_tex, github=github, pk=pk,
                             allow_click=verb == 'click' and bool(_NEXT.match(target['label'])),
                             job_url=url, on_committing_click=mark_click_started,
+                            provenance=provenance,
                             **({'fixture_context': ctx} if ctx else {}))
                         if verb == 'click':
                             step['last_button'] = target['label']
@@ -1262,9 +1420,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         history.append(result)
                     page = await session.page()
                     step['url'] = page['url']
-                    if not navigation_allowed(page['url'], url, direct_url):
+                    if not allowed(page['url']):
                         raise Gate('Click redirected to an unrelated job or tenant.')
-                    if submitted and navigation_allowed(page['url'], url, direct_url) and (phrase := confirmation(before, page)):
+                    if submitted and allowed(page['url']) and (phrase := confirmation(before, page)):
                         return {'status': 'applied', 'confirmation': phrase,
                                 'fields': [{'label': r['label'], 'value': filled[r['selector']]}
                                            for r in history if r.get('selector') in filled]}

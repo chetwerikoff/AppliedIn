@@ -938,3 +938,507 @@ async def test_choice_caption_mismatch_in_dom_witness_gates_without_grant(
     assert row['human_approved_answers'] == {}
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
+
+# Issue #29: the configured Greenhouse board, never a discovered iframe or URL,
+# is the only additional authority. All navigation/session calls remain fakes.
+GH_PK = 'example-co#123456'
+GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
+GH_DIRECT = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+
+
+def _greenhouse_row():
+    return {'pk': GH_PK, 'company': 'example-co', 'job_id': '123456',
+            'ats': 'greenhouse', 'jd_url': GH_WRAP,
+            'status': 'submitting', 'human_approved_answers': {},
+            'possible_submission': False}
+
+
+def _greenhouse_config(monkeypatch, tmp_path):
+    from agent import run
+
+    config = tmp_path / 'watchlist.yaml'
+    config.write_text(
+        'companies:\n  - name: example-co\n    ats: greenhouse\n'
+        '    board: example-co\n'
+        '    careers_url: https://careers.example-co.test/openings\n')
+    settings = SimpleNamespace(config_dir=str(tmp_path))
+    monkeypatch.setattr('core.config.get_settings', lambda: settings)
+    monkeypatch.setattr(run, 'get_settings', lambda: settings)
+    return config
+
+
+def _greenhouse_session(monkeypatch, tmp_path, page=None):
+    _greenhouse_config(monkeypatch, tmp_path)
+    if page is None:
+        page = inventory(field(form_action=GH_DIRECT),
+                         submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, decide, _ = world(monkeypatch, page)
+    row = _greenhouse_row()
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    return browser, decide, row
+
+
+def _greenhouse_provenance(row, configs=None):
+    from discovery.watchlist import CompanyConfig
+    from tools.claude_chrome import verified_greenhouse_alias
+
+    configs = configs if configs is not None else [
+        CompanyConfig(name='example-co', ats='greenhouse',
+                      careers_url='https://careers.example-co.test/openings',
+                      board='example-co')]
+    return verified_greenhouse_alias(
+        row, pk=GH_PK, company='example-co', url=GH_WRAP, configs=configs)
+
+
+def test_explicit_greenhouse_tenant_requires_canonical_row_and_config():
+    from discovery.watchlist import CompanyConfig
+    from tools.claude_chrome import direct_board_url
+
+    row = _greenhouse_row()
+    alias = _greenhouse_provenance(row)
+    assert alias and alias.url == GH_DIRECT
+    assert direct_board_url(GH_WRAP) == ''  # The Claude engine is unchanged.
+    assert _greenhouse_provenance({**row, 'job_id': '654321'}) is None
+    assert _greenhouse_provenance({**row, 'pk': 'example-co#654321'}) is None
+    assert _greenhouse_provenance({**row, 'ats': 'custom'}) is None
+    assert _greenhouse_provenance({**row, 'jd_url': GH_WRAP + '#changed'}) is None
+
+    good = CompanyConfig(name='example-co', ats='greenhouse',
+                         board='example-co',
+                         careers_url='https://careers.example-co.test/openings')
+    for board in ('https://job-boards.greenhouse.io/example-co', 'EXAMPLE-CO',
+                  'example.co/path', 'example%2dco', 'éxample-co', 'foo@bar'):
+        assert _greenhouse_provenance(row, [good.model_copy(
+            update={'board': board})]) is None
+    for careers in ('http://careers.example-co.test/openings',
+                    'https://careers.example-co.test:443/openings',
+                    'https://user@careers.example-co.test/openings',
+                    'https://careers.example-co.test/openings?x=1',
+                    'https://careers.example-co.test/openings#fragment',
+                    'https://careers.example-co.test/openings/%2e',
+                    'https://careers.example-co.test/openings//other',
+                    'https://careers.example-co.test/openings/../other',
+                    'https://CAREERS.example-co.test/openings'):
+        assert _greenhouse_provenance(row, [good.model_copy(
+            update={'careers_url': careers})]) is None
+    assert _greenhouse_provenance(row, [good, good]) is None
+    assert _greenhouse_provenance(row, []) is None
+    assert _greenhouse_provenance(row, [good.model_copy(
+        update={'ats': 'custom'})]) is None
+
+
+def test_unicode_company_collisions_do_not_authorize_alias():
+    from discovery.watchlist import CompanyConfig
+    from tools.claude_chrome import verified_greenhouse_alias
+
+    row = {**_greenhouse_row(), 'company': 'Exämple-Co',
+           'pk': 'exämple-co#123456'}
+    first = CompanyConfig(name='Exämple-Co', ats='greenhouse',
+                          board='example-co',
+                          careers_url='https://careers.example-co.test/openings')
+    duplicate = first.model_copy(update={'name': 'EXÄMPLE-CO'})
+    assert verified_greenhouse_alias(
+        row, pk=row['pk'], company=row['company'], url=row['jd_url'],
+        configs=[first]) is not None
+    assert verified_greenhouse_alias(
+        row, pk=row['pk'], company=row['company'], url=row['jd_url'],
+        configs=[first, duplicate]) is None
+
+
+@pytest.mark.parametrize('query', [
+    'gh_jid=654321', 'gh_jid=123456&gh_jid=123456',
+    'gh_jid=%31%32%33%34%35%36', 'gh_jid=１２３４５６',
+    'GH_JID=123456', 'gh_jid=123456&board=example-co',
+    'gh_jid=123456&board=another', 'gh_jid=123456&Board=example-co',
+    'gh_jid=123456&src=feed',
+])
+def test_only_one_exact_literal_gh_jid_is_new_alias(query):
+    from tools.claude_chrome import greenhouse_alias_candidate
+
+    from tools.claude_chrome import verified_greenhouse_alias
+    from discovery.watchlist import CompanyConfig
+
+    row = {**_greenhouse_row(), 'jd_url': GH_WRAP.split('?')[0] + '?' + query}
+    assert not greenhouse_alias_candidate(row['jd_url']) or query == 'gh_jid=654321'
+    assert verified_greenhouse_alias(
+        row, pk=GH_PK, company='example-co', url=row['jd_url'],
+        configs=[CompanyConfig(
+            name='example-co', ats='greenhouse', board='example-co',
+            careers_url='https://careers.example-co.test/openings')]) is None
+
+
+def test_alias_effective_route_guard_is_job_scoped_and_legacy_unchanged():
+    alias = _greenhouse_provenance(_greenhouse_row())
+    assert forms.navigation_allowed(GH_DIRECT, provenance=alias)
+    assert forms.navigation_allowed(GH_DIRECT + '/apply', provenance=alias)
+    assert forms.navigation_allowed(GH_WRAP, provenance=alias)
+    assert forms.navigation_allowed(GH_DIRECT, GH_DIRECT)  # Legacy explicit origin.
+    for route in (
+        GH_DIRECT + '/../654321', GH_DIRECT + '/./apply',
+        GH_DIRECT + '/%2e%2e/654321', GH_DIRECT + '/%2fother',
+        GH_DIRECT + '//apply', GH_DIRECT + r'/\..\other',
+        GH_DIRECT + '?src=feed', GH_DIRECT + '#different',
+        'https://job-boards.greenhouse.io/example-co/jobs/654321',
+        'https://job-boards.greenhouse.io/other/jobs/123456',
+        'https://job-boards.greenhouse.io.evil.test/example-co/jobs/123456',
+        'https://foreign.test/job/123456',
+    ):
+        assert not forms.navigation_allowed(route, provenance=alias), route
+
+
+async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(monkeypatch, tmp_path):
+    from agent import run
+
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path)
+    response = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert response['status'] == 'gate'
+    q = response['form_question']
+    assert q['origin_row'] == {
+        'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
+    assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
+    assert (q['label'], q['selector'], q['form_selector']) == (
+        'Email', '#email', '#application')
+    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
+    assert not decide.await_count
+
+    # The same synthetic tracking-status seam used by the actual direct writer.
+    class Tracking:
+        def get(self, pk):
+            assert pk == GH_PK
+            return deepcopy(row)
+
+        def set_status(self, pk, status, **changes):
+            assert pk == GH_PK
+            row.update(status=status, **changes)
+
+    tracking = Tracking()
+    tracking.set_status(
+        GH_PK, 'needs_human', gate_source='applier', gate_call_id='direct',
+        gate_pending={'question': response['question'], 'form_question': q})
+    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) == 'Email'
+    row['jd_url'] = (
+        'https://careers.example-co.test/openings/other?gh_jid=123456')
+    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) is None
+    row['jd_url'] = GH_WRAP
+    q.pop('origin_row')
+    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) is None
+
+
+async def test_no_explicit_alias_config_stops_before_navigation(monkeypatch, tmp_path):
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+    result = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert result['status'] == 'gate' and result['form_question'] is None
+    assert browser.calls == [] and not decide.await_count
+
+
+async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch, tmp_path):
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    original = browser.navigate
+
+    async def revoke(url):
+        page = await original(url)
+        (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+        return page
+
+    monkeypatch.setattr(browser, 'navigate', revoke)
+    result = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert result['status'] == 'gate' and result['form_question'] is None
+    assert [call[0] for call in browser.calls] == ['navigate']
+    assert not decide.await_count
+
+
+@pytest.mark.parametrize('verb,kind', [
+    ('fill', 'email'), ('select', 'select'), ('choose', 'checkbox'),
+    ('upload', 'file'), ('click', 'submit'),
+])
+async def test_alias_unsafe_native_receiver_never_mutates(
+        monkeypatch, tmp_path, verb, kind):
+    if kind == 'submit':
+        chosen = submit('Continue', selector='#chosen',
+                        form_action='https://foreign.test/job/123456')
+    else:
+        selected = {
+            'email': {}, 'select': {'tag': 'select', 'type': 'select',
+                                    'options': [{'value': 'a', 'label': 'Alpha'}]},
+            'checkbox': {'type': 'checkbox', 'value': 'yes', 'has_value': True},
+            'file': {'type': 'file'},
+        }[kind]
+        chosen = field('Upload résumé' if kind == 'file' else 'Email', '#chosen',
+                       form_action='https://foreign.test/job/123456',
+                       **selected)
+    p = inventory(chosen, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: True)
+    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
+    alias = _greenhouse_provenance(row)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': verb, 'selector': '#chosen', 'fact': 'Email'},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, allow_click=True,
+            job_url=GH_WRAP, provenance=alias)
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('verb', ['upload', 'click'])
+async def test_tracked_action_never_promotes_observed_page_to_origin(
+        monkeypatch, tmp_path, verb):
+    p = inventory(field('Upload résumé', '#file', type='file'),
+                  submit('Continue', selector='#next', form_action=GH_DIRECT),
+                  url=GH_DIRECT)
+    browser, _, _ = _greenhouse_session(monkeypatch, tmp_path, p)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: True)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': verb, 'selector': '#file' if verb == 'upload'
+                        else '#next'}, facts={}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, allow_click=True, job_url='')
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+async def test_alias_execute_gate_producer_captures_original_row(monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    alias = _greenhouse_provenance(row)
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={}, filled={}, resume_path='Resume.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=GH_PK, job_url=GH_WRAP, provenance=alias)
+    assert caught.value.form_question['origin_row'] == {
+        'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
+    assert caught.value.form_question['url'] == GH_DIRECT
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+
+async def test_alias_exact_approved_field_writes_only_verified_receiver(
+        monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Email': {'value': 'test@example.test', 'selector': '#email',
+                  'url': GH_DIRECT, 'label': 'Email', 'question': '',
+                  'tag': 'input', 'type': 'email', 'form_selector': '#application',
+                  'form_action': GH_DIRECT}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example.test'}, filled={},
+        resume_path='Resume.pdf', company='example-co', jd_text='',
+        resume_tex='', github='', pk=GH_PK, job_url=GH_WRAP,
+        provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'fill'
+    assert [c for c in browser.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example.test')]
+
+
+async def test_alias_exact_upload_uses_fresh_native_receiver(monkeypatch, tmp_path):
+    p = inventory(field('Upload résumé', '#resume', tag='input', type='file',
+                        form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, p, {'action': 'upload', 'selector': '#resume'},
+        facts={}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['uploaded'] is True
+    assert len([c for c in browser.calls if c[0] == 'upload']) == 1
+
+
+async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_context(
+        monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    # Even a matching-looking page.url and job_url cannot mint authority.
+    with pytest.raises(forms.Gate, match='verified alias context'):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT)
+    assert browser.calls == []
+
+
+async def test_alias_wrong_tracked_caller_identity_never_mutates(monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT,
+            provenance=_greenhouse_provenance(row))
+    assert browser.calls == []
+
+
+async def test_alias_config_revoked_during_witness_gates_without_question(
+        monkeypatch, tmp_path):
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    original_call = browser.call
+
+    async def revoke_on_observe(*args, **kwargs):
+        result = await original_call(*args, **kwargs)
+        if args[0] == 'evaluate':
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+        return result
+
+    monkeypatch.setattr(browser, 'call', revoke_on_observe)
+    outcome = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate'
+    assert outcome['form_question'] is None
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+async def test_alias_approved_select_uses_exact_native_option(monkeypatch, tmp_path):
+    options = [{'value': 'remote', 'label': 'Remote'},
+               {'value': 'hybrid', 'label': 'Hybrid'}]
+    select = field('Work mode', '#work', tag='select', type='select',
+                   options=options, form_action=GH_DIRECT)
+    p = inventory(select, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Work mode': {
+            'value': 'Remote', 'selector': '#work', 'url': GH_DIRECT,
+            'label': 'Work mode', 'question': '', 'tag': 'select',
+            'type': 'select', 'form_selector': '#application',
+            'form_action': GH_DIRECT, 'options': deepcopy(options)}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'select', 'selector': '#work',
+                     'fact': 'Work mode', 'value': 'remote'},
+        facts={'Work mode': 'Remote'}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'select'
+    assert [c for c in browser.calls if c[0] == 'select'] == [
+        ('select', '#work', '--value', 'remote')]
+
+
+async def test_alias_approved_choice_uses_exact_native_control(monkeypatch, tmp_path):
+    choice = field('Email contact', '#choice', tag='input', type='checkbox',
+                   question='Contact preference', required=True, value='yes',
+                   has_value=True, checked=False, form_action=GH_DIRECT)
+    p = inventory(choice, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Contact preference': {
+            'value': 'yes', 'selector': '#choice', 'url': GH_DIRECT,
+            'label': 'Email contact', 'question': 'Contact preference',
+            'tag': 'input', 'type': 'checkbox',
+            'form_selector': '#application', 'form_action': GH_DIRECT,
+            'visible_text': 'Email contact'}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'choose', 'selector': '#choice',
+                     'fact': 'Contact preference'},
+        facts={'Contact preference': 'yes'}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'choose'
+    assert [c for c in browser.calls if c[0] == 'click'] == [
+        ('click', '#choice')]
+
+
+async def test_alias_safe_native_continue_stays_under_existing_hold(
+        monkeypatch, tmp_path):
+    next_button = submit('Continue', selector='#next', form_action=GH_DIRECT)
+    p = inventory(next_button, url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    prior = browser.call
+
+    async def fake_continue(*args, **kwargs):
+        if args[0] == 'click' and args[1] == '#next':
+            browser.calls.append(args)
+            return {}
+        return await prior(*args, **kwargs)
+
+    monkeypatch.setattr(browser, 'call', fake_continue)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: pk == GH_PK)
+    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
+    receipt = await forms.execute(
+        browser, p, {'action': 'click', 'selector': '#next'},
+        facts={}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, allow_click=True,
+        provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'click'
+    assert [c for c in browser.calls if c[0] == 'click'] == [
+        ('click', '#next')]
+
+@pytest.mark.parametrize('verb', ['upload', 'click'])
+async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
+        monkeypatch, tmp_path, verb):
+    # Evaluate may yield while the explicit board mapping is revoked. The
+    # receiver's pre-await provenance check cannot authorize the later IPC.
+    receiver = (field('Upload résumé', '#resume', type='file',
+                      form_action=GH_DIRECT)
+                if verb == 'upload' else
+                submit('Continue', selector='#next', form_action=GH_DIRECT))
+    page = inventory(receiver, url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, page)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: pk == GH_PK)
+    monkeypatch.setattr(forms, 'check_before_committing_click',
+                        lambda *args, **kwargs: None)
+    original = browser.call
+
+    async def revoke_during_evaluate(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if args[0] == 'evaluate':
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+        return result
+
+    monkeypatch.setattr(browser, 'call', revoke_during_evaluate)
+    with pytest.raises(forms.Gate, match='mapping'):
+        await forms.execute(
+            browser, page,
+            {'action': verb, 'selector': '#resume' if verb == 'upload' else '#next'},
+            facts={}, filled={}, resume_path='Resume.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=GH_PK, job_url=GH_WRAP, allow_click=verb == 'click',
+            provenance=_greenhouse_provenance(row))
+    assert [call[0] for call in browser.calls] == ['evaluate']
+
+
+async def test_alias_revoked_during_session_acquisition_prevents_navigation(
+        monkeypatch, tmp_path):
+    # Session acquisition is awaited after the first provenance proof, so
+    # revocation during __aenter__ must deny even the first navigate IPC.
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+
+    class RevokingSession:
+        async def __aenter__(self):
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+            return browser
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(bsk, 'Session', lambda kind: RevokingSession())
+    outcome = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate' and outcome['form_question'] is None
+    assert browser.calls == []
+    assert not decide.await_count

@@ -929,9 +929,35 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                         for o in field['options']}) != len(field['options'])))):
         return None
     from tools.browser_skill_apply import navigation_allowed
+    from tools.claude_chrome import (
+        greenhouse_alias_candidate, verified_greenhouse_alias,
+    )
     url = row.get('jd_url') or ''
-    # A rewritten board URL is not proof of same-employer authorization.
-    if not navigation_allowed(field['url'], url):
+    if greenhouse_alias_candidate(url):
+        # Independently repeat the trusted row/config proof at answer time. An
+        # unchanged board URL is insufficient if the original wrapper drifted.
+        from core.ids import make_pk
+        from discovery.watchlist import load_watchlist
+        company, job_id = row.get('company'), row.get('job_id')
+        if (not isinstance(company, str) or not isinstance(job_id, str)
+                or row.get('pk') != pk or make_pk(company, job_id) != pk):
+            return None
+        try:
+            configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+            proven = verified_greenhouse_alias(
+                row, pk=pk, company=company, url=url, configs=configs)
+        except Exception:
+            return None
+        expected = {'jd_url': url, 'company': company, 'ats': row.get('ats')}
+        witness = field.get('origin_row')
+        if (proven is None or not isinstance(witness, dict)
+                or set(witness) != {'jd_url', 'company', 'ats'}
+                or any(type(witness[k]) is not str or witness[k] != value
+                       for k, value in expected.items())
+                or not navigation_allowed(field['url'], provenance=proven)):
+            return None
+    elif not navigation_allowed(field['url'], url):
+        # Original engine and non-alias direct-form grants stay unchanged.
         return None
     return field['label']
 

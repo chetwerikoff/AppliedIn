@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 import shutil
 import tempfile
 from pathlib import Path
 
+from core.ids import make_pk
 from core.logging import get_logger
 
 log = get_logger(__name__)
@@ -790,6 +793,105 @@ def _stage_resume(src: str, owner: str) -> str:
     except OSError:
         log.warning("could not stage the résumé — using it where it is", exc_info=True)
         return src
+
+
+
+# Only an explicitly configured Greenhouse tenant can authorize a job alias.
+# This validator is pure: discovery-probed boards and page/iframe content are
+# intentionally absent from its inputs.
+_ALIAS_BOARD = re.compile(r'[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?\Z')
+_ALIAS_JID = re.compile(r'gh_jid=([0-9]+)\Z')
+_ALIAS_LABEL = re.compile(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z')
+_ALIAS_PATH = re.compile(r'/[A-Za-z0-9._~/-]*\Z')
+
+
+@dataclass(frozen=True)
+class GreenhouseJobAlias:
+    pk: str
+    company: str
+    job_id: str
+    ats: str
+    wrapper: str
+    careers_url: str
+    board: str
+    url: str
+
+
+def _alias_https_parts(value: str, *, query: bool = False) -> tuple[str, str, str] | None:
+    """Strict literal HTTPS authority/path; never let URL normalization grant trust."""
+    if (not isinstance(value, str) or not value.startswith('https://')
+            or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in value)
+            or '%' in value or '\\' in value or '#' in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        host, path = parts.netloc, parts.path
+        if (parts.scheme != 'https' or not host or len(host) > 253
+                or parts.hostname != host or parts.username is not None
+                or parts.password is not None or parts.port is not None
+                or not all(_ALIAS_LABEL.fullmatch(label)
+                           for label in host.split('.'))
+                or not path.startswith('/') or not _ALIAS_PATH.fullmatch(path)
+                or '//' in path
+                or any(part in {'.', '..'} for part in path.split('/'))):
+            return None
+        literal = f'https://{host}{path}' + (f'?{parts.query}' if query else '')
+        if value != literal:
+            return None
+        return host, path, parts.query
+    except (ValueError, TypeError):
+        return None
+
+
+def greenhouse_alias_candidate(url: str) -> bool:
+    """The only no-board wrapper syntax eligible for the new guarded route."""
+    if not isinstance(url, str):
+        return False
+    try:
+        return bool(_ALIAS_JID.fullmatch(urlsplit(url).query))
+    except ValueError:
+        return False
+
+
+def verified_greenhouse_alias(row: dict, *, pk: str, company: str, url: str,
+                              configs: list) -> GreenhouseJobAlias | None:
+    """Prove one tracked job against one current, explicit company/tenant tuple."""
+    if not isinstance(row, dict) or not isinstance(configs, list):
+        return None
+    name, jid = row.get('company'), row.get('job_id')
+    if (not isinstance(pk, str) or not isinstance(name, str)
+            or not isinstance(jid, str) or not re.fullmatch(r'[0-9]+\Z', jid)
+            or row.get('pk') != pk or pk != make_pk(name, jid)
+            or company != name or url != row.get('jd_url')
+            or row.get('ats') != 'greenhouse'):
+        return None
+    matches = [item for item in configs
+               if isinstance(getattr(item, 'name', None), str)
+               and item.name.strip().lower() == name.strip().lower()]
+    if len(matches) != 1:
+        return None
+    cfg = matches[0]
+    board = getattr(cfg, 'board', None)
+    careers = getattr(cfg, 'careers_url', None)
+    if (getattr(cfg, 'ats', None) != 'greenhouse'
+            or not isinstance(board, str) or not _ALIAS_BOARD.fullmatch(board)):
+        return None
+    configured = _alias_https_parts(careers)
+    wrapped = _alias_https_parts(url, query=True)
+    if not configured or not wrapped:
+        return None
+    configured_host, configured_path, _ = configured
+    wrapper_host, wrapper_path, wrapper_query = wrapped
+    match = _ALIAS_JID.fullmatch(wrapper_query)
+    if (not match or match.group(1) != jid or wrapper_host != configured_host
+            or not (configured_path == '/'
+                    or wrapper_path == configured_path
+                    or wrapper_path.startswith(configured_path.rstrip('/') + '/'))):
+        return None
+    return GreenhouseJobAlias(
+        pk=pk, company=name, job_id=jid, ats='greenhouse', wrapper=url,
+        careers_url=careers, board=board,
+        url=f'https://job-boards.greenhouse.io/{board}/jobs/{jid}')
 
 
 def direct_board_url(url: str) -> str:

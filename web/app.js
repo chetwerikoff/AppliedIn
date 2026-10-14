@@ -42,7 +42,7 @@ function savedAppsSort() {
 }
 
 const state = {
-  apps: [],
+  apps: [], unassignedReplies: [], replyAssigning: new Set(),
   tracker: {}, trackerDrafts: {}, trackerSaving: new Set(),
   appFrom: "", appTo: "", appOutcome: "", appDue: false,
   requests: new Set(), launch: null,
@@ -956,7 +956,8 @@ function renderTabs() {
   $("#tab-n-apps").textContent = state.apps.length;
   const needs = state.apps.filter((a) => a.status === "needs_human").length;
   const stuck = state.apps.filter(isStuck).length;
-  const nb = $("#tab-n-needs"); nb.hidden = !needs; tick(nb, needs);
+  const needsTotal = needs + (state.unassignedReplies || []).length;
+  const nb = $("#tab-n-needs"); nb.hidden = !needsTotal; tick(nb, needsTotal);
   const sb = $("#tab-n-stuck"); sb.hidden = !stuck; tick(sb, stuck);
   renderCoFilter();
 }
@@ -2169,6 +2170,17 @@ function appsSortHead(key, label) {
     <button type="button" class="app-sort" data-app-sort="${key}">${label}<span class="app-sort-arrow" aria-hidden="true">${active ? (direction === "asc" ? "↑" : "↓") : ""}</span></button></th>`;
 }
 
+function replySummaryHtml(reply) {
+  const label = String(reply.label || "other").replace(/_/g, " ");
+  return `<div class="reply-summary"><span class="reply-label">${esc(label)}</span>
+    <time>${esc(reply.date || "Date unavailable")}</time>
+    <span>${esc(reply.sender || "Unknown sender")}</span>
+    <span>${esc(reply.subject || "No subject")}</span></div>`;
+}
+function replyTime(value) {
+  const time = Date.parse(value || "");
+  return Number.isFinite(time) ? time : Number.NEGATIVE_INFINITY;
+}
 // --- Applications table ----------------------------------------------------
 function viewApps() {
   const base = byCompany(state.apps);
@@ -2201,7 +2213,7 @@ function viewApps() {
     return `<tr data-pk="${esc(r.pk)}">
       <td>${tagHtml(r.status)}</td>
       <td class="t-co">${esc(r.company)}</td>
-      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}</td>
+      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
       <td>${scoreHtml(r.match_score)}</td>
       <td><span class="t-links">${cv}${jd}${sc}</span></td>
       <td class="t-when t-applied">${["applied", "applied_manual"].includes(r.status)
@@ -2254,18 +2266,33 @@ function needsCard(r) {
 function viewNeeds() {
   const all = state.apps.filter((a) => a.status === "needs_human");
   const items = visible(all);
-  if (!items.length) {
-    return all.length && filtersActive() ? emptyFiltered()
-      : `<div class="empty"><div class="empty-big">Nothing needs you</div>
-          The pipeline is running clean — questions and approvals will land here.</div>`;
-  }
-  const approvable = items.filter(approveAllPicks).length;
-  const head = `<div class="pane-note">
+  const matched = visible(state.apps).filter((app) => (app.replies || []).length)
+    .flatMap((app) => app.replies.map((reply) => ({ app, reply })))
+    .sort((a, b) => replyTime(b.reply.date) - replyTime(a.reply.date));
+  const matchedPage = state.page.needsReplies || 50;
+  const shownMatched = matched.slice(0, matchedPage);
+  const matchedHtml = shownMatched.length ? `<section class="reply-section"><h3>Recruiter replies</h3>
+    ${shownMatched.map(({app, reply}) => `<article class="reply-card">
+      <header><b>${esc(app.company)} · ${esc(app.title)}</b></header>${replySummaryHtml(reply)}</article>`).join("")}
+    ${matched.length > shownMatched.length ? moreBtn("needsReplies", shownMatched.length, matched.length, 50) : ""}</section>` : "";
+  const search = state.query.trim().toLowerCase();
+  const unassigned = (state.unassignedReplies || []).filter((reply) =>
+    !search || `${reply.sender || ""} ${reply.subject || ""}`.toLowerCase().includes(search));
+  const eligible = state.apps.filter((app) => ["applied", "applied_manual"].includes(app.status));
+  const unassignedHtml = unassigned.length ? `<section class="reply-section"><h3>Unassigned replies</h3>
+    ${unassigned.map((reply) => `<article class="reply-card">${replySummaryHtml(reply)}
+      <label>Assign to application<select data-reply-target="${esc(reply.record_id)}">
+        <option value="">Choose an applied application</option>${eligible.map((app) => `<option value="${esc(app.pk)}">${esc(app.company)} · ${esc(app.title)}</option>`).join("")}
+      </select></label><button type="button" class="btn btn-ghost" data-reply-assign="${esc(reply.record_id)}" ${state.replyAssigning.has(reply.record_id) ? "disabled" : ""}>Assign</button></article>`).join("")}</section>` : "";
+  const gateHtml = items.length ? `<section class="gate-section"><div class="pane-note">
     <span>${items.length} waiting on you — answer or approve to continue.</span>
-    ${approvable ? `<button class="btn btn-amber" data-approve-all="1">
-      Approve all ${approvable} ready</button>` : ""}
-  </div>`;
-  return head + items.map(needsCard).join("");
+    ${items.filter(approveAllPicks).length ? `<button class="btn btn-amber" data-approve-all="1">Approve all ${items.filter(approveAllPicks).length} ready</button>` : ""}
+    </div>${items.map(needsCard).join("")}</section>` :
+    (all.length && filtersActive() && !matched.length && !unassigned.length ? emptyFiltered() : "");
+  if (!items.length && !matched.length && !unassigned.length) return all.length && filtersActive() ? emptyFiltered()
+    : `<div class="empty"><div class="empty-big">Nothing needs you</div>
+        The pipeline is running clean — questions and approvals will land here.</div>`;
+  return gateHtml + matchedHtml + unassignedHtml;
 }
 
 // --- Unable-to-do-it cards -------------------------------------------------
@@ -3079,9 +3106,10 @@ function appsSig() {
        + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
        + (a.jd_read_error || "") + "\u0001" + (a.score_override ? "o" : "") + "\u0001"
-       + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "") + "\n";
+       + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "")
+       + "\u0001" + JSON.stringify(a.replies || []) + "\n";
   }
-  return s;
+  return s + "\u0001" + JSON.stringify(state.unassignedReplies || []);
 }
 
 const coKey = (c) => String(c || "").trim().toLowerCase();
@@ -3613,7 +3641,6 @@ async function load() {
     const d = await import("./demo-data.js");
     state.apps = d.applications;
     const counts = d.stats.counts_by_status || {};
-    // Demo /stats lacks the live-only keys — derive them so the deck renders.
     applyStats({ ...d.stats, apply_mode: "gated", discovering: false,
       processing: false, found_waiting: counts.found || 0 });
     state.paused = d.paused;
@@ -3625,6 +3652,7 @@ async function load() {
     ]);
     state.apps = (apps.items || []).filter((r) => !isInternalPk(r.pk));
     applyStats(stats);
+    await loadUnassigned();
   }
   renderAll();
 }
@@ -3709,13 +3737,39 @@ async function loadCompanies() {
   renderCompanyOptions();   // keep the custom-role datalist in step
 }
 
+async function loadUnassigned() {
+  if (DEMO) { state.unassignedReplies = []; return; }
+  try {
+    const response = await fetch(api("/replies/unassigned"), { headers: auth.header() });
+    const payload = await response.json();
+    state.unassignedReplies = Array.isArray(payload.replies) ? payload.replies : [];
+  } catch { /* Keep the last successful reply list during a transient outage. */ }
+}
+
+async function assignReply(recordId) {
+  if (state.replyAssigning.has(recordId)) return;
+  const target = $(`#pane [data-reply-target="${CSS.escape(recordId)}"]`);
+  if (!target?.value) { toast("Choose an applied application first."); return; }
+  state.replyAssigning.add(recordId);
+  renderPane();
+  const result = await post(`/replies/${encodeURIComponent(recordId)}/assign`, { pk: target.value });
+  state.replyAssigning.delete(recordId);
+  if (!result?.ok) {
+    await loadUnassigned();
+    toast(result?.error || "Could not assign this reply.");
+    refreshPane();
+    return;
+  }
+  await Promise.all([loadApps(), loadUnassigned()]);
+  toast("Reply assigned.");
+}
 async function loadApps() {
   if (DEMO) return;
   try {
     const a = await fetch(api("/applications"), { headers: auth.header() }).then((r) => r.json());
     state.apps = (a.items || []).filter((r) => !isInternalPk(r.pk));
+    await loadUnassigned();
     await migrateReviewSkips();
-    // The heatmap and the Fresh tab ride the same cadence, but only while on screen.
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
     renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
@@ -6021,6 +6075,8 @@ function wire() {
   window.addEventListener("pointercancel", () => setTimeout(releasePress, 0));
 
   $("#pane").addEventListener("click", (e) => {
+    const assignButton = e.target.closest("[data-reply-assign]");
+    if (assignButton?.dataset?.replyAssign) { assignReply(assignButton.dataset.replyAssign); return; }
     const appSort = state.tab === "apps" && e.target.closest(".applications-table [data-app-sort]");
     if (appSort) { chooseAppsSort(appSort.dataset.appSort); return; }
     if (e.target.closest("a")) return;                 // links behave as links

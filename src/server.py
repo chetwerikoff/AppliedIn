@@ -10,6 +10,7 @@ DynamoDB — same contract, different host.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI
@@ -204,6 +205,21 @@ def _is_job_row(row: dict) -> bool:
     `meta#…`) shares the tracking table but isn't a job — hide it from the board
     so it doesn't render as a blank card or inflate the counts."""
     return not is_internal_pk(row.get("pk") or "")
+
+def reply_ingest_label(label) -> str:
+    from core.reply_classifier import validated_label
+    return validated_label(label)
+def _reply_sort_timestamp(value) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return float("-inf")
+
+
+
 
 
 def _to_ui(row: dict, artifacts) -> dict:
@@ -441,8 +457,79 @@ def create_app() -> FastAPI:
     def applications():
         stores = make_stores(settings)
         rows = [r for r in stores.tracking.all() if _is_job_row(r)]
-        return {"items": [_to_ui(r, stores.artifacts) for r in rows]}
+        replies, reply_error = [], None
+        from core import reply_ingest
+        credentials = reply_ingest.local_credentials(settings)
+        if settings.mode == "local" and reply_ingest.enabled() and credentials:
+            try:
+                replies = reply_ingest.read_records(settings)
+            except Exception:
+                reply_error = "Recruiter replies are temporarily unavailable."
+        grouped = {}
+        for reply in replies:
+            pk = reply.get("pk")
+            if pk and pk != "UNASSIGNED":
+                grouped.setdefault(pk, []).append({
+                    "record_id": reply.get("record_id"),
+                    "label": reply_ingest_label(reply.get("label")),
+                    "date": reply.get("date") or "",
+                    "sender": reply.get("sender") or "",
+                    "subject": reply.get("subject") or "",
+                })
+        for items in grouped.values():
+            items.sort(key=lambda item: _reply_sort_timestamp(item["date"]), reverse=True)
+        payload = {"items": [_to_ui(r, stores.artifacts) | {"replies": grouped.get(r.get("pk"), [])}
+                              for r in rows]}
+        if reply_error:
+            payload.update(replies=[], error=reply_error)
+        return payload
 
+    @app.get("/replies/unassigned")
+    def unassigned_replies():
+        from core import reply_ingest
+        credentials = reply_ingest.local_credentials(settings)
+        if settings.mode != "local" or not reply_ingest.enabled() or not credentials:
+            return {"replies": []}
+        try:
+            records = reply_ingest.read_records(settings)
+        except Exception:
+            return {"replies": [], "error": "Recruiter replies are temporarily unavailable."}
+        return {"replies": [
+            {"record_id": r.get("record_id"),
+             "label": reply_ingest_label(r.get("label")),
+             "date": r.get("date") or "", "sender": r.get("sender") or "",
+             "subject": r.get("subject") or ""}
+            for r in records if r.get("pk") == "UNASSIGNED"]}
+
+    @app.post("/replies/{record_id}/assign")
+    def assign_reply(record_id: str, body: dict):
+        from core import reply_ingest
+        pk = str((body or {}).get("pk") or "")
+        if settings.mode != "local" or not reply_ingest.enabled() or not reply_ingest.local_credentials(settings):
+            return {"ok": False, "error": "Recruiter replies are unavailable."}
+        try:
+            records = reply_ingest.read_records(settings)
+        except Exception:
+            return {"ok": False, "error": "Recruiter replies are temporarily unavailable."}
+        current = next((record for record in records if record.get("record_id") == record_id), None)
+        stores = make_stores(settings)
+        row = stores.tracking.get(pk) if pk and not is_internal_pk(pk) else None
+        if not row or row.get("status") not in (Status.APPLIED, Status.APPLIED_MANUAL,
+                                                  Status.APPLIED.value, Status.APPLIED_MANUAL.value):
+            return {"ok": False, "error": "Choose an existing applied application."}
+        if current is None:
+            return {"ok": False, "error": "Reply not found."}
+        if current.get("pk") == pk:
+            return {"ok": True}
+        try:
+            result = reply_ingest.assign(record_id, pk, settings)
+        except Exception:
+            return {"ok": False, "error": "Recruiter replies are temporarily unavailable."}
+        if result == "not_found":
+            return {"ok": False, "error": "Reply not found."}
+        if result == "conflict":
+            return {"ok": False, "error": "Reply was already assigned to another application."}
+        return {"ok": True}
     @app.get("/application-tracker")
     def application_tracker():
         return {"items": make_stores(settings).tracking.application_notes()}

@@ -141,6 +141,30 @@ def _parse_headers(raw: bytes) -> tuple[dict, bool]:
     return ({"date": date, "sender": sender, "subject": safe("subject"),
              "message_id": safe("message-id")}, parse_failed)
 
+def _decode_text_prefix(headers: bytes, fragment: bytes) -> str:
+    """Return inline text only; MIME headers and attachment parts stay out of the model input."""
+    try:
+        message = email.message_from_bytes(headers + fragment, policy=email.policy.default)
+        texts = []
+        def collect(part):
+            if (part.get_content_disposition() == "attachment" or part.get_filename()
+                    or part.get_content_type() == "message/rfc822"):
+                return
+            if part.is_multipart():
+                for child in part.iter_parts():
+                    collect(child)
+                return
+            if part.get_content_type() not in ("text/plain", "text/html"):
+                return
+            value = part.get_content()
+            if isinstance(value, str) and value:
+                texts.append(value)
+        collect(message)
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
 def _state_path(settings) -> Path:
     return Path(settings.local_dir) / STATE_NAME
 
@@ -178,6 +202,29 @@ def read_records(settings) -> list[dict]:
                 for row in rows]
 
 
+def assign(record_id: str, pk: str, settings) -> str:
+    """Claim one unassigned record under the same lock as ingest commits."""
+    with WRITE_LOCK:
+        path = _state_path(settings)
+        state = _read_state(path)
+        found = None
+        for account in state.get("accounts", {}).values():
+            for record in account.get("records", []):
+                if record.get("record_id") == record_id:
+                    found = record
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return "not_found"
+        if found.get("pk") == pk:
+            return "assigned"
+        if found.get("pk") != "UNASSIGNED":
+            return "conflict"
+        found["pk"] = pk
+        _write_state(path, state)
+        return "assigned"
+
 def _account_key(creds: dict) -> str:
     return json.dumps([str(creds["host"]).casefold(), str(creds["username"]), str(creds["mailbox"])], separators=(",", ":"))
 
@@ -206,6 +253,7 @@ def _processed(path: Path, key: str, validity: str, uid: int) -> bool:
     with WRITE_LOCK:
         account = _read_state(path).get("accounts", {}).get(key, {})
         return f"{validity}:{uid}" in account.get("processed", [])
+
 
 
 def _commit_uid(path: Path, key: str, validity: str, uid: int,
@@ -294,10 +342,14 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
             except Exception:
                 pk = "UNASSIGNED"
             text = client.fetch_text_prefix(uid)
-            try:
-                label = classifier(fields, text) if classifier else None
-            except Exception:
-                label = None
+            label = None
+            if classifier is not None:
+                try:
+                    from core.reply_classifier import validated_label
+                    fragment = _decode_text_prefix(raw, text) if isinstance(text, bytes) else str(text or "")
+                    label = validated_label(classifier(fields, fragment))
+                except Exception:
+                    label = None
             record = {"record_id": str(uuid.uuid4()), **fields, "label": label, "pk": pk}
             inserted = _commit_uid(state_path, key, validity, uid, record, fields["message_id"])
             _advance_cursor(state_path, key, validity, uid)
@@ -306,6 +358,10 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
     finally:
         client.logout()
     return processed_count
+
+def _production_classifier(_fields: dict, text: str) -> str:
+    from core.reply_classifier import classify
+    return classify(text)
 
 
 def run_poller(stop_event=None) -> None:
@@ -319,7 +375,7 @@ def run_poller(stop_event=None) -> None:
             settings = get_settings()
             creds = local_credentials(settings)
             if settings.mode == "local" and enabled() and creds:
-                ingest_pass(settings, creds, make_stores(settings))
+                ingest_pass(settings, creds, make_stores(settings), classifier=_production_classifier)
         except Exception:
             logger.warning("IMAP poll failed; will retry on next interval")
         interval = poll_interval() or 60

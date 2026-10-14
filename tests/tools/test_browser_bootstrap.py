@@ -132,6 +132,23 @@ async def attempt(current, *, facts=None):
                              pk=PK, resume_path='Resume.pdf')
 
 
+async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monkeypatch):
+    url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+
+    def unavailable_row(*args, **kwargs):
+        raise OSError('tracking unavailable')
+
+    # The cross-tenant gate must not depend on tracking storage being reachable.
+    monkeypatch.setattr(forms, '_row', unavailable_row)
+    monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
+        'Cross-tenant direct board must be rejected before browser open'))
+    result = await forms.apply(url, 'example-co', {}, 'synthetic',
+                               pk=PK, resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert 'Derived board tenant or job' in result['question']
+
+
 @pytest.mark.parametrize('extra,selected', [
     ({}, '#email'),
     ({'type': 'tel'}, '#email'),

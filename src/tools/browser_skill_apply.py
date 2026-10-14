@@ -913,6 +913,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             for c in page['controls']):
         return page
     page, witness = await _observe_controls(session, page)
+    if provenance is not None and (
+            not _alias_current(provenance, fixture_context=fixture_context)
+            or not navigation_allowed(page.get('url', ''), provenance=provenance)):
+        raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
     for item in page['controls']:
         if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
@@ -926,6 +930,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 and str(item.get('value') or '').strip()):
             continue
         try:
+            if provenance is not None and not _alias_current(
+                    provenance, fixture_context=fixture_context):
+                raise Gate('The trusted alias is no longer current.')
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=True,
                 provenance=provenance)
@@ -989,6 +996,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job Greenhouse provenance.')
+    elif pk:
+        tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
+        if greenhouse_alias_candidate(tracked.get('jd_url')):
+            # Direct calls cannot borrow a page URL as alias provenance.
+            raise Gate('This Greenhouse wrapper needs a verified alias context.')
     verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -1004,6 +1016,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         else:
             _require_native_action(target, verb)
         observed, witness = await _observe_controls(session, page)
+        if provenance is not None and (
+                not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(observed.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('The same-job page or mapping changed before a field gate.')
         target = control(observed, action)
         if verb == 'choose':
             _require_native_choice(target)
@@ -1084,9 +1101,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
-        if provenance is not None and not _alias_current(
-                provenance, fixture_context=ctx):
-            raise Gate('The same-job alias changed before disclosure.')
+        if provenance is not None and (
+                not _alias_current(provenance, fixture_context=ctx)
+                or not navigation_allowed(latest.get('url', ''),
+                                          provenance=provenance)):
+            raise Gate('The same-job page or mapping changed before disclosure.')
         fresh_question = _disclosure_question(
             latest, current, latest_witness, job_url or latest['url'],
             provenance=provenance)

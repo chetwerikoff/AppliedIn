@@ -1923,6 +1923,12 @@ async def test_noncanonical_vendor_url_refuses_before_http_client(monkeypatch, r
 
     pk = make_pk('example-co', 'backend-123')
     row = _vendor_row(pk, raw_url)
+    original_urlsplit = forms.urlsplit
+    def refuse_parser_normalization(candidate, *args, **kwargs):
+        if candidate == raw_url:
+            pytest.fail('Noncanonical tracked URL reached URL parsing')
+        return original_urlsplit(candidate, *args, **kwargs)
+    monkeypatch.setattr(forms, 'urlsplit', refuse_parser_normalization)
     monkeypatch.setattr(forms.httpx, 'AsyncClient', lambda **kwargs: pytest.fail(
         'Noncanonical tracked URL reached HTTP client construction'))
     assert await forms._probe_vendor_redirect(row, pk, 'example-co', raw_url) is None

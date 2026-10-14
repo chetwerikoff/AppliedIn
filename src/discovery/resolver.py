@@ -47,6 +47,86 @@ class AtsMatch:
 # --- URL-pattern detectors ---------------------------------------------------
 # Each returns an AtsMatch or None. Order matters only for disjoint hosts.
 
+# New ATS direct URL patterns parse their own original URL. The legacy detectors
+# below still receive netloc/path for compatibility; they are not authority
+# checks for the new fixed-host feed adapters.
+_ASCII_TENANT = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_ASCII_ACCOUNT = r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?"
+_ASCII_JOB = r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+
+
+def _new_ats_parts(url: str):
+    """Deny ambiguous parsed input before extracting any feed authority."""
+    if (not isinstance(url, str) or len(url) > 2048
+            or any(ch in url for ch in ("%", "\\", "?", "#"))
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url)):
+        return None
+    try:
+        p = urlparse(url)
+        if (p.scheme != "https" or not p.hostname or not p.netloc.isascii()
+                or p.username is not None or p.password is not None
+                or p.port not in (None, 443) or p.query or p.fragment
+                or not re.fullmatch(r"/[A-Za-z0-9_./~-]*", p.path or "/")
+                or "//" in p.path or any(x in (".", "..") for x in p.path.split("/"))):
+            return None
+        if not all(re.fullmatch(_ASCII_TENANT, x) for x in p.hostname.split(".")):
+            return None
+    except ValueError:
+        return None
+    return p
+
+
+def _personio(host: str, path: str, url: str) -> AtsMatch | None:
+    p = _new_ats_parts(url)
+    if p is None:
+        return None
+    match = re.fullmatch(rf"({_ASCII_TENANT})\.jobs\.personio\.(?:de|com)",
+                         p.hostname or "")
+    if match and (p.path in ("", "/", "/xml")
+                  or re.fullmatch(r"/job/[1-9][0-9]{0,127}", p.path)):
+        return AtsMatch("personio", match.group(1))
+    return None
+
+
+def _teamtailor(host: str, path: str, url: str) -> AtsMatch | None:
+    p = _new_ats_parts(url)
+    if p is None:
+        return None
+    match = re.fullmatch(rf"({_ASCII_TENANT})\.teamtailor\.com", p.hostname or "")
+    if match and (p.path in ("", "/", "/jobs", "/jobs.rss")
+                  or re.fullmatch(rf"/jobs/{_ASCII_JOB}", p.path)):
+        return AtsMatch("teamtailor", match.group(1))
+    return None
+
+
+def _recruitee(host: str, path: str, url: str) -> AtsMatch | None:
+    p = _new_ats_parts(url)
+    if p is None:
+        return None
+    match = re.fullmatch(rf"({_ASCII_TENANT})\.recruitee\.com", p.hostname or "")
+    if match and (p.path in ("", "/", "/careers", "/careers/",
+                            "/api/offers", "/api/offers/")
+                  or re.fullmatch(rf"/o/{_ASCII_JOB}", p.path)):
+        return AtsMatch("recruitee", match.group(1))
+    return None
+
+
+def _workable(host: str, path: str, url: str) -> AtsMatch | None:
+    p = _new_ats_parts(url)
+    if p is None or p.hostname != "apply.workable.com":
+        return None
+    # Widget account path takes precedence over the generic account component.
+    widget = re.fullmatch(rf"/api/v1/widget/accounts/({_ASCII_ACCOUNT})", p.path)
+    if widget:
+        return AtsMatch("workable", widget.group(1))
+    match = re.fullmatch(
+        rf"/({_ASCII_ACCOUNT})(?:/|/j/{_ASCII_JOB})?", p.path)
+    if match and match.group(1).lower() not in {"api", "j"}:
+        return AtsMatch("workable", match.group(1))
+    return None
+
+
+
 def _greenhouse(host: str, path: str, url: str) -> AtsMatch | None:
     # boards.greenhouse.io/<token>, job-boards.greenhouse.io/<token>,
     # or an embed URL ...?for=<token>
@@ -104,7 +184,8 @@ def _eightfold(host: str, path: str, url: str) -> AtsMatch | None:
     return None
 
 
-_URL_DETECTORS = (_greenhouse, _lever, _ashby, _smartrecruiters, _workday, _eightfold)
+_URL_DETECTORS = (_personio, _teamtailor, _recruitee, _workable,
+                  _greenhouse, _lever, _ashby, _smartrecruiters, _workday, _eightfold)
 
 # Signatures to look for inside a fetched custom careers page (many custom pages
 # embed or link their real ATS board). Only ATSes we have a feed adapter for.

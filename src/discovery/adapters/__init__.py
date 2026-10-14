@@ -25,7 +25,11 @@ class ATSAdapter(Protocol):
 from .ashby import AshbyAdapter  # noqa: E402
 from .greenhouse import GreenhouseAdapter  # noqa: E402
 from .lever import LeverAdapter  # noqa: E402
+from .personio import PersonioAdapter  # noqa: E402
+from .recruitee import RecruiteeAdapter  # noqa: E402
 from .smartrecruiters import SmartRecruitersAdapter  # noqa: E402
+from .teamtailor import TeamtailorAdapter  # noqa: E402
+from .workable import WorkableAdapter  # noqa: E402
 from .workday import WorkdayAdapter  # noqa: E402
 
 ADAPTERS: dict[str, ATSAdapter] = {
@@ -36,6 +40,10 @@ ADAPTERS: dict[str, ATSAdapter] = {
         AshbyAdapter(),
         SmartRecruitersAdapter(),
         WorkdayAdapter(),
+        PersonioAdapter(),
+        TeamtailorAdapter(),
+        RecruiteeAdapter(),
+        WorkableAdapter(),
     )
 }
 

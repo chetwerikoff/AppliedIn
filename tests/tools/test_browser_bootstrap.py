@@ -1205,3 +1205,108 @@ async def test_tracked_action_never_promotes_observed_page_to_origin(
             resume_tex='', github='', pk=GH_PK, allow_click=True, job_url='')
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+async def test_alias_execute_gate_producer_captures_original_row(monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    alias = _greenhouse_provenance(row)
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={}, filled={}, resume_path='Resume.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=GH_PK, job_url=GH_WRAP, provenance=alias)
+    assert caught.value.form_question['origin_row'] == {
+        'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
+    assert caught.value.form_question['url'] == GH_DIRECT
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+
+async def test_alias_exact_approved_field_writes_only_verified_receiver(
+        monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Email': {'value': 'test@example.test', 'selector': '#email',
+                  'url': GH_DIRECT, 'label': 'Email', 'question': '',
+                  'tag': 'input', 'type': 'email', 'form_selector': '#application',
+                  'form_action': GH_DIRECT}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example.test'}, filled={},
+        resume_path='Resume.pdf', company='example-co', jd_text='',
+        resume_tex='', github='', pk=GH_PK, job_url=GH_WRAP,
+        provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'fill'
+    assert [c for c in browser.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example.test')]
+
+
+async def test_alias_exact_upload_uses_fresh_native_receiver(monkeypatch, tmp_path):
+    p = inventory(field('Upload résumé', '#resume', tag='input', type='file',
+                        form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, p, {'action': 'upload', 'selector': '#resume'},
+        facts={}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['uploaded'] is True
+    assert len([c for c in browser.calls if c[0] == 'upload']) == 1
+
+
+async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_context(
+        monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    # Even a matching-looking page.url and job_url cannot mint authority.
+    with pytest.raises(forms.Gate, match='verified alias context'):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT)
+    assert browser.calls == []
+
+
+async def test_alias_wrong_tracked_caller_identity_never_mutates(monkeypatch, tmp_path):
+    p = inventory(field(form_action=GH_DIRECT),
+                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT,
+            provenance=_greenhouse_provenance(row))
+    assert browser.calls == []
+
+
+async def test_alias_config_revoked_during_witness_gates_without_question(
+        monkeypatch, tmp_path):
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    original_call = browser.call
+
+    async def revoke_on_observe(*args, **kwargs):
+        result = await original_call(*args, **kwargs)
+        if args[0] == 'evaluate':
+            (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
+        return result
+
+    monkeypatch.setattr(browser, 'call', revoke_on_observe)
+    outcome = await forms.apply(
+        GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+        resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate'
+    assert outcome['form_question'] is None
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)

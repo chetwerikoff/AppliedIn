@@ -21,7 +21,29 @@ PAGE = r"""(() => {
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   const nodes = Array.from(document.querySelectorAll(query));
-  const controls = nodes.filter(e => visible(e) || e.form || e.closest('form') || e.type === 'file').map(e => {
+  const linkId = e => {
+    const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
+      .trim().split(/\s+/).filter(Boolean);
+    if (refs.length !== 1) return '';
+    const owners = Array.from(document.querySelectorAll('[role="combobox"]'))
+      .filter(c => {
+        const candidate = (c.getAttribute('aria-controls') || c.getAttribute('aria-owns') || '')
+          .trim().split(/\s+/).filter(Boolean);
+        return candidate.length === 1 && candidate[0] === refs[0];
+      });
+    return owners.length === 1 ? refs[0] : '';
+  };
+  const linkedListbox = e => {
+    const id = linkId(e);
+    const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
+    if (!id || !matches.length) return null;
+    return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
+      ? matches[0] : null;
+  };
+  const controls = nodes.filter(e => (e.getAttribute('role') !== 'option' ||
+    !Array.from(document.querySelectorAll('[role="combobox"]'))
+      .some(c=>linkedListbox(c)?.contains(e))) &&
+    (visible(e) || e.form || e.closest('form') || e.type === 'file')).map(e => {
     const group = e.closest(
       'fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
     const question = clean(group?.querySelector(
@@ -47,6 +69,32 @@ PAGE = r"""(() => {
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
       options:e.options ? Array.from(e.options)
         .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
+      combobox: type === 'combobox' ? (() => {
+        const list = linkedListbox(e);
+        const options = list ? Array.from(list.querySelectorAll('[role="option"]'))
+          .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
+          .map(o=>({selector:selector(o),unique:document.querySelectorAll(selector(o)).length === 1,
+            tag:o.tagName.toLowerCase(), native_type:o.type || '',
+            submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
+              o.type === 'submit' || o.type === 'image',
+            navigates:o.tagName === 'A' && !!o.href,
+            value:o.getAttribute('data-value') || o.getAttribute('value') || '',
+            label:clean(o.innerText),selected:o.getAttribute('aria-selected') === 'true'})) : [];
+        const hiddenId = e.getAttribute('data-value-input');
+        const hiddenName = e.getAttribute('data-value-name');
+        const receivers = Array.from(document.querySelectorAll('input[type="hidden"]'))
+          .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
+            (typeof e.contains === 'function' && e.contains(h)) ||
+            (hiddenName && h.name === hiddenName)));
+        return {linked:!!list, link_id:linkId(e),
+          listbox_selector:list ? selector(list) : '', options,
+          selected_text:clean(e.getAttribute('aria-valuetext') ||
+            e.getAttribute('data-selected-label') || ''),
+          displayed_text:clean(e.value || e.innerText || ''),
+          selected_value:e.getAttribute('data-selected-value') || '',
+          hidden_selector:receivers.length === 1 ? selector(receivers[0]) : '',
+          hidden_value:receivers.length === 1 ? receivers[0].value : ''};
+      })() : null,
       href:e.tagName === 'A' ? e.href : ''};
   });
   const description = document.querySelector('[data-automation-id="jobPostingDescription"]');
@@ -66,12 +114,27 @@ PAGE = r"""(() => {
   });
   // A closed shadow root cannot be inspected. Detect visible custom hosts and
   // opaque widgets instead of treating 'no open shadow root' as completeness.
+  const linkedParts = new Set();
+  const linkedComboboxes = Array.from(document.querySelectorAll('[role="combobox"]'))
+    .filter(e => {
+      const list = linkedListbox(e);
+      if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
+          (e.form || e.closest('form')))) return false;
+      // Only a genuinely absent target is a provisional closed picker.
+      if (!list) return document.getElementById(linkId(e)) === null;
+      const options = Array.from(list.querySelectorAll('[role="option"]'));
+      if (options.some(o => o.closest('[role="listbox"]') !== list)) return false;
+      linkedParts.add(list); options.forEach(o=>linkedParts.add(o));
+      return true;
+    });
   const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>
     (visible(e) || e.closest('form') || e.getAttribute('aria-required') === 'true') &&
     e.tagName !== 'BROWSER-SKILL-OVERLAY' && (
-      e.matches('[contenteditable], [role="combobox"], [role="listbox"], [role="option"]') ||
-      e.tagName.includes('-') ||
-      (e.closest('form') && e.matches('canvas,object,embed,[aria-controls]'))));
+      (e.matches('[role="combobox"]') && !linkedComboboxes.includes(e)) ||
+      (e.matches('[role="listbox"],[role="option"]') && !linkedParts.has(e)) ||
+      e.matches('[contenteditable]') || e.tagName.includes('-') ||
+      (e.closest('form') && e.matches('canvas,object,embed,[aria-controls]') &&
+        !e.matches('[role="combobox"]') && !linkedParts.has(e))));
   const inventoryVerified = document.readyState === 'complete' &&
     controls.length <= 500 && !opaqueControls && !siteShadow;
   return {url:location.href, title, text:text.slice(0,100000),

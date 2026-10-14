@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -36,6 +37,64 @@ def authority(tmp_path, monkeypatch):
         yield state
     finally:
         fixture._SESSION_ENTRY.reset(token)
+
+
+class _ServedFormInventory(HTMLParser):
+    """Project fixture form groups the same way PAGE exposes control questions."""
+    def __init__(self):
+        super().__init__()
+        self.div_depth = 0
+        self.groups = []
+        self.label_group = None
+        self.label_parts = []
+        self.controls = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "div":
+            self.div_depth += 1
+            if "form-group" in attrs.get("class", "").split():
+                self.groups.append({"depth": self.div_depth, "question": ""})
+        group = self.groups[-1] if self.groups else None
+        if attrs.get("data-automation-id") == "formLabel" and group:
+            self.label_group = group
+            self.label_parts = []
+        typ = attrs.get("role") or (
+            attrs.get("type", "text") if tag == "input" else tag)
+        if group and (tag in {"input", "textarea", "select", "button"}
+                      or attrs.get("role") == "combobox"):
+            selector = "#" + attrs["id"] if attrs.get("id") else tag
+            self.controls.append({
+                "selector": selector, "name": attrs.get("name"),
+                "label": group["question"] or attrs.get("name", ""),
+                "question": group["question"],
+                "type": typ, "tag": tag, "required": False,
+                "in_form": True, "form_selector": "#synthetic-form",
+                "form_action": fixture.URL,
+            })
+
+    def handle_data(self, data):
+        if self.label_group is not None:
+            self.label_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if self.label_group is not None:
+            self.label_group["question"] = " ".join(
+                " ".join(self.label_parts).split())
+            self.label_group = None
+            self.label_parts = []
+        if tag == "div":
+            if self.groups and self.groups[-1]["depth"] == self.div_depth:
+                self.groups.pop()
+            self.div_depth -= 1
+
+
+def served_fixture_page():
+    """Read the exact response body and retain hidden controls in PAGE inventory."""
+    inventory = _ServedFormInventory()
+    inventory.feed(fixture._FORM.decode("utf-8"))
+    return {"url": fixture.URL, "controls": inventory.controls}
+
 
 
 def synthetic_page(*, url=fixture.URL, receiver=fixture.URL, extra_granted=False):
@@ -86,6 +145,140 @@ async def test_forged_context_refused_before_store_or_browser(monkeypatch, conte
                           resume_path="/fake/pdf", fixture_context=context)
 
 
+def test_positive_approval_grants_match_live_group_question(authority):
+    """The live PAGE inventory uses the exact form-group question."""
+    authority.enable_positive_fixture()
+    page = synthetic_page()
+    target = next(item for item in page["controls"]
+                  if item["selector"] == "#name")
+    target.update(question="Name", form_selector="#synthetic-form",
+                  form_action=fixture.URL)
+    forms.exact_approval(
+        fixture.PK, "Name", fixture._FACTS["Name"], target=target,
+        url=fixture.URL, fixture_context=authority)
+
+    stale_question = {**target, "question": ""}
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        forms.exact_approval(
+            fixture.PK, "Name", fixture._FACTS["Name"], target=stale_question,
+            url=fixture.URL, fixture_context=authority)
+
+
+def test_fixture_does_not_grant_the_additional_question(authority):
+    authority.enable_positive_fixture()
+    assert "Additional question" not in authority.row["human_approved_answers"]
+
+
+def test_served_form_hidden_machine_input_does_not_collide_with_approval_question():
+    """Hidden receiver fields share group text but are not answerable controls."""
+    page = served_fixture_page()
+    location = next(c for c in page["controls"] if c["selector"] == "#location")
+    hidden = next(c for c in page["controls"]
+                  if c["selector"] == "#location-code")
+    assert location["question"] == hidden["question"] == "Where are you located?"
+    assert forms._approval_question_collisions(page, location) == [hidden]
+
+    assert forms._key(page, location) == "Where are you located?"
+
+
+def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
+    page = served_fixture_page()
+    assert 'data-label-input="work-authorization-caption"' not in fixture._FORM.decode()
+    assert not any(control["selector"] == "#work-authorization-caption"
+                   for control in page["controls"])
+
+async def test_fixture_orders_combos_before_the_ungranted_gate(authority):
+    page = served_fixture_page()
+    selectors = [control["selector"] for control in page["controls"]]
+    combo_selectors = list(fixture._COMBO_SELECTORS.values())
+    assert selectors.index("#name") < min(selectors.index(s) for s in combo_selectors)
+    assert max(selectors.index(s) for s in combo_selectors) < selectors.index("#additional")
+
+    authority.enable_positive_fixture()
+    actions = [
+        await authority.decision("", page, [], model="synthetic-fixture")
+        for _ in range(5)
+    ]
+    assert [action["selector"] for action in actions] == [
+        "#name", *combo_selectors, "#additional"]
+
+
+def test_fixture_reports_untouched_combos_as_not_reached():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    page = served_fixture_page()
+    state.observe_page(page)
+    assert all(item["outcome"] == "not_reached"
+               for item in state.combo_observations.values())
+
+    key = "Where are you located?"
+    state.combo_touched.add(key)
+    state.observe_page(page)
+    assert state.combo_observations[key]["outcome"] == "not_committed"
+
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("inventory_verified", False), ("truncated", True),
+    ("opaque_controls", True), ("shadow_roots", True),
+    ("unsupported_frames", ["http://127.0.0.1/frame"]),
+])
+async def test_incomplete_inventory_diagnostics_never_replace_guard_input(
+        authority, flag, value):
+    # A second read can see a settled DOM; that must not authorize the rejected
+    # original inventory or hide the flags that actually caused the gate.
+    page = synthetic_page()
+    page[flag] = value
+    diagnostic = {"ready_state": "complete", "offending_elements": [
+        {"selector": "#synthetic-opaque", "tag": "div", "role": "listbox"}],
+        "shadow_hosts": []}
+    calls = []
+    class Raw:
+        async def navigate(self, url):
+            return page
+        async def call(self, *args):
+            calls.append(args)
+            return {"value": diagnostic}
+    edge = authority.facade(Raw())
+    observed = await edge.navigate(fixture.URL)
+    assert observed is page and authority.last_page is page
+    assert observed[flag] == value
+    assert authority.inventory_diagnostics == diagnostic
+    assert calls == [("evaluate", fixture._inventory_diagnostic_script())]
+    with pytest.raises(forms.Gate, match="inventory is incomplete"):
+        forms._inventory_ok(observed)
+    assert authority.fills == authority.ipc_index == 0
+
+
+
+def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    state.combo_touched.update(fixture._MACHINE_VALUES)
+    page = served_fixture_page()
+    for key, selector in fixture._COMBO_SELECTORS.items():
+        control = next(c for c in page["controls"] if c["selector"] == selector)
+        control["combobox"] = {
+            "selected_text": fixture._FACTS[key],
+            "selected_value": fixture._MACHINE_VALUES[key],
+            "hidden_selector": fixture._HIDDEN_SELECTORS[key],
+            "hidden_value": fixture._MACHINE_VALUES[key],
+        }
+    state.observe_page(page)
+    assert state.committed == {
+        key: (fixture._FACTS[key], fixture._MACHINE_VALUES[key])
+        for key in fixture._MACHINE_VALUES
+    }
+    assert all(item["outcome"] == "committed"
+               for item in state.combo_observations.values())
+
+    location = next(c for c in page["controls"] if c["selector"] == "#location")
+    location["combobox"]["hidden_value"] = "OTHER_CITY"
+    state.observe_page(page)
+    assert "Where are you located?" not in state.committed
+    assert state.combo_observations["Where are you located?"]["reason"] == (
+        "hidden machine value did not match the selected value")
+
+
+
 async def test_controller_generated_second_field_gate_after_exactly_one_name_fill(
         authority, monkeypatch):
     page = synthetic_page()
@@ -119,13 +312,10 @@ async def test_controller_generated_second_field_gate_after_exactly_one_name_fil
     monkeypatch.setattr(forms.submit_hold, "is_held", _source_denied)
     monkeypatch.setattr("core.events.emit", _source_denied)
     result = await forms.apply(
-        fixture.URL, fixture.COMPANY, {"Name": "Test User",
-                                      "Additional question": "Synthetic answer"},
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
         "synthetic-fixture", pk=fixture.PK, resume_path=authority.resume_path,
         fixture_context=authority)
-    # The exclusive legacy fixture supplies neither full saved provenance
-    # nor the controller's new fixed read-only witness. It must now fail closed;
-    # it cannot be upgraded as evidence for Issue #31's new bootstrap.
+    # A partial legacy grant cannot be upgraded into the current witnessed form path.
     assert result["status"] == "gate" and result["form_question"] is None
     assert authority.fills == 0 and authority.decisions == 1
     assert not any(c[0] in {"fill", "click", "upload", "select", "choose", "evaluate"}
@@ -171,13 +361,17 @@ async def test_closed_facade_denies_all_extra_ipc_below_controller(authority):
     ]
 
 
-def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
+def test_fixture_handler_rejects_wrong_host_path_and_every_non_get_method():
     # Construct BaseHTTPRequestHandler without a socket or network transport.
     def request(method, path, host):
         handler = object.__new__(fixture._FixtureHandler)
         handler.path = path
-        handler.headers = {"Host": host}
+        handler.command = method
+        handler.requestline = f"{method} {path} HTTP/1.1"
+        handler.headers = {"Host": host, "Content-Length": "0"}
+        handler.rfile = io.BytesIO()
         handler.wfile = io.BytesIO()
+        handler.server = SimpleNamespace(synthetic_run=None)
         captured = []
         handler.send_response = lambda status: captured.append(("status", status))
         handler.send_header = lambda key, value: captured.append((key, value))
@@ -196,10 +390,40 @@ def test_fixture_handler_rejects_wrong_host_path_method_and_redirects():
         ("POST", fixture._PATH, "127.0.0.1:18789"),
         ("HEAD", fixture._PATH, "127.0.0.1:18789"),
         ("PUT", fixture._PATH, "127.0.0.1:18789"),
+        ("DELETE", fixture._PATH, "127.0.0.1:18789"),
+        ("PATCH", fixture._PATH, "127.0.0.1:18789"),
+        ("OPTIONS", fixture._PATH, "127.0.0.1:18789"),
+        ("CONNECT", fixture._PATH, "127.0.0.1:18789"),
+        ("TRACE", fixture._PATH, "127.0.0.1:18789"),
     ]:
         headers, response = request(method, path, host)
-        assert headers[0][1] in {404, 405}
+        expected = 404 if method == "GET" else 405
+        assert ("status", expected) in headers
         assert not response and not any(key.lower() == "location" for key, _ in headers)
+
+
+def test_fixture_records_post_but_always_refuses_with_405():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    handler = object.__new__(fixture._FixtureHandler)
+    handler.path = fixture._PATH
+    handler.command = "POST"
+    handler.requestline = f"POST {fixture._PATH} HTTP/1.1"
+    handler.headers = {"Host": "127.0.0.1:18789", "Content-Length": "0",
+                       "Content-Type": "multipart/form-data; boundary=synthetic"}
+    handler.rfile = io.BytesIO(b"an otherwise plausible form body")
+    handler.wfile = io.BytesIO()
+    handler.server = SimpleNamespace(synthetic_run=state)
+    statuses = []
+    handler.send_response = statuses.append
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler.do_POST()
+    assert statuses == [405] and not handler.wfile.getvalue()
+    assert state.post_attempts == 1 and state.post_count == 0
+    assert state.post_rejection == (
+        "Synthetic fixture refuses every non-GET form method.")
+    assert state.post_receipts[0]["response_status"] == 405
+
 
 
 async def test_real_session_thread_context_and_read_only_connected_path(
@@ -403,12 +627,12 @@ def test_normal_daemon_library_import_and_entry_keep_old_import_boundary(tmp_pat
 
 
 
-def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
+def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
         tmp_path):
-    """Drive the whole CLI -> Session -> controller path with fake BSK transport.
+    """The daemon refuses incomplete offline BSK evidence before any form write.
 
-    sitecustomize is loaded by the new interpreter before __main__ or core.config.
-    No socket is ever created/bound and no real BSK executable is called.
+    sitecustomize runs before daemon imports. Its fake BSK never completes the
+    linked-control witness, and no socket or owner-like file may be reached.
     """
     from textwrap import dedent
 
@@ -617,11 +841,11 @@ def test_fresh_daemon_full_synthetic_path_uses_no_owner_io_or_real_sockets(
     result = subprocess.run(
         [sys.executable, "-m", "daemon", "--synthetic-browser-fixture"],
         cwd=tmp_path, env=env, text=True, capture_output=True, timeout=45)
-    # The old exclusive fixture intentionally denies the NEW fixed evaluate
-    # IPC and carries a legacy five-key grant. The daemon must reject it before
-    # writing, not pretend its earlier positive path proves the new witness.
+    # The offline transport supplies an incomplete inventory, not a false
+    # success receipt; the controller must gate before any mutating operation.
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert '"safe_gate": false' in result.stdout.lower()
+    assert '"submitted": false' in result.stdout.lower()
+    assert '"status": "gate"' in result.stdout.lower()
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
     assert "http_handler_selected" in kinds

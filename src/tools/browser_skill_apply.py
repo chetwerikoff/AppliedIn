@@ -273,6 +273,18 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
             if any(target.get(k, '') != receipt.get(k, '')
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
+            if receipt.get('action') == 'combobox':
+                combo = target.get('combobox') or {}
+                if (not _same(combo.get('selected_text', ''),
+                            receipt.get('committed_caption', ''))
+                        or not _same(combo.get('displayed_text', ''),
+                                    combo.get('selected_text', ''))
+                        or not _same(receipt.get('approved_value', ''),
+                                    receipt.get('committed_caption', ''))
+                        or combo.get('selected_value') != receipt.get('committed_value')
+                        or combo.get('hidden_selector') != receipt.get('hidden_selector')
+                        or combo.get('hidden_value') != receipt.get('hidden_value')):
+                    raise Gate('The committed combobox value changed before submission.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
                            **({'fixture_context': ctx} if ctx else {}))
@@ -379,7 +391,8 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         raise Gate('The tailored PDF is missing; nothing may be submitted without it.')
 
 
-def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -> None:
+def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
+               receipts: list | None = None) -> None:
     if page.get('truncated') or page.get('inventory_verified') is not True:
         raise Gate('The form inventory is incomplete; review the full form before submitting.')
     if page.get('opaque_controls') or page.get('unsupported_frames') or page.get('shadow_roots'):
@@ -400,17 +413,62 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '') -
     for target in controls:
         typ = target.get('type', '')
         if typ == 'hidden':
-            if target.get('in_form') and (target.get('required') or target.get('has_value')):
-                raise Gate('A hidden form value is not independently authorized.')
+            if target.get('in_form') is True:
+                owners = [c for c in controls if c.get('type') == 'combobox'
+                          and c.get('in_form') is True
+                          and c.get('form_selector') == target.get('form_selector')
+                          and (c.get('combobox') or {}).get('hidden_selector')
+                          == target.get('selector')]
+                if target.get('required') or target.get('has_value'):
+                    authorized = False
+                    if len(owners) == 1:
+                        owner = owners[0]
+                        combo = owner.get('combobox') or {}
+                        linked_receipts = [r for r in receipts or []
+                                           if r.get('action') == 'combobox'
+                                           and r.get('selector') == owner.get('selector')
+                                           and r.get('hidden_selector') == target.get('selector')]
+                        if len(linked_receipts) == 1:
+                            receipt = linked_receipts[0]
+                            before = receipt.get('hidden_value_before')
+                            after = receipt.get('hidden_value')
+                            authorized = (
+                                bool(owner.get('form_selector'))
+                                and owner.get('form_action') == target.get('form_action')
+                                and isinstance(before, str) and isinstance(after, str)
+                                and before != after and bool(after)
+                                and after == receipt.get('committed_value')
+                                and after == combo.get('selected_value')
+                                and after == combo.get('hidden_value')
+                                and after == target.get('value'))
+                    if not authorized:
+                        raise Gate('A hidden form value is not independently authorized.')
             continue
         if target.get('disabled') or typ in {'button', 'submit'}:
             continue
+        expected = filled.get(target['selector'])
+        if typ == 'combobox':
+            combo = target.get('combobox') or {}
+            has_selection = any(str(combo.get(key) or '').strip() for key in (
+                'selected_text', 'selected_value', 'hidden_value'))
+            if not target.get('required') and not has_selection:
+                continue
+            if (not isinstance(combo.get('link_id'), str) or not combo.get('link_id')
+                    or expected is None or not _same(combo.get('selected_text', ''), expected)
+                    or not _same(combo.get('displayed_text', ''), combo.get('selected_text', ''))
+                    or not combo.get('selected_value')
+                    or (combo.get('hidden_selector')
+                        and combo.get('hidden_value') != combo.get('selected_value'))):
+                if combo.get('hidden_selector') and combo.get('hidden_value') != combo.get('selected_value'):
+                    raise Gate('A hidden form value is not independently authorized.')
+                raise Gate(f'Unverified or changed combobox value: {target["label"]}')
+            guarded_value(target, expected)
+            continue
         if target.get('in_form') and (
                 target.get('tag') not in {'input', 'textarea', 'select', 'button'}
-                or typ in {'combobox', 'contenteditable', 'option'}):
+                or typ in {'contenteditable', 'option'}):
             raise Gate('Unsupported custom control; human inspection is required.')
         value = target.get('value', '')
-        expected = filled.get(target['selector'])
         if typ in {'radio', 'checkbox'}:
             if target.get('checked'):
                 guarded_value(target, target.get('label', value))
@@ -510,7 +568,29 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
   };
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
-  return {url: location.href, controls: Array.from(document.querySelectorAll(query))
+  const linkId = e => {
+    const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
+      .trim().split(/\\s+/).filter(Boolean);
+    if (refs.length !== 1) return '';
+    const owners = Array.from(document.querySelectorAll('[role="combobox"]'))
+      .filter(c => {
+        const candidate = (c.getAttribute('aria-controls') || c.getAttribute('aria-owns') || '')
+          .trim().split(/\\s+/).filter(Boolean);
+        return candidate.length === 1 && candidate[0] === refs[0];
+      });
+    return owners.length === 1 ? refs[0] : '';
+  };
+  const linkedListbox = e => {
+    const id = linkId(e);
+    const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
+    if (!id || !matches.length) return null;
+    return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
+      ? matches[0] : null;
+  };
+  const all = Array.from(document.querySelectorAll(query)).filter(e =>
+    e.getAttribute('role') !== 'option' || !Array.from(document.querySelectorAll('[role="combobox"]'))
+      .some(c=>linkedListbox(c)?.contains(e)));
+  return {url: location.href, controls: all
     .filter(e => (!!e.getClientRects().length &&
       getComputedStyle(e).visibility !== 'hidden') ||
       e.form || e.closest('form') || e.type === 'file')
@@ -520,6 +600,23 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
           (e.getAttribute('type') || e.tagName.toLowerCase()));
       const ownSelector = selector(e), formSelector = form ? selector(form) : '';
+      const list = type === 'combobox' ? linkedListbox(e) : null;
+      const opts = list ? Array.from(list.querySelectorAll('[role="option"]'))
+        .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
+        .map(o=>({selector:selector(o),unique:document.querySelectorAll(selector(o)).length === 1,
+          tag:o.tagName.toLowerCase(), native_type:o.type || '',
+          submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
+            o.type === 'submit' || o.type === 'image',
+          navigates:o.tagName === 'A' && !!o.href,
+          label:clean(o.innerText),
+          value:o.getAttribute('data-value') || o.getAttribute('value') || '',
+          selected:o.getAttribute('aria-selected') === 'true'})) : [];
+      const hiddenId = e.getAttribute('data-value-input');
+      const hiddenName = e.getAttribute('data-value-name');
+      const hidden = Array.from(document.querySelectorAll('input[type="hidden"]'))
+        .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
+          (typeof e.contains === 'function' && e.contains(h)) ||
+          (hiddenName && h.name === hiddenName)));
       return {selector:ownSelector, unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
@@ -532,7 +629,15 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         inert:!!e.closest('[inert]'), visible:visible(e),
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
-          .map(o=>({value:o.value,label:clean(o.textContent)})) : []};
+          .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
+        combobox:type === 'combobox' ? {linked:!!list, link_id:linkId(e),
+          listbox_selector:list ? selector(list) : '', options:opts,
+          selected_text:clean(e.getAttribute('aria-valuetext') ||
+            e.getAttribute('data-selected-label') || ''),
+          displayed_text:clean(e.value || e.innerText || ''),
+          selected_value:e.getAttribute('data-selected-value') || '',
+          hidden_selector:hidden.length === 1 ? selector(hidden[0]) : '',
+          hidden_value:hidden.length === 1 ? hidden[0].value : ''} : null};
     })};
 })()"""
 
@@ -561,13 +666,14 @@ def _submitter_texts(target: dict) -> tuple[str, ...]:
 
 
 def _material_select_options(target: dict) -> bool:
-    """Native option values and captions can encode assent behind a bland label."""
+    """Native and ARIA option values/captions can encode assent behind a bland label."""
     options = target.get('options')
-    return (target.get('tag') == 'select' and isinstance(options, list)
-            and any(isinstance(o, dict) and any(
-                isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
-                for k in ('value', 'label')) for o in options))
-
+    if target.get('type') == 'combobox':
+        options = (target.get('combobox') or {}).get('options')
+    return (isinstance(options, list) and any(
+        isinstance(o, dict) and any(
+            isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
+            for k in ('value', 'label')) for o in options))
 
 def _unrelated_search_form(controls: list[dict]) -> bool:
     """Ignore only a proven search-only form, not a second plausible application."""
@@ -596,9 +702,8 @@ def _inventory_ok(page: dict) -> None:
 def _identity(target: dict) -> tuple:
     return tuple(target.get(k) for k in (
         'selector', 'label', 'question', 'tag', 'type', 'in_form',
-        'form_selector', 'form_action', 'formaction', 'options', 'disabled',
+        'form_selector', 'form_action', 'formaction', 'options', 'combobox', 'disabled',
         'required', 'has_value', 'value', 'checked', 'name'))
-
 
 def _page_identity(page: dict) -> tuple:
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
@@ -634,6 +739,16 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
                              or observed['visible_text'] != original.get('label')))
                     or (original.get('tag') == 'select'
                         and original.get('options') != observed.get('options'))
+                    or (original.get('type') == 'combobox'
+                        and (original.get('combobox') != observed.get('combobox')
+                             or not isinstance(observed.get('combobox'), dict)
+                             or not observed['combobox'].get('link_id')
+                             or not (
+                                 (observed['combobox'].get('linked') is True
+                                  and isinstance(observed['combobox'].get('listbox_selector'), str)
+                                  and isinstance(observed['combobox'].get('options'), list))
+                                 or (observed['combobox'].get('linked') is False
+                                     and observed['combobox'].get('options') in (None, [])))))
                     or any(not isinstance(observed.get(k), bool)
                            for k in ('visible', 'readonly', 'inert'))):
                 raise ValueError('Control identity differs from the DOM witness')
@@ -686,13 +801,22 @@ def _bound_target(page: dict, target: dict) -> dict:
                  'value': c['value']} for c in members]}
 
 
+def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
+    key = target.get('question') or target.get('label')
+    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
+    return [c for c in page['controls']
+            if all(c is not member for member in own)
+            and _same(key, c.get('question') or c.get('label') or '')]
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
         raise Gate('The observed field has no distinct approval question.')
-    own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
-    if any(_same(key, c.get('question') or c.get('label') or '')
-           for c in page['controls'] if all(c is not member for member in own)):
+    # Hidden machine-value inputs repeat their visible control's group question,
+    # but cannot receive a separate human answer or approval grant.
+    if any(c.get('type') != 'hidden'
+           for c in _approval_question_collisions(page, target)):
         raise Gate('More than one control uses the same approval question; review manually.')
     return key
 
@@ -704,6 +828,9 @@ def _unanswered(page: dict, target: dict) -> bool:
         members = _radio_group(page, target)
         return any(c.get('required') for c in members) and not any(
             c.get('checked') for c in members)
+    if target.get('type') == 'combobox':
+        combo = target.get('combobox') or {}
+        return bool(target.get('required')) and not combo.get('selected_text')
     return bool(target.get('required')) and not target.get('has_value')
 
 
@@ -715,7 +842,7 @@ def _choice_prompt(target: dict, question: dict) -> str:
               else '')
     observed = question['question'] or question['control_label']
     if (question['control_label'] != observed
-            and question['type'] in {'checkbox', 'select'}):
+            and question['type'] in {'checkbox', 'select', 'combobox'}):
         observed += '\n' + question['control_label']
     if question['type'] == 'radio':
         observed += '\nOptions:\n' + '\n'.join(
@@ -723,7 +850,12 @@ def _choice_prompt(target: dict, question: dict) -> str:
     elif question.get('tag') == 'select':
         observed += '\nOptions:\n' + '\n'.join(
             option['label'] for option in question['options'])
-    else:
+    elif question.get('type') == 'combobox':
+        options = (target.get('combobox') or {}).get('options') or []
+        observed += ('\nOptions:\n' + '\n'.join(
+                    option['label'] for option in options) if options else
+                    '\nOpen the linked picker to load available options.')
+    elif question['type'] == 'checkbox':
         observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
     return prefix + observed
 
@@ -783,6 +915,25 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
             raise Gate('Competing native form purposes require human inspection.')
     return siblings
 
+def _combobox_options(target: dict) -> list:
+    combo = target.get('combobox') or {}
+    options = combo.get('options')
+    if (target.get('type') != 'combobox' or combo.get('linked') is not True
+            or not isinstance(combo.get('link_id'), str) or not combo['link_id']
+            or not isinstance(combo.get('listbox_selector'), str)
+            or not combo['listbox_selector'] or not isinstance(options, list) or not options
+            or any(not isinstance(o, dict) or o.get('unique') is not True
+                   or not all(isinstance(o.get(k), str) and o[k].strip()
+                              for k in ('selector', 'label'))
+                   or not isinstance(o.get('value'), str) for o in options)
+            or len({o['selector'] for o in options}) != len(options)
+            or len({_same_key(o['label']) for o in options}) != len(options)
+            or (combo.get('hidden_selector') and (
+                not isinstance(combo.get('hidden_selector'), str)
+                or not isinstance(combo.get('hidden_value'), str)))):
+        raise Gate('The combobox option linkage is incomplete or ambiguous.')
+    return options
+
 def _native_options(target: dict) -> list:
     options = target.get('options')
     if (not isinstance(options, list) or not options
@@ -810,10 +961,22 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         members = (_radio_group(page, target)
                    if target.get('type') == 'radio' else [target])
         target = members[0]
+    elif target.get('type') == 'combobox':
+        combo = target.get('combobox') or {}
+        if target.get('tag') not in {'input', 'div'} or not combo.get('link_id'):
+            raise Gate('Only uniquely linked input/div comboboxes may request a grant.')
+        options = combo.get('options')
+        if combo.get('linked') is True and options:
+            _combobox_options(target)
+        elif (combo.get('linked') is not True and combo.get('linked') is not False
+              or options not in (None, [])
+              or (combo.get('linked') is True and not combo.get('listbox_selector'))):
+            raise Gate('The closed combobox linkage is incomplete or ambiguous.')
+        members = [target]
     elif _native_answer(target):
         members = [target]
     else:
-        raise Gate('Only observed native text, select or choice controls may request a grant.')
+        raise Gate('Only observed native or linked combobox controls may request a grant.')
     if any(not isinstance(c.get('label'), str) or not c['label'].strip()
            or not isinstance(c.get('question'), str) for c in members):
         raise Gate('Complete native labels and questions are required.')
@@ -822,18 +985,20 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if (not dom or dom.get('visible') is not True
                 or dom.get('readonly') is True or dom.get('disabled') is True
                 or dom.get('inert') is True or member.get('disabled')
-                or (choice and dom.get('visible_text') != member['label'])):
+                or (choice and dom.get('visible_text') != member['label'])
+                or (member.get('type') == 'combobox'
+                    and dom.get('combobox') != member.get('combobox'))):
             raise Gate('This control is not visibly editable.')
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if not choice and (_MATERIAL_ASSENT.search(subject)
-                       or _material_select_options(target)):
+    if not choice and (_MATERIAL_ASSENT.search(subject) or _material_select_options(target)):
         raise Gate('Legal or material assent requires direct human review.')
     key = _key(page, target)
     siblings = _form_subject(page, target)
     if bootstrap and (not _unanswered(page, target)
-                      or (not choice and bool(str(target.get('value') or '').strip()))):
+                      or (not choice and target.get('type') != 'combobox'
+                          and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
     marked = any(
         (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
@@ -890,7 +1055,8 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                 _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
             raise Gate('Material assent outside a bound choice needs human inspection.')
         if (c.get('required') and c.get('in_form')
-                and c.get('tag') not in {'input', 'textarea', 'select', 'button'}):
+                and c.get('tag') not in {'input', 'textarea', 'select', 'button'}
+                and c.get('type') != 'combobox'):
             raise Gate('An uninspectable required choice needs human review.')
 
 
@@ -905,7 +1071,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if not navigation_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     candidate = [c for c in page['controls']
-                 if (_native_answer(c) or c.get('type') in {'radio', 'checkbox'})
+                 if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
     if not candidate and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
@@ -919,14 +1085,14 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
     for item in page['controls']:
-        if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox'})
+        if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox', 'combobox'})
                 and _unanswered(page, item)):
             continue
         if (item.get('type') == 'radio'
                 and _radio_group(page, item)[0] is not item):
             continue
         if item.get('disabled') or (
-                item.get('type') not in {'radio', 'checkbox'}
+                item.get('type') not in {'radio', 'checkbox', 'combobox'}
                 and str(item.get('value') or '').strip()):
             continue
         try:
@@ -957,7 +1123,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             except Gate:
                 pass
         prompt = (_choice_prompt(item, question)
-                  if (item.get('type') in {'radio', 'checkbox'}
+                  if (item.get('type') in {'radio', 'checkbox', 'combobox'}
                       or item.get('tag') == 'select')
                   else f'An exact human-approved answer is needed for "{key}".')
         raise Gate(prompt, form_question=question)
@@ -983,6 +1149,167 @@ async def _fresh_native_receiver(session, page: dict, action: dict,
                            provenance=provenance)
     return observed, current
 
+def _combobox_stable_identity(target: dict) -> tuple:
+    return tuple(target.get(k) for k in (
+        'selector', 'label', 'question', 'tag', 'type', 'in_form',
+        'form_selector', 'form_action', 'formaction', 'disabled', 'required'))
+
+
+async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
+                            filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
+    observed, witness = await _observe_controls(session, page)
+    target = control(observed, action)
+    form_question = _disclosure_question(
+        observed, target, witness, job_url or observed['url'], provenance=provenance)
+    form_question['pk'] = pk
+    key = action.get('fact', '')
+    answer = str(facts.get(key) or '').strip() if key in facts else ''
+    if not answer or not _same(key, form_question['label']):
+        raise Gate('Choose an exact approved answer for this combobox.',
+                   form_question=form_question)
+    try:
+        exact_approval(pk, key, answer, target=target, url=observed['url'],
+                       **({'fixture_context': ctx} if ctx else {}))
+    except Gate:
+        raise Gate('An exact human-approved answer is needed for this combobox.',
+                   form_question=form_question) from None
+    guarded_value(target, answer)
+    stable = _combobox_stable_identity(target)
+    link_id = (target.get('combobox') or {}).get('link_id')
+    if not link_id:
+        raise Gate('The combobox does not have a unique linked option container.')
+
+    latest, latest_witness, current = observed, witness, target
+    combo = current.get('combobox') or {}
+    options = (_combobox_options(current)
+               if combo.get('linked') is True and combo.get('options') else [])
+    if not options:
+        # Opening/filtering a picker can asynchronously mount its options. The only
+        # typed value is the exact approved answer, and each refresh is witnessed.
+        exact_approval(pk, key, answer, target=current, url=latest['url'],
+                       **({'fixture_context': ctx} if ctx else {}))
+        await session.call('click', current['selector'])
+        latest = await session.page()
+        latest, latest_witness = await _observe_controls(session, latest)
+        current = control(latest, action)
+        if (_combobox_stable_identity(current) != stable
+                or (current.get('combobox') or {}).get('link_id') != link_id
+                or not navigation_allowed(latest.get('url', ''),
+                                          job_url or observed['url'], provenance=provenance)):
+            raise Gate('The approved combobox changed while opening its picker.')
+        _disclosure_question(latest, current, latest_witness,
+                             job_url or latest['url'], provenance=provenance)
+        if current.get('tag') == 'input':
+            exact_approval(pk, key, answer, target=current, url=latest['url'],
+                           **({'fixture_context': ctx} if ctx else {}))
+            guarded_value(current, answer)
+            await session.call('fill', current['selector'], '--value', answer)
+        for attempt in range(20):
+            refreshed = await session.page()
+            refreshed, refreshed_witness = await _observe_controls(session, refreshed)
+            current = control(refreshed, action)
+            if (_combobox_stable_identity(current) != stable
+                    or (current.get('combobox') or {}).get('link_id') != link_id
+                    or not navigation_allowed(refreshed.get('url', ''),
+                                              job_url or observed['url'], provenance=provenance)):
+                raise Gate('The approved combobox changed while options were loading.')
+            combo = current.get('combobox') or {}
+            if combo.get('linked') is True and combo.get('options'):
+                options = _combobox_options(current)
+                latest, latest_witness = refreshed, refreshed_witness
+                break
+            if attempt < 19:
+                await asyncio.sleep(0.25)
+        if not options:
+            raise Gate('The linked picker did not expose current selectable options.',
+                       form_question=form_question)
+    matches = [option for option in options if _same(answer, option['label'])]
+    if len(matches) != 1:
+        raise Gate('No unambiguous visible option matches the approved answer.',
+                   form_question=form_question)
+    option = matches[0]
+    _disclosure_question(latest, current, latest_witness,
+                         job_url or latest['url'], provenance=provenance)
+    exact_approval(pk, key, answer, target=current, url=latest['url'],
+                   **({'fixture_context': ctx} if ctx else {}))
+    guarded_value(current, answer)
+    # Refresh immediately before the option click so hidden-value authorization
+    # compares the receiver on both sides of this exact selection action.
+    before_page = await session.page()
+    before_page, before_witness = await _observe_controls(session, before_page)
+    before_target = control(before_page, action)
+    if (_combobox_stable_identity(before_target) != stable
+            or not navigation_allowed(before_page.get('url', ''),
+                                      job_url or observed['url'], provenance=provenance)):
+        raise Gate('The approved combobox changed before selecting its option.')
+    before_options = [o for o in _combobox_options(before_target)
+                      if o.get('selector') == option.get('selector')]
+    if (len(before_options) != 1
+            or before_options[0].get('label') != option.get('label')
+            or before_options[0].get('value') != option.get('value')):
+        raise Gate('The approved option changed before selection.')
+    option = before_options[0]
+    latest, latest_witness, current = before_page, before_witness, before_target
+    combo_before = current.get('combobox') or {}
+    hidden_selector = combo_before.get('hidden_selector', '')
+    hidden_value_before = combo_before.get('hidden_value', '')
+    if hidden_selector:
+        linked_inputs = [c for c in latest.get('controls', [])
+                         if c.get('selector') == hidden_selector
+                         and c.get('type') == 'hidden'
+                         and c.get('in_form') is True
+                         and c.get('form_selector') == current.get('form_selector')]
+        if (len(linked_inputs) != 1
+                or not isinstance(hidden_value_before, str)
+                or linked_inputs[0].get('value') != hidden_value_before):
+            raise Gate('A hidden form value is not independently authorized.')
+    exact_approval(pk, key, answer, target=current, url=latest['url'],
+                   **({'fixture_context': ctx} if ctx else {}))
+    guarded_value(current, answer)
+    if option.get('submit') or option.get('navigates'):
+        raise Gate('A submission-capable or navigating option cannot be clicked.')
+    await session.call('click', option['selector'])
+    committed = await session.page()
+    committed, committed_witness = await _observe_controls(session, committed)
+    entries = [c for c in committed.get('controls', [])
+               if c.get('selector') == current['selector']]
+    if len(entries) != 1:
+        raise Gate('The selected combobox disappeared before commitment was verified.')
+    after = entries[0]
+    combo = after.get('combobox') or {}
+    witnessed = committed_witness.get(current['selector'], {}).get('combobox')
+    if _combobox_stable_identity(after) != stable:
+        raise Gate('The combobox identity changed during selection.')
+    if (hidden_selector and (not option['value']
+            or hidden_value_before == combo.get('hidden_value')
+            or combo.get('hidden_value') != option['value']
+            or witnessed != combo)):
+        raise Gate('A hidden form value is not independently authorized.')
+    if (not _same(combo.get('selected_text', ''), option['label'])
+            or not _same(combo.get('displayed_text', ''), option['label'])
+            or not _same(combo.get('selected_value', ''), option['value'])
+            or combo.get('hidden_selector', '') != hidden_selector
+            or witnessed != combo):
+        raise Gate('The combobox did not expose an independently verified committed selection.')
+    if hidden_selector:
+        linked_inputs = [c for c in committed.get('controls', [])
+                         if c.get('selector') == hidden_selector
+                         and c.get('type') == 'hidden'
+                         and c.get('in_form') is True
+                         and c.get('form_selector') == after.get('form_selector')]
+        if (len(linked_inputs) != 1
+                or linked_inputs[0].get('value') != combo.get('hidden_value')):
+            raise Gate('A hidden form value is not independently authorized.')
+    filled[current['selector']] = option['label']
+    return {'action': 'combobox', 'label': current['label'],
+            'selector': current['selector'], 'question': current.get('question', ''),
+            'url': latest['url'], 'fact': key, 'approved_value': answer,
+            'committed_caption': option['label'],
+            'committed_value': combo['selected_value'],
+            'hidden_selector': hidden_selector,
+            'hidden_value_before': hidden_value_before,
+            'hidden_value': combo.get('hidden_value', '')}
+
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
@@ -999,7 +1326,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job Greenhouse provenance.')
-    elif pk and (verb in {'fill', 'select', 'choose', 'upload'}
+    elif pk and (verb in {'fill', 'select', 'choose', 'combobox', 'upload'}
                  or (verb == 'click' and allow_click)):
         # A non-committing, unapproved click is refused on existing local
         # guards and must not fetch stores merely to repeat that refusal.
@@ -1015,6 +1342,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
+    if verb == 'combobox':
+        return await _execute_combobox(session, page, action, facts=facts,
+                                       filled=filled, pk=pk, job_url=job_url,
+                                       ctx=ctx, provenance=provenance)
     if verb in {'fill', 'select', 'choose'}:
         if verb == 'choose':
             _require_native_choice(target)
@@ -1360,7 +1691,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 fixture_context=ctx)
                         check_form_destination(page, target, *trusted_origins,
                                                provenance=provenance)
-                        check_form(page, filled, uploaded, Path(resume_path).name)
+                        check_form(page, filled, uploaded, Path(resume_path).name, history)
                         verify_history(history, page)
                         before = page
                         # The independent hold precedes IPC; only a possible click
@@ -1397,14 +1728,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     fixture_context=ctx)
                             check_form_destination(page, target, *trusted_origins,
                                                    provenance=provenance)
-                            check_form(page, filled, uploaded, Path(resume_path).name)
+                            check_form(page, filled, uploaded, Path(resume_path).name, history)
                             verify_history(history, page)
                             before = page
                             step['last_button'] = target['label']
                             hold_dispatch(step)
                         elif verb == 'click':
                             raise Gate('Unproven JS-backed or one-click navigation requires a human gate.')
-                        elif verb in {'fill', 'select', 'choose', 'upload'}:
+                        elif verb in {'fill', 'select', 'choose', 'combobox', 'upload'}:
                             verify_dispatch()
                         result = await execute(
                             session, page, action, facts=facts, filled=filled,

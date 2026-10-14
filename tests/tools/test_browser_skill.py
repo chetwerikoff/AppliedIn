@@ -1125,6 +1125,133 @@ console.log(JSON.stringify(eval(process.argv[2])));
         assert observed['opaque_controls']
         assert not observed['inventory_verified']
 
+@pytest.mark.parametrize('scenario', [
+    'input', 'div', 'provisional', 'orphan-listbox', 'orphan-option',
+    'shared', 'other-form', 'nested', 'wrong-role', 'duplicate-id',
+    'contenteditable', 'canvas', 'custom', 'submit-option', 'navigate-option',
+])
+def test_production_page_and_witness_execute_linkage_and_opacity_js(scenario):
+    """Run both production JS readers against the same synthetic DOM graph."""
+    import subprocess
+    from tools.browser_skill_dom import PAGE
+    script = r'''
+const scenario = process.argv[1];
+const all = [];
+const url = 'http://127.0.0.1/fixture/example-co/job/1';
+function make(tag, id, attrs={}, parent=null, extra={}) {
+  const n = {id, tagName:tag.toUpperCase(), nodeType:1, parentElement:parent,
+    children:[], form:null, type:extra.type || (tag === 'input' ? 'text' : ''),
+    value:extra.value || '', name:extra.name || '', required:true, disabled:false,
+    readOnly:false, inert:false, labels:[], innerText:extra.text || '',
+    href:extra.href || '', style:{}, options:undefined,
+    getClientRects:()=>[{width:120,height:24,right:120,bottom:24}], getAttribute:k=>Object.hasOwn(attrs,k) ? attrs[k] : null,
+    hasAttribute:k=>Object.hasOwn(attrs,k),
+    matches:q=>q.split(',').some(s=>s.trim()===':disabled' ? !!n.disabled :
+      s.trim()==='[inert]' ? !!n.inert :
+      s.trim()==='[contenteditable]' ? n.hasAttribute('contenteditable') :
+      s.trim()==='[contenteditable="true"]' ? n.getAttribute('contenteditable')==='true' :
+      s.trim()==='canvas' ? n.tagName==='CANVAS' :
+      s.trim()==='object' ? n.tagName==='OBJECT' :
+      s.trim()==='embed' ? n.tagName==='EMBED' :
+      s.trim()==='[aria-controls]' ? !!n.getAttribute('aria-controls') :
+      s.trim()==='[role="combobox"]' ? n.getAttribute('role')==='combobox' :
+      s.trim()==='[role="listbox"]' ? n.getAttribute('role')==='listbox' :
+      s.trim()==='[role="option"]' ? n.getAttribute('role')==='option' : false),
+    closest:q=>{ for(let p=n;p;p=p.parentElement) {
+      if(q==='form' && p.tagName==='FORM') return p;
+      if(q==='[role="listbox"]' && p.getAttribute('role')==='listbox') return p;
+      if(q==='[inert]' && p.inert) return p;
+    } return null; },
+    contains:x=>{for(let p=x;p;p=p.parentElement) if(p===n) return true; return false;},
+    querySelectorAll:q=>descendants(n).filter(x=>matches(x,q)),
+    querySelector:()=>null};
+  if(parent) parent.children.push(n); all.push(n); return n;
+}
+function descendants(n){return n.children.flatMap(c=>[c,...descendants(c)]);}
+function matches(n,q){return q.split(',').some(s=>{s=s.trim();
+  if(s.startsWith('#')) return n.id===s.slice(1);
+  if(s==='input[type="hidden"]') return n.tagName==='INPUT' && n.type==='hidden';
+  if(s==='*') return true;
+  if(s==='input') return n.tagName==='INPUT';
+  if(s==='textarea') return n.tagName==='TEXTAREA';
+  if(s==='select') return n.tagName==='SELECT';
+  if(s==='button') return n.tagName==='BUTTON';
+  if(s==='a[href]') return n.tagName==='A' && !!n.href;
+  if(s==='[role="button"]') return n.getAttribute('role')==='button';
+  if(s==='[role="combobox"]') return n.getAttribute('role')==='combobox';
+  if(s==='[role="option"]') return n.getAttribute('role')==='option';
+  if(s==='[role="radio"]') return n.getAttribute('role')==='radio';
+  if(s==='[role="checkbox"]') return n.getAttribute('role')==='checkbox';
+  if(s==='[contenteditable="true"]') return n.getAttribute('contenteditable')==='true';
+  return false;});}
+const form=make('form','application',{},null); form.action=url;
+const other=make('form','other-form',{},null); other.action=url;
+const linked=scenario!=='orphan-listbox' && scenario!=='orphan-option';
+let combo=null, list=null;
+if(linked){
+  const tag=scenario==='div'?'div':'input';
+  combo=make(tag,'country',{'role':'combobox','aria-controls':scenario==='provisional'?'missing':'choices',
+    'aria-valuetext':'Example Country'},form,{value:'Example Country'}); combo.form=form;
+  if(scenario==='shared') make('input','country-2',{'role':'combobox','aria-controls':'choices'},form);
+}
+if(!['provisional','orphan-option','orphan-listbox'].includes(scenario)){
+  const listParent=scenario==='other-form'?other:form;
+  list=make('div','choices',{'role':scenario==='wrong-role'?'grid':'listbox'},listParent);
+  const optionParent=scenario==='nested'?make('div','nested',{'role':'listbox'},list):list;
+  const optionTag=scenario==='submit-option'?'button':scenario==='navigate-option'?'a':'div';
+  const optionType=scenario==='submit-option'?'submit':'';
+  const option=make(optionTag,'country-example',{'role':'option','data-value':'EX',
+    'aria-selected':'true'},optionParent,{text:'Example Country',type:optionType,
+    href:scenario==='navigate-option'?'https://example.test/away':''});
+  option.value='EX'; if(scenario==='submit-option') option.form=form;
+}
+if(scenario==='orphan-option') make('div','orphan',{'role':'option'},form,{text:'Orphan'});
+if(scenario==='orphan-listbox') make('div','orphan-list',{'role':'listbox'},form);
+if(scenario==='duplicate-id') make('div','choices',{'role':'listbox'},form);
+if(scenario==='contenteditable') make('div','editor',{'contenteditable':'true'},form);
+if(scenario==='canvas') make('canvas','canvas',{},form);
+if(scenario==='custom') make('x-widget','custom',{},form);
+const combos=()=>all.filter(n=>n.getAttribute('role')==='combobox');
+global.document={readyState:'complete',title:'Synthetic',body:{innerText:''},
+  querySelector:()=>null,getElementById:id=>all.find(n=>n.id===id)||null,
+  querySelectorAll:q=>q.startsWith('#')?all.filter(n=>n.id===q.slice(1)):
+    q==='*'?all: q==='[role="combobox"]'?combos():all.filter(n=>matches(n,q))};
+global.CSS={escape:s=>s}; global.location={href:url}; global.scrollX=0; global.scrollY=0;
+global.getComputedStyle=n=>({visibility:'visible',display:'block',opacity:'1',position:'static'});
+const page=eval(process.argv[2]); const witness=eval(process.argv[3]);
+console.log(JSON.stringify({page,witness}));
+'''
+    from tools.browser_skill_apply import _FIXED_CONTROL_WITNESS
+    result = json.loads(subprocess.check_output(
+        ['node', '-e', script, scenario, PAGE, _FIXED_CONTROL_WITNESS], text=True))
+    page, witness = result['page'], result['witness']
+    if scenario in {'input', 'div', 'submit-option', 'navigate-option'}:
+        assert page['inventory_verified'] and not page['opaque_controls']
+        assert [c['selector'] for c in page['controls']] == ['#country']
+        assert [c['selector'] for c in witness['controls']] == ['#country']
+        assert page['controls'][0]['combobox'] == witness['controls'][0]['combobox'], (
+            page['controls'][0]['combobox'], witness['controls'][0]['combobox'])
+        option = witness['controls'][0]['combobox']['options'][0]
+        assert option['submit'] is (scenario == 'submit-option')
+        assert option['navigates'] is (scenario == 'navigate-option')
+        assert witness['controls'][0]['combobox']['displayed_text'] == 'Example Country'
+        assert witness['controls'][0]['combobox']['displayed_text'] == page['controls'][0]['combobox']['selected_text']
+    elif scenario == 'provisional':
+        assert page['inventory_verified'] and not page['opaque_controls']
+        assert page['controls'][0]['combobox']['linked'] is False
+        assert witness['controls'][0]['combobox']['linked'] is False
+    else:
+        assert page['opaque_controls'] and not page['inventory_verified']
+        combos = [c for c in witness['controls'] if c.get('type') == 'combobox']
+        if scenario in {'shared', 'wrong-role', 'duplicate-id'}:
+            assert combos and all(not c['combobox']['linked'] for c in combos)
+        elif scenario in {'other-form', 'nested'}:
+            assert combos and combos[0]['combobox']['linked']
+        elif scenario == 'orphan-option':
+            assert any(c['type'] == 'option' for c in witness['controls'])
+        elif scenario == 'orphan-listbox':
+            assert witness['controls'] == []
+
 
 @pytest.mark.parametrize('query', ['?job_id=other', '?job_id=one&job_id=other', '?tenant=other'])
 def test_added_or_ambiguous_query_identity_never_authorizes_navigation(query):
@@ -2132,3 +2259,18 @@ async def test_discovery_cancellation_during_final_browser_effect_preempts_fallb
     assert session.calls == [('navigate', seed),
                              ('fill', '#search', '--value', 'engineer')]
     assert session.reads[-1] == seed
+
+async def test_application_native_select_prompt_preserves_server_choice_semantics(monkeypatch):
+    request = {}
+    def completion(**kwargs):
+        request.update(kwargs)
+        return {'choices': [{'message': {'content': '{"action":"finish"}'},
+                              'finish_reason': 'stop'}]}
+    monkeypatch.setattr('litellm.completion', completion)
+    monkeypatch.setattr('core.steering.messages', lambda prompt: [
+        {'role': 'system', 'content': prompt}])
+    assert await bsk.decision('Synthetic application', {}, [], model='synthetic') == {
+        'action': 'finish'}
+    prompt = request['messages'][0]['content']
+    assert ('For an APPLICATION native select, leave value empty: the server chooses '
+            'the option from the exact human-approved answer.') in prompt

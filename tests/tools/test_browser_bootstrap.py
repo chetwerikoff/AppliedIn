@@ -1310,3 +1310,79 @@ async def test_alias_config_revoked_during_witness_gates_without_question(
     assert not decide.await_count
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
+
+async def test_alias_approved_select_uses_exact_native_option(monkeypatch, tmp_path):
+    options = [{'value': 'remote', 'label': 'Remote'},
+               {'value': 'hybrid', 'label': 'Hybrid'}]
+    select = field('Work mode', '#work', tag='select', type='select',
+                   options=options, form_action=GH_DIRECT)
+    p = inventory(select, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Work mode': {
+            'value': 'Remote', 'selector': '#work', 'url': GH_DIRECT,
+            'label': 'Work mode', 'question': '', 'tag': 'select',
+            'type': 'select', 'form_selector': '#application',
+            'form_action': GH_DIRECT, 'options': deepcopy(options)}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'select', 'selector': '#work',
+                     'fact': 'Work mode', 'value': 'remote'},
+        facts={'Work mode': 'Remote'}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'select'
+    assert [c for c in browser.calls if c[0] == 'select'] == [
+        ('select', '#work', '--value', 'remote')]
+
+
+async def test_alias_approved_choice_uses_exact_native_control(monkeypatch, tmp_path):
+    choice = field('Email contact', '#choice', tag='input', type='checkbox',
+                   question='Contact preference', required=True, value='yes',
+                   has_value=True, checked=False, form_action=GH_DIRECT)
+    p = inventory(choice, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row['human_approved_answers'] = {
+        'Contact preference': {
+            'value': 'yes', 'selector': '#choice', 'url': GH_DIRECT,
+            'label': 'Email contact', 'question': 'Contact preference',
+            'tag': 'input', 'type': 'checkbox',
+            'form_selector': '#application', 'form_action': GH_DIRECT,
+            'visible_text': 'Email contact'}}
+    receipt = await forms.execute(
+        browser, p, {'action': 'choose', 'selector': '#choice',
+                     'fact': 'Contact preference'},
+        facts={'Contact preference': 'yes'}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'choose'
+    assert [c for c in browser.calls if c[0] == 'click'] == [
+        ('click', '#choice')]
+
+
+async def test_alias_safe_native_continue_stays_under_existing_hold(
+        monkeypatch, tmp_path):
+    next_button = submit('Continue', selector='#next', form_action=GH_DIRECT)
+    p = inventory(next_button, url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    prior = browser.call
+
+    async def fake_continue(*args, **kwargs):
+        if args[0] == 'click' and args[1] == '#next':
+            browser.calls.append(args)
+            return {}
+        return await prior(*args, **kwargs)
+
+    monkeypatch.setattr(browser, 'call', fake_continue)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: pk == GH_PK)
+    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
+    receipt = await forms.execute(
+        browser, p, {'action': 'click', 'selector': '#next'},
+        facts={}, filled={}, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=GH_PK, job_url=GH_WRAP, allow_click=True,
+        provenance=_greenhouse_provenance(row))
+    assert receipt['action'] == 'click'
+    assert [c for c in browser.calls if c[0] == 'click'] == [
+        ('click', '#next')]

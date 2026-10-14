@@ -989,6 +989,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   fixture_context=None,
                   provenance: GreenhouseJobAlias | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
+    verb = action.get('action')
     if provenance is not None:
         if (pk != provenance.pk or company != provenance.company
                 or job_url != provenance.wrapper
@@ -996,12 +997,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job Greenhouse provenance.')
-    elif pk:
+    elif pk and (verb in {'fill', 'select', 'choose', 'upload'}
+                 or (verb == 'click' and allow_click)):
+        # A non-committing, unapproved click is refused on existing local
+        # guards and must not fetch stores merely to repeat that refusal.
         tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
         if greenhouse_alias_candidate(tracked.get('jd_url')):
             # Direct calls cannot borrow a page URL as alias provenance.
             raise Gate('This Greenhouse wrapper needs a verified alias context.')
-    verb = action.get('action')
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
             or page.get('unsupported_frames')):

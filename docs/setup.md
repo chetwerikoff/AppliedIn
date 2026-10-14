@@ -100,6 +100,12 @@ Expect `200`. Then tell them the first run does nothing on its own: discovery is
 on a six hour schedule and does not sweep at boot, so they should press **Discover**
 scoped to one company to see the pipeline work end to end.
 
+### Optional recruiter-reply monitoring
+
+Reply ingestion is local-only and off by default. Run `./appliedin imap-setup` to save the IMAP host, mailbox and username plus an app password entered at a non-echoing prompt; setup stores the credential locally with owner-only permissions. Do not put credentials in command arguments or configuration files.
+
+Set `APPLIEDIN_IMAP_ENABLED=1` to opt in and set `APPLIEDIN_IMAP_POLL_INTERVAL_SEC` to a positive number of seconds. An unset, invalid or nonpositive interval disables background polling; other daemon workers continue normally. After setup or changing either variable, restart the daemon. The dashboard's Setup check performs an authentication-only read-only check when enabled and locally configured; it does not fetch messages.
+
 ### When it does not work
 
 | symptom | cause |

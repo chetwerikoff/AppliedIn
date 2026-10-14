@@ -330,6 +330,30 @@ def resume(pk: str, answer: str) -> dict:
     return resume_job(pk, answer)
 
 
+def imap_setup() -> dict:
+    import getpass
+    from pathlib import Path
+    from core.config import get_settings
+    from core.reply_ingest import secure_secrets_file
+
+    settings = get_settings()
+    if settings.mode != "local":
+        return {"status": "refused", "error": "IMAP setup is available in local mode only."}
+    path = Path(settings.local_dir) / "secrets.json"
+    secure_secrets_file(path)
+    host = input("IMAP host: ").strip()
+    mailbox = input("IMAP mailbox: ").strip()
+    username = input("IMAP username: ").strip()
+    password = getpass.getpass("IMAP app password: ")
+    if not all((host, mailbox, username, password)):
+        return {"status": "refused", "error": "All IMAP settings are required."}
+    from core.stores import make_stores
+    make_stores(settings).secrets.put_json("imap", {"host": host, "mailbox": mailbox,
+                                                     "username": username, "password": password})
+    secure_secrets_file(path)
+    return {"status": "saved", "detail": "Restart the daemon to enable configured polling."}
+
+
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="appliedin", description=__doc__)
@@ -355,6 +379,7 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("answer")
 
     sub.add_parser("browser-setup", help="install BrowserSkill manually in a clean Chrome profile")
+    sub.add_parser("imap-setup", help="configure optional local IMAP reply ingestion")
     args = p.parse_args(argv)
     # Switch instances BEFORE any command reads a setting: the pid file, the log,
     # the artifacts and the Redis connection all hang off this choice.
@@ -374,6 +399,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "browser-setup":
         from tools.browser_profile import browser_setup
         print(json.dumps(browser_setup(), indent=2))
+        return
+    if args.cmd == "imap-setup":
+        print(json.dumps(imap_setup(), indent=2))
         return
     if args.cmd == "logs":  # streams to the terminal, not JSON
         logs()

@@ -187,8 +187,39 @@ def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
     assert not any(control["selector"] == "#work-authorization-caption"
                    for control in page["controls"])
 
+async def test_fixture_orders_combos_before_the_ungranted_gate(authority):
+    page = served_fixture_page()
+    selectors = [control["selector"] for control in page["controls"]]
+    combo_selectors = list(fixture._COMBO_SELECTORS.values())
+    assert selectors.index("#name") < min(selectors.index(s) for s in combo_selectors)
+    assert max(selectors.index(s) for s in combo_selectors) < selectors.index("#additional")
+
+    authority.enable_positive_fixture()
+    actions = [
+        await authority.decision("", page, [], model="synthetic-fixture")
+        for _ in range(5)
+    ]
+    assert [action["selector"] for action in actions] == [
+        "#name", *combo_selectors, "#additional"]
+
+
+def test_fixture_reports_untouched_combos_as_not_reached():
+    state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    page = served_fixture_page()
+    state.observe_page(page)
+    assert all(item["outcome"] == "not_reached"
+               for item in state.combo_observations.values())
+
+    key = "Where are you located?"
+    state.combo_touched.add(key)
+    state.observe_page(page)
+    assert state.combo_observations[key]["outcome"] == "not_committed"
+
+
+
 def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
     state = fixture._SyntheticRun("/synthetic/resume.pdf")
+    state.combo_touched.update(fixture._MACHINE_VALUES)
     page = served_fixture_page()
     for key, selector in fixture._COMBO_SELECTORS.items():
         control = next(c for c in page["controls"] if c["selector"] == selector)

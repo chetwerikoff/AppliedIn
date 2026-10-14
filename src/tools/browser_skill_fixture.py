@@ -62,8 +62,6 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
  action="http://127.0.0.1:18789/fixture/example-co/job/1">
 <div class="form-group"><label for="name" data-automation-id="formLabel">Name</label>
 <input id="name" name="name" type="text"></div>
-<div class="form-group"><label for="additional" data-automation-id="formLabel">Additional question</label>
-<textarea id="additional" name="additional"></textarea></div>
 <div class="form-group"><label for="resume">Résumé</label>
 <input id="resume" name="resume" type="file" required></div>
 <div class="form-group"><div id="location-question" data-automation-id="formLabel">
@@ -103,6 +101,8 @@ Are you authorized to work?</div>
  aria-selected="false">Yes</div>
 <div id="work-authorization-option-no" role="option" data-value="no"
  aria-selected="false">No</div></div>
+<div class="form-group"><label for="additional" data-automation-id="formLabel">Additional question</label>
+<textarea id="additional" name="additional"></textarea></div>
 <button id="submit" type="submit">Submit application</button></form>
 <script>
 function bindPicker(comboId,listId,asyncFilter){
@@ -178,8 +178,9 @@ class _SyntheticRun:
                  "navigations", "decisions", "status_writes", "positive",
                  "ipc_index", "open_controls", "input_values", "committed",
                  "post_count", "post_payload", "submit_ipc", "uploaded",
-                 "last_page", "combo_observations", "submit_call_entered",
-                 "submit_guard", "post_attempts", "post_rejection", "post_receipts")
+                 "last_page", "combo_observations", "combo_touched",
+                 "submit_call_entered", "submit_guard", "post_attempts",
+                 "post_rejection", "post_receipts")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -209,6 +210,7 @@ class _SyntheticRun:
         self.uploaded = False
         self.last_page = None
         self.combo_observations = {}
+        self.combo_touched = set()
         self.submit_call_entered = 0
         self.submit_guard = "not_reached"
         self.post_attempts = 0
@@ -256,6 +258,13 @@ class _SyntheticRun:
         self.combo_observations = {}
         controls = observed.get("controls", []) if isinstance(observed, dict) else []
         for key, selector in _COMBO_SELECTORS.items():
+            if key not in self.combo_touched:
+                self.combo_observations[key] = {
+                    "outcome": "not_reached",
+                    "visible_text": "", "selected_value": "", "hidden_value": "",
+                    "reason": "combobox interaction was not reached",
+                }
+                continue
             matches = [c for c in controls
                        if isinstance(c, dict) and c.get("selector") == selector]
             if len(matches) != 1:
@@ -323,6 +332,12 @@ class _SyntheticRun:
     async def decision(self, task: str, page: dict, history: list, *, model: str):
         actions = (
             {"action": "fill", "selector": "#name", "fact": "Name"},
+            {"action": "combobox", "selector": "#location",
+             "fact": "Where are you located?"},
+            {"action": "combobox", "selector": "#phone-country",
+             "fact": "What is your phone country?"},
+            {"action": "combobox", "selector": "#work-authorization",
+             "fact": "Are you authorized to work?"},
             {"action": "fill", "selector": "#additional",
              "fact": "Additional question"},
         )
@@ -414,6 +429,11 @@ class _SyntheticRun:
                     if selector != "#work-authorization" and state.input_values.get(selector) != _FACTS[key]:
                         raise PermissionError("Fixture filter did not equal its approved fact.")
                 await raw.call(*args, **kwargs)
+                for key, selector in _COMBO_SELECTORS.items():
+                    if (args[0] in {"click", "fill"} and len(args) > 1
+                            and (args[1] == selector
+                                 or _OPTION_SELECTORS.get(args[1]) == key)):
+                        state.combo_touched.add(key)
                 state.ipc_index += 1
                 if args[0] == "fill":
                     state.fills += 1
@@ -511,11 +531,10 @@ def run() -> int:
                 form_question = result.get("form_question") or {}
                 expected_commits = {key: (_FACTS[key], value)
                                      for key, value in _MACHINE_VALUES.items()}
-                # One fill writes Name; the second decision reaches #additional,
-                # but that field has no exact fixture grant and must Gate before IPC.
-                expected_fills = 1
-                # Those two decisions are the name write and the unapproved gate request.
-                expected_decisions = 2
+                # Name plus the two filtered pickers are the only fills; the
+                # fourth picker uses clicks, then the fifth decision gates.
+                expected_fills = 3
+                expected_decisions = 5
                 ok = (result.get("status") == "gate"
                       and form_question.get("selector") == "#additional"
                       and state.fills == expected_fills
@@ -546,10 +565,10 @@ def run() -> int:
                 ]
                 for key in _MACHINE_VALUES:
                     observation = state.combo_observations.get(key, {
-                        "outcome": "not_committed",
+                        "outcome": "not_reached",
                         "visible_text": "", "selected_value": "",
                         "hidden_value": "",
-                        "reason": "no BrowserSkill page readback was available",
+                        "reason": "no BrowserSkill interaction reached this combobox",
                     })
                     outcomes.append({"field": key, **observation})
                 outcomes.append({

@@ -80,6 +80,9 @@ def match_message(headers, candidates: list[dict], aliases: list[dict]) -> str:
         has_evidence = bool(used_pks) or any(
             str(row.get("profile_id", "")) == alias_id for row in rows)
         positives, contradictions = [], []
+        other_aliases = [a for a in aliases if str(a.get("id", "")) != alias_id]
+        other_used_pks = {str(pk) for other in other_aliases
+                          for pk in (other.get("used_pks") or [])}
         for row in rows:
             profile = str(row.get("profile_id", ""))
             pk = str(row.get("pk", ""))
@@ -87,6 +90,7 @@ def match_message(headers, candidates: list[dict], aliases: list[dict]) -> str:
             positive = pk in used_pks or (alias_id and profile == alias_id)
             contradicted = bool(profile and other_alias is not None and profile != alias_id)
             contradicted = contradicted or bool(pk in used_pks and profile and profile != alias_id)
+            contradicted = contradicted or pk in other_used_pks
             if positive and not contradicted:
                 positives.append(row)
             elif contradicted or (profile and (other_alias is not None or profile.startswith("rot-"))):
@@ -114,11 +118,11 @@ def match_message(headers, candidates: list[dict], aliases: list[dict]) -> str:
     return str(rows[0].get("pk")) if len(rows) == 1 else "UNASSIGNED"
 
 
-def _parse_headers(raw: bytes) -> dict:
+def _parse_headers(raw: bytes) -> tuple[dict, bool]:
     try:
         msg = email.message_from_bytes(raw, policy=email.policy.default)
     except Exception:
-        return {"date": "", "sender": "", "subject": "", "message_id": ""}
+        return {"date": "", "sender": "", "subject": "", "message_id": ""}, True
     def safe(name):
         try:
             return str(msg.get(name, ""))
@@ -131,10 +135,11 @@ def _parse_headers(raw: bytes) -> dict:
     except Exception:
         date = ""
     address = email.utils.parseaddr(sender)[1] if sender else ""
-    if sender and "@" not in address:
+    parse_failed = bool(sender and "@" not in address)
+    if parse_failed:
         sender = ""
-    return {"date": date, "sender": sender, "subject": safe("subject"),
-            "message_id": safe("message-id")}
+    return ({"date": date, "sender": sender, "subject": safe("subject"),
+             "message_id": safe("message-id")}, parse_failed)
 
 def _state_path(settings) -> Path:
     return Path(settings.local_dir) / STATE_NAME
@@ -143,10 +148,11 @@ def _state_path(settings) -> Path:
 def _read_state(path: Path) -> dict:
     try:
         value = json.loads(path.read_text())
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
-
+    if not isinstance(value, dict):
+        raise ValueError("reply ingest state must be a JSON object")
+    return value
 
 def _write_state(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -282,9 +288,9 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
                 _advance_cursor(state_path, key, validity, uid)
                 continue
             raw = client.fetch_headers(uid)
-            fields = _parse_headers(raw)
+            fields, parse_failed = _parse_headers(raw)
             try:
-                pk = match_message(raw, candidates, alias_snapshot)
+                pk = "UNASSIGNED" if parse_failed else match_message(raw, candidates, alias_snapshot)
             except Exception:
                 pk = "UNASSIGNED"
             text = client.fetch_text_prefix(uid)

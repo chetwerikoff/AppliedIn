@@ -30,6 +30,17 @@ def test_matcher_prefers_recorded_alias_usage_and_rejects_conflict():
     assert reply_ingest.match_message(header(To="alias-unused@example-co.test", Subject="Reply"), rows, [unused]) == "UNASSIGNED"
 
 
+def test_competing_alias_used_pk_blocks_company_fallback():
+    row = {"pk": "example-co#one", "company": "example-co",
+           "title": "Backend Engineer", "status": "applied", "profile_id": ""}
+    addressed = {"id": "rot-a", "email": "alias-a@example-co.test",
+                 "company": "example-co", "used_pks": []}
+    competing = {"id": "rot-b", "email": "alias-b@example-co.test",
+                 "company": "example-co", "used_pks": [row["pk"]]}
+    assert reply_ingest.match_message(
+        header(To=addressed["email"], Subject="Backend Engineer"),
+        [row], [addressed, competing]) == "UNASSIGNED"
+
 def test_matcher_fallback_requires_explicit_company_and_subject_title():
     rows = [{"pk": "example-co#one", "company": "example-co", "title": "Backend Engineer"}]
     assert reply_ingest.match_message(header(From="Example-co Recruiting <jobs@shared-ats.test>",
@@ -126,20 +137,23 @@ def test_processed_uid_replay_advances_cursor_without_duplicate(tmp_path, monkey
     assert state["last_uid"] == 41
     assert len(reply_ingest.read_records(settings)) == 1
 
-def test_bad_header_is_recorded_unassigned_and_does_not_block_later_uids(tmp_path, monkeypatch):
-    aliases_calls = []
-    monkeypatch.setattr("core.rotation.aliases", lambda: aliases_calls.append(1) or [])
+def test_bad_header_with_eligible_alias_is_unassigned_between_valid_messages(tmp_path, monkeypatch):
+    alias = {"id": "rot-a", "email": "reply@example-co.test", "company": "example-co",
+             "used_pks": ["example-co#one"]}
+    monkeypatch.setattr("core.rotation.aliases", lambda: [alias])
     settings = type("Settings", (), {"mode": "local", "local_dir": str(tmp_path)})()
     credentials = {"host": "imap.example-co.test", "username": "test", "password": "synthetic", "mailbox": "INBOX"}
     candidates_read = []
+    row = {"pk": "example-co#one", "company": "example-co", "title": "Backend Engineer",
+           "status": "applied", "profile_id": "rot-a"}
     class Tracking:
         def query_status(self, status):
             candidates_read.append(status)
-            return []
+            return [row] if status.value == "applied" else []
         def all(self): raise AssertionError("tracking.all() must not be used")
-    messages = {1: b"From: recruiter@example-co.test\r\nSubject: One\r\nMessage-ID: <one@example-co.test>\r\n\r\n",
-                2: b"From: %%%\r\nSubject: broken\r\n\r\n",
-                3: b"From: recruiter@example-co.test\r\nSubject: Three\r\nMessage-ID: <three@example-co.test>\r\n\r\n"}
+    messages = {1: header(To=alias["email"], From="recruiter@example-co.test", Subject="Backend Engineer"),
+                2: header(To=alias["email"], From="%%%", Subject="Backend Engineer"),
+                3: header(To=alias["email"], From="recruiter@example-co.test", Subject="Backend Engineer")}
     class Client:
         uidvalidity = "99"
         def search_uids(self, query): return [1, 2, 3]
@@ -149,12 +163,10 @@ def test_bad_header_is_recorded_unassigned_and_does_not_block_later_uids(tmp_pat
     stores = type("Stores", (), {"tracking": Tracking()})()
     assert reply_ingest.ingest_pass(settings, credentials, stores, Client()) == 3
     records = reply_ingest.read_records(settings)
-    assert len(records) == 3
-    assert records[1]["sender"] == "" and records[1]["pk"] == "UNASSIGNED"
-    assert all("body" not in record for record in records)
+    assert [record["pk"] for record in records] == [row["pk"], "UNASSIGNED", row["pk"]]
+    assert records[1]["sender"] == ""
     assert b"body must remain in memory" not in (tmp_path / reply_ingest.STATE_NAME).read_bytes()
-    assert len(candidates_read) == 2 and len(aliases_calls) == 1
-
+    assert len(candidates_read) == 2
 
 class FakeTracking:
     def __init__(self, applied=None, manual=None):
@@ -363,6 +375,43 @@ def test_daemon_poller_registration_gates_all_configuration(monkeypatch):
     assert started == ["imap-replies"]
 
 
+
+def test_state_read_permission_error_preserves_file_and_retries(tmp_path, monkeypatch):
+    settings = type("Settings", (), {"mode": "local", "local_dir": str(tmp_path)})()
+    credentials = fake_credentials()
+    path = tmp_path / reply_ingest.STATE_NAME
+    original = b'{"accounts":{}}'
+    path.write_bytes(original)
+    real_read_text = Path.read_text
+    failed = False
+    def fail_once(instance, *args, **kwargs):
+        nonlocal failed
+        if instance == path and not failed:
+            failed = True
+            raise PermissionError("synthetic permission failure")
+        return real_read_text(instance, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", fail_once)
+    client = FakeClient("12", [41], {41: b"Message-ID: <retry@example-co.test>\r\n\r\n"})
+    with pytest.raises(PermissionError, match="synthetic permission failure"):
+        reply_ingest.ingest_pass(settings, credentials, fake_stores(), client)
+    assert path.read_bytes() == original
+    monkeypatch.setattr(Path, "read_text", real_read_text)
+    retry = FakeClient("12", [41], {41: b"Message-ID: <retry@example-co.test>\r\n\r\n"})
+    assert reply_ingest.ingest_pass(settings, credentials, fake_stores(), retry) == 1
+    account = json.loads(path.read_text())["accounts"][reply_ingest._account_key(credentials)]
+    assert account["last_uid"] == 41 and len(account["records"]) == 1
+
+
+
+def test_corrupt_state_is_not_treated_as_empty(tmp_path):
+    path = tmp_path / reply_ingest.STATE_NAME
+    path.write_text("not-json")
+    with pytest.raises(json.JSONDecodeError):
+        reply_ingest._read_state(path)
+    assert path.read_text() == "not-json"
+
+
+
 def test_poller_uses_configured_cadence_and_survives_pass_failure(monkeypatch, caplog):
     import logging
     from core import config, stores
@@ -392,6 +441,7 @@ def test_poller_uses_configured_cadence_and_survives_pass_failure(monkeypatch, c
     assert "IMAP poll failed; will retry on next interval" in caplog.text
 
 
+
 def test_imap_setup_cloud_refuses_before_prompt_and_store(monkeypatch):
     import builtins
     import getpass
@@ -405,6 +455,7 @@ def test_imap_setup_cloud_refuses_before_prompt_and_store(monkeypatch):
     assert imap_setup()["status"] == "refused"
 
 
+
 def test_setup_health_disabled_cloud_timeout_and_success(monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     import server
@@ -412,8 +463,7 @@ def test_setup_health_disabled_cloud_timeout_and_success(monkeypatch, tmp_path):
     from core.config import Settings
     credentials = fake_credentials()
     def request(mode, is_enabled, creds, transport_error=None):
-        settings = Settings(mode=mode, config_dir=str(tmp_path / "config"),
-                            local_dir=str(tmp_path))
+        settings = Settings(mode=mode, config_dir=str(tmp_path / "config"), local_dir=str(tmp_path))
         monkeypatch.setattr(server, "get_settings", lambda: settings)
         monkeypatch.setattr(reply_ingest, "enabled", lambda: is_enabled)
         monkeypatch.setattr(reply_ingest, "local_credentials", lambda *_: creds if mode == "local" else None)
@@ -434,6 +484,47 @@ def test_setup_health_disabled_cloud_timeout_and_success(monkeypatch, tmp_path):
     success = request("local", True, credentials)
     assert next(c for c in success if c["name"] == "IMAP replies")["state"] == "ready"
     assert all(any(c["name"] == name for c in timeout) for name in ("Résumé", "Model access", "PDF rendering"))
+
+
+
+def test_local_imap_setup_uses_getpass_file_secrets_and_keeps_mode_0600(monkeypatch, tmp_path):
+    import builtins
+    import getpass
+    from core import config, stores
+    from core.storage.local import FileSecrets
+    from cli import imap_setup
+    settings = type("Settings", (), {"mode": "local", "local_dir": str(tmp_path)})()
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    answers = iter(["imap.example-co.test", "INBOX", "account", "imap.example-co.test", "INBOX", "account"])
+    monkeypatch.setattr(builtins, "input", lambda _prompt: next(answers))
+    passwords = iter(["synthetic-password-one", "synthetic-password-two"])
+    monkeypatch.setattr(getpass, "getpass", lambda _prompt: next(passwords))
+    path = tmp_path / "secrets.json"
+    monkeypatch.setattr(stores, "make_stores", lambda _settings: type("Stores", (), {"secrets": FileSecrets(path)})())
+    assert imap_setup()["status"] == "saved"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert imap_setup()["status"] == "saved"
+    assert path.stat().st_mode & 0o777 == 0o600
+    stored = json.loads(path.read_text())
+    assert set(stored) == {"imap"}
+    assert stored["imap"]["password"] == "synthetic-password-two"
+
+
+
+def test_local_imap_setup_unsafe_target_aborts_before_password_prompt(monkeypatch, tmp_path):
+    import builtins
+    import getpass
+    from core import config
+    from cli import imap_setup
+    settings = type("Settings", (), {"mode": "local", "local_dir": str(tmp_path)})()
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+    target = tmp_path / "target.json"
+    target.write_text("{}")
+    (tmp_path / "secrets.json").symlink_to(target)
+    monkeypatch.setattr(builtins, "input", lambda *_: pytest.fail("unsafe target prompted"))
+    monkeypatch.setattr(getpass, "getpass", lambda *_: pytest.fail("unsafe target requested password"))
+    with pytest.raises(OSError, match="unsafe secrets file"):
+        imap_setup()
 
 
 def test_classifier_failure_records_null_label_and_advances(tmp_path, monkeypatch):

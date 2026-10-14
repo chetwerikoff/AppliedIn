@@ -138,6 +138,27 @@ bindPicker('phone-country','phone-country-options',false);
 bindPicker('work-authorization','work-authorization-options',false);
 </script></body></html>''').encode("utf-8")
 
+
+def _inventory_diagnostic_script() -> str:
+    # Instrument the fixed observer only for reporting. Its original result is
+    # still the sole inventory passed to the controller and all its guards.
+    from tools.browser_skill_dom import PAGE
+    script = PAGE.replace(
+        "const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>",
+        "const opaqueElements = Array.from(document.querySelectorAll('*')).filter(e =>")
+    script = script.replace(
+        "  const inventoryVerified =",
+        "  const opaqueControls = opaqueElements.length > 0;\n  const inventoryVerified =")
+    return script.replace(
+        "return {url:location.href, title, text:text.slice(0,100000),",
+        "return {ready_state:document.readyState, "
+        "offending_elements:opaqueElements.map(e=>({selector:selector(e),"
+        "tag:e.tagName.toLowerCase(),role:e.getAttribute('role')})), "
+        "shadow_hosts:shadowRoots.map(e=>({selector:selector(e),"
+        "tag:e.tagName.toLowerCase()})), "
+        "url:location.href, title, text:text.slice(0,100000),")
+
+
 # This context carries ONLY a one-shot object minted in run(). It is not a flag,
 # user input, serialized token, request parameter or globally installed patch.
 _SESSION_ENTRY: ContextVar[object | None] = ContextVar(
@@ -180,7 +201,7 @@ class _SyntheticRun:
                  "post_count", "post_payload", "submit_ipc", "uploaded",
                  "last_page", "combo_observations", "combo_touched",
                  "submit_call_entered", "submit_guard", "post_attempts",
-                 "post_rejection", "post_receipts")
+                 "post_rejection", "post_receipts", "inventory_diagnostics")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -216,6 +237,7 @@ class _SyntheticRun:
         self.post_attempts = 0
         self.post_rejection = ""
         self.post_receipts = []
+        self.inventory_diagnostics = None
 
 
     def enable_positive_fixture(self) -> None:
@@ -365,6 +387,14 @@ class _SyntheticRun:
     def facade(self, raw):
         """A closed edge exposing only the original controller's exact fixture path."""
         state = self
+        async def diagnose(observed):
+            if (isinstance(observed, dict) and (
+                    observed.get("inventory_verified") is not True
+                    or observed.get("truncated") or observed.get("opaque_controls")
+                    or observed.get("shadow_roots") or observed.get("unsupported_frames"))):
+                result = await raw.call("evaluate", _inventory_diagnostic_script())
+                state.inventory_diagnostics = result.get("value")
+
 
         class _Closed:
             __slots__ = ()
@@ -379,6 +409,7 @@ class _SyntheticRun:
                 state.observe_page(observed)
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture redirected outside the fixed job URL.")
+                await diagnose(observed)
                 return observed
 
             async def page(self):
@@ -388,6 +419,7 @@ class _SyntheticRun:
                 state.observe_page(observed)
                 if not isinstance(observed, dict) or observed.get("url") != URL:
                     raise PermissionError("Fixture page escaped the fixed job URL.")
+                await diagnose(observed)
                 return observed
 
             async def call(self, *args, **kwargs):
@@ -613,6 +645,13 @@ def run() -> int:
                     )}.get(form_question.get("selector")),
                     "reason": result.get("question") or result.get("detail"),
                 }
+                inventory = {key: (state.last_page or {}).get(key) for key in (
+                    "inventory_verified", "truncated", "opaque_controls",
+                    "shadow_roots", "unsupported_frames")}
+                if isinstance(state.inventory_diagnostics, dict):
+                    inventory["diagnostics"] = {
+                        key: state.inventory_diagnostics.get(key) for key in (
+                            "ready_state", "offending_elements", "shadow_hosts")}
                 print(json.dumps({"fixture": "native-form",
                                   "safe_gate": ok,
                                   "submitted": state.submit_ipc > 0,
@@ -621,6 +660,7 @@ def run() -> int:
                                   "post_received": state.post_count == 1,
                                   "gate": gate, "fields": outcomes,
                                   "approval_question_collisions": collisions,
+                                  "inventory": inventory,
                                   "submit": {
                                       "guard": state.submit_guard,
                                       "call_entered": state.submit_call_entered > 0,

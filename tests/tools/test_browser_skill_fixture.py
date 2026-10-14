@@ -217,6 +217,39 @@ def test_fixture_reports_untouched_combos_as_not_reached():
 
 
 
+@pytest.mark.parametrize("flag,value", [
+    ("inventory_verified", False), ("truncated", True),
+    ("opaque_controls", True), ("shadow_roots", True),
+    ("unsupported_frames", ["http://127.0.0.1/frame"]),
+])
+async def test_incomplete_inventory_diagnostics_never_replace_guard_input(
+        authority, flag, value):
+    # A second read can see a settled DOM; that must not authorize the rejected
+    # original inventory or hide the flags that actually caused the gate.
+    page = synthetic_page()
+    page[flag] = value
+    diagnostic = {"ready_state": "complete", "offending_elements": [
+        {"selector": "#synthetic-opaque", "tag": "div", "role": "listbox"}],
+        "shadow_hosts": []}
+    calls = []
+    class Raw:
+        async def navigate(self, url):
+            return page
+        async def call(self, *args):
+            calls.append(args)
+            return {"value": diagnostic}
+    edge = authority.facade(Raw())
+    observed = await edge.navigate(fixture.URL)
+    assert observed is page and authority.last_page is page
+    assert observed[flag] == value
+    assert authority.inventory_diagnostics == diagnostic
+    assert calls == [("evaluate", fixture._inventory_diagnostic_script())]
+    with pytest.raises(forms.Gate, match="inventory is incomplete"):
+        forms._inventory_ok(observed)
+    assert authority.fills == authority.ipc_index == 0
+
+
+
 def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
     state = fixture._SyntheticRun("/synthetic/resume.pdf")
     state.combo_touched.update(fixture._MACHINE_VALUES)

@@ -141,6 +141,25 @@ def _parse_headers(raw: bytes) -> tuple[dict, bool]:
     return ({"date": date, "sender": sender, "subject": safe("subject"),
              "message_id": safe("message-id")}, parse_failed)
 
+def _decode_text_prefix(headers: bytes, fragment: bytes) -> str:
+    """Return inline text only; MIME headers and attachment parts stay out of the model input."""
+    try:
+        message = email.message_from_bytes(headers + fragment, policy=email.policy.default)
+        parts = message.walk() if message.is_multipart() else (message,)
+        texts = []
+        for part in parts:
+            if part.is_multipart() or part.get_content_disposition() == "attachment" or part.get_filename():
+                continue
+            if part.get_content_type() not in ("text/plain", "text/html"):
+                continue
+            value = part.get_content()
+            if isinstance(value, str) and value:
+                texts.append(value)
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
 def _state_path(settings) -> Path:
     return Path(settings.local_dir) / STATE_NAME
 
@@ -178,6 +197,29 @@ def read_records(settings) -> list[dict]:
                 for row in rows]
 
 
+def assign(record_id: str, pk: str, settings) -> str:
+    """Claim one unassigned record under the same lock as ingest commits."""
+    with WRITE_LOCK:
+        path = _state_path(settings)
+        state = _read_state(path)
+        found = None
+        for account in state.get("accounts", {}).values():
+            for record in account.get("records", []):
+                if record.get("record_id") == record_id:
+                    found = record
+                    break
+            if found is not None:
+                break
+        if found is None:
+            return "not_found"
+        if found.get("pk") == pk:
+            return "assigned"
+        if found.get("pk") != "UNASSIGNED":
+            return "conflict"
+        found["pk"] = pk
+        _write_state(path, state)
+        return "assigned"
+
 def _account_key(creds: dict) -> str:
     return json.dumps([str(creds["host"]).casefold(), str(creds["username"]), str(creds["mailbox"])], separators=(",", ":"))
 
@@ -206,6 +248,14 @@ def _processed(path: Path, key: str, validity: str, uid: int) -> bool:
     with WRITE_LOCK:
         account = _read_state(path).get("accounts", {}).get(key, {})
         return f"{validity}:{uid}" in account.get("processed", [])
+
+def _known_message_id(path: Path, key: str, message_id: str) -> bool:
+    if not message_id:
+        return False
+    with WRITE_LOCK:
+        account = _read_state(path).get("accounts", {}).get(key, {})
+        return message_id in account.get("message_ids", [])
+
 
 
 def _commit_uid(path: Path, key: str, validity: str, uid: int,
@@ -293,11 +343,23 @@ def ingest_pass(settings, credentials: dict | None = None, stores=None, transpor
                 pk = "UNASSIGNED" if parse_failed else match_message(raw, candidates, alias_snapshot)
             except Exception:
                 pk = "UNASSIGNED"
+            if _known_message_id(state_path, key, fields["message_id"]):
+                duplicate = {"record_id": str(uuid.uuid4()), **fields, "label": "other", "pk": pk}
+                _commit_uid(state_path, key, validity, uid, duplicate, fields["message_id"])
+                _advance_cursor(state_path, key, validity, uid)
+                continue
             text = client.fetch_text_prefix(uid)
             try:
-                label = classifier(fields, text) if classifier else None
+                from core.reply_classifier import classify, validated_label
+
+                if classifier:
+                    candidate = classifier(fields, text)
+                else:
+                    fragment = _decode_text_prefix(raw, text) if isinstance(text, bytes) else str(text or "")
+                    candidate = classify(fragment)
+                label = validated_label(candidate)
             except Exception:
-                label = None
+                label = None if classifier else "other"
             record = {"record_id": str(uuid.uuid4()), **fields, "label": label, "pk": pk}
             inserted = _commit_uid(state_path, key, validity, uid, record, fields["message_id"])
             _advance_cursor(state_path, key, validity, uid)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -262,7 +263,7 @@ def test_nonempty_wholly_invalid_feed_raises(ats):
         response = xml_response(personio_xml(
             ["<position><id>bad</id><name>Engineer</name></position>"]))
     elif ats == "teamtailor":
-        response = xml_response(rss([rss_item(link="https://other.teamtailor.com/jobs/a")]))
+        response = xml_response(rss([rss_item(link="https://other.teamtailor.com/jobs/a/extra")]))
     elif ats == "recruitee":
         response = httpx.Response(200, json={"offers": [{"id": 2, "title": ""}]})
     else:
@@ -327,7 +328,7 @@ def test_teamtailor_and_recruitee_non_posting_paths(ats, bad_path, monkeypatch):
 @pytest.mark.parametrize("ats", ["teamtailor", "recruitee"])
 @pytest.mark.parametrize("source", [
     "/jobs/backend-123", "//example-co.teamtailor.com/jobs/backend-123",
-    "https://evil.example/jobs/backend-123",
+    "https://evil.example/jobs/backend-123/extra",
     "https://user@example-co.teamtailor.com/jobs/backend-123",
     "https://example-co.teamtailor.com:8443/jobs/backend-123",
     "https://example-co.teamtailor.com/jobs/backend-123?x=y",
@@ -346,6 +347,237 @@ def test_relative_foreign_and_unsafe_raw_source_rejected_before_normalizer(
     with httpx.Client(transport=httpx.MockTransport(lambda req: body)) as c:
         with pytest.raises(ValueError, match="no valid jobs"):
             ADAPTERS[ats].fetch(company(ats), c)
+
+
+
+@pytest.mark.parametrize("ats,foreign", [
+    ("teamtailor", "https://careers.example-co.test/jobs/backend-123"),
+    ("teamtailor", "https://other.teamtailor.com/jobs/backend-123"),
+    ("teamtailor", "https://evil.example/jobs/backend-123"),
+    ("recruitee", "https://jobs.example-co.test/o/backend-123"),
+    ("recruitee", "https://other.recruitee.com/o/backend-123"),
+])
+def test_custom_domain_posting_rehomes_only_path(ats, foreign, monkeypatch):
+    from discovery import crawler
+
+    path = "/jobs/backend-123" if ats == "teamtailor" else "/o/backend-123"
+    canonical = f"https://example-co.{ats}.com{path}"
+    baseline = fetch_fixture(ats)[0]
+    feed_url, _ = fixture_for(ats)
+    calls = []
+    original = crawler._trusted_posting_url
+
+    def normalizer_spy(candidate, base):
+        calls.append((candidate, base))
+        return original(candidate, base)
+
+    monkeypatch.setattr(crawler, "_trusted_posting_url", normalizer_spy)
+    if ats == "teamtailor":
+        payload = xml_response(rss([rss_item(foreign, guid="foreign-guid")]))
+    else:
+        row = recruitee_row()
+        row["careers_url"] = foreign
+        payload = httpx.Response(200, json={"offers": [row]})
+    jobs = fetch_fixture(ats, payload,
+                         careers_url="https://careers.example-co.test/roles")
+    assert len(jobs) == 1
+    assert jobs[0].jd_url == baseline.jd_url == canonical
+    assert jobs[0].job_id == baseline.job_id
+    assert calls == [(canonical, feed_url)]  # Never normalize a foreign origin.
+
+
+@pytest.mark.parametrize("ats", ["teamtailor", "recruitee"])
+def test_mixed_same_host_and_custom_domain_keep_stable_id_and_path_case(ats):
+    if ats == "teamtailor":
+        payload = xml_response(rss([
+            rss_item(" \nhttps://EXAMPLE-CO.teamtailor.com:443/jobs/Backend-001 \t",
+                     guid="same-guid"),
+            rss_item("https://careers.example-co.test/jobs/Backend-002",
+                     guid="same-guid"),
+            rss_item("https://jobs.example-co.test/jobs/Backend-002",
+                     guid="different-guid"),
+        ]))
+        paths = ["Backend-001", "Backend-002"]
+    else:
+        one, two = recruitee_row(), recruitee_row()
+        one["careers_url"] = "https://EXAMPLE-CO.recruitee.com:443/o/Backend-001"
+        two.update(id=43, careers_url="https://jobs.example-co.test/o/Backend-002")
+        payload = httpx.Response(200, json={"offers": [one, two]})
+        paths = ["Backend-001", "Backend-002"]
+    jobs = fetch_fixture(ats, payload)
+    prefix = "/jobs/" if ats == "teamtailor" else "/o/"
+    assert [job.jd_url for job in jobs] == [
+        f"https://example-co.{ats}.com{prefix}{path}" for path in paths]
+    assert len({job.job_id for job in jobs}) == 2
+    if ats == "recruitee":
+        assert [job.job_id for job in jobs] == ["42", "43"]
+
+
+@pytest.mark.parametrize("ats", ["teamtailor", "recruitee"])
+@pytest.mark.parametrize("bad_kind", [
+    "wrong_grammar", "extra_segment", "traversal", "encoded_separator",
+    "encoded_traversal", "query", "fragment", "default_port", "empty_port",
+    "other_port", "userinfo", "http", "relative", "scheme_relative",
+    "backslash", "leading_padding", "trailing_newline", "trailing_tab",
+    "malformed_host", "unicode_path", "oversized_slug",
+])
+def test_hostile_custom_link_drops_only_row_before_normalizer(
+        ats, bad_kind, monkeypatch):
+    from discovery import crawler
+
+    prefix = "/jobs/" if ats == "teamtailor" else "/o/"
+    path = f"{prefix}backend-123"
+    good_path = f"{prefix}safe-2"
+    foreign = "careers.example-co.test" if ats == "teamtailor" else "jobs.example-co.test"
+    canonical_good = f"https://example-co.{ats}.com{good_path}"
+    hostile = {
+        "wrong_grammar": f"https://{foreign}" + (
+            "/o/backend-123" if ats == "teamtailor" else "/jobs/backend-123"),
+        "extra_segment": f"https://{foreign}{path}/extra",
+        "traversal": f"https://{foreign}{path}/../safe-2",
+        "encoded_separator": f"https://{foreign}{path}%2Fextra",
+        "encoded_traversal": f"https://{foreign}{prefix}%2e%2e",
+        "query": f"https://{foreign}{path}?draft=1",
+        "fragment": f"https://{foreign}{path}#detail",
+        "default_port": f"https://{foreign}:443{path}",
+        "empty_port": f"https://{foreign}:{path}",
+        "other_port": f"https://{foreign}:8443{path}",
+        "userinfo": f"https://user@{foreign}{path}",
+        "http": f"http://{foreign}{path}",
+        "relative": path,
+        "scheme_relative": f"//{foreign}{path}",
+        "backslash": f"https://{foreign}{path}" + "\\",
+        "leading_padding": f" https://{foreign}{path}",
+        "trailing_newline": f"https://{foreign}{path}\n",
+        "trailing_tab": f"https://{foreign}{path}\t",
+        "malformed_host": f"https://careers..test{path}",
+        "unicode_path": f"https://{foreign}{path}ü",
+        "oversized_slug": f"https://{foreign}{prefix}" + "a" * 129,
+    }[bad_kind]
+    original = crawler._trusted_posting_url
+    calls = []
+
+    def normalizer_spy(candidate, base):
+        calls.append(candidate)
+        assert candidate == canonical_good, "unsafe raw URL reached normalizer"
+        return original(candidate, base)
+
+    monkeypatch.setattr(crawler, "_trusted_posting_url", normalizer_spy)
+    if ats == "teamtailor":
+        payload = xml_response(rss([rss_item(hostile), rss_item(canonical_good)]))
+    else:
+        bad_row, good_row = recruitee_row(), recruitee_row()
+        bad_row["careers_url"] = hostile
+        good_row.update(id=43, careers_url=canonical_good)
+        payload = httpx.Response(200, json={"offers": [bad_row, good_row]})
+    jobs = fetch_fixture(ats, payload)
+    assert [job.jd_url for job in jobs] == [canonical_good]
+    assert calls == [canonical_good]
+
+
+@pytest.mark.parametrize("decorated", [
+    " {}", "{} ", "\n{}", "{}\r", "{}\t",
+    "&#10;{}", "{}&#10;", "{}&#13;", "{}&#9;",
+])
+def test_teamtailor_untrimmed_foreign_rss_link_never_reaches_normalizer(
+        decorated, monkeypatch):
+    from discovery import crawler
+
+    foreign = "https://careers.example-co.test/jobs/bad-1"
+    safe_raw = " \nhttps://EXAMPLE-CO.teamtailor.com:443/jobs/safe-2 \t"
+    safe_trimmed = safe_raw.strip()
+    canonical = "https://example-co.teamtailor.com/jobs/safe-2"
+    calls = []
+    original = crawler._trusted_posting_url
+
+    def normalizer_spy(candidate, base):
+        calls.append(candidate)
+        assert candidate == safe_trimmed, "raw foreign RSS control was trimmed away"
+        return original(candidate, base)
+
+    monkeypatch.setattr(crawler, "_trusted_posting_url", normalizer_spy)
+    payload = xml_response(rss([rss_item(decorated.format(foreign)),
+                                rss_item(safe_raw)]))
+    jobs = fetch_fixture("teamtailor", payload)
+    assert [job.jd_url for job in jobs] == [canonical]
+    assert calls == [safe_trimmed]
+
+
+@pytest.mark.parametrize("ats", ["teamtailor", "recruitee"])
+@pytest.mark.parametrize("kind", ["long", "short", "empty"])
+def test_feed_jd_retained_and_deferred_reads_use_only_canonical_url(
+        ats, kind, monkeypatch):
+    from agent.run import _jd_text
+    from tools import jd
+
+    path = "/jobs/backend-123" if ats == "teamtailor" else "/o/backend-123"
+    foreign = ("https://careers.example-co.test" if ats == "teamtailor"
+               else "https://jobs.example-co.test") + path
+    description = {
+        "long": "Detailed backend responsibilities and qualifications. " * 12,
+        "short": "Brief summary",
+        "empty": "",
+    }[kind]
+    if ats == "teamtailor":
+        item = rss_item(foreign)
+        item = item.replace("</item>", f"<description>{description}</description></item>")
+        payload = xml_response(rss([item]))
+    else:
+        row = recruitee_row()
+        row.update(careers_url=foreign, description=description)
+        payload = httpx.Response(200, json={"offers": [row]})
+    job = fetch_fixture(ats, payload)
+    assert len(job) == 1
+    record = job[0]
+    assert record.jd_text == description.strip()
+    assert record.jd_url == f"https://example-co.{ats}.com{path}"
+
+    calls = []
+    fetched = "Expanded job description from canonical URL. " * 15
+
+    def reader(url, reader_kind):
+        calls.append((url, reader_kind))
+        return fetched
+
+    monkeypatch.setattr(jd, "fetch_jd", reader)
+    result = asyncio.run(_jd_text({"jd_url": record.jd_url,
+                                   "jd_text": record.jd_text}))
+    if kind == "long":
+        assert len(record.jd_text) >= 400
+        assert result == record.jd_text
+        assert calls == []
+    else:
+        assert result == fetched.strip()
+        assert calls == [(record.jd_url, "jd_sweep")]
+
+
+@pytest.mark.parametrize("ats", ["teamtailor", "recruitee"])
+@pytest.mark.parametrize("tamper", ["foreign", "other_path", "query"])
+def test_foreign_link_rehome_still_checks_normalized_destination(
+        ats, tamper, monkeypatch):
+    from discovery import crawler
+
+    path = "/jobs/backend-123" if ats == "teamtailor" else "/o/backend-123"
+    foreign_host = ("careers.example-co.test" if ats == "teamtailor"
+                    else "jobs.example-co.test")
+    foreign = f"https://{foreign_host}{path}"
+    target = f"https://example-co.{ats}.com"
+    tampered = {
+        "foreign": foreign,
+        "other_path": f"{target}{path}-altered",
+        "query": f"{target}{path}?unexpected=true",
+    }[tamper]
+    monkeypatch.setattr(crawler, "_trusted_posting_url",
+                        lambda candidate, base: tampered)
+    if ats == "teamtailor":
+        payload = xml_response(rss([rss_item(foreign)]))
+    else:
+        row = recruitee_row()
+        row["careers_url"] = foreign
+        payload = httpx.Response(200, json={"offers": [row]})
+    with httpx.Client(transport=httpx.MockTransport(lambda req: payload)) as client:
+        with pytest.raises(ValueError, match="nonempty ATS feed had no valid jobs"):
+            ADAPTERS[ats].fetch(company(ats), client)
 
 
 def test_workable_accountless_and_bound_url_union_hidden_and_siblings():

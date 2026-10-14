@@ -57,3 +57,20 @@ def test_resolve_unrecognized_page_is_crawl():
     m = resolve("https://www.acme.com/careers", client)
     assert m.ats == "custom"
     assert m.discovery is DiscoveryMode.CRAWL
+
+
+def test_vendor_urls_still_resolve_but_custom_posting_hosts_do_not():
+    for url, ats, board in (
+        ("https://example-co.teamtailor.com/jobs/backend-123", "teamtailor", "example-co"),
+        ("https://example-co.recruitee.com/o/backend-123", "recruitee", "example-co"),
+    ):
+        match = detect_from_url(url)
+        assert (match.ats, match.board) == (ats, board)
+    for custom in (
+        "https://careers.example-co.test/jobs/backend-123",
+        "https://jobs.example-co.test/o/backend-123",
+    ):
+        assert detect_from_url(custom) is None
+        fallback = resolve(custom)
+        assert (fallback.ats, fallback.board, fallback.discovery) == (
+            "custom", custom, DiscoveryMode.CRAWL)

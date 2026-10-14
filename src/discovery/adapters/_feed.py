@@ -101,14 +101,24 @@ def _careers_base(company: CompanyConfig, board: str, ats: str,
     return fallback
 
 
-def _posting_url(candidate: object, host: str, path_pattern: str, base: str) -> str | None:
-    """Raw check, existing normalizer, independent normalized destination guard."""
+def _posting_url(candidate: object, host: str, path_pattern: str, base: str,
+                 *, allow_foreign_path: bool = False) -> str | None:
+    """Validate the raw link before normalization; only a vetted path can cross hosts."""
     raw = _url_parts(candidate)
-    if raw is None or raw.hostname != host or not re.fullmatch(path_pattern, raw.path):
+    if raw is None or not re.fullmatch(path_pattern, raw.path):
         return None
+
+    normalized_candidate = candidate
+    if raw.hostname != host:
+        # A foreign hostname supplies no tenant authority. Even an explicit
+        # default or empty port is disallowed on this path-only exception.
+        if not allow_foreign_path or ":" in raw.netloc:
+            return None
+        normalized_candidate = f"https://{host}{raw.path}"
+
     from ..crawler import _trusted_posting_url
 
-    result = _trusted_posting_url(candidate, base)
+    result = _trusted_posting_url(normalized_candidate, base)
     checked = _url_parts(result)
     if (checked is None or checked.hostname != host or checked.path != raw.path
             or not re.fullmatch(path_pattern, checked.path)):

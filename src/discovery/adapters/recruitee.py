@@ -38,7 +38,8 @@ class RecruiteeAdapter:
             location = _location_text(
                 _locations(row.get("locations")), _remote_cues(row))
             link = _posting_url(row.get("careers_url"), host,
-                                r"/o/[A-Za-z0-9][A-Za-z0-9_-]{0,127}", base)
+                                r"/o/[A-Za-z0-9][A-Za-z0-9_-]{0,127}", base,
+                                allow_foreign_path=True)
             if title is None or jd_text is None or location is None or link is None:
                 continue
             jobs.append(JobRecord(

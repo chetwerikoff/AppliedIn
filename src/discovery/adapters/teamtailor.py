@@ -11,7 +11,7 @@ from core.models import JobRecord
 
 from ..watchlist import CompanyConfig
 from ._feed import (_board_token, _careers_base, _clean, _feed, _location_text,
-               _nonempty_or_error, _posting_url, _published)
+               _nonempty_or_error, _posting_url, _published, _url_parts)
 from ._feed import _child_text, _tag, _xml_rows
 
 log = get_logger(__name__)
@@ -62,8 +62,17 @@ class TeamtailorAdapter:
             title = _clean(_child_text(item, "title"), 512, required=True)
             if title is None:
                 continue
-            link = _posting_url(_child_text(item, "link").strip(), host,
-                                r"/jobs/[A-Za-z0-9][A-Za-z0-9_-]{0,127}", base)
+            raw_link = _child_text(item, "link")
+            trimmed_link = raw_link.strip()
+            if raw_link != trimmed_link:
+                # Legacy same-host RSS padding is accepted, but trimming a
+                # foreign link must not erase whitespace/control evidence.
+                trimmed_parts = _url_parts(trimmed_link)
+                if trimmed_parts is None or trimmed_parts.hostname != host:
+                    continue
+            link = _posting_url(
+                trimmed_link, host, r"/jobs/[A-Za-z0-9][A-Za-z0-9_-]{0,127}",
+                base, allow_foreign_path=True)
             if link is None:
                 continue
             # Both fields must be safe BEFORE constructing the JobRecord; even

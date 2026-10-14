@@ -9,6 +9,7 @@ checks the imported JavaScript in Chrome, NOT BrowserSkill IPC or owner grants.
 """
 from __future__ import annotations
 
+from collections import Counter
 import contextlib
 import fcntl
 import json
@@ -21,11 +22,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 PASS = "PASS native-control-witness: loopback-only; native-state-matrix verified"
 FAIL = "FAIL native-control-witness:"
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 TIMEOUT = 75
+_BROWSER_UI_CHROME_HOSTS = frozenset({"resources", "theme", "omnibox-popup.top-chrome"})
 
 
 class SmokeFailure(Exception):
@@ -155,10 +158,11 @@ class CDP:
         self.discovered: dict[str, str] = {}
         self.intercepted_targets: set[str] = set()
         self.background_sessions: set[str] = set()
+        self.browser_ui_sessions: set[str] = set()
         self.page_session: str | None = None
         self.page_target: str | None = None
-        self.fetch: list[tuple[str, str, str]] = []
-        self.network: list[tuple[str, str, str]] = []
+        self.fetch: list[tuple[str | None, str, str, str]] = []
+        self.network: list[tuple[str | None, str, str, str]] = []
         self.redirects: list[str] = []
         self.forbidden: list[str] = []
         self.loaded = False
@@ -208,6 +212,8 @@ class CDP:
         require(session not in self.prepared, "duplicate CDP child-target session")
         if target_type in {"background_page", "browser_ui"}:
             self.background_sessions.add(session)
+        if target_type == "browser_ui":
+            self.browser_ui_sessions.add(session)
         # Both domains must ACK *before* target release or first navigation.
         self.call("Network.enable", session=session)
         self.call("Fetch.enable", {"patterns": [{"urlPattern": "*",
@@ -226,6 +232,27 @@ class CDP:
             self.page_target = target
         if waiting:
             self.call("Runtime.runIfWaitingForDebugger", session=session)
+
+    def _browser_ui_chrome_request(self, session: str | None, url: str) -> bool:
+        if session not in self.browser_ui_sessions:
+            return False
+        try:
+            parsed = urlsplit(url)
+            return (parsed.scheme == "chrome"
+                    and parsed.hostname in _BROWSER_UI_CHROME_HOSTS
+                    and parsed.port is None)
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    def fixture_requests_verified(self) -> bool:
+        # Chrome's own UI traffic is recorded, but cannot count as a fixture GET.
+        expected = [(self.page_session, self.fixture_url, "GET", "Document")]
+        regular_fetch = [request for request in self.fetch
+                         if not self._browser_ui_chrome_request(request[0], request[1])]
+        regular_network = [request for request in self.network
+                           if not self._browser_ui_chrome_request(request[0], request[1])]
+        return (regular_fetch == expected and regular_network == expected
+                and Counter(self.fetch) == Counter(self.network))
 
     def _dispatch(self, message: dict):
         if isinstance(message.get("id"), int):
@@ -251,24 +278,27 @@ class CDP:
             req = args.get("request") or {}
             url, verb = req.get("url", ""), req.get("method", "")
             kind = args.get("resourceType", "")
-            self.fetch.append((url, verb, kind))
-            if (session not in self.background_sessions and url == self.fixture_url
-                    and verb == "GET" and kind == "Document"):
+            self.fetch.append((session, url, verb, kind))
+            if (self._browser_ui_chrome_request(session, url)
+                    or (session not in self.background_sessions
+                        and url == self.fixture_url and verb == "GET"
+                        and kind == "Document")):
                 self.call("Fetch.continueRequest", {"requestId": args["requestId"]}, session)
             else:
-                self.forbidden.append(f"Fetch rejected {verb} {kind} destination {url[:200]!r}")
+                self.forbidden.append(f"Fetch rejected {verb} {kind} destination {str(url)[:200]!r}")
                 self.call("Fetch.failRequest", {"requestId": args["requestId"],
                                                  "errorReason": "BlockedByClient"}, session)
         elif method == "Network.requestWillBeSent":
             request = args.get("request") or {}
             url, verb = request.get("url", ""), request.get("method", "")
             kind = args.get("type", "")
-            self.network.append((url, verb, kind))
+            self.network.append((session, url, verb, kind))
             if args.get("redirectResponse") is not None:
-                self.redirects.append(url[:200])
-            if (session in self.background_sessions or url != self.fixture_url
-                    or verb != "GET" or kind != "Document"):
-                self.forbidden.append(f"Network observed {verb} {kind} destination {url[:200]!r}")
+                self.redirects.append(str(url)[:200])
+            if (not self._browser_ui_chrome_request(session, url)
+                    and (session in self.background_sessions or url != self.fixture_url
+                         or verb != "GET" or kind != "Document")):
+                self.forbidden.append(f"Network observed {verb} {kind} destination {str(url)[:200]!r}")
         elif method == "Page.frameNavigated" and session == self.page_session:
             frame = args.get("frame") or {}
             if not frame.get("parentId"):
@@ -492,9 +522,7 @@ def _run_chrome(fixture, production_script: str, browser: str):
                             (cdp.forbidden or cdp.redirects or ["unverified network attempt"])[0])
                     require(set(cdp.discovered) <= cdp.intercepted_targets,
                             "a page/frame/worker target lacked pre-navigation interception")
-                    require(len(cdp.fetch) == len(cdp.network) == 1
-                            and cdp.fetch[0] == cdp.network[0] ==
-                                (url, "GET", "Document"),
+                    require(cdp.fixture_requests_verified(),
                             "CDP Fetch/Network destination or interception log mismatch")
                     require(recorder.snapshot() ==
                             [("GET", fixture.PATH, url.split('/')[2], True)],

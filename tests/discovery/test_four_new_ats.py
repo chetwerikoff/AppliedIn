@@ -463,8 +463,8 @@ def test_workable_wholly_rejected_groups_do_not_advance_handler_watermark(
     b'<?xml version="1.0" encoding="ISO-8859-1"?><rss/>',
 ])
 def test_xml_forbidden_encoding_and_dtd_never_reach_elementtree(ats, body, monkeypatch):
-    from discovery.adapters import personio
-    monkeypatch.setattr(personio.ET, "iterparse",
+    from discovery.adapters import _feed
+    monkeypatch.setattr(_feed.ET, "iterparse",
                         lambda *args, **kwargs: pytest.fail("forbidden XML reached parser"))
     with httpx.Client(transport=httpx.MockTransport(
         lambda req: xml_response(body))) as client:
@@ -474,7 +474,7 @@ def test_xml_forbidden_encoding_and_dtd_never_reach_elementtree(ats, body, monke
 
 @pytest.mark.parametrize("ats", ["personio", "teamtailor"])
 def test_xml_parser_limits_nonjob_extension_nodes_depth_rows(ats):
-    from discovery.adapters.personio import _xml_rows
+    from discovery.adapters._feed import _xml_rows
     root = "workzag-jobs" if ats == "personio" else "rss"
     row = "position" if ats == "personio" else "item"
     start = f"<{root}>" + ("<channel>" if ats == "teamtailor" else "")

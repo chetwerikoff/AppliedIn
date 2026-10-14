@@ -20,6 +20,27 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const api = (p) => (CONFIG.apiUrl || "").replace(/\/$/, "") + p;
 
+// Browser-local preferences must never prevent the dashboard from loading.
+function localGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function localSet(key, value) {
+  try { localStorage.setItem(key, value); }
+  catch { /* The in-memory setting still works in restricted storage modes. */ }
+}
+
+const APPS_SORT_KEY = "appliedin.applicationsSort";
+const APPS_SORT_KEYS = ["status", "company", "role", "match", "applied", "updated"];
+function validAppsSort(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && APPS_SORT_KEYS.includes(value.key) && ["asc", "desc"].includes(value.direction)
+    ? { key: value.key, direction: value.direction } : null;
+}
+function savedAppsSort() {
+  try { return validAppsSort(JSON.parse(localGet(APPS_SORT_KEY))); }
+  catch { return null; }
+}
+
 const state = {
   apps: [],
   tracker: {}, trackerDrafts: {}, trackerSaving: new Set(),
@@ -30,6 +51,7 @@ const state = {
   tab: ["#steering", "#career-ops", "#cosign", "#fresh"].includes(location.hash) ? location.hash.slice(1) : "pipeline",
   findView: ["#career-ops", "#cosign"].includes(location.hash) ? location.hash.slice(1) : "fresh",
   filter: "all",      // status chip on the Applications table
+  appsSort: savedAppsSort(), // explicit Applications-only table order
   logKind: "all",     // kind chip on the Logs view
   liveState: "off",   // SSE connection state (off | connecting | live | demo)
   query: "",          // free-text search
@@ -64,10 +86,10 @@ const state = {
   secOpen: { closed: false }, // pipeline stack: which foldable sections are open
   openCos: new Set(), // pipeline stack: companies expanded inside Found
   openQCos: new Set(), // pipeline stack: companies expanded inside Queued to apply
-  reviewCollapsed: localStorage.getItem("appliedin.reviewCollapsed") === "yes",
-  reviewSort: localStorage.getItem("appliedin.reviewSort") || "newest",
+  reviewCollapsed: localGet("appliedin.reviewCollapsed") === "yes",
+  reviewSort: localGet("appliedin.reviewSort") || "newest",
   reviewFilter: "active", reviewAnchor: null, reviewNotices: {},
-  activityCollapsed: localStorage.getItem("appliedin.activityCollapsed") === "yes",
+  activityCollapsed: localGet("appliedin.activityCollapsed") === "yes",
   forcePreparing: new Set(),
   reviewPicked: new Set(), // final review: selection never authorizes submission
   reviewSkipped: new Set(),
@@ -91,7 +113,7 @@ const state = {
 
 // --- text helpers ----------------------------------------------------------
 try {
-  const skipped = JSON.parse(localStorage.getItem("appliedin.reviewSkipped") || "[]");
+  const skipped = JSON.parse(localGet("appliedin.reviewSkipped") || "[]");
   if (Array.isArray(skipped)) state.reviewSkipped = new Set(skipped.filter((pk) => typeof pk === "string"));
 } catch { /* A damaged browser preference must not prevent the board loading. */ }
 
@@ -255,7 +277,7 @@ const pickedAll = () =>
 const discoverScope = () => (pickedAll() ? [] : [...state.picked]);
 const DISCOVER_PICK_KEY = "appliedin.discoverpicked";
 function savePicked() {
-  try { localStorage.setItem(DISCOVER_PICK_KEY, JSON.stringify([...state.picked])); }
+  try { localSet(DISCOVER_PICK_KEY, JSON.stringify([...state.picked])); }
   catch { /* selection still works when storage is unavailable */ }
 }
 
@@ -1441,7 +1463,7 @@ function setReviewSort(value) {
   if (!["newest", "oldest", "company"].includes(value)) return;
   state.reviewSort = value;
   state.reviewAnchor = null;
-  localStorage.setItem("appliedin.reviewSort", value);
+  localSet("appliedin.reviewSort", value);
   renderPane();
 }
 function reviewStatus(r) {
@@ -1610,7 +1632,7 @@ async function reviewAction(action, company, explicitPks = null, day = null) {
   } finally {
     state.approvingAll = false;
     // Legacy browser-only skips remain excluded until the server saves them.
-    localStorage.setItem("appliedin.reviewSkipped", JSON.stringify([...state.reviewSkipped]));
+    localSet("appliedin.reviewSkipped", JSON.stringify([...state.reviewSkipped]));
     await loadQueue();
     renderPane();
     scheduleReload();
@@ -1636,7 +1658,7 @@ async function migrateReviewSkips() {
         state.reviewSkipped.delete(item.pk);
       }
     }
-    localStorage.setItem("appliedin.reviewSkipped", JSON.stringify([...state.reviewSkipped]));
+    localSet("appliedin.reviewSkipped", JSON.stringify([...state.reviewSkipped]));
   } finally { state.reviewMigrating = false; }
 }
 
@@ -2077,6 +2099,72 @@ async function loadHealth() {
   finally { state.healthLoading = false; button.disabled = false; }
 }
 
+// Sort only the Applications table's already-filtered rows. Never mutate rows or
+// fall back to display strings for numbers and dates.
+function applicationsSortText(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text && !/^[-–—]+$/.test(text) ? text.toLocaleLowerCase() : null;
+}
+function applicationsSortTime(value) {
+  if (applicationsSortText(value) == null) return null;
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? time : null;
+}
+function applicationsSortValue(row, key) {
+  if (key === "status") {
+    const label = STATUS_META[row.status]?.label || String(row.status || "—").replace(/_/g, " ");
+    return applicationsSortText(label);
+  }
+  if (key === "company") return applicationsSortText(row.company);
+  if (key === "role") return applicationsSortText(row.title);
+  if (key === "match") {
+    if (typeof row.match_score === "boolean" || applicationsSortText(row.match_score) == null) return null;
+    const n = Number(row.match_score);
+    return Number.isFinite(n) ? n : null;
+  }
+  if (key === "applied") return ["applied", "applied_manual"].includes(row.status)
+    ? applicationsSortTime(row.applied_at) : null;
+  if (key === "updated") return applicationsSortTime(row.updated_at);
+  return null;
+}
+function sortApplications(rows, key, direction) {
+  if (!APPS_SORT_KEYS.includes(key) || !["asc", "desc"].includes(direction)) return [...rows];
+  return rows.map((row, index) => ({ row, index })).sort((a, b) => {
+    const av = applicationsSortValue(a.row, key), bv = applicationsSortValue(b.row, key);
+    if (av == null && bv != null) return 1;
+    if (bv == null && av != null) return -1;
+    if (av != null && bv != null) {
+      const cmp = typeof av === "number" ? av - bv : av.localeCompare(bv);
+      if (cmp) return direction === "asc" ? cmp : -cmp;
+    }
+    // Equal primaries always put the most recently updated row first. A fully
+    // equal pair keeps source order, including when both timestamps are missing.
+    const at = applicationsSortTime(a.row.updated_at);
+    const bt = applicationsSortTime(b.row.updated_at);
+    if (at == null && bt != null) return 1;
+    if (bt == null && at != null) return -1;
+    if (at != null && bt != null && at !== bt) return bt - at;
+    return a.index - b.index;
+  }).map(({ row }) => row);
+}
+function chooseAppsSort(key) {
+  if (!APPS_SORT_KEYS.includes(key)) return;
+  const direction = state.appsSort?.key === key
+    ? (state.appsSort.direction === "asc" ? "desc" : "asc")
+    : (["status", "company", "role"].includes(key) ? "asc" : "desc");
+  state.appsSort = { key, direction };
+  localSet(APPS_SORT_KEY, JSON.stringify(state.appsSort));
+  delete state.page.appsTable;
+  renderPane();
+}
+function appsSortHead(key, label) {
+  const active = state.appsSort?.key === key;
+  const direction = state.appsSort?.direction;
+  return `<th${active ? ` aria-sort="${direction === "asc" ? "ascending" : "descending"}"` : ""}>
+    <button type="button" class="app-sort" data-app-sort="${key}">${label}<span class="app-sort-arrow" aria-hidden="true">${active ? (direction === "asc" ? "↑" : "↓") : ""}</span></button></th>`;
+}
+
 // --- Applications table ----------------------------------------------------
 function viewApps() {
   const base = byCompany(state.apps);
@@ -2086,7 +2174,10 @@ function viewApps() {
     `<button class="chip" data-filter="${k}" aria-selected="${state.filter === k}">
       ${label}<span class="n">${counts[k]}</span></button>`).join("");
   const pred = FILTERS.find(([k]) => k === state.filter)[2];
-  const allRows = trackerRows(visible(state.apps.filter(pred)));
+  const filteredRows = trackerRows(visible(state.apps.filter(pred)));
+  const allRows = state.appsSort
+    ? sortApplications(filteredRows, state.appsSort.key, state.appsSort.direction)
+    : filteredRows;
   // Paginate. All 1737 rows at once produced 1.1MB of DOM and blocked the main
   // thread for 145ms on every switch to this tab and every re-render after it,
   // which is exactly what makes a click feel dead. Every other lane on this board
@@ -2127,7 +2218,7 @@ function viewApps() {
       <colgroup><col class="col-status"><col class="col-company"><col>
         <col class="col-match"><col class="col-links"><col class="col-applied"><col class="col-updated"></colgroup>
       <thead><tr>
-      <th>status</th><th>company</th><th>role</th><th>match</th><th>links</th><th>applied on</th><th>updated</th>
+      ${appsSortHead("status", "status")}${appsSortHead("company", "company")}${appsSortHead("role", "role")}${appsSortHead("match", "match")}<th>links</th>${appsSortHead("applied", "applied on")}${appsSortHead("updated", "updated")}
       </tr></thead><tbody>${body}</tbody></table>${empty}
       ${allRows.length > rows.length
         ? moreBtn("appsTable", rows.length, allRows.length, 50)
@@ -3555,13 +3646,13 @@ async function loadGlobalPrefs() {
 const FRESH_PICK_KEY = "appliedin.freshpicked";
 
 function saveFreshPicked() {
-  try { localStorage.setItem(FRESH_PICK_KEY, JSON.stringify([...state.freshPicked])); }
+  try { localSet(FRESH_PICK_KEY, JSON.stringify([...state.freshPicked])); }
   catch { /* private mode, or full — the selection simply does not survive */ }
 }
 
 function restoreFreshPicked() {
   try {
-    const raw = JSON.parse(localStorage.getItem(FRESH_PICK_KEY) || "[]");
+    const raw = JSON.parse(localGet(FRESH_PICK_KEY) || "[]");
     if (Array.isArray(raw)) state.freshPicked = new Set(raw.filter((c) => typeof c === "string"));
   } catch { /* nothing saved, or unreadable */ }
 }
@@ -3593,7 +3684,7 @@ async function loadCompanies() {
                                                         { sensitivity: "base" }));
   if (!state.pickedLoaded && state.companies.length) {
     let saved = null;
-    try { saved = JSON.parse(localStorage.getItem(DISCOVER_PICK_KEY)); } catch { /* first visit */ }
+    try { saved = JSON.parse(localGet(DISCOVER_PICK_KEY)); } catch { /* first visit */ }
     state.picked = new Set(Array.isArray(saved) ? saved : state.companies);
     state.pickedLoaded = true;
   }
@@ -4930,7 +5021,7 @@ function wire() {
   measureDeck();
   $("#btn-activity-panel").addEventListener("click", () => {
     state.activityCollapsed = !state.activityCollapsed;
-    localStorage.setItem("appliedin.activityCollapsed", state.activityCollapsed ? "yes" : "no");
+    localSet("appliedin.activityCollapsed", state.activityCollapsed ? "yes" : "no");
     renderActivityLayout();
   });
   $("#m-shared-prefs").addEventListener("click", () => { $("#menu").hidden = true; $("#btn-prefs").click(); });
@@ -4940,7 +5031,7 @@ function wire() {
   // Mount dialogs at the page root so their dimensions belong to the viewport.
   $$(".preferences-drawer, #setup-health").forEach((el) => document.body.appendChild(el));
   $("#btn-review").addEventListener("click", () => {
-    state.reviewCollapsed = false; localStorage.setItem("appliedin.reviewCollapsed", "no");
+    state.reviewCollapsed = false; localSet("appliedin.reviewCollapsed", "no");
     state.tab = "pipeline"; state.coFilter = ""; state.query = ""; state.locFilter = "";
     $("#co-filter").value = ""; $("#search").value = "";
     renderTabs(); renderPane(); ($("#review-queue") || $(".ps-ready"))?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -5082,7 +5173,7 @@ function wire() {
     const b = e.target.closest("[data-scan-w]");
     if (!b) return;
     state.scanHours = Number(b.dataset.scanW) || 0;
-    localStorage.setItem("appliedin.scanw", String(state.scanHours));
+    localSet("appliedin.scanw", String(state.scanHours));
     renderScanWindow(); renderPickerState(); renderDiscoverLabel();
   });
   // Add a company to the watchlist from the picker; the finder resolves its
@@ -5926,6 +6017,8 @@ function wire() {
   window.addEventListener("pointercancel", () => setTimeout(releasePress, 0));
 
   $("#pane").addEventListener("click", (e) => {
+    const appSort = state.tab === "apps" && e.target.closest(".applications-table [data-app-sort]");
+    if (appSort) { chooseAppsSort(appSort.dataset.appSort); return; }
     if (e.target.closest("a")) return;                 // links behave as links
     if (e.target.closest("[data-clear-filters]")) {
       state.coFilter = ""; state.query = ""; state.logKind = "all";
@@ -5961,7 +6054,7 @@ function wire() {
     const fw = e.target.closest("[data-fresh-w]");
     if (fw) {
       state.freshHours = Number(fw.dataset.freshW);
-      localStorage.setItem("appliedin.freshw", String(state.freshHours));
+      localSet("appliedin.freshw", String(state.freshHours));
       renderPane();
       return;
     }
@@ -6045,7 +6138,7 @@ function wire() {
     if (res) { openResume(res.dataset.resume); return; }
     if (e.target.closest("[data-review-collapse]")) {
       state.reviewCollapsed = !state.reviewCollapsed;
-      localStorage.setItem("appliedin.reviewCollapsed", state.reviewCollapsed ? "yes" : "no");
+      localSet("appliedin.reviewCollapsed", state.reviewCollapsed ? "yes" : "no");
       renderPane(); return;
     }
     if (e.target.closest("[data-review-stop]")) { stopApplying(); return; }
@@ -6450,7 +6543,7 @@ function wire() {
   $("#m-theme").addEventListener("click", () => {
     const root = document.documentElement;
     root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
-    localStorage.setItem("appliedin.theme", root.dataset.theme);
+    localSet("appliedin.theme", root.dataset.theme);
     renderMenuState();
   });
   $("#m-reset").addEventListener("click", () => { closeMenu(); resetPipeline(); });
@@ -6476,11 +6569,11 @@ async function boot() {
   // Light unless someone chose dark. The stylesheet's base palette is the dark
   // one, so with nothing saved the demo opened as an all-black board.
   let savedTheme = null;
-  try { savedTheme = localStorage.getItem("appliedin.theme"); } catch { /* private window */ }
+  try { savedTheme = localGet("appliedin.theme"); } catch { /* private window */ }
   document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
-  const savedW = Number(localStorage.getItem("appliedin.freshw"));
+  const savedW = Number(localGet("appliedin.freshw"));
   if (FRESH_WINDOWS.some(([h]) => h === savedW)) state.freshHours = savedW;
-  const savedScan = Number(localStorage.getItem("appliedin.scanw"));
+  const savedScan = Number(localGet("appliedin.scanw"));
   if (SCAN_WINDOWS.some(([h]) => h === savedScan)) state.scanHours = savedScan;
   wire();
   renderScanWindow();   // the chips are static HTML; sync them to the restore

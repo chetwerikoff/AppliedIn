@@ -1489,7 +1489,8 @@ async def test_alias_revoked_during_session_acquisition_prevents_navigation(
     assert not decide.await_count
 
 @pytest.mark.parametrize('tag', ['input', 'div'])
-async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(tag):
+async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
+        monkeypatch, tag):
     combo = field(
         'Country', '#country', tag=tag, type='combobox', required=True,
         combobox={'linked': True, 'link_id': 'country-list',
@@ -1500,6 +1501,7 @@ async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(t
                   'selected_text': '', 'displayed_text': '',
                   'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
     current = inventory(combo, submit())
+    monkeypatch.setattr(forms, '_row', lambda _pk: {})
     evidence = witness(current)
     evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
     browser = Browser(current, result=evidence)

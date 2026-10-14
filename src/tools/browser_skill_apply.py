@@ -437,15 +437,23 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     return parts.join(' > ');
   };
   const visible = e => {
-    if (!e.getClientRects().length) return false;
+    const rects = e.getClientRects();
+    if (!rects.length) return false;
+    let fixed = false;
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
       const style = getComputedStyle(n);
       if (!style || style.display === 'none' ||
           style.visibility === 'hidden' || style.visibility === 'collapse' ||
           !(Number(style.opacity) > 0))
         return false;
+      if (style.position === 'fixed') fixed = true;
     }
-    return true;
+    // Scroll offsets preserve ordinary below-fold controls, but a fixed control
+    // (including one inside a fixed ancestor) also needs viewport-positive edges.
+    return Array.from(rects).some(rect =>
+      rect.width > 0 && rect.height > 0 &&
+      rect.right + scrollX > 0 && rect.bottom + scrollY > 0 &&
+      (!fixed || (rect.right > 0 && rect.bottom > 0)));
   };
   // PAGE.label can fall back to input.name; choices need actual visible
   // caption text rather than that non-visible fallback.

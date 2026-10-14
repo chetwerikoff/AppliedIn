@@ -957,6 +957,27 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                        for k, value in expected.items())
                 or not navigation_allowed(field['url'], provenance=proven)):
             return None
+    elif row.get('ats') in {'teamtailor', 'recruitee'}:
+        from core.ids import make_pk
+        from tools.browser_skill_apply import redirect_provenance
+        company, job_id = row.get('company'), row.get('job_id')
+        if (not isinstance(company, str) or not isinstance(job_id, str)
+                or row.get('pk') != pk or make_pk(company, job_id) != pk):
+            return None
+        witness = field.get('origin_row')
+        expected = {'jd_url': url, 'company': company, 'ats': row.get('ats'),
+                    'pk': pk, 'job_id': job_id}
+        target = field.get('verified_redirect_url')
+        proven = redirect_provenance(row, pk, target)
+        if (not proven or not isinstance(witness, dict) or witness != expected
+                or field.get('url') != target
+                or not navigation_allowed(field.get('form_action', ''),
+                                          provenance=proven)
+                or not navigation_allowed(field['url'], provenance=proven)):
+            return None
+        if field.get('formaction') and not navigation_allowed(
+                field['formaction'], provenance=proven):
+            return None
     elif not navigation_allowed(field['url'], url):
         # Original engine and non-alias direct-form grants stay unchanged.
         return None
@@ -1187,12 +1208,14 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 'question': observed['question'], 'tag': observed['tag'],
                 'type': observed['type'], 'form_selector': observed['form_selector'],
                 'form_action': observed['form_action'],
+                **({'verified_redirect_url': observed['verified_redirect_url']}
+                   if observed.get('verified_redirect_url') else {}),
                 **({'options': observed['options']} if observed['tag'] == 'select' else {}),
-                 **({'visible_text': observed['visible_text']}
-                    if observed['type'] == 'checkbox' else {}),
-                 **({'radio_name': observed['radio_name'],
-                     'radio_members': observed['radio_members']}
-                    if observed['type'] == 'radio' else {}),
+                **({'visible_text': observed['visible_text']}
+                   if observed['type'] == 'checkbox' else {}),
+                **({'radio_name': observed['radio_name'],
+                    'radio_members': observed['radio_members']}
+                   if observed['type'] == 'radio' else {}),
             }
             stores.tracking.set_status(
                 pk, row.get('status') or Status.NEEDS_HUMAN,

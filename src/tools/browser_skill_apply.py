@@ -7,9 +7,13 @@ validated here before the browser acts. Unsupported controls become human gates.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
 
 from tools import browser_skill as bsk
 from tools.claude_chrome import (
@@ -46,10 +50,135 @@ _ATS_HOSTS = (
     'smartrecruiters.com',
 )
 
+@dataclass(frozen=True)
+class VendorRedirectProvenance:
+    pk: str
+    company: str
+    ats: str
+    job_id: str
+    wrapper: str
+    target_url: str
+
+
+_VENDOR_PATH = {
+    'teamtailor': ('teamtailor.com', re.compile(r'^/jobs/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
+    'recruitee': ('recruitee.com', re.compile(r'^/o/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
+}
+_DNS_LABEL = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+
+
+def _tenant_job(row: dict, pk: str, company: str, url: str):
+    """Bind eligible canonical vendor URLs to one coherent tracked identity."""
+    try:
+        from core.ids import make_pk
+
+        if (row.get('pk') != pk or row.get('company') != company
+                or row.get('jd_url') != url or row.get('ats') not in _VENDOR_PATH
+                or make_pk(company, row.get('job_id', '')) != pk):
+            return None
+        vendor, route = _VENDOR_PATH[row['ats']]
+        parsed = urlsplit(url)
+        labels = parsed.hostname.split('.') if parsed.hostname else []
+        if (parsed.scheme != 'https' or parsed.netloc != parsed.hostname
+                or parsed.query or parsed.fragment or '?' in url or '#' in url
+                or len(labels) != 3 or labels[1:] != vendor.split('.')
+                or not all(_DNS_LABEL.fullmatch(label) for label in labels)
+                or not route.fullmatch(parsed.path)):
+            return None
+        return vendor, route
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _literal_redirect_target(canonical: str, location: str) -> bool:
+    """Reject parser normalization before a vendor Location gains authority."""
+    if (not isinstance(location, str) or not location
+            or any(ord(c) <= 32 or ord(c) == 127 or c == '\\\\' for c in location)
+            or '#' in location or location.endswith('?')):
+        return False
+    try:
+        source, target = urlsplit(canonical), urlsplit(location)
+        host = target.hostname or ''
+        labels = host.split('.')
+        if (target.scheme != 'https' or target.netloc != host
+                or target.username is not None or target.password is not None
+                or target.port is not None or not host or host != host.lower()
+                or len(labels) < 2 or host == 'localhost' or host.endswith('.local')
+                or not all(_DNS_LABEL.fullmatch(part) for part in labels)):
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return False
+        except ValueError:
+            pass
+        rebuilt = urlunsplit((target.scheme, target.netloc, target.path, target.query, ''))
+        return (rebuilt == location and target.path == source.path
+                and target.query == source.query)
+    except (TypeError, ValueError):
+        return False
+
+
+
+def redirect_provenance(row: dict, pk: str, target_url: str):
+    """Rebuild only the row-bound, syntactically exact redirect witness."""
+    company, canonical, ats = row.get('company'), row.get('jd_url'), row.get('ats')
+    eligible = _tenant_job(row, pk, company, canonical)
+    if not eligible or not _literal_redirect_target(canonical, target_url):
+        return None
+    return VendorRedirectProvenance(pk, company, ats, row['job_id'], canonical, target_url)
+
+
+def _redirect_current(provenance: VendorRedirectProvenance, *, fixture_context=None) -> bool:
+    row = _row(provenance.pk, fixture_context=fixture_context)
+    return (row.get('pk') == provenance.pk and row.get('company') == provenance.company
+            and row.get('ats') == provenance.ats and row.get('job_id') == provenance.job_id
+            and row.get('jd_url') == provenance.wrapper)
+
+
+async def _probe_vendor_redirect(row: dict, pk: str, company: str, url: str):
+    eligible = _tenant_job(row, pk, company, url)
+    if eligible is None:
+        return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=15) as client:
+            response = await client.get(url)
+        if response.status_code not in {301, 302}:
+            return None
+        raw_locations = [value for name, value in response.headers.raw
+                         if name.lower() == b'location']
+        if len(raw_locations) != 1:
+            return None
+        target = raw_locations[0].decode('ascii')
+        return redirect_provenance(row, pk, target)
+    except (httpx.HTTPError, OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+
+
+
 
 def navigation_allowed(href: str, *origins: str,
-                       provenance: GreenhouseJobAlias | None = None) -> bool:
+                       provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> bool:
     """Require a proven job route, independent of untrusted observed origins."""
+    if isinstance(provenance, VendorRedirectProvenance):
+        if (not isinstance(href, str) or href == provenance.wrapper
+                or any(ord(c) <= 32 or ord(c) == 127 or c == '\\\\' for c in href)
+                or '#' in href):
+            return False
+        try:
+            target, base = urlsplit(href), urlsplit(provenance.target_url)
+            if (target.scheme, target.netloc) != ('https', base.netloc) or target.fragment:
+                return False
+            if (target.query != base.query or '?' in href and not base.query
+                    or target.path != base.path
+                    and not target.path.startswith(base.path.rstrip('/') + '/')):
+                return False
+            if any(part in {'.', '..'} for part in target.path.split('/')) or '%' in target.path:
+                return False
+            return True
+        except (TypeError, ValueError):
+            return False
     if provenance is not None:
         if not isinstance(provenance, GreenhouseJobAlias):
             return False
@@ -220,8 +349,10 @@ def _configured_alias(pk: str, company: str, url: str, *,
         return None
 
 
-def _alias_current(provenance: GreenhouseJobAlias, *,
+def _alias_current(provenance: GreenhouseJobAlias | VendorRedirectProvenance, *,
                    fixture_context=None) -> bool:
+    if isinstance(provenance, VendorRedirectProvenance):
+        return _redirect_current(provenance, fixture_context=fixture_context)
     return (isinstance(provenance, GreenhouseJobAlias)
             and _configured_alias(provenance.pk, provenance.company,
                                   provenance.wrapper,
@@ -229,7 +360,7 @@ def _alias_current(provenance: GreenhouseJobAlias, *,
 
 
 def exact_approval(pk: str, key: str, value: str, *,
-                   target: dict | None = None, url: str = '',
+                   target: dict | None = None, url: str = '', provenance=None,
                    fixture_context=None) -> None:
     """Approval belongs to one observed control, not a reusable bank label."""
     ctx = _synthetic(fixture_context, pk=pk)
@@ -258,12 +389,16 @@ def exact_approval(pk: str, key: str, value: str, *,
                      or not isinstance(target.get('radio_members'), list)))
             or (target.get('tag') == 'select'
                 and grant.get('options') != target.get('options'))):
-        # Old label-only string grants have no control identity and always gate.
+        # Old label-only grants have no control identity and always gate.
         raise Gate('An exact human-approved answer is needed for this control.')
+    if (isinstance(provenance, VendorRedirectProvenance)
+            and (not _alias_current(provenance, fixture_context=ctx)
+                 or grant.get('verified_redirect_url') != provenance.target_url)):
+        raise Gate('The exact approval no longer matches this verified redirect.')
 
 
 def check_approvals(pk: str, history: list, page: dict | None = None, *,
-                    fixture_context=None) -> None:
+                    fixture_context=None, provenance=None) -> None:
     ctx = _synthetic(fixture_context, pk=pk)
     for receipt in history:
         if receipt.get('fact'):
@@ -287,6 +422,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                     raise Gate('The committed combobox value changed before submission.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
+                           provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
 
 
@@ -499,7 +635,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
-                           provenance: GreenhouseJobAlias | None = None) -> None:
+                           provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
@@ -953,7 +1089,7 @@ def _same_key(value: str) -> str:
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
-                         provenance: GreenhouseJobAlias | None = None) -> dict:
+                         provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
     choice = target.get('type') in {'radio', 'checkbox'}
     if choice:
         if target.get('tag') != 'input':
@@ -1017,11 +1153,18 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
-    if provenance is not None:
+    if isinstance(provenance, GreenhouseJobAlias):
         question['origin_row'] = {
             'jd_url': provenance.wrapper, 'company': provenance.company,
             'ats': provenance.ats,
         }
+    elif isinstance(provenance, VendorRedirectProvenance):
+        question['origin_row'] = {
+            'jd_url': provenance.wrapper, 'company': provenance.company,
+            'ats': provenance.ats, 'pk': provenance.pk,
+            'job_id': provenance.job_id,
+        }
+        question['verified_redirect_url'] = provenance.target_url
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
     if target.get('type') == 'checkbox':
@@ -1034,7 +1177,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
 
 
 def _bootstrap_wall(page: dict, witness: dict, *origins: str,
-                    provenance: GreenhouseJobAlias | None = None) -> None:
+                    provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
@@ -1062,7 +1205,7 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
 
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
-                     provenance: GreenhouseJobAlias | None = None) -> dict:
+                     provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _alias_current(provenance, fixture_context=fixture_context)):
@@ -1117,8 +1260,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         if value:
             try:
                 exact_approval(pk, key, value, target=_bound_target(page, item),
-                               url=page['url'], **({'fixture_context': fixture_context}
-                                                  if fixture_context else {}))
+                               url=page['url'], provenance=provenance,
+                               **({'fixture_context': fixture_context}
+                                  if fixture_context else {}))
                 continue
             except Gate:
                 pass
@@ -1132,7 +1276,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
 
 async def _fresh_native_receiver(session, page: dict, action: dict,
-                                 original: dict, provenance: GreenhouseJobAlias,
+                                 original: dict, provenance: GreenhouseJobAlias | VendorRedirectProvenance,
                                  *, fixture_context=None) -> tuple[dict, dict]:
     """An alias needs a current native receiver before *every* mutating IPC."""
     if not _alias_current(provenance, fixture_context=fixture_context):
@@ -1169,6 +1313,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                    form_question=form_question)
     try:
         exact_approval(pk, key, answer, target=target, url=observed['url'],
+                       provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
     except Gate:
         raise Gate('An exact human-approved answer is needed for this combobox.',
@@ -1187,6 +1332,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         # Opening/filtering a picker can asynchronously mount its options. The only
         # typed value is the exact approved answer, and each refresh is witnessed.
         exact_approval(pk, key, answer, target=current, url=latest['url'],
+                       provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
         await session.call('click', current['selector'])
         latest = await session.page()
@@ -1201,6 +1347,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                              job_url or latest['url'], provenance=provenance)
         if current.get('tag') == 'input':
             exact_approval(pk, key, answer, target=current, url=latest['url'],
+                           provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
             guarded_value(current, answer)
             await session.call('fill', current['selector'], '--value', answer)
@@ -1231,6 +1378,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     _disclosure_question(latest, current, latest_witness,
                          job_url or latest['url'], provenance=provenance)
     exact_approval(pk, key, answer, target=current, url=latest['url'],
+                   provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
     # Refresh immediately before the option click so hidden-value authorization
@@ -1264,6 +1412,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                 or linked_inputs[0].get('value') != hidden_value_before):
             raise Gate('A hidden form value is not independently authorized.')
     exact_approval(pk, key, answer, target=current, url=latest['url'],
+                   provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
     if option.get('submit') or option.get('navigates'):
@@ -1316,7 +1465,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
                   fixture_context=None,
-                  provenance: GreenhouseJobAlias | None = None) -> dict:
+                  provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     verb = action.get('action')
     if provenance is not None:
@@ -1325,7 +1474,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not _alias_current(provenance, fixture_context=ctx)
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
-            raise Gate('This page lacks current same-job Greenhouse provenance.')
+            raise Gate('This page lacks current same-job provenance.')
     elif pk and (verb in {'fill', 'select', 'choose', 'combobox', 'upload'}
                  or (verb == 'click' and allow_click)):
         # A non-committing, unapproved click is refused on existing local
@@ -1391,7 +1540,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate(detail, form_question=form_question)
         try:
             exact_approval(pk, key, value, target=_bound_target(page, target),
-                           url=page['url'],
+                           url=page['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
             prompt = (_choice_prompt(target, form_question)
@@ -1450,6 +1599,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The original authorized control identity is no longer current.')
         exact_approval(pk, key, str(facts[key]).strip(),
                        target=_bound_target(latest, current), url=latest['url'],
+                       provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
         if verb == 'fill':
             guarded_value(current, write_value)
@@ -1546,9 +1696,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
 
     def verify_history(history, page):
         if ctx is not None:
-            check_approvals(pk, history, page, fixture_context=ctx)
+            check_approvals(pk, history, page, fixture_context=ctx,
+                            provenance=provenance)
         else:
-            check_approvals(pk, history, page)
+            check_approvals(pk, history, provenance=provenance)
 
     def hold_dispatch(step):
         if ctx is not None:
@@ -1581,6 +1732,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.')
             direct_url = provenance.url
             trusted_origins = (url,)
+        else:
+            tracked = ((_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {})
+            if tracked.get('ats') in _VENDOR_PATH:
+                provenance = await _probe_vendor_redirect(tracked, pk, company, url)
+                if provenance is None:
+                    raise Gate('The tracked vendor job did not prove one safe same-job redirect.')
+                direct_url = provenance.target_url
+                trusted_origins = (url,)
 
         def allowed(href: str) -> bool:
             return ((provenance is None
@@ -1615,6 +1774,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 + _site_rules(url, company))
         emit('running', pk=pk, agent='browser', url=url,
              detail='Applying through BrowserSkill in the dedicated Chrome profile')
+        if (isinstance(provenance, VendorRedirectProvenance)
+                and not _alias_current(provenance, fixture_context=ctx)):
+            raise Gate('The verified posting changed before BrowserSkill startup.')
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
                 session = ctx.facade(raw_session) if ctx else raw_session
@@ -1623,6 +1785,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     raise Gate('The original same-job tenant mapping changed before navigation.')
                 page = await session.navigate(direct_url)
                 step['url'] = page['url']
+                if (isinstance(provenance, VendorRedirectProvenance)
+                        and page.get('url') != provenance.target_url):
+                    raise Gate('Initial page did not match the exact vendor-verified target.')
                 if not allowed(page['url']):
                     raise Gate('Initial redirect is not proven to be the same employer job.')
                 for _ in range(100):

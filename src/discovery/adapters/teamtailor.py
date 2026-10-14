@@ -10,9 +10,9 @@ from core.logging import get_logger
 from core.models import JobRecord
 
 from ..watchlist import CompanyConfig
-from .personio import (_board_token, _careers_base, _clean, _feed, _location_text,
+from ._feed import (_board_token, _careers_base, _clean, _feed, _location_text,
                _nonempty_or_error, _posting_url, _published)
-from .personio import _child_text, _tag, _xml_rows
+from ._feed import _child_text, _tag, _xml_rows
 
 log = get_logger(__name__)
 

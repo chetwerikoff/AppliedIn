@@ -10,7 +10,7 @@ from core.logging import get_logger
 from core.models import JobRecord
 
 from ..watchlist import CompanyConfig
-from .personio import (_SEGMENT, _board_token, _careers_base, _clean, _feed,
+from ._feed import (_SEGMENT, _board_token, _careers_base, _clean, _feed,
                _json_rows, _location_text, _locations, _nonempty_or_error,
                _posting_url, _published, _remote_cues, _url_parts)
 

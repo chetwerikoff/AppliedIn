@@ -971,8 +971,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 write_value = target['value']
         else:
             guarded_value(target, value)
-            write_value = (choose_value(target, value, str(action.get('value', '')))
-                           if verb == 'select' else value)
+            if verb == 'select':
+                try:
+                    write_value = choose_value(target, value, str(action.get('value', '')))
+                except Gate as exc:
+                    if str(exc) != 'No unambiguous option matches the approved answer.':
+                        raise
+                    raise Gate(gate_prompt, form_question=form_question) from None
+            else:
+                write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
         latest, latest_witness = await _observe_controls(session, page)
         current = control(latest, action)

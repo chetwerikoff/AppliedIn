@@ -7,6 +7,7 @@ const node = (tag, attrs={}, parent=null) => {
     value:'',innerText:attrs.text || '',labels:[],disabled:false,readOnly:false,
     getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
     hasAttribute:k=>Object.hasOwn(attrs,k),
+    attributes:Object.keys(attrs).filter(k=>!['rect','bounds','text'].includes(k)).map(name=>({name})),
     getClientRects:()=>attrs.rect===null ? [] : [attrs.rect || {width:100,height:30,right:100,bottom:30}],
     getBoundingClientRect:()=> {if(attrs.bounds===null) throw Error('unreadable'); return attrs.bounds || attrs.rect || {width:100,height:30};},
     matches:q=>q.split(',').some(s=>match(e,s)),
@@ -62,7 +63,10 @@ function frame(kind, edit={}) {
     attrs={...attrs,src:'https://newassets.hcaptcha.com/captcha/v1/test/static/hcaptcha-enclave.html?secret=redacted#fragment',style:{visibility:'hidden'}};
   } else if(kind==='R' || kind==='B') {
     parent=spec.inside ? form || body : body;
-    if(spec.badge) parent=node('div',{class:'grecaptcha-badge'},parent);
+    if(spec.badge) {
+      if(spec.tokenBadge)parent=node('div',spec.badgeWrapper || {},parent);
+      parent=node('div',{class:'grecaptcha-badge'},parent);
+    }
     attrs={...attrs,src:'https://www.recaptcha.net/recaptcha/enterprise/'+(kind==='B' ? 'bframe' : 'anchor'),style:{visibility:spec.visible ? 'visible':'hidden'},bounds:{width:256,height:60}};
   } else if(kind==='W') {
     parent=node('li',{class:'application-question awli-application-row',...(spec.required ? {required:true}: {}),
@@ -91,11 +95,24 @@ for(const e of nodes.filter(e=>e.tagName==='IFRAME')) {
 if(spec.helper) node('button',{id:'hcaptchaSubmitBtn',class:spec.helper==='hidden' ? 'hidden':'',type:'submit',rect:spec.helper==='hidden' ? null:undefined},form || body);
 for(let i=0;i<(spec.tokens || []).length;i++) {
   const name=spec.tokens[i];
-  const token=node(spec.textarea ? 'textarea':'input',{id:'token-'+i,name,type:'hidden'},spec.tokenOutside ? body:form || body);
+  let parent=spec.tokenOutside ? body : form || body;
+  let attrs={id:'token-'+i,name,type:'hidden'};
+  if(spec.tokenBadge) {
+    parent=nodes.find(e=>e.matches('div.grecaptcha-badge')) ||
+      node('div',{class:'grecaptcha-badge'},node('div',spec.badgeWrapper || {},body));
+    if(spec.tokenNotInBadge)parent=parent.parentElement;
+    if(spec.tokenInForm)parent=form;
+    attrs={id:'g-recaptcha-response-'+(100+i),class:'g-recaptcha-response',name,
+      style:{display:'none'},rect:null,...spec.tokenEdit};
+  }
+  const token=node(spec.textarea ? 'textarea':'input',attrs,parent);
   if(spec.tokenAssociated)token.form=form;
   Object.defineProperty(token,'value',{get:()=> {throw Error('PROTECTED TOKEN VALUE READ');}});
+  if(spec.tokenVisible)token.getClientRects=()=>[{width:1,height:1}];
+  if(spec.tokenNestedWrapper)token.parentElement.parentElement.parentElement=node('div',{},body);
   if(spec.claim) node('input',{role:'combobox',type:'text','data-value-input':token.id,'aria-haspopup':'true','aria-autocomplete':'list'},token.parentElement);
 }
+if(spec.tokenSiblingBadge)node('div',{class:'grecaptcha-badge'},body);
 global.document={baseURI:'https://example-co.test/',readyState:'complete',body,title:'Synthetic',
   querySelectorAll:q=>nodes.filter(n=>n.matches(q)),
   querySelector:q=>document.querySelectorAll(q)[0] || null,

@@ -578,8 +578,8 @@ ENTRY_PAGE = entry_reader(PAGE)
 
 
 _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
-  // Exclude from native marker probing only; Greenhouse never exempts these
-  // controls from an applicant inventory: it stops before that inventory runs.
+  // All response nodes stay out of root probing and every later value traversal.
+  // Only the architect-bound passive badge textarea may pass the pre-read Gate.
   const excluded = new Set(responseNodes);
 """ + _APPLICATION_ROOT.replace('filter(e=>!excluded.has(e))',
                                 'filter(e=>e.form===f && !excluded.has(e))') + _VISIBLE_RECAPTCHA + r"""
@@ -587,7 +587,7 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   // Otherwise a collapse/transparent transition could disappear from the witness.
   const greenhouseFrames = Array.from(document.querySelectorAll('iframe')).filter(e =>
     !!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden');
-  const greenhouse = {response_controls:responseNodes.length>0,
+  const greenhouse = {response_controls:false, badge_responses:0,
     root:root ? {selector:selector(root),action:root.action} : null,
     frames:greenhouseFrames.map(e => {
       const raw=e.getAttribute('src');
@@ -599,6 +599,30 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       return {selector:selector(e),origin,path,visibility:style.visibility,display:style.display,
         outside,badge,bounds,status:visibleRecaptcha(origin,path,shown,outside,badge,bounds)};
     })};
+  const badges=Array.from(document.querySelectorAll('div.grecaptcha-badge'));
+  const badgeResponse = e => {
+    const badge=e.parentElement, wrapper=badge?.parentElement, style=getComputedStyle(e);
+    const names=Array.from(e.attributes || []).map(a=>a.name).sort().join(',');
+    return responseNodes.length===1 && e.tagName==='TEXTAREA' &&
+      e.getAttribute('name')==='g-recaptcha-response' &&
+      /^g-recaptcha-response-\d+$/.test(e.getAttribute('id') || '') &&
+      e.getAttribute('class')==='g-recaptcha-response' && names==='class,id,name,style' &&
+      !!root && !root.contains(e) && !e.form && !e.closest('form') &&
+      !e.getClientRects().length && style.display==='none' &&
+      badges.length===1 && badge===badges[0] && badge.matches('div.grecaptcha-badge') &&
+      wrapper?.tagName==='DIV' && !wrapper.hasAttribute('id') && !wrapper.hasAttribute('class') &&
+      wrapper.parentElement===document.body &&
+      greenhouseFrames.some((f,i)=>badge.contains(f) && greenhouse.frames[i].status==='R');
+  };
+  const safeResponses=responseNodes.filter(badgeResponse);
+  greenhouse.badge_responses=safeResponses.length;
+  greenhouse.response_controls=safeResponses.length!==responseNodes.length;
+  // A page cannot turn even a passive response node into an applicant receiver.
+  for (const c of document.querySelectorAll('input,textarea,select,[role="combobox"]')) {
+    if (excluded.has(c)) continue;
+    if (responseNodes.some(r => c.getAttribute('data-value-input')===r.id && !!r.id ||
+        c.getAttribute('data-value-name')===r.getAttribute('name'))) greenhouse.response_controls=true;
+  }
   // PAGE and closedGraph eagerly read values. Returning after the shared frame
   // observation preserves visible-bframe precedence without reading a response.
   if (greenhouse.response_controls) return {url:location.href, greenhouse};
@@ -608,6 +632,11 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
 def greenhouse_reader(script: str) -> str:
     """Visible-only observation, selected by current typed alias in the controller."""
     script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)
+    script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
+    script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
+                            "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
+    script = script.replace("Array.from(document.querySelectorAll('[role=\"combobox\"]'))",
+                            "Array.from(document.querySelectorAll('[role=\"combobox\"]')).filter(e=>!excluded.has(e))")
     script = script.replace('return {url:location.href, title,',
                             'return {greenhouse, url:location.href, title,')
     script = script.replace('return {url: location.href, controls:',

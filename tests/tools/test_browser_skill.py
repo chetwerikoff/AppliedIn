@@ -2659,22 +2659,16 @@ def test_greenhouse_response_pre_read_guard_removal_is_red(reader):
     source = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
     guard = 'if (greenhouse.response_controls) return {url:location.href, greenhouse};'
     assert guard in source
-    spec = {'tokens': ['g-recaptcha-response'], 'textarea': True, 'claim': True}
+    spec = {'tokens': ['g-recaptcha-response'], 'textarea': False, 'claim': True}
     def protected(script):
         result = _gh_dom(spec, script)
         assert 'controls' not in result
         with pytest.raises(forms.Gate, match='CAPTCHA response control'):
             _gh_safe(result)
     protected(source)
-    if reader == 'page':
-        with pytest.raises(subprocess.CalledProcessError) as caught:
-            protected(source.replace(guard, ''))
-        assert 'PROTECTED TOKEN VALUE READ' in caught.value.stderr
-    else:
-        # The witness must also stop before exporting response-node metadata;
-        # unlike PAGE it need not read a plain hidden control's value to be wrong.
-        with pytest.raises(AssertionError, match='controls'):
-            protected(source.replace(guard, ''))
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        protected(source.replace(guard, ''))
+    assert 'PROTECTED TOKEN VALUE READ' in caught.value.stderr
     protected(source)
 
 
@@ -2694,3 +2688,131 @@ def test_greenhouse_response_controller_guard_removal_is_red():
     with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
         protected(scope['_greenhouse_safety'])
     protected(forms._greenhouse_safety)
+
+
+def _badge_response(change=None, script=None):
+    spec = dict(tokenBadge=True, textarea=True, tokens=['g-recaptcha-response'])
+    spec.update(change or {})
+    return _gh_dom(spec, script)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_exact_badge_textarea_is_never_read_or_exported(reader):
+    script = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    observed = _badge_response(script=script)
+    _gh_safe(observed)
+    assert observed['greenhouse']['response_controls'] is False
+    assert observed['greenhouse']['badge_responses'] == 1
+    assert all(c['selector'] != '#g-recaptcha-response-100' for c in observed['controls'])
+    if reader == 'page':
+        forms._inventory_ok(observed)
+        assert observed['unsupported_frames'] == []
+    # The prior blanket response Gate rejects this exact realistic specimen.
+    blanket = 'greenhouse.response_controls=responseNodes.length>0;'
+    old = 'greenhouse.response_controls=safeResponses.length!==responseNodes.length;'
+    assert old in script
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        _gh_safe(_badge_response(script=script.replace(old, blanket)))
+    _gh_safe(_badge_response(script=script))
+
+
+_BADGE_RESPONSE_NEGATIVES = [
+    {'tokenInForm': True}, {'tokenNotInBadge': True}, {'tokenAssociated': True},
+    {'frames': []}, {'badge': False}, {'tokenSiblingBadge': True},
+    {'tokenVisible': True}, {'tokenEdit': {'style': {'display': 'block'}}},
+    {'textarea': False}, {'tokens': ['h-captcha-response']},
+    {'tokens': ['g-recaptcha-response', 'g-recaptcha-response']},
+    {'tokens': ['g-recaptcha-response', 'h-captcha-response']},
+    {'tokenEdit': {'id': 'synthetic-response'}},
+    {'tokenEdit': {'class': 'g-recaptcha-response extra'}},
+    {'tokenEdit': {'value': ''}}, {'tokenEdit': {'value': 'synthetic-nonempty'}},
+    {'tokenEdit': {'data-extra': ''}}, {'badgeWrapper': {'id': 'synthetic-wrapper'}},
+    {'badgeWrapper': {'class': ''}}, {'tokenNestedWrapper': True}, {'claim': True},
+ ]
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('change', _BADGE_RESPONSE_NEGATIVES)
+def test_greenhouse_badge_response_isolated_shape_refusals(change, reader):
+    script = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        _gh_safe(_badge_response(change, script))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('change,guard', [
+    ({'textarea': False}, "e.tagName==='TEXTAREA' &&"),
+    ({'tokens': ['h-captcha-response']}, "e.getAttribute('name')==='g-recaptcha-response' &&"),
+    ({'tokens': ['g-recaptcha-response', 'g-recaptcha-response']}, 'responseNodes.length===1 &&'),
+    ({'tokenEdit': {'id': 'synthetic-response'}},
+     "/^g-recaptcha-response-\\d+$/.test(e.getAttribute('id') || '') &&"),
+    ({'tokenEdit': {'class': 'g-recaptcha-response extra'}},
+     "e.getAttribute('class')==='g-recaptcha-response' &&"),
+    ({'tokenEdit': {'data-extra': ''}}, "names==='class,id,name,style' &&"),
+    ({'tokenAssociated': True}, '!e.form &&'),
+    ({'tokenVisible': True}, '      !e.getClientRects().length &&'),
+    ({'tokenEdit': {'style': {'display': 'block'}}}, "style.display==='none' &&"),
+    ({'tokenSiblingBadge': True}, 'badges.length===1 &&'),
+    ({'badgeWrapper': {'id': 'synthetic-wrapper'}}, "!wrapper.hasAttribute('id') &&"),
+    ({'badgeWrapper': {'class': ''}}, "!wrapper.hasAttribute('class') &&"),
+    ({'tokenNestedWrapper': True}, 'wrapper.parentElement===document.body &&'),
+ ])
+def test_greenhouse_badge_response_new_guard_removal_is_red(change, guard, reader):
+    source = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    assert guard in source
+    def negative(script):
+        with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+            _gh_safe(_badge_response(change, script))
+    negative(source)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        negative(source.replace(guard, 'true &&'))
+    negative(source)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_badge_response_requires_admitted_anchor_on_every_read(reader):
+    source = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    guard = "greenhouseFrames.some((f,i)=>badge.contains(f) && greenhouse.frames[i].status==='R')"
+    assert guard in source
+    observed = _badge_response({'frames': []}, source)
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        _gh_safe(observed)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+            _gh_safe(_badge_response({'frames': []}, source.replace(guard, 'true')))
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        _gh_safe(_badge_response({'frames': []}, source))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+async def test_greenhouse_later_badge_textarea_change_gates_before_next_mutation(reader):
+    source = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    good, bad = _badge_response(script=source), _badge_response({'tokenNotInBadge': True}, source)
+    raw = SimpleNamespace(call=AsyncMock(side_effect=[{'value': good}, {'value': bad}]))
+    session = forms._GreenhouseSession(raw, lambda u: u == _GH_URL, _GH_ALIAS)
+    await session.page()
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        if reader == 'page':
+            await session.page()
+        else:
+            await session.call('evaluate', forms._FIXED_CONTROL_WITNESS)
+        await session.call('fill', '#email', '--value', 'test@example-co.test')
+    assert all(c.args[0] == 'evaluate' for c in raw.call.await_args_list)
+
+
+async def test_greenhouse_exact_badge_textarea_reaches_guarded_decision(monkeypatch, tmp_path):
+    from tests.tools.test_browser_bootstrap import _greenhouse_session, GH_WRAP, GH_DIRECT, GH_PK
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    original = browser.call
+    async def read(*args, **kwargs):
+        if args[0] == 'evaluate':
+            browser.calls.append(args)
+            return {'value': _badge_response({'url': GH_DIRECT}, args[1])}
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(browser, 'call', read)
+    outcome = await forms.apply(GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+                                resume_path='Resume.pdf')
+    assert decide.await_count == 1  # A response-presence blanket Gate fails here.
+    assert outcome['status'] == 'gate'
+    assert not any(c[0] in {'fill', 'upload', 'select', 'click'} for c in browser.calls)
+    assert 'g-recaptcha-response' not in json.dumps(decide.await_args.args[1])

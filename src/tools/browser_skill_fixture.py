@@ -177,10 +177,11 @@ _FORM = _entry_form()
 
 def _greenhouse_form() -> bytes:
     # CSP blocks provider loads; only the top-document passive signature is read.
-    badge = ('<div class="grecaptcha-badge"><iframe '
+    badge = ('<div><div class="grecaptcha-badge"><iframe '
              'src="https://www.recaptcha.net/recaptcha/enterprise/anchor" '
              'style="width:256px;height:60px;border:0;padding:0;visibility:visible;display:block">'
-             '</iframe></div>')
+             '</iframe><textarea class="g-recaptcha-response" id="g-recaptcha-response-123" '
+             'name="g-recaptcha-response" style="display:none"></textarea></div></div>')
     return _closed_form().replace(b'</form>', ('</form>' + badge).encode())
 
 
@@ -355,7 +356,9 @@ class _SyntheticRun:
         self.committed = {}
         self.combo_observations = {}
         frames = (observed or {}).get('greenhouse', {}).get('frames', [])
-        if self.greenhouse and frames and all(f.get('status') == 'R' for f in frames):
+        if (self.greenhouse and frames and all(f.get('status') == 'R' for f in frames)
+                and observed.get('greenhouse', {}).get('badge_responses') == 1
+                and not observed.get('greenhouse', {}).get('response_controls')):
             self.visible_badge_anchor = 'PASS'
         controls = observed.get("controls", []) if isinstance(observed, dict) else []
         country = [c for c in controls if c.get('selector') == '#country']
@@ -567,7 +570,9 @@ class _SyntheticRun:
                     state.entry_observations.append({
                         'reader':'page' if args[1] == page_script else 'witness',
                         'root':bool(observed.get(field, {}).get('root')),
-                        'frames':[f.get('status') for f in frames]})
+                        'frames':[f.get('status') for f in frames],
+                        **({'badge_responses':observed.get(field, {}).get('badge_responses')}
+                           if state.greenhouse else {})})
                     return result
                 if not state.positive:
                     if (args != ("fill", "#name", "--value", "Test User")

@@ -1471,7 +1471,7 @@ async def test_unknown_frame_failure_diagnostic_preserves_rejected_snapshot(auth
 
 
 async def test_greenhouse_fixture_has_separate_typed_authority_and_scoped_readers(authority):
-    from tests.tools.test_browser_skill import _gh_dom
+    from tests.tools.test_browser_skill import _badge_response
     authority.enable_positive_fixture()
     authority.greenhouse = True
     proof = authority.entry_provenance()
@@ -1483,7 +1483,7 @@ async def test_greenhouse_fixture_has_separate_typed_authority_and_scoped_reader
             scripts.append(args)
             if args == ('navigate', fixture.URL):
                 return {}
-            return {'value': _gh_dom({'url': fixture.URL}, args[1])}
+            return {'value': _badge_response({'url': fixture.URL}, args[1])}
         async def page(self):
             pytest.fail('Greenhouse fixture must never use generic PAGE')
         async def navigate(self, url):
@@ -1528,6 +1528,9 @@ def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_requi
     assert fixture._FORM == fixture._entry_form()
     assert b'https://www.recaptcha.net/recaptcha/enterprise/anchor' in fixture._greenhouse_form()
     assert b'width:256px;height:60px;border:0;padding:0' in fixture._greenhouse_form()
+    assert (b'<textarea class="g-recaptcha-response" id="g-recaptcha-response-123" '
+            b'name="g-recaptcha-response" style="display:none"></textarea>'
+            in fixture._greenhouse_form())
 
 
 @pytest.mark.parametrize('native_valid', [False, True])

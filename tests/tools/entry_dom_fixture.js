@@ -92,6 +92,7 @@ if(spec.helper) node('button',{id:'hcaptchaSubmitBtn',class:spec.helper==='hidde
 for(let i=0;i<(spec.tokens || []).length;i++) {
   const name=spec.tokens[i];
   const token=node(spec.textarea ? 'textarea':'input',{id:'token-'+i,name,type:'hidden'},spec.tokenOutside ? body:form || body);
+  if(spec.tokenAssociated)token.form=form;
   Object.defineProperty(token,'value',{get:()=> {throw Error('PROTECTED TOKEN VALUE READ');}});
   if(spec.claim) node('input',{role:'combobox',type:'text','data-value-input':token.id,'aria-haspopup':'true','aria-autocomplete':'list'},token.parentElement);
 }

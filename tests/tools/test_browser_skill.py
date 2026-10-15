@@ -2607,3 +2607,90 @@ async def test_greenhouse_freshness_guard_removal_detected(monkeypatch):
     monkeypatch.setattr(session, 'page', cached_page)
     with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
         await negative()
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('textarea', [False, True])
+@pytest.mark.parametrize('placement', [{}, {'tokenOutside': True},
+                                      {'tokenOutside': True, 'tokenAssociated': True}])
+@pytest.mark.parametrize('name', ['g-recaptcha-response', 'h-captcha-response'])
+def test_greenhouse_response_receiver_gates_before_any_value_read(reader, textarea, placement, name):
+    # The getter throws even for a hidden/form-associated node: a later Python
+    # inventory Gate is too late to undo a token read in PAGE or the shared graph.
+    script = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    observed = _gh_dom(dict(placement, textarea=textarea, tokens=[name]), script)
+    assert observed['greenhouse']['response_controls'] is True
+    assert 'controls' not in observed
+    with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+        _gh_safe(observed)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_response_guard_preserves_visible_bframe_priority(reader):
+    script = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    observed = _gh_dom({'tokens': ['g-recaptcha-response'], 'textarea': True, 'frames': ['B']}, script)
+    with pytest.raises(forms.Gate, match='visible reCAPTCHA Enterprise challenge'):
+        _gh_safe(observed)
+
+
+async def test_greenhouse_response_pre_read_gate_never_reaches_model(monkeypatch, tmp_path):
+    from tests.tools.test_browser_bootstrap import _greenhouse_session, GH_WRAP, GH_DIRECT, GH_PK
+    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    original = browser.call
+    async def read(*args, **kwargs):
+        if args[0] == 'evaluate':
+            browser.calls.append(args)
+            return {'value': _gh_dom({'url': GH_DIRECT, 'tokens': ['g-recaptcha-response'],
+                                     'textarea': True}, args[1])}
+        return await original(*args, **kwargs)
+    monkeypatch.setattr(browser, 'call', read)
+    outcome = await forms.apply(GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
+                                resume_path='Resume.pdf')
+    assert outcome['status'] == 'gate'
+    assert 'CAPTCHA response control' in outcome['question']
+    assert outcome.get('form_question') is None
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'upload', 'select', 'click'} for c in browser.calls)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_response_pre_read_guard_removal_is_red(reader):
+    import subprocess
+    source = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    guard = 'if (greenhouse.response_controls) return {url:location.href, greenhouse};'
+    assert guard in source
+    spec = {'tokens': ['g-recaptcha-response'], 'textarea': True, 'claim': True}
+    def protected(script):
+        result = _gh_dom(spec, script)
+        assert 'controls' not in result
+        with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+            _gh_safe(result)
+    protected(source)
+    if reader == 'page':
+        with pytest.raises(subprocess.CalledProcessError) as caught:
+            protected(source.replace(guard, ''))
+        assert 'PROTECTED TOKEN VALUE READ' in caught.value.stderr
+    else:
+        # The witness must also stop before exporting response-node metadata;
+        # unlike PAGE it need not read a plain hidden control's value to be wrong.
+        with pytest.raises(AssertionError, match='controls'):
+            protected(source.replace(guard, ''))
+    protected(source)
+
+
+def test_greenhouse_response_controller_guard_removal_is_red():
+    import inspect
+    source = inspect.getsource(forms._greenhouse_safety)
+    guard = ("    if observed.get('response_controls'):\n"
+             "        raise Gate('CAPTCHA response control requires manual inspection; no values read.')\n")
+    assert guard in source
+    scope = dict(vars(forms))
+    exec(source.replace(guard, ''), scope)
+    observed = _gh_dom({'tokens': ['g-recaptcha-response'], 'textarea': True, 'frames': []})
+    def protected(check):
+        with pytest.raises(forms.Gate, match='CAPTCHA response control'):
+            check(observed, lambda url: url == _GH_URL, _GH_ALIAS)
+    protected(forms._greenhouse_safety)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        protected(scope['_greenhouse_safety'])
+    protected(forms._greenhouse_safety)

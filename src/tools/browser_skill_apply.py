@@ -1068,6 +1068,8 @@ def _greenhouse_safety(page, allowed, provenance):
     # Challenge precedence must cover the whole observation, not just the first frame.
     if any(isinstance(f, dict) and f.get('status') == 'visible-recaptcha' for f in frames):
         raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+    if observed.get('response_controls'):
+        raise Gate('CAPTCHA response control requires manual inspection; no values read.')
     if any(not isinstance(f, dict) or f.get('status') != 'R' for f in frames):
         raise Gate('unknown/untrusted application frame; inspect manually.')
     root = observed.get('root')

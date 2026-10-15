@@ -465,11 +465,15 @@ _VISIBLE_RECAPTCHA = r"""
   };
 """
 
-# Inserted before either reader's graph: filtering the final list is too late,
-# because closedGraph and linked receivers read hidden values eagerly.
-_ENTRY_OBSERVATION = r"""
+# Metadata only: neither consumer may inspect a response value to recognize it.
+_CAPTCHA_RESPONSE_NODES = r"""
   const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
     ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
+"""
+
+# Inserted before either reader's graph: filtering the final list is too late,
+# because closedGraph and linked receivers read hidden values eagerly.
+_ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
   const excluded = new Set([...responseNodes, ...reservedButtons]);
 """ + _APPLICATION_ROOT + _VISIBLE_RECAPTCHA + r"""
@@ -573,15 +577,18 @@ def entry_reader(script: str) -> str:
 ENTRY_PAGE = entry_reader(PAGE)
 
 
-_GREENHOUSE_OBSERVATION = r"""
-  const excluded = new Set();
+_GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
+  // Exclude from native marker probing only; Greenhouse never exempts these
+  // controls from an applicant inventory: it stops before that inventory runs.
+  const excluded = new Set(responseNodes);
 """ + _APPLICATION_ROOT.replace('filter(e=>!excluded.has(e))',
                                 'filter(e=>e.form===f && !excluded.has(e))') + _VISIBLE_RECAPTCHA + r"""
   // Both readers use ordinary PAGE's frame visibility, not witness editability.
   // Otherwise a collapse/transparent transition could disappear from the witness.
   const greenhouseFrames = Array.from(document.querySelectorAll('iframe')).filter(e =>
     !!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden');
-  const greenhouse = {root:root ? {selector:selector(root),action:root.action} : null,
+  const greenhouse = {response_controls:responseNodes.length>0,
+    root:root ? {selector:selector(root),action:root.action} : null,
     frames:greenhouseFrames.map(e => {
       const raw=e.getAttribute('src');
       let origin='', path='';
@@ -592,6 +599,9 @@ _GREENHOUSE_OBSERVATION = r"""
       return {selector:selector(e),origin,path,visibility:style.visibility,display:style.display,
         outside,badge,bounds,status:visibleRecaptcha(origin,path,shown,outside,badge,bounds)};
     })};
+  // PAGE and closedGraph eagerly read values. Returning after the shared frame
+  // observation preserves visible-bframe precedence without reading a response.
+  if (greenhouse.response_controls) return {url:location.href, greenhouse};
 """
 
 

@@ -56,8 +56,14 @@ def _closed_form() -> bytes:
     fillers = ''.join(f'<input id="filler-{i}" name="filler_{i}" aria-label="Optional synthetic {i}">'
                       for i in range(24))
     return ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>Synthetic application</title></head><body><h1>Synthetic role at example-co</h1>
-<form id="synthetic-form" method="POST" enctype="multipart/form-data"
+<title>Synthetic application</title>
+<style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
+</head><body><h1>Synthetic role at example-co</h1>
+<p>Offline fixture for synthetic example-co facts only. No real person or employer.
+This form is served only by the daemon's --synthetic-browser-fixture mode.
+It has no external links, cross-origin resources, redirects or real ATS connection.</p>
+<form id="synthetic-form" class="ashby-application-form" data-synthetic-tenant="example-co.test"
+ method="POST" enctype="multipart/form-data"
  action="http://127.0.0.1:18789/fixture/example-co/job/1">
 <div class="form-group"><label for="name" data-automation-id="formLabel">Name</label>
 <input id="name" name="name"></div>

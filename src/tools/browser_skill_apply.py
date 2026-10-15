@@ -61,6 +61,52 @@ class VendorRedirectProvenance:
     target_url: str
 
 
+@dataclass(frozen=True)
+class ApplicationEntryProvenance:
+    pk: str
+    company: str
+    ats: str
+    job_id: str
+    wrapper: str
+    board: str
+    url: str
+
+
+_APPLICATION_ENTRY = {
+    'ashby': ('jobs.ashbyhq.com', 'application'),
+    'lever': ('jobs.lever.co', 'apply'),
+}
+_BOARD_TOKEN = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?')
+_JOB_UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def _application_entry(row: dict, pk: str, company: str, url: str, configs):
+    """The persisted board is an independent witness, never inferred from the URL."""
+    from core.ids import make_pk
+
+    ats, job_id = row.get('ats'), row.get('job_id')
+    if (ats not in _APPLICATION_ENTRY or row.get('company') != company
+            or row.get('pk') != pk or row.get('jd_url') != url
+            or not isinstance(job_id, str) or not _JOB_UUID.fullmatch(job_id)
+            or make_pk(company, job_id) != pk):
+        return None
+    candidates = [c for c in configs
+                  if c.name.strip().lower() == company.strip().lower()]
+    if len(candidates) != 1:
+        return None
+    config = candidates[0]
+    if (config.ats != ats or not isinstance(config.board, str)
+            or not _BOARD_TOKEN.fullmatch(config.board)):
+        return None
+    host, suffix = _APPLICATION_ENTRY[ats]
+    posting = f'https://{host}/{config.board}/{job_id}'
+    # Literal equality rejects parser normalization, userinfo, ports and encoding.
+    if url != posting:
+        return None
+    return ApplicationEntryProvenance(
+        pk, company, ats, job_id, url, config.board, posting + '/' + suffix)
+
+
 _VENDOR_PATH = {
     'teamtailor': ('teamtailor.com', re.compile(r'^/jobs/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
     'recruitee': ('recruitee.com', re.compile(r'^/o/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
@@ -176,9 +222,13 @@ async def _probe_vendor_redirect(row: dict, pk: str, company: str, url: str):
 
 
 
+Provenance = GreenhouseJobAlias | VendorRedirectProvenance | ApplicationEntryProvenance
+
 def navigation_allowed(href: str, *origins: str,
-                       provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> bool:
+                       provenance: Provenance | None = None) -> bool:
     """Require a proven job route, independent of untrusted observed origins."""
+    if isinstance(provenance, ApplicationEntryProvenance):
+        return isinstance(href, str) and href == provenance.url
     if isinstance(provenance, VendorRedirectProvenance):
         if (not isinstance(href, str) or href == provenance.wrapper
                 or any(ord(c) <= 32 or ord(c) == 127 or c == '\\' for c in href)
@@ -352,7 +402,7 @@ def _row(pk: str, *, fixture_context=None) -> dict:
 
 
 def _configured_alias(pk: str, company: str, url: str, *,
-                      fixture_context=None) -> GreenhouseJobAlias | None:
+                      fixture_context=None) -> GreenhouseJobAlias | ApplicationEntryProvenance | None:
     """Reload only the explicit watchlist and the authoritative tracked row."""
     try:
         from core.config import get_settings
@@ -360,6 +410,8 @@ def _configured_alias(pk: str, company: str, url: str, *,
         row = (_row(pk, fixture_context=fixture_context) if fixture_context
                else _row(pk))
         configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        if row.get('ats') in _APPLICATION_ENTRY:
+            return _application_entry(row, pk, company, url, configs)
         return verified_greenhouse_alias(
             row, pk=pk, company=company, url=url, configs=configs)
     except Exception:
@@ -367,11 +419,11 @@ def _configured_alias(pk: str, company: str, url: str, *,
         return None
 
 
-def _alias_current(provenance: GreenhouseJobAlias | VendorRedirectProvenance, *,
+def _alias_current(provenance: Provenance, *,
                    fixture_context=None) -> bool:
     if isinstance(provenance, VendorRedirectProvenance):
         return _redirect_current(provenance, fixture_context=fixture_context)
-    return (isinstance(provenance, GreenhouseJobAlias)
+    return (isinstance(provenance, (GreenhouseJobAlias, ApplicationEntryProvenance))
             and _configured_alias(provenance.pk, provenance.company,
                                   provenance.wrapper,
                                   fixture_context=fixture_context) == provenance)
@@ -664,7 +716,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
-                           provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> None:
+                           provenance: Provenance | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
@@ -683,6 +735,8 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                 or not navigation_allowed(base, *origins, provenance=provenance)
                 or (override and not navigation_allowed(
                     override, *origins, provenance=provenance))):
+            if isinstance(provenance, ApplicationEntryProvenance):
+                raise Gate('native form receiver not proven; inspect the destination manually.')
             raise Gate('The form destination is external or not proven to be this tracked job.')
 
 
@@ -881,6 +935,7 @@ def _page_identity(page: dict) -> tuple:
             page.get('unsupported_frames'),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
+_APPLICATION_WAIT_SECONDS = 15.0
 
 def _closed_mode(target: dict) -> bool:
     return (target.get('combobox') or {}).get('mode') == 'closed-react-select'
@@ -919,7 +974,78 @@ def _observe_closed_admissions(session, page: dict) -> None:
 
 
 
-async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
+
+def _application_marker(siblings: list[dict]) -> bool:
+    return any(
+        (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
+                                   for t in _submitter_texts(c)))
+        or (c.get('type') == 'file'
+            and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
+        for c in siblings)
+
+
+async def _stable_application_form(session, allowed, provenance, *, deadline: float) -> dict:
+    """Only fresh native-form proof can end the read-only post-navigation wait."""
+    loop = asyncio.get_running_loop()
+    previous, seen = None, False
+
+    def check_current(page):
+        if not isinstance(page, dict):
+            raise Gate('The current form control inventory is malformed.')
+        _inventory_ok(page)
+        if not allowed(page.get('url', '')):
+            raise Gate('Application entry route or current row/config changed; inspect manually.')
+
+    while loop.time() < deadline:
+        budget = asyncio.timeout_at(deadline)
+        try:
+            async with budget:
+                page = await session.page()
+                check_current(page)
+                # The fixed witness also reads PAGE internally. Both awaits share
+                # this deadline; its cancellation-to-Gate conversion cannot extend it.
+                page, witness = await _observe_controls(session, page, readiness=True)
+                check_current(page)
+            if budget.expired() or loop.time() >= deadline:
+                raise TimeoutError
+        except (TimeoutError, OSError, bsk.Unavailable):
+            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
+        except Gate:
+            if budget.expired():
+                raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
+            raise
+        except Exception:
+            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
+
+        qualifying = False
+        for c in page['controls']:
+            if not (c.get('in_form') and (_native_answer(c) or (c.get('tag') == 'input'
+                    and c.get('type') in {'radio', 'checkbox'}))):
+                continue
+            siblings = _form_subject(page, c)
+            if not _application_marker(siblings):
+                continue
+            # Readiness proves ownership and receiver, not an answer or a grant.
+            for sibling in siblings:
+                check_form_destination(page, sibling, provenance=provenance)
+            dom = witness[c['selector']]
+            if (dom.get('visible') is True and dom.get('readonly') is False
+                    and dom.get('inert') is False and not c.get('disabled')):
+                qualifying = True
+        identity = (_page_identity(page), repr(page['controls']), repr(witness)) if qualifying else None
+        if qualifying:
+            seen = True
+            if identity == previous:
+                return page
+        previous = identity
+        await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
+    reason = ('unstable application form inventory after bounded wait' if seen else
+              'no qualifying application form after bounded wait')
+    raise Gate(reason + '; inspect the application manually.')
+
+
+
+async def _observe_controls(session, page: dict, *, readiness: bool = False) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page)
     try:
@@ -967,6 +1093,8 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
         _observe_closed_admissions(session, current)
         return current, lookup
     except (Exception, asyncio.CancelledError) as exc:
+        if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)):
+            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
         raise Gate('The current DOM witness is unavailable or changed; '
                    'inspect this form before answering or writing.') from None
 
@@ -1161,7 +1289,7 @@ def _same_key(value: str) -> str:
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
-                         provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
+                         provenance: Provenance | None = None) -> dict:
     choice = target.get('type') in {'radio', 'checkbox'}
     if choice:
         if target.get('tag') != 'input':
@@ -1209,13 +1337,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
-    marked = any(
-        (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
-                                   for t in _submitter_texts(c)))
-        or (c.get('type') == 'file'
-            and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
-        for c in siblings)
-    if not marked:
+    if not _application_marker(siblings):
         raise Gate('No positive native application-form marker was observed.')
     check_form_destination(page, target, *origins, provenance=provenance)
     question = {
@@ -1250,7 +1372,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
 
 
 def _bootstrap_wall(page: dict, witness: dict, *origins: str,
-                    provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> None:
+                    provenance: Provenance | None = None) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
@@ -1278,7 +1400,7 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
 
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
-                     provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
+                     provenance: Provenance | None = None) -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _alias_current(provenance, fixture_context=fixture_context)):
@@ -1349,7 +1471,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
 
 async def _fresh_native_receiver(session, page: dict, action: dict,
-                                 original: dict, provenance: GreenhouseJobAlias | VendorRedirectProvenance,
+                                 original: dict, provenance: Provenance,
                                  *, fixture_context=None) -> tuple[dict, dict]:
     """An alias needs a current native receiver before *every* mutating IPC."""
     if not _alias_current(provenance, fixture_context=fixture_context):
@@ -1516,6 +1638,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         await session.call('click', current['selector'])
         latest = await session.page()
         latest, latest_witness = await _observe_controls(session, latest)
+        if provenance is not None and not _alias_current(
+            provenance, fixture_context=ctx):
+            raise Gate('The verified posting changed while opening the picker; '
+                       'inspect the current configured board and tracked job manually.')
         current = control(latest, action)
         if (_combobox_stable_identity(current) != stable
                 or (current.get('combobox') or {}).get('link_id') != link_id
@@ -1652,7 +1778,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
                   fixture_context=None,
-                  provenance: GreenhouseJobAlias | VendorRedirectProvenance | None = None) -> dict:
+                  provenance: Provenance | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     verb = action.get('action')
     if provenance is not None:
@@ -1933,6 +2059,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     and not navigation_allowed(direct_url, url, provenance=provenance)):
                 raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
             tracked = ((_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {})
+            if (tracked.get('ats') in _APPLICATION_ENTRY
+                    or urlsplit(url).hostname in {h for h, _ in _APPLICATION_ENTRY.values()}):
+                provenance = _configured_alias(pk, company, url, fixture_context=ctx)
+                if not isinstance(provenance, ApplicationEntryProvenance):
+                    raise Gate('Current explicit ATS board and canonical tracked job not proven; '
+                               'inspect the persisted company configuration manually.')
+                direct_url = provenance.url
+                trusted_origins = (url,)
             if tracked.get('ats') in _VENDOR_PATH:
                 provenance = await _probe_vendor_redirect(tracked, pk, company, url)
                 if provenance is None:
@@ -1983,12 +2117,20 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         provenance, fixture_context=ctx):
                     raise Gate('The original same-job tenant mapping changed before navigation.')
                 page = await session.navigate(direct_url)
+                deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS
+                if isinstance(provenance, ApplicationEntryProvenance):
+                    if not isinstance(page, dict):
+                        raise Gate('The current form control inventory is malformed.')
+                    _inventory_ok(page)
                 step['url'] = page['url']
                 if (isinstance(provenance, VendorRedirectProvenance)
                         and page.get('url') != provenance.target_url):
                     raise Gate('Initial page did not match the exact vendor-verified target.')
                 if not allowed(page['url']):
                     raise Gate('Initial redirect is not proven to be the same employer job.')
+                if isinstance(provenance, ApplicationEntryProvenance):
+                    page = await _stable_application_form(
+                        session, allowed, provenance, deadline=deadline)
                 for _ in range(100):
                     if submitted:
                         context = handoff(

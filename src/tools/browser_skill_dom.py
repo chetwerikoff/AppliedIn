@@ -471,8 +471,12 @@ _APPLICATION_ROOT = r"""
     paneNodes.add(p); p.querySelectorAll('*').forEach(n=>paneNodes.add(n));
   }
   paneNodes.forEach(n=>excluded.add(n));
-  const evidenceNodes=Array.from(document.querySelectorAll(query+',input[type="hidden"],[contenteditable],'+
-    '[role="listbox"],canvas,object,embed')).filter(e=>!excluded.has(e));
+  // Description links remain in the original PAGE inventory; they are not
+  // input/receiver candidates. Role-button links still enter this census and
+  // no link acquires action authority through the structural branch.
+  const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
+    ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
+    .filter(e=>!excluded.has(e));
   const rootEvidence=!forms.length && (containers.length || submitters.length) ?
     evidenceNodes.slice(0,501).map(e => {
       const sel=selector(e), id=e.id || '';

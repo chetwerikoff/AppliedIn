@@ -8,6 +8,7 @@ const node = (tag, attrs={}, parent=null) => {
     getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
     hasAttribute:k=>Object.hasOwn(attrs,k),
     attributes:Object.keys(attrs).filter(k=>!['rect','bounds','text'].includes(k)).map(name=>({name})),
+    getAttributeNames:()=>Object.keys(attrs),
     getClientRects:()=>attrs.rect===null ? [] : [attrs.rect || {width:100,height:30,right:100,bottom:30}],
     getBoundingClientRect:()=> {if(attrs.bounds===null) throw Error('unreadable'); return attrs.bounds || attrs.rect || {width:100,height:30};},
     matches:q=>q.split(',').some(s=>match(e,s)),
@@ -57,11 +58,11 @@ if(spec.ambiguous) {
   node('button',{type:'submit',text:'Submit application'},other);
 }
 if(spec.formless) {
-  const wrapper=node('div',{id:'application-root'},body);
-  const pane=node('div',{id:'autofill',class:'ashby-application-form-autofill-pane'},wrapper);
+  const wrapper=node(spec.wrapperTag || 'div',{id:'application-root',class:spec.wrapperClass || ''},body);
+  const pane=node(spec.paneTag || 'div',{id:'autofill',class:'ashby-application-form-autofill-pane'},wrapper);
   const helper=node('input',{id:'autofill-file',type:'file'},pane);
   node('button',{id:'autofill-button',type:'button',text:'Autofill'},pane);
-  Object.defineProperty(helper,'value',{get:()=> {throw Error('AUTOFILL VALUE READ');}});
+  if(!form) Object.defineProperty(helper,'value',{get:()=> {throw Error('AUTOFILL VALUE READ');}});
   const container=node('div',{id:'application-fields',class:'ashby-application-form-container'},wrapper);
   const field=(tag,id,type,text,required=false) => {
     const entry=node('div',{class:'ashby-application-form-field-entry'},container);
@@ -75,7 +76,7 @@ if(spec.formless) {
   resume.getClientRects=()=>[{width:1,height:1,right:1,bottom:1}];
   node('button',{id:'dropzone',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},resume.parentElement);
   field('textarea','additional','textarea','Additional information');
-  const submit=node('button',{id:'structural-submit',class:'ashby-application-form-submit-button',text:'Submit application'},wrapper);
+  const submit=node('button',{id:'structural-submit',class:'ashby-application-form-submit-button',text:'Submit application',...(spec.submitAttrs || {})},wrapper);
   submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
   const move=(e,to)=> {e.parentElement.children.splice(e.parentElement.children.indexOf(e),1); e.parentElement=to; to.children.push(e);};
   if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
@@ -85,6 +86,16 @@ if(spec.formless) {
   if(spec.wrongOrder) wrapper.children.reverse();
   if(spec.duplicateLabel) node('label',{'for':'_systemfield_name',class:'ashby-application-form-question-title',text:'Other'},container);
   if(spec.hiddenOutside) node('input',{id:'outside-hidden',type:'hidden',rect:null},body);
+  if(spec.extraChild) node('span',{},wrapper);
+  if(spec.movePane) move(pane,body);
+  if(spec.moveSubmit) move(submit,container);
+  if(spec.duplicateSubmit) node('button',{class:'ashby-application-form-submit-button'},body);
+  if(spec.duplicatePane) node('div',{class:'ashby-application-form-autofill-pane'},body);
+  if(spec.duplicateId) node('input',{id:'_systemfield_name',type:'text'},container);
+  if(spec.noResume) move(resume,pane);
+  if(spec.invisible) {const e=nodes.find(e=>e.id===spec.invisible);e.getClientRects=()=>[];}
+  if(spec.nativeOwnerMissing) for(const e of nodes.filter(e=>e.id==='submit')) e.form=null;
+  if(spec.descriptionLink) node('a',{id:'description-link',href:'https://example-co.test/info'},body);
 }
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};

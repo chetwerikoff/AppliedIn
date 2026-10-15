@@ -24,34 +24,38 @@ _RESUME_BYTES = (b"%PDF-1.4" + bytes([10])
                  + b"% synthetic fixture; never submitted" + bytes([10])
                  + b"%%EOF" + bytes([10]))
 COMPANY = "example-co"
-_FACTS = {
-    "Name": "Test User",
-    "Additional question": "Synthetic answer",
-    "Where are you located?": "Synthetic Example City",
-    "What is your phone country?": "Example Country",
-    "Are you authorized to work?": "Yes",
-}
-_MACHINE_VALUES = {
-    "Where are you located?": "SYNTHETIC_CITY",
-    "What is your phone country?": "EX",
-    "Are you authorized to work?": "yes",
-}
-_OPTION_SELECTORS = {
-    "#location-option-city": "Where are you located?",
-    "#phone-country-option-example": "What is your phone country?",
-    "#work-authorization-option-yes": "Are you authorized to work?",
-}
 _COMBO_SELECTORS = {
-    "Where are you located?": "#location",
-    "What is your phone country?": "#phone-country",
-    "Are you authorized to work?": "#work-authorization",
+    'Where are you located?': '#location',
+    'School': '#school', 'Degree': '#degree', 'Discipline': '#discipline',
 }
-_HIDDEN_SELECTORS = {
-    "Where are you located?": "#location-code",
-    "What is your phone country?": "#phone-country-code",
-    "Are you authorized to work?": "#work-authorization-code",
+_FACTS = {
+    'Name': 'Test User', 'Additional question': 'Synthetic answer',
+    'Where are you located?': 'Synthetic Example City',
+    'School': 'Synthetic School', 'Degree': 'Synthetic Degree',
+    'Discipline': 'Synthetic Discipline', 'Phone': '+12025550123',
 }
-_FORM = ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
+_MACHINE_VALUES = {key: _FACTS[key] for key in _COMBO_SELECTORS}
+_OPTION_SELECTORS = {selector+'-option': key for key, selector in _COMBO_SELECTORS.items()}
+_HIDDEN_SELECTORS = {key: selector+'-code' for key, selector in _COMBO_SELECTORS.items()}
+
+
+def _closed_form() -> bytes:
+    # Component-rendered display branches replace placeholders; no invented
+    # aria-valuetext/data-selected-* attributes carry commitment evidence.
+    from html import escape
+    fields = []
+    for question, selector in _COMBO_SELECTORS.items():
+        name = selector[1:]
+        fields.append(f'''<div id="{name}-field" class="form-group">
+<label id="{name}-label" for="{name}" data-automation-id="formLabel">{escape(question)}</label>
+<div id="{name}-value"><div id="{name}-input">
+<input id="{name}" name="{name}" role="combobox" aria-expanded="false"
+ aria-haspopup="true" aria-autocomplete="list" aria-labelledby="{name}-label" required>
+</div><div class="react-select__placeholder">Choose</div></div>
+<input type="hidden" id="{name}-code" name="{name}_value"></div>''')
+    fillers = ''.join(f'<input id="filler-{i}" name="filler_{i}" aria-label="Optional synthetic {i}">'
+                      for i in range(24))
+    return ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Synthetic application</title>
 <style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
 </head><body><h1>Synthetic role at example-co</h1>
@@ -62,82 +66,42 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
  method="POST" enctype="multipart/form-data"
  action="http://127.0.0.1:18789/fixture/example-co/job/1">
 <div class="form-group"><label for="name" data-automation-id="formLabel">Name</label>
-<input id="name" name="name" type="text"></div>
-<div class="form-group"><label for="resume">Résumé</label>
-<input id="resume" name="resume" type="file" required></div>
-<div class="form-group"><div id="location-question" data-automation-id="formLabel">
-Where are you located?</div>
-<input id="location" name="location" type="text" role="combobox"
- aria-labelledby="location-question" aria-controls="location-options"
- aria-autocomplete="list" aria-expanded="false" aria-required="true"
- data-value-input="location-code">
-<input id="location-code" name="location_value" type="hidden"></div>
-<div id="location-options" role="listbox" hidden>
-<div id="location-option-city" role="option" data-value="SYNTHETIC_CITY"
- aria-selected="false">Synthetic Example City</div>
-<div id="location-option-other" role="option" data-value="OTHER_CITY"
- aria-selected="false">Other Synthetic City</div></div>
-<div class="form-group"><div id="phone-country-question" data-automation-id="formLabel">
-What is your phone country?</div>
-<input id="phone-country" name="phone_country" type="text" role="combobox"
- aria-labelledby="phone-country-question" aria-controls="phone-country-options"
- aria-autocomplete="list" aria-expanded="false" aria-required="true"
- data-value-input="phone-country-code">
-<input id="phone-country-code" name="phone_country_value" type="hidden"></div>
-<div id="phone-country-options" role="listbox" hidden>
-<div id="phone-country-option-example" role="option" data-value="EX"
- aria-selected="false">Example Country</div>
-<div id="phone-country-option-other" role="option" data-value="OT"
- aria-selected="false">Other Synthetic Country</div></div>
-<div class="form-group"><div id="work-authorization-question" data-automation-id="formLabel">
-Are you authorized to work?</div>
-<div id="work-authorization" role="combobox" tabindex="0"
- aria-labelledby="work-authorization-question"
- aria-controls="work-authorization-options" aria-expanded="false"
- aria-required="true" data-value-input="work-authorization-code">Choose an answer</div>
-<input id="work-authorization-code" name="work_authorization_value" type="hidden">
-</div>
-<div id="work-authorization-options" role="listbox" hidden>
-<div id="work-authorization-option-yes" role="option" data-value="yes"
- aria-selected="false">Yes</div>
-<div id="work-authorization-option-no" role="option" data-value="no"
- aria-selected="false">No</div></div>
+<input id="name" name="name"></div>
+<label for="resume">Résumé</label><input id="resume" name="resume" type="file" required>
+''' + ''.join(fields) + '''
+<div class="form-group"><label for="phone" data-automation-id="formLabel">Phone</label>
+<div id="telephone" class="iti"><input id="phone" name="phone" type="tel">
+<div class="iti__country-container"><button id="country-button" type="button" class="iti__selected-country">Country</button></div>
+<div class="iti__dropdown-content" hidden>
+<input class="iti__search-input" role="combobox" id="country-search">
+<ul class="iti__country-list" role="listbox" id="country-list">
+<li class="iti__country" role="option" id="country-option">Synthetic country</li></ul></div></div></div>
 <div class="form-group"><label for="additional" data-automation-id="formLabel">Additional question</label>
 <textarea id="additional" name="additional"></textarea></div>
-<button id="submit" type="submit">Submit application</button></form>
+''' + fillers + '''<button id="submit" type="submit">Submit application</button></form>
 <script>
-function bindPicker(comboId,listId,asyncFilter){
- const combo=document.getElementById(comboId), list=document.getElementById(listId);
- const options=Array.from(list.querySelectorAll('[role="option"]'));
- const show=()=>{list.hidden=false;combo.setAttribute('aria-expanded','true');};
- combo.addEventListener('click',show);
- if(combo.tagName==='INPUT'){
-  combo.addEventListener('focus',show);
-  combo.addEventListener('input',()=>{
-   list.hidden=true;
-   const update=()=>{
-    const needle=combo.value.trim().toLowerCase();
-    options.forEach(o=>{o.hidden=!!needle&&!o.innerText.toLowerCase().includes(needle)});
-    show();
-   };
-   if(asyncFilter)window.setTimeout(update,60);else update();
+const answers = ''' + json.dumps({s[1:]: _FACTS[k] for k, s in _COMBO_SELECTORS.items()}) + ''';
+for (const [id,answer] of Object.entries(answers)) {
+ const input=document.getElementById(id);
+ input.addEventListener('click',()=>{
+  if(input.getAttribute('aria-expanded')==='true')return;
+  const list=document.createElement('div');list.id=id+'-options';list.setAttribute('role','listbox');
+  const option=document.createElement('div');option.id=id+'-option';
+  option.setAttribute('role','option');option.setAttribute('data-value',answer);option.textContent=answer;
+  list.append(option);document.body.append(list);
+  input.setAttribute('aria-expanded','true');input.setAttribute('aria-controls',list.id);
+  option.addEventListener('click',()=>{
+   const display=document.getElementById(id+'-value').lastElementChild;
+   display.className='react-select__single-value';display.textContent=option.innerText;
+   document.getElementById(id+'-code').value=option.getAttribute('data-value');
+   input.value='';input.setAttribute('aria-expanded','false');input.removeAttribute('aria-controls');list.remove();
   });
- }
- options.forEach(option=>option.addEventListener('click',()=>{
-  const caption=option.innerText.trim(), value=option.getAttribute('data-value');
-  if(combo.tagName==='INPUT')combo.value=caption;else combo.innerText=caption;
-  combo.setAttribute('aria-valuetext',caption);
-  combo.setAttribute('data-selected-label',caption);
-  combo.setAttribute('data-selected-value',value);
-  options.forEach(o=>o.setAttribute('aria-selected',String(o===option)));
-  document.getElementById(combo.getAttribute('data-value-input')).value=value;
-  list.hidden=true;combo.setAttribute('aria-expanded','false');
- }));
+ });
 }
-bindPicker('location','location-options',true);
-bindPicker('phone-country','phone-country-options',false);
-bindPicker('work-authorization','work-authorization-options',false);
-</script></body></html>''').encode("utf-8")
+</script></body></html>''').encode('utf-8')
+
+
+_FORM = _closed_form()
 
 
 def _inventory_diagnostic_script() -> str:
@@ -202,7 +166,7 @@ class _SyntheticRun:
                  "post_count", "post_payload", "submit_ipc", "uploaded",
                  "last_page", "combo_observations", "combo_touched",
                  "submit_call_entered", "submit_guard", "post_attempts",
-                 "post_rejection", "post_receipts", "inventory_diagnostics")
+                 "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -239,20 +203,16 @@ class _SyntheticRun:
         self.post_rejection = ""
         self.post_receipts = []
         self.inventory_diagnostics = None
+        self.widget_receipts = []
 
 
     def enable_positive_fixture(self) -> None:
         self.positive = True
         specs = {
-            "Name": ("#name", "Name", "Name", "input", "text"),
-            "Where are you located?": ("#location", "Where are you located?",
-                                        "Where are you located?", "input", "combobox"),
-            "What is your phone country?": ("#phone-country",
-                "What is your phone country?", "What is your phone country?",
-                "input", "combobox"),
-            "Are you authorized to work?": ("#work-authorization",
-                "Are you authorized to work?", "Are you authorized to work?",
-                "div", "combobox"),
+            'Name': ('#name', 'Name', 'Name', 'input', 'text'),
+            'Phone': ('#phone', 'Phone', 'Phone', 'input', 'tel'),
+            **{key: (selector, key, key, 'input', 'combobox')
+               for key, selector in _COMBO_SELECTORS.items()},
         }
         for key, (selector, label, question, tag, typ) in specs.items():
             self.row["human_approved_answers"][key] = {
@@ -262,17 +222,10 @@ class _SyntheticRun:
             }
 
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
-        return (
-            ("fill", "#name", "--value", _FACTS["Name"]),
-            ("click", "#location"),
-            ("fill", "#location", "--value", _FACTS["Where are you located?"]),
-            ("click", "#location-option-city"),
-            ("click", "#phone-country"),
-            ("fill", "#phone-country", "--value", _FACTS["What is your phone country?"]),
-            ("click", "#phone-country-option-example"),
-            ("click", "#work-authorization"),
-            ("click", "#work-authorization-option-yes"),
-        )
+        return (('fill', '#name', '--value', _FACTS['Name']),
+                *(ipc for selector in _COMBO_SELECTORS.values()
+                  for ipc in (('click', selector), ('click', selector+'-option'))),
+                ('fill', '#phone', '--value', _FACTS['Phone']))
 
     def observe_page(self, observed: dict) -> None:
         """Retain browser-read caption/value pairs as committed fixture state."""
@@ -311,9 +264,11 @@ class _SyntheticRun:
                 reasons.append("linked hidden-value control was missing or changed")
             if hidden != _MACHINE_VALUES[key]:
                 reasons.append("hidden machine value did not match the selected value")
+            if combo.get('displayed_text') != _FACTS[key]:
+                reasons.append('current displayed caption did not match the approved answer')
             observation = {
                 "outcome": "committed" if not reasons else "not_committed",
-                "visible_text": visible, "selected_value": selected,
+                "visible_text": visible, "displayed_text": combo.get('displayed_text'), "selected_value": selected,
                 "hidden_value": hidden,
                 "reason": "; ".join(reasons),
             }
@@ -353,16 +308,13 @@ class _SyntheticRun:
         self.events.append({"kind": kind, "pk": details.get("pk")})
 
     async def decision(self, task: str, page: dict, history: list, *, model: str):
+        self.widget_receipts = [r for r in history if r.get('action') == 'combobox']
         actions = (
-            {"action": "fill", "selector": "#name", "fact": "Name"},
-            {"action": "combobox", "selector": "#location",
-             "fact": "Where are you located?"},
-            {"action": "combobox", "selector": "#phone-country",
-             "fact": "What is your phone country?"},
-            {"action": "combobox", "selector": "#work-authorization",
-             "fact": "Are you authorized to work?"},
-            {"action": "fill", "selector": "#additional",
-             "fact": "Additional question"},
+            {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
+            *({'action': 'combobox', 'selector': selector, 'fact': key}
+              for key, selector in _COMBO_SELECTORS.items()),
+            {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
+            {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},
         )
         if model != "synthetic-fixture" or self.decisions >= len(actions):
             raise ValueError("Synthetic decision sequence exhausted; rerun fixture.")
@@ -398,7 +350,7 @@ class _SyntheticRun:
 
 
         class _Closed:
-            __slots__ = ()
+            __slots__ = ('_closed_admissions',)
 
             async def navigate(self, url: str):
                 if url != URL or state.navigations:
@@ -452,15 +404,9 @@ class _SyntheticRun:
                     raise PermissionError("Fixture attachment is not the staged synthetic PDF.")
                 if args[0] == "click" and args[1] in _OPTION_SELECTORS:
                     key = _OPTION_SELECTORS[args[1]]
-                    selector = {
-                        "Where are you located?": "#location",
-                        "What is your phone country?": "#phone-country",
-                        "Are you authorized to work?": "#work-authorization",
-                    }[key]
+                    selector = _COMBO_SELECTORS[key]
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
-                    if selector != "#work-authorization" and state.input_values.get(selector) != _FACTS[key]:
-                        raise PermissionError("Fixture filter did not equal its approved fact.")
                 await raw.call(*args, **kwargs)
                 for key, selector in _COMBO_SELECTORS.items():
                     if (args[0] in {"click", "fill"} and len(args) > 1
@@ -473,16 +419,11 @@ class _SyntheticRun:
                     state.input_values[args[1]] = args[3]
                 elif args[0] == "upload":
                     state.uploaded = True
-                elif args[0] == "click" and args[1] in {
-                        "#location", "#phone-country", "#work-authorization"}:
+                elif args[0] == 'click' and args[1] in _COMBO_SELECTORS.values():
                     state.open_controls.add(args[1])
                 elif args[0] == "click" and args[1] in _OPTION_SELECTORS:
                     key = _OPTION_SELECTORS[args[1]]
-                    selector = {
-                        "Where are you located?": "#location",
-                        "What is your phone country?": "#phone-country",
-                        "Are you authorized to work?": "#work-authorization",
-                    }[key]
+                    selector = _COMBO_SELECTORS[key]
                     state.open_controls.discard(selector)
 
         return _Closed()
@@ -564,15 +505,29 @@ def run() -> int:
                 form_question = result.get("form_question") or {}
                 expected_commits = {key: (_FACTS[key], value)
                                      for key, value in _MACHINE_VALUES.items()}
-                # Name plus the two filtered pickers are the only fills; the
-                # fourth picker uses clicks, then the fifth decision gates.
-                expected_fills = 3
-                expected_decisions = 5
+                # Four choices and exact tel precede the unapproved optional field.
+                expected_fills = 2
+                expected_decisions = 7
+                phone = [c for c in (state.last_page or {}).get('controls', [])
+                         if c.get('selector') == '#phone']
+                phone_ok = len(phone)==1 and phone[0].get('value')==_FACTS['Phone']
+                from tools.browser_skill_apply import _check_closed_commit, control, Gate
+                receipt_ok = len(state.widget_receipts) == 4
+                try:
+                    for receipt in state.widget_receipts:
+                        _check_closed_commit(control(state.last_page, receipt),
+                                             receipt['approved_value'], receipt)
+                except Gate:
+                    receipt_ok = False
                 ok = (result.get("status") == "gate"
                       and form_question.get("selector") == "#additional"
                       and state.fills == expected_fills
                       and state.decisions == expected_decisions
                       and state.committed == expected_commits
+                      and phone_ok
+                      and receipt_ok
+                      and state.last_page.get('inventory_verified') is True
+                      and state.last_page.get('opaque_controls') is False
                       and all(state.combo_observations.get(key, {}).get("outcome")
                               == "committed"
                               and state.combo_observations[key].get("visible_text")
@@ -588,8 +543,8 @@ def run() -> int:
                       and state.submit_ipc == 0
                       and state.post_attempts == 0
                       and state.post_count == 0)
-                field_selectors = {"Name": "#name",
-                                   "Additional question": "#additional"}
+                field_selectors = {'Name': '#name', 'Phone': '#phone',
+                                   'Additional question': '#additional'}
                 outcomes = [
                     {"field": key, "outcome": (
                         "filled" if state.input_values.get(selector) == _FACTS[key]
@@ -640,9 +595,7 @@ def run() -> int:
                     "kind": result.get("reason") or result.get("status"),
                     "field": {selector: field for field, selector in (
                         *field_selectors.items(),
-                        ("Where are you located?", "#location"),
-                        ("What is your phone country?", "#phone-country"),
-                        ("Are you authorized to work?", "#work-authorization"),
+                        *_COMBO_SELECTORS.items(),
                     )}.get(form_question.get("selector")),
                     "reason": result.get("question") or result.get("detail"),
                 }
@@ -658,6 +611,11 @@ def run() -> int:
                                   "submitted": state.submit_ipc > 0,
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),
+                                  'phone_exact_readback': phone_ok,
+                                  'receipt_exact_readbacks': receipt_ok,
+                                  'widget_receipts': state.widget_receipts,
+                                  'picker_ipc': 0, 'continue_ipc': 0,
+                                  'final_stage': 'optional-control-action' if form_question.get('selector')=='#additional' else 'premature',
                                   "post_received": state.post_count == 1,
                                   "gate": gate, "fields": outcomes,
                                   "approval_question_collisions": collisions,

@@ -197,10 +197,10 @@ async def test_fixture_orders_combos_before_the_ungranted_gate(authority):
     authority.enable_positive_fixture()
     actions = [
         await authority.decision("", page, [], model="synthetic-fixture")
-        for _ in range(5)
+        for _ in range(7)
     ]
     assert [action["selector"] for action in actions] == [
-        "#name", *combo_selectors, "#additional"]
+        "#name", *combo_selectors, "#phone", "#additional"]
 
 
 def test_fixture_reports_untouched_combos_as_not_reached():
@@ -258,6 +258,7 @@ def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
         control = next(c for c in page["controls"] if c["selector"] == selector)
         control["combobox"] = {
             "selected_text": fixture._FACTS[key],
+            'displayed_text': fixture._FACTS[key],
             "selected_value": fixture._MACHINE_VALUES[key],
             "hidden_selector": fixture._HIDDEN_SELECTORS[key],
             "hidden_value": fixture._MACHINE_VALUES[key],

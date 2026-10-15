@@ -1108,7 +1108,8 @@ const field = {id: 'field', tagName: kind === 'custom' ? 'X-FOO' : 'INPUT',
     (kind === 'combobox' && q.includes('[role="combobox"]'))};
 global.document = {readyState: 'complete', title: 'Synthetic form', body: {innerText: ''},
   querySelector: () => null, getElementById: () => null,
-  querySelectorAll: q => q === '*' || !q.startsWith('#') ? [field] : [field]};
+  querySelectorAll: q => q === '.iti' ? [] : q === '[role="combobox"]' ?
+    (kind === 'combobox' ? [field] : []) : [field]};
 global.CSS = {escape: s => s};
 global.location = {href: 'https://example.test/job/1'};
 global.getComputedStyle = () => ({visibility: 'visible'});
@@ -1739,7 +1740,8 @@ const button = {id:'submit',tagName:'BUTTON',type:'submit',form,formAction:'http
   getClientRects:()=>[1],closest:q=>q==='form'?form:null,matches:()=>false,
   getAttribute:k=>k==='formaction'?'/receive':null};
 global.document={readyState:'complete',title:'Synthetic application',body:{innerText:''},
-  querySelector:()=>null,getElementById:()=>null,querySelectorAll:()=>[button]};
+  querySelector:()=>null,getElementById:()=>null,
+  querySelectorAll:q=>q === '.iti' || q === '[role="combobox"]' ? [] : [button]};
 global.CSS={escape:s=>s};
 global.location={href:'https://employer.test/job/1'};
 global.getComputedStyle=()=>({visibility:'visible'});

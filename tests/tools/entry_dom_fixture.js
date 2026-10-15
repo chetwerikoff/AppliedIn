@@ -96,6 +96,20 @@ if(spec.formless) {
   if(spec.invisible) {const e=nodes.find(e=>e.id===spec.invisible);e.getClientRects=()=>[];}
   if(spec.nativeOwnerMissing) for(const e of nodes.filter(e=>e.id==='submit')) e.form=null;
   if(spec.descriptionLink) node('a',{id:'description-link',href:'https://example-co.test/info'},body);
+  if(spec.missingPane) {
+    for(const n of [pane,...pane.querySelectorAll('*')]) nodes.splice(nodes.indexOf(n),1);
+    wrapper.children.splice(wrapper.children.indexOf(pane),1);
+  }
+  if(spec.clipStyle) {
+    const e=nodes.find(n=>n.id===(spec.clipTarget || '_systemfield_name'));
+    Object.assign((spec.clipAncestor ? e.parentElement : e).style,spec.clipStyle);
+  }
+  if(spec.searchForm) {
+    const search=node('form',{id:'search-form'},body);
+    search.action='https://jobs.ashbyhq.com/example-co/search';
+    node('input',{id:'job-search',type:spec.searchForm==='foreign' ? 'text':'search'},search);
+    node('button',{id:'search-submit',type:'submit',text:'Search jobs'},search);
+  }
 }
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};
@@ -119,6 +133,13 @@ function frame(kind, edit={}) {
     parent=node('span',{class:'IN-widget'},parent);
     attrs={...attrs,title:'LinkedIn Embedded Content',rect:{width:236,height:48,right:236,bottom:48}};
   } else if(kind==='X') attrs={...attrs,style:{visibility:'hidden'},rect:{width:1,height:1,right:1,bottom:1}};
+  else if(kind==='Z') {
+    parent=node(spec.zParentTag || 'div',spec.zParentAttrs || {},
+      spec.zInside ? nodes.find(n=>n.id==='application-fields') : body);
+    if(!spec.zParentAttrs?.id) parent.id='';
+    if(spec.zNested) {const outer=node('div',{},body);parent.parentElement=outer;}
+    attrs={...attrs,style:{display:'none'},rect:null};
+  }
   if(kind==='X' && spec.inside) parent=form || body;
   if(spec.brokenEdge) parent=node('div',{},parent);
   if(spec.bounds==='missing') attrs.bounds=null;

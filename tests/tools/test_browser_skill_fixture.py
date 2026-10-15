@@ -393,7 +393,8 @@ def test_fixture_handler_rejects_wrong_host_path_and_every_non_get_method():
     assert ("status", 200) in good
     assert b'id="_systemfield_name"' in body and b'id="additional"' in body
     assert b'ashby-application-form-submit-button' in body and b'<form' not in body
-    assert b'<iframe' not in body and b'type="submit"' not in body
+    assert body.count(b'<iframe') == 3 and b'type="submit"' not in body
+    assert b'<div><iframe style="display:none"></iframe></div>' in body
     for method, path, host in [
         ("GET", fixture._PATH, "localhost:18789"),
         ("GET", fixture._PATH, "[::1]:18789"),
@@ -1390,11 +1391,11 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
         await facade.call('navigate',fixture.URL)
 
 
-def test_formless_fixture_has_no_frames_but_x_bounds_remain_strict_offline():
-    # The new single live page has no captcha candidates. Keep the old UA
-    # border regression offline: a 1px content box plus borders is not X.
+def test_formless_fixture_mirrors_r_r_z_but_x_bounds_remain_strict_offline():
+    # AC-Z adds the exact inert frame beside the existing R pair; it does not
+    # relax X's old UA-border regression.
     from tests.tools.test_browser_application_entry import dom
-    assert b'<iframe' not in fixture._FORM
+    assert fixture._FORM.count(b'<iframe') == 3
     for size, status in ((1, 'X'), (5, 'unknown')):
         page = dom(dict(frames=['X'], edit={'rect':{'width':size,'height':size}}))
         assert page['entry']['frames'][0]['status'] == status

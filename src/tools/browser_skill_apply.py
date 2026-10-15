@@ -715,6 +715,9 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                         for c in controls):
                     raise Gate(f'Required choice is empty: {target["label"]}')
         elif typ != 'file' and target.get('tag') in {'input', 'textarea', 'select'}:
+            if _formless_root(page) and expected is not None and (
+                    not target.get('has_value') or value != expected):
+                raise Gate('A previously verified structural answer is empty or changed.')
             if target.get('required') and not target.get('has_value'):
                 raise Gate(f'Required field is empty: {target["label"]}')
             if typ == 'tel' and expected is not None and (
@@ -1245,7 +1248,8 @@ def _entry_safety(page, allowed, provenance):
             raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
         if status == 'visible-hcaptcha':
             raise Gate('visible hCaptcha challenge; inspect manually.')
-        if status not in {'H', 'R', 'W', 'X'}:
+        if status not in {'H', 'R', 'W', 'X'} and not (
+                status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
             raise Gate('unknown/untrusted application frame; inspect manually.')
     if entry.get('response_error'):
         raise Gate('untrusted captcha response control; ambiguous owner or provider.')
@@ -1258,6 +1262,13 @@ def _entry_safety(page, allowed, provenance):
                                provenance=provenance)
     for c in controls:
         if c.get('in_form'):
+            owner = c.get('form_selector')
+            siblings = [other for other in controls if other.get('form_selector') == owner]
+            if (_formless_root(page) and isinstance(provenance, ApplicationEntryProvenance)
+                    and provenance.ats == 'ashby'
+                    and all(other.get('native_form_owner_selector') == owner for other in siblings)
+                    and _unrelated_search_form(siblings)):
+                continue
             check_form_destination(page, c, provenance=provenance)
     if _formless_root(page) and isinstance(provenance, ApplicationEntryProvenance) and provenance.ats == 'ashby':
         _formless_boundary(page, provenance)
@@ -1273,7 +1284,8 @@ class _EntrySession:
         self.step = step
         self.formless_identity = None
         self.committing = False
-        self.submit_authorized = False
+        self.submit_authorized = None
+        self.on_committing_click = None
 
     async def page(self):
         result = await self.call('evaluate', ENTRY_PAGE)
@@ -1298,8 +1310,13 @@ class _EntrySession:
             if args[0] == 'click':
                 if not self.submit_authorized:
                     raise Gate('Structural submit lacks final approval, attachment and hold checks.')
+                if _page_identity(current) != self.submit_authorized:
+                    self.submit_authorized = None
+                    raise Gate('Validated structural answers or attachment changed before submit; inspect manually.')
                 self.submit_authorized = False
                 self.committing = True
+                if self.on_committing_click is not None:
+                    self.on_committing_click()
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await self.raw.call(*args, **kwargs)
@@ -2729,9 +2746,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         step['last_button'] = target['label']
                         hold_dispatch(step)
                         check_commit()
-                        submitted = True
                         if structural:
-                            session.submit_authorized = True
+                            # Immutable identity includes the independently verified values
+                            # and root-evidence file lists, not just the structural edges.
+                            session.submit_authorized = _page_identity(page)
+                            session.on_committing_click = mark_click_started
+                        else:
+                            submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):
                             await asyncio.sleep(1)

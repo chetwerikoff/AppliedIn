@@ -464,7 +464,10 @@ _APPLICATION_ROOT = r"""
   let structuralError='';
   if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
     structuralError='ambiguous application roots';
-  else if (!forms.length && container && exactSubmit && !ordered)
+  else if (!forms.length && container && exactSubmit && !ordered && !(
+    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
+    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))
     structuralError='application root sibling identity mismatch';
   const paneNodes=new Set();
   if (!forms.length) for (const p of panes) {
@@ -477,6 +480,16 @@ _APPLICATION_ROOT = r"""
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
     .filter(e=>!excluded.has(e));
+  const entryVisible=e => {
+    if (!visible(e)) return false;
+    // Clipping can hide a text recipient despite a positive layout rectangle.
+    // Unknown clipping geometry is not proof of an editable applicant target.
+    for (let n=e;n;n=n.parentElement) {
+      const s=getComputedStyle(n);
+      if ((s.clip && s.clip!=='auto') || (s.clipPath && s.clipPath!=='none')) return false;
+    }
+    return true;
+  };
   const rootEvidence=!forms.length && (containers.length || submitters.length) ?
     evidenceNodes.slice(0,501).map(e => {
       const sel=selector(e), id=e.id || '';
@@ -499,7 +512,7 @@ _APPLICATION_ROOT = r"""
         dropzone:e.matches('button.ashby-application-form-input-file-dropzone-upload'),
         required:!!e.required,disabled:!!e.disabled || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),inert:!!e.closest('[inert]'),
-        visible:visible(e),value:e.type==='password' ? '' : (e.value || ''),
+        visible:entryVisible(e),value:e.type==='password' ? '' : (e.value || ''),
         files:e.files ? Array.from(e.files).map(f=>f.name) : [],
         autocomplete:e.getAttribute('autocomplete') || '',role:e.getAttribute('role') || '',
         iti:!!e.closest('.iti'),contenteditable:e.hasAttribute('contenteditable')};
@@ -574,6 +587,12 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
     const visibleR=visibleRecaptcha(origin,path,shown,outside,badge,bounds);
+    // AC-Z is scoped to the entry reader; ordinary PAGE gains no frame waiver.
+    const z=raw===null && e.getAttribute('title')===null &&
+      !e.getAttributeNames().some(a=>a.startsWith('data-') || a.startsWith('aria-')) &&
+      style.display==='none' && e.getClientRects().length===0 && outside &&
+      parent?.tagName==='DIV' && !parent.id && !parent.getAttribute('class') &&
+      parent.parentElement===document.body;
     let status='unknown';
     // Visible bframe precedence is independent of root proof/placement.
     if (visibleR==='visible-recaptcha') status=visibleR;
@@ -581,6 +600,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     else if ((r && outside && hidden) || visibleR==='R') status='R';
     else if (w) { status='W'; row.querySelectorAll(query).forEach(n=>excluded.add(n)); }
     else if (x) status='X';
+    else if (z) status='Z';
     return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
@@ -637,6 +657,7 @@ def entry_reader(script: str) -> str:
     script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
     script = script.replace('return {selector:ownSelector, unique:',
                             "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
+                            "submit:['submit','image'].includes(e.type), "
                             "required:!!e.required,files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
                             'selector:ownSelector, unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')

@@ -296,7 +296,7 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch):
     with pytest.raises(forms.Gate, match='lacks final approval'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
-    session.submit_authorized = True
+    session.submit_authorized = forms._page_identity(await session.page())
     await session.call('click', '#structural-submit')
     with pytest.raises(forms.Gate, match='cannot be retried'):
         await session.call('click', '#structural-submit')
@@ -649,3 +649,193 @@ def test_structural_presubmit_requires_only_the_staged_attachment(monkeypatch):
     resume['files'] = ['Resume.pdf', 'Unexpected.pdf']
     with pytest.raises(forms.Gate, match='exact staged résumé'):
         forms.check_form(raw.current, {}, True, 'Resume.pdf')
+
+
+@pytest.mark.parametrize('drift', ['required', 'optional', 'removed-resume', 'replaced-resume', 'extra-resume', 'root'])
+async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch, drift):
+    row, raw, decide, provenance = root_world(monkeypatch)
+    facts = approve_fields(row, raw.current, raw.fixed, provenance)
+    decide.side_effect = action_sequence()
+    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: None)
+    def rerender(*a, **kw):
+        for snapshot in (raw.current, raw.fixed):
+            if drift == 'root':
+                snapshot['entry']['formless']['pane'] = '#changed-pane'
+            for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                if drift in {'required', 'optional'} and c['selector'] == (
+                        '#_systemfield_name' if drift == 'required' else '#additional'):
+                    c.update(value='Unapproved replacement', has_value=True)
+                if c.get('type') == 'file' and drift.endswith('resume'):
+                    c['files'] = {'removed-resume': [], 'replaced-resume': ['Other.pdf'],
+                                  'extra-resume': ['Resume.pdf', 'Other.pdf']}[drift]
+    monkeypatch.setattr(forms, 'check_before_committing_click', rerender)
+    original_sleep = asyncio.sleep
+    async def fast_sleep(delay):
+        await original_sleep(0)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fast_sleep)
+    result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
+                               pk=PK, resume_path='Resume.pdf')
+    assert not any(c[0] == 'click' for c in raw.calls), result
+    assert result['status'] == 'gate', result
+    assert ('root identity drift' if drift == 'root' else 'changed before submit') in result['question']
+
+
+def test_cleared_optional_structural_answer_is_not_a_verified_receipt(monkeypatch):
+    _, raw, _, _ = root_world(monkeypatch)
+    for c in raw.current['controls']:
+        if c.get('required') and c.get('type') != 'file':
+            c.update(value='Verified', has_value=True)
+    filled = {c['selector']: c['value'] for c in raw.current['controls'] if c.get('has_value')}
+    filled['#additional'] = 'Approved optional answer'
+    with pytest.raises(forms.Gate, match='previously verified structural answer'):
+        forms.check_form(raw.current, filled, True)
+
+
+@pytest.mark.parametrize('style', [{'clip': 'rect(0px, 0px, 0px, 0px)'},
+                                   {'clipPath': 'inset(100%)'}])
+@pytest.mark.parametrize('ancestor', [False, True])
+@pytest.mark.parametrize('target', ['_systemfield_name', '_systemfield_email', 'additional'])
+async def test_css_clipped_text_is_not_an_applicant_target(monkeypatch, style, ancestor, target):
+    _, raw, decide, _ = root_world(monkeypatch, clipStyle=style, clipAncestor=ancestor, clipTarget=target)
+    for snapshot in (raw.current, raw.fixed):
+        c = next(c for c in snapshot['entry']['root_evidence'] if c['id'] == target)
+        assert not c['visible']
+    result = await attempt()
+    assert result['status'] == 'gate' and 'editability changed' in result['question'], result
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+def test_clipped_labelled_resume_remains_supported(monkeypatch):
+    _, raw, _, provenance = root_world(monkeypatch, clipStyle={'clip': 'rect(0px, 0px, 0px, 0px)'},
+                                      clipTarget='_systemfield_resume')
+    for snapshot in (raw.current, raw.fixed):
+        members = forms._formless_boundary(snapshot, provenance)
+        assert next(c for c in members if c['type'] == 'file')['id'] == '_systemfield_resume'
+
+
+@pytest.mark.parametrize('kind', ['search', 'foreign'])
+async def test_search_only_receiver_exception_reaches_real_question(monkeypatch, kind):
+    _, raw, decide, _ = root_world(monkeypatch, searchForm=kind)
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    if kind == 'search':
+        assert result.get('form_question'), result
+        assert result['form_question']['label'] == 'Name', result
+    else:
+        assert 'native form receiver not proven' in result['question'], result
+        assert not result.get('form_question')
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatch):
+    _, raw, decide, _ = root_world(monkeypatch, frames=['R', 'B', 'Z'])
+    assert [f['status'] for f in raw.current['entry']['frames']] == ['R', 'R', 'Z']
+    assert raw.current['entry'] == raw.fixed['entry']
+    result = await attempt()
+    assert result['status'] == 'gate' and result['form_question']['label'] == 'Name', result
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('changes', [
+    {'edit': {'src': 'about:blank'}}, {'edit': {'src': 'https://foreign.test/frame'}},
+    {'edit': {'title': ''}}, {'edit': {'data-extra': ''}}, {'edit': {'aria-hidden': 'true'}},
+    {'edit': {'style': {'display': 'block'}}},
+    {'edit': {'rect': {'width': 1, 'height': 1}}}, {'zInside': True},
+    {'zParentTag': 'section'}, {'zParentAttrs': {'id': 'foreign'}},
+    {'zParentAttrs': {'class': 'foreign'}}, {'zNested': True},
+])
+def test_each_ac_z_signature_condition_is_required(monkeypatch, changes):
+    _, raw, _, provenance = root_world(monkeypatch, frames=['Z'], **changes)
+    for snapshot in (raw.current, raw.fixed):
+        assert snapshot['entry']['frames'][0]['status'] == 'unknown'
+        with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+            forms._entry_safety(snapshot, lambda url: True, provenance)
+
+
+def test_ac_z_cannot_waive_an_unproven_entry(monkeypatch):
+    _, raw, _, _ = root_world(monkeypatch, frames=['Z'])
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(raw.current, lambda url: True, None)
+
+
+async def test_ac_z_becoming_active_is_rejected_on_later_inventory(monkeypatch):
+    row, raw, _, provenance = root_world(monkeypatch, frames=['Z'])
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
+    await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
+    raw.current, raw.fixed = observed(frames=['Z'], edit={'src': 'https://foreign.test/frame'})
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await session.page()
+    no_mutations(raw)
+
+
+async def test_missing_autofill_pane_uses_the_existing_entry_wait(monkeypatch):
+    _, raw, _, provenance = root_world(monkeypatch, missingPane=True)
+    for snapshot in (raw.current, raw.fixed):
+        with pytest.raises(forms._EntryNotReady, match='no unique application root'):
+            forms._entry_safety(snapshot, lambda url: True, provenance)
+    complete = observed()
+    original = raw.call
+    reads = 0
+    async def mounts(method, *args, **kwargs):
+        nonlocal reads
+        if method == 'evaluate' and args == (forms.ENTRY_PAGE,):
+            reads += 1
+            if reads == 3:
+                raw.current, raw.fixed = deepcopy(complete)
+        return await original(method, *args, **kwargs)
+    raw.call = mounts
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
+    assert page['entry']['formless']['root'] == '#application-root'
+    assert reads >= 4
+    no_mutations(raw)
+
+
+def test_search_only_exception_needs_the_inputs_actual_native_owner(monkeypatch):
+    _, raw, _, provenance = root_world(monkeypatch, searchForm='search')
+    search = next(c for c in raw.current['controls'] if c['selector'] == '#job-search')
+    search['native_form_owner_selector'] = ''
+    with pytest.raises(forms.Gate, match='native form receiver not proven'):
+        forms._entry_safety(raw.current, lambda url: True, provenance)
+
+
+@pytest.mark.parametrize('fact', ['src', 'title', 'data', 'aria', 'display', 'rects',
+                                  'outside', 'parent-tag', 'parent-id', 'parent-class', 'grandparent'])
+def test_ac_z_predicate_rejects_each_failed_fact(fact):
+    # Exercise each clause of the production producer directly. Physical DOM
+    # constraints can make clauses redundant; those must not hide a missing check.
+    import json
+    import subprocess
+    from tools.browser_skill_dom import _ENTRY_OBSERVATION
+    predicate = 'const z=' + _ENTRY_OBSERVATION.split('const z=', 1)[1].split(';', 1)[0] + ';'
+    script = r'''
+const fact=process.argv[1], document={body:{}};
+const raw=fact==='src' ? '' : null;
+const outside=fact!=='outside', style={display:fact==='display' ? 'block':'none'};
+const parent={tagName:fact==='parent-tag' ? 'SECTION':'DIV',
+  id:fact==='parent-id' ? 'foreign':'',
+  getAttribute:()=>fact==='parent-class' ? 'foreign':null,
+  parentElement:fact==='grandparent' ? {}:document.body};
+const e={getAttribute:()=>fact==='title' ? '':null,
+  getAttributeNames:()=>fact==='data' ? ['data-extra']:fact==='aria' ? ['aria-hidden']:[],
+  getClientRects:()=>fact==='rects' ? [{}]:[]};
+eval(process.argv[2]+'console.log(JSON.stringify(z));');
+'''
+    result = subprocess.run(['node', '-e', script, fact, predicate],
+                            text=True, capture_output=True, check=True)
+    assert json.loads(result.stdout) is False
+
+
+@pytest.mark.parametrize('changes', [
+    {'wrapperTag': 'section'}, {'wrapperClass': 'foreign'}, {'wrongOrder': True},
+    {'extraChild': True}, {'moveSubmit': True},
+])
+def test_missing_pane_does_not_waive_proven_wrong_sibling_edges(monkeypatch, changes):
+    _, raw, _, provenance = root_world(monkeypatch, missingPane=True, **changes)
+    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+        forms._entry_safety(raw.current, lambda url: True, provenance)

@@ -158,7 +158,10 @@ label {display:block} .clipped {position:absolute;width:1px;height:1px;clip:rect
 <label class="ashby-application-form-question-title" for="additional">Additional information</label>
 <textarea id="additional" class="ashby-application-form-input-textarea"></textarea></div>
 </div><button class="ashby-application-form-submit-button">Submit application</button>
-</div></body></html>'''
+</div>
+<iframe src="https://www.recaptcha.net/recaptcha/enterprise/anchor" style="display:none"></iframe>
+<iframe src="https://www.recaptcha.net/recaptcha/enterprise/bframe" style="display:none"></iframe>
+<div><iframe style="display:none"></iframe></div></body></html>'''
 
 
 _FORM = _entry_form()
@@ -461,7 +464,7 @@ class _SyntheticRun:
         state = self
         async def diagnose(observed):
             field = 'greenhouse' if state.greenhouse else 'entry'
-            admitted = {'R'} if state.greenhouse else {'H', 'R', 'W', 'X'}
+            admitted = {'R'} if state.greenhouse else {'H', 'R', 'W', 'X', 'Z'}
             rejected = [f for f in (observed or {}).get(field, {}).get('frames', [])
                         if f.get('status') not in admitted]
             if (isinstance(observed, dict) and (
@@ -543,7 +546,7 @@ class _SyntheticRun:
                             state.entry_initial_not_ready = not structural.get('root')
                         state.observe_page(observed)
                         await diagnose(observed)
-                    elif any(f.get('status') not in ({'R'} if state.greenhouse else {'H','R','W','X'})
+                    elif any(f.get('status') not in ({'R'} if state.greenhouse else {'H','R','W','X','Z'})
                              for f in frames):
                         await diagnose(observed)
                     state.entry_observations.append({

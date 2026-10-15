@@ -1480,6 +1480,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         await session.call('click', current['selector'])
         latest = await session.page()
         latest, latest_witness = await _observe_controls(session, latest)
+        if provenance is not None and not _alias_current(
+            provenance, fixture_context=ctx):
+            raise Gate('The verified posting changed while opening the picker; '
+                       'inspect the current configured board and tracked job manually.')
         current = control(latest, action)
         if (_combobox_stable_identity(current) != stable
                 or (current.get('combobox') or {}).get('link_id') != link_id

@@ -53,10 +53,10 @@ class _ServedFormInventory(HTMLParser):
         attrs = dict(attrs)
         if tag == "div":
             self.div_depth += 1
-            if "form-group" in attrs.get("class", "").split():
+            if {'form-group', 'phone-input__country'} & set(attrs.get('class', '').split()):
                 self.groups.append({"depth": self.div_depth, "question": ""})
         group = self.groups[-1] if self.groups else None
-        if attrs.get("data-automation-id") == "formLabel" and group:
+        if (attrs.get('data-automation-id') == 'formLabel' or attrs.get('id') == 'country-label') and group:
             self.label_group = group
             self.label_parts = []
         typ = attrs.get("role") or (
@@ -69,7 +69,7 @@ class _ServedFormInventory(HTMLParser):
                 "label": group["question"] or attrs.get("name", ""),
                 "question": group["question"],
                 "type": typ, "tag": tag, "required": False,
-                "in_form": True, "form_selector": "#synthetic-form",
+                "in_form": True, "form_selector": "#application-form",
                 "form_action": fixture.URL,
             })
 
@@ -151,7 +151,7 @@ def test_positive_approval_grants_match_live_group_question(authority):
     page = synthetic_page()
     target = next(item for item in page["controls"]
                   if item["selector"] == "#name")
-    target.update(question="Name", form_selector="#synthetic-form",
+    target.update(question="Name", form_selector="#application-form",
                   form_action=fixture.URL)
     forms.exact_approval(
         fixture.PK, "Name", fixture._FACTS["Name"], target=target,
@@ -190,14 +190,14 @@ def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
 async def test_fixture_orders_combos_before_the_ungranted_gate(authority):
     page = served_fixture_page()
     selectors = [control["selector"] for control in page["controls"]]
-    combo_selectors = list(fixture._COMBO_SELECTORS.values())
+    combo_selectors = list(fixture._CHOICE_SELECTORS.values())
     assert selectors.index("#name") < min(selectors.index(s) for s in combo_selectors)
     assert max(selectors.index(s) for s in combo_selectors) < selectors.index("#additional")
 
     authority.enable_positive_fixture()
     actions = [
         await authority.decision("", page, [], model="synthetic-fixture")
-        for _ in range(7)
+        for _ in range(8)
     ]
     assert [action["selector"] for action in actions] == [
         "#name", *combo_selectors, "#phone", "#additional"]
@@ -269,7 +269,7 @@ def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
         for key in fixture._MACHINE_VALUES
     }
     assert all(item["outcome"] == "committed"
-               for item in state.combo_observations.values())
+               for key, item in state.combo_observations.items() if key in fixture._MACHINE_VALUES)
 
     location = next(c for c in page["controls"] if c["selector"] == "#location")
     location["combobox"]["hidden_value"] = "OTHER_CITY"

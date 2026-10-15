@@ -28,14 +28,16 @@ _COMBO_SELECTORS = {
     'Where are you located?': '#location',
     'School': '#school', 'Degree': '#degree', 'Discipline': '#discipline',
 }
+_CHOICE_SELECTORS = {**_COMBO_SELECTORS, 'Country': '#country'}
 _FACTS = {
     'Name': 'Test User', 'Additional question': 'Synthetic answer',
     'Where are you located?': 'Synthetic Example City',
     'School': 'Synthetic School', 'Degree': 'Synthetic Degree',
     'Discipline': 'Synthetic Discipline', 'Phone': '+12025550123',
+    'Country': 'Synthetic Country',
 }
 _MACHINE_VALUES = {key: _FACTS[key] for key in _COMBO_SELECTORS}
-_OPTION_SELECTORS = {selector+'-option': key for key, selector in _COMBO_SELECTORS.items()}
+_OPTION_SELECTORS = {selector+'-option': key for key, selector in _CHOICE_SELECTORS.items()}
 _HIDDEN_SELECTORS = {key: selector+'-code' for key, selector in _COMBO_SELECTORS.items()}
 
 
@@ -55,6 +57,9 @@ def _closed_form() -> bytes:
 <input type="hidden" id="{name}-code" name="{name}_value"></div>''')
     fillers = ''.join(f'<input id="filler-{i}" name="filler_{i}" aria-label="Optional synthetic {i}">'
                       for i in range(24))
+    picker_options = ''.join(
+        f'<li id="iti-0__item-synthetic-{i}" class="iti__country" role="option">Synthetic {i}</li>'
+        for i in range(244))
     return ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Synthetic application</title>
 <style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
@@ -62,38 +67,62 @@ def _closed_form() -> bytes:
 <p>Offline fixture for synthetic example-co facts only. No real person or employer.
 This form is served only by the daemon's --synthetic-browser-fixture mode.
 It has no external links, cross-origin resources, redirects or real ATS connection.</p>
-<form id="synthetic-form" class="ashby-application-form" data-synthetic-tenant="example-co.test"
+<form id="application-form" class="application--form" data-synthetic-tenant="example-co.test"
  method="POST" enctype="multipart/form-data"
  action="http://127.0.0.1:18789/fixture/example-co/job/1">
 <div class="form-group"><label for="name" data-automation-id="formLabel">Name</label>
 <input id="name" name="name"></div>
 <label for="resume">Résumé</label><input id="resume" name="resume" type="file" required>
 ''' + ''.join(fields) + '''
-<div class="form-group"><label for="phone" data-automation-id="formLabel">Phone</label>
-<div id="telephone" class="iti"><input id="phone" name="phone" type="tel">
-<div class="iti__country-container"><button id="country-button" type="button" class="iti__selected-country">Country</button></div>
-<div class="iti__dropdown-content" hidden>
-<input class="iti__search-input" role="combobox" id="country-search">
-<ul class="iti__country-list" role="listbox" id="country-list">
-<li class="iti__country" role="option" id="country-option">Synthetic country</li></ul></div></div></div>
+<div class="application--questions"><div><fieldset class="phone-input"><legend>Phone</legend>
+<div class="phone-input__country"><div class="select"><div class="select__container">
+<div class="select-shell"><div id="country-owner">
+<label id="country-label" for="country">Country</label>
+<div class="select__control"><div id="country-value" class="select__value-container">
+<div class="select__input-container"><input id="country" type="text" class="select__input"
+ role="combobox" autocomplete="off" tabindex="0" aria-autocomplete="list" aria-expanded="false"
+ aria-haspopup="true" aria-required="true" aria-invalid="false" aria-labelledby="country-label"
+ aria-describedby="react-select-country-placeholder country-error" aria-errormessage="country-error"
+ aria-activedescendant=""></div><div id="react-select-country-placeholder" class="select__placeholder">Choose</div>
+</div></div><span id="country-error"></span></div></div></div></div></div>
+<div class="phone-input__phone"><div class="text-input-wrapper"><div class="input-wrapper">
+<div id="telephone" class="iti iti--allow-dropdown iti--show-flags iti--inline-dropdown">
+<div class="iti__country-container" hidden>
+<button id="country-button" type="button" class="iti__selected-country" aria-haspopup="dialog"
+ aria-expanded="false" aria-controls="iti-0__dropdown-content" aria-label="Select country">
+<div class="iti__selected-country-primary"><div class="iti__flag iti__globe"></div>
+<div class="iti__arrow" aria-hidden="true"></div></div></button>
+<div id="iti-0__dropdown-content" class="iti__dropdown-content iti__hide" role="dialog" aria-modal="true" hidden>
+<div class="iti__search-input-wrapper"><span class="iti__search-icon" aria-hidden="true"><svg></svg></span>
+<input id="iti-0__search-input" class="iti__search-input" type="search" role="combobox"
+ aria-expanded="true" aria-controls="iti-0__country-listbox" aria-autocomplete="list" autocomplete="off">
+<button id="country-clear" class="iti__search-clear iti__hide" type="button" tabindex="-1" hidden>Clear search</button></div>
+<span class="iti__a11y-text"></span><div class="iti__no-results iti__hide" aria-hidden="true"></div>
+<ul id="iti-0__country-listbox" class="iti__country-list" role="listbox">''' + picker_options + '''</ul></div></div>
+<input id="phone" class="input input__single-line iti__tel-input" type="tel" aria-label="Phone"
+ aria-required="true" aria-invalid="false" autocomplete="off" data-intl-tel-input-id="0"
+ aria-describedby="phone-description phone-error phone-help" aria-errormessage="phone-error">
+</div></div></div><span id="phone-description"></span><span id="phone-error"></span><span id="phone-help"></span>
+</div></fieldset></div></div>
 <div class="form-group"><label for="additional" data-automation-id="formLabel">Additional question</label>
 <textarea id="additional" name="additional"></textarea></div>
 ''' + fillers + '''<button id="submit" type="submit">Submit application</button></form>
 <script>
-const answers = ''' + json.dumps({s[1:]: _FACTS[k] for k, s in _COMBO_SELECTORS.items()}) + ''';
+const answers = ''' + json.dumps({s[1:]: _FACTS[k] for k, s in _CHOICE_SELECTORS.items()}) + ''';
 for (const [id,answer] of Object.entries(answers)) {
  const input=document.getElementById(id);
  input.addEventListener('click',()=>{
   if(input.getAttribute('aria-expanded')==='true')return;
   const list=document.createElement('div');list.id=id+'-options';list.setAttribute('role','listbox');
   const option=document.createElement('div');option.id=id+'-option';
-  option.setAttribute('role','option');option.setAttribute('data-value',answer);option.textContent=answer;
-  list.append(option);document.body.append(list);
+  option.setAttribute('role','option');if(id!=='country')option.setAttribute('data-value',answer);option.textContent=answer;
+  list.append(option);(id==='country'?document.getElementById('country-owner'):document.body).append(list);
   input.setAttribute('aria-expanded','true');input.setAttribute('aria-controls',list.id);
   option.addEventListener('click',()=>{
    const display=document.getElementById(id+'-value').lastElementChild;
    display.className='react-select__single-value';display.textContent=option.innerText;
-   document.getElementById(id+'-code').value=option.getAttribute('data-value');
+   if(id!=='country')document.getElementById(id+'-code').value=option.getAttribute('data-value');
+   else {input.setAttribute('aria-describedby','country-error');input.setAttribute('aria-invalid','false');}
    input.value='';input.setAttribute('aria-expanded','false');input.removeAttribute('aria-controls');list.remove();
   });
  });
@@ -212,18 +241,18 @@ class _SyntheticRun:
             'Name': ('#name', 'Name', 'Name', 'input', 'text'),
             'Phone': ('#phone', 'Phone', 'Phone', 'input', 'tel'),
             **{key: (selector, key, key, 'input', 'combobox')
-               for key, selector in _COMBO_SELECTORS.items()},
+               for key, selector in _CHOICE_SELECTORS.items()},
         }
         for key, (selector, label, question, tag, typ) in specs.items():
             self.row["human_approved_answers"][key] = {
                 "value": _FACTS[key], "selector": selector, "label": label,
                 "question": question, "url": URL, "tag": tag, "type": typ,
-                "form_selector": "#synthetic-form", "form_action": URL,
+                "form_selector": "#application-form", "form_action": URL,
             }
 
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
         return (('fill', '#name', '--value', _FACTS['Name']),
-                *(ipc for selector in _COMBO_SELECTORS.values()
+                *(ipc for selector in _CHOICE_SELECTORS.values()
                   for ipc in (('click', selector), ('click', selector+'-option'))),
                 ('fill', '#phone', '--value', _FACTS['Phone']))
 
@@ -233,6 +262,19 @@ class _SyntheticRun:
         self.committed = {}
         self.combo_observations = {}
         controls = observed.get("controls", []) if isinstance(observed, dict) else []
+        country = [c for c in controls if c.get('selector') == '#country']
+        combo = country[0].get('combobox') or {} if len(country) == 1 else {}
+        country_ok = ('Country' in self.combo_touched
+                      and combo.get('receiverless_country') is True
+                      and combo.get('selected_text') == _FACTS['Country']
+                      and combo.get('displayed_text') == _FACTS['Country']
+                      and not any(k in combo for k in ('hidden_selector', 'hidden_value', 'selected_value')))
+        self.combo_observations['Country'] = {
+            'outcome': ('not_reached' if 'Country' not in self.combo_touched else
+                        'committed' if country_ok else 'not_committed'),
+            'selected_text': combo.get('selected_text', ''),
+            'displayed_text': combo.get('displayed_text', ''),
+        }
         for key, selector in _COMBO_SELECTORS.items():
             if key not in self.combo_touched:
                 self.combo_observations[key] = {
@@ -312,7 +354,7 @@ class _SyntheticRun:
         actions = (
             {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
             *({'action': 'combobox', 'selector': selector, 'fact': key}
-              for key, selector in _COMBO_SELECTORS.items()),
+              for key, selector in _CHOICE_SELECTORS.items()),
             {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
             {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},
         )
@@ -404,11 +446,11 @@ class _SyntheticRun:
                     raise PermissionError("Fixture attachment is not the staged synthetic PDF.")
                 if args[0] == "click" and args[1] in _OPTION_SELECTORS:
                     key = _OPTION_SELECTORS[args[1]]
-                    selector = _COMBO_SELECTORS[key]
+                    selector = _CHOICE_SELECTORS[key]
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
                 await raw.call(*args, **kwargs)
-                for key, selector in _COMBO_SELECTORS.items():
+                for key, selector in _CHOICE_SELECTORS.items():
                     if (args[0] in {"click", "fill"} and len(args) > 1
                             and (args[1] == selector
                                  or _OPTION_SELECTORS.get(args[1]) == key)):
@@ -419,11 +461,11 @@ class _SyntheticRun:
                     state.input_values[args[1]] = args[3]
                 elif args[0] == "upload":
                     state.uploaded = True
-                elif args[0] == 'click' and args[1] in _COMBO_SELECTORS.values():
+                elif args[0] == 'click' and args[1] in _CHOICE_SELECTORS.values():
                     state.open_controls.add(args[1])
                 elif args[0] == "click" and args[1] in _OPTION_SELECTORS:
                     key = _OPTION_SELECTORS[args[1]]
-                    selector = _COMBO_SELECTORS[key]
+                    selector = _CHOICE_SELECTORS[key]
                     state.open_controls.discard(selector)
 
         return _Closed()
@@ -507,12 +549,12 @@ def run() -> int:
                                      for key, value in _MACHINE_VALUES.items()}
                 # Four choices and exact tel precede the unapproved optional field.
                 expected_fills = 2
-                expected_decisions = 7
+                expected_decisions = 8
                 phone = [c for c in (state.last_page or {}).get('controls', [])
                          if c.get('selector') == '#phone']
                 phone_ok = len(phone)==1 and phone[0].get('value')==_FACTS['Phone']
                 from tools.browser_skill_apply import _check_closed_commit, control, Gate
-                receipt_ok = len(state.widget_receipts) == 4
+                receipt_ok = len(state.widget_receipts) == 5
                 try:
                     for receipt in state.widget_receipts:
                         _check_closed_commit(control(state.last_page, receipt),
@@ -526,6 +568,8 @@ def run() -> int:
                       and state.committed == expected_commits
                       and phone_ok
                       and receipt_ok
+                      and state.combo_observations['Country']['outcome'] == 'committed'
+                      and state.ipc_index == len(state._positive_ipc())
                       and state.last_page.get('inventory_verified') is True
                       and state.last_page.get('opaque_controls') is False
                       and all(state.combo_observations.get(key, {}).get("outcome")
@@ -559,6 +603,7 @@ def run() -> int:
                         "reason": "no BrowserSkill interaction reached this combobox",
                     })
                     outcomes.append({"field": key, **observation})
+                outcomes.append({'field': 'Country', **state.combo_observations['Country']})
                 outcomes.append({
                     "field": "Résumé",
                     "outcome": "uploaded" if state.uploaded else "not_reached",
@@ -595,7 +640,7 @@ def run() -> int:
                     "kind": result.get("reason") or result.get("status"),
                     "field": {selector: field for field, selector in (
                         *field_selectors.items(),
-                        *_COMBO_SELECTORS.items(),
+                        *_CHOICE_SELECTORS.items(),
                     )}.get(form_question.get("selector")),
                     "reason": result.get("question") or result.get("detail"),
                 }
@@ -612,6 +657,7 @@ def run() -> int:
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),
                                   'phone_exact_readback': phone_ok,
+                                  'receiverless_country': state.combo_observations['Country'],
                                   'receipt_exact_readbacks': receipt_ok,
                                   'widget_receipts': state.widget_receipts,
                                   'picker_ipc': 0, 'continue_ipc': 0,

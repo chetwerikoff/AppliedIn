@@ -16,6 +16,41 @@ _WIDGET_GRAPH = r"""
   };
   const placeholderBranch = e => attr(e, 'class').split(/\s+/)
     .some(s=>s.endsWith('__placeholder') || /(?:^|-)placeholder$/.test(s));
+  const countryGraph = (e, L, F, form, phase) => {
+    // This receiverless authority belongs to the observed phone field only.
+    const chain = ['input.select__input','div.select__input-container',
+      'div.select__value-container','div.select__control','div','div.select-shell',
+      'div.select__container','div.select','div.phone-input__country',
+      'fieldset.phone-input','div','div.application--questions','form'];
+    const path = []; let n=e;
+    for (const shape of chain) {
+      if (!n || !n.matches(shape) || nativeForm(n)!==form || !uniqueNode(n)) return null;
+      path.push(n); n=n.parentElement;
+    }
+    const fieldset=path[9], branches=Array.from(fieldset.children);
+    if (e.id!=='country' || byId('country')!==e || form.id!=='application-form' || path[12]!==form ||
+        document.querySelectorAll('fieldset.phone-input').length!==1 ||
+        branches.length!==3 || branches.filter(x=>x.tagName==='LEGEND').length!==1 ||
+        branches.filter(x=>x.matches('div.phone-input__country')).length!==1 ||
+        branches.filter(x=>x.matches('div.phone-input__phone')).length!==1 ||
+        !path[8].contains(F) || L.tagName!=='LABEL' || L.id!=='country-label' ||
+        attr(L,'for')!==e.id || document.querySelectorAll('label[for="country"]').length!==1 ||
+        fieldset.querySelectorAll('input[type="hidden"]').length ||
+        e.type!=='text' || attr(e,'autocomplete')!=='off' || attr(e,'tabindex')!=='0' ||
+        attr(e,'aria-required')!=='true' || !['true','false'].includes(attr(e,'aria-invalid')) ||
+        !e.hasAttribute('aria-activedescendant') ||
+        !attr(e,'aria-describedby') || !attr(e,'aria-errormessage')) return null;
+    // Mutable error/placeholder references are current safety evidence, not identity.
+    for (const k of ['aria-describedby','aria-errormessage']) {
+      for (const id of attr(e,k).split(/\s+/)) {
+        const ref=byId(id);
+        if (!ref || nativeForm(ref)!==form || !path[8].contains(ref)) return null;
+      }
+    }
+    if (phase!=='C1' && (e.hasAttribute('aria-controls') || e.hasAttribute('aria-owns') ||
+        attr(e,'aria-activedescendant') || e.value)) return null;
+    return path.map(selector);
+  };
   const closedGraph = e => {
     if (e.tagName !== 'INPUT' || attr(e,'role') !== 'combobox' || !visible(e) ||
         attr(e,'aria-haspopup') !== 'true' || attr(e,'aria-autocomplete') !== 'list') return null;
@@ -46,10 +81,14 @@ _WIDGET_GRAPH = r"""
     const noLinks = !attr(e,'aria-controls') && !attr(e,'aria-owns') && !attr(e,'aria-activedescendant');
     const phase = expanded==='true' ? 'C1' : expanded==='false' && noLinks ? (token ? 'C2' : 'C0') : '';
     if (!phase) return null;
+    const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
+    if (e.id==='country' && e.closest('fieldset.phone-input') && !country) return null;
     return {mode:'closed-react-select',phase,label_selector:selector(L),
       field_selector:selector(F),value_container_selector:selector(V),
-      input_wrapper_selector:selector(W),hidden_selector:H ? selector(H) : '',
-      hidden_value:H ? H.value : '',selected_value:H ? H.value : '',
+      input_wrapper_selector:selector(W),hidden_selector:country ? undefined : H ? selector(H) : '',
+      hidden_value:country ? undefined : H ? H.value : '',
+      selected_value:country ? undefined : H ? H.value : '',
+      ...(country ? {receiverless_country:true,country_graph:country} : {}),
       selected_text:token ? display[0].innerText : '',
       displayed_text:token ? display[0].innerText : ''};
   };
@@ -79,6 +118,7 @@ _WIDGET_GRAPH = r"""
     const claims = popupClaims(e);
     if (!claims?.length || claims.some(n=>n!==claims[0])) return null;
     const list = claims[0], form = nativeForm(e);
+    if (newGraphs.get(e).receiverless_country && nativeForm(list)!==form) return null;
     if (!visible(list) || (nativeForm(list) && nativeForm(list)!==form) ||
         list.parentElement?.closest('[role="listbox"]') || list.querySelectorAll('[role="listbox"]').length) return null;
     const options = Array.from(list.querySelectorAll('[role="option"]'));
@@ -99,27 +139,69 @@ _WIDGET_GRAPH = r"""
     return Array.from(o.querySelectorAll('*')).some(dangerous);
   };
   const pickerParts = new Set();
+  // Failed ITI ownership must not fall through to legacy popup omission.
+  const pickerCandidate = e => !!e.closest('.iti,.iti__dropdown-content') ||
+    e.matches('.iti__search-input,.iti__country-list');
   for (const wrapper of document.querySelectorAll('.iti')) {
     const form = nativeForm(wrapper), tels = Array.from(wrapper.querySelectorAll('input[type="tel"]'));
-    if (!form || !uniqueNode(wrapper) || wrapper.parentElement?.closest('.iti') ||
-        wrapper.querySelectorAll('.iti').length || tels.length!==1 || nativeForm(tels[0])!==form) continue;
-    const one = (root, q) => { const a=Array.from(root.querySelectorAll(q)); return a.length===1 ? a[0] : null; };
-    const container = one(wrapper,'.iti__country-container');
-    const button = container && one(container,'.iti__selected-country');
-    const dropdown = one(wrapper,'.iti__dropdown-content');
-    const search = dropdown && one(dropdown,'.iti__search-input');
-    const list = dropdown && one(dropdown,'.iti__country-list');
-    if (!button || button.tagName!=='BUTTON' || button.type!=='button' ||
-        button.hasAttribute('formaction') || button.closest('a[href]') ||
-        !search || search.tagName!=='INPUT' || !['text','search'].includes(search.type) ||
-        attr(search,'role')!=='combobox' || !list || attr(list,'role')!=='listbox' ||
-        [container,dropdown].some(n=>n.tagName!=='DIV' || attr(n,'role')) ||
-        container.parentElement!==wrapper || dropdown.parentElement!==wrapper ||
-        button.parentElement!==container || search.parentElement!==dropdown || list.parentElement!==dropdown) continue;
-    const options = Array.from(list.querySelectorAll('.iti__country'));
-    const parts = [container,button,dropdown,search,list,...options];
-    if (parts.some(n=>nativeForm(n)!==form || !uniqueNode(n)) ||
-        options.some(n=>attr(n,'role')!=='option' || n.closest('[role="listbox"]')!==list || unsafeOption(n))) continue;
+    if (!form || !uniqueNode(wrapper) || !visible(wrapper) || wrapper.parentElement?.closest('.iti') ||
+        wrapper.querySelectorAll('.iti').length || tels.length!==1 || !visible(tels[0]) ||
+        tels[0].parentElement!==wrapper || nativeForm(tels[0])!==form) continue;
+    const one = (root,q) => { const a=Array.from(root.querySelectorAll(q)); return a.length===1 ? a[0] : null; };
+    // A locally valid picker elsewhere is not the witnessed phone-fieldset decoration.
+    const inputWrapper=wrapper.parentElement, textWrapper=inputWrapper?.parentElement;
+    const phoneBranch=textWrapper?.parentElement, fieldset=phoneBranch?.parentElement;
+    if (document.querySelectorAll('.iti').length!==1 ||
+        document.querySelectorAll('input[type="tel"]').length!==1 ||
+        tels[0].id!=='phone' || byId('phone')!==tels[0] ||
+        !inputWrapper?.matches('div.input-wrapper') ||
+        !textWrapper?.matches('div.text-input-wrapper') ||
+        !phoneBranch?.matches('div.phone-input__phone') ||
+        !fieldset?.matches('fieldset.phone-input') || nativeForm(fieldset)!==form ||
+        form.id!=='application-form' || byId('application-form')!==form ||
+        one(form,'fieldset.phone-input')!==fieldset ||
+        one(fieldset,'.phone-input__phone')!==phoneBranch) continue;
+    const container=one(wrapper,'.iti__country-container');
+    const button=container && one(container,'.iti__selected-country');
+    const dialog=container && one(container,'.iti__dropdown-content');
+    const searchWrapper=dialog && one(dialog,'.iti__search-input-wrapper');
+    const search=searchWrapper && one(searchWrapper,'.iti__search-input');
+    const clear=searchWrapper && one(searchWrapper,'.iti__search-clear');
+    const list=dialog && one(dialog,'.iti__country-list');
+    if (!container || !button || !dialog || !searchWrapper || !search || !clear || !list ||
+        container.tagName!=='DIV' || attr(container,'role') || container.parentElement!==wrapper ||
+        container.children.length!==2 || button.parentElement!==container || dialog.parentElement!==container ||
+        button.tagName!=='BUTTON' || button.type!=='button' || attr(button,'aria-haspopup')!=='dialog' ||
+        attr(button,'aria-expanded')!=='false' || !dialog.id || byId(attr(button,'aria-controls'))!==dialog ||
+        dialog.tagName!=='DIV' || attr(dialog,'role')!=='dialog' || attr(dialog,'aria-modal')!=='true' ||
+        searchWrapper.tagName!=='DIV' || searchWrapper.parentElement!==dialog ||
+        search.tagName!=='INPUT' || search.type!=='search' || attr(search,'role')!=='combobox' ||
+        search.parentElement!==searchWrapper || attr(search,'aria-expanded')!=='true' ||
+        attr(search,'aria-autocomplete')!=='list' || attr(search,'autocomplete')!=='off' ||
+        !list.id || byId(attr(search,'aria-controls'))!==list ||
+        clear.tagName!=='BUTTON' || clear.type!=='button' || clear.parentElement!==searchWrapper ||
+        list.tagName!=='UL' || attr(list,'role')!=='listbox' || list.parentElement!==dialog) continue;
+    const options=Array.from(list.querySelectorAll('[role="option"]'));
+    const parts=[container,...container.querySelectorAll('*')];
+    const structural=new Set([container,button,dialog,searchWrapper,search,clear,list,...options]);
+    const auxiliary=n => {
+      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE'].includes(n.tagName.toUpperCase()) ||
+          attr(n,'role') || n.matches('input,button,a,select,textarea,[contenteditable]')) return false;
+      if (button.contains(n) || options.some(o=>o.contains(n))) return true;
+      if (n.parentElement===dialog) return n.matches('span.iti__a11y-text,div.iti__no-results');
+      const icon=n.closest('.iti__search-icon');
+      return !!icon && icon.parentElement===searchWrapper;
+    };
+    const claimants=Array.from(document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]'));
+    if (options.length!==244 || list.children.length!==244 ||
+        options.some(n=>n.tagName!=='LI' || !n.matches('.iti__country') || n.parentElement!==list || !n.id) ||
+        parts.some(n=>nativeForm(n)!==form || !uniqueNode(n) || (n.id && byId(n.id)!==n) || n.getClientRects().length ||
+          unsafeOption(n) || (!structural.has(n) && !auxiliary(n))) ||
+        wrapper.querySelectorAll(editable).length!==2 ||
+        claimants.some(n=>['aria-controls','aria-owns','aria-activedescendant'].some(k=>
+          attr(n,k).split(/\s+/).filter(Boolean).some(id=>parts.some(p=>p.id===id) &&
+            !((n===button && k==='aria-controls' && id===dialog.id) ||
+              (n===search && k==='aria-controls' && id===list.id)))))) continue;
     parts.forEach(n=>pickerParts.add(n));
   }
 """
@@ -166,7 +248,11 @@ PAGE = r"""(() => {
     return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
       ? matches[0] : null;
   };
-  const currentListbox = e => newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
+  const currentListbox = e => {
+    if (pickerCandidate(e)) return null;
+    const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
+    return list && !pickerCandidate(list) ? list : null;
+  };
   const controls = nodes.filter(e => !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
@@ -248,13 +334,15 @@ PAGE = r"""(() => {
   const linkedComboboxes = Array.from(document.querySelectorAll('[role="combobox"]'))
     .filter(e => {
       if (pickerParts.has(e)) return true;
+      if (pickerCandidate(e)) return false;
       if (newGraphs.get(e)) {
-        const list = closedPopup(e);
+        const list = currentListbox(e);
         if (newGraphs.get(e).phase==='C1' && !list) return false;
         if (list) { linkedParts.add(list); list.querySelectorAll('[role="option"]').forEach(o=>linkedParts.add(o)); }
         return true;
       }
-      const list = linkedListbox(e);
+      if (e.id==='country' && e.closest('fieldset.phone-input')) return false;
+      const list = currentListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;
       // Only a genuinely absent target is a provisional closed picker.

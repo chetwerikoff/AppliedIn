@@ -2699,6 +2699,9 @@ def _badge_response(change=None, script=None):
 @pytest.mark.parametrize('reader', ['page', 'witness'])
 def test_greenhouse_exact_badge_textarea_is_never_read_or_exported(reader):
     script = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    assert 'nodes.filter(e => !excluded.has(e) &&' in forms.GREENHOUSE_PAGE, 'PAGE exclusion rewrite drifted'
+    assert 'Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&' in forms._GREENHOUSE_FIXED_CONTROL_WITNESS, 'witness exclusion rewrite drifted'
+    assert "Array.from(document.querySelectorAll('[role=\"combobox\"]')).filter(e=>!excluded.has(e))" in script, 'graph exclusion rewrite drifted'
     observed = _badge_response(script=script)
     _gh_safe(observed)
     assert observed['greenhouse']['response_controls'] is False

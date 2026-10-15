@@ -295,7 +295,7 @@ async def test_receiverless_history_never_compares_nonexistent_transport(phone_g
     forms.check_approvals('example-co#1', [receipt], page)
 
 
-def test_served_fixture_html_itself_passes_production_readers_offline():
+def served_fixture_dom():
     # Parse the actual served bytes: no HTTP server, network or second fixture.
     from html.parser import HTMLParser
     from tools import browser_skill_fixture as fixture
@@ -321,7 +321,11 @@ def test_served_fixture_html_itself_passes_production_readers_offline():
                 self.stack[-1]['text'] += text
     tree = Tree()
     tree.feed(fixture._FORM.decode())
-    snapshot = dom(fixtureTree=tree.root, fixtureUrl=fixture.URL)
+    return dom(fixtureTree=tree.root, fixtureUrl=fixture.URL)
+
+
+def test_served_fixture_html_itself_passes_production_readers_offline():
+    snapshot = served_fixture_dom()
     assert snapshot['page']['inventory_verified'] is True
     assert snapshot['page']['opaque_controls'] is False
     assert snapshot['page']['truncated'] is False
@@ -376,3 +380,20 @@ def test_picker_exemption_requires_one_exact_phone_branch(scenario):
         if scenario == 'secondIti':
             assert {'#second-country-button', '#second-country-search',
                     '#second-picker-option-0'} <= selectors
+
+
+@pytest.mark.parametrize('scenario', [
+    {'countryCaption': 'approved country'}, {'countryCodes': {'data-value': 'CODE'}},
+])
+async def test_genuine_country_option_failure_keeps_country_commit_cause(phone_grants, scenario):
+    session = PhoneSession(requiredProxy=True, **scenario)
+    with pytest.raises(forms.Gate, match='receiverless country commitment'):
+        await choose_country(session, phone_grants[0])
+    assert session.calls == [('click', '#country')]
+
+
+def test_genuine_country_option_linkage_failure_keeps_country_commit_cause():
+    target = combo(dom(fullPhone=True, phases={'country': 'C1'}), 'country')
+    target['combobox']['options'] = []
+    with pytest.raises(forms.Gate, match='receiverless country commitment'):
+        forms._combobox_options(target)

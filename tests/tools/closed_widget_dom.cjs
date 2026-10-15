@@ -4,26 +4,27 @@ const nodes = [];
 function make(tag,id,attrs={},parent=null,text='') {
   const n = {tagName:tag.toUpperCase(),id,nodeType:1,parentElement:parent,children:[],
     attrs, value:attrs.value || '',name:attrs.name || '',type:attrs.type || (tag==='input'?'text':tag==='button'?'submit':''),
-    disabled:false,required:!!attrs.required,readOnly:false,checked:false,labels:[],
+    disabled:false,required:Object.hasOwn(attrs,'required'),readOnly:false,checked:false,labels:[],
     getAttribute:k=>Object.hasOwn(attrs,k)?attrs[k]:null,hasAttribute:k=>Object.hasOwn(attrs,k),
     matches:q=>matches(n,q),contains:o=>{for(let p=o;p;p=p.parentElement)if(p===n)return true;return false;},
     closest:q=>{for(let p=n;p;p=p.parentElement)if(matches(p,q))return p;return null;},
     querySelectorAll:q=>nodes.filter(o=>o!==n&&n.contains(o)&&matches(o,q)),
     querySelector:q=>n.querySelectorAll(q)[0]||null,
     getClientRects:()=>n.closest('[hidden]')||n.type==='hidden'?[]:[{width:120,height:24,right:120,bottom:24}]};
-  Object.defineProperty(n,'form',{get:()=>tag==='input'||tag==='button'||tag==='textarea'?n.closest('form'):undefined});
+  Object.defineProperty(n,'attributes',{get:()=>Object.keys(attrs).map(name=>({name,value:attrs[name]}))});
+  Object.defineProperty(n,'form',{get:()=>Object.hasOwn(n,'formOwner')?n.formOwner:tag==='input'||tag==='button'||tag==='textarea'?n.closest('form'):undefined});
   Object.defineProperty(n,'innerText',{get:()=>text+n.children.map(c=>c.innerText).join('')});
   if(parent)parent.children.push(n);nodes.push(n);return n;
 }
 function matches(n,q){return q.split(',').some(s=>{
   s=s.trim();if(s==='*')return true;if(s===':disabled')return n.disabled;
-  if(s.includes(':nth-of-type(')){
+  if(s.includes(':nth-of-type(')||s.includes(':nth-child(')){
     let p=n;
     for(const part of s.split(' > ').reverse()){
-      const m=part.match(/^([a-z]+):nth-of-type\((\d+)\)$/);
-      if(!m||!p||p.tagName!==m[1].toUpperCase())return false;
-      const sib=p.parentElement?p.parentElement.children.filter(x=>x.tagName===p.tagName):[p];
-      if(sib.indexOf(p)+1!==Number(m[2]))return false;p=p.parentElement;
+      const m=part.match(/^([a-z]+|\*):nth-(of-type|child)\((\d+)\)$/);
+      if(!m||!p||(m[1]!=='*'&&p.tagName!==m[1].toUpperCase()))return false;
+      const sib=p.parentElement?p.parentElement.children.filter(x=>m[2]==='child'||x.tagName===p.tagName):[p];
+      if(sib.indexOf(p)+1!==Number(m[3]))return false;p=p.parentElement;
     }
     return !p;
   }
@@ -41,11 +42,35 @@ function matches(n,q){return q.split(',').some(s=>{
 const root=make('html','root'),body=make('body','body',{},root);
 const form=make('form','application',{},body);form.action='https://example-co.test/job/1';
 const keys=['location','school','degree','discipline'];
+function proxyFor(key,input,F,shell,phase){
+  if(!scenario.requiredProxy)return;
+  input.attrs['aria-required']='true';
+  const change=scenario.proxyMutation?.key===key?scenario.proxyMutation:{};
+  if(change.ownerAttr){const [k,v]=change.ownerAttr;if(v===null)delete input.attrs[k];else input.attrs[k]=v;}
+  if(phase==='C2'&&!change.mounted)return;
+  const attrs={required:'',tabindex:'-1','aria-hidden':'true',class:'validation-only'};
+  if(change.attr){const [k,v]=change.attr;if(v===null)delete attrs[k];else attrs[k]=v;}
+  if(change.shellCount)make('div','extra-shell',{class:'select-shell'},F);
+  if(change.shellNested){
+    shell.parentElement.children.splice(shell.parentElement.children.indexOf(shell),1);
+    const wrapper=make('div','shell-parent',{},F);shell.parentElement=wrapper;wrapper.children.push(shell);
+  }
+  if(change.shellOutsideControl){shell.attrs.class='ordinary';shell=make('div',key+'-proxy-shell',{class:'select-shell'},F);}
+  if(change.comboForeign)input.formOwner=null;
+  const p=make(change.tag||'input','',attrs,change.parent==='outside'?form:change.parent==='inside'?F:shell);
+  p.proxy=true;p.value=change.value||'';
+  p.computed={opacity:'0',position:'absolute',pointerEvents:'none',...(change.style||{})};
+  if(change.foreign)p.formOwner=change.foreign==='null'?null:make('form','foreign-proxy',{},body);
+  if(change.second){const second=make('input','', {...attrs},shell);second.computed=p.computed;}
+  if(change.extra)make(change.extra==='contenteditable'?'div':'input','extra-editable',
+    change.extra==='contenteditable'?{contenteditable:'true'}:change.extra==='combobox'?{role:'combobox'}:{},F);
+}
 for(const key of keys){
   const phase=scenario.phases?.[key]||'C0';
   const field=make('div',key+'-field',{},form);
   const label=make('label',key+'-label',{},field,key);
-  const v=make('div',key+'-value',{},field);
+  const shell=scenario.requiredProxy?make('div',key+'-shell',{class:'select-shell'},field):field;
+  const v=make('div',key+'-value',{},shell);
   const w=make('div',key+'-input',{},v);
   const attrs={role:'combobox','aria-labelledby':label.id,'aria-expanded':phase==='C1'?'true':'false','aria-haspopup':'true','aria-autocomplete':'list'};
   const input=make('input',key,attrs,w);
@@ -68,6 +93,7 @@ for(const key of keys){
     if(scenario.invalidExpanded)attrs['aria-expanded']='mixed';
     if(scenario.displayQuery)v.children[1].attrs.class='ordinary-text';
   }
+  proxyFor(key,input,field,shell,phase);
   if(phase==='C1'){
     const parent=scenario.danger==='ancestor'?make('a',key+'-anchor',{href:'/away'},body):body;
     if(parent.tagName==='A')parent.href='/away';
@@ -98,7 +124,7 @@ if(scenario.fullPhone){
   const container=make('div','country-container',{class:'select__container'},select);
   const shell=make('div','country-shell',{class:'select-shell'},container);
   const owner=make('div','country-owner',{},shell);
-  const label=make('label','country-label',{for:'country'},owner,'Country');
+  const label=make('label','country-label',{for:'country'},container,'Country');
   const control=make('div','country-control',{class:'select__control'},owner);
   const v=make('div','country-value',{class:'select__value-container'},control);
   const w=make('div','country-input',{class:'select__input-container'},v);
@@ -128,6 +154,7 @@ if(scenario.fullPhone){
   if(scenario.countryNoToken)nodes.find(n=>n.id==='react-select-country-placeholder').attrs.class='ordinary-text';
   if(scenario.countryDrift)owner.id+='-changed';
   if(scenario.countryWrongChain)shell.attrs.class='wrong-shell';
+  proxyFor('country',input,container,shell,phase);
 }
 phoneParent=make('div','phone-branch',{class:'phone-input__phone'},fs);
 phoneParent=make('div','phone-text',{class:'text-input-wrapper'},phoneParent);
@@ -187,6 +214,13 @@ make('textarea','additional',{},form);
 make('input','resume',{type:'file','aria-label':'Résumé'},form);
 make('button','submit',{type:'submit'},form,'Submit application');
 for(let i=0;i<25;i++)make('input','filler-'+i,{},form);
+if(scenario.diagnostics){
+  for(let i=0;i<(scenario.diagnostics.count||1);i++){
+    let parent=form;
+    for(let d=0;d<(scenario.diagnostics.depth||0);d++)parent=make('div','deep-'+i+'-'+d,{},parent);
+    make(scenario.diagnostics.custom?'private-test-user-example-com':'canvas','test-user@example-co.test-'+i,{},parent);
+  }
+}
 if(scenario.fixtureTree){
   nodes.length=0;
   const build=(tree,parent=null)=>{
@@ -200,6 +234,7 @@ global.document={readyState:'complete',title:'Synthetic',body:nodes.find(n=>n.ta
   querySelectorAll:q=>nodes.filter(n=>matches(n,q)),querySelector:q=>nodes.find(n=>matches(n,q))||null,
   getElementById:id=>nodes.find(n=>n.id===id)||null};
 global.location={href:scenario.fixtureUrl||form.action};global.CSS={escape:s=>s};global.scrollX=0;global.scrollY=0;
-global.getComputedStyle=()=>({visibility:'visible',display:'block',opacity:'1',position:'static'});
+global.getComputedStyle=n=>({visibility:'visible',display:'block',opacity:'1',position:'static',pointerEvents:'auto',...(n.computed||{}),
+  ...(scenario.fixtureTree&&n.attrs.class==='validation-only'?{opacity:'0',position:'absolute',pointerEvents:'none'}:{})});
 const page=eval(process.argv[3]),witness=eval(process.argv[4]);
 console.log(JSON.stringify({page,witness}));

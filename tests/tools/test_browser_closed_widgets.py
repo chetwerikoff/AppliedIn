@@ -435,3 +435,234 @@ async def test_never_committed_component_times_out_without_more_ipc(monkeypatch,
     with pytest.raises(forms.Gate, match='bounded wait'):
         await choose(session, grants)
     assert session.calls == [('click', '#location'), ('click', '#location-option')]
+
+
+@pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
+def test_required_proxies_are_not_answers_or_immutable_identity(phase):
+    snapshot = dom(fullPhone=True, requiredProxy=True, phases=dict.fromkeys((*KEYS, 'country'), phase))
+    assert snapshot['page']['inventory_verified'] is True
+    assert snapshot['page']['opaque_controls'] is False
+    assert len(snapshot['page']['controls']) == len(snapshot['witness']['controls']) == 38
+    for key in ('location', 'country'):
+        target = combo(snapshot, key)
+        graph = target['combobox']
+        assert graph == next(c['combobox'] for c in snapshot['witness']['controls'] if c['selector'] == '#'+key)
+        assert graph['required_proxy_mounted'] is (phase != 'C2')
+        c0 = combo(dom(fullPhone=True, requiredProxy=True), key)
+        assert forms._closed_key(target) == forms._closed_key(c0)
+    country = combo(snapshot, 'country')['combobox']
+    assert len(country['country_graph']) == 13
+    assert country['field_selector'] == '#country-container'
+    assert not {'hidden_selector', 'hidden_value', 'selected_value'} & country.keys()
+
+
+PROXY_BAD = [
+    *({'attr': [k, None]} for k in ('required', 'tabindex', 'aria-hidden', 'class')),
+    {'attr': ['tabindex', '0']}, {'attr': ['aria-hidden', 'false']},
+    *({'attr': [k, '']} for k in ('type', 'name', 'id', 'role', 'value', 'form',
+        'disabled', 'readonly', 'autofocus', 'style', 'aria-label', 'data-answer', 'onclick', 'unknown')),
+    {'value': 'Synthetic answer'}, {'style': {'opacity': '1'}},
+    {'style': {'position': 'static'}}, {'style': {'pointerEvents': 'auto'}},
+    {'parent': 'inside'}, {'foreign': 'other'}, {'foreign': 'null'}, {'second': True},
+    {'shellCount': True}, {'shellNested': True}, {'comboForeign': True}, {'tag': 'textarea'},
+    {'shellOutsideControl': True},
+    {'ownerAttr': ['aria-required', None]}, {'ownerAttr': ['aria-required', 'false']},
+    {'ownerAttr': ['aria-haspopup', 'false']}, {'ownerAttr': ['aria-autocomplete', None]},
+    {'ownerAttr': ['aria-expanded', 'mixed']}, {'ownerAttr': ['aria-labelledby', 'missing']},
+    *({'extra': kind} for kind in ('input', 'contenteditable', 'combobox')),
+]
+
+
+@pytest.mark.parametrize('key', ['location', 'country'])
+@pytest.mark.parametrize('mutation', PROXY_BAD)
+@pytest.mark.parametrize('phase', ['C0', 'C1'])
+def test_required_proxy_fingerprint_and_first_C1_quarantine(key, mutation, phase):
+    snapshot = dom(fullPhone=True, requiredProxy=True, phases={key: phase},
+                   proxyMutation={'key': key, **mutation})
+    assert snapshot['page']['opaque_controls'] is True
+    assert snapshot['page']['inventory_verified'] is False
+    for reader in snapshot.values():
+        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#'+key)
+        assert graph.get('mode') != 'closed-react-select'
+        assert graph.get('quarantined') is True
+        assert graph['linked'] is False and graph['link_id'] == '' and graph['options'] == []
+
+
+async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):
+    session, filled, receipts = Session(requiredProxy=True), {}, []
+    for key in KEYS:
+        receipts.append(await choose(session, grants, key, filled))
+    current, _ = await forms._observe_controls(session, await session.page())
+    forms.check_form(current, filled, True, receipts=receipts)
+    forms.check_approvals('example-co#1', receipts, current)
+    assert session.calls == [step for key in KEYS for step in [('click', '#'+key), ('click', '#'+key+'-option')]]
+
+
+@pytest.mark.parametrize('key', ['location', 'country'])
+async def test_mounted_proxy_gates_even_with_committed_token_and_receipt(key, monkeypatch):
+    # Import synthetic phone helpers without requiring pytest fixture registration.
+    import runpy
+    phone = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
+    facts = {**dict.fromkeys(KEYS, ''), 'Country': 'Approved country'}
+    for k in KEYS:
+        facts[k] = 'Approved '+k
+    baseline = dom(fullPhone=True, requiredProxy=True)
+    answers = {}
+    for k, answer in facts.items():
+        t = combo(baseline, 'country' if k == 'Country' else k)
+        answers[k] = {**{n: t[n] for n in ('selector', 'label', 'question', 'tag', 'type', 'form_selector', 'form_action')}, 'value': answer, 'url': URL}
+    monkeypatch.setattr(forms, '_row', lambda pk: {'pk': pk, 'status': 'submitting', 'human_approved_answers': answers})
+    session = phone['PhoneSession'](requiredProxy=True)
+    receipt = await (phone['choose_country'](session, facts) if key == 'country' else choose(session, facts))
+    target = combo(session.snapshot, key)
+    target['combobox']['required_proxy_mounted'] = True
+    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
+        forms._check_closed_commit(target, 'Approved '+key, receipt)
+    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
+        forms.check_form({'controls': [target], 'inventory_verified': True}, {}, True, receipts=[receipt])
+    mounted = dom(fullPhone=True, requiredProxy=True, phases={key: 'C2'},
+                  proxyMutation={'key': key, 'mounted': True})
+    session.snapshot = mounted
+    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
+        await forms._observe_controls(session, await session.page())
+    assert all(c[1] not in ('#submit', '#additional') for c in session.calls)
+
+
+@pytest.mark.parametrize('key', ['location', 'country'])
+def test_untouched_required_proxy_and_outside_F_cannot_submit(key):
+    snapshot = dom(fullPhone=True, requiredProxy=True)
+    target = combo(snapshot, key)
+    with pytest.raises(forms.Gate, match='closed_select.required_proxy_uncommitted'):
+        forms.check_form({'controls': [target], 'inventory_verified': True}, {}, True)
+    outside = dom(fullPhone=True, requiredProxy=True, proxyMutation={'key': key, 'parent': 'outside'})
+    assert outside['page']['inventory_verified'] is True
+    assert combo(outside, key)['combobox']['mode'] == 'closed-react-select'
+    ordinary = [c for c in outside['page']['controls'] if c.get('required') and c['type'] == 'text' and not c['has_value']]
+    assert len(ordinary) == 1
+    with pytest.raises(forms.Gate):
+        forms.check_form({'controls': ordinary, 'inventory_verified': True}, {}, True)
+
+
+@pytest.mark.parametrize('scenario,expected', [
+    ({'custom': True}, '*:nth-child('), ({'depth': 14}, 'unavailable'),
+    ({'count': 8}, 'canvas:nth-of-type('),
+])
+def test_diagnostic_locators_are_bounded_unique_and_never_page_identifiers(scenario, expected):
+    snapshot = dom(diagnostics=scenario)
+    p = snapshot['page']
+    assert p['opaque_count'] == scenario.get('count', 1)
+    assert len(p['opaque_locators']) == min(3, p['opaque_count'])
+    assert all(expected in x for x in p['opaque_locators'])
+    with pytest.raises(forms.Gate) as caught:
+        forms._inventory_ok(p)
+    reason = str(caught.value)
+    assert 'opaque_controls' in reason
+    assert 'test-user' not in reason and '@' not in reason
+    assert 'private-' not in reason
+    assert reason.count('control=') <= 3
+
+
+@pytest.mark.parametrize('fresh', [False, True])
+@pytest.mark.parametrize('flags', [
+    {'opaque_controls': True, 'opaque_count': 1, 'opaque_locators': ['#test-user@example-co.test']},
+    {'unsupported_frames': ['https://test-user@example-co.test/private']},
+    {'shadow_roots': True}, {'truncated': True}, {'inventory_verified': False},
+    {'opaque_controls': True, 'unsupported_frames': ['private'], 'shadow_roots': True, 'truncated': True},
+])
+async def test_country_never_masks_initial_or_fresh_inventory_causes(fresh, flags):
+    session = Session(fullPhone=True)
+    original = await session.page()
+    unsafe = {**copy.deepcopy(original), **flags}
+    if fresh:
+        async def current():
+            return unsafe
+        session.page = current
+    with pytest.raises(forms.Gate) as caught:
+        await forms._observe_controls(session, original if fresh else unsafe)
+    reason = str(caught.value)
+    for flag in flags:
+        if flag in {'opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'}:
+            assert flag in reason
+    if flags == {'inventory_verified': False}:
+        assert 'inventory_verified=false/readiness' in reason
+    assert 'receiverless country commitment' not in reason
+    assert 'test-user' not in reason and '@' not in reason and 'https:' not in reason
+    assert session.calls == []
+
+
+@pytest.mark.parametrize('kind,predicate', [
+    ('empty', 'combobox.link_id.required_nonempty'), ('unequal', 'combobox.link_id.equal'),
+    ('timeout', 'unavailable'), ('cancel', 'unavailable'),
+])
+async def test_witness_failure_names_class_and_first_predicate_without_values(kind, predicate):
+    import asyncio
+    session = Session(fullPhone=True)
+    if kind in {'empty', 'unequal'}:
+        for reader in session.snapshot.values():
+            c = next(c for c in reader['controls'] if c['selector'] == '#location')
+            c['selector'] = '#test-user@example-co.test'
+            c['combobox'] = {'linked': False, 'link_id': '', 'options': []}
+        if kind == 'unequal':
+            session.snapshot['witness']['controls'][0]['combobox']['link_id'] = 'private answer'
+    else:
+        async def error(*args):
+            raise (TimeoutError('test-user@example-co.test private answer') if kind == 'timeout'
+                   else asyncio.CancelledError('private answer'))
+        session.call = error
+    with pytest.raises(forms.Gate) as caught:
+        await forms._observe_controls(session, await session.page())
+    reason = str(caught.value)
+    assert 'exception=' + {'empty': 'ValueError', 'unequal': 'ValueError',
+                            'timeout': 'TimeoutError', 'cancel': 'CancelledError'}[kind] in reason
+    assert 'predicate=' + predicate in reason
+    assert 'test-user' not in reason and 'private answer' not in reason
+    assert 'receiverless country commitment' not in reason
+    assert session.calls == []
+
+
+@pytest.mark.parametrize('boundary', ['missing', 'downgrade', 'initial', 'drift'])
+async def test_every_admission_Gate_and_form_question_passes_witness_try(monkeypatch, boundary):
+    session = Session(fullPhone=True)
+    sentinel = forms.Gate('closed admission ' + boundary, form_question={'synthetic': boundary})
+    def refused(*args, **kwargs):
+        raise sentinel
+    monkeypatch.setattr(forms, '_observe_closed_admissions', refused)
+    with pytest.raises(forms.Gate) as caught:
+        await forms._observe_controls(session, await session.page())
+    assert caught.value is sentinel
+    assert caught.value.form_question == {'synthetic': boundary}
+    assert session.calls == []
+
+
+@pytest.mark.parametrize('cause', ['inventory', 'approval', 'destination', 'phase timeout'])
+async def test_country_wrapper_preserves_noncommit_Gates(monkeypatch, cause):
+    session = Session(fullPhone=True)
+    sentinel = forms.Gate('safe synthetic ' + cause, form_question={'synthetic': cause})
+    async def refused(*args, **kwargs):
+        raise sentinel
+    monkeypatch.setattr(forms, '_execute_closed_combobox', refused)
+    with pytest.raises(forms.Gate) as caught:
+        await forms._execute_combobox(session, await session.page(),
+            {'action': 'combobox', 'selector': '#country'}, facts={}, filled={},
+            pk='example-co#1', job_url=URL, ctx=None, provenance=None)
+    assert caught.value is sentinel
+    assert session.calls == []
+
+
+@pytest.mark.parametrize('scenario', ['badGraph', 'extraInput', 'noAutocomplete', 'wrongLabel',
+    'duplicateLabel', 'explicitOutside', 'invalidExpanded', 'displayQuery', 'multipleReceiver'])
+def test_each_failed_owner_check_is_quarantined_before_real_legacy_C1_options(scenario):
+    snapshot = dom(requiredProxy=True, phases={'location': 'C1'}, **{scenario: True})
+    assert snapshot['page']['opaque_controls'] is True
+    for reader in snapshot.values():
+        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#location')
+        assert graph.get('quarantined') is True
+        assert graph['linked'] is False and graph['options'] == []
+
+
+def test_candidate_signal_A_survives_without_any_proxy_signature():
+    snapshot = dom(phases={'location': 'C1'}, noAutocomplete=True)
+    for reader in snapshot.values():
+        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#location')
+        assert graph.get('quarantined') is True
+        assert graph['linked'] is False and graph['options'] == []

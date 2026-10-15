@@ -816,8 +816,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                 event("async_bsk", operation="navigate")
                 payload = {"ok": True}
             elif operation == "evaluate":
-                from tools.browser_skill_dom import PAGE
-                assert argv[2] == PAGE
+                from tools.browser_skill_dom import ENTRY_PAGE
+                assert argv[2] == ENTRY_PAGE
                 event("async_bsk", operation="evaluate_page")
                 payload = {"ok": True, "value": _page}
             else:
@@ -858,7 +858,7 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
     assert actions.count("session_start") == actions.count("session_stop") == 1
     assert actions.count("navigate") == 1
-    assert actions.count("evaluate_page") >= 2
+    assert actions.count("evaluate_page") == 1  # malformed entry Gates on its first scoped read
     assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
@@ -1325,3 +1325,143 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         assert "hold" in observed and "status" in observed
         assert "synthetic_status_race" in observed
         assert authority.row["status"] == "applied_manual"
+
+
+async def test_typed_fixture_entry_never_delegates_generic_navigation(authority, monkeypatch):
+    from copy import deepcopy
+    from tests.tools.test_browser_application_entry import dom, fake_clock
+    from tools.browser_skill_dom import entry_reader
+    fake_clock(monkeypatch)
+    authority.enable_positive_fixture()
+    proof = authority.entry_provenance()
+    complete = dom({'frames':['H','H','R','B','W','X']})
+    fixed = dom({'frames':['H','H','R','B','W','X']}, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    for page in (complete, fixed):
+        page['url'] = fixture.URL
+        page['entry']['root']['action'] = fixture.URL
+        for c in page['controls']:
+            c['form_action'] = fixture.URL
+    shell = {**deepcopy(complete), 'controls':[], 'inventory_verified':False,
+             'entry':{'root':None,'frames':[],'responses':[],
+                      'response_error':False,'helper_challenge':False}}
+    class Raw:
+        def __init__(self):
+            self.calls, self.pages = [], 0
+        async def navigate(self, url):
+            pytest.fail('generic raw.navigate must never observe the typed fixture')
+        async def page(self):
+            pytest.fail('generic raw.page must never observe the typed fixture')
+        async def call(self, *args):
+            self.calls.append(args)
+            if args == ('navigate',fixture.URL):
+                return {}
+            if args == ('evaluate',forms.ENTRY_PAGE):
+                self.pages += 1
+                return {'value':deepcopy(shell if self.pages==1 else complete)}
+            if args == ('evaluate',forms._ENTRY_FIXED_CONTROL_WITNESS):
+                return {'value':deepcopy(fixed)}
+            assert args == ('evaluate',entry_reader(fixture._inventory_diagnostic_script()))
+            return {'value':{'ready_state':'complete','offending_elements':[],'shadow_hosts':[]}}
+    raw = Raw()
+    facade = authority.facade(raw)
+    await facade.call('navigate',fixture.URL)
+    session = forms._EntrySession(facade, lambda u: u==fixture.URL and forms._alias_current(
+        proof,fixture_context=authority), proof)
+    result = await forms._stable_application_form(session,session.allowed,proof,
+        deadline=__import__('asyncio').get_running_loop().time()+15)
+    authority.entry_admitted(result)
+    assert authority.entry_wait == 'PASS'
+    assert authority.entry_initial_not_ready
+    assert raw.calls[0] == ('navigate',fixture.URL)
+    assert raw.calls[1] == ('evaluate',forms.ENTRY_PAGE)
+    assert raw.pages == 5  # initial shell plus two independent PAGE+witness pairs
+    assert sum(c==('evaluate',forms._ENTRY_FIXED_CONTROL_WITNESS) for c in raw.calls)==2
+    assert all(c[0] in {'navigate','evaluate'} for c in raw.calls)
+    assert authority.navigations == 1
+    with pytest.raises(PermissionError):
+        await facade.call('navigate',fixture.URL)
+
+
+def test_injected_helper_outer_box_meets_unchanged_x_bounds():
+    # Execute the actual fixture injection with the iframe UA content-box model.
+    # A CSS width of 1px alone is 1 + 2px left + 2px right = 5px, not X's <=1.
+    import json
+    import subprocess
+    from tests.tools.test_browser_application_entry import dom
+    source = fixture._FORM.decode().split('const add=', 1)[1]
+    source = 'const add=' + source.split('for(const name of', 1)[0]
+    script = r'''
+const frames=[];
+function element(tag) {
+  return {tag,style:{},attributes:{},
+    setAttribute(k,v){this.attributes[k]=v;},
+    append(e){e.parent=this;if(e.tag==='iframe')frames.push(e);},
+    querySelector(){return element('span');}};
+}
+const document={body:element('body'),createElement:element};
+const form=element('form'),h=element('div');
+eval(process.argv[1]);
+console.log(JSON.stringify(frames.filter(e=>e.parent===document.body &&
+  !Object.hasOwn(e.attributes,'src')).map(e=>{
+  const border=e.style.border===undefined ? 2 : parseFloat(e.style.border);
+  const padding=e.style.padding===undefined ? 0 : parseFloat(e.style.padding);
+  return {width:parseFloat(e.style.width)+2*padding+2*border,
+    height:parseFloat(e.style.height)+2*padding+2*border,
+    display:e.style.display || 'inline',visibility:e.style.visibility};
+})));
+'''
+    result = subprocess.run(['node','-e',script,source],capture_output=True,text=True,check=True)
+    helper, = json.loads(result.stdout)
+    assert helper == dict(width=1,height=1,display='block',visibility='hidden')
+    page = dom(dict(frames=['X'],edit={'rect':{'width':helper['width'],'height':helper['height']}}))
+    assert page['entry']['frames'][0]['status'] == 'X'
+
+
+def test_failure_diagnostic_reports_frame_box_structure_only():
+    from tests.tools.test_browser_application_entry import dom
+    from tools.browser_skill_dom import entry_reader
+    script = entry_reader(fixture._inventory_diagnostic_script())
+    page = dom(dict(frames=['X'],edit={'rect':{'width':5,'height':5},'style':{
+        'visibility':'hidden','display':'inline','width':'1px','height':'1px',
+        'borderTopWidth':'2px','borderRightWidth':'2px',
+        'borderBottomWidth':'2px','borderLeftWidth':'2px'}}), script)
+    frame, = page['frames']
+    assert frame['tag'] == 'iframe' and frame['parent_path'] == ['#body']
+    assert frame['rects'] == [{'width':5,'height':5}]
+    assert frame['borders'] == ['2px']*4
+    assert frame['width'] == frame['height'] == '1px'
+    assert not {'value','src','title','text','name'} & frame.keys()
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+async def test_unknown_frame_failure_diagnostic_preserves_rejected_snapshot(authority, reader):
+    from tools.browser_skill_dom import entry_reader
+    authority.enable_positive_fixture()
+    script = forms.ENTRY_PAGE if reader=='page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    rejected = {'selector':'#helper','status':'unknown','box':{'width':5,'height':5}}
+    original = dict(url=fixture.URL,controls=[],inventory_verified=True,
+                    entry=dict(root=None,frames=[rejected]))
+    diagnostic = dict(frames=[{'selector':'#helper','tag':'iframe',
+                       'rects':[{'width':1,'height':1}], 'borders':['0px']*4,
+                       'parent_path':['body']}])
+    calls = []
+    class Raw:
+        async def call(self, *args):
+            calls.append(args)
+            if args==('navigate',fixture.URL):
+                return {}
+            if args==('evaluate',script):
+                return {'value':original}
+            assert args==('evaluate',entry_reader(fixture._inventory_diagnostic_script()))
+            return {'value':diagnostic}
+    edge = authority.facade(Raw())
+    await edge.call('navigate',fixture.URL)
+    result = await edge.call('evaluate',script)
+    assert result['value'] is original
+    assert original['entry']['frames'][0]['status'] == 'unknown'
+    assert authority.inventory_diagnostics['rejected_frames'][0]['box'] == {'width':5,'height':5}
+    assert authority.inventory_diagnostics['frames'][0]['rects'] == [{'width':1,'height':1}]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(original,lambda u: True,authority.entry_provenance())
+    assert authority.fills == authority.ipc_index == 0
+    assert len(calls) == 3

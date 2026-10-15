@@ -370,3 +370,135 @@ PAGE = r"""(() => {
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
     inventory_verified:inventoryVerified};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
+
+
+# Inserted before either reader's graph: filtering the final list is too late,
+# because closedGraph and linked receivers read hidden values eagerly.
+_ENTRY_OBSERVATION = r"""
+  const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
+    ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
+  const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
+  const excluded = new Set([...responseNodes, ...reservedButtons]);
+  // Use the same native marker captions as PAGE/_application_marker, including
+  // accessible submit labels and input submit values; never a generic form shell.
+  const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
+    (e.getAttribute('aria-labelledby') || '').split(' ')
+      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
+    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const forms = Array.from(document.querySelectorAll('form')).filter(f =>
+    Array.from(f.querySelectorAll('input,button')).filter(e=>!excluded.has(e)).some(e => {
+      const group=e.closest('fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
+      const question=clean(group?.querySelector('legend,[data-automation-id="formLabel"]')?.innerText ||
+        group?.innerText || '');
+      return (e.type==='file' && /resume|résumé|\bcv\b/i.test(question+' '+entryLabel(e))) ||
+        (['submit','image'].includes(e.type) && [entryLabel(e),
+          e.tagName==='INPUT' && e.type==='submit' ? e.value : ''].some(t =>
+            ['submit application','send application','complete application',
+              'finish application','apply now'].includes(clean(t).toLowerCase())));
+    }));
+  const root = forms.length===1 ? forms[0] : null;
+  const rectOf = (e, bounding=false) => {
+    try {
+      const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
+      return r && Number.isFinite(r.width) && Number.isFinite(r.height) &&
+        r.width>=0 && r.height>=0 ? {width:r.width,height:r.height} : null;
+    } catch (_) { return null; }
+  };
+  const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
+    const raw = e.getAttribute('src');
+    let origin='', path='';
+    try { if (raw!==null) { const u=new URL(raw); origin=u.origin; path=u.pathname; } } catch (_) {}
+    const style=getComputedStyle(e), hidden=style.visibility==='hidden' || style.display==='none';
+    const shown=style.visibility==='visible' && style.display!=='none';
+    const outside=!!root && !root.contains(e), box=rectOf(e);
+    const parent=e.parentElement;
+    const h=origin==='https://newassets.hcaptcha.com' && path.endsWith('/static/hcaptcha-enclave.html') &&
+      !!root && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===root;
+    const r=['https://www.recaptcha.net','https://www.google.com'].includes(origin) &&
+      ['/recaptcha/enterprise/anchor','/recaptcha/enterprise/bframe'].includes(path);
+    const badge=!!e.closest('div.grecaptcha-badge'), bounds=rectOf(e,true);
+    let n=e.parentElement;
+    const chain=['span.IN-widget','div.awli-button-container','div.application-field',
+      'li.application-question.awli-application-row'];
+    const ancestry=[];
+    for (const shape of chain) {
+      if (!n || !n.matches(shape)) break;
+      ancestry.push(n); n=n.parentElement;
+    }
+    const row=ancestry.length===4 ? ancestry[3] : null;
+    const w=(raw===null || raw==='about:blank') && e.getAttribute('title')==='LinkedIn Embedded Content' &&
+      !!root && !!row && root.contains(row) && !!box && box.width<=400 && box.height<=100 &&
+      !row.required && row.getAttribute('aria-required')!=='true' && !row.hasAttribute('required') &&
+      // Match the actual inventory candidate set, or W could hide an ARIA answer.
+      !row.matches(query) && !row.querySelector(query) &&
+      !row.querySelector('[contenteditable],[required],[aria-required="true"]');
+    const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
+      style.visibility==='hidden' && outside;
+    let status='unknown';
+    // Visible bframe precedence is independent of root proof/placement.
+    if (r && path==='/recaptcha/enterprise/bframe' && shown) status='visible-recaptcha';
+    else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
+    else if (r && outside && (hidden || (path==='/recaptcha/enterprise/anchor' && shown &&
+      badge && !!bounds && bounds.width===256 && bounds.height===60))) status='R';
+    else if (w) { status='W'; row.querySelectorAll(query).forEach(n=>excluded.add(n)); }
+    else if (x) status='X';
+    return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
+      visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
+      ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
+      box,badge,bounds,status};
+  });
+  let responseError=false;
+  const entryResponses=responseNodes.map(e => {
+    const name=e.getAttribute('name'), owner=e.form || e.closest('form');
+    const signature=name==='h-captcha-response' ? 'H' : 'R';
+    if (responseNodes.filter(n=>n.getAttribute('name')===name).length!==1 ||
+        !entryFrames.some(f=>f.status===signature) || (owner && owner!==root)) responseError=true;
+    return {selector:selector(e),name,form:owner ? selector(owner) : ''};
+  });
+  // Reject a graph claiming a reserved receiver before closedGraph/newGraphs or
+  // any linked combobox path can touch its value (including a throwing getter).
+  for (const c of document.querySelectorAll('[role="combobox"]')) {
+    const form=c.form || c.closest('form');
+    const labelId=c.getAttribute('aria-labelledby');
+    const labels=labelId ? document.querySelectorAll('#'+CSS.escape(labelId)) : [];
+    let field=c.parentElement;
+    if (labels.length===1) while(field && !field.contains(labels[0])) field=field.parentElement;
+    else field=c.closest('[data-automation-id="formField"],.form-group');
+    if (responseNodes.some(h =>
+      c.getAttribute('data-value-input')===h.id && !!h.id ||
+      c.getAttribute('data-value-name')===h.getAttribute('name') || c.contains(h) ||
+      (field && field!==form && field.contains(h) && (h.form || h.closest('form'))===form)))
+      responseError=true;
+  }
+  const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
+    root:root ? {selector:selector(root),action:root.action} : null,
+    helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
+      (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
+        getComputedStyle(e).display!=='none'))};
+  if (responseError) return {url:location.href,controls:[],entry,inventory_verified:false};
+"""
+
+
+def entry_reader(script: str) -> str:
+    """Scope the two code-owned readers without changing ordinary PAGE/graphs.
+
+    All exclusions precede the shared graph; no protected value is read even
+    transiently. The fixed witness observes provider identities independently.
+    """
+    script = script.replace(_WIDGET_GRAPH, _ENTRY_OBSERVATION + _WIDGET_GRAPH)
+    script = script.replace('const closedGraph = e => {',
+                            'const closedGraph = e => { if (excluded.has(e)) return null;')
+    script = script.replace('const H = hidden[0];',
+                            'const H = hidden[0]; if (responseNodes.includes(H)) '
+                            '{ entry.response_error=true; return null; }')
+    script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
+    script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
+                            "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
+    script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')
+    script = script.replace('return {url: location.href, controls:', 'return {entry, url: location.href, controls:')
+    script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"
+                            "      .filter(visible).map(e=>e.src)", 'unsupported_frames:[]')
+    return script
+
+
+ENTRY_PAGE = entry_reader(PAGE)

@@ -429,8 +429,9 @@ _ENTRY_OBSERVATION = r"""
     const w=(raw===null || raw==='about:blank') && e.getAttribute('title')==='LinkedIn Embedded Content' &&
       !!root && !!row && root.contains(row) && !!box && box.width<=400 && box.height<=100 &&
       !row.required && row.getAttribute('aria-required')!=='true' && !row.hasAttribute('required') &&
-      !row.querySelector('input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
-        '[contenteditable],[required],[aria-required="true"]');
+      // Match the actual inventory candidate set, or W could hide an ARIA answer.
+      !row.matches(query) && !row.querySelector(query) &&
+      !row.querySelector('[contenteditable],[required],[aria-required="true"]');
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
     let status='unknown';

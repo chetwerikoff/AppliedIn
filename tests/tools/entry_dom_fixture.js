@@ -60,8 +60,10 @@ function frame(kind, edit={}) {
     if(spec.badge) parent=node('div',{class:'grecaptcha-badge'},parent);
     attrs={...attrs,src:'https://www.recaptcha.net/recaptcha/enterprise/'+(kind==='B' ? 'bframe' : 'anchor'),style:{visibility:spec.visible ? 'visible':'hidden'},bounds:{width:256,height:60}};
   } else if(kind==='W') {
-    parent=node('li',{class:'application-question awli-application-row',...(spec.required ? {required:true}: {})},form || body);
+    parent=node('li',{class:'application-question awli-application-row',...(spec.required ? {required:true}: {}),
+      ...(spec.rowRole ? {id:'w-row',role:spec.rowRole}: {})},form || body);
     if(spec.extra) node('input',{type:'text'},parent);
+    if(spec.extraRole) node('span',{id:'aria-applicant',role:spec.extraRole,'aria-checked':'false',text:'Synthetic consent'},parent);
     parent=node('div',{class:'application-field'},parent);
     parent=node('div',{class:'awli-button-container'},parent);
     parent=node('span',{class:'IN-widget'},parent);

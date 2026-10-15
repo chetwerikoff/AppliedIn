@@ -688,6 +688,19 @@ def test_widget_row_must_not_be_a_question(change):
     assert dom(dict(frames=['W'],**change))['entry']['frames'][0]['status'] == 'unknown'
 
 
+@pytest.mark.parametrize('reader', ['page','witness'])
+@pytest.mark.parametrize('role', ['checkbox','radio','option'])
+@pytest.mark.parametrize('placement', ['extraRole','rowRole'])
+def test_w_row_cannot_mask_aria_applicant_controls(reader, role, placement):
+    script = forms.ENTRY_PAGE if reader=='page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(frames=['W'],**{placement:role}),script)
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    selector = '#aria-applicant' if placement=='extraRole' else '#w-row'
+    assert any(c['selector']==selector and c['type']==role for c in page['controls'])
+    with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
+        forms._entry_safety(page,lambda u: True,None)
+
+
 @pytest.mark.parametrize('kind,edit,options,status', [
     ('H', {'src':'https://newassets.hcaptcha.com/static/hcaptcha-enclave.html/extra'}, {}, 'unknown'),
     ('H', {'style':{'visibility':'visible'}}, {}, 'visible-hcaptcha'),

@@ -706,6 +706,10 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
         elif typ != 'file' and target.get('tag') in {'input', 'textarea', 'select'}:
             if target.get('required') and not target.get('has_value'):
                 raise Gate(f'Required field is empty: {target["label"]}')
+            if typ == 'tel' and expected is not None and (
+                not target.get('has_value') or value != expected
+            ):
+                raise Gate('A previously verified phone value is empty or changed.')
             if target.get('has_value'):
                 observed = value
                 if target.get('tag') == 'select':
@@ -834,6 +838,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
           label:graph ? o.innerText : clean(o.innerText),
           value:o.getAttribute('data-value') || o.getAttribute('value') || '',
+          ...(graph ? {value_attributes:['data-value','value']
+            .filter(k=>o.hasAttribute(k)).map(k=>o.getAttribute(k))} : {}),
           selected:o.getAttribute('aria-selected') === 'true'})) : [];
       const hiddenId = e.getAttribute('data-value-input');
       const hiddenName = e.getAttribute('data-value-name');
@@ -948,7 +954,7 @@ def _closed_key(target: dict) -> tuple:
         'input_wrapper_selector', 'hidden_selector'))
 
 
-def _observe_closed_admissions(session, page: dict) -> None:
+def _observe_closed_admissions(session, page: dict, *, transition=None) -> None:
     # A fresh expanded/committed graph is a candidate, never initial authority.
     admissions = getattr(session, '_closed_admissions', None)
     if admissions is None:
@@ -969,7 +975,9 @@ def _observe_closed_admissions(session, page: dict) -> None:
             if phase != 'C0':
                 raise Gate('Closed combobox lacks initial C0 admission.')
             admissions[sel] = {'key': key, 'phase': 'C0'}
-        elif prior['key'] != key or phase != prior['phase']:
+        elif prior['key'] != key or (phase != prior['phase'] and not (
+                transition == (sel, phase)
+                and (prior['phase'], phase) in {('C0', 'C1'), ('C1', 'C2')})):
             raise Gate('The closed combobox graph or ordered phase changed.')
 
 
@@ -1045,7 +1053,8 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
-async def _observe_controls(session, page: dict, *, readiness: bool = False) -> tuple[dict, dict]:
+async def _observe_controls(session, page: dict, *, readiness: bool = False,
+                            closed_transition=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page)
     try:
@@ -1090,7 +1099,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         _inventory_ok(current)
         if _page_identity(current) != _page_identity(page):
             raise ValueError('The current inventory changed during observation')
-        _observe_closed_admissions(session, current)
+        _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
     except (Exception, asyncio.CancelledError) as exc:
         if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)):
@@ -1505,9 +1514,9 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
             or not answer or not target['combobox'].get('hidden_selector')):
         raise Gate('A closed choice needs initial admission, exact answer and one receiver.')
 
-    async def preflight():
+    async def preflight(transition=None):
         fresh = await session.page()
-        fresh, witness = await _observe_controls(session, fresh)
+        fresh, witness = await _observe_controls(session, fresh, closed_transition=transition)
         current = control(fresh, action)
         if (_closed_key(current) != stable or not _closed_mode(current)
                 or not navigation_allowed(fresh.get('url', ''), job_url or page['url'],
@@ -1525,12 +1534,26 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         check_form_destination(fresh, current, job_url or page['url'], provenance=provenance)
         return fresh, current
 
+    async def wait_phase(expected):
+        # Only this authorized click may await its next phase. Prior same-key
+        # DOM is transient; all other controls, grants and receivers stay guarded.
+        try:
+            async with asyncio.timeout(5):
+                for _ in range(20):
+                    fresh, current = await preflight((selector, expected))
+                    if current['combobox']['phase'] == expected:
+                        admission['phase'] = expected
+                        return fresh, current
+                    await asyncio.sleep(0.25)
+        except TimeoutError:
+            pass
+        raise Gate('The closed picker did not reach its expected phase within the bounded wait.')
+
     fresh, current = await preflight()
     before = current['combobox']['hidden_value']
-    admission['phase'] = 'C1'
     await session.call('click', selector)
     # Component opening is observed, never simulated by page-evaluate mutation.
-    fresh, current = await preflight()
+    fresh, current = await wait_phase('C1')
     options = _combobox_options(current)
     popup = tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector'))
     candidates = [o for o in options if _same(o['label'], answer)]
@@ -1545,15 +1568,17 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         raise Gate('The current closed option disappeared.')
     option = matches[0]
     # Literal caption AND observed transport value are separate action boundaries.
-    if option['label'] != answer or option['value'] != answer:
+    if option['label'] != answer:
         raise Gate('The current option caption/code is not the exact approved answer.')
+    codes = option.get('value_attributes')
+    if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):
+        raise Gate('Every present option value attribute must exactly match the approved answer.')
     if option.get('submit') or option.get('navigates'):
         raise Gate('A submission-capable or navigating option cannot be clicked.')
     if current['combobox']['hidden_value'] != before:
         raise Gate('The hidden receiver changed before the authorized option click.')
-    admission['phase'] = 'C2'
     await session.call('click', option['selector'])
-    fresh, current = await preflight()
+    fresh, current = await wait_phase('C2')
     receipt = _ClosedReceipt({
         'action':'combobox', 'selector':selector, 'label':current['label'],
         'question':current.get('question', ''), 'url':fresh['url'],
@@ -1937,7 +1962,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             readback, _ = await _observe_controls(session, await session.page())
             phone = control(readback, action)
             if (_combobox_stable_identity(phone) != _combobox_stable_identity(current)
-                    or phone.get('value') != write_value):
+                    or phone.get('value') != write_value or phone.get('has_value') is not True):
                 raise Gate('The full approved international phone did not read back exactly.')
         filled[current['selector']] = write_value
     elif verb == 'upload':
@@ -2195,6 +2220,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             page, target = await _fresh_native_receiver(
                                 session, page, action, target, provenance,
                                 fixture_context=ctx)
+                        elif getattr(session, '_closed_admissions', None):
+                            # Direct routes still need current C3 parity for admitted widgets.
+                            page, _ = await _observe_controls(session, page)
+                            target = control(page, action)
                         check_form_destination(page, target, *trusted_origins,
                                                provenance=provenance)
                         check_form(page, filled, uploaded, Path(resume_path).name, history)
@@ -2232,6 +2261,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 page, target = await _fresh_native_receiver(
                                     session, page, action, target, provenance,
                                     fixture_context=ctx)
+                            elif getattr(session, '_closed_admissions', None):
+                                page, _ = await _observe_controls(session, page)
+                                target = control(page, action)
                             check_form_destination(page, target, *trusted_origins,
                                                    provenance=provenance)
                             check_form(page, filled, uploaded, Path(resume_path).name, history)

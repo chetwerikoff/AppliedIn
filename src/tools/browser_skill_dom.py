@@ -207,6 +207,8 @@ PAGE = r"""(() => {
               o.type === 'submit' || o.type === 'image',
             navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',
+            ...(graph ? {value_attributes:['data-value','value']
+              .filter(k=>o.hasAttribute(k)).map(k=>o.getAttribute(k))} : {}),
             label:graph ? o.innerText : clean(o.innerText),selected:o.getAttribute('aria-selected') === 'true'})) : [];
         const hiddenId = e.getAttribute('data-value-input');
         const hiddenName = e.getAttribute('data-value-name');

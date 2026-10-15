@@ -297,7 +297,8 @@ def test_popup_relationship_itself_refuses_ambiguous_ownership(scenario):
     assert combo(snapshot)['combobox']['options'] == []
 
 
-async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatch):
+@pytest.mark.parametrize('cleared', [False, True])
+async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatch, cleared):
     session = Session()
     phone = next(c for c in session.snapshot['page']['controls'] if c['selector']=='#phone')
     phone.update(label='Phone', question='Phone')
@@ -310,7 +311,9 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
     async def transport(*args):
         if args[0] == 'fill':
             session.calls.append(args)
-            phone.update(value='+12025550124', has_value=True)
+            # PAGE can retain approved-looking data-value while native value is empty.
+            phone.update(value='+12025550123' if cleared else '+12025550124',
+                         has_value=not cleared)
             return {}
         return await original(*args)
     session.call = transport
@@ -320,3 +323,104 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
             facts={'Phone':'+12025550123'}, filled={}, resume_path='', company='example-co',
             jd_text='', resume_tex='', github='', pk='example-co#1', job_url=URL)
     assert session.calls == [('fill', '#phone', '--value', '+12025550123')]
+
+
+@pytest.mark.parametrize('attrs', [
+    {'data-value': 'Approved location', 'value': 'OTHER'},
+    {'data-value': '', 'value': 'Approved location'},
+    {'data-value': 'Approved location', 'value': ''},
+    {},
+])
+async def test_every_present_option_attribute_must_be_approved(grants, attrs):
+    session = Session(optionAttrs=attrs)
+    with pytest.raises(forms.Gate):
+        await choose(session, grants)
+    assert session.calls == [('click', '#location')]
+
+
+def test_cleared_optional_phone_cannot_evade_presubmit():
+    page = dom()['page']
+    phone = next(c for c in page['controls'] if c['selector'] == '#phone')
+    phone.update(value='+12025550123', has_value=False, required=False)
+    with pytest.raises(forms.Gate, match='phone value'):
+        forms.check_form(page, {'#phone': '+12025550123'}, True)
+
+
+@pytest.mark.parametrize('delayed', ['C1', 'C2', 'both'])
+async def test_delayed_component_phase_is_observed_without_extra_ipc(grants, delayed):
+    class Delayed(Session):
+        pending = None
+        reads = 0
+        async def call(self, *args):
+            before = self.snapshot
+            result = await super().call(*args)
+            if args[0] == 'click':
+                phase = 'C2' if args[1].endswith('-option') else 'C1'
+                if delayed in {phase, 'both'}:
+                    self.pending, self.snapshot, self.reads = self.snapshot, before, 0
+            return result
+        async def page(self):
+            if self.pending is not None:
+                self.reads += 1
+                if self.reads > 2:
+                    self.snapshot, self.pending = self.pending, None
+            return await super().page()
+    session = Delayed()
+    receipt = await choose(session, grants)
+    assert receipt['committed_value'] == 'Approved location'
+    assert session.calls == [('click', '#location'), ('click', '#location-option')]
+
+
+@pytest.mark.parametrize('verb', ['submit', 'click'])
+async def test_direct_route_commit_requires_latest_fixed_witness(monkeypatch, grants, verb):
+    from unittest.mock import AsyncMock
+    from tools import browser_skill as bsk
+    class Direct(Session):
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def navigate(self, url):
+            assert url == URL
+            return await self.page()
+    session = Direct()
+    await choose(session, grants)
+    session.calls.clear()
+    if verb == 'click':
+        for snapshot in session.snapshot.values():
+            next(c for c in snapshot['controls'] if c['selector'] == '#submit')['label'] = 'Continue'
+    async def decide(*args, **kwargs):
+        # The direct route has no alias. Drift arrives after bootstrap/model input.
+        combo({'page': session.snapshot['witness']})['combobox']['selected_text'] = 'late drift'
+        return {'action': verb, 'selector': '#submit'}
+    monkeypatch.setattr(bsk, 'Session', lambda *a, **kw: session)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    monkeypatch.setattr(forms, '_bootstrap', AsyncMock(side_effect=lambda s, p, *a, **kw: p))
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'check_form', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'check_approvals', lambda *a, **kw: None)
+    held = []
+    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: held.append(a))
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
+    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *a: '')
+    result = await forms.apply(URL, 'example-co', grants, 'synthetic',
+                               pk='example-co#1', resume_path='Synthetic.pdf')
+    assert result['status'] == 'gate' and 'DOM witness' in result['question']
+    assert not held and session.calls == []
+
+
+async def test_never_committed_component_times_out_without_more_ipc(monkeypatch, grants):
+    class NeverCommitted(Session):
+        async def call(self, *args):
+            before = self.snapshot
+            result = await super().call(*args)
+            if args == ('click', '#location-option'):
+                self.snapshot = before
+            return result
+    async def no_sleep(delay):
+        pass
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
+    session = NeverCommitted()
+    with pytest.raises(forms.Gate, match='bounded wait'):
+        await choose(session, grants)
+    assert session.calls == [('click', '#location'), ('click', '#location-option')]

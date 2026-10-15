@@ -63,6 +63,10 @@ for(const key of keys){
     if(parent.tagName==='A')parent.href='/away';
     const list=make('div',key+'-list',{role:'listbox'},parent);
     const option=make('div',key+'-option',{role:'option','data-value':scenario.code||'Approved '+key},list,scenario.caption||'Approved '+key);
+    if(scenario.optionAttrs) {
+      delete option.attrs['data-value'];
+      Object.assign(option.attrs,scenario.optionAttrs);
+    }
     if(scenario.danger==='descendant')make('button',key+'-danger',{type:'submit'},option);
     if(scenario.conflict)attrs['aria-owns']='school-list';
     if(scenario.shared)make('input','other-owner',{role:'combobox','aria-controls':list.id},form);

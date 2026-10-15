@@ -50,10 +50,11 @@ def _closed_form() -> bytes:
         name = selector[1:]
         fields.append(f'''<div id="{name}-field" class="form-group">
 <label id="{name}-label" for="{name}" data-automation-id="formLabel">{escape(question)}</label>
-<div id="{name}-value"><div id="{name}-input">
+<div class="select-shell"><div id="{name}-value"><div id="{name}-input">
 <input id="{name}" name="{name}" role="combobox" aria-expanded="false"
- aria-haspopup="true" aria-autocomplete="list" aria-labelledby="{name}-label" required>
+ aria-haspopup="true" aria-autocomplete="list" aria-labelledby="{name}-label" aria-required="true" required>
 </div><div class="react-select__placeholder">Choose</div></div>
+{('<input required tabindex="-1" aria-hidden="true" class="validation-only">' if name == 'location' else '')}</div>
 <input type="hidden" id="{name}-code" name="{name}_value"></div>''')
     fillers = ''.join(f'<input id="filler-{i}" name="filler_{i}" aria-label="Optional synthetic {i}">'
                       for i in range(24))
@@ -62,7 +63,8 @@ def _closed_form() -> bytes:
         for i in range(244))
     return ('''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Synthetic application</title>
-<style>[role="listbox"][hidden],[role="option"][hidden]{display:none}</style>
+<style>[role="listbox"][hidden],[role="option"][hidden]{display:none}
+.validation-only{opacity:0;position:absolute;pointer-events:none}</style>
 </head><body><h1>Synthetic role at example-co</h1>
 <p>Offline fixture for synthetic example-co facts only. No real person or employer.
 This form is served only by the daemon's --synthetic-browser-fixture mode.
@@ -76,15 +78,16 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
 ''' + ''.join(fields) + '''
 <div class="application--questions"><div><fieldset class="phone-input"><legend>Phone</legend>
 <div class="phone-input__country"><div class="select"><div class="select__container">
-<div class="select-shell"><div id="country-owner">
 <label id="country-label" for="country">Country</label>
+<div class="select-shell"><div id="country-owner">
 <div class="select__control"><div id="country-value" class="select__value-container">
 <div class="select__input-container"><input id="country" type="text" class="select__input"
  role="combobox" autocomplete="off" tabindex="0" aria-autocomplete="list" aria-expanded="false"
  aria-haspopup="true" aria-required="true" aria-invalid="false" aria-labelledby="country-label"
  aria-describedby="react-select-country-placeholder country-error" aria-errormessage="country-error"
  aria-activedescendant=""></div><div id="react-select-country-placeholder" class="select__placeholder">Choose</div>
-</div></div><span id="country-error"></span></div></div></div></div></div>
+</div></div><span id="country-error"></span></div>
+<input required tabindex="-1" aria-hidden="true" class="validation-only"></div></div></div></div>
 <div class="phone-input__phone"><div class="text-input-wrapper"><div class="input-wrapper">
 <div id="telephone" class="iti iti--allow-dropdown iti--show-flags iti--inline-dropdown">
 <div class="iti__country-container" hidden>
@@ -123,6 +126,7 @@ for (const [id,answer] of Object.entries(answers)) {
    display.className='react-select__single-value';display.textContent=option.innerText;
    if(id!=='country')document.getElementById(id+'-code').value=option.getAttribute('data-value');
    else {input.setAttribute('aria-describedby','country-error');input.setAttribute('aria-invalid','false');}
+   input.closest('.select-shell').querySelector('.validation-only')?.remove();
    input.value='';input.setAttribute('aria-expanded','false');input.removeAttribute('aria-controls');list.remove();
   });
  });
@@ -175,16 +179,11 @@ def _inventory_diagnostic_script() -> str:
     # Instrument the fixed observer only for reporting. Its original result is
     # still the sole inventory passed to the controller and all its guards.
     from tools.browser_skill_dom import PAGE
-    script = PAGE.replace(
-        "const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>",
-        "const opaqueElements = Array.from(document.querySelectorAll('*')).filter(e =>")
-    script = script.replace(
-        "  const inventoryVerified =",
-        "  const opaqueControls = opaqueElements.length > 0;\n  const inventoryVerified =")
+    script = PAGE
     return script.replace(
         "return {url:location.href, title, text:text.slice(0,100000),",
         "return {ready_state:document.readyState, "
-        "offending_elements:opaqueElements.map(e=>({selector:selector(e),"
+        "offending_elements:opaqueNodes.slice(0,3).map(e=>({selector:diagnosticLocator(e),"
         "tag:e.tagName.toLowerCase(),role:e.getAttribute('role')})), "
         "shadow_hosts:shadowRoots.map(e=>({selector:selector(e),"
         "tag:e.tagName.toLowerCase()})), "

@@ -171,7 +171,10 @@ def test_fixture_does_not_grant_the_additional_question(authority):
 
 def test_served_form_hidden_machine_input_does_not_collide_with_approval_question():
     """Hidden receiver fields share group text but are not answerable controls."""
-    page = served_fixture_page()
+    import runpy
+    # Static HTML parsing cannot prove proxy omission; use the production PAGE.
+    helpers = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
+    page = helpers['served_fixture_dom']()['page']
     location = next(c for c in page["controls"] if c["selector"] == "#location")
     hidden = next(c for c in page["controls"]
                   if c["selector"] == "#location-code")

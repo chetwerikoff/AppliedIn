@@ -623,6 +623,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
     for target in controls:
+        _required_proxy_validity(target, submitting=True)
         typ = target.get('type', '')
         if typ == 'hidden':
             if target.get('in_form') is True:
@@ -751,7 +752,7 @@ def check_form_destination(page: dict, target: dict, *origins: str,
 
 # No model/page text is executable here. This code-owned read uses the same
 # selector rules as PAGE and independently establishes DOM editability/ownership.
-from tools.browser_skill_dom import _WIDGET_GRAPH
+from tools.browser_skill_dom import _DIAGNOSTIC_TAGS, _WIDGET_GRAPH
 
 _FIXED_CONTROL_WITNESS = r"""(() => {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -818,11 +819,11 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       ? matches[0] : null;
   };
   const currentListbox = e => {
-    if (pickerCandidate(e)) return null;
+    if (pickerCandidate(e) || quarantined.has(e)) return null;
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
-  const all = Array.from(document.querySelectorAll(query)).filter(e => !pickerParts.has(e) && (
+  const all = Array.from(document.querySelectorAll(query)).filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (
     e.getAttribute('role') !== 'option' || !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))));
   return {url: location.href, controls: all
@@ -855,7 +856,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
           (typeof e.contains === 'function' && e.contains(h)) ||
           (hiddenName && h.name === hiddenName)));
-      return {selector:ownSelector, unique:document.querySelectorAll(ownSelector).length === 1,
+      return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
@@ -868,7 +869,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
-        combobox:type === 'combobox' ? {...(graph || {}),linked:!!list, link_id:graph ? (list?.id || '') : linkId(e),
+        combobox:type === 'combobox' ? {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
+          linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options:opts,
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
@@ -924,15 +926,44 @@ def _unrelated_search_form(controls: list[dict]) -> bool:
             for t in _submitter_texts(c)))
         for c in controls))
 
+def _safe_diagnostic(value) -> str:
+    # Validate the reader's bounded structural grammar again at the log boundary.
+    tags = '|'.join(_DIAGNOSTIC_TAGS.split())
+    segment = rf'(?:(?:{tags}):nth-of-type\([1-9][0-9]*\)|\*:nth-child\([1-9][0-9]*\))'
+    return value if (isinstance(value, str) and len(value) <= 600
+                     and re.fullmatch(segment + rf'(?: > {segment}){{0,11}}', value)) else 'unavailable'
+
+
+def _required_proxy_validity(target, *, submitting=False) -> None:
+    combo = target.get('combobox') or {}
+    if combo.get('required_proxy_mounted') is True:
+        if combo.get('phase') == 'C2':
+            raise Gate('closed_select.required_proxy_mounted; control=' +
+                       _safe_diagnostic(target.get('diagnostic_locator')))
+        if submitting:
+            raise Gate('closed_select.required_proxy_uncommitted; control=' +
+                       _safe_diagnostic(target.get('diagnostic_locator')))
+
+
 
 def _inventory_ok(page: dict) -> None:
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
             or page.get('unsupported_frames')):
-        if any(c.get('selector') == '#country' and c.get('form_selector') == '#application-form'
-               and not _receiverless_country(c) for c in page.get('controls', []) if isinstance(c, dict)):
-            raise Gate(_COUNTRY_GATE)
-        raise Gate('The current form inventory is incomplete; human inspection is required.')
+        causes = []
+        for flag in ('opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'):
+            if page.get(flag):
+                causes.append(flag + (' count=' + str(len(page[flag]))
+                              if flag == 'unsupported_frames' and isinstance(page[flag], list) else ''))
+        if page.get('opaque_controls'):
+            count = page.get('opaque_count')
+            causes.append('opaque_count=' + str(count if type(count) is int and count >= 0 else 'unavailable'))
+            locators = page.get('opaque_locators')
+            causes.extend('control=' + _safe_diagnostic(x) for x in (
+                locators[:3] if isinstance(locators, list) and locators else [None]))
+        if not causes:
+            causes.append('inventory_verified=false/readiness')
+        raise Gate('The current form inventory is incomplete; ' + '; '.join(causes))
     controls = page.get('controls')
     if (not isinstance(controls, list) or
             any(not isinstance(c, dict) or not isinstance(c.get('selector'), str)
@@ -994,6 +1025,7 @@ def _observe_closed_admissions(session, page: dict, *, transition=None) -> None:
                 raise Gate('An admitted closed combobox cannot downgrade to legacy mode.')
             continue
         combo = target['combobox']
+        _required_proxy_validity(target)
         key = (page['url'], _closed_key(target))
         phase = combo.get('phase')
         if prior is None:
@@ -1152,70 +1184,95 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                             closed_transition=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page)
+    predicate, locator = 'unavailable', 'unavailable'
+
+    def require(ok, key):
+        nonlocal predicate
+        if not ok:
+            predicate = key
+            raise ValueError
+
     try:
         result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
         value = result.get('value') if isinstance(result, dict) else None
-        if isinstance(session, _EntrySession) and value.get('entry') != page.get('entry'):
-            raise ValueError('The provider inventory changed during observation')
-        if (not isinstance(value, dict) or value.get('url') != page.get('url')
-                or not isinstance(value.get('controls'), list)
-                or len(value['controls']) != len(page['controls'])):
-            raise ValueError('The fixed DOM witness does not match PAGE')
+        require(isinstance(value, dict), 'witness.object')
+        if isinstance(session, _EntrySession):
+            require(value.get('entry') == page.get('entry'), 'entry.equal')
+        require(value.get('url') == page.get('url'), 'url.equal')
+        require(isinstance(value.get('controls'), list), 'controls.list')
+        require(len(value['controls']) == len(page['controls']), 'controls.length.equal')
         lookup = {}
         for original, observed in zip(page['controls'], value['controls']):
-            if not isinstance(observed, dict):
-                raise ValueError('Malformed DOM witness entry')
+            locator = _safe_diagnostic(original.get('diagnostic_locator'))
+            require(isinstance(observed, dict), 'control.object')
             sel = original['selector']
-            if (sel in lookup or observed.get('selector') != sel
-                    or observed.get('unique') is not True
-                    or observed.get('unique_form') is not True
-                    or any(original.get(k) != observed.get(k) for k in (
-                        'tag', 'type', 'in_form', 'form_selector',
-                        'form_action', 'formaction', 'disabled'))
-                    or (original.get('type') in {'radio', 'checkbox'}
-                        and (not isinstance(observed.get('visible_text'), str)
-                             or not observed['visible_text'].strip()
-                             or observed['visible_text'] != original.get('label')))
-                    or (original.get('tag') == 'select'
-                        and original.get('options') != observed.get('options'))
-                    or (original.get('type') == 'combobox'
-                        and (original.get('combobox') != observed.get('combobox')
-                             or not isinstance(observed.get('combobox'), dict)
-                             or (not _closed_mode(original) and not observed['combobox'].get('link_id'))
-                             or not (
-                                 (observed['combobox'].get('linked') is True
-                                  and isinstance(observed['combobox'].get('listbox_selector'), str)
-                                  and isinstance(observed['combobox'].get('options'), list))
-                                 or (observed['combobox'].get('linked') is False
-                                     and observed['combobox'].get('options') in (None, [])))))
-                    or any(not isinstance(observed.get(k), bool)
-                           for k in ('visible', 'readonly', 'inert'))):
-                raise ValueError('Control identity differs from the DOM witness')
+            require(sel not in lookup, 'selector.unique')
+            require(observed.get('selector') == sel, 'selector.equal')
+            for key in ('unique', 'unique_form'):
+                require(observed.get(key) is True, key + '.true')
+            for key in ('tag', 'type', 'in_form', 'form_selector',
+                        'form_action', 'formaction', 'disabled'):
+                require(original.get(key) == observed.get(key), key + '.equal')
+            if original.get('type') in {'radio', 'checkbox'}:
+                require(isinstance(observed.get('visible_text'), str) and
+                        bool(observed['visible_text'].strip()), 'visible_text.required_nonempty')
+                require(observed['visible_text'] == original.get('label'), 'visible_text.equal')
+            if original.get('tag') == 'select':
+                require(original.get('options') == observed.get('options'), 'options.equal')
+            if original.get('type') == 'combobox':
+                combo = observed.get('combobox')
+                require(isinstance(combo, dict), 'combobox.object')
+                source = original.get('combobox')
+                require(isinstance(source, dict), 'combobox.PAGE.object')
+                # Enumerate code-owned keys only; never serialize page-supplied keys.
+                keys = ('mode', 'phase', 'quarantined', 'required_proxy_mounted',
+                        'label_selector', 'field_selector', 'value_container_selector',
+                        'input_wrapper_selector', 'receiverless_country', 'country_graph',
+                        'link_id', 'linked', 'listbox_selector', 'options', 'selected_text',
+                        'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value')
+                for key in keys:
+                    require(source.get(key) == combo.get(key), 'combobox.' + key + '.equal')
+                require(source == combo, 'combobox.equal')
+                if not _closed_mode(original):
+                    require(bool(combo.get('link_id')), 'combobox.link_id.required_nonempty')
+                require((combo.get('linked') is True
+                         and isinstance(combo.get('listbox_selector'), str)
+                         and isinstance(combo.get('options'), list)) or
+                        (combo.get('linked') is False and combo.get('options') in (None, [])),
+                        'combobox.linked.shape')
+            for key in ('visible', 'readonly', 'inert'):
+                require(isinstance(observed.get(key), bool), key + '.bool')
             lookup[sel] = observed
+        locator = 'unavailable'
         current = await session.page()
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current)
-        if _page_identity(current) != _page_identity(page):
-            raise ValueError('The current inventory changed during observation')
+        require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
         if not readiness:
             _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
+    except Gate:
+        raise
     except (Exception, asyncio.CancelledError) as exc:
-        if isinstance(session, _EntrySession) and isinstance(exc, asyncio.CancelledError):
-            raise
-        if isinstance(session, _EntrySession) and readiness and isinstance(exc, (OSError, bsk.Unavailable)):
-            raise
-        if isinstance(session, _EntrySession) and isinstance(exc, Gate):
-            raise
-        if isinstance(session, _EntrySession) and readiness and isinstance(exc, ValueError):
-            raise _EntryNotReady('unstable application form inventory') from None
-        if any(_receiverless_country(c) for c in page.get('controls', [])):
-            raise Gate(_COUNTRY_GATE) from None
-        if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)):
-            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
-        raise Gate('The current DOM witness is unavailable or changed; '
-                   'inspect this form before answering or writing.') from None
+        if isinstance(session, _EntrySession):
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if readiness and isinstance(exc, (OSError, bsk.Unavailable)):
+                raise
+            if readiness and isinstance(exc, ValueError):
+                raise _EntryNotReady('unstable application form inventory') from None
+            # Preserve the entry-scoped country failure route, without remapping
+            # unrelated ordinary-form witness failures back to a country cause.
+            if any(_receiverless_country(c) for c in page.get('controls', [])):
+                raise Gate(_COUNTRY_GATE) from None
+        # Neither raw exception text nor compared values belong in diagnostics.
+        error = type(exc).__name__
+        error = error if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', error) else 'Exception'
+        prefix = ('application form inventory read timed out/unavailable; '
+                  if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)) else '')
+        raise Gate(prefix + 'The current DOM witness is unavailable or changed; '
+                   f'exception={error}; predicate={predicate}; control={locator}') from None
 
 
 def _radio_group(page: dict, target: dict) -> list[dict]:
@@ -1386,7 +1443,8 @@ def _combobox_options(target: dict) -> list:
             or (combo.get('hidden_selector') and (
                 not isinstance(combo.get('hidden_selector'), str)
                 or not isinstance(combo.get('hidden_value'), str)))):
-        raise Gate('The combobox option linkage is incomplete or ambiguous.')
+        raise Gate(_COUNTRY_GATE if _receiverless_country(target) else
+                   'The combobox option linkage is incomplete or ambiguous.')
     return options
 
 def _native_options(target: dict) -> list:
@@ -1621,10 +1679,12 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     admission = session._closed_admissions.get(selector)
     answer = facts.get(action.get('fact'))
     country = _receiverless_country(target)
-    if (not admission or admission['phase'] != 'C0' or not isinstance(answer, str)
-            or not answer or (not country and not target['combobox'].get('hidden_selector'))):
-        raise Gate(_COUNTRY_GATE if selector == '#country' else
-                   'A closed choice needs initial admission, exact answer and one receiver.')
+    if not admission or admission['phase'] != 'C0':
+        raise Gate('closed_select.precondition.initial_C0')
+    if not isinstance(answer, str) or not answer:
+        raise Gate('closed_select.precondition.exact_answer')
+    if not country and not target['combobox'].get('hidden_selector'):
+        raise Gate('closed_select.precondition.native_receiver')
 
     async def preflight(transition=None):
         fresh = await session.page()
@@ -1672,23 +1732,23 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     popup = tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector'))
     candidates = [o for o in options if _same(o['label'], answer)]
     if len(candidates) != 1:
-        raise Gate('The closed picker has no unique approved option.')
+        raise Gate(_COUNTRY_GATE if country else 'The closed picker has no unique approved option.')
     candidate = candidates[0]
     fresh, current = await preflight()
     if tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector')) != popup:
-        raise Gate('The expanded closed-picker relationship changed before choice.')
+        raise Gate(_COUNTRY_GATE if country else 'The expanded closed-picker relationship changed before choice.')
     matches = [o for o in _combobox_options(current) if o['selector']==candidate['selector']]
     if len(matches) != 1:
-        raise Gate('The current closed option disappeared.')
+        raise Gate(_COUNTRY_GATE if country else 'The current closed option disappeared.')
     option = matches[0]
     # Literal caption AND observed transport value are separate action boundaries.
     if option['label'] != answer:
-        raise Gate('The current option caption/code is not the exact approved answer.')
+        raise Gate(_COUNTRY_GATE if country else 'The current option caption/code is not the exact approved answer.')
     codes = option.get('value_attributes')
     if not isinstance(codes, list) or any(code != answer for code in codes):
-        raise Gate('Every present option value attribute must exactly match the approved answer.')
+        raise Gate(_COUNTRY_GATE if country else 'Every present option value attribute must exactly match the approved answer.')
     if option.get('submit') or option.get('navigates'):
-        raise Gate('A submission-capable or navigating option cannot be clicked.')
+        raise Gate(_COUNTRY_GATE if country else 'A submission-capable or navigating option cannot be clicked.')
     if not country and current['combobox']['hidden_value'] != before:
         raise Gate('The hidden receiver changed before the authorized option click.')
     await session.call('click', option['selector'])
@@ -1723,6 +1783,7 @@ class _ClosedReceipt(dict):
 
 def _check_closed_commit(target, approved, receipt):
     combo = target.get('combobox') or {}
+    _required_proxy_validity(target, submitting=True)
     if target.get('selector') == '#country' and (
             combo.get('receiverless_country') or getattr(receipt, '_country_admission', None)):
         admission = getattr(receipt, '_country_admission', None)
@@ -1767,14 +1828,9 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action)
     if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
-        try:
-            return await _execute_closed_combobox(
-                session, observed, action, facts=facts, filled=filled, pk=pk,
-                job_url=job_url, ctx=ctx, provenance=provenance)
-        except Gate as exc:
-            if _receiverless_country(target):
-                raise Gate(_COUNTRY_GATE, form_question=exc.form_question) from None
-            raise
+        return await _execute_closed_combobox(
+            session, observed, action, facts=facts, filled=filled, pk=pk,
+            job_url=job_url, ctx=ctx, provenance=provenance)
     form_question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     form_question['pk'] = pk

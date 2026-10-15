@@ -1,5 +1,12 @@
 """Read-only DOM inventory. Models never supply JavaScript to the browser."""
 
+_DIAGNOSTIC_TAGS = (
+    'html body form div span input label button textarea select option fieldset legend '
+    'p section main article header footer ul ol li a canvas object embed iframe table '
+    'tbody tr td h1 h2 h3'
+)
+
+
 _WIDGET_GRAPH = r"""
   // Executed afresh in each reader. No page attributes or model flags retain admission.
   const nativeForm = e => e.form || e.closest('form');
@@ -16,6 +23,32 @@ _WIDGET_GRAPH = r"""
   };
   const placeholderBranch = e => attr(e, 'class').split(/\s+/)
     .some(s=>s.endsWith('__placeholder') || /(?:^|-)placeholder$/.test(s));
+  // Diagnostics never reuse action selectors: even escaped IDs can hold answers.
+  const diagnosticTags = new Set('DIAGNOSTIC_TAGS'.split(' '));
+  const diagnosticLocator = e => {
+    const parts = [];
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      if (parts.length===12) return 'unavailable';
+      const tag=n.tagName.toLowerCase(), siblings=n.parentElement ? Array.from(n.parentElement.children) : [n];
+      parts.unshift(diagnosticTags.has(tag) ? tag+':nth-of-type('+(siblings.filter(x=>x.tagName===n.tagName).indexOf(n)+1)+')' : '*:nth-child('+(siblings.indexOf(n)+1)+')');
+    }
+    const path=parts.join(' > ');
+    return path && document.querySelectorAll(path).length===1 ? path : 'unavailable';
+  };
+  const requiredProxies = new Set();
+  const requiredProxy = (p,e,F,L,form) => {
+    const names=Array.from(p.attributes || []).map(a=>a.name).sort();
+    const shell=p.parentElement, style=getComputedStyle(p);
+    return e.tagName==='INPUT' && attr(e,'aria-required')==='true' &&
+      names.join(',')==='aria-hidden,class,required,tabindex' &&
+      p.tagName==='INPUT' && p.hasAttribute('required') && attr(p,'tabindex')==='-1' &&
+      attr(p,'aria-hidden')==='true' && p.value==='' &&
+      !!e.form && p.form===e.form && e.form===form &&
+      nativeForm(F)===form && nativeForm(L)===form &&
+      shell?.matches('div.select-shell') && shell.parentElement===F && shell.contains(e) &&
+      F.querySelectorAll('div.select-shell').length===1 &&
+      style.opacity==='0' && style.position==='absolute' && style.pointerEvents==='none';
+  };
   const countryGraph = (e, L, F, form, phase) => {
     // This receiverless authority belongs to the observed phone field only.
     const chain = ['input.select__input','div.select__input-container',
@@ -66,8 +99,9 @@ _WIDGET_GRAPH = r"""
     let F = V; while (F && !F.contains(L)) F = F.parentElement;
     if (!F || F===form || nativeForm(F)!==form || nativeForm(L)!==form ||
         F.querySelectorAll('[role="combobox"]').length !== 1 ||
-        Array.from(F.querySelectorAll(editable)).some(n=>n!==e) ||
         ![e,L,W,V,F,form].every(uniqueNode)) return null;
+    const extras=Array.from(F.querySelectorAll(editable)).filter(n=>n!==e);
+    if (extras.length>1 || (extras.length===1 && !requiredProxy(extras[0],e,F,L,form))) return null;
     const labels = Array.from(document.querySelectorAll('[role="combobox"]'))
       .filter(n=>attr(n,'aria-labelledby')===id);
     if (labels.length !== 1) return null;
@@ -83,7 +117,8 @@ _WIDGET_GRAPH = r"""
     if (!phase) return null;
     const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
     if (e.id==='country' && e.closest('fieldset.phone-input') && !country) return null;
-    return {mode:'closed-react-select',phase,label_selector:selector(L),
+    if (extras.length) requiredProxies.add(extras[0]);
+    return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),
       field_selector:selector(F),value_container_selector:selector(V),
       input_wrapper_selector:selector(W),hidden_selector:country ? undefined : H ? selector(H) : '',
       hidden_value:country ? undefined : H ? H.value : '',
@@ -94,6 +129,21 @@ _WIDGET_GRAPH = r"""
   };
   const newGraphs = new Map(Array.from(document.querySelectorAll('[role="combobox"]'))
     .map(e=>[e,closedGraph(e)]));
+  // Rejected react-select owners must never downgrade to legacy linked authority.
+  const rejectedCandidate = e => {
+    if (e.tagName!=='INPUT' || attr(e,'role')!=='combobox' || newGraphs.get(e)) return false;
+    const W=e.parentElement, V=W?.parentElement;
+    if (e.form && W?.contains(e) && V && Array.from(V.children).some(n=>n!==W &&
+        visible(n) && (singleBranch(n) || placeholderBranch(n)))) return true;
+    const L=byId(attr(e,'aria-labelledby'));
+    let F=e.parentElement; while (F && F.tagName!=='FORM' && !F.contains(L)) F=F.parentElement;
+    return !!L && !!F && F.tagName!=='FORM' && Array.from(F.querySelectorAll(editable)).some(n=> {
+      if (n===e || n.tagName!=='INPUT' || requiredProxies.has(n)) return false;
+      const s=getComputedStyle(n);
+      return attr(n,'aria-hidden')==='true' || (s.opacity==='0' && s.pointerEvents==='none');
+    });
+  };
+  const quarantined = new Set(Array.from(newGraphs.keys()).filter(rejectedCandidate));
   const popupClaims = e => {
     const lists = [];
     for (const key of ['aria-controls','aria-owns']) {
@@ -204,7 +254,7 @@ _WIDGET_GRAPH = r"""
               (n===search && k==='aria-controls' && id===list.id)))))) continue;
     parts.forEach(n=>pickerParts.add(n));
   }
-"""
+""".replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS)
 
 PAGE = r"""(() => {
   const visible = e => !!e.getClientRects().length &&
@@ -249,11 +299,11 @@ PAGE = r"""(() => {
       ? matches[0] : null;
   };
   const currentListbox = e => {
-    if (pickerCandidate(e)) return null;
+    if (pickerCandidate(e) || quarantined.has(e)) return null;
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
-  const controls = nodes.filter(e => !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
+  const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
     (visible(e) || e.form || e.closest('form') || e.type === 'file')).map(e => {
@@ -272,7 +322,7 @@ PAGE = r"""(() => {
     // Do not infer a receiver from the visible button label.
     const formAction = form?.action || '';
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
-    return {selector:selector(e), label:label(e).slice(0,600),
+    return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
       in_form:!!form, form_selector:form ? selector(form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
@@ -302,7 +352,8 @@ PAGE = r"""(() => {
           .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
-        return {...(graph || {}),linked:!!list, link_id:graph ? (list?.id || '') : linkId(e),
+        return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
+          linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
@@ -334,7 +385,7 @@ PAGE = r"""(() => {
   const linkedComboboxes = Array.from(document.querySelectorAll('[role="combobox"]'))
     .filter(e => {
       if (pickerParts.has(e)) return true;
-      if (pickerCandidate(e)) return false;
+      if (pickerCandidate(e) || quarantined.has(e)) return false;
       if (newGraphs.get(e)) {
         const list = currentListbox(e);
         if (newGraphs.get(e).phase==='C1' && !list) return false;
@@ -352,7 +403,7 @@ PAGE = r"""(() => {
       linkedParts.add(list); options.forEach(o=>linkedParts.add(o));
       return true;
     });
-  const opaqueControls = Array.from(document.querySelectorAll('*')).some(e =>
+  const opaqueNodes = Array.from(document.querySelectorAll('*')).filter(e =>
     (visible(e) || e.closest('form') || e.getAttribute('aria-required') === 'true') &&
     e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) && (
       (e.matches('[role="combobox"]') && !linkedComboboxes.includes(e)) ||
@@ -360,6 +411,7 @@ PAGE = r"""(() => {
       e.matches('[contenteditable]') || e.tagName.includes('-') ||
       (e.closest('form') && e.matches('canvas,object,embed,[aria-controls]') &&
         !e.matches('[role="combobox"]') && !linkedParts.has(e))));
+  const opaqueControls = opaqueNodes.length>0;
   const inventoryVerified = document.readyState === 'complete' &&
     controls.length <= 500 && !opaqueControls && !siteShadow;
   return {url:location.href, title, text:text.slice(0,100000),
@@ -368,6 +420,7 @@ PAGE = r"""(() => {
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
+    opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.slice(0,3).map(diagnosticLocator),
     inventory_verified:inventoryVerified};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 

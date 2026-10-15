@@ -130,7 +130,43 @@ for (const [id,answer] of Object.entries(answers)) {
 </script></body></html>''').encode('utf-8')
 
 
-_FORM = _closed_form()
+def _entry_form() -> bytes:
+    # Same sealed page: root appears first; passive frames arrive while inert.
+    text = _closed_form().decode('utf-8')
+    text = text.replace('<form id="application-form"',
+                        '<template id="entry-template"><form inert id="application-form"')
+    text = text.replace('</form>\n<script>', '</form></template>\n<script>\nsetTimeout(() => {\n'
+                        'document.body.append(document.getElementById("entry-template").content);')
+    injection = r'''
+ setTimeout(() => {
+  const form=document.getElementById('application-form');
+  const h=document.createElement('div'); h.id='h-captcha'; h.className='h-captcha'; form.append(h);
+  const add=(parent,src,style) => {
+   const e=document.createElement('iframe'); if(src!==null)e.setAttribute('src',src);
+   Object.assign(e.style,style); parent.append(e); return e;
+  };
+  for(let i=0;i<2;i++)add(h,'https://newassets.hcaptcha.com/captcha/v1/synthetic/static/hcaptcha-enclave.html',
+    {visibility:'hidden',width:'100vw',height:'100vh'});
+  for(const path of ['anchor','bframe'])add(document.body,'https://www.recaptcha.net/recaptcha/enterprise/'+path,
+    {visibility:'hidden'});
+  const row=document.createElement('li'); row.className='application-question awli-application-row';
+  row.innerHTML='<div class="application-field"><div class="awli-button-container"><span class="IN-widget"></span></div></div>';
+  form.append(row); const w=add(row.querySelector('span'),null,{width:'236px',height:'48px'});
+  w.title='LinkedIn Embedded Content';
+  add(document.body,null,{width:'1px',height:'1px',visibility:'hidden'});
+  for(const name of ['h-captcha-response','g-recaptcha-response']) {
+   const e=document.createElement('textarea');e.name=name;e.hidden=true;form.append(e);
+  }
+  const helper=document.createElement('button');helper.id='hcaptchaSubmitBtn';helper.className='hidden';
+  helper.hidden=true;form.append(helper);
+  form.removeAttribute('inert');
+ }, 1000);
+}, 1000);
+'''
+    return text.replace('</script></body>', injection + '</script></body>').encode('utf-8')
+
+
+_FORM = _entry_form()
 
 
 def _inventory_diagnostic_script() -> str:
@@ -195,7 +231,8 @@ class _SyntheticRun:
                  "post_count", "post_payload", "submit_ipc", "uploaded",
                  "last_page", "combo_observations", "combo_touched",
                  "submit_call_entered", "submit_guard", "post_attempts",
-                 "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts")
+                 "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
+                 "entry_initial_not_ready", "entry_wait", "entry_observations")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -233,6 +270,25 @@ class _SyntheticRun:
         self.post_receipts = []
         self.inventory_diagnostics = None
         self.widget_receipts = []
+        self.entry_initial_not_ready = False
+        self.entry_wait = 'PENDING'
+        self.entry_observations = []
+        self.observe_page(None)
+
+    def entry_provenance(self):
+        if (not authorized(self, pk=PK, company=COMPANY, url=URL)
+                or self.row.get('pk') != PK or self.row.get('company') != COMPANY):
+            raise PermissionError('Synthetic entry authority is absent.')
+        if not self.positive:
+            return None
+        from tools.browser_skill_apply import ApplicationEntryProvenance
+        return ApplicationEntryProvenance(PK, COMPANY, 'lever', 'synthetic-job',
+                                          URL, 'example-co', URL)
+
+    def entry_admitted(self, page):
+        if self.entry_initial_not_ready and self.entry_provenance() and (
+                {f['status'] for f in page['entry']['frames']} == {'H', 'R', 'W', 'X'}):
+            self.entry_wait = 'PASS'
 
 
     def enable_positive_fixture(self) -> None:
@@ -387,7 +443,9 @@ class _SyntheticRun:
                     observed.get("inventory_verified") is not True
                     or observed.get("truncated") or observed.get("opaque_controls")
                     or observed.get("shadow_roots") or observed.get("unsupported_frames"))):
-                result = await raw.call("evaluate", _inventory_diagnostic_script())
+                from tools.browser_skill_dom import entry_reader
+                script = _inventory_diagnostic_script()
+                result = await raw.call('evaluate', entry_reader(script) if state.positive else script)
                 state.inventory_diagnostics = result.get("value")
 
 
@@ -395,6 +453,8 @@ class _SyntheticRun:
             __slots__ = ('_closed_admissions',)
 
             async def navigate(self, url: str):
+                if state.positive:
+                    raise PermissionError('Typed fixture entry requires the single navigation IPC.')
                 if url != URL or state.navigations:
                     raise PermissionError("Fixture permits one navigate to the fixed job URL.")
                 if not authorized(state, pk=PK, company=COMPANY, url=URL):
@@ -408,6 +468,8 @@ class _SyntheticRun:
                 return observed
 
             async def page(self):
+                if state.positive:
+                    raise PermissionError('Typed fixture entry requires scoped PAGE evaluation.')
                 if not state.navigations or not authorized(state):
                     raise PermissionError("Fixture cannot inspect another session.")
                 observed = await raw.page()
@@ -418,13 +480,33 @@ class _SyntheticRun:
                 return observed
 
             async def call(self, *args, **kwargs):
+                if state.positive and args == ('navigate', URL) and not kwargs:
+                    state.entry_provenance()
+                    if state.navigations:
+                        raise PermissionError('Fixture permits only one navigation IPC.')
+                    state.navigations += 1
+                    return await raw.call(*args)
                 if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")
                 if state.positive and args and args[0] == "evaluate":
-                    from tools.browser_skill_apply import _FIXED_CONTROL_WITNESS
-                    if args != ("evaluate", _FIXED_CONTROL_WITNESS) or kwargs:
+                    from tools.browser_skill_apply import ENTRY_PAGE, _ENTRY_FIXED_CONTROL_WITNESS
+                    if args not in {('evaluate', ENTRY_PAGE),
+                                    ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)} or kwargs:
                         raise PermissionError("Fixture denies this browser operation.")
-                    return await raw.call(*args)
+                    result = await raw.call(*args)
+                    observed = result.get('value') if isinstance(result, dict) else None
+                    if not isinstance(observed, dict) or observed.get('url') != URL:
+                        raise PermissionError('Fixture page escaped the fixed job URL.')
+                    if args[1] == ENTRY_PAGE:
+                        if not state.entry_observations:
+                            state.entry_initial_not_ready = not observed.get('entry', {}).get('root')
+                        state.observe_page(observed)
+                        await diagnose(observed)
+                    state.entry_observations.append({
+                        'reader':'page' if args[1] == ENTRY_PAGE else 'witness',
+                        'root':bool(observed.get('entry', {}).get('root')),
+                        'frames':[f.get('status') for f in observed.get('entry', {}).get('frames', [])]})
+                    return result
                 if not state.positive:
                     if (args != ("fill", "#name", "--value", "Test User")
                             or kwargs or state.fills):
@@ -562,6 +644,7 @@ def run() -> int:
                 except Gate:
                     receipt_ok = False
                 ok = (result.get("status") == "gate"
+                      and state.entry_wait == 'PASS'
                       and form_question.get("selector") == "#additional"
                       and state.fills == expected_fills
                       and state.decisions == expected_decisions
@@ -653,6 +736,9 @@ def run() -> int:
                             "ready_state", "offending_elements", "shadow_hosts")}
                 print(json.dumps({"fixture": "native-form",
                                   "safe_gate": ok,
+                                  'entry_wait': state.entry_wait,
+                                  'entry_initial_not_ready': state.entry_initial_not_ready,
+                                  'entry_observations': state.entry_observations,
                                   "submitted": state.submit_ipc > 0,
                                   "status": result.get("status"),
                                   "comboboxes": len(state.committed),

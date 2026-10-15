@@ -23,6 +23,7 @@ from tools.claude_chrome import (
     verified_greenhouse_alias,
 )
 from tools import submit_hold
+from tools.browser_skill_dom import ENTRY_PAGE, entry_reader
 
 _SENSITIVE = re.compile(
     r'disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|'
@@ -405,6 +406,9 @@ def _configured_alias(pk: str, company: str, url: str, *,
                       fixture_context=None) -> GreenhouseJobAlias | ApplicationEntryProvenance | None:
     """Reload only the explicit watchlist and the authoritative tracked row."""
     try:
+        if fixture_context is not None:
+            ctx = _synthetic(fixture_context, pk=pk, company=company, url=url)
+            return ctx.entry_provenance()
         from core.config import get_settings
         from discovery.watchlist import load_watchlist
         row = (_row(pk, fixture_context=fixture_context) if fixture_context
@@ -945,7 +949,7 @@ def _identity(target: dict) -> tuple:
 def _page_identity(page: dict) -> tuple:
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
             page.get('opaque_controls'), page.get('shadow_roots'),
-            page.get('unsupported_frames'),
+            page.get('unsupported_frames'), repr(page.get('entry')),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
 _APPLICATION_WAIT_SECONDS = 15.0
@@ -1013,64 +1017,134 @@ def _application_marker(siblings: list[dict]) -> bool:
         for c in siblings)
 
 
-async def _stable_application_form(session, allowed, provenance, *, deadline: float) -> dict:
-    """Only fresh native-form proof can end the read-only post-navigation wait."""
+_ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
+
+
+class _EntryNotReady(Gate):
+    """A safe changing observation, retryable only during the entry wait."""
+
+
+def _entry_safety(page, allowed, provenance):
+    if not isinstance(page, dict):
+        raise Gate('The current form control inventory is malformed.')
+    if not allowed(page.get('url', '')):
+        raise Gate('Application entry route or current row/config changed; inspect manually.')
+    controls = page.get('controls')
+    if (not isinstance(controls, list) or any(not isinstance(c, dict) or
+            not isinstance(c.get('selector'), str) or not c['selector']
+            or not isinstance(c.get('tag'), str) or not isinstance(c.get('type'), str)
+            or not isinstance(c.get('in_form'), bool)
+            or (c['in_form'] and not c.get('form_selector')) for c in controls)):
+        raise Gate('The current form control inventory is malformed.')
+    entry = page.get('entry')
+    if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
+        raise Gate('The current form control inventory is malformed.')
+    for frame in entry['frames']:
+        status = frame.get('status') if isinstance(frame, dict) else None
+        if status == 'visible-recaptcha':
+            raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+        if status == 'visible-hcaptcha':
+            raise Gate('visible hCaptcha challenge; inspect manually.')
+        if status not in {'H', 'R', 'W', 'X'}:
+            raise Gate('unknown/untrusted application frame; inspect manually.')
+    if entry.get('response_error'):
+        raise Gate('untrusted captcha response control; ambiguous owner or provider.')
+    if entry.get('helper_challenge'):
+        raise Gate('visible hCaptcha challenge control; inspect manually.')
+    root = entry.get('root')
+    if root:
+        check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
+                                          form_action=root.get('action'), formaction=''),
+                               provenance=provenance)
+    for c in controls:
+        if c.get('in_form'):
+            check_form_destination(page, c, provenance=provenance)
+
+
+_ASHBY_WAIT_SECONDS = 90.0
+
+
+class _EntrySession:
+    """Route every nested reader through scoped scripts and fresh authority."""
+    def __init__(self, raw, allowed, provenance, step=None):
+        self.raw, self.allowed, self.provenance = raw, allowed, provenance
+        self.step = step
+
+    async def page(self):
+        result = await self.call('evaluate', ENTRY_PAGE)
+        return result['value']
+
+    async def call(self, *args, **kwargs):
+        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
+            args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+        result = await self.raw.call(*args, **kwargs)
+        if args and args[0] == 'evaluate':
+            page = result.get('value') if isinstance(result, dict) else None
+            if self.step is not None and isinstance(page, dict):
+                self.step['url'] = page.get('url', '')
+            _entry_safety(page, self.allowed, self.provenance)
+        return result
+
+
+def _entry_not_ready(page):
+    for key in ('truncated', 'opaque_controls', 'shadow_roots'):
+        if page.get(key):
+            return key + ' application inventory'
+    if page.get('inventory_verified') is not True:
+        return 'unverified application inventory'
+    if not page['entry'].get('root'):
+        return 'no qualifying application form'
+    return ''
+
+
+async def _stable_application_form(session, allowed, provenance, *, deadline: float,
+                                   initial=None) -> dict:
+    """Two fresh complete PAGE+witness pairs inside one navigation budget."""
     loop = asyncio.get_running_loop()
     previous, seen = None, False
-
-    def check_current(page):
-        if not isinstance(page, dict):
-            raise Gate('The current form control inventory is malformed.')
-        _inventory_ok(page)
-        if not allowed(page.get('url', '')):
-            raise Gate('Application entry route or current row/config changed; inspect manually.')
-
+    last_reason = 'no qualifying application form'
+    page = initial
     while loop.time() < deadline:
-        budget = asyncio.timeout_at(deadline)
         try:
-            async with budget:
-                page = await session.page()
-                check_current(page)
-                # The fixed witness also reads PAGE internally. Both awaits share
-                # this deadline; its cancellation-to-Gate conversion cannot extend it.
+            async with asyncio.timeout_at(deadline):
+                page = await session.page() if page is None else page
+                _entry_safety(page, allowed, provenance)
+                reason = _entry_not_ready(page)
+                if reason:
+                    raise _EntryNotReady(reason)
                 page, witness = await _observe_controls(session, page, readiness=True)
-                check_current(page)
-            if budget.expired() or loop.time() >= deadline:
-                raise TimeoutError
-        except (TimeoutError, OSError, bsk.Unavailable):
-            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
-        except Gate:
-            if budget.expired():
-                raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
-            raise
-        except Exception:
-            raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
-
-        qualifying = False
-        for c in page['controls']:
-            if not (c.get('in_form') and (_native_answer(c) or (c.get('tag') == 'input'
-                    and c.get('type') in {'radio', 'checkbox'}))):
-                continue
-            siblings = _form_subject(page, c)
-            if not _application_marker(siblings):
-                continue
-            # Readiness proves ownership and receiver, not an answer or a grant.
-            for sibling in siblings:
-                check_form_destination(page, sibling, provenance=provenance)
-            dom = witness[c['selector']]
-            if (dom.get('visible') is True and dom.get('readonly') is False
-                    and dom.get('inert') is False and not c.get('disabled')):
-                qualifying = True
-        identity = (_page_identity(page), repr(page['controls']), repr(witness)) if qualifying else None
-        if qualifying:
-            seen = True
-            if identity == previous:
-                return page
-        previous = identity
+                if loop.time() >= deadline:
+                    raise TimeoutError
+                reason = _entry_not_ready(page)
+                if reason:
+                    raise _EntryNotReady(reason)
+                qualifying = any(
+                    c.get('in_form') and _application_marker(_form_subject(page, c))
+                    and (_native_answer(c) or (c.get('tag') == 'input'
+                         and c.get('type') in {'radio', 'checkbox'}))
+                    and witness[c['selector']].get('visible') is True
+                    and witness[c['selector']].get('readonly') is False
+                    and witness[c['selector']].get('inert') is False
+                    and not c.get('disabled') for c in page['controls'])
+                identity = (_page_identity(page), repr(witness)) if qualifying else None
+                if qualifying:
+                    seen = True
+                    if identity == previous and loop.time() < deadline:
+                        _observe_closed_admissions(session, page)
+                        return page
+                last_reason = ('unstable application form inventory' if seen else
+                               'no qualifying application form')
+                previous = identity
+        except _EntryNotReady as exc:
+            last_reason, previous = str(exc), None
+        except TimeoutError:
+            last_reason = 'application form inventory read timed out/unavailable'
+            break
+        except (OSError, bsk.Unavailable):
+            last_reason, previous = 'application form inventory read timed out/unavailable', None
+        page = None
         await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
-    reason = ('unstable application form inventory after bounded wait' if seen else
-              'no qualifying application form after bounded wait')
-    raise Gate(reason + '; inspect the application manually.')
+    raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
 
 
 
@@ -1081,6 +1155,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
     try:
         result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
         value = result.get('value') if isinstance(result, dict) else None
+        if isinstance(session, _EntrySession) and value.get('entry') != page.get('entry'):
+            raise ValueError('The provider inventory changed during observation')
         if (not isinstance(value, dict) or value.get('url') != page.get('url')
                 or not isinstance(value.get('controls'), list)
                 or len(value['controls']) != len(page['controls'])):
@@ -1117,12 +1193,23 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 raise ValueError('Control identity differs from the DOM witness')
             lookup[sel] = observed
         current = await session.page()
+        if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
+            raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current)
         if _page_identity(current) != _page_identity(page):
             raise ValueError('The current inventory changed during observation')
-        _observe_closed_admissions(session, current, transition=closed_transition)
+        if not readiness:
+            _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
     except (Exception, asyncio.CancelledError) as exc:
+        if isinstance(session, _EntrySession) and isinstance(exc, asyncio.CancelledError):
+            raise
+        if isinstance(session, _EntrySession) and readiness and isinstance(exc, (OSError, bsk.Unavailable)):
+            raise
+        if isinstance(session, _EntrySession) and isinstance(exc, Gate):
+            raise
+        if isinstance(session, _EntrySession) and readiness and isinstance(exc, ValueError):
+            raise _EntryNotReady('unstable application form inventory') from None
         if any(_receiverless_country(c) for c in page.get('controls', [])):
             raise Gate(_COUNTRY_GATE) from None
         if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)):
@@ -2121,7 +2208,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         submitted = True
 
     direct_url = direct_board_url(url) or url
-    provenance = None
+    provenance = ctx.entry_provenance() if ctx else None
     trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
@@ -2200,21 +2287,25 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 if provenance is not None and not _alias_current(
                         provenance, fixture_context=ctx):
                     raise Gate('The original same-job tenant mapping changed before navigation.')
-                page = await session.navigate(direct_url)
-                deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS
                 if isinstance(provenance, ApplicationEntryProvenance):
-                    if not isinstance(page, dict):
-                        raise Gate('The current form control inventory is malformed.')
-                    _inventory_ok(page)
-                step['url'] = page['url']
-                if (isinstance(provenance, VendorRedirectProvenance)
-                        and page.get('url') != provenance.target_url):
-                    raise Gate('Initial page did not match the exact vendor-verified target.')
-                if not allowed(page['url']):
-                    raise Gate('Initial redirect is not proven to be the same employer job.')
-                if isinstance(provenance, ApplicationEntryProvenance):
+                    if not bsk.web_url(direct_url) or not allowed(direct_url):
+                        raise Gate('Application entry route or current row/config changed.')
+                    await session.call('navigate', direct_url)
+                    deadline = asyncio.get_running_loop().time() + (
+                        _ASHBY_WAIT_SECONDS if provenance.ats == 'ashby' else _APPLICATION_WAIT_SECONDS)
+                    session = _EntrySession(session, allowed, provenance, step)
                     page = await _stable_application_form(
                         session, allowed, provenance, deadline=deadline)
+                    if ctx:
+                        ctx.entry_admitted(page)
+                else:
+                    page = await session.navigate(direct_url)
+                    step['url'] = page['url']
+                    if (isinstance(provenance, VendorRedirectProvenance)
+                            and page.get('url') != provenance.target_url):
+                        raise Gate('Initial page did not match the exact vendor-verified target.')
+                    if not allowed(page['url']):
+                        raise Gate('Initial redirect is not proven to be the same employer job.')
                 for _ in range(100):
                     if submitted:
                         context = handoff(

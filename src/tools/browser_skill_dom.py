@@ -148,6 +148,19 @@ _WIDGET_GRAPH = r"""
         wrapper.querySelectorAll('.iti').length || tels.length!==1 || !visible(tels[0]) ||
         tels[0].parentElement!==wrapper || nativeForm(tels[0])!==form) continue;
     const one = (root,q) => { const a=Array.from(root.querySelectorAll(q)); return a.length===1 ? a[0] : null; };
+    // A locally valid picker elsewhere is not the witnessed phone-fieldset decoration.
+    const inputWrapper=wrapper.parentElement, textWrapper=inputWrapper?.parentElement;
+    const phoneBranch=textWrapper?.parentElement, fieldset=phoneBranch?.parentElement;
+    if (document.querySelectorAll('.iti').length!==1 ||
+        document.querySelectorAll('input[type="tel"]').length!==1 ||
+        tels[0].id!=='phone' || byId('phone')!==tels[0] ||
+        !inputWrapper?.matches('div.input-wrapper') ||
+        !textWrapper?.matches('div.text-input-wrapper') ||
+        !phoneBranch?.matches('div.phone-input__phone') ||
+        !fieldset?.matches('fieldset.phone-input') || nativeForm(fieldset)!==form ||
+        form.id!=='application-form' || byId('application-form')!==form ||
+        one(form,'fieldset.phone-input')!==fieldset ||
+        one(fieldset,'.phone-input__phone')!==phoneBranch) continue;
     const container=one(wrapper,'.iti__country-container');
     const button=container && one(container,'.iti__selected-country');
     const dialog=container && one(container,'.iti__dropdown-content');

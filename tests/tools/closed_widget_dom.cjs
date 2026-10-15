@@ -87,13 +87,13 @@ for(const key of keys){
   }
 }
 let phoneParent=form;
+form.id='application-form';
+const questions=make('div','questions',{class:'application--questions'},form);
+const outer=make('div','phone-outer',{},questions);
+const fs=make('fieldset','phone-field',{class:'phone-input'},outer);
+make('legend','phone-legend',{},fs,'Phone');
+const country=make('div','country-field',{class:'phone-input__country'},fs);
 if(scenario.fullPhone){
-  form.id='application-form';
-  const questions=make('div','questions',{class:'application--questions'},form);
-  const outer=make('div','phone-outer',{},questions);
-  const fs=make('fieldset','phone-field',{class:'phone-input'},outer);
-  make('legend','phone-legend',{},fs,'Phone');
-  const country=make('div','country-field',{class:'phone-input__country'},fs);
   const select=make('div','country-select',{class:'select'},country);
   const container=make('div','country-container',{class:'select__container'},select);
   const shell=make('div','country-shell',{class:'select-shell'},container);
@@ -128,10 +128,10 @@ if(scenario.fullPhone){
   if(scenario.countryNoToken)nodes.find(n=>n.id==='react-select-country-placeholder').attrs.class='ordinary-text';
   if(scenario.countryDrift)owner.id+='-changed';
   if(scenario.countryWrongChain)shell.attrs.class='wrong-shell';
-  phoneParent=make('div','phone-branch',{class:'phone-input__phone'},fs);
-  phoneParent=make('div','phone-text',{class:'text-input-wrapper'},phoneParent);
-  phoneParent=make('div','phone-input-wrapper',{class:'input-wrapper'},phoneParent);
 }
+phoneParent=make('div','phone-branch',{class:'phone-input__phone'},fs);
+phoneParent=make('div','phone-text',{class:'text-input-wrapper'},phoneParent);
+phoneParent=make('div','phone-input-wrapper',{class:'input-wrapper'},phoneParent);
 const iti=make('div','telephone',{class:'iti'},phoneParent);
 make('input','phone',{type:'tel','aria-label':'Phone'},iti);
 if(scenario.multipleTel)make('input','second-phone',{type:'tel'},iti);
@@ -152,6 +152,24 @@ if(!flat){
 }
 const list=make('ul','country-list',{class:'iti__country-list',role:'listbox'},dd);
 for(let i=0;i<244;i++)make('li','picker-option-'+i,{class:'iti__country',role:'option'},list,'Synthetic '+i);
+if(scenario.secondIti){
+  const clone=(n,parent)=>{
+    const attrs={...n.attrs};
+    for(const k of ['aria-controls','aria-owns','aria-labelledby','aria-describedby'])
+      if(attrs[k])attrs[k]=attrs[k].split(' ').map(id=>'second-'+id).join(' ');
+    const c=make(n.tagName.toLowerCase(),'second-'+n.id,attrs,parent);
+    for(const child of n.children)clone(child,c);
+    return c;
+  };
+  clone(iti,form);
+}
+if(scenario.movedIti){
+  phoneParent.children.splice(phoneParent.children.indexOf(iti),1);
+  iti.parentElement=form;form.children.push(iti);
+}
+if(scenario.renamedPhone)nodes.find(n=>n.id==='phone').id='other-phone';
+if(scenario.secondTelOutside)make('input','outside-tel',{type:'tel'},form);
+if(scenario.brokenPhoneChain)phoneParent.attrs.class='other-input-wrapper';
 if(scenario.pickerAttr){const [id,k,v]=scenario.pickerAttr;const n=nodes.find(n=>n.id===id);if(v===null)delete n.attrs[k];else n.attrs[k]=v;if(k==='type')n.type=v;}
 if(scenario.pickerDuplicate)make('div','dropdown',{},cc);
 if(scenario.pickerForeign){const other=make('form','other',{},body);dd.parentElement=other;other.children.push(dd);}

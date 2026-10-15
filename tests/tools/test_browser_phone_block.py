@@ -361,3 +361,18 @@ async def test_each_receiverless_commit_evidence_member_is_validated(phone_grant
     receipt._witnessed = tuple(sorted(receipt.items()))
     with pytest.raises(forms.Gate, match='receiverless country commitment'):
         forms._check_closed_commit(target, 'Approved country', receipt)
+
+
+@pytest.mark.parametrize('scenario', ['secondIti', 'movedIti', 'renamedPhone',
+                                      'secondTelOutside', 'brokenPhoneChain'])
+def test_picker_exemption_requires_one_exact_phone_branch(scenario):
+    # A fully linked second picker is not the already-covered two-tels-in-one case.
+    snapshot = dom(fullPhone=True, **{scenario: True})
+    assert snapshot['page']['opaque_controls'] is True
+    assert snapshot['page']['inventory_verified'] is False
+    for reader in snapshot.values():
+        selectors = {c['selector'] for c in reader['controls']}
+        assert {'#country-button', '#country-search', '#picker-option-0'} <= selectors
+        if scenario == 'secondIti':
+            assert {'#second-country-button', '#second-country-search',
+                    '#second-picker-option-0'} <= selectors

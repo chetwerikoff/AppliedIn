@@ -98,7 +98,7 @@ def grants(monkeypatch):
     answers = {key: {'value': 'Approved '+key, 'selector': '#'+key,
                     'label': key, 'question': key, 'url': URL,
                     'tag': 'input', 'type': 'combobox',
-                    'form_selector': '#application', 'form_action': URL}
+                    'form_selector': '#application-form', 'form_action': URL}
                for key in KEYS}
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': answers})

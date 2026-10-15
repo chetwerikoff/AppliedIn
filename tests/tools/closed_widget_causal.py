@@ -14,7 +14,7 @@ BASE = 'tests/tools/test_browser_closed_widgets.py::'
 CASES = {
  'literal-caption': ('_execute_closed_combobox', "if option['label'] != answer:", 'if False:', 'test_unsafe_choice_never_clicks_an_option[scenario0]'),
  'literal-spacing': ('_execute_closed_combobox', "if option['label'] != answer:", 'if False:', 'test_unsafe_choice_never_clicks_an_option[scenario1]'),
- 'literal-option-code': ('_execute_closed_combobox', "if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):", 'if False:', 'test_unsafe_choice_never_clicks_an_option[scenario2]'),
+ 'literal-option-code': ('_execute_closed_combobox', "if not isinstance(codes, list) or any(code != answer for code in codes):", 'if False:', 'test_unsafe_choice_never_clicks_an_option[scenario2]'),
  'initial-admission': ('_observe_closed_admissions', "if phase != 'C0':", 'if False:', 'test_observation_itself_refuses_unproved_continuation[initial]'),
  'stable-anchors': ('_observe_closed_admissions', "prior['key'] != key or ", '', 'test_observation_itself_refuses_unproved_continuation[identity]'),
  'ordered-phase': ('_observe_closed_admissions', "phase != prior['phase']", 'False', 'test_observation_itself_refuses_unproved_continuation[phase]'),
@@ -43,9 +43,10 @@ CASES = {
  'non-submitting-picker': ('JS', " || button.type!=='button'", '', 'test_unproven_graph_or_picker_retains_opacity[scenario5]'),
  'nonempty-tel-readback': ('execute', " or phone.get('has_value') is not True", '', 'test_full_phone_readback_mismatch_gates_after_only_tel_fill[True]'),
  'nonempty-tel-presubmit': ('check_form', "if typ == 'tel' and expected is not None and (", 'if False and (', 'test_cleared_optional_phone_cannot_evade_presubmit'),
- 'conflicting-option-attributes': ('_execute_closed_combobox', "if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs0]'),
- 'empty-data-option-attribute': ('_execute_closed_combobox', "if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs1]'),
- 'empty-value-option-attribute': ('_execute_closed_combobox', "if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs2]'),
+ 'conflicting-option-attributes': ('_execute_closed_combobox', "if not isinstance(codes, list) or any(code != answer for code in codes):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs0]'),
+ 'empty-data-option-attribute': ('_execute_closed_combobox', "if not isinstance(codes, list) or any(code != answer for code in codes):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs1]'),
+ 'empty-value-option-attribute': ('_execute_closed_combobox', "if not isinstance(codes, list) or any(code != answer for code in codes):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs2]'),
+ 'different-data-option-attribute': ('_execute_closed_combobox', "if not isinstance(codes, list) or any(code != answer for code in codes):", 'if False:', 'test_every_present_option_attribute_must_be_approved[attrs3]'),
  'direct-submit-c3-witness': ('apply', 'page, _ = await _observe_controls(session, page)', 'pass', 'test_direct_route_commit_requires_latest_fixed_witness[submit]'),
  'direct-continue-c3-witness': ('apply', 'page, _ = await _observe_controls(session, page)', 'pass', 'test_direct_route_commit_requires_latest_fixed_witness[click]'),
 }

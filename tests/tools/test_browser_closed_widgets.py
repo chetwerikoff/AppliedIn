@@ -329,13 +329,24 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
     {'data-value': 'Approved location', 'value': 'OTHER'},
     {'data-value': '', 'value': 'Approved location'},
     {'data-value': 'Approved location', 'value': ''},
-    {},
+    {'data-value': 'OTHER'},
 ])
 async def test_every_present_option_attribute_must_be_approved(grants, attrs):
     session = Session(optionAttrs=attrs)
     with pytest.raises(forms.Gate):
         await choose(session, grants)
     assert session.calls == [('click', '#location')]
+
+
+async def test_attribute_less_option_commits_exact_caption_and_receiver(grants):
+    session, filled = Session(optionAttrs={}), {}
+    receipt = await choose(session, grants, filled=filled)
+    assert receipt['committed_caption'] == receipt['committed_value'] == grants['location']
+    assert receipt['hidden_value'] == grants['location']
+    assert session.calls == [('click', '#location'), ('click', '#location-option')]
+    final, _ = await forms._observe_controls(session, await session.page())
+    forms.check_form(final, filled, True, receipts=[receipt])
+    forms.check_approvals('example-co#1', [receipt], final)
 
 
 def test_cleared_optional_phone_cannot_evade_presubmit():

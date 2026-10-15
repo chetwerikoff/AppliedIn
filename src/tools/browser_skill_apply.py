@@ -1571,7 +1571,7 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     if option['label'] != answer:
         raise Gate('The current option caption/code is not the exact approved answer.')
     codes = option.get('value_attributes')
-    if not isinstance(codes, list) or not codes or any(code != answer for code in [option['value'], *codes]):
+    if not isinstance(codes, list) or any(code != answer for code in codes):
         raise Gate('Every present option value attribute must exactly match the approved answer.')
     if option.get('submit') or option.get('navigates'):
         raise Gate('A submission-capable or navigating option cannot be clicked.')
@@ -1583,7 +1583,10 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         'action':'combobox', 'selector':selector, 'label':current['label'],
         'question':current.get('question', ''), 'url':fresh['url'],
         'fact':action['fact'], 'approved_value':answer,
-        'committed_caption':option['label'], 'committed_value':option['value'],
+        # Attribute-less react-select options commit the witnessed exact caption;
+        # the independently current receiver/token must still prove that value.
+        'committed_caption':option['label'],
+        'committed_value':codes[0] if codes else option['label'],
         'hidden_selector':current['combobox']['hidden_selector'],
         'hidden_value_before':before, 'hidden_value':current['combobox']['hidden_value'],
         'closed_admission':stable,

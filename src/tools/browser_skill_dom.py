@@ -40,7 +40,9 @@ _WIDGET_GRAPH = r"""
     const names=Array.from(p.attributes || []).map(a=>a.name).sort();
     const shell=p.parentElement, style=getComputedStyle(p);
     return e.tagName==='INPUT' && attr(e,'aria-required')==='true' &&
-      names.join(',')==='aria-hidden,class,required,tabindex' &&
+      (names.join(',')==='aria-hidden,class,required,tabindex' ||
+        (names.join(',')==='aria-hidden,class,required,tabindex,value' &&
+         p.getAttribute('value')==='')) &&
       p.tagName==='INPUT' && p.hasAttribute('required') && attr(p,'tabindex')==='-1' &&
       attr(p,'aria-hidden')==='true' && p.value==='' &&
       !!e.form && p.form===e.form && e.form===form &&
@@ -425,15 +427,8 @@ PAGE = r"""(() => {
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 
 
-# Inserted before either reader's graph: filtering the final list is too late,
-# because closedGraph and linked receivers read hidden values eagerly.
-_ENTRY_OBSERVATION = r"""
-  const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
-    ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
-  const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
-  const excluded = new Set([...responseNodes, ...reservedButtons]);
-  // Use the same native marker captions as PAGE/_application_marker, including
-  // accessible submit labels and input submit values; never a generic form shell.
+# Native application-root proof and the visible badge predicate have one owner.
+_APPLICATION_ROOT = r"""
   const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
     (e.getAttribute('aria-labelledby') || '').split(' ')
       .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
@@ -457,6 +452,27 @@ _ENTRY_OBSERVATION = r"""
         r.width>=0 && r.height>=0 ? {width:r.width,height:r.height} : null;
     } catch (_) { return null; }
   };
+"""
+
+# Hidden R and the other providers stay exclusively in the entry classifier.
+_VISIBLE_RECAPTCHA = r"""
+  const visibleRecaptcha = (origin,path,shown,outside,badge,bounds) => {
+    const provider=['https://www.recaptcha.net','https://www.google.com'].includes(origin);
+    if (provider && path==='/recaptcha/enterprise/bframe' && shown) return 'visible-recaptcha';
+    if (provider && path==='/recaptcha/enterprise/anchor' && shown && outside &&
+        badge && !!bounds && bounds.width===256 && bounds.height===60) return 'R';
+    return 'unknown';
+  };
+"""
+
+# Inserted before either reader's graph: filtering the final list is too late,
+# because closedGraph and linked receivers read hidden values eagerly.
+_ENTRY_OBSERVATION = r"""
+  const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
+    ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
+  const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
+  const excluded = new Set([...responseNodes, ...reservedButtons]);
+""" + _APPLICATION_ROOT + _VISIBLE_RECAPTCHA + r"""
   const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='';
@@ -487,12 +503,12 @@ _ENTRY_OBSERVATION = r"""
       !row.querySelector('[contenteditable],[required],[aria-required="true"]');
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
+    const visibleR=visibleRecaptcha(origin,path,shown,outside,badge,bounds);
     let status='unknown';
     // Visible bframe precedence is independent of root proof/placement.
-    if (r && path==='/recaptcha/enterprise/bframe' && shown) status='visible-recaptcha';
+    if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
-    else if (r && outside && (hidden || (path==='/recaptcha/enterprise/anchor' && shown &&
-      badge && !!bounds && bounds.width===256 && bounds.height===60))) status='R';
+    else if ((r && outside && hidden) || visibleR==='R') status='R';
     else if (w) { status='W'; row.querySelectorAll(query).forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
@@ -555,3 +571,41 @@ def entry_reader(script: str) -> str:
 
 
 ENTRY_PAGE = entry_reader(PAGE)
+
+
+_GREENHOUSE_OBSERVATION = r"""
+  const excluded = new Set();
+""" + _APPLICATION_ROOT.replace('filter(e=>!excluded.has(e))',
+                                'filter(e=>e.form===f && !excluded.has(e))') + _VISIBLE_RECAPTCHA + r"""
+  // Both readers use ordinary PAGE's frame visibility, not witness editability.
+  // Otherwise a collapse/transparent transition could disappear from the witness.
+  const greenhouseFrames = Array.from(document.querySelectorAll('iframe')).filter(e =>
+    !!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden');
+  const greenhouse = {root:root ? {selector:selector(root),action:root.action} : null,
+    frames:greenhouseFrames.map(e => {
+      const raw=e.getAttribute('src');
+      let origin='', path='';
+      try { if(raw!==null) { const u=new URL(raw); origin=u.origin; path=u.pathname; } } catch (_) {}
+      const style=getComputedStyle(e), bounds=rectOf(e,true);
+      const shown=style.visibility==='visible' && style.display!=='none';
+      const outside=!!root && !root.contains(e), badge=!!e.closest('div.grecaptcha-badge');
+      return {selector:selector(e),origin,path,visibility:style.visibility,display:style.display,
+        outside,badge,bounds,status:visibleRecaptcha(origin,path,shown,outside,badge,bounds)};
+    })};
+"""
+
+
+def greenhouse_reader(script: str) -> str:
+    """Visible-only observation, selected by current typed alias in the controller."""
+    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)
+    script = script.replace('return {url:location.href, title,',
+                            'return {greenhouse, url:location.href, title,')
+    script = script.replace('return {url: location.href, controls:',
+                            'return {greenhouse, url: location.href, controls:')
+    script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"
+                            "      .filter(visible).map(e=>e.src)",
+                            "unsupported_frames:greenhouse.frames.filter(f=>f.status!=='R').map(f=>f.selector)")
+    return script
+
+
+GREENHOUSE_PAGE = greenhouse_reader(PAGE)

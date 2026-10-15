@@ -23,7 +23,9 @@ from tools.claude_chrome import (
     verified_greenhouse_alias,
 )
 from tools import submit_hold
-from tools.browser_skill_dom import ENTRY_PAGE, entry_reader
+from tools.browser_skill_dom import (
+    ENTRY_PAGE, GREENHOUSE_PAGE, entry_reader, greenhouse_reader,
+)
 
 _SENSITIVE = re.compile(
     r'disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|'
@@ -981,6 +983,7 @@ def _page_identity(page: dict) -> tuple:
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
             page.get('opaque_controls'), page.get('shadow_roots'),
             page.get('unsupported_frames'), repr(page.get('entry')),
+            repr(page.get('greenhouse')),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
 _APPLICATION_WAIT_SECONDS = 15.0
@@ -1050,6 +1053,55 @@ def _application_marker(siblings: list[dict]) -> bool:
 
 
 _ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
+_GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
+
+
+def _greenhouse_safety(page, allowed, provenance):
+    if not isinstance(provenance, GreenhouseJobAlias):
+        raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
+    if not isinstance(page, dict) or not allowed(page.get('url', '')):
+        raise Gate('Greenhouse route or current row/config changed; inspect manually.')
+    observed = page.get('greenhouse')
+    if not isinstance(observed, dict) or not isinstance(observed.get('frames'), list):
+        raise Gate('The current form control inventory is malformed.')
+    frames = observed['frames']
+    # Challenge precedence must cover the whole observation, not just the first frame.
+    if any(isinstance(f, dict) and f.get('status') == 'visible-recaptcha' for f in frames):
+        raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+    if any(not isinstance(f, dict) or f.get('status') != 'R' for f in frames):
+        raise Gate('unknown/untrusted application frame; inspect manually.')
+    root = observed.get('root')
+    if frames:
+        if not isinstance(root, dict) or not root.get('selector'):
+            raise Gate('unknown/untrusted application frame; inspect manually.')
+        check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
+                                          form_action=root.get('action'), formaction=''),
+                               provenance=provenance)
+
+
+class _GreenhouseSession:
+    """Every PAGE and independent witness re-proves current alias and visible frames."""
+    def __init__(self, raw, allowed, provenance, step=None):
+        self.raw, self.allowed, self.provenance = raw, allowed, provenance
+        self.step = step
+
+    async def page(self):
+        return (await self.call('evaluate', GREENHOUSE_PAGE))['value']
+
+    async def call(self, *args, **kwargs):
+        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
+            args = ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)
+        elif args == ('evaluate', bsk.PAGE):
+            args = ('evaluate', GREENHOUSE_PAGE)
+        result = await self.raw.call(*args, **kwargs)
+        if args in {('evaluate', GREENHOUSE_PAGE),
+                    ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)}:
+            page = result.get('value') if isinstance(result, dict) else None
+            if self.step is not None and isinstance(page, dict):
+                self.step['url'] = page.get('url', '')
+            _greenhouse_safety(page, self.allowed, self.provenance)
+        return result
+
 
 
 class _EntryNotReady(Gate):
@@ -1198,6 +1250,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         require(isinstance(value, dict), 'witness.object')
         if isinstance(session, _EntrySession):
             require(value.get('entry') == page.get('entry'), 'entry.equal')
+        if isinstance(session, _GreenhouseSession):
+            require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
         require(isinstance(value.get('controls'), list), 'controls.list')
         require(len(value['controls']) == len(page['controls']), 'controls.length.equal')
@@ -2354,6 +2408,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, allowed, provenance, deadline=deadline)
                     if ctx:
                         ctx.entry_admitted(page)
+                elif isinstance(provenance, GreenhouseJobAlias):
+                    if not allowed(direct_url):
+                        raise Gate('Greenhouse route or current row/config changed.')
+                    await session.call('navigate', direct_url)
+                    session = _GreenhouseSession(session, allowed, provenance, step)
+                    page = await session.page()
                 else:
                     page = await session.navigate(direct_url)
                     step['url'] = page['url']

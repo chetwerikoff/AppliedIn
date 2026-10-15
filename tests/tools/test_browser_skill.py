@@ -2276,3 +2276,334 @@ async def test_application_native_select_prompt_preserves_server_choice_semantic
     prompt = request['messages'][0]['content']
     assert ('For an APPLICATION native select, leave value empty: the server chooses '
             'the option from the exact human-approved answer.') in prompt
+
+
+_REAL_OBSERVE_CONTROLS = forms._observe_controls
+_GH_URL = 'https://job-boards.greenhouse.io/example-co/jobs/123'
+_GH_ALIAS = forms.GreenhouseJobAlias(
+    pk='example-co#123', company='example-co', ats='greenhouse', job_id='123',
+    wrapper='https://careers.example-co.test/job/123',
+    careers_url='https://careers.example-co.test/', board='example-co', url=_GH_URL)
+
+
+def _gh_dom(change=None, script=None):
+    """Execute production JS in the same offline parent DOM as the entry tests."""
+    import subprocess
+    from pathlib import Path
+    spec = dict(frames=['R'], visible=True, badge=True, url=_GH_URL)
+    spec.update(change or {})
+    result = subprocess.run(
+        ['node', str(Path(__file__).with_name('entry_dom_fixture.js')),
+         json.dumps(spec), script or forms.GREENHOUSE_PAGE],
+        capture_output=True, text=True, check=True)
+    return json.loads(result.stdout)
+
+
+def _gh_safe(observed, provenance=_GH_ALIAS):
+    forms._greenhouse_safety(observed, lambda url: url == _GH_URL, provenance)
+
+
+@pytest.mark.parametrize('origin', ['https://www.recaptcha.net', 'https://www.google.com'])
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_badge_exact_visible_origins(origin, reader):
+    script = (forms.GREENHOUSE_PAGE if reader == 'page'
+              else forms._GREENHOUSE_FIXED_CONTROL_WITNESS)
+    observed = _gh_dom({'edit': {'src': origin + '/recaptcha/enterprise/anchor'}}, script)
+    _gh_safe(observed)
+    assert [f['status'] for f in observed['greenhouse']['frames']] == ['R']
+    assert observed['greenhouse']['root']['selector'] == '#application-form'
+    if reader == 'page':
+        forms._inventory_ok(observed)
+        assert observed['unsupported_frames'] == []
+        assert not observed['opaque_controls'] and not observed['shadow_roots']
+
+
+_GH_NEGATIVES = [
+    {'edit': {'src': origin + '/recaptcha/enterprise/anchor'}}
+    for origin in ['http://www.recaptcha.net', 'https://recaptcha.net',
+                   'https://www.recaptcha.net:444', 'https://www.recaptcha.net.example-co.test']
+ ] + [
+    {'edit': {'src': 'https://www.recaptcha.net' + path}} for path in [
+        '/prefix/recaptcha/enterprise/anchor', '/recaptcha/enterprise/anchor/suffix',
+        '/recaptcha/enterprise/anchor/', '/recaptcha/api2/anchor']
+ ] + [
+    {'badge': False}, {'inside': True}, {'root': False}, {'ambiguous': True},
+    {'marker': 'absent'}, {'bounds': {'width': 300, 'height': 60}},
+    {'foreignMarker': True},
+    {'bounds': {'width': 256, 'height': 61}}, {'bounds': {'width': 255, 'height': 60}},
+    {'bounds': {'width': 256, 'height': 59}}, {'bounds': {'width': 256.5, 'height': 60}},
+    {'bounds': 'missing'}, {'bounds': 'nan'}, {'bounds': 'infinity'},
+    {'edit': {'style': {'visibility': 'collapse', 'display': 'block'}}},
+    {'edit': {'style': {'visibility': 'visible', 'display': 'none'}}},
+    {'sibling': True},
+ ]
+
+
+@pytest.mark.parametrize('change', _GH_NEGATIVES)
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_badge_isolated_visible_negatives(change, reader):
+    script = (forms.GREENHOUSE_PAGE if reader == 'page'
+              else forms._GREENHOUSE_FIXED_CONTROL_WITNESS)
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        _gh_safe(_gh_dom(change, script))
+
+
+@pytest.mark.parametrize('placement', [{}, {'inside': True}, {'root': False}])
+def test_greenhouse_visible_bframe_precedes_root_and_unknown(placement):
+    for frames in [['B'], ['R', 'B']]:
+        with pytest.raises(forms.Gate, match='visible reCAPTCHA Enterprise challenge'):
+            _gh_safe(_gh_dom(dict(placement, frames=frames, badge=False)))
+
+
+@pytest.mark.parametrize('change', [
+    {'visible': False}, {'edit': {'rect': None}},
+    {'edit': {'style': {'visibility': 'hidden'}}},
+    {'edit': {'rect': None, 'style': {'display': 'none'}}},
+ ])
+@pytest.mark.parametrize('shape', [{}, {'root': False}, {'inside': True},
+                                  {'edit': {'src': 'https://untrusted.example-co.test/frame'}}])
+def test_greenhouse_nonvisible_parity(change, shape):
+    from tools.browser_skill_dom import PAGE
+    spec = {**shape, **change, 'edit': {**shape.get('edit', {}), **change.get('edit', {})}}
+    for kind in ['R', 'B'] :
+        spec['frames'] = [kind]
+        ordinary = _gh_dom(spec, PAGE)
+        scoped = _gh_dom(spec)
+        assert ordinary['unsupported_frames'] == scoped['unsupported_frames'] == []
+        assert scoped['greenhouse']['frames'] == []
+        _gh_safe(scoped)
+
+
+def test_greenhouse_ordinary_reader_never_trusts_badge():
+    from tools.browser_skill_dom import PAGE
+    observed = _gh_dom(script=PAGE)
+    assert 'greenhouse' not in observed and observed['unsupported_frames']
+    with pytest.raises(forms.Gate, match='incomplete'):
+        forms._inventory_ok(observed)
+
+
+@pytest.mark.parametrize('provenance', [None, object(), forms.VendorRedirectProvenance(
+    'example-co#123', 'example-co', 'workday', '123',
+    'https://careers.example-co.test/job/123', _GH_URL)])
+def test_greenhouse_badge_typed_provenance_guard(provenance):
+    with pytest.raises(forms.Gate, match='typed same-job provenance'):
+        _gh_safe(_gh_dom(), provenance)
+
+
+@pytest.mark.parametrize('change', _GH_NEGATIVES + [{'frames': ['B']}])
+async def test_greenhouse_every_fresh_reader_gates_before_mutation(change):
+    good, bad = _gh_dom(), _gh_dom(change)
+    class Raw:
+        def __init__(self):
+            self.reads = 0
+            self.mutations = []
+        async def call(self, *args, **kwargs):
+            if args[0] == 'evaluate':
+                self.reads += 1
+                return {'value': good if self.reads == 1 else bad}
+            self.mutations.append(args)
+    for later in ['page', 'witness']:
+        raw = Raw()
+        session = forms._GreenhouseSession(raw, lambda url: url == _GH_URL, _GH_ALIAS)
+        assert await session.page() == good
+        with pytest.raises(forms.Gate):
+            if later == 'page':
+                await session.page()
+            else:
+                await session.call('evaluate', forms._FIXED_CONTROL_WITNESS)
+            await session.call('fill', '#email', '--value', 'test@example-co.test')
+        assert not raw.mutations
+
+
+async def test_greenhouse_current_alias_rechecked_on_later_witness():
+    current = True
+    raw = SimpleNamespace(call=AsyncMock(return_value={'value': _gh_dom()}))
+    session = forms._GreenhouseSession(raw, lambda url: current and url == _GH_URL, _GH_ALIAS)
+    await session.page()
+    current = False
+    with pytest.raises(forms.Gate, match='current row/config changed'):
+        await session.call('evaluate', forms._FIXED_CONTROL_WITNESS)
+
+
+async def test_greenhouse_independent_witness_and_repage_are_scoped(monkeypatch):
+    monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
+    calls = []
+    class Raw:
+        async def call(self, *args):
+            calls.append(args)
+            return {'value': _gh_dom(script=args[1])}
+    session = forms._GreenhouseSession(Raw(), lambda url: url == _GH_URL, _GH_ALIAS)
+    initial = await session.page()
+    current, witness = await forms._observe_controls(session, initial)
+    assert current == initial and '#email' in witness
+    assert calls == [('evaluate', forms.GREENHOUSE_PAGE),
+                     ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
+                     ('evaluate', forms.GREENHOUSE_PAGE)]
+
+
+@pytest.mark.parametrize('key,value', [('opaque_controls', True), ('shadow_roots', True),
+                                     ('truncated', True), ('inventory_verified', False)])
+def test_greenhouse_badge_does_not_relax_adjacent_inventory_guards(key, value):
+    observed = _gh_dom()
+    observed[key] = value
+    _gh_safe(observed)
+    with pytest.raises(forms.Gate, match='incomplete'):
+        forms._inventory_ok(observed)
+
+
+@pytest.mark.parametrize('change,old,new', [
+    ({'edit': {'src': 'https://wrong.example-co.test/recaptcha/enterprise/anchor'}},
+     "const provider=['https://www.recaptcha.net','https://www.google.com'].includes(origin)",
+     'const provider=true'),
+    ({'edit': {'src': 'https://www.recaptcha.net/recaptcha/api2/anchor'}},
+     "path==='/recaptcha/enterprise/anchor' &&", 'true &&'),
+    ({'badge': False}, 'badge && !!bounds', 'true && !!bounds'),
+    ({'inside': True}, 'shown && outside &&', 'shown && true &&'),
+    ({'ambiguous': True}, 'forms.length===1 ?', 'forms.length>=1 ?'),
+    ({'edit': {'style': {'visibility': 'collapse', 'display': 'block'}}},
+     "style.visibility==='visible' && style.display!=='none'", "style.display!=='none'"),
+    ({'bounds': {'width': 300, 'height': 60}}, 'bounds.width===256 &&', 'true &&'),
+    ({'bounds': {'width': 256, 'height': 61}}, 'bounds.height===60', 'true'),
+ ])
+def test_greenhouse_guard_removal_sensitivity(change, old, new):
+    # Run the *same* negative assertion with exactly one production conjunct
+    # removed in-memory, never changing or committing weakened production code.
+    original = forms.GREENHOUSE_PAGE
+    assert old in original
+    def negative(script):
+        with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+            _gh_safe(_gh_dom(change, script))
+    negative(original)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        negative(original.replace(old, new))
+    negative(original)
+
+
+def _proxy_dom(change=None, *, page_script=None, witness_script=None):
+    import subprocess
+    from pathlib import Path
+    spec = dict(fullPhone=True, requiredProxy=True, proxyValueAttribute=True)
+    spec.update(change or {})
+    return json.loads(subprocess.check_output([
+        'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
+        json.dumps(spec), page_script or bsk.PAGE,
+        witness_script or forms._FIXED_CONTROL_WITNESS], text=True))
+
+
+@pytest.mark.parametrize('value_attribute', [False, True])
+def test_greenhouse_proxy_exact_four_or_five_names_in_both_readers(value_attribute):
+    result = _proxy_dom({'proxyValueAttribute': value_attribute})
+    forms._inventory_ok(result['page'])
+    for reader in result.values():
+        for key in ['location', 'country']:
+            target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
+            assert target['combobox']['mode'] == 'closed-react-select'
+            assert target['combobox']['required_proxy_mounted'] is True
+            forms._required_proxy_validity(target)
+
+
+@pytest.mark.parametrize('mutation', [
+    {'attr': ['value', 'nonempty']},
+    {'attr': ['data-extra', '']},
+    {'attr': ['required', None]},
+    {'value': 'nonempty'},
+ ])
+@pytest.mark.parametrize('key', ['location', 'country'])
+def test_greenhouse_proxy_five_name_isolated_negatives(mutation, key):
+    result = _proxy_dom({'proxyMutation': {'key': key, **mutation}})
+    with pytest.raises(forms.Gate, match='opaque_controls'):
+        forms._inventory_ok(result['page'])
+    for reader in result.values():
+        target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
+        assert target['combobox']['quarantined'] is True
+        assert target['combobox'].get('mode') != 'closed-react-select'
+
+
+def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
+    old = ("(names.join(',')==='aria-hidden,class,required,tabindex' ||\n"
+           "        (names.join(',')==='aria-hidden,class,required,tabindex,value' &&\n"
+           "         p.getAttribute('value')===''))")
+    assert old in bsk.PAGE and old in forms._FIXED_CONTROL_WITNESS
+    def positive(page_script, witness_script):
+        result = _proxy_dom(page_script=page_script, witness_script=witness_script)
+        forms._inventory_ok(result['page'])
+        assert all(next(c for c in reader['controls'] if c['selector'] == '#location')[
+            'combobox'].get('mode') == 'closed-react-select' for reader in result.values())
+    positive(bsk.PAGE, forms._FIXED_CONTROL_WITNESS)
+    with pytest.raises(forms.Gate, match='opaque_controls'):
+        positive(bsk.PAGE.replace(old, "names.join(',')==='aria-hidden,class,required,tabindex'"),
+                 forms._FIXED_CONTROL_WITNESS.replace(old,
+                    "names.join(',')==='aria-hidden,class,required,tabindex'"))
+    positive(bsk.PAGE, forms._FIXED_CONTROL_WITNESS)
+
+
+@pytest.mark.parametrize('change', _GH_NEGATIVES + [
+    {'frames': ['B']}, {'action': 'https://foreign.example-co.test/submit'}])
+async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(change, monkeypatch):
+    monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
+    monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: True)
+    initial = _gh_dom()
+    class Raw:
+        def __init__(self):
+            self.mutations = []
+        async def call(self, *args, **kwargs):
+            if args[0] == 'evaluate':
+                spec = {} if args[1] == forms._GREENHOUSE_FIXED_CONTROL_WITNESS else change
+                return {'value': _gh_dom(spec, args[1])}
+            self.mutations.append(args)
+    raw = Raw()
+    session = forms._GreenhouseSession(raw, lambda url: url == _GH_URL, _GH_ALIAS)
+    with pytest.raises(forms.Gate):
+        await forms.execute(session, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+                            facts={'Email': 'test@example-co.test'}, filled={}, resume_path='',
+                            company=_GH_ALIAS.company, jd_text='', resume_tex='', github='',
+                            pk=_GH_ALIAS.pk, job_url=_GH_ALIAS.wrapper, provenance=_GH_ALIAS)
+    assert not raw.mutations
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_greenhouse_bframe_priority_removal_detected(reader):
+    original = forms.GREENHOUSE_PAGE if reader == 'page' else forms._GREENHOUSE_FIXED_CONTROL_WITNESS
+    clause = "if (provider && path==='/recaptcha/enterprise/bframe' && shown) return 'visible-recaptcha';"
+    assert clause in original
+    def challenge(script):
+        with pytest.raises(forms.Gate, match='visible reCAPTCHA Enterprise challenge'):
+            _gh_safe(_gh_dom({'frames': ['B'], 'root': False}, script))
+    challenge(original)
+    with pytest.raises(AssertionError, match='Regex pattern did not match'):
+        challenge(original.replace(clause, ''))
+    challenge(original)
+
+
+def test_greenhouse_typed_guard_removal_detected():
+    import inspect
+    source = inspect.getsource(forms._greenhouse_safety)
+    guard = ("    if not isinstance(provenance, GreenhouseJobAlias):\n"
+             "        raise Gate('Greenhouse frame observation lacks typed same-job provenance.')\n")
+    assert guard in source
+    scope = dict(vars(forms))
+    exec(source.replace(guard, ''), scope)
+    observed = _gh_dom({'frames': []})
+    def negative(check):
+        with pytest.raises(forms.Gate, match='typed same-job provenance'):
+            check(observed, lambda url: url == _GH_URL, None)
+    negative(forms._greenhouse_safety)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        negative(scope['_greenhouse_safety'])
+    negative(forms._greenhouse_safety)
+
+
+async def test_greenhouse_freshness_guard_removal_detected(monkeypatch):
+    good, bad = _gh_dom(), _gh_dom({'bounds': {'width': 300, 'height': 60}})
+    raw = SimpleNamespace(call=AsyncMock(side_effect=[{'value': good}, {'value': bad}]))
+    session = forms._GreenhouseSession(raw, lambda url: url == _GH_URL, _GH_ALIAS)
+    await session.page()
+    async def negative():
+        with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+            await session.page()
+    await negative()
+    async def cached_page():
+        return good
+    monkeypatch.setattr(session, 'page', cached_page)
+    with pytest.raises(pytest.fail.Exception, match='DID NOT RAISE'):
+        await negative()

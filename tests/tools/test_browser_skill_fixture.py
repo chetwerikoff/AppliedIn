@@ -819,8 +819,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                 event("async_bsk", operation="navigate")
                 payload = {"ok": True}
             elif operation == "evaluate":
-                from tools.browser_skill_dom import ENTRY_PAGE
-                assert argv[2] == ENTRY_PAGE
+                from tools.browser_skill_dom import ENTRY_PAGE, GREENHOUSE_PAGE
+                assert argv[2] in {ENTRY_PAGE, GREENHOUSE_PAGE}
                 event("async_bsk", operation="evaluate_page")
                 payload = {"ok": True, "value": _page}
             else:
@@ -859,9 +859,9 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                    and (e["dotenv"], e["cost"]) != ("1", "True")
                    for e in events)
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
-    assert actions.count("session_start") == actions.count("session_stop") == 1
-    assert actions.count("navigate") == 1
-    assert actions.count("evaluate_page") == 1  # malformed entry Gates on its first scoped read
+    assert actions.count("session_start") == actions.count("session_stop") == 2
+    assert actions.count("navigate") == 2
+    assert actions.count("evaluate_page") == 2  # Each malformed scoped read independently Gates.
     assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
@@ -1468,3 +1468,101 @@ async def test_unknown_frame_failure_diagnostic_preserves_rejected_snapshot(auth
         forms._entry_safety(original,lambda u: True,authority.entry_provenance())
     assert authority.fills == authority.ipc_index == 0
     assert len(calls) == 3
+
+
+async def test_greenhouse_fixture_has_separate_typed_authority_and_scoped_readers(authority):
+    from tests.tools.test_browser_skill import _gh_dom
+    authority.enable_positive_fixture()
+    authority.greenhouse = True
+    proof = authority.entry_provenance()
+    assert isinstance(proof, forms.GreenhouseJobAlias)
+    assert forms._alias_current(proof, fixture_context=authority)
+    scripts = []
+    class Raw:
+        async def call(self, *args):
+            scripts.append(args)
+            if args == ('navigate', fixture.URL):
+                return {}
+            return {'value': _gh_dom({'url': fixture.URL}, args[1])}
+        async def page(self):
+            pytest.fail('Greenhouse fixture must never use generic PAGE')
+        async def navigate(self, url):
+            pytest.fail('Greenhouse fixture must never use generic navigate')
+    facade = authority.facade(Raw())
+    await facade.call('navigate', fixture.URL)
+    session = forms._GreenhouseSession(facade, lambda u: u == fixture.URL and forms._alias_current(
+        proof, fixture_context=authority), proof)
+    observed = await session.page()
+    await session.call('evaluate', forms._FIXED_CONTROL_WITNESS)
+    assert authority.visible_badge_anchor == 'PASS'
+    assert authority.entry_wait == 'PENDING'
+    assert authority.navigations == 1
+    assert {o['reader'] for o in authority.entry_observations} == {'page', 'witness'}
+    forms._inventory_ok(observed)
+    assert scripts == [('navigate', fixture.URL), ('evaluate', forms.GREENHOUSE_PAGE),
+                       ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS)]
+    for script in [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS, bsk.PAGE]:
+        with pytest.raises(PermissionError):
+            await facade.call('evaluate', script)
+    with pytest.raises(PermissionError):
+        await facade.call('navigate', fixture.URL)
+    assert authority.submit_ipc == authority.post_attempts == 0
+
+
+def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_required():
+    class Inventory(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.inputs = []
+        def handle_starttag(self, tag, attrs):
+            if tag == 'input':
+                self.inputs.append(dict(attrs))
+    document = Inventory()
+    document.feed(fixture._greenhouse_form().decode())
+    proxies = [e for e in document.inputs if e.get('class') == 'validation-only']
+    assert len(proxies) == 2
+    assert all(set(e) == {'aria-hidden', 'class', 'required', 'tabindex', 'value'}
+               and e['value'] == '' for e in proxies)
+    searches = [e for e in document.inputs if e.get('role') == 'combobox']
+    assert searches and all('required' not in e for e in searches)
+    assert fixture._FORM == fixture._entry_form()
+    assert b'https://www.recaptcha.net/recaptcha/enterprise/anchor' in fixture._greenhouse_form()
+    assert b'width:256px;height:60px;border:0;padding:0' in fixture._greenhouse_form()
+
+
+@pytest.mark.parametrize('native_valid', [False, True])
+async def test_greenhouse_fixture_records_native_validity_after_existing_choice(authority, native_valid):
+    authority.enable_positive_fixture()
+    authority.greenhouse = True
+    calls = []
+    class Raw:
+        async def call(self, *args):
+            calls.append(args)
+            if args == ('evaluate', fixture._COMMITTED_VALIDITY):
+                return {'value': dict.fromkeys(fixture._CHOICE_SELECTORS.values(), native_valid)}
+            return {}
+    facade = authority.facade(Raw())
+    await facade.call('navigate', fixture.URL)
+    for ipc in authority._positive_ipc():
+        await facade.call(*ipc)
+    assert authority.native_validity == dict.fromkeys(fixture._CHOICE_SELECTORS.values(), native_valid)
+    assert sum(c == ('evaluate', fixture._COMMITTED_VALIDITY) for c in calls) == 5
+    assert all(c[0] in {'navigate','evaluate','fill','click'} for c in calls)
+    assert not any(c == ('click', '#submit') for c in calls)
+    assert authority.submit_call_entered == authority.post_attempts == 0
+
+
+@pytest.mark.parametrize('invalid', ['required', 'value', 'validity', 'proxy', None])
+def test_fixture_committed_validity_executes_native_check_not_visual_caption(invalid):
+    source = r'''
+const nodes=Object.fromEntries(['#location','#school','#degree','#discipline','#country'].map(s=>[s,{
+  required:process.argv[2]==='required',value:process.argv[2]==='value'?'search':'',
+  checkValidity:()=>process.argv[2]!=='validity',
+  closest:()=>({querySelector:()=>process.argv[2]==='proxy'?{}:null})
+}]));
+global.document={querySelector:s=>nodes[s]};
+console.log(JSON.stringify(eval(process.argv[1])));
+'''
+    result = json.loads(subprocess.check_output(
+        ['node', '-e', source, fixture._COMMITTED_VALIDITY, invalid or 'valid'], text=True))
+    assert result == dict.fromkeys(fixture._CHOICE_SELECTORS.values(), invalid is None)

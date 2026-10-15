@@ -37,7 +37,7 @@ function match(e,q) {
 const body=node('body',{id:'body'});
 const form=spec.root===false ? null : node('form',{id:'application-form'},body);
 if(form) {
-  form.action='https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
+  form.action=spec.action || spec.url || 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
   node('input',{id:'email',name:'Email',type:'email'},form);
   if(spec.marker!=='absent') {
     const marker=spec.marker || 'text';
@@ -47,8 +47,13 @@ if(form) {
           marker==='labelledby' ? {'aria-labelledby':'submit-caption'} :
           marker==='value' ? {name:'submit'} : {text:'Submit application'})},form);
     if(marker==='value') submit.value='Submit application';
+    if(spec.foreignMarker)submit.form=null;
     if(marker==='labelledby') node('span',{id:'submit-caption',text:'Submit application'},body);
   }
+}
+if(spec.ambiguous) {
+  const other=node('form',{id:'other-application'},body);other.action=form.action;
+  node('button',{type:'submit',text:'Submit application'},other);
 }
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};
@@ -73,10 +78,16 @@ function frame(kind, edit={}) {
   if(spec.brokenEdge) parent=node('div',{},parent);
   if(spec.bounds==='missing') attrs.bounds=null;
   else if(spec.bounds==='nan') attrs.bounds={width:NaN,height:60};
+  else if(spec.bounds==='infinity') attrs.bounds={width:256,height:Infinity};
   else if(spec.bounds) attrs.bounds=spec.bounds;
   return node('iframe',{...attrs,...edit},parent);
 }
 for(const k of spec.frames || []) frame(k,spec.edit || {});
+if(spec.sibling) frame('R',{src:'https://untrusted.example-co.test/widget'});
+for(const e of nodes.filter(e=>e.tagName==='IFRAME')) {
+  Object.defineProperty(e,'contentDocument',{get:()=>{throw Error('CHILD FRAME READ');}});
+  Object.defineProperty(e,'contentWindow',{get:()=>{throw Error('CHILD FRAME READ');}});
+}
 if(spec.helper) node('button',{id:'hcaptchaSubmitBtn',class:spec.helper==='hidden' ? 'hidden':'',type:'submit',rect:spec.helper==='hidden' ? null:undefined},form || body);
 for(let i=0;i<(spec.tokens || []).length;i++) {
   const name=spec.tokens[i];
@@ -88,6 +99,6 @@ global.document={baseURI:'https://example-co.test/',readyState:'complete',body,t
   querySelectorAll:q=>nodes.filter(n=>n.matches(q)),
   querySelector:q=>document.querySelectorAll(q)[0] || null,
   getElementById:id=>nodes.find(n=>n.id===id) || null};
-global.CSS={escape:s=>s}; global.location={href:form?.action || 'https://example-co.test/'};
+global.CSS={escape:s=>s}; global.location={href:spec.url || form?.action || 'https://example-co.test/'};
 global.scrollX=0; global.scrollY=0; global.getComputedStyle=e=>e.style;
 console.log(JSON.stringify(eval(process.argv[3])));

@@ -90,9 +90,9 @@ class _ServedFormInventory(HTMLParser):
 
 
 def served_fixture_page():
-    """Read the exact response body and retain hidden controls in PAGE inventory."""
+    """Keep the predecessor native widget snapshot as an offline regression."""
     inventory = _ServedFormInventory()
-    inventory.feed(fixture._FORM.decode("utf-8"))
+    inventory.feed(fixture._closed_form().decode('utf-8'))
     return {"url": fixture.URL, "controls": inventory.controls}
 
 
@@ -104,6 +104,7 @@ def synthetic_page(*, url=fixture.URL, receiver=fixture.URL, extra_granted=False
                 "disabled": False, "has_value": False, "value": "",
                 "submit": typ == "submit", "in_form": True,
                 "form_selector": "#synthetic-form", "form_action": receiver,
+                'native_form_owner_selector': '#synthetic-form',
                 "formaction": "", "files": [], **attrs}
     controls = [
         item("#name", "Name"),
@@ -153,6 +154,12 @@ def test_positive_approval_grants_match_live_group_question(authority):
                   if item["selector"] == "#name")
     target.update(question="Name", form_selector="#application-form",
                   form_action=fixture.URL)
+    # PRIMARY now stops before any grant; this native unit test supplies its
+    # own explicit synthetic answer rather than borrowing fixture authority.
+    assert authority.row['human_approved_answers'] == {}
+    authority.row['human_approved_answers']['Name'] = {
+        'value': fixture._FACTS['Name'], 'url': fixture.URL,
+        **{k: target[k] for k in ('selector','label','question','tag','type','form_selector','form_action')}}
     forms.exact_approval(
         fixture.PK, "Name", fixture._FACTS["Name"], target=target,
         url=fixture.URL, fixture_context=authority)
@@ -384,8 +391,9 @@ def test_fixture_handler_rejects_wrong_host_path_and_every_non_get_method():
         return captured, handler.wfile.getvalue()
     good, body = request("GET", fixture._PATH, "127.0.0.1:18789")
     assert ("status", 200) in good
-    assert b'id="name"' in body and b'id="additional"' in body
-    assert b'type="submit"' in body and fixture.URL.encode() in body
+    assert b'id="_systemfield_name"' in body and b'id="additional"' in body
+    assert b'ashby-application-form-submit-button' in body and b'<form' not in body
+    assert b'<iframe' not in body and b'type="submit"' not in body
     for method, path, host in [
         ("GET", fixture._PATH, "localhost:18789"),
         ("GET", fixture._PATH, "[::1]:18789"),
@@ -1337,13 +1345,10 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     fake_clock(monkeypatch)
     authority.enable_positive_fixture()
     proof = authority.entry_provenance()
-    complete = dom({'frames':['H','H','R','B','W','X']})
-    fixed = dom({'frames':['H','H','R','B','W','X']}, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    complete = dom({'root':False,'formless':True})
+    fixed = dom({'root':False,'formless':True}, forms._ENTRY_FIXED_CONTROL_WITNESS)
     for page in (complete, fixed):
         page['url'] = fixture.URL
-        page['entry']['root']['action'] = fixture.URL
-        for c in page['controls']:
-            c['form_action'] = fixture.URL
     shell = {**deepcopy(complete), 'controls':[], 'inventory_verified':False,
              'entry':{'root':None,'frames':[],'responses':[],
                       'response_error':False,'helper_challenge':False}}
@@ -1385,39 +1390,14 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
         await facade.call('navigate',fixture.URL)
 
 
-def test_injected_helper_outer_box_meets_unchanged_x_bounds():
-    # Execute the actual fixture injection with the iframe UA content-box model.
-    # A CSS width of 1px alone is 1 + 2px left + 2px right = 5px, not X's <=1.
-    import json
-    import subprocess
+def test_formless_fixture_has_no_frames_but_x_bounds_remain_strict_offline():
+    # The new single live page has no captcha candidates. Keep the old UA
+    # border regression offline: a 1px content box plus borders is not X.
     from tests.tools.test_browser_application_entry import dom
-    source = fixture._FORM.decode().split('const add=', 1)[1]
-    source = 'const add=' + source.split('for(const name of', 1)[0]
-    script = r'''
-const frames=[];
-function element(tag) {
-  return {tag,style:{},attributes:{},
-    setAttribute(k,v){this.attributes[k]=v;},
-    append(e){e.parent=this;if(e.tag==='iframe')frames.push(e);},
-    querySelector(){return element('span');}};
-}
-const document={body:element('body'),createElement:element};
-const form=element('form'),h=element('div');
-eval(process.argv[1]);
-console.log(JSON.stringify(frames.filter(e=>e.parent===document.body &&
-  !Object.hasOwn(e.attributes,'src')).map(e=>{
-  const border=e.style.border===undefined ? 2 : parseFloat(e.style.border);
-  const padding=e.style.padding===undefined ? 0 : parseFloat(e.style.padding);
-  return {width:parseFloat(e.style.width)+2*padding+2*border,
-    height:parseFloat(e.style.height)+2*padding+2*border,
-    display:e.style.display || 'inline',visibility:e.style.visibility};
-})));
-'''
-    result = subprocess.run(['node','-e',script,source],capture_output=True,text=True,check=True)
-    helper, = json.loads(result.stdout)
-    assert helper == dict(width=1,height=1,display='block',visibility='hidden')
-    page = dom(dict(frames=['X'],edit={'rect':{'width':helper['width'],'height':helper['height']}}))
-    assert page['entry']['frames'][0]['status'] == 'X'
+    assert b'<iframe' not in fixture._FORM
+    for size, status in ((1, 'X'), (5, 'unknown')):
+        page = dom(dict(frames=['X'], edit={'rect':{'width':size,'height':size}}))
+        assert page['entry']['frames'][0]['status'] == status
 
 
 def test_failure_diagnostic_reports_frame_box_structure_only():

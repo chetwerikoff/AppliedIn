@@ -327,6 +327,7 @@ PAGE = r"""(() => {
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
       in_form:!!form, form_selector:form ? selector(form) : '',
+      native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
@@ -444,7 +445,68 @@ _APPLICATION_ROOT = r"""
             ['submit application','send application','complete application',
               'finish application','apply now'].includes(clean(t).toLowerCase())));
     }));
-  const root = forms.length===1 ? forms[0] : null;
+  const nativeRoot = forms.length===1 ? forms[0] : null;
+  // Observe the production three-sibling boundary independently in each reader.
+  // The pane is structural evidence only: never read its values or build targets.
+  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+  const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
+  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));
+  const container=containers.length===1 ? containers[0] : null;
+  const exactSubmit=submitters.length===1 ? submitters[0] : null;
+  const wrapper=container?.parentElement;
+  const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit?.parentElement===wrapper && wrapper.children.length===3 &&
+    wrapper.children[0].matches('div.ashby-application-form-autofill-pane') &&
+    wrapper.children[1]===container && wrapper.children[2]===exactSubmit &&
+    panes.length===1 && panes[0]===wrapper.children[0];
+  const structuralRoot=!forms.length && ordered ? wrapper : null;
+  const root=nativeRoot || structuralRoot;
+  let structuralError='';
+  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
+    structuralError='ambiguous application roots';
+  else if (!forms.length && container && exactSubmit && !ordered)
+    structuralError='application root sibling identity mismatch';
+  const paneNodes=new Set();
+  if (!forms.length) for (const p of panes) {
+    paneNodes.add(p); p.querySelectorAll('*').forEach(n=>paneNodes.add(n));
+  }
+  paneNodes.forEach(n=>excluded.add(n));
+  const evidenceNodes=Array.from(document.querySelectorAll(query+',input[type="hidden"],[contenteditable],'+
+    '[role="listbox"],canvas,object,embed')).filter(e=>!excluded.has(e));
+  const rootEvidence=!forms.length && (containers.length || submitters.length) ?
+    evidenceNodes.slice(0,501).map(e => {
+      const sel=selector(e), id=e.id || '';
+      const labels=id ? Array.from(document.querySelectorAll('label[for]'))
+        .filter(l=>l.getAttribute('for')===id) : [];
+      const actualLabels=Array.from(e.labels || []);
+      const linked=labels.length===1 && actualLabels.length===1 && actualLabels[0]===labels[0] &&
+        labels[0].matches('label.ashby-application-form-question-title') &&
+        !!container && container.contains(labels[0]) && container.contains(e) &&
+        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
+        document.getElementById(labels[0].getAttribute('for'))===e;
+      return {selector:sel,unique:document.querySelectorAll(sel).length===1,
+        tag:e.tagName.toLowerCase(),type:e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
+        id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
+        associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!container && container.contains(e),
+        native_owner:e.form ? selector(e.form) : '',
+        declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
+        submit:e===exactSubmit,untyped:e.getAttribute('type')===null,
+        dropzone:e.matches('button.ashby-application-form-input-file-dropzone-upload'),
+        required:!!e.required,disabled:!!e.disabled || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',
+        readonly:!!e.readOnly || e.hasAttribute('readonly'),inert:!!e.closest('[inert]'),
+        visible:visible(e),value:e.type==='password' ? '' : (e.value || ''),
+        files:e.files ? Array.from(e.files).map(f=>f.name) : [],
+        autocomplete:e.getAttribute('autocomplete') || '',role:e.getAttribute('role') || '',
+        iti:!!e.closest('.iti'),contenteditable:e.hasAttribute('contenteditable')};
+    }) : [];
+  const formless=!forms.length && (containers.length || submitters.length) ? {
+    root:structuralRoot ? selector(structuralRoot) : '',
+    container:container ? selector(container) : '',
+    submit:exactSubmit ? selector(exactSubmit) : '',
+    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),
+    pane:panes.length===1 ? selector(panes[0]) : '',
+    error:structuralError,truncated:evidenceNodes.length>500} : null;
   const rectOf = (e, bounding=false) => {
     try {
       const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
@@ -486,7 +548,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const outside=!!root && !root.contains(e), box=rectOf(e);
     const parent=e.parentElement;
     const h=origin==='https://newassets.hcaptcha.com' && path.endsWith('/static/hcaptcha-enclave.html') &&
-      !!root && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===root;
+      !!nativeRoot && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===nativeRoot;
     const r=['https://www.recaptcha.net','https://www.google.com'].includes(origin) &&
       ['/recaptcha/enterprise/anchor','/recaptcha/enterprise/bframe'].includes(path);
     const badge=!!e.closest('div.grecaptcha-badge'), bounds=rectOf(e,true);
@@ -500,7 +562,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     }
     const row=ancestry.length===4 ? ancestry[3] : null;
     const w=(raw===null || raw==='about:blank') && e.getAttribute('title')==='LinkedIn Embedded Content' &&
-      !!root && !!row && root.contains(row) && !!box && box.width<=400 && box.height<=100 &&
+      !!nativeRoot && !!row && nativeRoot.contains(row) && !!box && box.width<=400 && box.height<=100 &&
       !row.required && row.getAttribute('aria-required')!=='true' && !row.hasAttribute('required') &&
       // Match the actual inventory candidate set, or W could hide an ARIA answer.
       !row.matches(query) && !row.querySelector(query) &&
@@ -544,7 +606,8 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       responseError=true;
   }
   const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
-    root:root ? {selector:selector(root),action:root.action} : null,
+    root:nativeRoot ? {selector:selector(nativeRoot),action:nativeRoot.action} : null,
+    formless,root_evidence:rootEvidence,
     helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
         getComputedStyle(e).display!=='none'))};
@@ -567,6 +630,11 @@ def entry_reader(script: str) -> str:
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
+    script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
+    script = script.replace('return {selector:ownSelector, unique:',
+                            "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
+                            "required:!!e.required,files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
+                            'selector:ownSelector, unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')
     script = script.replace('return {url: location.href, controls:', 'return {entry, url: location.href, controls:')
     script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"

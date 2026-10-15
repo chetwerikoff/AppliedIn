@@ -56,6 +56,36 @@ if(spec.ambiguous) {
   const other=node('form',{id:'other-application'},body);other.action=form.action;
   node('button',{type:'submit',text:'Submit application'},other);
 }
+if(spec.formless) {
+  const wrapper=node('div',{id:'application-root'},body);
+  const pane=node('div',{id:'autofill',class:'ashby-application-form-autofill-pane'},wrapper);
+  const helper=node('input',{id:'autofill-file',type:'file'},pane);
+  node('button',{id:'autofill-button',type:'button',text:'Autofill'},pane);
+  Object.defineProperty(helper,'value',{get:()=> {throw Error('AUTOFILL VALUE READ');}});
+  const container=node('div',{id:'application-fields',class:'ashby-application-form-container'},wrapper);
+  const field=(tag,id,type,text,required=false) => {
+    const entry=node('div',{class:'ashby-application-form-field-entry'},container);
+    const l=node('label',{'for':id,class:'ashby-application-form-question-title',text},entry);
+    const e=node(tag,{id,type,required},entry); e.labels=[l]; e.files=type==='file' ? [] : undefined;
+    return e;
+  };
+  field('input','_systemfield_name','text','Name',true);
+  field('input','_systemfield_email','email','Email',true);
+  const resume=field('input','_systemfield_resume','file','Resume',true);
+  resume.getClientRects=()=>[{width:1,height:1,right:1,bottom:1}];
+  node('button',{id:'dropzone',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},resume.parentElement);
+  field('textarea','additional','textarea','Additional information');
+  const submit=node('button',{id:'structural-submit',class:'ashby-application-form-submit-button',text:'Submit application'},wrapper);
+  submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
+  const move=(e,to)=> {e.parentElement.children.splice(e.parentElement.children.indexOf(e),1); e.parentElement=to; to.children.push(e);};
+  if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
+  if(spec.extraType) node(spec.extraType==='select' ? 'select':'input',
+    {id:'unsupported',type:spec.extraType,required:true,...(spec.extraAttrs || {})},container);
+  if(spec.duplicate) node('div',{class:'ashby-application-form-container'},body);
+  if(spec.wrongOrder) wrapper.children.reverse();
+  if(spec.duplicateLabel) node('label',{'for':'_systemfield_name',class:'ashby-application-form-question-title',text:'Other'},container);
+  if(spec.hiddenOutside) node('input',{id:'outside-hidden',type:'hidden',rect:null},body);
+}
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};
   if(kind==='H') {

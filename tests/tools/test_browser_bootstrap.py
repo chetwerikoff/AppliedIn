@@ -20,7 +20,7 @@ PK = 'example-co#1'
 
 
 def field(label='Email', selector='#email', *, required=True, **extra):
-    return {
+    result = {
         'selector': selector, 'label': label, 'question': '',
         'tag': 'input', 'type': 'email' if label == 'Email' else 'text',
         'required': required, 'disabled': False, 'value': '', 'has_value': False,
@@ -28,6 +28,9 @@ def field(label='Email', selector='#email', *, required=True, **extra):
         'formaction': '', 'submit': False, 'checked': False, 'options': [],
         **extra,
     }
+    result.setdefault('native_form_owner_selector',
+                      result['form_selector'] if result['in_form'] else '')
+    return result
 
 
 def submit(label='Submit application', *, selector='#submit', **extra):
@@ -49,6 +52,7 @@ def witness(page):
         {'selector': c['selector'], 'unique': True, 'unique_form': True,
          'tag': c['tag'], 'type': c['type'], 'in_form': c['in_form'],
          'form_selector': c.get('form_selector', ''),
+         'native_form_owner_selector': c.get('native_form_owner_selector', ''),
          'form_action': c.get('form_action', ''),
          'formaction': c.get('formaction', ''), 'disabled': c['disabled'],
          'readonly': False, 'inert': False, 'visible': True,

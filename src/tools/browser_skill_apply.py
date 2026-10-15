@@ -482,7 +482,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 combo = target.get('combobox') or {}
                 if _closed_mode(target) or 'closed_admission' in receipt:
                     _check_closed_commit(target, receipt.get('approved_value'), receipt)
-                if (not _same(combo.get('selected_text', ''),
+                if not _receiverless_country(target) and (not _same(combo.get('selected_text', ''),
                             receipt.get('committed_caption', ''))
                         or not _same(combo.get('displayed_text', ''),
                                     combo.get('selected_text', ''))
@@ -813,7 +813,11 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
       ? matches[0] : null;
   };
-  const currentListbox = e => newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
+  const currentListbox = e => {
+    if (pickerCandidate(e)) return null;
+    const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
+    return list && !pickerCandidate(list) ? list : null;
+  };
   const all = Array.from(document.querySelectorAll(query)).filter(e => !pickerParts.has(e) && (
     e.getAttribute('role') !== 'option' || !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))));
@@ -921,6 +925,9 @@ def _inventory_ok(page: dict) -> None:
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
             or page.get('unsupported_frames')):
+        if any(c.get('selector') == '#country' and c.get('form_selector') == '#application-form'
+               and not _receiverless_country(c) for c in page.get('controls', []) if isinstance(c, dict)):
+            raise Gate(_COUNTRY_GATE)
         raise Gate('The current form inventory is incomplete; human inspection is required.')
     controls = page.get('controls')
     if (not isinstance(controls, list) or
@@ -947,11 +954,25 @@ def _closed_mode(target: dict) -> bool:
     return (target.get('combobox') or {}).get('mode') == 'closed-react-select'
 
 
+_COUNTRY_GATE = 'receiverless country commitment not independently verified; review with the human before submit.'
+
+
+def _receiverless_country(target: dict) -> bool:
+    combo = target.get('combobox') or {}
+    return (_closed_mode(target) and target.get('selector') == '#country'
+            and target.get('form_selector') == '#application-form'
+            and combo.get('receiverless_country') is True
+            and isinstance(combo.get('country_graph'), list)
+            and len(combo['country_graph']) == 13
+            and not any(k in combo for k in ('hidden_selector', 'hidden_value', 'selected_value')))
+
+
 def _closed_key(target: dict) -> tuple:
     combo = target.get('combobox') or {}
     return _combobox_stable_identity(target) + tuple(combo.get(k) for k in (
         'label_selector', 'field_selector', 'value_container_selector',
-        'input_wrapper_selector', 'hidden_selector'))
+        'input_wrapper_selector', 'hidden_selector')) + (
+            tuple(combo.get('country_graph', [])), combo.get('receiverless_country'))
 
 
 def _observe_closed_admissions(session, page: dict, *, transition=None) -> None:
@@ -974,7 +995,7 @@ def _observe_closed_admissions(session, page: dict, *, transition=None) -> None:
         if prior is None:
             if phase != 'C0':
                 raise Gate('Closed combobox lacks initial C0 admission.')
-            admissions[sel] = {'key': key, 'phase': 'C0'}
+            admissions[sel] = {'key': key, 'phase': 'C0', 'phases': ('C0',)}
         elif prior['key'] != key or (phase != prior['phase'] and not (
                 transition == (sel, phase)
                 and (prior['phase'], phase) in {('C0', 'C1'), ('C1', 'C2')})):
@@ -1102,6 +1123,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
     except (Exception, asyncio.CancelledError) as exc:
+        if any(_receiverless_country(c) for c in page.get('controls', [])):
+            raise Gate(_COUNTRY_GATE) from None
         if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)):
             raise Gate('application form inventory read timed out/unavailable; inspect manually.') from None
         raise Gate('The current DOM witness is unavailable or changed; '
@@ -1510,9 +1533,11 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     selector = target['selector']
     admission = session._closed_admissions.get(selector)
     answer = facts.get(action.get('fact'))
+    country = _receiverless_country(target)
     if (not admission or admission['phase'] != 'C0' or not isinstance(answer, str)
-            or not answer or not target['combobox'].get('hidden_selector')):
-        raise Gate('A closed choice needs initial admission, exact answer and one receiver.')
+            or not answer or (not country and not target['combobox'].get('hidden_selector'))):
+        raise Gate(_COUNTRY_GATE if selector == '#country' else
+                   'A closed choice needs initial admission, exact answer and one receiver.')
 
     async def preflight(transition=None):
         fresh = await session.page()
@@ -1542,6 +1567,8 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
                 for _ in range(20):
                     fresh, current = await preflight((selector, expected))
                     if current['combobox']['phase'] == expected:
+                        if admission['phase'] != expected:
+                            admission['phases'] += (expected,)
                         admission['phase'] = expected
                         return fresh, current
                     await asyncio.sleep(0.25)
@@ -1550,7 +1577,7 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         raise Gate('The closed picker did not reach its expected phase within the bounded wait.')
 
     fresh, current = await preflight()
-    before = current['combobox']['hidden_value']
+    before = current['combobox'].get('hidden_value')
     await session.call('click', selector)
     # Component opening is observed, never simulated by page-evaluate mutation.
     fresh, current = await wait_phase('C1')
@@ -1575,7 +1602,7 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         raise Gate('Every present option value attribute must exactly match the approved answer.')
     if option.get('submit') or option.get('navigates'):
         raise Gate('A submission-capable or navigating option cannot be clicked.')
-    if current['combobox']['hidden_value'] != before:
+    if not country and current['combobox']['hidden_value'] != before:
         raise Gate('The hidden receiver changed before the authorized option click.')
     await session.call('click', option['selector'])
     fresh, current = await wait_phase('C2')
@@ -1586,11 +1613,15 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
         # Attribute-less react-select options commit the witnessed exact caption;
         # the independently current receiver/token must still prove that value.
         'committed_caption':option['label'],
-        'committed_value':codes[0] if codes else option['label'],
-        'hidden_selector':current['combobox']['hidden_selector'],
-        'hidden_value_before':before, 'hidden_value':current['combobox']['hidden_value'],
+        **({'option_selector': option['selector'], 'option_codes': tuple(codes)} if country else {
+            'committed_value':codes[0] if codes else option['label'],
+            'hidden_selector':current['combobox']['hidden_selector'],
+            'hidden_value_before':before, 'hidden_value':current['combobox']['hidden_value'],
+        }),
         'closed_admission':stable,
     })
+    if country:
+        receipt._country_admission = admission
     _check_closed_commit(current, answer, receipt)
     filled[selector] = answer
     return receipt
@@ -1605,6 +1636,26 @@ class _ClosedReceipt(dict):
 
 def _check_closed_commit(target, approved, receipt):
     combo = target.get('combobox') or {}
+    if target.get('selector') == '#country' and (
+            combo.get('receiverless_country') or getattr(receipt, '_country_admission', None)):
+        admission = getattr(receipt, '_country_admission', None)
+        if (not _receiverless_country(target) or combo.get('phase') != 'C2'
+                or not isinstance(receipt, _ClosedReceipt)
+                or receipt._witnessed != tuple(sorted(receipt.items()))
+                or not isinstance(approved, str) or not approved
+                or not admission or admission.get('phases') != ('C0', 'C1', 'C2')
+                or admission.get('phase') != 'C2'
+                or admission.get('key') != (receipt.get('url'), _closed_key(target))
+                or receipt.get('closed_admission') != _closed_key(target)
+                or not receipt.get('option_selector')
+                or not isinstance(receipt.get('option_codes'), tuple)
+                or any(code != approved for code in receipt['option_codes'])
+                or any(combo.get(k) != approved for k in ('selected_text', 'displayed_text'))
+                or any(receipt.get(k) != approved for k in ('approved_value', 'committed_caption'))
+                or any(k in receipt for k in ('hidden_selector', 'hidden_value',
+                                             'hidden_value_before', 'committed_value'))):
+            raise Gate(_COUNTRY_GATE)
+        return
     if (not _closed_mode(target) or combo.get('phase') != 'C2'
             or not isinstance(receipt, _ClosedReceipt)
             or receipt._witnessed != tuple(sorted(receipt.items()))
@@ -1629,9 +1680,14 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action)
     if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
-        return await _execute_closed_combobox(
-            session, observed, action, facts=facts, filled=filled, pk=pk,
-            job_url=job_url, ctx=ctx, provenance=provenance)
+        try:
+            return await _execute_closed_combobox(
+                session, observed, action, facts=facts, filled=filled, pk=pk,
+                job_url=job_url, ctx=ctx, provenance=provenance)
+        except Gate as exc:
+            if _receiverless_country(target):
+                raise Gate(_COUNTRY_GATE, form_question=exc.form_question) from None
+            raise
     form_question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     form_question['pk'] = pk

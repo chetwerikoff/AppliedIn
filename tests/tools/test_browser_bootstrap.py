@@ -801,7 +801,8 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
             resume_path='Resume.pdf', company='example-co', jd_text='',
             resume_tex='', github='', pk=PK, job_url=URL)
         assert receipt['fact'] == key
-        assert browser.calls[-1][0] == ('click' if verb == 'choose' else 'fill')
+        writes = [call for call in browser.calls if call[0] != 'evaluate']
+        assert writes[-1][0] == ('click' if verb == 'choose' else 'fill')
         assert sum(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls) == mutations + 1
 

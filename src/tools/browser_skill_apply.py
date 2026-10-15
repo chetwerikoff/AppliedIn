@@ -428,6 +428,8 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 raise Gate('The approved question changed; human review is required.')
             if receipt.get('action') == 'combobox':
                 combo = target.get('combobox') or {}
+                if _closed_mode(target) or 'closed_admission' in receipt:
+                    _check_closed_commit(target, receipt.get('approved_value'), receipt)
                 if (not _same(combo.get('selected_text', ''),
                             receipt.get('committed_caption', ''))
                         or not _same(combo.get('displayed_text', ''),
@@ -607,6 +609,15 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 'selected_text', 'selected_value', 'hidden_value'))
             if not target.get('required') and not has_selection:
                 continue
+            if _closed_mode(target):
+                current_receipts = [r for r in receipts or []
+                                    if r.get('action') == 'combobox'
+                                    and r.get('selector') == target['selector']]
+                if len(current_receipts) != 1:
+                    raise Gate('The closed combobox needs its witnessed admission/commit receipt.')
+                _check_closed_commit(target, expected, current_receipts[0])
+                guarded_value(target, expected)
+                continue
             if (not isinstance(combo.get('link_id'), str) or not combo.get('link_id')
                     or expected is None or not _same(combo.get('selected_text', ''), expected)
                     or not _same(combo.get('displayed_text', ''), combo.get('selected_text', ''))
@@ -649,7 +660,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     observed = next((o['label'] for o in target.get('options', [])
                                      if o['value'] == value), value)
                 guarded_value(target, observed or expected or '')
-                if expected is None or (value and not _same(value, expected)):
+                if expected is None or (value and (value != expected if typ == 'tel' else not _same(value, expected))):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
@@ -678,6 +689,8 @@ def check_form_destination(page: dict, target: dict, *origins: str,
 
 # No model/page text is executable here. This code-owned read uses the same
 # selector rules as PAGE and independently establishes DOM editability/ownership.
+from tools.browser_skill_dom import _WIDGET_GRAPH
+
 _FIXED_CONTROL_WITNESS = r"""(() => {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const selector = e => {
@@ -722,6 +735,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
   };
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
+  /* WIDGET_GRAPH */
   const linkId = e => {
     const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
       .trim().split(/\\s+/).filter(Boolean);
@@ -741,9 +755,10 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
       ? matches[0] : null;
   };
-  const all = Array.from(document.querySelectorAll(query)).filter(e =>
+  const currentListbox = e => newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
+  const all = Array.from(document.querySelectorAll(query)).filter(e => !pickerParts.has(e) && (
     e.getAttribute('role') !== 'option' || !Array.from(document.querySelectorAll('[role="combobox"]'))
-      .some(c=>linkedListbox(c)?.contains(e)));
+      .some(c=>currentListbox(c)?.contains(e))));
   return {url: location.href, controls: all
     .filter(e => (!!e.getClientRects().length &&
       getComputedStyle(e).visibility !== 'hidden') ||
@@ -754,15 +769,16 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
           (e.getAttribute('type') || e.tagName.toLowerCase()));
       const ownSelector = selector(e), formSelector = form ? selector(form) : '';
-      const list = type === 'combobox' ? linkedListbox(e) : null;
+      const graph = newGraphs.get(e);
+      const list = type === 'combobox' ? currentListbox(e) : null;
       const opts = list ? Array.from(list.querySelectorAll('[role="option"]'))
         .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
         .map(o=>({selector:selector(o),unique:document.querySelectorAll(selector(o)).length === 1,
           tag:o.tagName.toLowerCase(), native_type:o.type || '',
           submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
             o.type === 'submit' || o.type === 'image',
-          navigates:o.tagName === 'A' && !!o.href,
-          label:clean(o.innerText),
+          navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
+          label:graph ? o.innerText : clean(o.innerText),
           value:o.getAttribute('data-value') || o.getAttribute('value') || '',
           selected:o.getAttribute('aria-selected') === 'true'})) : [];
       const hiddenId = e.getAttribute('data-value-input');
@@ -784,16 +800,16 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
-        combobox:type === 'combobox' ? {linked:!!list, link_id:linkId(e),
+        combobox:type === 'combobox' ? {...(graph || {}),linked:!!list, link_id:graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options:opts,
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:hidden.length === 1 ? selector(hidden[0]) : '',
-          hidden_value:hidden.length === 1 ? hidden[0].value : ''} : null};
+          hidden_value:hidden.length === 1 ? hidden[0].value : '', ...(graph || {})} : null};
     })};
-})()"""
+})()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 
 _APP_SUBMIT_LABELS = frozenset({
     'submit application', 'send application', 'complete application',
@@ -866,6 +882,43 @@ def _page_identity(page: dict) -> tuple:
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
 
+def _closed_mode(target: dict) -> bool:
+    return (target.get('combobox') or {}).get('mode') == 'closed-react-select'
+
+
+def _closed_key(target: dict) -> tuple:
+    combo = target.get('combobox') or {}
+    return _combobox_stable_identity(target) + tuple(combo.get(k) for k in (
+        'label_selector', 'field_selector', 'value_container_selector',
+        'input_wrapper_selector', 'hidden_selector'))
+
+
+def _observe_closed_admissions(session, page: dict) -> None:
+    # A fresh expanded/committed graph is a candidate, never initial authority.
+    admissions = getattr(session, '_closed_admissions', None)
+    if admissions is None:
+        admissions = session._closed_admissions = {}
+    if set(admissions) - {c['selector'] for c in page['controls']}:
+        raise Gate('An admitted closed combobox disappeared from the current form.')
+    for target in page['controls']:
+        sel = target['selector']
+        prior = admissions.get(sel)
+        if not _closed_mode(target):
+            if prior:
+                raise Gate('An admitted closed combobox cannot downgrade to legacy mode.')
+            continue
+        combo = target['combobox']
+        key = (page['url'], _closed_key(target))
+        phase = combo.get('phase')
+        if prior is None:
+            if phase != 'C0':
+                raise Gate('Closed combobox lacks initial C0 admission.')
+            admissions[sel] = {'key': key, 'phase': 'C0'}
+        elif prior['key'] != key or phase != prior['phase']:
+            raise Gate('The closed combobox graph or ordered phase changed.')
+
+
+
 async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page)
@@ -896,7 +949,7 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
                     or (original.get('type') == 'combobox'
                         and (original.get('combobox') != observed.get('combobox')
                              or not isinstance(observed.get('combobox'), dict)
-                             or not observed['combobox'].get('link_id')
+                             or (not _closed_mode(original) and not observed['combobox'].get('link_id'))
                              or not (
                                  (observed['combobox'].get('linked') is True
                                   and isinstance(observed['combobox'].get('listbox_selector'), str)
@@ -911,6 +964,7 @@ async def _observe_controls(session, page: dict) -> tuple[dict, dict]:
         _inventory_ok(current)
         if _page_identity(current) != _page_identity(page):
             raise ValueError('The current inventory changed during observation')
+        _observe_closed_admissions(session, current)
         return current, lookup
     except (Exception, asyncio.CancelledError) as exc:
         raise Gate('The current DOM witness is unavailable or changed; '
@@ -1117,7 +1171,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         target = members[0]
     elif target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
-        if target.get('tag') not in {'input', 'div'} or not combo.get('link_id'):
+        if (target.get('tag') not in {'input', 'div'}
+                or (not _closed_mode(target) and not combo.get('link_id'))):
             raise Gate('Only uniquely linked input/div comboboxes may request a grant.')
         options = combo.get('options')
         if combo.get('linked') is True and options:
@@ -1234,8 +1289,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not any(
-            c.get('type') in {'radio', 'checkbox', 'password'}
+    if not candidate and not getattr(session, '_closed_admissions', {}) and not any(
+            _closed_mode(c) or c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
@@ -1317,6 +1372,105 @@ def _combobox_stable_identity(target: dict) -> tuple:
         'form_selector', 'form_action', 'formaction', 'disabled', 'required'))
 
 
+async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
+                                   job_url, ctx, provenance):
+    target = control(page, action)
+    stable = _closed_key(target)
+    selector = target['selector']
+    admission = session._closed_admissions.get(selector)
+    answer = facts.get(action.get('fact'))
+    if (not admission or admission['phase'] != 'C0' or not isinstance(answer, str)
+            or not answer or not target['combobox'].get('hidden_selector')):
+        raise Gate('A closed choice needs initial admission, exact answer and one receiver.')
+
+    async def preflight():
+        fresh = await session.page()
+        fresh, witness = await _observe_controls(session, fresh)
+        current = control(fresh, action)
+        if (_closed_key(current) != stable or not _closed_mode(current)
+                or not navigation_allowed(fresh.get('url', ''), job_url or page['url'],
+                                          provenance=provenance)
+                or (provenance is not None and not _alias_current(provenance, fixture_context=ctx))):
+            raise Gate('The closed combobox identity or destination changed.')
+        question = _disclosure_question(fresh, current, witness, job_url or page['url'],
+                                        provenance=provenance)
+        if action.get('fact') != question['label']:
+            raise Gate('The exact closed question is not approved.')
+        exact_approval(pk, action['fact'], answer, target=current, url=fresh['url'],
+                       provenance=provenance,
+                       **({'fixture_context': ctx} if ctx else {}))
+        guarded_value(current, answer)
+        check_form_destination(fresh, current, job_url or page['url'], provenance=provenance)
+        return fresh, current
+
+    fresh, current = await preflight()
+    before = current['combobox']['hidden_value']
+    admission['phase'] = 'C1'
+    await session.call('click', selector)
+    # Component opening is observed, never simulated by page-evaluate mutation.
+    fresh, current = await preflight()
+    options = _combobox_options(current)
+    popup = tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector'))
+    candidates = [o for o in options if _same(o['label'], answer)]
+    if len(candidates) != 1:
+        raise Gate('The closed picker has no unique approved option.')
+    candidate = candidates[0]
+    fresh, current = await preflight()
+    if tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector')) != popup:
+        raise Gate('The expanded closed-picker relationship changed before choice.')
+    matches = [o for o in _combobox_options(current) if o['selector']==candidate['selector']]
+    if len(matches) != 1:
+        raise Gate('The current closed option disappeared.')
+    option = matches[0]
+    # Literal caption AND observed transport value are separate action boundaries.
+    if option['label'] != answer or option['value'] != answer:
+        raise Gate('The current option caption/code is not the exact approved answer.')
+    if option.get('submit') or option.get('navigates'):
+        raise Gate('A submission-capable or navigating option cannot be clicked.')
+    if current['combobox']['hidden_value'] != before:
+        raise Gate('The hidden receiver changed before the authorized option click.')
+    admission['phase'] = 'C2'
+    await session.call('click', option['selector'])
+    fresh, current = await preflight()
+    receipt = _ClosedReceipt({
+        'action':'combobox', 'selector':selector, 'label':current['label'],
+        'question':current.get('question', ''), 'url':fresh['url'],
+        'fact':action['fact'], 'approved_value':answer,
+        'committed_caption':option['label'], 'committed_value':option['value'],
+        'hidden_selector':current['combobox']['hidden_selector'],
+        'hidden_value_before':before, 'hidden_value':current['combobox']['hidden_value'],
+        'closed_admission':stable,
+    })
+    _check_closed_commit(current, answer, receipt)
+    filled[selector] = answer
+    return receipt
+
+
+class _ClosedReceipt(dict):
+    """JSON-visible history with a code-only witness, never rehydrated from model text."""
+    def __init__(self, values):
+        super().__init__(values)
+        self._witnessed = tuple(sorted(values.items()))
+
+
+def _check_closed_commit(target, approved, receipt):
+    combo = target.get('combobox') or {}
+    if (not _closed_mode(target) or combo.get('phase') != 'C2'
+            or not isinstance(receipt, _ClosedReceipt)
+            or receipt._witnessed != tuple(sorted(receipt.items()))
+            or not isinstance(approved, str) or not approved
+            or receipt.get('closed_admission') != _closed_key(target)
+            or not combo.get('hidden_selector')
+            or receipt.get('hidden_selector') != combo['hidden_selector']
+            or not isinstance(receipt.get('hidden_value_before'), str)
+            or receipt.get('hidden_value_before') == approved
+            or any(combo.get(k) != approved for k in (
+                'selected_text', 'displayed_text', 'selected_value', 'hidden_value'))
+            or any(receipt.get(k) != approved for k in (
+                'approved_value', 'committed_caption', 'committed_value', 'hidden_value'))):
+        raise Gate('The closed combobox commit lacks exact current independent readback.')
+
+
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
     observed, witness = await _observe_controls(session, page)
@@ -1324,6 +1478,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action)
+    if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
+        return await _execute_closed_combobox(
+            session, observed, action, facts=facts, filled=filled, pk=pk,
+            job_url=job_url, ctx=ctx, provenance=provenance)
     form_question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     form_question['pk'] = pk
@@ -1649,6 +1807,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     raise Gate('The bound radio answer no longer matches this member.')
             guarded_value(current, str(facts[key]).strip())
             await session.call('click', current['selector'])
+        if current.get('type') == 'tel':
+            readback, _ = await _observe_controls(session, await session.page())
+            phone = control(readback, action)
+            if (_combobox_stable_identity(phone) != _combobox_stable_identity(current)
+                    or phone.get('value') != write_value):
+                raise Gate('The full approved international phone did not read back exactly.')
         filled[current['selector']] = write_value
     elif verb == 'upload':
         if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):

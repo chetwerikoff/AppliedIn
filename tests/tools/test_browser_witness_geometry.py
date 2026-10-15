@@ -86,7 +86,9 @@ for (const data of spec.controls) {
 }
 global.document = {
   querySelectorAll: query => query.startsWith('#') ?
-    (byId.has(query.slice(1)) ? [byId.get(query.slice(1))] : []) : controls,
+    (byId.has(query.slice(1)) ? [byId.get(query.slice(1))] : []) :
+    query === '.iti' ? [] : query === '[role="combobox"]' ?
+    controls.filter(n=>n.getAttribute('role')==='combobox') : controls,
   getElementById: id => byId.get(id) || null,
 };
 global.getComputedStyle = node => Object.assign({

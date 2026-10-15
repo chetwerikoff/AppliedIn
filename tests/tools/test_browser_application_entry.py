@@ -860,16 +860,19 @@ async def test_missing_control_shape_is_immediate_not_readiness(monkeypatch, mem
     assert session.pages == 1 and not decide.await_count
 
 
-async def test_read_unavailable_uses_remaining_single_budget(monkeypatch):
+@pytest.mark.parametrize('start', [0.0, 122.43808771])
+async def test_read_unavailable_uses_remaining_single_budget(monkeypatch, start):
     clock = fake_clock(monkeypatch)
-    start = clock[0]
+    clock[0] = start
     _, _, session, decide = world(monkeypatch,'lever')
     async def unavailable(s):
         raise OSError('synthetic inventory read unavailable')
     session.on_page = unavailable
     result = await attempt('lever')
     assert 'read timed out/unavailable after bounded wait' in result['question']
-    assert clock[0]-start == 15
+    # Compare absolute deadlines: subtracting a fractional origin can round
+    # even when the controller stopped at exactly the intended deadline.
+    assert clock[0] == start + 15
     assert not decide.await_count
     no_mutations(session)
 

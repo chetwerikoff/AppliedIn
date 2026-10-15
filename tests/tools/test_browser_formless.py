@@ -622,3 +622,30 @@ async def test_ipc_producer_takes_its_own_fresh_independent_witness(monkeypatch)
     with pytest.raises(forms.Gate, match='predicate=native_form_owner_selector.equal'):
         await session.call('fill', '#_systemfield_name', '--value', 'Test User')
     no_mutations(raw)
+
+
+async def test_structural_upload_cannot_accept_an_additional_file(monkeypatch):
+    _, raw, session, page, provenance = await admitted(monkeypatch)
+    original = raw.call
+    async def extra_file(method, *args, **kw):
+        result = await original(method, *args, **kw)
+        if method == 'upload':
+            for snapshot in (raw.current, raw.fixed):
+                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                    if c.get('type') == 'file':
+                        c['files'].append('Unexpected.pdf')
+        return result
+    raw.call = extra_file
+    with pytest.raises(forms.Gate, match='exact staged résumé'):
+        await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
+                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
+                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
+                            provenance=provenance)
+
+
+def test_structural_presubmit_requires_only_the_staged_attachment(monkeypatch):
+    _, raw, _, _ = root_world(monkeypatch)
+    resume = next(c for c in raw.current['controls'] if c['type'] == 'file')
+    resume['files'] = ['Resume.pdf', 'Unexpected.pdf']
+    with pytest.raises(forms.Gate, match='exact staged résumé'):
+        forms.check_form(raw.current, {}, True, 'Resume.pdf')

@@ -623,6 +623,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     and attachment in c.get('files', [])]
         if len(attached) != 1:
             raise Gate('The résumé attachment is no longer present on the current file input.')
+        if _formless_root(page) and attached[0].get('files') != [attachment]:
+            raise Gate('Only the exact staged résumé may remain attached; inspect manually.')
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
@@ -2467,6 +2469,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                    and re.search(r'resume|résumé|cv', label(c), re.I)]
         if len(matches) != 1 or Path(resume_path).name not in matches[0].get('files', []):
             raise Gate('The uploaded résumé was not proven in the current file input.')
+        if _formless_root(page) and matches[0].get('files') != [Path(resume_path).name]:
+            raise Gate('Only the exact staged résumé may be uploaded; inspect manually.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
         if (not allow_click or not pk

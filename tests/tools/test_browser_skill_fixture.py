@@ -1380,3 +1380,88 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     assert authority.navigations == 1
     with pytest.raises(PermissionError):
         await facade.call('navigate',fixture.URL)
+
+
+def test_injected_helper_outer_box_meets_unchanged_x_bounds():
+    # Execute the actual fixture injection with the iframe UA content-box model.
+    # A CSS width of 1px alone is 1 + 2px left + 2px right = 5px, not X's <=1.
+    import json
+    import subprocess
+    from tests.tools.test_browser_application_entry import dom
+    source = fixture._FORM.decode().split('const add=', 1)[1]
+    source = 'const add=' + source.split('for(const name of', 1)[0]
+    script = r'''
+const frames=[];
+function element(tag) {
+  return {tag,style:{},attributes:{},
+    setAttribute(k,v){this.attributes[k]=v;},
+    append(e){e.parent=this;if(e.tag==='iframe')frames.push(e);},
+    querySelector(){return element('span');}};
+}
+const document={body:element('body'),createElement:element};
+const form=element('form'),h=element('div');
+eval(process.argv[1]);
+console.log(JSON.stringify(frames.filter(e=>e.parent===document.body &&
+  !Object.hasOwn(e.attributes,'src')).map(e=>{
+  const border=e.style.border===undefined ? 2 : parseFloat(e.style.border);
+  const padding=e.style.padding===undefined ? 0 : parseFloat(e.style.padding);
+  return {width:parseFloat(e.style.width)+2*padding+2*border,
+    height:parseFloat(e.style.height)+2*padding+2*border,
+    display:e.style.display || 'inline',visibility:e.style.visibility};
+})));
+'''
+    result = subprocess.run(['node','-e',script,source],capture_output=True,text=True,check=True)
+    helper, = json.loads(result.stdout)
+    assert helper == dict(width=1,height=1,display='block',visibility='hidden')
+    page = dom(dict(frames=['X'],edit={'rect':{'width':helper['width'],'height':helper['height']}}))
+    assert page['entry']['frames'][0]['status'] == 'X'
+
+
+def test_failure_diagnostic_reports_frame_box_structure_only():
+    from tests.tools.test_browser_application_entry import dom
+    from tools.browser_skill_dom import entry_reader
+    script = entry_reader(fixture._inventory_diagnostic_script())
+    page = dom(dict(frames=['X'],edit={'rect':{'width':5,'height':5},'style':{
+        'visibility':'hidden','display':'inline','width':'1px','height':'1px',
+        'borderTopWidth':'2px','borderRightWidth':'2px',
+        'borderBottomWidth':'2px','borderLeftWidth':'2px'}}), script)
+    frame, = page['frames']
+    assert frame['tag'] == 'iframe' and frame['parent_path'] == ['#body']
+    assert frame['rects'] == [{'width':5,'height':5}]
+    assert frame['borders'] == ['2px']*4
+    assert frame['width'] == frame['height'] == '1px'
+    assert not {'value','src','title','text','name'} & frame.keys()
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+async def test_unknown_frame_failure_diagnostic_preserves_rejected_snapshot(authority, reader):
+    from tools.browser_skill_dom import entry_reader
+    authority.enable_positive_fixture()
+    script = forms.ENTRY_PAGE if reader=='page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    rejected = {'selector':'#helper','status':'unknown','box':{'width':5,'height':5}}
+    original = dict(url=fixture.URL,controls=[],inventory_verified=True,
+                    entry=dict(root=None,frames=[rejected]))
+    diagnostic = dict(frames=[{'selector':'#helper','tag':'iframe',
+                       'rects':[{'width':1,'height':1}], 'borders':['0px']*4,
+                       'parent_path':['body']}])
+    calls = []
+    class Raw:
+        async def call(self, *args):
+            calls.append(args)
+            if args==('navigate',fixture.URL):
+                return {}
+            if args==('evaluate',script):
+                return {'value':original}
+            assert args==('evaluate',entry_reader(fixture._inventory_diagnostic_script()))
+            return {'value':diagnostic}
+    edge = authority.facade(Raw())
+    await edge.call('navigate',fixture.URL)
+    result = await edge.call('evaluate',script)
+    assert result['value'] is original
+    assert original['entry']['frames'][0]['status'] == 'unknown'
+    assert authority.inventory_diagnostics['rejected_frames'][0]['box'] == {'width':5,'height':5}
+    assert authority.inventory_diagnostics['frames'][0]['rects'] == [{'width':1,'height':1}]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(original,lambda u: True,authority.entry_provenance())
+    assert authority.fills == authority.ipc_index == 0
+    assert len(calls) == 3

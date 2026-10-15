@@ -153,7 +153,9 @@ def _entry_form() -> bytes:
   row.innerHTML='<div class="application-field"><div class="awli-button-container"><span class="IN-widget"></span></div></div>';
   form.append(row); const w=add(row.querySelector('span'),null,{width:'236px',height:'48px'});
   w.title='LinkedIn Embedded Content';
-  add(document.body,null,{width:'1px',height:'1px',visibility:'hidden'});
+  // X bounds are outer client rects: the UA iframe border otherwise adds 4px.
+  add(document.body,null,{width:'1px',height:'1px',visibility:'hidden',
+    border:'0',padding:'0',display:'block'});
   for(const name of ['h-captcha-response','g-recaptcha-response']) {
    const e=document.createElement('textarea');e.name=name;e.hidden=true;form.append(e);
   }
@@ -186,6 +188,14 @@ def _inventory_diagnostic_script() -> str:
         "tag:e.tagName.toLowerCase(),role:e.getAttribute('role')})), "
         "shadow_hosts:shadowRoots.map(e=>({selector:selector(e),"
         "tag:e.tagName.toLowerCase()})), "
+        "frames:Array.from(document.querySelectorAll('iframe')).map(e=>{ "
+        "const s=getComputedStyle(e), path=[]; "
+        "for(let p=e.parentElement;p;p=p.parentElement)path.unshift(selector(p)); "
+        "return {selector:selector(e),tag:e.tagName.toLowerCase(),parent_path:path, "
+        "rects:Array.from(e.getClientRects(),r=>({x:r.x,y:r.y,width:r.width,height:r.height})), "
+        "display:s.display,visibility:s.visibility,width:s.width,height:s.height,box_sizing:s.boxSizing, "
+        "borders:[s.borderTopWidth,s.borderRightWidth,s.borderBottomWidth,s.borderLeftWidth], "
+        "padding:[s.paddingTop,s.paddingRight,s.paddingBottom,s.paddingLeft]};}), "
         "url:location.href, title, text:text.slice(0,100000),")
 
 
@@ -439,14 +449,23 @@ class _SyntheticRun:
         """A closed edge exposing only the original controller's exact fixture path."""
         state = self
         async def diagnose(observed):
+            rejected = [f for f in (observed or {}).get('entry', {}).get('frames', [])
+                        if f.get('status') not in {'H', 'R', 'W', 'X'}]
             if (isinstance(observed, dict) and (
                     observed.get("inventory_verified") is not True
                     or observed.get("truncated") or observed.get("opaque_controls")
-                    or observed.get("shadow_roots") or observed.get("unsupported_frames"))):
+                    or observed.get("shadow_roots") or observed.get("unsupported_frames")
+                    or rejected)):
                 from tools.browser_skill_dom import entry_reader
                 script = _inventory_diagnostic_script()
                 result = await raw.call('evaluate', entry_reader(script) if state.positive else script)
                 state.inventory_diagnostics = result.get("value")
+                if rejected and isinstance(state.inventory_diagnostics, dict):
+                    # Keep the actual rejected snapshot distinct from the later
+                    # diagnostic read: a settled second read cannot authorize it.
+                    state.inventory_diagnostics['rejected_frames'] = [
+                        {k:f.get(k) for k in ('selector','status','box','bounds',
+                         'visibility','display','outside','root','ancestors')} for f in rejected]
 
 
         class _Closed:
@@ -501,6 +520,9 @@ class _SyntheticRun:
                         if not state.entry_observations:
                             state.entry_initial_not_ready = not observed.get('entry', {}).get('root')
                         state.observe_page(observed)
+                        await diagnose(observed)
+                    elif any(f.get('status') not in {'H', 'R', 'W', 'X'}
+                             for f in observed.get('entry', {}).get('frames', [])):
                         await diagnose(observed)
                     state.entry_observations.append({
                         'reader':'page' if args[1] == ENTRY_PAGE else 'witness',
@@ -733,7 +755,8 @@ def run() -> int:
                 if isinstance(state.inventory_diagnostics, dict):
                     inventory["diagnostics"] = {
                         key: state.inventory_diagnostics.get(key) for key in (
-                            "ready_state", "offending_elements", "shadow_hosts")}
+                            "ready_state", "offending_elements", "shadow_hosts",
+                            "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "native-form",
                                   "safe_gate": ok,
                                   'entry_wait': state.entry_wait,

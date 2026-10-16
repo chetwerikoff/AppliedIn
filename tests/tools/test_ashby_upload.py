@@ -86,6 +86,33 @@ async def test_exact_default_upload_and_bounded_settle(monkeypatch, unchanged):
     assert len(raw.mutations) == 1
 
 
+@pytest.mark.parametrize('other_drift', [None, 'value', 'has_value'])
+async def test_chooser_fakepath_only_exempts_verified_resume_value(monkeypatch, other_drift):
+    after = observed(attached=True, files=['Resume.pdf'])
+    # Chromium populates both properties when the chooser selects the file.
+    for page in after:
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#_systemfield_resume':
+                c.update(value=r'C:\fakepath\Resume.pdf', has_value=True)
+            elif c['selector'] == '#_systemfield_name' and other_drift:
+                c[other_drift] = 'Changed answer' if other_drift == 'value' else True
+    raw, session, _ = setup_upload(monkeypatch, after=after)
+    identity = session.formless_identity
+    if other_drift:
+        with pytest.raises(forms.Gate, match='Application control semantics changed'):
+            await upload(session)
+        assert session.formless_identity == identity
+    else:
+        await upload(session)
+        page = await session.page()
+        current = forms._upload_input(page, forms._upload_tree(page))
+        assert current['value'] == r'C:\fakepath\Resume.pdf'
+        assert current['has_value'] is True and current['files'] == ['Resume.pdf']
+        assert session.formless_identity == forms._root_identity(page)
+        assert not session.submit_authorized
+    assert len(raw.mutations) == 1
+
+
 @pytest.mark.parametrize('args,kwargs', [
     (('upload', '#dropzone', '--file', 'Resume.pdf'), {'timeout': 130}),
     (('upload', '#delete-0', '--file', 'Resume.pdf'), {'timeout': 130}),

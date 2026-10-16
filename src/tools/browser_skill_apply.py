@@ -1281,8 +1281,11 @@ def _upload_delta(before, after, filename):
         raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
     # Candidate semantics and values must survive positional selector re-keying.
     def candidates(page):
+        original = _upload_input(page, _upload_tree(page))
+        # The chooser sets fakepath/value flags; only this verified input may change them.
         return [{k: v for k, v in c.items()
-                 if k not in {'selector', 'label_selector', 'files'}}
+                 if k not in {'selector', 'label_selector', 'files'}
+                 and (c is not original or k not in {'value', 'has_value'})}
                 for c in page['entry']['root_evidence']]
     if candidates(before) != candidates(after):
         raise Gate('Application control semantics changed during upload.')

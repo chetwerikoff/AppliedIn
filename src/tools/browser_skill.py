@@ -28,6 +28,7 @@ _GONE = re.compile(r'no longer available|job (?:posting )?(?:is )?closed|'
 class Unavailable(RuntimeError):
     effect_state = ""
     file_access_required = False
+    code: str | None = None
 
 
 def _env() -> dict:
@@ -58,6 +59,13 @@ def _result(raw: str, code: int) -> dict | list:
         problem = Unavailable(f"BrowserSkill operation unavailable: {reason}")
         if isinstance(value, dict):
             data = value.get("data") or {}
+            codes = ([value['code']] if 'code' in value else [])
+            if isinstance(data, dict) and 'code' in data:
+                codes.append(data['code'])
+            # A conflicting or malformed literal must not become no-effect proof.
+            if (codes and all(type(c) is str and re.fullmatch(r'[a-z_]{1,40}', c)
+                              for c in codes) and len(set(codes)) == 1):
+                problem.code = codes[0]
             if isinstance(data, dict):
                 problem.effect_state = str(data.get("effect_state") or "")
             problem.file_access_required = (

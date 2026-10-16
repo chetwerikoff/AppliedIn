@@ -52,9 +52,9 @@ def _closed_form() -> bytes:
 <label id="{name}-label" for="{name}" data-automation-id="formLabel">{escape(question)}</label>
 <div class="select-shell"><div id="{name}-value"><div id="{name}-input">
 <input id="{name}" name="{name}" role="combobox" aria-expanded="false"
- aria-haspopup="true" aria-autocomplete="list" aria-labelledby="{name}-label" aria-required="true" required>
+ aria-haspopup="true" aria-autocomplete="list" aria-labelledby="{name}-label" aria-required="true">
 </div><div class="react-select__placeholder">Choose</div></div>
-{('<input required tabindex="-1" aria-hidden="true" class="validation-only">' if name == 'location' else '')}</div>
+{('<input required tabindex="-1" aria-hidden="true" class="validation-only" value="">' if name == 'location' else '')}</div>
 <input type="hidden" id="{name}-code" name="{name}_value"></div>''')
     fillers = ''.join(f'<input id="filler-{i}" name="filler_{i}" aria-label="Optional synthetic {i}">'
                       for i in range(24))
@@ -87,7 +87,7 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
  aria-describedby="react-select-country-placeholder country-error" aria-errormessage="country-error"
  aria-activedescendant=""></div><div id="react-select-country-placeholder" class="select__placeholder">Choose</div>
 </div></div><span id="country-error"></span></div>
-<input required tabindex="-1" aria-hidden="true" class="validation-only"></div></div></div></div>
+<input required tabindex="-1" aria-hidden="true" class="validation-only" value=""></div></div></div></div>
 <div class="phone-input__phone"><div class="text-input-wrapper"><div class="input-wrapper">
 <div id="telephone" class="iti iti--allow-dropdown iti--show-flags iti--inline-dropdown">
 <div class="iti__country-container" hidden>
@@ -175,6 +175,26 @@ def _entry_form() -> bytes:
 _FORM = _entry_form()
 
 
+def _greenhouse_form() -> bytes:
+    # CSP blocks provider loads; only the top-document passive signature is read.
+    badge = ('<div><div class="grecaptcha-badge"><iframe '
+             'src="https://www.recaptcha.net/recaptcha/enterprise/anchor" '
+             'style="width:256px;height:60px;border:0;padding:0;visibility:visible;display:block">'
+             '</iframe><textarea class="g-recaptcha-response" id="g-recaptcha-response-123" '
+             'name="g-recaptcha-response" style="display:none"></textarea></div></div>')
+    return _closed_form().replace(b'</form>', ('</form>' + badge).encode())
+
+
+_COMMITTED_VALIDITY = r"""(() => {
+  const selectors=['#location','#school','#degree','#discipline','#country'];
+  return Object.fromEntries(selectors.map(s => {
+    const e=document.querySelector(s);
+    return [s, !!e && !e.required && e.value==='' && e.checkValidity() &&
+      !e.closest('.select-shell').querySelector('.validation-only')];
+  }));
+})()"""
+
+
 def _inventory_diagnostic_script() -> str:
     # Instrument the fixed observer only for reporting. Its original result is
     # still the sole inventory passed to the controller and all its guards.
@@ -241,7 +261,8 @@ class _SyntheticRun:
                  "last_page", "combo_observations", "combo_touched",
                  "submit_call_entered", "submit_guard", "post_attempts",
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
-                 "entry_initial_not_ready", "entry_wait", "entry_observations")
+                 "entry_initial_not_ready", "entry_wait", "entry_observations",
+                 "greenhouse", "visible_badge_anchor", "native_validity")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -282,6 +303,9 @@ class _SyntheticRun:
         self.entry_initial_not_ready = False
         self.entry_wait = 'PENDING'
         self.entry_observations = []
+        self.greenhouse = False
+        self.visible_badge_anchor = 'PENDING'
+        self.native_validity = {}
         self.observe_page(None)
 
     def entry_provenance(self):
@@ -290,6 +314,11 @@ class _SyntheticRun:
             raise PermissionError('Synthetic entry authority is absent.')
         if not self.positive:
             return None
+        if self.greenhouse:
+            from tools.claude_chrome import GreenhouseJobAlias
+            return GreenhouseJobAlias(pk=PK, company=COMPANY, ats='greenhouse',
+                                      job_id='synthetic-job', wrapper=URL,
+                                      careers_url=URL, board='example-co', url=URL)
         from tools.browser_skill_apply import ApplicationEntryProvenance
         return ApplicationEntryProvenance(PK, COMPANY, 'lever', 'synthetic-job',
                                           URL, 'example-co', URL)
@@ -326,6 +355,11 @@ class _SyntheticRun:
         self.last_page = observed
         self.committed = {}
         self.combo_observations = {}
+        frames = (observed or {}).get('greenhouse', {}).get('frames', [])
+        if (self.greenhouse and frames and all(f.get('status') == 'R' for f in frames)
+                and observed.get('greenhouse', {}).get('badge_responses') == 1
+                and not observed.get('greenhouse', {}).get('response_controls')):
+            self.visible_badge_anchor = 'PASS'
         controls = observed.get("controls", []) if isinstance(observed, dict) else []
         country = [c for c in controls if c.get('selector') == '#country']
         combo = country[0].get('combobox') or {} if len(country) == 1 else {}
@@ -448,16 +482,19 @@ class _SyntheticRun:
         """A closed edge exposing only the original controller's exact fixture path."""
         state = self
         async def diagnose(observed):
-            rejected = [f for f in (observed or {}).get('entry', {}).get('frames', [])
-                        if f.get('status') not in {'H', 'R', 'W', 'X'}]
+            field = 'greenhouse' if state.greenhouse else 'entry'
+            admitted = {'R'} if state.greenhouse else {'H', 'R', 'W', 'X'}
+            rejected = [f for f in (observed or {}).get(field, {}).get('frames', [])
+                        if f.get('status') not in admitted]
             if (isinstance(observed, dict) and (
                     observed.get("inventory_verified") is not True
                     or observed.get("truncated") or observed.get("opaque_controls")
                     or observed.get("shadow_roots") or observed.get("unsupported_frames")
                     or rejected)):
-                from tools.browser_skill_dom import entry_reader
+                from tools.browser_skill_dom import entry_reader, greenhouse_reader
                 script = _inventory_diagnostic_script()
-                result = await raw.call('evaluate', entry_reader(script) if state.positive else script)
+                reader = greenhouse_reader if state.greenhouse else entry_reader
+                result = await raw.call('evaluate', reader(script) if state.positive else script)
                 state.inventory_diagnostics = result.get("value")
                 if rejected and isinstance(state.inventory_diagnostics, dict):
                     # Keep the actual rejected snapshot distinct from the later
@@ -507,26 +544,35 @@ class _SyntheticRun:
                 if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")
                 if state.positive and args and args[0] == "evaluate":
-                    from tools.browser_skill_apply import ENTRY_PAGE, _ENTRY_FIXED_CONTROL_WITNESS
-                    if args not in {('evaluate', ENTRY_PAGE),
-                                    ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)} or kwargs:
+                    from tools.browser_skill_apply import (
+                        ENTRY_PAGE, _ENTRY_FIXED_CONTROL_WITNESS,
+                        GREENHOUSE_PAGE, _GREENHOUSE_FIXED_CONTROL_WITNESS)
+                    page_script, witness_script = (
+                        (GREENHOUSE_PAGE, _GREENHOUSE_FIXED_CONTROL_WITNESS) if state.greenhouse
+                        else (ENTRY_PAGE, _ENTRY_FIXED_CONTROL_WITNESS))
+                    if args not in {('evaluate', page_script),
+                                    ('evaluate', witness_script)} or kwargs:
                         raise PermissionError("Fixture denies this browser operation.")
                     result = await raw.call(*args)
                     observed = result.get('value') if isinstance(result, dict) else None
                     if not isinstance(observed, dict) or observed.get('url') != URL:
                         raise PermissionError('Fixture page escaped the fixed job URL.')
-                    if args[1] == ENTRY_PAGE:
-                        if not state.entry_observations:
-                            state.entry_initial_not_ready = not observed.get('entry', {}).get('root')
+                    field = 'greenhouse' if state.greenhouse else 'entry'
+                    frames = observed.get(field, {}).get('frames', [])
+                    if args[1] == page_script:
+                        if not state.entry_observations and not state.greenhouse:
+                            state.entry_initial_not_ready = not observed.get(field, {}).get('root')
                         state.observe_page(observed)
                         await diagnose(observed)
-                    elif any(f.get('status') not in {'H', 'R', 'W', 'X'}
-                             for f in observed.get('entry', {}).get('frames', [])):
+                    elif any(f.get('status') not in ({'R'} if state.greenhouse else {'H','R','W','X'})
+                             for f in frames):
                         await diagnose(observed)
                     state.entry_observations.append({
-                        'reader':'page' if args[1] == ENTRY_PAGE else 'witness',
-                        'root':bool(observed.get('entry', {}).get('root')),
-                        'frames':[f.get('status') for f in observed.get('entry', {}).get('frames', [])]})
+                        'reader':'page' if args[1] == page_script else 'witness',
+                        'root':bool(observed.get(field, {}).get('root')),
+                        'frames':[f.get('status') for f in frames],
+                        **({'badge_responses':observed.get(field, {}).get('badge_responses')}
+                           if state.greenhouse else {})})
                     return result
                 if not state.positive:
                     if (args != ("fill", "#name", "--value", "Test User")
@@ -553,6 +599,13 @@ class _SyntheticRun:
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
                 await raw.call(*args, **kwargs)
+                if state.greenhouse and args[0] == 'click' and args[1] in _OPTION_SELECTORS:
+                    result = await raw.call('evaluate', _COMMITTED_VALIDITY)
+                    observed = result.get('value') if isinstance(result, dict) else None
+                    if not isinstance(observed, dict):
+                        raise PermissionError('Synthetic native validity readback unavailable.')
+                    selector = _CHOICE_SELECTORS[_OPTION_SELECTORS[args[1]]]
+                    state.native_validity[selector] = observed.get(selector) is True
                 for key, selector in _CHOICE_SELECTORS.items():
                     if (args[0] in {"click", "fill"} and len(args) > 1
                             and (args[1] == selector
@@ -584,13 +637,15 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         if (self.path != _PATH or self.headers.get("Host") != "127.0.0.1:18789"):
             self._reject()
             return
+        state = getattr(getattr(self, 'server', None), 'synthetic_run', None)
+        document = _greenhouse_form() if type(state) is _SyntheticRun and state.greenhouse else _FORM
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(_FORM)))
+        self.send_header("Content-Length", str(len(document)))
         self.end_headers()
-        self.wfile.write(_FORM)
+        self.wfile.write(document)
 
     def _record_post_receipt(self, state, status: int) -> None:
         if type(state) is _SyntheticRun:
@@ -619,8 +674,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         pass  # Never log request headers, URLs or session data.
 
 
-def run() -> int:
-    """Only daemon's exact -m branch calls this, in a one-shot process."""
+def _run_scenario(*, greenhouse=False) -> int:
+    """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
     # Fail closed if the fixed port is occupied; NEVER choose another port,
@@ -634,6 +689,7 @@ def run() -> int:
                 document = Path(root) / "Synthetic-Resume.pdf"
                 document.write_bytes(_RESUME_BYTES)
                 state = _SyntheticRun(str(document))
+                state.greenhouse = greenhouse
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -665,7 +721,8 @@ def run() -> int:
                 except Gate:
                     receipt_ok = False
                 ok = (result.get("status") == "gate"
-                      and state.entry_wait == 'PASS'
+                      and (state.visible_badge_anchor == 'PASS' if greenhouse else state.entry_wait == 'PASS')
+                      and (not greenhouse or state.native_validity == dict.fromkeys(_CHOICE_SELECTORS.values(), True))
                       and form_question.get("selector") == "#additional"
                       and state.fills == expected_fills
                       and state.decisions == expected_decisions
@@ -757,7 +814,10 @@ def run() -> int:
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "native-form",
-                                  "safe_gate": ok,
+                                  'scenario': 'greenhouse' if greenhouse else 'entry',
+                                  'session_safe_gate': ok,
+                                  'visible_badge_anchor': state.visible_badge_anchor,
+                                  'native_committed_validity': state.native_validity,
                                   'entry_wait': state.entry_wait,
                                   'entry_initial_not_ready': state.entry_initial_not_ready,
                                   'entry_observations': state.entry_observations,
@@ -786,3 +846,15 @@ def run() -> int:
         finally:
             server.shutdown()
             thread.join(timeout=3)
+
+
+def run() -> int:
+    """One public invocation, two bounded independent provenances and human Gates."""
+    entry = _run_scenario()
+    greenhouse = _run_scenario(greenhouse=True)
+    ok = entry == greenhouse == 0
+    print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
+                      'entry_wait': 'PASS' if entry == 0 else 'FAIL',
+                      'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
+                      'sessions': 2}))
+    return 0 if ok else 1

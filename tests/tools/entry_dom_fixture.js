@@ -7,6 +7,7 @@ const node = (tag, attrs={}, parent=null) => {
     value:'',innerText:attrs.text || '',labels:[],disabled:false,readOnly:false,
     getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
     hasAttribute:k=>Object.hasOwn(attrs,k),
+    attributes:Object.keys(attrs).filter(k=>!['rect','bounds','text'].includes(k)).map(name=>({name})),
     getClientRects:()=>attrs.rect===null ? [] : [attrs.rect || {width:100,height:30,right:100,bottom:30}],
     getBoundingClientRect:()=> {if(attrs.bounds===null) throw Error('unreadable'); return attrs.bounds || attrs.rect || {width:100,height:30};},
     matches:q=>q.split(',').some(s=>match(e,s)),
@@ -37,7 +38,7 @@ function match(e,q) {
 const body=node('body',{id:'body'});
 const form=spec.root===false ? null : node('form',{id:'application-form'},body);
 if(form) {
-  form.action='https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
+  form.action=spec.action || spec.url || 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
   node('input',{id:'email',name:'Email',type:'email'},form);
   if(spec.marker!=='absent') {
     const marker=spec.marker || 'text';
@@ -47,8 +48,13 @@ if(form) {
           marker==='labelledby' ? {'aria-labelledby':'submit-caption'} :
           marker==='value' ? {name:'submit'} : {text:'Submit application'})},form);
     if(marker==='value') submit.value='Submit application';
+    if(spec.foreignMarker)submit.form=null;
     if(marker==='labelledby') node('span',{id:'submit-caption',text:'Submit application'},body);
   }
+}
+if(spec.ambiguous) {
+  const other=node('form',{id:'other-application'},body);other.action=form.action;
+  node('button',{type:'submit',text:'Submit application'},other);
 }
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};
@@ -57,7 +63,10 @@ function frame(kind, edit={}) {
     attrs={...attrs,src:'https://newassets.hcaptcha.com/captcha/v1/test/static/hcaptcha-enclave.html?secret=redacted#fragment',style:{visibility:'hidden'}};
   } else if(kind==='R' || kind==='B') {
     parent=spec.inside ? form || body : body;
-    if(spec.badge) parent=node('div',{class:'grecaptcha-badge'},parent);
+    if(spec.badge) {
+      if(spec.tokenBadge)parent=node('div',spec.badgeWrapper || {},parent);
+      parent=node('div',{class:'grecaptcha-badge'},parent);
+    }
     attrs={...attrs,src:'https://www.recaptcha.net/recaptcha/enterprise/'+(kind==='B' ? 'bframe' : 'anchor'),style:{visibility:spec.visible ? 'visible':'hidden'},bounds:{width:256,height:60}};
   } else if(kind==='W') {
     parent=node('li',{class:'application-question awli-application-row',...(spec.required ? {required:true}: {}),
@@ -73,21 +82,41 @@ function frame(kind, edit={}) {
   if(spec.brokenEdge) parent=node('div',{},parent);
   if(spec.bounds==='missing') attrs.bounds=null;
   else if(spec.bounds==='nan') attrs.bounds={width:NaN,height:60};
+  else if(spec.bounds==='infinity') attrs.bounds={width:256,height:Infinity};
   else if(spec.bounds) attrs.bounds=spec.bounds;
   return node('iframe',{...attrs,...edit},parent);
 }
 for(const k of spec.frames || []) frame(k,spec.edit || {});
+if(spec.sibling) frame('R',{src:'https://untrusted.example-co.test/widget'});
+for(const e of nodes.filter(e=>e.tagName==='IFRAME')) {
+  Object.defineProperty(e,'contentDocument',{get:()=>{throw Error('CHILD FRAME READ');}});
+  Object.defineProperty(e,'contentWindow',{get:()=>{throw Error('CHILD FRAME READ');}});
+}
 if(spec.helper) node('button',{id:'hcaptchaSubmitBtn',class:spec.helper==='hidden' ? 'hidden':'',type:'submit',rect:spec.helper==='hidden' ? null:undefined},form || body);
 for(let i=0;i<(spec.tokens || []).length;i++) {
   const name=spec.tokens[i];
-  const token=node(spec.textarea ? 'textarea':'input',{id:'token-'+i,name,type:'hidden'},spec.tokenOutside ? body:form || body);
+  let parent=spec.tokenOutside ? body : form || body;
+  let attrs={id:'token-'+i,name,type:'hidden'};
+  if(spec.tokenBadge) {
+    parent=nodes.find(e=>e.matches('div.grecaptcha-badge')) ||
+      node('div',{class:'grecaptcha-badge'},node('div',spec.badgeWrapper || {},body));
+    if(spec.tokenNotInBadge)parent=parent.parentElement;
+    if(spec.tokenInForm)parent=form;
+    attrs={id:'g-recaptcha-response-'+(100+i),class:'g-recaptcha-response',name,
+      style:{display:'none'},rect:null,...spec.tokenEdit};
+  }
+  const token=node(spec.textarea ? 'textarea':'input',attrs,parent);
+  if(spec.tokenAssociated)token.form=form;
   Object.defineProperty(token,'value',{get:()=> {throw Error('PROTECTED TOKEN VALUE READ');}});
+  if(spec.tokenVisible)token.getClientRects=()=>[{width:1,height:1}];
+  if(spec.tokenNestedWrapper)token.parentElement.parentElement.parentElement=node('div',{},body);
   if(spec.claim) node('input',{role:'combobox',type:'text','data-value-input':token.id,'aria-haspopup':'true','aria-autocomplete':'list'},token.parentElement);
 }
+if(spec.tokenSiblingBadge)node('div',{class:'grecaptcha-badge'},body);
 global.document={baseURI:'https://example-co.test/',readyState:'complete',body,title:'Synthetic',
   querySelectorAll:q=>nodes.filter(n=>n.matches(q)),
   querySelector:q=>document.querySelectorAll(q)[0] || null,
   getElementById:id=>nodes.find(n=>n.id===id) || null};
-global.CSS={escape:s=>s}; global.location={href:form?.action || 'https://example-co.test/'};
+global.CSS={escape:s=>s}; global.location={href:spec.url || form?.action || 'https://example-co.test/'};
 global.scrollX=0; global.scrollY=0; global.getComputedStyle=e=>e.style;
 console.log(JSON.stringify(eval(process.argv[3])));

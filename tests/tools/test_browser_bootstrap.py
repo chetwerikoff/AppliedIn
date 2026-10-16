@@ -992,6 +992,30 @@ def _greenhouse_session(monkeypatch, tmp_path, page=None, *, careers_url=GH_CARE
         page = inventory(field(form_action=GH_DIRECT),
                          submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, decide, _ = world(monkeypatch, page)
+    original_call = browser.call
+
+    def scoped(observed):
+        observed = deepcopy(observed)
+        observed['greenhouse'] = {
+            'root': {'selector': '#application', 'action': GH_DIRECT}, 'frames': []}
+        return observed
+
+    async def call(*args, **kwargs):
+        # Keep the original synthetic transport and revocation seams, while
+        # representing the new scoped PAGE separately from its fixed witness.
+        if args == ('navigate', GH_DIRECT):
+            return await browser.navigate(GH_DIRECT)
+        if args == ('evaluate', forms.GREENHOUSE_PAGE):
+            browser.calls.append(args)
+            return {'value': scoped(await browser.page())}
+        if args == ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS):
+            result = await original_call('evaluate', forms._FIXED_CONTROL_WITNESS)
+            browser.calls[-1] = args
+            result['value'] = scoped(result['value'])
+            return result
+        return await original_call(*args, **kwargs)
+
+    monkeypatch.setattr(browser, 'call', call)
     row = _greenhouse_row()
     monkeypatch.setattr(forms, '_row', lambda pk: row)
     return browser, decide, row
@@ -1163,7 +1187,10 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
     assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
     assert (q['label'], q['selector'], q['form_selector']) == (
         'Email', '#email', '#application')
-    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
+    assert browser.calls == [('navigate', GH_DIRECT),
+                             ('evaluate', forms.GREENHOUSE_PAGE),
+                             ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
+                             ('evaluate', forms.GREENHOUSE_PAGE)]
     assert not decide.await_count
 
     # The same synthetic tracking-status seam used by the actual direct writer.
@@ -1213,7 +1240,7 @@ async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
     assert result['status'] == 'gate' and result['form_question'] is None
-    assert [call[0] for call in browser.calls] == ['navigate']
+    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
     assert not decide.await_count
 
 
@@ -1360,7 +1387,7 @@ async def test_alias_config_revoked_during_witness_gates_without_question(
 
     async def revoke_on_observe(*args, **kwargs):
         result = await original_call(*args, **kwargs)
-        if args[0] == 'evaluate':
+        if args == ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS):
             (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
         return result
 

@@ -49,6 +49,7 @@ function proxyFor(key,input,F,shell,phase){
   if(change.ownerAttr){const [k,v]=change.ownerAttr;if(v===null)delete input.attrs[k];else input.attrs[k]=v;}
   if(phase==='C2'&&!change.mounted)return;
   const attrs={required:'',tabindex:'-1','aria-hidden':'true',class:'validation-only'};
+  if(scenario.proxyValueAttribute)attrs.value='';
   if(change.attr){const [k,v]=change.attr;if(v===null)delete attrs[k];else attrs[k]=v;}
   if(change.shellCount)make('div','extra-shell',{class:'select-shell'},F);
   if(change.shellNested){

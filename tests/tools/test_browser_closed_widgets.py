@@ -459,9 +459,10 @@ def test_required_proxies_are_not_answers_or_immutable_identity(phase):
 PROXY_BAD = [
     *({'attr': [k, None]} for k in ('required', 'tabindex', 'aria-hidden', 'class')),
     {'attr': ['tabindex', '0']}, {'attr': ['aria-hidden', 'false']},
-    *({'attr': [k, '']} for k in ('type', 'name', 'id', 'role', 'value', 'form',
+    *({'attr': [k, '']} for k in ('type', 'name', 'id', 'role', 'form',
         'disabled', 'readonly', 'autofocus', 'style', 'aria-label', 'data-answer', 'onclick', 'unknown')),
     {'value': 'Synthetic answer'}, {'style': {'opacity': '1'}},
+    {'attr': ['value', 'Synthetic answer']},
     {'style': {'position': 'static'}}, {'style': {'pointerEvents': 'auto'}},
     {'parent': 'inside'}, {'foreign': 'other'}, {'foreign': 'null'}, {'second': True},
     {'shellCount': True}, {'shellNested': True}, {'comboForeign': True}, {'tag': 'textarea'},

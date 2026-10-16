@@ -21,7 +21,10 @@ DEFECTS = ['two-names', 'extra-text', 'extra-role', 'two-texts', 'hidden-text',
            'two-labels', 'two-fields', 'text-path', 'field-path', 'member-path',
            'missing-qa', 'blank-name', 'two-checkboxes',
            'label-under-field', 'split-sections', 'nested-sections', 'non-div-sections',
-           'opacity-label', 'opacity-text', 'opacity-inner', 'opacity-card']
+           'opacity-label', 'opacity-text', 'opacity-inner', 'opacity-card',
+           'clip-text', 'clip-label', 'clip-inner',
+           'clip-path-text', 'clip-path-label', 'clip-path-inner',
+           'opacity-span', 'hidden-span', 'no-rect-span']
 MUTATIONS = [(kind, defect) for kind in ('radio', 'checkbox') for defect in DEFECTS
              if (kind, defect) != ('checkbox', 'blank-name')]
 
@@ -66,6 +69,14 @@ def test_exact_questions_keep_visible_required_marker_and_own_card(reader):
     assert all(c['native_form_owner_selector'] == '#application-form' for c in items)
     assert all(not c['checked'] for c in items)
     assert forms._radio_group(page, items[0]) == items[:2]
+
+
+@pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_rendered_text_span_and_required_marker_remain_the_question(reader, kind):
+    page = read({'kinds': [kind], 'defect': 'visible-span'}, reader)
+    assert all(c['question'] == 'Synthetic '+kind+' question *'
+               and not c.get('lever_card_unresolved') for c in choices(page))
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])

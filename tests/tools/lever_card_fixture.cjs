@@ -9,7 +9,14 @@ module.exports = ({spec,node,nodes,form,body}) => {
     const card=node('li',{id:kind+'-card',class:'application-question custom-question'},form);
     const inner=node('div',{},card);
     const label=node('div',{class:'application-label'},inner);
-    const text=node('div',{class:'text',text:'Synthetic '+kind+' question '},label);
+    const inSpan=['opacity-span','hidden-span','no-rect-span','visible-span'].includes(defect);
+    const text=node('div',{class:'text',text:inSpan ? '' : 'Synthetic '+kind+' question '},label);
+    if(inSpan) {
+      const content=node('span',{text:'Synthetic '+kind+' question '},text);
+      if(defect==='opacity-span')content.style.opacity='0';
+      if(defect==='hidden-span')content.style.visibility='hidden';
+      if(defect==='no-rect-span')content.getClientRects=()=>[];
+    }
     node('span',{class:'required',text:'*'},text);
     const field=node('div',{class:'application-field'},inner);
     const list=node('ul',{'data-qa':'synthetic-options'},field);
@@ -34,6 +41,10 @@ module.exports = ({spec,node,nodes,form,body}) => {
     if(defect==='opacity-text')text.style.opacity='0';
     if(defect==='opacity-inner')inner.style.opacity='0';
     if(defect==='opacity-card')card.style.opacity='0';
+    for(const [name,target] of [['text',text],['label',label],['inner',inner]]) {
+      if(defect==='clip-'+name)target.style.clip='rect(0px, 0px, 0px, 0px)';
+      if(defect==='clip-path-'+name)target.style.clipPath='inset(100%)';
+    }
     if(defect==='two-names') {
       if(kind==='radio')members[1].name='foreign-answer';
       else {add('radio',1,'foreign-one'); add('radio',2,'foreign-two');}

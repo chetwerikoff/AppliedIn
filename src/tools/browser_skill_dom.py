@@ -332,11 +332,18 @@ PAGE = r"""(() => {
         labels[0].parentElement.parentElement !== card ||
         texts[0].parentElement !== labels[0] || !visible(texts[0]) ||
         !clean(texts[0].innerText) || !members.length) return '';
-    // Opacity-zero sections keep rectangles and innerText but show no question.
-    for (let p = texts[0]; p; p = p.parentElement) {
-      if (Number(getComputedStyle(p).opacity) === 0) return '';
-      if (p === card) break;
-    }
+    // Concealed text retains innerText; unknown clipping geometry is not proof.
+    const shownOnPath = n => {
+      for (let p = n; p; p = p.parentElement) {
+        const s = getComputedStyle(p);
+        if (Number(s.opacity) === 0 || s.visibility !== 'visible' || s.display === 'none' ||
+            (s.clip && s.clip !== 'auto') || (s.clipPath && s.clipPath !== 'none')) return false;
+        if (p === card) return true;
+      }
+      return false;
+    };
+    if (!shownOnPath(texts[0]) || !Array.from(texts[0].querySelectorAll('*'))
+        .every(n => n.getClientRects().length > 0 && shownOnPath(n))) return '';
     if (e.type === 'checkbox' ? members.length !== 1 : !clean(e.name)) return '';
     if (!members.every(m => {
       const caption = m.closest('label');

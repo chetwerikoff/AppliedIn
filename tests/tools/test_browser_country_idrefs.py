@@ -106,7 +106,8 @@ def test_native_fixture_bytes_are_absent_error_c0(source):
     assert combo(snapshot, 'country')['combobox'] == next(
         c['combobox'] for c in snapshot['witness']['controls'] if c['selector'] == '#country')
     assert combo(snapshot, 'country')['combobox']['phase'] == 'C0'
-    assert b'id="country"' not in fixture._FORM
+    # The four-leg harness retains Ashby separately from the native W entry.
+    assert b'id="country"' not in fixture._ashby_form()
     assert fixture._FORM == fixture._entry_form()
     assert b"input.setAttribute('aria-describedby','country-error')" not in markup
 

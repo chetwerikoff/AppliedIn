@@ -140,6 +140,10 @@ if(scenario.fullPhone){
   if(!scenario.countryErrorAbsent)make('span','country-error',{},
     scenario.countryErrorOutside?form:scenario.countryErrorForeign?make('form','foreign-form',{},body):owner);
   if(scenario.countryErrorDuplicate)make('span','country-error',{},owner);
+  if(scenario.countryErrorForeignOwner){
+    const error=nodes.find(n=>n.id==='country-error');
+    error.tagName='OUTPUT';error.formOwner=make('form','error-form',{},body);
+  }
   if(scenario.countryPlaceholderAbsent)nodes.find(n=>n.id==='react-select-country-placeholder').id='unreferenced-placeholder';
   if(scenario.presentation && phase==='C2'){attrs['aria-describedby']='country-error';attrs['aria-invalid']='true';}
   if(phase==='C1'){

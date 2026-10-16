@@ -86,7 +86,7 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
  aria-haspopup="true" aria-required="true" aria-invalid="false" aria-labelledby="country-label"
  aria-describedby="react-select-country-placeholder country-error" aria-errormessage="country-error"
  aria-activedescendant=""></div><div id="react-select-country-placeholder" class="select__placeholder">Choose</div>
-</div></div><span id="country-error"></span></div>
+</div></div></div>
 <input required tabindex="-1" aria-hidden="true" class="validation-only" value=""></div></div></div></div>
 <div class="phone-input__phone"><div class="text-input-wrapper"><div class="input-wrapper">
 <div id="telephone" class="iti iti--allow-dropdown iti--show-flags iti--inline-dropdown">
@@ -125,7 +125,7 @@ for (const [id,answer] of Object.entries(answers)) {
    const display=document.getElementById(id+'-value').lastElementChild;
    display.className='react-select__single-value';display.textContent=option.innerText;
    if(id!=='country')document.getElementById(id+'-code').value=option.getAttribute('data-value');
-   else {input.setAttribute('aria-describedby','country-error');input.setAttribute('aria-invalid','false');}
+   else {input.setAttribute('aria-describedby','react-select-country-placeholder country-error');input.setAttribute('aria-invalid','false');}
    input.closest('.select-shell').querySelector('.validation-only')?.remove();
    input.value='';input.setAttribute('aria-expanded','false');input.removeAttribute('aria-controls');list.remove();
   });

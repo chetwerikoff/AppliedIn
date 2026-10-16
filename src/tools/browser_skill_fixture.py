@@ -86,7 +86,7 @@ It has no external links, cross-origin resources, redirects or real ATS connecti
  aria-haspopup="true" aria-required="true" aria-invalid="false" aria-labelledby="country-label"
  aria-describedby="react-select-country-placeholder country-error" aria-errormessage="country-error"
  aria-activedescendant=""></div><div id="react-select-country-placeholder" class="select__placeholder">Choose</div>
-</div></div><span id="country-error"></span></div>
+</div></div></div>
 <input required tabindex="-1" aria-hidden="true" class="validation-only" value=""></div></div></div></div>
 <div class="phone-input__phone"><div class="text-input-wrapper"><div class="input-wrapper">
 <div id="telephone" class="iti iti--allow-dropdown iti--show-flags iti--inline-dropdown">
@@ -125,7 +125,7 @@ for (const [id,answer] of Object.entries(answers)) {
    const display=document.getElementById(id+'-value').lastElementChild;
    display.className='react-select__single-value';display.textContent=option.innerText;
    if(id!=='country')document.getElementById(id+'-code').value=option.getAttribute('data-value');
-   else {input.setAttribute('aria-describedby','country-error');input.setAttribute('aria-invalid','false');}
+   else {input.setAttribute('aria-describedby','react-select-country-placeholder country-error');input.setAttribute('aria-invalid','false');}
    input.closest('.select-shell').querySelector('.validation-only')?.remove();
    input.value='';input.setAttribute('aria-expanded','false');input.removeAttribute('aria-controls');list.remove();
   });
@@ -940,10 +940,11 @@ def run() -> int:
     greenhouse = _run_scenario(greenhouse=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    ok = entry == greenhouse == lookalike == ashby == 0
+    scenarios = (entry, greenhouse, lookalike, ashby)
+    ok = all(result == 0 for result in scenarios)
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
                       'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
-                      'sessions': 3}))
+                      'sessions': len(scenarios)}))
     return 0 if ok else 1

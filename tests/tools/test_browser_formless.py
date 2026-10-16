@@ -53,10 +53,16 @@ class RootSession:
             return {}
         if method == 'upload':
             selector, _, path = args
-            for snapshot in (self.current, self.fixed):
-                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                    if c['selector'] == selector:
-                        c['files'] = [path]
+            assert selector == '#dropzone' and kwargs == {'timeout': 130}
+            after = observed(attached=True, files=[path])
+            for old, new in zip((self.current, self.fixed), after):
+                lookup = {c['selector']: c for c in old['controls'] + old['entry']['root_evidence']}
+                for c in new['controls'] + new['entry']['root_evidence']:
+                    source = lookup.get(c['selector'], {})
+                    for key in ('value', 'has_value'):
+                        if key in source:
+                            c[key] = source[key]
+            self.current, self.fixed = after
             return {}
         if method == 'click':
             if self.before_click:
@@ -78,7 +84,8 @@ def root_world(monkeypatch, **changes):
 
 async def admitted(monkeypatch):
     row, raw, decision, provenance = root_world(monkeypatch)
-    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
     page = await forms._stable_application_form(
         session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
     return row, raw, session, page, provenance
@@ -252,7 +259,7 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('fill', '#_systemfield_name', '--value', 'Test User'),
         ('fill', '#_systemfield_email', '--value', 'test@example-co.test'),
-        ('upload', '#_systemfield_resume', '--file', 'Resume.pdf'),
+        ('upload', '#dropzone', '--file', 'Resume.pdf'),
         ('click', '#structural-submit')]
     assert checkpoints == ['held', 'checked']
 
@@ -538,7 +545,7 @@ async def test_upload_requires_independent_fixed_readback(monkeypatch):
                     c['files'] = []
         return result
     raw.call = corrupt
-    with pytest.raises(forms.Gate, match='upload outcome is unclear'):
+    with pytest.raises(forms.Gate, match='witness disagreement'):
         await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
                             resume_path='Resume.pdf', company=COMPANY, jd_text='',
                             resume_tex='', github='', pk=PK, job_url=posting('ashby'),

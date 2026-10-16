@@ -39,6 +39,7 @@ STAGES = {
     'entry': 'Additional question', 'greenhouse': 'Additional question',
     'greenhouse_empty_placeholder': 'Additional question',
     'w_button_aria_label': 'unknown-frame-gate', 'ashby': 'direct-human-question',
+    'ashby-upload': 'ashby-upload-attached-human-gate',
     'lever_custom_radio': 'Lever custom radio question',
     'lever_custom_checkbox': 'Lever custom checkbox question',
 }
@@ -53,6 +54,15 @@ def traversal(state, *, premature=False):
     if state.w_lookalike:
         state.entry_observations = [{'frames': ['unknown']}]
         return dict(status='gate', question='unknown/untrusted application frame')
+    if state.ashby_upload:
+        filename = fixture.Path(state.resume_path).name
+        state.last_page['entry'] = {'upload_tree': dict(
+            complete=True, attached=True, filename=filename, svgs=[])}
+        state.last_page['controls'] = [dict(selector='#_systemfield_resume', files=[filename])]
+        state.fills, state.decisions, state.ipc_index, state.upload_ipc = 2, 4, 3, 1
+        state.uploaded = True
+        return dict(status='gate', form_question=dict(
+            owner_kind='ashby-formless-root', selector='#additional'))
     if state.ashby:
         state.last_page['entry'] = {'formless': {'root': '#root', 'submit': '#send'}}
         return dict(status='gate', form_question=dict(

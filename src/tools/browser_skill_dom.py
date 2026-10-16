@@ -559,6 +559,77 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
   const excluded = new Set([...responseNodes, ...reservedButtons]);
 """ + _APPLICATION_ROOT + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
+  // W is a passive row, not permission to act on either widget node. All raw
+  // audits are local to W; the canonical inventory and ordinary PAGE stay intact.
+  let wUnreadable=false;
+  const wNodes = row => {
+    try {
+      const list = value => {
+        if (!value || !Number.isSafeInteger(value.length) || value.length<0) throw Error('unknown collection');
+        const result=Array.from(value);
+        if (result.length!==value.length || result.some(n=>!n || n.nodeType!==1)) throw Error('unknown node');
+        return result;
+      };
+      const attrs = e => {
+        if (!e.attributes || !Number.isSafeInteger(e.attributes.length)) throw Error('unknown attributes');
+        return Array.from(e.attributes, a => {
+          if (typeof a.name!=='string' || typeof a.value!=='string') throw Error('unknown attribute');
+          return a.name.toLowerCase();
+        });
+      };
+      const buttons=list(row.querySelectorAll('button'));
+      const links=list(row.querySelectorAll('a.learn-more-link'));
+      if (buttons.length!==1 || !buttons[0].matches('button.awli-button') || links.length>1) return null;
+      const button=buttons[0], link=links[0];
+      if ([button,...links].some(n=>n.namespaceURI!=='http://www.w3.org/1999/xhtml')) return null;
+      if (button.getAttribute('type')!=='button' || button.type!=='button' ||
+          ['name','form','formaction'].some(a=>button.hasAttribute(a))) return null;
+      // A contained form owner is expected; an explicit form attribute is not.
+      if (link) {
+        const raw=link.getAttribute('href');
+        let valid=false;
+        try {
+          const url=new URL(raw);
+          valid=typeof raw==='string' && /^https:\/\//i.test(raw) && raw===raw.trim() && url.protocol==='https:' &&
+            url.origin!==new URL(location.href).origin && link.matches('a[href]');
+        } catch (_) {}
+        if (!valid) return null;
+      }
+      const anchors=list(row.querySelectorAll('a'));
+      if (anchors.length!==(link ? 1 : 0) || (link && anchors[0]!==link)) return null;
+      const permitted=link ? [button,link] : [button];
+      const inventory=list(row.querySelectorAll(query));
+      if (inventory.length!==permitted.length || inventory.some(n=>!permitted.includes(n))) return null;
+      const subtree=[row,...list(row.querySelectorAll('*'))];
+      for (const n of subtree) {
+        const names=attrs(n), role=n.getAttribute('role');
+        if (role!==null && (typeof role!=='string' || role.trim()!=='')) return null;
+        if (!permitted.includes(n)) {
+          if (names.includes('tabindex')) return null;
+          if (names.some(a=>a.startsWith('on'))) return null;
+        }
+        if (typeof n.localName!=='string' || !n.localName || n.localName.includes('-') ||
+            n.shadowRoot!==null) return null;
+        if (n!==row && n.matches('summary,area[href],audio[controls],video[controls],object,embed')) return null;
+      }
+      if (list(root.elements).some(n=>row.contains(n) && n!==button)) return null;
+      // labels includes external label[for] and wrapping labels. Missing evidence
+      // is unknown, never an empty name. Do not read the iframe child document.
+      if (list(button.labels).length || button.closest('label')) return null;
+      const nameAttrs=['aria-label','aria-labelledby','aria-owns','title','alt',
+        'placeholder','label','value','aria-description','aria-describedby'];
+      for (const n of [button,...list(button.querySelectorAll('*'))]) {
+        if (attrs(n).some(a=>nameAttrs.includes(a))) return null;
+        if (typeof n.textContent!=='string' || n.textContent.trim() ||
+            typeof n.innerText!=='string' || n.innerText.trim()) return null;
+        for (const pseudo of ['::before','::after']) {
+          const content=getComputedStyle(n,pseudo).content;
+          if (typeof content!=='string' || !['none','normal','""',"''"].includes(content)) return null;
+        }
+      }
+      return permitted;
+    } catch (_) { wUnreadable=true; return null; }
+  };
   const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='';
@@ -584,9 +655,9 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const w=(raw===null || raw==='about:blank') && e.getAttribute('title')==='LinkedIn Embedded Content' &&
       !!nativeRoot && !!row && nativeRoot.contains(row) && !!box && box.width<=400 && box.height<=100 &&
       !row.required && row.getAttribute('aria-required')!=='true' && !row.hasAttribute('required') &&
-      // Match the actual inventory candidate set, or W could hide an ARIA answer.
-      !row.matches(query) && !row.querySelector(query) &&
+      !row.matches(query) &&
       !row.querySelector('[contenteditable],[required],[aria-required="true"]');
+    const widget=w ? wNodes(row) : null;
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
     const visibleR=visibleRecaptcha(origin,path,shown,outside,badge,bounds);
@@ -601,7 +672,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
     else if ((r && outside && hidden) || visibleR==='R') status='R';
-    else if (w) { status='W'; row.querySelectorAll(query).forEach(n=>excluded.add(n)); }
+    else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';
     return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
@@ -638,7 +709,9 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
         getComputedStyle(e).display!=='none'))};
-  if (responseError) return {url:location.href,controls:[],entry,inventory_verified:false};
+  // An unreadable W name must reach the named frame Gate before generic graphs
+  // attempt to read that same property as an ordinary applicant control.
+  if (responseError || wUnreadable) return {url:location.href,controls:[],entry,inventory_verified:false};
 """
 
 

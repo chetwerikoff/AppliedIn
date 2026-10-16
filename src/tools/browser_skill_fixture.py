@@ -134,7 +134,7 @@ for (const [id,answer] of Object.entries(answers)) {
 </script></body></html>''').encode('utf-8')
 
 
-def _entry_form() -> bytes:
+def _ashby_form() -> bytes:
     # One sealed page; real root admission must reach a direct human question.
     return b'''<!doctype html><html><head><meta charset="utf-8">
 <title>Synthetic application</title><style>
@@ -162,6 +162,46 @@ label {display:block} .clipped {position:absolute;width:1px;height:1px;clip:rect
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/anchor" style="display:none"></iframe>
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/bframe" style="display:none"></iframe>
 <div><iframe style="display:none"></iframe></div></body></html>'''
+
+
+def _entry_form() -> bytes:
+    # Same sealed page: root appears first; passive frames arrive while inert.
+    text = _closed_form().decode('utf-8')
+    text = text.replace('<form id="application-form"',
+                        '<template id="entry-template"><form inert id="application-form"')
+    text = text.replace('</form>\n<script>', '</form></template>\n<script>\nsetTimeout(() => {\n'
+                        'document.body.append(document.getElementById("entry-template").content);')
+    injection = r'''
+ setTimeout(() => {
+  const form=document.getElementById('application-form');
+  const h=document.createElement('div'); h.id='h-captcha'; h.className='h-captcha'; form.append(h);
+  const add=(parent,src,style) => {
+   const e=document.createElement('iframe'); if(src!==null)e.setAttribute('src',src);
+   Object.assign(e.style,style); parent.append(e); return e;
+  };
+  for(let i=0;i<2;i++)add(h,'https://newassets.hcaptcha.com/captcha/v1/synthetic/static/hcaptcha-enclave.html',
+    {visibility:'hidden',width:'100vw',height:'100vh'});
+  for(const path of ['anchor','bframe'])add(document.body,'https://www.recaptcha.net/recaptcha/enterprise/'+path,
+    {visibility:'hidden'});
+  const row=document.createElement('li'); row.className='application-question awli-application-row';
+  row.innerHTML='<div class="application-field"><div class="awli-button-container"><span class="IN-widget"></span>' +
+    '<button id="w-button" class="awli-button" type="button"></button>' +
+    '<a id="w-link" class="learn-more-link" href="https://widgets.example-co.test">Learn more</a></div></div>';
+  form.append(row); const w=add(row.querySelector('span'),null,{width:'236px',height:'48px'});
+  w.title='LinkedIn Embedded Content';
+  // X bounds are outer client rects: the UA iframe border otherwise adds 4px.
+  add(document.body,null,{width:'1px',height:'1px',visibility:'hidden',
+    border:'0',padding:'0',display:'block'});
+  for(const name of ['h-captcha-response','g-recaptcha-response']) {
+   const e=document.createElement('textarea');e.name=name;e.hidden=true;form.append(e);
+  }
+  const helper=document.createElement('button');helper.id='hcaptchaSubmitBtn';helper.className='hidden';
+  helper.hidden=true;form.append(helper);
+  form.removeAttribute('inert');
+ }, 1000);
+}, 1000);
+'''
+    return text.replace('</script></body>', injection + '</script></body>').encode('utf-8')
 
 
 _FORM = _entry_form()
@@ -254,7 +294,8 @@ class _SyntheticRun:
                  "submit_call_entered", "submit_guard", "post_attempts",
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
-                 "greenhouse", "visible_badge_anchor", "native_validity")
+                 "greenhouse", "visible_badge_anchor", "native_validity",
+                 "w_lookalike", "w_target_ipc", "ashby")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -298,6 +339,9 @@ class _SyntheticRun:
         self.greenhouse = False
         self.visible_badge_anchor = 'PENDING'
         self.native_validity = {}
+        self.w_lookalike = False
+        self.w_target_ipc = 0
+        self.ashby = False
         self.observe_page(None)
 
     def entry_provenance(self):
@@ -312,12 +356,14 @@ class _SyntheticRun:
                                       job_id='synthetic-job', wrapper=URL,
                                       careers_url=URL, board='example-co', url=URL)
         from tools.browser_skill_apply import ApplicationEntryProvenance
-        return ApplicationEntryProvenance(PK, COMPANY, 'ashby', 'synthetic-job',
+        return ApplicationEntryProvenance(PK, COMPANY, 'ashby' if self.ashby else 'lever', 'synthetic-job',
                                           URL, 'example-co', URL)
 
     def entry_admitted(self, page):
-        root = page.get('entry', {}).get('formless') or {}
-        if self.entry_provenance() and root.get('root') and not root.get('error'):
+        root = (page.get('entry', {}).get('formless') or {}) if self.ashby else page.get('entry', {})
+        if (self.entry_provenance() and root.get('root') and not root.get('error')
+                and (self.ashby or (self.entry_initial_not_ready and
+                    {f['status'] for f in page['entry']['frames']} == {'H', 'R', 'W', 'X'}))):
             self.entry_wait = 'PASS'
 
 
@@ -326,7 +372,7 @@ class _SyntheticRun:
         self.row['human_approved_answers'] = {}
         # Only Ashby stops before applicant IPC; the independent native leg
         # retains its pre-existing exact grants to exercise picker readbacks.
-        if not self.greenhouse:
+        if self.ashby:
             return
         specs = {
             'Name': ('#name', 'Name', 'Name', 'input', 'text'),
@@ -532,6 +578,9 @@ class _SyntheticRun:
                 return observed
 
             async def call(self, *args, **kwargs):
+                if (len(args)>1 and args[0] in {'click','focus','fill','evaluate','navigate'}
+                        and args[1] in {'#w-button','#w-link','https://widgets.example-co.test'}):
+                    state.w_target_ipc += 1
                 if state.positive and args == ('navigate', URL) and not kwargs:
                     state.entry_provenance()
                     if state.navigations:
@@ -556,7 +605,8 @@ class _SyntheticRun:
                         raise PermissionError('Fixture page escaped the fixed job URL.')
                     field = 'greenhouse' if state.greenhouse else 'entry'
                     frames = observed.get(field, {}).get('frames', [])
-                    structural = observed.get('entry', {}).get('formless') or {}
+                    structural = ((observed.get('entry', {}).get('formless') or {}) if state.ashby
+                                  else observed.get('entry', {}))
                     if args[1] == page_script:
                         if not state.entry_observations and not state.greenhouse:
                             state.entry_initial_not_ready = not structural.get('root')
@@ -578,11 +628,11 @@ class _SyntheticRun:
                         raise PermissionError("Fixture denies this browser operation.")
                     state.fills += 1
                     return await raw.call(*args)
-                if args == ('click', '#submit') or (not state.greenhouse and args and args[0] == 'click'):
+                if args == ('click', '#submit') or (state.ashby and args and args[0] == 'click'):
                     state.submit_call_entered += 1
                     state.submit_guard = "denied: fixture forbids committing BSK IPC"
                     raise PermissionError("Fixture never permits submission-capable IPC.")
-                if not state.greenhouse:
+                if state.ashby:
                     raise PermissionError("Fixture never permits applicant or committing BSK IPC.")
                 sequence = state._positive_ipc()
                 if (state.ipc_index >= len(sequence) or args != sequence[state.ipc_index]
@@ -628,6 +678,9 @@ class _SyntheticRun:
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
+    # Chrome can leave an idle preconnect; shutdown cannot interrupt its read.
+    timeout = 2
+
     def _reject(self, status: int = 404) -> None:
         self.send_response(status)
         self.send_header("Content-Length", "0")
@@ -639,6 +692,10 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             return
         state = getattr(getattr(self, 'server', None), 'synthetic_run', None)
         document = _greenhouse_form() if type(state) is _SyntheticRun and state.greenhouse else _FORM
+        if type(state) is not _SyntheticRun or state.ashby:
+            document = _ashby_form()
+        if type(state) is _SyntheticRun and state.w_lookalike:
+            document = document.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
@@ -674,7 +731,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         pass  # Never log request headers, URLs or session data.
 
 
-def _run_scenario(*, greenhouse=False) -> int:
+def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -690,6 +747,8 @@ def _run_scenario(*, greenhouse=False) -> int:
                 document.write_bytes(_RESUME_BYTES)
                 state = _SyntheticRun(str(document))
                 state.greenhouse = greenhouse
+                state.w_lookalike = w_lookalike
+                state.ashby = ashby
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -748,6 +807,14 @@ def _run_scenario(*, greenhouse=False) -> int:
                       and state.submit_ipc == 0
                       and state.post_attempts == 0
                       and state.post_count == 0)
+                if w_lookalike:
+                    ok = (result.get('status') == 'gate'
+                          and 'unknown/untrusted application frame' in result.get('question', '')
+                          and any('unknown' in o['frames'] for o in state.entry_observations)
+                          and state.fills == state.decisions == state.ipc_index == 0
+                          and not state.uploaded and state.submit_call_entered == 0
+                          and state.submit_ipc == state.post_attempts == state.post_count == 0)
+                ok = ok and state.w_target_ipc == 0
                 field_selectors = {'Name': '#name', 'Phone': '#phone',
                                    'Additional question': '#additional'}
                 outcomes = [
@@ -806,7 +873,7 @@ def _run_scenario(*, greenhouse=False) -> int:
                     "reason": result.get("question") or result.get("detail"),
                 }
                 structural = (state.last_page or {}).get('entry', {}).get('formless') or {}
-                if not greenhouse:
+                if state.ashby:
                     ok = (result.get('status') == 'gate' and state.entry_wait == 'PASS'
                           and form_question.get('owner_kind') == 'ashby-formless-root'
                           and form_question.get('selector') == '#_systemfield_name'
@@ -828,8 +895,11 @@ def _run_scenario(*, greenhouse=False) -> int:
                         key: state.inventory_diagnostics.get(key) for key in (
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
-                print(json.dumps({"fixture": "native-form" if greenhouse else "ashby-formless",
-                                  'scenario': 'greenhouse' if greenhouse else 'entry',
+                print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
+                                  'scenario': ('ashby' if state.ashby else
+                                               'w_button_aria_label' if w_lookalike else
+                                               'greenhouse' if greenhouse else 'entry'),
+                                  'w_target_ipc': state.w_target_ipc,
                                   'session_safe_gate': ok,
                                   'safe_gate': ok,
                                   'visible_badge_anchor': state.visible_badge_anchor,
@@ -841,7 +911,9 @@ def _run_scenario(*, greenhouse=False) -> int:
                                   "status": result.get("status"),
                                   'applicant_ipc': state.ipc_index, 'model_decisions': state.decisions,
                                   'root_witnessed': state.entry_wait == 'PASS',
-                                  'final_stage': 'direct-human-question' if ok else 'premature',
+                                  'final_stage': ('unknown-frame-gate' if w_lookalike else
+                                                  'direct-human-question' if state.ashby else
+                                                  'Additional question') if ok else 'premature',
                                   "post_received": state.post_count == 1,
                                   "gate": gate,
                                   "inventory": inventory,
@@ -856,16 +928,22 @@ def _run_scenario(*, greenhouse=False) -> int:
                 return 0 if ok else 1
         finally:
             server.shutdown()
+            server.server_close()
             thread.join(timeout=3)
+            if thread.is_alive():
+                raise RuntimeError('Synthetic fixture harness server did not stop.')
 
 
 def run() -> int:
-    """One public invocation, two bounded independent provenances and human Gates."""
+    """One invocation, existing provenances, positive and isolated W human Gates."""
     entry = _run_scenario()
     greenhouse = _run_scenario(greenhouse=True)
-    ok = entry == greenhouse == 0
+    lookalike = _run_scenario(w_lookalike=True)
+    ashby = _run_scenario(ashby=True)
+    ok = entry == greenhouse == lookalike == ashby == 0
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
-                      'sessions': 2}))
+                      'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
+                      'sessions': 3}))
     return 0 if ok else 1

@@ -25,6 +25,106 @@ from tools import browser_skill_apply as forms
 from tools import browser_skill_fixture as fixture
 
 
+def _assert_handler_socket_timeout():
+    from socketserver import StreamRequestHandler
+
+    calls = []
+    connection = SimpleNamespace(
+        settimeout=lambda seconds: calls.append(seconds),
+        makefile=lambda *_args: io.BytesIO())
+    handler = object.__new__(fixture._FixtureHandler)
+    handler.request = connection
+    StreamRequestHandler.setup(handler)
+    assert calls == [2]
+    assert fixture._FixtureHandler.timeout == 2
+
+
+def test_handler_applies_timeout_to_accepted_connection(monkeypatch):
+    """StreamRequestHandler, not HTTPServer.timeout, bounds the accepted read."""
+    _assert_handler_socket_timeout()
+    with monkeypatch.context() as removed:
+        removed.delattr(fixture._FixtureHandler, 'timeout')
+        with pytest.raises(AssertionError):
+            _assert_handler_socket_timeout()
+    _assert_handler_socket_timeout()
+
+
+def _assert_scenario_teardown(monkeypatch, capsys, *, alive, reader=None):
+    events = []
+
+    class BodyStopped(Exception):
+        pass
+
+    class Server:
+        def __init__(self, *_args):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            pass
+        def serve_forever(self):
+            raise AssertionError('fake thread must never serve or bind a socket')
+        def shutdown(self):
+            events.append('shutdown')
+        def server_close(self):
+            events.append('server_close')
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+        def start(self):
+            pass
+        def join(self, timeout):
+            assert timeout == 3
+            events.append('join')
+        def is_alive(self):
+            return alive
+
+    async def stop_body(*_args, **_kwargs):
+        raise BodyStopped()
+
+    with monkeypatch.context() as fake:
+        fake.setattr(fixture, 'HTTPServer', Server)
+        fake.setattr(threading, 'Thread', Thread)
+        fake.setattr(fixture, '_daemon_origin', lambda: True)
+        fake.setattr(fixture._SyntheticRun, 'enable_positive_fixture', lambda self: None)
+        fake.setattr(forms, 'apply', stop_body)
+        if reader is not None:
+            reader.__globals__.update(_daemon_origin=fixture._daemon_origin,
+                                      HTTPServer=Server)
+            fake.setattr(fixture, '_run_scenario', reader)
+        with pytest.raises(Exception) as raised:
+            fixture.run()
+    assert events == ['shutdown', 'server_close', 'join']
+    if alive:
+        assert type(raised.value) is RuntimeError
+        assert str(raised.value) == 'Synthetic fixture harness server did not stop.'
+    else:
+        assert type(raised.value) is BodyStopped
+    # run() must not turn an incomplete scenario/teardown into aggregate PASS.
+    assert capsys.readouterr().out == ''
+
+
+@pytest.mark.parametrize('guard,alive', [
+    ('            if thread.is_alive():\n'
+     "                raise RuntimeError('Synthetic fixture harness server did not stop.')", True),
+    ('            server.server_close()', False),
+])
+def test_scenario_teardown_guards_and_removal_sensitivity(monkeypatch, capsys, guard, alive):
+    """Each actual teardown guard is sensitive without a listener or live thread."""
+    import inspect
+
+    _assert_scenario_teardown(monkeypatch, capsys, alive=alive)
+    source = inspect.getsource(fixture._run_scenario)
+    assert source.count(guard) == 1, 'counterfactual must remove exactly its own guard'
+    namespace = dict(fixture.__dict__)
+    exec(compile(source.replace(guard, ''), '<teardown-guard-removed>', 'exec'), namespace)
+    with pytest.raises(AssertionError):
+        _assert_scenario_teardown(monkeypatch, capsys, alive=alive,
+                                  reader=namespace['_run_scenario'])
+    _assert_scenario_teardown(monkeypatch, capsys, alive=alive)
+
+
 @pytest.fixture
 def authority(tmp_path, monkeypatch):
     """A unit-test-only exact-origin stub; other tests check real CLI origin."""
@@ -148,6 +248,7 @@ async def test_forged_context_refused_before_store_or_browser(monkeypatch, conte
 
 def test_positive_approval_grants_match_live_group_question(authority):
     """The live PAGE inventory uses the exact form-group question."""
+    authority.ashby = True
     authority.enable_positive_fixture()
     page = synthetic_page()
     target = next(item for item in page["controls"]
@@ -728,6 +829,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                 pass
             def shutdown(self):
                 pass
+            def server_close(self):
+                pass
         http.server.HTTPServer = OfflineHTTPServer
 
         original_import = builtins.__import__
@@ -868,9 +971,11 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                    and (e["dotenv"], e["cost"]) != ("1", "True")
                    for e in events)
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
-    assert actions.count("session_start") == actions.count("session_stop") == 2
-    assert actions.count("navigate") == 2
-    assert actions.count("evaluate_page") == 2  # Each malformed scoped read independently Gates.
+    # W positive/negative, Greenhouse and Ashby each use an independent session;
+    # none may inherit a previous session's missing witness.
+    assert actions.count("session_start") == actions.count("session_stop") == 4
+    assert actions.count("navigate") == 4
+    assert actions.count("evaluate_page") == 4
     assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
@@ -1344,6 +1449,7 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     from tests.tools.test_browser_application_entry import dom, fake_clock
     from tools.browser_skill_dom import entry_reader
     fake_clock(monkeypatch)
+    authority.ashby = True
     authority.enable_positive_fixture()
     proof = authority.entry_provenance()
     complete = dom({'root':False,'formless':True})
@@ -1395,7 +1501,7 @@ def test_formless_fixture_mirrors_r_r_z_but_x_bounds_remain_strict_offline():
     # AC-Z adds the exact inert frame beside the existing R pair; it does not
     # relax X's old UA-border regression.
     from tests.tools.test_browser_application_entry import dom
-    assert fixture._FORM.count(b'<iframe') == 3
+    assert fixture._ashby_form().count(b'<iframe') == 3
     for size, status in ((1, 'X'), (5, 'unknown')):
         page = dom(dict(frames=['X'], edit={'rect':{'width':size,'height':size}}))
         assert page['entry']['frames'][0]['status'] == status
@@ -1615,3 +1721,49 @@ console.log(JSON.stringify(eval(process.argv[1])));
     result = json.loads(subprocess.check_output(
         ['node', '-e', source, fixture._COMMITTED_VALIDITY, invalid or 'valid'], text=True))
     assert result == dict.fromkeys(fixture._CHOICE_SELECTORS.values(), invalid is None)
+
+
+def test_w_lookalike_is_one_non_origin_mutation_on_original_sealed_get(authority):
+    documents = []
+    for invalid in (False, True):
+        authority.w_lookalike = invalid
+        handler = object.__new__(fixture._FixtureHandler)
+        handler.path = fixture._PATH
+        handler.headers = {'Host': '127.0.0.1:18789'}
+        handler.server = SimpleNamespace(synthetic_run=authority)
+        handler.wfile = io.BytesIO()
+        headers = []
+        handler.send_response = lambda status: headers.append(('status', status))
+        handler.send_header = lambda key, value: headers.append((key, value))
+        handler.end_headers = lambda: None
+        handler.do_GET()
+        assert ('status', 200) in headers
+        assert any(key == 'Content-Security-Policy' and "default-src 'none'" in value
+                   for key, value in headers)
+        documents.append(handler.wfile.getvalue())
+    positive, negative = documents
+    assert positive == fixture._FORM
+    assert b'class="awli-button" type="button"></button>' in positive
+    assert b'class="learn-more-link" href="https://widgets.example-co.test"' in positive
+    assert negative == positive.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
+    assert authority.post_attempts == authority.post_count == 0
+
+
+async def test_w_fixture_counts_denied_widget_targets_without_forwarding(authority):
+    authority.enable_positive_fixture()
+    forwarded = []
+    class Raw:
+        async def call(self, *args):
+            forwarded.append(args)
+            return {}
+    facade = authority.facade(Raw())
+    await facade.call('navigate', fixture.URL)
+    assert authority.w_target_ipc == 0
+    for method in ('click', 'focus', 'fill', 'evaluate'):
+        for selector in ('#w-button', '#w-link'):
+            with pytest.raises(PermissionError, match='denies'):
+                await facade.call(method, selector)
+    with pytest.raises(PermissionError, match='denies'):
+        await facade.call('navigate', 'https://widgets.example-co.test')
+    assert authority.w_target_ipc == 9
+    assert forwarded == [('navigate', fixture.URL)]

@@ -18,7 +18,7 @@ from tests.tools.test_browser_closed_widgets import Session, choose, dom, grants
 def instrument(script):
     return script.replace('const pickerParts = new Set();', '''
       global.__graphs.push({graphs:Array.from(newGraphs,([e,g])=>[selector(e),g]),
-        proxies:Array.from(requiredProxies,selector)});
+        proxies:Array.from(requiredProxies,selector), quarantined:Array.from(quarantined,selector)});
       const pickerParts = new Set();''')
 
 
@@ -67,7 +67,8 @@ def test_graph_eligibility_matrix(kind, site, name, change):
                 visibility=[dict(id=k+suffix, **change) for k in ('location', 'school')],
                 **offsets)
     if site == 'rejected-display':
-        spec.update(badGraph=True, wrongLabel=True)
+        spec.update(badGraph=True, wrongLabel=True, proxyKeys=['school', 'degree'],
+                    visibility=[dict(id='location-display', **change)])
     out = observe(kind, **spec)
     p, w = out['page'], out['witness']
     assert out['graphs'][0] == out['graphs'][1]
@@ -85,6 +86,10 @@ def test_graph_eligibility_matrix(kind, site, name, change):
         assert len(old['witness']['controls']) == len(old['page']['controls']) + 2
         assert len(old['graphs'][0]['proxies']) == 2
         assert old['graphs'][1]['proxies'] == []
+    elif site == 'rejected-display' and name not in {'empty-rects', 'scroll-offset'}:
+        old = observe(kind, old=True, **spec)
+        assert '#location' in old['graphs'][0]['quarantined']
+        assert '#location' not in old['graphs'][1]['quarantined']
 
 
 @pytest.mark.parametrize('kind', ['entry', 'greenhouse'])
@@ -101,9 +106,13 @@ def test_invalid_proxy_is_preserved_not_blanket_hidden(kind, mutation):
 
 
 @pytest.mark.parametrize('part', ['location', 'location-label', 'location-display'])
-@pytest.mark.parametrize('style', [dict(opacity='0'), dict(visibility='collapse')])
-async def test_graph_parity_never_grants_strict_invisible_evidence(grants, part, style):
-    session = Session(visibility=[dict(id=part, style=style)])
+@pytest.mark.parametrize('change', [dict(style={'opacity': '0'}), dict(style={'visibility': 'collapse'}),
+                                  dict(rects=[{**RECT, 'width': 0}]),
+                                  dict(rects=[{**RECT, 'right': -20}], parentStyle={'position': 'fixed'}, scrollX=100)])
+async def test_graph_parity_never_grants_strict_invisible_evidence(grants, part, change):
+    change = copy.deepcopy(change)
+    offsets = {k: change.pop(k) for k in ('scrollX', 'scrollY') if k in change}
+    session = Session(visibility=[dict(id=part, **change)], **offsets)
     p, w = session.snapshot['page'], session.snapshot['witness']
     target = next(c for c in p['controls'] if c['selector'] == '#location')
     evidence = next(c for c in w['controls'] if c['selector'] == '#location')
@@ -133,15 +142,18 @@ def test_missing_or_nonboolean_strict_evidence_never_discloses(flag, value):
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 @pytest.mark.parametrize('part', ['location-label', 'location-display'])
-async def test_every_phase_refuses_strict_evidence_before_commit_or_submit(grants, phase, part):
+@pytest.mark.parametrize('change', [dict(style={'opacity': '0'}), dict(style={'visibility': 'collapse'}),
+                                  dict(rects=[{**RECT, 'height': 0}]),
+                                  dict(rects=[{**RECT, 'right': -20}], parentStyle={'position': 'fixed'})])
+async def test_every_phase_refuses_strict_evidence_before_commit_or_submit(grants, phase, part, change):
     class Changing(Session):
         async def call(self, *args):
             result = await super().call(*args)
             if args[0] == 'click' and self.phases.get('location') == phase:
                 self.snapshot = dom(
-                    phases=self.phases, visibility=[dict(id=part, style={'opacity': '0'})])
+                    phases=self.phases, visibility=[dict(id=part, **change)], scrollX=100)
             return result
-    session = Changing(**({'visibility': [dict(id=part, style={'opacity': '0'})]}
+    session = Changing(**({'visibility': [dict(id=part, **change)], 'scrollX': 100}
                           if phase == 'C0' else {}))
     with pytest.raises(forms.Gate, match='visibly editable'):
         await choose(session, grants)

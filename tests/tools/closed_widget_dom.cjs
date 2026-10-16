@@ -270,7 +270,7 @@ for(const change of scenario.visibility || []){
 }
 global.document={readyState:'complete',title:'Synthetic',body:nodes.find(n=>n.tagName==='BODY'),
   querySelectorAll:q=>nodes.filter(n=>matches(n,q)),querySelector:q=>nodes.find(n=>matches(n,q))||null,
-  getElementById:id=>nodes.find(n=>n.id===id)||null};
+  getElementById:id=>id?nodes.find(n=>n.id===id)||null:null};
 global.location={href:scenario.fixtureUrl||form.action};global.CSS={escape:s=>s};global.scrollX=scenario.scrollX||0;global.scrollY=scenario.scrollY||0;
 global.getComputedStyle=n=>({visibility:'visible',display:'block',opacity:'1',position:'static',pointerEvents:'auto',...(n.computed||{}),
   ...(scenario.fixtureTree&&n.attrs.class==='validation-only'?{opacity:'0',position:'absolute',pointerEvents:'none'}:{})});

@@ -260,6 +260,10 @@ if(scenario.fixtureTree){
     for(const child of tree.children)build(child,n);
   };
   build(scenario.fixtureTree);
+  // Native labels include enclosing labels as well as explicit for= associations.
+  for(const n of nodes.filter(n=>['INPUT','TEXTAREA','SELECT'].includes(n.tagName)))
+    n.labels=nodes.filter(l=>l.tagName==='LABEL' &&
+      (l.contains(n) || !!n.id && l.getAttribute('for')===n.id));
 }
 // Style/geometry contrasts are applied to identical nodes for each independent reader.
 for(const change of scenario.visibility || []){
@@ -270,7 +274,7 @@ for(const change of scenario.visibility || []){
 }
 global.document={readyState:'complete',title:'Synthetic',body:nodes.find(n=>n.tagName==='BODY'),
   querySelectorAll:q=>nodes.filter(n=>matches(n,q)),querySelector:q=>nodes.find(n=>matches(n,q))||null,
-  getElementById:id=>id?nodes.find(n=>n.id===id)||null:null};
+  getElementById:id=>id ? nodes.find(n=>n.id===id)||null : null};
 global.location={href:scenario.fixtureUrl||form.action};global.CSS={escape:s=>s};global.scrollX=scenario.scrollX||0;global.scrollY=scenario.scrollY||0;
 global.getComputedStyle=n=>({visibility:'visible',display:'block',opacity:'1',position:'static',pointerEvents:'auto',...(n.computed||{}),
   ...(scenario.fixtureTree&&n.attrs.class==='validation-only'?{opacity:'0',position:'absolute',pointerEvents:'none'}:{})});

@@ -62,6 +62,10 @@ if(form) {
     if(marker==='labelledby') node('span',{id:'submit-caption',text:'Submit application'},body);
   }
 }
+if(spec.lever) {
+  const build = require('./lever_card_fixture.cjs');
+  build({spec:spec.lever,node,nodes,form,body});
+}
 if(spec.ambiguous) {
   const other=node('form',{id:'other-application'},body);other.action=form.action;
   node('button',{type:'submit',text:'Submit application'},other);

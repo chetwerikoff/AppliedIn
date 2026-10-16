@@ -312,6 +312,53 @@ def authorized(context: object, *, pk: str = "", company: str = "",
 _ORIGIN = object()
 
 
+def _lever_question_form(kind: str) -> bytes:
+    # Separate unanswered cards keep either question from masking the other leg.
+    options = (('first', 'First option'), ('second', 'Second option')) if kind == 'radio' else (
+        ('updates', 'Send synthetic updates'),)
+    choices = ''.join(f'<li><label><input id="custom-{kind}-{value}" type="{kind}" '
+                      f'name="synthetic-{kind}" value="{value}" required>'
+                      f'<span class="application-answer-alternative">{caption}</span></label></li>'
+                      for value, caption in options)
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Synthetic application</title></head><body><h1>Synthetic role at example-co</h1>
+<form id="application-form" class="application--form" action="{URL}" method="POST">
+<ul><li class="application-question custom-question"><div>
+<div class="application-label"><div class="text">Synthetic {kind} question <span class="required">*</span></div></div>
+<div class="application-field"><ul data-qa="synthetic-options">{choices}</ul></div>
+</div></li></ul><button id="submit" type="submit">Submit application</button>
+</form></body></html>'''.encode('utf-8')
+
+
+def _lever_question_observation(state, result: dict) -> dict:
+    kind = state.custom_question
+    expected = 'Synthetic '+kind+' question *'
+    page = state.last_page or {}
+    controls = [c for c in page.get('controls', []) if c.get('type') in {'radio', 'checkbox'}]
+    question = result.get('form_question') or {}
+    unselected = bool(controls) and all(c.get('checked') is False for c in controls)
+    unresolved = any(c.get('lever_card_unresolved') for c in controls)
+    ok = (result.get('status') == 'gate' and state.entry_wait == 'PASS'
+          and len(controls) == (2 if kind == 'radio' else 1)
+          and all(c.get('tag') == 'input' and c.get('type') == kind
+                  and c.get('question') == expected
+                  and c.get('native_form_owner_selector') == '#application-form'
+                  for c in controls)
+          and question.get('selector') == controls[0].get('selector')
+          and question.get('question') == expected and question.get('type') == kind
+          and unselected and not unresolved
+          and page.get('inventory_verified') is True and not page.get('opaque_controls')
+          and not state.row.get('human_approved_answers')
+          and state.choice_ipc == state.fills == state.decisions == state.ipc_index == 0
+          and not state.uploaded and not state.committed
+          and state.submit_call_entered == state.submit_ipc == state.post_attempts == state.post_count == 0
+          and not state.post_receipts and state.navigations == 1)
+    return {'safe_gate': ok, 'question': question.get('question'),
+            'lever_card_unresolved': unresolved, 'unselected': unselected,
+            'choice_ipc': state.choice_ipc,
+            'final_stage': 'Lever custom '+kind+' question' if ok else 'premature'}
+
+
 class _SyntheticRun:
     __slots__ = ("_origin", "resume_path", "row", "events", "hold", "fills",
                  "navigations", "decisions", "status_writes", "positive",
@@ -322,7 +369,8 @@ class _SyntheticRun:
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
                  "greenhouse", "visible_badge_anchor", "native_validity",
-                 "w_lookalike", "w_target_ipc", "ashby", "ashby_upload", "upload_ipc")
+                 "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
+                 "ashby_upload", "upload_ipc")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -369,6 +417,8 @@ class _SyntheticRun:
         self.w_lookalike = False
         self.w_target_ipc = 0
         self.ashby = False
+        self.custom_question = ''
+        self.choice_ipc = 0
         self.ashby_upload = False
         self.upload_ipc = 0
         self.observe_page(None)
@@ -391,7 +441,7 @@ class _SyntheticRun:
     def entry_admitted(self, page):
         root = (page.get('entry', {}).get('formless') or {}) if self.ashby else page.get('entry', {})
         if (self.entry_provenance() and root.get('root') and not root.get('error')
-                and (self.ashby or (self.entry_initial_not_ready and
+                and (self.ashby or self.custom_question or (self.entry_initial_not_ready and
                     {f['status'] for f in page['entry']['frames']} == {'H', 'R', 'W', 'X'}))):
             self.entry_wait = 'PASS'
             if self.ashby_upload:
@@ -413,9 +463,9 @@ class _SyntheticRun:
     def enable_positive_fixture(self) -> None:
         self.positive = True
         self.row['human_approved_answers'] = {}
-        # Only Ashby stops before applicant IPC; the independent native leg
-        # retains its pre-existing exact grants to exercise picker readbacks.
-        if self.ashby:
+        # Read-only question legs stop before applicant IPC; native picker legs
+        # retain their pre-existing exact grants to exercise commitment readbacks.
+        if self.ashby or self.custom_question:
             return
         specs = {
             'Name': ('#name', 'Name', 'Name', 'input', 'text'),
@@ -682,6 +732,9 @@ class _SyntheticRun:
                         raise PermissionError("Fixture denies this browser operation.")
                     state.fills += 1
                     return await raw.call(*args)
+                if state.custom_question:
+                    state.choice_ipc += 1
+                    raise PermissionError('Fixture custom-question legs permit observation only.')
                 if args == ('click', '#submit') or (state.ashby and args and args[0] == 'click'):
                     state.submit_call_entered += 1
                     state.submit_guard = "denied: fixture forbids committing BSK IPC"
@@ -754,6 +807,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             document = _ashby_upload_form()
         if type(state) is _SyntheticRun and state.w_lookalike:
             document = document.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
+        if type(state) is _SyntheticRun and state.custom_question:
+            document = _lever_question_form(state.custom_question)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'")
@@ -789,7 +844,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         pass  # Never log request headers, URLs or session data.
 
 
-def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upload=False) -> int:
+def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
+                  custom_question='', ashby_upload=False) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -807,6 +863,7 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upl
                 state.greenhouse = greenhouse
                 state.w_lookalike = w_lookalike
                 state.ashby = ashby or ashby_upload
+                state.custom_question = custom_question
                 state.ashby_upload = ashby_upload
                 state.enable_positive_fixture()
                 server.synthetic_run = state
@@ -946,22 +1003,28 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upl
                     gate = {'kind': result.get('reason') or result.get('status'),
                             'field': form_question.get('control_label'),
                             'reason': result.get('question') or result.get('detail')}
-                    if state.ashby_upload:
-                        tree = (state.last_page or {}).get('entry', {}).get('upload_tree') or {}
-                        files = [c.get('files') for c in (state.last_page or {}).get('controls', [])
-                                 if c.get('selector') == '#_systemfield_resume']
-                        ok = (result.get('status') == 'gate' and state.entry_wait == 'PASS'
-                              and form_question.get('selector') == '#additional'
-                              and form_question.get('owner_kind') == 'ashby-formless-root'
-                              and state.fills == 2 and state.decisions == 4
-                              and state.ipc_index == 3 and state.upload_ipc == 1 and state.uploaded
-                              and tree.get('complete') is True and tree.get('attached') is True
-                              and tree.get('filename') == Path(state.resume_path).name
-                              and files == [[Path(state.resume_path).name]]
-                              and not tree.get('svgs') and not state.committed
-                              and state.submit_call_entered == state.submit_ipc == 0
-                              and state.post_attempts == state.post_count == 0
-                              and (state.last_page or {}).get('inventory_verified') is True)
+                custom = _lever_question_observation(state, result) if custom_question else {}
+                if custom_question:
+                    ok = custom['safe_gate']
+                    gate = {'kind': result.get('reason') or result.get('status'),
+                            'field': form_question.get('control_label'),
+                            'reason': result.get('question') or result.get('detail')}
+                elif state.ashby_upload:
+                    tree = (state.last_page or {}).get('entry', {}).get('upload_tree') or {}
+                    files = [c.get('files') for c in (state.last_page or {}).get('controls', [])
+                             if c.get('selector') == '#_systemfield_resume']
+                    ok = (result.get('status') == 'gate' and state.entry_wait == 'PASS'
+                          and form_question.get('selector') == '#additional'
+                          and form_question.get('owner_kind') == 'ashby-formless-root'
+                          and state.fills == 2 and state.decisions == 4
+                          and state.ipc_index == 3 and state.upload_ipc == 1 and state.uploaded
+                          and tree.get('complete') is True and tree.get('attached') is True
+                          and tree.get('filename') == Path(state.resume_path).name
+                          and files == [[Path(state.resume_path).name]]
+                          and not tree.get('svgs') and not state.committed
+                          and state.submit_call_entered == state.submit_ipc == 0
+                          and state.post_attempts == state.post_count == 0
+                          and (state.last_page or {}).get('inventory_verified') is True)
                 inventory = {key: (state.last_page or {}).get(key) for key in (
                     "inventory_verified", "truncated", "opaque_controls",
                     "shadow_roots", "unsupported_frames")}
@@ -971,7 +1034,8 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upl
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
-                                  'scenario': ('ashby-upload' if state.ashby_upload else
+                                  'scenario': ('lever_custom_'+custom_question if custom_question else
+                                               'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
                                                'w_button_aria_label' if w_lookalike else
                                                'greenhouse' if greenhouse else 'entry'),
@@ -997,6 +1061,7 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upl
                                   "post_received": state.post_count == 1,
                                   "gate": gate,
                                   "inventory": inventory,
+                                  **custom,
                                   "submit": {
                                       "guard": state.submit_guard,
                                       "call_entered": state.submit_call_entered > 0,
@@ -1015,17 +1080,21 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, ashby_upl
 
 
 def run() -> int:
-    """One invocation, existing provenances, positive and isolated W human Gates."""
+    """Every invocation exercises all seven isolated, sealed question/frame legs."""
     entry = _run_scenario()
     greenhouse = _run_scenario(greenhouse=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
     ashby_upload = _run_scenario(ashby_upload=True)
-    scenarios = (entry, greenhouse, lookalike, ashby, ashby_upload)
+    radio = _run_scenario(custom_question='radio')
+    checkbox = _run_scenario(custom_question='checkbox')
+    scenarios = (entry, greenhouse, lookalike, ashby, ashby_upload, radio, checkbox)
     ok = all(result == 0 for result in scenarios)
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
                       'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
+                      'lever_custom_radio': 'PASS' if radio == 0 else 'FAIL',
+                      'lever_custom_checkbox': 'PASS' if checkbox == 0 else 'FAIL',
                       'sessions': len(scenarios)}))
     return 0 if ok else 1

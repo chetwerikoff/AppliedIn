@@ -101,8 +101,9 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
     monkeypatch.setattr(fixture, '_run_scenario', lambda **kwargs: calls.append(kwargs) or 0)
     assert fixture.run() == 0
     assert calls == [{}, {'greenhouse': True}, {'w_lookalike': True},
-                     {'ashby': True}, {'ashby_upload': True}]
-    assert json.loads(capsys.readouterr().out)['sessions'] == 5
+                     {'ashby': True}, {'ashby_upload': True},
+                     {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
+    assert json.loads(capsys.readouterr().out)['sessions'] == 7
 
 
 def test_real_local_handler_opens_chooser_and_renders_only_passive_item():

@@ -678,6 +678,9 @@ class _SyntheticRun:
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
+    # Chrome can leave an idle preconnect; shutdown cannot interrupt its read.
+    timeout = 2
+
     def _reject(self, status: int = 404) -> None:
         self.send_response(status)
         self.send_header("Content-Length", "0")
@@ -925,7 +928,10 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False) -> int:
                 return 0 if ok else 1
         finally:
             server.shutdown()
+            server.server_close()
             thread.join(timeout=3)
+            if thread.is_alive():
+                raise RuntimeError('Synthetic fixture harness server did not stop.')
 
 
 def run() -> int:

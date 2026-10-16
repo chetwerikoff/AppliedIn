@@ -1,7 +1,7 @@
 """Offline adversarial proof of the daemon-exclusive synthetic BrowserSkill fixture.
 
-No test opens a socket, starts Chrome/BSK, reaches owner stores or queues an apply.
-The eventual native-positive primary-checkout traversal is operator-only.
+Tests never start Chrome/BSK, reach owner stores or queue an apply. One
+operator-authorized teardown regression opens only an ephemeral loopback socket.
 """
 from __future__ import annotations
 
@@ -23,6 +23,50 @@ from tools import browser_profile as profile
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
 from tools import browser_skill_fixture as fixture
+
+
+def test_idle_loopback_preconnect_cannot_block_fixture_shutdown():
+    """A browser may preconnect without sending a request between smoke legs."""
+    import socket
+    import time
+    from http.server import HTTPServer
+
+    accepted, stopped = threading.Event(), threading.Event()
+
+    class Handler(fixture._FixtureHandler):
+        def setup(self):
+            super().setup()
+            accepted.set()
+
+    server = HTTPServer(('127.0.0.1', 0), Handler)
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
+    idle = socket.create_connection(server.server_address, timeout=1)
+    shutdown = None
+    try:
+        assert accepted.wait(1), 'idle connection must be accepted before shutdown'
+        started = time.monotonic()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            serving.join(timeout=3)
+            stopped.set()
+
+        shutdown = threading.Thread(target=stop, daemon=True)
+        shutdown.start()
+        assert stopped.wait(5), 'idle preconnect trapped the single-threaded fixture teardown'
+        assert time.monotonic() - started < 5
+        assert not serving.is_alive()
+    finally:
+        # Also clean up the deliberate RED run, whose handler has no timeout.
+        idle.close()
+        if shutdown is not None:
+            shutdown.join(timeout=3)
+        else:
+            server.shutdown()
+        server.server_close()
+        serving.join(timeout=3)
 
 
 @pytest.fixture

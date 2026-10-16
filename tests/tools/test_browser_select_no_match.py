@@ -23,6 +23,7 @@ def page_with_native_select():
         'question': QUESTION, 'tag': 'select', 'type': 'select',
         'required': True, 'disabled': False, 'value': '', 'has_value': False,
         'in_form': True, 'form_selector': '#application', 'form_action': URL,
+        'native_form_owner_selector': '#application',
         'formaction': '', 'submit': False, 'checked': False,
         'options': deepcopy(OPTIONS),
     }
@@ -59,6 +60,7 @@ class ReadOnlySession:
             {'selector': c['selector'], 'unique': True, 'unique_form': True,
              'tag': c['tag'], 'type': c['type'], 'in_form': c['in_form'],
              'form_selector': c['form_selector'], 'form_action': c['form_action'],
+             'native_form_owner_selector': c['native_form_owner_selector'],
              'formaction': c['formaction'], 'disabled': c['disabled'],
              'readonly': False, 'inert': False, 'visible': True,
              'visible_text': '', 'options': deepcopy(c['options'])}

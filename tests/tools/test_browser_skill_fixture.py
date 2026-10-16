@@ -90,9 +90,9 @@ class _ServedFormInventory(HTMLParser):
 
 
 def served_fixture_page():
-    """Read the exact response body and retain hidden controls in PAGE inventory."""
+    """Keep the predecessor native widget snapshot as an offline regression."""
     inventory = _ServedFormInventory()
-    inventory.feed(fixture._FORM.decode("utf-8"))
+    inventory.feed(fixture._closed_form().decode('utf-8'))
     return {"url": fixture.URL, "controls": inventory.controls}
 
 
@@ -104,6 +104,7 @@ def synthetic_page(*, url=fixture.URL, receiver=fixture.URL, extra_granted=False
                 "disabled": False, "has_value": False, "value": "",
                 "submit": typ == "submit", "in_form": True,
                 "form_selector": "#synthetic-form", "form_action": receiver,
+                'native_form_owner_selector': '#synthetic-form',
                 "formaction": "", "files": [], **attrs}
     controls = [
         item("#name", "Name"),
@@ -153,6 +154,12 @@ def test_positive_approval_grants_match_live_group_question(authority):
                   if item["selector"] == "#name")
     target.update(question="Name", form_selector="#application-form",
                   form_action=fixture.URL)
+    # PRIMARY now stops before any grant; this native unit test supplies its
+    # own explicit synthetic answer rather than borrowing fixture authority.
+    assert authority.row['human_approved_answers'] == {}
+    authority.row['human_approved_answers']['Name'] = {
+        'value': fixture._FACTS['Name'], 'url': fixture.URL,
+        **{k: target[k] for k in ('selector','label','question','tag','type','form_selector','form_action')}}
     forms.exact_approval(
         fixture.PK, "Name", fixture._FACTS["Name"], target=target,
         url=fixture.URL, fixture_context=authority)
@@ -384,8 +391,10 @@ def test_fixture_handler_rejects_wrong_host_path_and_every_non_get_method():
         return captured, handler.wfile.getvalue()
     good, body = request("GET", fixture._PATH, "127.0.0.1:18789")
     assert ("status", 200) in good
-    assert b'id="name"' in body and b'id="additional"' in body
-    assert b'type="submit"' in body and fixture.URL.encode() in body
+    assert b'id="_systemfield_name"' in body and b'id="additional"' in body
+    assert b'ashby-application-form-submit-button' in body and b'<form' not in body
+    assert body.count(b'<iframe') == 3 and b'type="submit"' not in body
+    assert b'<div><iframe style="display:none"></iframe></div>' in body
     for method, path, host in [
         ("GET", fixture._PATH, "localhost:18789"),
         ("GET", fixture._PATH, "[::1]:18789"),
@@ -1337,13 +1346,10 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     fake_clock(monkeypatch)
     authority.enable_positive_fixture()
     proof = authority.entry_provenance()
-    complete = dom({'frames':['H','H','R','B','W','X']})
-    fixed = dom({'frames':['H','H','R','B','W','X']}, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    complete = dom({'root':False,'formless':True})
+    fixed = dom({'root':False,'formless':True}, forms._ENTRY_FIXED_CONTROL_WITNESS)
     for page in (complete, fixed):
         page['url'] = fixture.URL
-        page['entry']['root']['action'] = fixture.URL
-        for c in page['controls']:
-            c['form_action'] = fixture.URL
     shell = {**deepcopy(complete), 'controls':[], 'inventory_verified':False,
              'entry':{'root':None,'frames':[],'responses':[],
                       'response_error':False,'helper_challenge':False}}
@@ -1385,39 +1391,14 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
         await facade.call('navigate',fixture.URL)
 
 
-def test_injected_helper_outer_box_meets_unchanged_x_bounds():
-    # Execute the actual fixture injection with the iframe UA content-box model.
-    # A CSS width of 1px alone is 1 + 2px left + 2px right = 5px, not X's <=1.
-    import json
-    import subprocess
+def test_formless_fixture_mirrors_r_r_z_but_x_bounds_remain_strict_offline():
+    # AC-Z adds the exact inert frame beside the existing R pair; it does not
+    # relax X's old UA-border regression.
     from tests.tools.test_browser_application_entry import dom
-    source = fixture._FORM.decode().split('const add=', 1)[1]
-    source = 'const add=' + source.split('for(const name of', 1)[0]
-    script = r'''
-const frames=[];
-function element(tag) {
-  return {tag,style:{},attributes:{},
-    setAttribute(k,v){this.attributes[k]=v;},
-    append(e){e.parent=this;if(e.tag==='iframe')frames.push(e);},
-    querySelector(){return element('span');}};
-}
-const document={body:element('body'),createElement:element};
-const form=element('form'),h=element('div');
-eval(process.argv[1]);
-console.log(JSON.stringify(frames.filter(e=>e.parent===document.body &&
-  !Object.hasOwn(e.attributes,'src')).map(e=>{
-  const border=e.style.border===undefined ? 2 : parseFloat(e.style.border);
-  const padding=e.style.padding===undefined ? 0 : parseFloat(e.style.padding);
-  return {width:parseFloat(e.style.width)+2*padding+2*border,
-    height:parseFloat(e.style.height)+2*padding+2*border,
-    display:e.style.display || 'inline',visibility:e.style.visibility};
-})));
-'''
-    result = subprocess.run(['node','-e',script,source],capture_output=True,text=True,check=True)
-    helper, = json.loads(result.stdout)
-    assert helper == dict(width=1,height=1,display='block',visibility='hidden')
-    page = dom(dict(frames=['X'],edit={'rect':{'width':helper['width'],'height':helper['height']}}))
-    assert page['entry']['frames'][0]['status'] == 'X'
+    assert fixture._FORM.count(b'<iframe') == 3
+    for size, status in ((1, 'X'), (5, 'unknown')):
+        page = dom(dict(frames=['X'], edit={'rect':{'width':size,'height':size}}))
+        assert page['entry']['frames'][0]['status'] == status
 
 
 def test_failure_diagnostic_reports_frame_box_structure_only():
@@ -1531,6 +1512,71 @@ def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_requi
     assert (b'<textarea class="g-recaptcha-response" id="g-recaptcha-response-123" '
             b'name="g-recaptcha-response" style="display:none"></textarea>'
             in fixture._greenhouse_form())
+
+
+async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
+    """Ashby's intentional zero-grant Gate must not erase the native leg's grants."""
+    import runpy
+    helpers = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
+    snapshot = helpers['served_fixture_dom']()
+    authority.greenhouse = True
+    authority.enable_positive_fixture()
+    provenance = authority.entry_provenance()
+
+    # The real served native bytes and production readers still admit the
+    # untouched hidden-receiver graph. The failure was before opening it:
+    # bootstrap asks again for a grant the fixture previously supplied.
+    location = next(c for c in snapshot['page']['controls'] if c['selector'] == '#location')
+    assert location['combobox']['mode'] == 'closed-react-select'
+    assert location['combobox']['phase'] == 'C0'
+    assert location['combobox']['options'] == []
+    forms.exact_approval(
+        fixture.PK, 'Where are you located?', fixture._FACTS['Where are you located?'],
+        target=forms._bound_target(snapshot['page'], location), url=fixture.URL,
+        fixture_context=authority, provenance=provenance)
+    assert authority.ipc_index == authority.decisions == 0
+    assert authority.submit_ipc == authority.post_attempts == 0
+
+
+@pytest.mark.parametrize('reader_name', ['entry_reader', 'greenhouse_reader'])
+def test_fixture_reader_rewrite_anchors_all_match_current_inputs(reader_name):
+    """A stale replacement silently removes a safety witness from fixture readers."""
+    import ast
+    import inspect
+    from tools import browser_skill_dom as dom
+
+    reader = getattr(dom, reader_name)
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(reader)))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == 'script' and node.func.attr == 'replace']
+    assert calls, 'The audit must enumerate the actual reader replacements.'
+
+    class AuditedScript(str):
+        def __new__(cls, value, observations):
+            instance = super().__new__(cls, value)
+            instance.observations = observations
+            return instance
+
+        def replace(self, old, new, count=-1):
+            result = super().replace(old, new, count)
+            self.observations.append((old, old in self, result != self))
+            return type(self)(result, self.observations)
+
+    runs = []
+    for script in (dom.PAGE, forms._FIXED_CONTROL_WITNESS):
+        observations = []
+        assert reader(AuditedScript(script, observations)) == reader(script)
+        assert len(observations) == len(calls), 'Every declared rewrite must be audited.'
+        runs.append(observations)
+
+    # PAGE-only and fixed-only anchors intentionally differ. Each replacement
+    # must really change at least one current input, rather than silently no-op
+    # on both as the stale fixed-witness selector anchor did after the rebase.
+    for index, observations in enumerate(zip(*runs, strict=True)):
+        assert len({old for old, _, _ in observations}) == 1
+        assert any(present and changed for _, present, changed in observations), (
+            reader_name, index, observations[0][0])
 
 
 @pytest.mark.parametrize('native_valid', [False, True])

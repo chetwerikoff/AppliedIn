@@ -111,6 +111,7 @@ async def test_failed_mark_or_readback_means_gate_and_zero_clicks(world, monkeyp
                              'in_form': True, 'form_action': URL},
                             {'selector': '#submit', 'type': 'submit', 'tag': 'button',
                              'label': button, 'submit': True,
+                             'form_selector': '#application', 'native_form_owner_selector': '#application',
                              'in_form': True, 'form_action': URL}]}
     calls = []
     class Session:
@@ -386,6 +387,7 @@ async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
                     'form_action': URL},
                    {'selector': '#submit', 'type': 'submit', 'tag': 'button',
                     'label': 'Submit application', 'submit': True, 'in_form': True,
+                    'form_selector': '#application', 'native_form_owner_selector': '#application',
                     'form_action': URL}]}
     calls = []
 

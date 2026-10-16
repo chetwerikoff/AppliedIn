@@ -201,6 +201,7 @@ def control(label, selector, *, tag='input', type='text', **changes):
         'tag': tag, 'type': type, 'required': True,
         'disabled': False, 'readonly': False, 'in_form': True,
         'form_selector': '#application', 'form_action': URL,
+        'native_form_owner_selector': '#application',
         'formaction': '', 'submit': False, 'checked': False, 'has_value': False,
         'value': '', 'options': [], **changes,
     }

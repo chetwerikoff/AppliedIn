@@ -36,6 +36,7 @@ def control(*, selected_text='', selected_value='', hidden_value='',
 def button():
     return {**control(), 'selector': '#submit', 'label': 'Submit application',
             'question': '', 'tag': 'button', 'type': 'submit', 'required': False,
+            'native_form_owner_selector': '#application',
             'submit': True, 'options': [], 'combobox': None}
 
 
@@ -63,6 +64,7 @@ def evidence(current):
         {'selector': c['selector'], 'unique': True, 'unique_form': True,
          'tag': c['tag'], 'type': c['type'], 'in_form': c['in_form'],
          'form_selector': c['form_selector'], 'form_action': c['form_action'],
+         'native_form_owner_selector': c.get('native_form_owner_selector'),
          'formaction': c['formaction'], 'disabled': c['disabled'],
          'readonly': False, 'inert': False, 'visible': True, 'visible_text': '',
          'options': deepcopy(c['options']), 'combobox': deepcopy(c.get('combobox'))}

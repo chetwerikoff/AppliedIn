@@ -327,6 +327,7 @@ PAGE = r"""(() => {
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
       in_form:!!form, form_selector:form ? selector(form) : '',
+      native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
@@ -444,7 +445,7 @@ _APPLICATION_ROOT = r"""
             ['submit application','send application','complete application',
               'finish application','apply now'].includes(clean(t).toLowerCase())));
     }));
-  const root = forms.length===1 ? forms[0] : null;
+  const nativeRoot = forms.length===1 ? forms[0] : null;
   const rectOf = (e, bounding=false) => {
     try {
       const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
@@ -452,6 +453,87 @@ _APPLICATION_ROOT = r"""
         r.width>=0 && r.height>=0 ? {width:r.width,height:r.height} : null;
     } catch (_) { return null; }
   };
+"""
+
+# Structural admission belongs only to ApplicationEntryProvenance, never an alias.
+_ASHBY_ROOT = r"""
+  // The pane is structural evidence only: never read its values or build targets.
+  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+  const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
+  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));
+  const container=containers.length===1 ? containers[0] : null;
+  const exactSubmit=submitters.length===1 ? submitters[0] : null;
+  const wrapper=container?.parentElement;
+  const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit?.parentElement===wrapper && wrapper.children.length===3 &&
+    wrapper.children[0].matches('div.ashby-application-form-autofill-pane') &&
+    wrapper.children[1]===container && wrapper.children[2]===exactSubmit &&
+    panes.length===1 && panes[0]===wrapper.children[0];
+  const structuralRoot=!forms.length && ordered ? wrapper : null;
+  const root=nativeRoot || structuralRoot;
+  let structuralError='';
+  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
+    structuralError='ambiguous application roots';
+  else if (!forms.length && container && exactSubmit && !ordered && !(
+    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
+    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))
+    structuralError='application root sibling identity mismatch';
+  const paneNodes=new Set();
+  if (!forms.length) for (const p of panes) {
+    paneNodes.add(p); p.querySelectorAll('*').forEach(n=>paneNodes.add(n));
+  }
+  paneNodes.forEach(n=>excluded.add(n));
+  // Description links remain in the original PAGE inventory; they are not
+  // input/receiver candidates. Role-button links still enter this census and
+  // no link acquires action authority through the structural branch.
+  const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
+    ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
+    .filter(e=>!excluded.has(e));
+  const entryVisible=e => {
+    if (!visible(e)) return false;
+    // Clipping can hide a text recipient despite a positive layout rectangle.
+    // Unknown clipping geometry is not proof of an editable applicant target.
+    for (let n=e;n;n=n.parentElement) {
+      const s=getComputedStyle(n);
+      if ((s.clip && s.clip!=='auto') || (s.clipPath && s.clipPath!=='none')) return false;
+    }
+    return true;
+  };
+  const rootEvidence=!forms.length && (containers.length || submitters.length) ?
+    evidenceNodes.slice(0,501).map(e => {
+      const sel=selector(e), id=e.id || '';
+      const labels=id ? Array.from(document.querySelectorAll('label[for]'))
+        .filter(l=>l.getAttribute('for')===id) : [];
+      const actualLabels=Array.from(e.labels || []);
+      const linked=labels.length===1 && actualLabels.length===1 && actualLabels[0]===labels[0] &&
+        labels[0].matches('label.ashby-application-form-question-title') &&
+        !!container && container.contains(labels[0]) && container.contains(e) &&
+        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
+        document.getElementById(labels[0].getAttribute('for'))===e;
+      return {selector:sel,unique:document.querySelectorAll(sel).length===1,
+        tag:e.tagName.toLowerCase(),type:e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
+        id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
+        associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!container && container.contains(e),
+        native_owner:e.form ? selector(e.form) : '',
+        declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
+        submit:e===exactSubmit,untyped:e.getAttribute('type')===null,
+        dropzone:e.matches('button.ashby-application-form-input-file-dropzone-upload'),
+        required:!!e.required,disabled:!!e.disabled || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',
+        readonly:!!e.readOnly || e.hasAttribute('readonly'),inert:!!e.closest('[inert]'),
+        visible:entryVisible(e),value:e.type==='password' ? '' : (e.value || ''),
+        files:e.files ? Array.from(e.files).map(f=>f.name) : [],
+        autocomplete:e.getAttribute('autocomplete') || '',role:e.getAttribute('role') || '',
+        iti:!!e.closest('.iti'),contenteditable:e.hasAttribute('contenteditable')};
+    }) : [];
+  const formless=!forms.length && (containers.length || submitters.length) ? {
+    root:structuralRoot ? selector(structuralRoot) : '',
+    container:container ? selector(container) : '',
+    submit:exactSubmit ? selector(exactSubmit) : '',
+    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),
+    pane:panes.length===1 ? selector(panes[0]) : '',
+    error:structuralError,truncated:evidenceNodes.length>500} : null;
 """
 
 # Hidden R and the other providers stay exclusively in the entry classifier.
@@ -476,7 +558,7 @@ _CAPTCHA_RESPONSE_NODES = r"""
 _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
   const excluded = new Set([...responseNodes, ...reservedButtons]);
-""" + _APPLICATION_ROOT + _VISIBLE_RECAPTCHA + r"""
+""" + _APPLICATION_ROOT + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
   const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='';
@@ -486,7 +568,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const outside=!!root && !root.contains(e), box=rectOf(e);
     const parent=e.parentElement;
     const h=origin==='https://newassets.hcaptcha.com' && path.endsWith('/static/hcaptcha-enclave.html') &&
-      !!root && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===root;
+      !!nativeRoot && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===nativeRoot;
     const r=['https://www.recaptcha.net','https://www.google.com'].includes(origin) &&
       ['/recaptcha/enterprise/anchor','/recaptcha/enterprise/bframe'].includes(path);
     const badge=!!e.closest('div.grecaptcha-badge'), bounds=rectOf(e,true);
@@ -500,7 +582,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     }
     const row=ancestry.length===4 ? ancestry[3] : null;
     const w=(raw===null || raw==='about:blank') && e.getAttribute('title')==='LinkedIn Embedded Content' &&
-      !!root && !!row && root.contains(row) && !!box && box.width<=400 && box.height<=100 &&
+      !!nativeRoot && !!row && nativeRoot.contains(row) && !!box && box.width<=400 && box.height<=100 &&
       !row.required && row.getAttribute('aria-required')!=='true' && !row.hasAttribute('required') &&
       // Match the actual inventory candidate set, or W could hide an ARIA answer.
       !row.matches(query) && !row.querySelector(query) &&
@@ -508,6 +590,12 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
     const visibleR=visibleRecaptcha(origin,path,shown,outside,badge,bounds);
+    // AC-Z is scoped to the entry reader; ordinary PAGE gains no frame waiver.
+    const z=raw===null && e.getAttribute('title')===null &&
+      !e.getAttributeNames().some(a=>a.startsWith('data-') || a.startsWith('aria-')) &&
+      style.display==='none' && e.getClientRects().length===0 && outside &&
+      parent?.tagName==='DIV' && !parent.id && !parent.getAttribute('class') &&
+      parent.parentElement===document.body;
     let status='unknown';
     // Visible bframe precedence is independent of root proof/placement.
     if (visibleR==='visible-recaptcha') status=visibleR;
@@ -515,6 +603,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     else if ((r && outside && hidden) || visibleR==='R') status='R';
     else if (w) { status='W'; row.querySelectorAll(query).forEach(n=>excluded.add(n)); }
     else if (x) status='X';
+    else if (z) status='Z';
     return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
@@ -544,7 +633,8 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       responseError=true;
   }
   const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
-    root:root ? {selector:selector(root),action:root.action} : null,
+    root:nativeRoot ? {selector:selector(nativeRoot),action:nativeRoot.action} : null,
+    formless,root_evidence:rootEvidence,
     helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
         getComputedStyle(e).display!=='none'))};
@@ -567,6 +657,12 @@ def entry_reader(script: str) -> str:
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
+    script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
+    script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
+                            "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
+                            "submit:['submit','image'].includes(e.type), "
+                            "required:!!e.required,files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
+                            'selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')
     script = script.replace('return {url: location.href, controls:', 'return {entry, url: location.href, controls:')
     script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"
@@ -583,6 +679,7 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const excluded = new Set(responseNodes);
 """ + _APPLICATION_ROOT.replace('filter(e=>!excluded.has(e))',
                                 'filter(e=>e.form===f && !excluded.has(e))') + _VISIBLE_RECAPTCHA + r"""
+  const root=nativeRoot;
   // Both readers use ordinary PAGE's frame visibility, not witness editability.
   // Otherwise a collapse/transparent transition could disappear from the witness.
   const greenhouseFrames = Array.from(document.querySelectorAll('iframe')).filter(e =>

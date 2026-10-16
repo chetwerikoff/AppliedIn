@@ -24,12 +24,15 @@ def enable(tmp_path):
 
 
 def target(**values):
-    return {'selector': '#field', 'label': 'First name', 'question': '', 'type': 'text',
+    result = {'selector': '#field', 'label': 'First name', 'question': '', 'type': 'text',
             'tag': 'input', 'disabled': False, 'has_value': False, 'value': '',
             'required': False, 'in_form': True, 'submit': False,
             'form_selector': '#application',
             'form_action': 'https://employer.test/job/1', 'formaction': '',
             **values}
+    result.setdefault('native_form_owner_selector',
+                      result['form_selector'] if result['in_form'] else '')
+    return result
 
 
 def grant(field, value, *, selector='#field',
@@ -1734,7 +1737,7 @@ def test_dom_inventory_exposes_effective_native_action_and_formaction():
     import subprocess
     from tools.browser_skill_dom import PAGE
     script = r"""
-const form = {action:'https://employer.test/job/1/submit', querySelector:()=>null};
+const form = {id:'application',action:'https://employer.test/job/1/submit', querySelector:()=>null};
 const button = {id:'submit',tagName:'BUTTON',type:'submit',form,formAction:'https://foreign.test/receive',
   labels:[],name:'',innerText:'Submit application',required:false,disabled:false,value:'',
   getClientRects:()=>[1],closest:q=>q==='form'?form:null,matches:()=>false,

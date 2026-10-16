@@ -341,7 +341,9 @@ def native_submit(target: dict) -> bool:
     """A label and safe form.action do not prove a JS button's click effect."""
     return (target.get('submit') is True
             and target.get('tag') in {'button', 'input'}
-            and target.get('type') in {'submit', 'image'})
+            and target.get('type') in {'submit', 'image'}
+            and bool(target.get('native_form_owner_selector'))
+            and target.get('native_form_owner_selector') == target.get('form_selector'))
 
 
 def guarded_value(target: dict, value: str) -> str:
@@ -621,6 +623,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     and attachment in c.get('files', [])]
         if len(attached) != 1:
             raise Gate('The résumé attachment is no longer present on the current file input.')
+        if _formless_root(page) and attached[0].get('files') != [attachment]:
+            raise Gate('Only the exact staged résumé may remain attached; inspect manually.')
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
@@ -711,6 +715,9 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                         for c in controls):
                     raise Gate(f'Required choice is empty: {target["label"]}')
         elif typ != 'file' and target.get('tag') in {'input', 'textarea', 'select'}:
+            if _formless_root(page) and expected is not None and (
+                    not target.get('has_value') or value != expected):
+                raise Gate('A previously verified structural answer is empty or changed.')
             if target.get('required') and not target.get('has_value'):
                 raise Gate(f'Required field is empty: {target["label"]}')
             if typ == 'tel' and expected is not None and (
@@ -729,6 +736,11 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
 def check_form_destination(page: dict, target: dict, *origins: str,
                            provenance: Provenance | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
+    if _formless_root(page) and not target.get('in_form'):
+        members = _formless_boundary(page, provenance)
+        if target.get('selector') not in {c['selector'] for c in members} | {_formless_root(page)['submit']}:
+            raise Gate('autofill or unsupported structural receiver forbidden.')
+        return
     if not target.get('in_form'):
         raise Gate('The action is not bound to an inspectable native form.')
     form_selector = target.get('form_selector')
@@ -861,6 +873,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
+        native_form_owner_selector:e.form ? selector(e.form) : '',
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
         formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
@@ -1110,6 +1123,110 @@ class _EntryNotReady(Gate):
     """A safe changing observation, retryable only during the entry wait."""
 
 
+def _formless_root(page: dict) -> dict | None:
+    entry = page.get('entry') or {}
+    return None if entry.get('root') else entry.get('formless')
+
+
+def _formless_boundary(page: dict, provenance=None) -> list[dict]:
+    """Structural recipient, never a native form or a claimed HTTP endpoint."""
+    root = _formless_root(page)
+    if (not root or not isinstance(provenance, ApplicationEntryProvenance)
+            or provenance.ats != 'ashby'
+            or not navigation_allowed(page.get('url', ''), provenance=provenance)):
+        raise Gate('formless structural recipient not proven; inspect manually.')
+    if root.get('error'):
+        raise Gate(root['error'] + '; inspect the application manually.')
+    if not root.get('root'):
+        raise _EntryNotReady('no unique application root')
+    evidence = page['entry'].get('root_evidence')
+    if (root.get('truncated') or not isinstance(evidence, list) or not evidence
+            or len(evidence) > 500):
+        raise Gate('incomplete application root evidence; inspect manually.')
+    selectors = [c.get('selector') for c in evidence]
+    if len(set(selectors)) != len(selectors) or any(
+            not c.get('unique') for c in evidence):
+        raise Gate('ambiguous application root control identity; inspect manually.')
+    # A null native owner never establishes shared ownership. Only a proven
+    # unrelated native search form can be omitted from this global census.
+    ignored = set()
+    owners = {c.get('native_owner') for c in evidence if c.get('native_owner')}
+    for owner in owners:
+        siblings = [c for c in page['controls'] if c.get('form_selector') == owner]
+        if siblings and _unrelated_search_form(siblings):
+            ignored.update(c['selector'] for c in siblings)
+    members = []
+    for c in evidence:
+        if c['selector'] in ignored:
+            continue
+        if c.get('native_owner') or c.get('declared_owner') or c.get('formaction') is not None:
+            raise Gate('receiver outside root or foreign native receiver; inspect manually.')
+        if not c.get('inside'):
+            cause = ('exact submit outside root' if c.get('submit') else
+                     'receiver outside root' if c.get('type') == 'hidden' else
+                     'candidate control outside root')
+            raise Gate(cause + '; inspect manually.')
+        if c.get('submit'):
+            if (c['selector'] != root.get('submit') or c.get('tag') != 'button'
+                    or not c.get('untyped') or c.get('role') or c.get('disabled')
+                    or c.get('inert') or not c.get('visible')):
+                raise Gate('exact structural submit changed; inspect manually.')
+            continue
+        if not c.get('in_container'):
+            raise Gate('candidate control outside application container; inspect manually.')
+        if c.get('dropzone') and c.get('tag') == 'button':
+            continue
+        typ = c.get('type')
+        if c.get('iti'):
+            cause = 'unsupported .iti phone-country picker'
+        elif c.get('contenteditable'):
+            cause = 'unsupported contenteditable widget'
+        elif c.get('role') or c.get('autocomplete') not in {'', 'off'}:
+            cause = 'unsupported autocomplete/combobox widget'
+        elif typ in {'select', 'radio', 'checkbox', 'hidden'}:
+            cause = 'unsupported ' + typ + (' receiver' if typ == 'hidden' else ' widget')
+        elif typ == 'file' and c.get('id') != '_systemfield_resume':
+            cause = 'unsupported file receiver'
+        elif not ((c.get('tag') == 'input' and typ in {'text', 'email', 'file'})
+                  or (c.get('tag') == 'textarea' and typ == 'textarea')):
+            cause = 'unsupported custom control'
+        else:
+            cause = ''
+        if cause:
+            raise Gate(cause + '; complete this control manually.')
+        if (not c.get('associated') or not c.get('label') or c.get('disabled')
+                or c.get('readonly') or c.get('inert')
+                or (typ != 'file' and not c.get('visible'))):
+            raise Gate('application label/control association or editability changed; inspect manually.')
+        if _MATERIAL_ASSENT.search(c['label']):
+            raise Gate('unsupported material assent; review directly with the human.')
+        members.append(c)
+    if len([c for c in members if c.get('type') == 'file']) != 1:
+        raise Gate('missing unique labelled resume receiver; inspect manually.')
+    # Cross-channel PAGE fields cannot silently disagree with the global census.
+    lookup = {c['selector']: c for c in page['controls']}
+    for c in members:
+        original = lookup.get(c['selector'])
+        if not original or any(original.get(k) != c.get(k) for k in (
+                'tag', 'type', 'label', 'value', 'required', 'disabled', 'files')):
+            raise Gate('application field inventory differs from root evidence; inspect manually.')
+    return members
+
+
+def _structural_submit(page: dict, target: dict, provenance=None) -> bool:
+    _formless_boundary(page, provenance)
+    return target.get('selector') == _formless_root(page)['submit']
+
+
+def _root_identity(page: dict):
+    root = _formless_root(page)
+    if not root:
+        return None
+    evidence = page['entry'].get('root_evidence', [])
+    return (repr(root), tuple(tuple((k, repr(v)) for k, v in c.items()
+                            if k not in {'value', 'has_value', 'files'}) for c in evidence))
+
+
 def _entry_safety(page, allowed, provenance):
     if not isinstance(page, dict):
         raise Gate('The current form control inventory is malformed.')
@@ -1131,7 +1248,8 @@ def _entry_safety(page, allowed, provenance):
             raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
         if status == 'visible-hcaptcha':
             raise Gate('visible hCaptcha challenge; inspect manually.')
-        if status not in {'H', 'R', 'W', 'X'}:
+        if status not in {'H', 'R', 'W', 'X'} and not (
+                status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
             raise Gate('unknown/untrusted application frame; inspect manually.')
     if entry.get('response_error'):
         raise Gate('untrusted captcha response control; ambiguous owner or provider.')
@@ -1144,7 +1262,16 @@ def _entry_safety(page, allowed, provenance):
                                provenance=provenance)
     for c in controls:
         if c.get('in_form'):
+            owner = c.get('form_selector')
+            siblings = [other for other in controls if other.get('form_selector') == owner]
+            if (_formless_root(page) and isinstance(provenance, ApplicationEntryProvenance)
+                    and provenance.ats == 'ashby'
+                    and all(other.get('native_form_owner_selector') == owner for other in siblings)
+                    and _unrelated_search_form(siblings)):
+                continue
             check_form_destination(page, c, provenance=provenance)
+    if _formless_root(page) and isinstance(provenance, ApplicationEntryProvenance) and provenance.ats == 'ashby':
+        _formless_boundary(page, provenance)
 
 
 _ASHBY_WAIT_SECONDS = 90.0
@@ -1155,12 +1282,41 @@ class _EntrySession:
     def __init__(self, raw, allowed, provenance, step=None):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
+        self.formless_identity = None
+        self.committing = False
+        self.submit_authorized = None
+        self.on_committing_click = None
 
     async def page(self):
         result = await self.call('evaluate', ENTRY_PAGE)
         return result['value']
 
     async def call(self, *args, **kwargs):
+        if args and args[0] != 'evaluate' and self.formless_identity is not None:
+            if self.committing:
+                raise Gate('A possible structural submit cannot be retried automatically.')
+            # This is the actual IPC producer, including adversarial direct calls.
+            current = await self.page()
+            current, _ = await _observe_controls(self, current)
+            members = _formless_boundary(current, self.provenance)
+            root = _formless_root(current)
+            selector = args[1] if len(args) > 1 else ''
+            allowed = {c['selector']: c for c in members}
+            typ = allowed.get(selector, {}).get('type')
+            if not ((args[0] == 'fill' and typ in {'text', 'email', 'textarea'})
+                    or (args[0] == 'upload' and typ == 'file')
+                    or (args[0] == 'click' and selector == root['submit'])):
+                raise Gate('autofill or unsupported root target forbidden at IPC producer.')
+            if args[0] == 'click':
+                if not self.submit_authorized:
+                    raise Gate('Structural submit lacks final approval, attachment and hold checks.')
+                if _page_identity(current) != self.submit_authorized:
+                    self.submit_authorized = None
+                    raise Gate('Validated structural answers or attachment changed before submit; inspect manually.')
+                self.submit_authorized = False
+                self.committing = True
+                if self.on_committing_click is not None:
+                    self.on_committing_click()
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await self.raw.call(*args, **kwargs)
@@ -1169,6 +1325,9 @@ class _EntrySession:
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
             _entry_safety(page, self.allowed, self.provenance)
+            if (self.formless_identity is not None and not self.committing
+                    and _root_identity(page) != self.formless_identity):
+                raise Gate('application root identity drift; inspect manually.')
         return result
 
 
@@ -1178,8 +1337,8 @@ def _entry_not_ready(page):
             return key + ' application inventory'
     if page.get('inventory_verified') is not True:
         return 'unverified application inventory'
-    if not page['entry'].get('root'):
-        return 'no qualifying application form'
+    if not page['entry'].get('root') and not (_formless_root(page) or {}).get('root'):
+        return 'no unique application root' if _formless_root(page) else 'no qualifying application form'
     return ''
 
 
@@ -1205,18 +1364,23 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                 if reason:
                     raise _EntryNotReady(reason)
                 qualifying = any(
-                    c.get('in_form') and _application_marker(_form_subject(page, c))
+                    not _formless_root(page) and c.get('in_form')
+                    and _application_marker(_form_subject(page, c))
                     and (_native_answer(c) or (c.get('tag') == 'input'
                          and c.get('type') in {'radio', 'checkbox'}))
                     and witness[c['selector']].get('visible') is True
                     and witness[c['selector']].get('readonly') is False
                     and witness[c['selector']].get('inert') is False
                     and not c.get('disabled') for c in page['controls'])
+                if _formless_root(page) and provenance.ats == 'ashby':
+                    qualifying = bool(_formless_boundary(page, provenance))
                 identity = (_page_identity(page), repr(witness)) if qualifying else None
                 if qualifying:
                     seen = True
                     if identity == previous and loop.time() < deadline:
                         _observe_closed_admissions(session, page)
+                        if _formless_root(page):
+                            session.formless_identity = _root_identity(page)
                         return page
                 last_reason = ('unstable application form inventory' if seen else
                                'no qualifying application form')
@@ -1267,7 +1431,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             for key in ('unique', 'unique_form'):
                 require(observed.get(key) is True, key + '.true')
             for key in ('tag', 'type', 'in_form', 'form_selector',
-                        'form_action', 'formaction', 'disabled'):
+                        'form_action', 'formaction', 'disabled', 'native_form_owner_selector'):
                 require(original.get(key) == observed.get(key), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
                 require(isinstance(observed.get('visible_text'), str) and
@@ -1360,6 +1524,10 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
 
 def _bound_target(page: dict, target: dict) -> dict:
     """Grant identity for a radio is its entire group, never one model option."""
+    structural = _formless_root(page)
+    if structural:
+        return {**target, 'owner_kind': 'ashby-formless-root',
+                'form_selector': structural['root'], 'form_action': structural['submit']}
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -1457,6 +1625,12 @@ def _require_native_action(target: dict, verb: str) -> None:
 
 
 def _form_subject(page: dict, target: dict) -> list[dict]:
+    if _formless_root(page):
+        selectors = {c['selector'] for c in page['entry'].get('root_evidence', [])
+                     if c.get('in_container') and c.get('associated')}
+        if target.get('selector') not in selectors:
+            raise Gate('autofill or non-applicant target cannot request an answer.')
+        return [c for c in page['controls'] if c['selector'] in selectors]
     form = target.get('form_selector')
     if (target.get('in_form') is not True or not isinstance(form, str)
             or not form.strip() or not isinstance(target.get('form_action'), str)
@@ -1523,6 +1697,11 @@ def _same_key(value: str) -> str:
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None) -> dict:
+    structural = _formless_root(page)
+    if structural:
+        members = _formless_boundary(page, provenance)
+        if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
+            raise Gate('Only witnessed text-entry controls may request a structural grant.')
     choice = target.get('type') in {'radio', 'checkbox'}
     if choice:
         if target.get('tag') != 'input':
@@ -1581,6 +1760,12 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
+    if structural:
+        # These legacy envelope slots are opaque structural identities here.
+        # They are never supplied to native receiver or navigation validation.
+        question.update(owner_kind='ashby-formless-root',
+                        form_selector=structural['root'],
+                        form_action=structural['submit'])
     if isinstance(provenance, GreenhouseJobAlias):
         question['origin_row'] = {
             'jd_url': provenance.wrapper, 'company': provenance.company,
@@ -1641,6 +1826,44 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     _inventory_ok(page)
     if not navigation_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
+    if _formless_root(page):
+        if not isinstance(session, _EntrySession) or session.formless_identity is None:
+            raise Gate('formless root lacks stable independent admission.')
+        page, witness = await _observe_controls(session, page)
+        members = _formless_boundary(page, provenance)
+        for observed in members:
+            if observed['type'] == 'file':
+                continue
+            item = control(page, observed)
+            key = _key(page, item)
+            value = str(facts.get(key) or '').strip()
+            previous = (_row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)).get(
+                'human_approved_answers', {}).get(key)
+            if isinstance(previous, dict) and any(previous.get(k) != expected for k, expected in (
+                    ('form_selector', _formless_root(page)['root']),
+                    ('form_action', _formless_root(page)['submit']))):
+                raise Gate('Previously approved structural root or submit changed; inspect manually.')
+            approved = False
+            if item.get('has_value') or value:
+                try:
+                    exact_approval(pk, key, value, target=_bound_target(page, item),
+                                   url=page['url'], provenance=provenance,
+                                   **({'fixture_context': fixture_context} if fixture_context else {}))
+                    approved = True
+                except Gate:
+                    if item.get('has_value'):
+                        raise
+                if approved:
+                    if item.get('has_value') and item.get('value') != value:
+                        raise Gate('unapproved populated application control; inspect manually.')
+                    guarded_value(item, value)
+                    continue
+            if item.get('required') or value:
+                question = _disclosure_question(page, item, witness, *origins, provenance=provenance)
+                question['pk'] = pk
+                raise Gate(f'An exact human-approved answer is needed for "{key}".',
+                           form_question=question)
+        return page
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
@@ -2083,6 +2306,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             or page.get('opaque_controls') or page.get('shadow_roots')
             or page.get('unsupported_frames')):
         raise Gate('The application form is not inspectable; human review is required.')
+    if _formless_root(page):
+        _formless_boundary(page, provenance)
+        if not isinstance(session, _EntrySession) or session.formless_identity != _root_identity(page):
+            raise Gate('formless root lacks stable independent admission.')
+        check_form_destination(page, control(page, action), provenance=provenance)
     target = control(page, action)
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
@@ -2216,6 +2444,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     raise Gate('The bound radio answer no longer matches this member.')
             guarded_value(current, str(facts[key]).strip())
             await session.call('click', current['selector'])
+        if _formless_root(page):
+            readback, _ = await _observe_controls(session, await session.page())
+            actual = control(readback, action)
+            if actual.get('value') != write_value or not actual.get('has_value'):
+                raise Gate('The approved structural field value did not read back exactly.')
+            exact_approval(pk, key, write_value, target=_bound_target(readback, actual),
+                           url=readback['url'], provenance=provenance,
+                           **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':
             readback, _ = await _observe_controls(session, await session.page())
             phone = control(readback, action)
@@ -2236,6 +2472,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
+            if _formless_root(page):
+                observed, _ = await _observe_controls(session, observed)
+                _formless_boundary(observed, provenance)
         except (Exception, asyncio.CancelledError) as exc:
             if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
@@ -2247,6 +2486,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                    and re.search(r'resume|résumé|cv', label(c), re.I)]
         if len(matches) != 1 or Path(resume_path).name not in matches[0].get('files', []):
             raise Gate('The uploaded résumé was not proven in the current file input.')
+        if _formless_root(page) and matches[0].get('files') != [Path(resume_path).name]:
+            raise Gate('Only the exact staged résumé may be uploaded; inspect manually.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
         if (not allow_click or not pk
@@ -2481,8 +2722,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise Gate('Unproven application navigation may commit; inspect it yourself.')
                     elif verb == 'submit':
                         target = control(page, action)
-                        if not is_submission(target) or not native_submit(target):
-                            raise Gate('A proven native submit control is required before clicking.')
+                        structural = bool(_formless_root(page))
+                        if not ((_structural_submit(page, target, provenance) if structural else
+                                 is_submission(target) and native_submit(target))):
+                            raise Gate('A proven exact structural submit control is required before clicking.'
+                                       if structural else 'A proven native submit control is required before clicking.')
                         verify_dispatch()
                         if provenance is not None:
                             page, target = await _fresh_native_receiver(
@@ -2502,11 +2746,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         step['last_button'] = target['label']
                         hold_dispatch(step)
                         check_commit()
-                        submitted = True
+                        if structural:
+                            # Immutable identity includes the independently verified values
+                            # and root-evidence file lists, not just the structural edges.
+                            session.submit_authorized = _page_identity(page)
+                            session.on_committing_click = mark_click_started
+                        else:
+                            submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):
                             await asyncio.sleep(1)
                             after = await session.page()
+                            if structural:
+                                after, _ = await _observe_controls(session, after)
                             step['url'] = after['url']
                             if allowed(after['url']) and (phrase := confirmation(before, after)):
                                 return {'status': 'applied', 'confirmation': phrase,

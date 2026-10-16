@@ -19,7 +19,9 @@ READERS = [dom.PAGE, dom.ENTRY_PAGE, dom.GREENHOUSE_PAGE]
 DEFECTS = ['two-names', 'extra-text', 'extra-role', 'two-texts', 'hidden-text',
            'empty-text', 'outside-form', 'reassociated', 'member-owner', 'no-owner',
            'two-labels', 'two-fields', 'text-path', 'field-path', 'member-path',
-           'missing-qa', 'blank-name', 'two-checkboxes']
+           'missing-qa', 'blank-name', 'two-checkboxes',
+           'label-under-field', 'split-sections', 'nested-sections', 'non-div-sections',
+           'opacity-label', 'opacity-text', 'opacity-inner', 'opacity-card']
 MUTATIONS = [(kind, defect) for kind in ('radio', 'checkbox') for defect in DEFECTS
              if (kind, defect) != ('checkbox', 'blank-name')]
 
@@ -146,3 +148,43 @@ async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeyp
         await forms._bootstrap(session, session.current, 'example-co#synthetic', {}, URL)
     assert exc.value.form_question['control_label'] == 'Send synthetic updates'
     assert exc.value.form_question['question'] == ''
+
+
+@pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_native_role_override_retains_unresolved_flag_from_production_reader(reader, kind):
+    page = read({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch'}, reader)
+    inputs = [c for c in page['controls']
+              if c['tag'] == 'input' and c['selector'].startswith('#'+kind+'-')]
+    assert len(inputs) == (2 if kind == 'radio' else 1)
+    assert all(c['type'] == 'switch' and c['question'] == ''
+               and c.get('lever_card_unresolved') is True for c in inputs)
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+@pytest.mark.parametrize('fresh', [False, True], ids=['initial', 'refreshed'])
+@pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
+async def test_unresolved_role_override_gates_initial_and_refreshed_observation(kind, fresh, optional):
+    malformed = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch', 'optional': optional}
+    session = Session({'kinds': [kind], 'optional': optional} if fresh else malformed)
+    if fresh:
+        session.fresh = read(malformed)
+    with pytest.raises(forms.Gate) as exc:
+        await forms._observe_controls(session, session.current)
+    assert str(exc.value) == REASON
+    assert exc.value.form_question is None
+    assert len(session.calls) == int(fresh)
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+@pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
+async def test_unresolved_role_override_precedes_any_bootstrap_grant(monkeypatch, kind, optional):
+    session = Session({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch', 'optional': optional})
+    monkeypatch.setattr(forms, '_row', lambda *a, **kw: pytest.fail('Grant bank reached'))
+    monkeypatch.setattr(forms, '_disclosure_question',
+                        lambda *a, **kw: pytest.fail('Question constructed before structural Gate'))
+    with pytest.raises(forms.Gate) as exc:
+        await forms._bootstrap(session, session.current, 'example-co#synthetic', {}, URL)
+    assert str(exc.value) == REASON
+    assert exc.value.form_question is None
+    assert session.calls == []

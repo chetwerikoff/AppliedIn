@@ -985,8 +985,8 @@ def _inventory_ok(page: dict) -> None:
                 or not c['selector'] for c in controls)):
         raise Gate('The current form control inventory is malformed.')
     # Stop before radio admission or label-only checkbox handoffs can hide this cause.
-    if any(c.get('tag') == 'input' and c.get('type') in {'radio', 'checkbox'}
-           and c.get('lever_card_unresolved') is True for c in controls):
+    if any(c.get('tag') == 'input' and c.get('lever_card_unresolved') is True
+           for c in controls):
         raise Gate('Lever question card did not match the exact supported shape; inspect manually.')
 
 

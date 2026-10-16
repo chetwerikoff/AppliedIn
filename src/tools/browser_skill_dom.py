@@ -327,8 +327,16 @@ PAGE = r"""(() => {
       '[role="radio"],[role="checkbox"],[contenteditable="true"]'));
     if (!owner || !owner.contains(card) || !owner.contains(e) ||
         labels.length !== 1 || fields.length !== 1 || texts.length !== 1 ||
+        labels[0].parentElement?.tagName !== 'DIV' ||
+        labels[0].parentElement !== fields[0].parentElement ||
+        labels[0].parentElement.parentElement !== card ||
         texts[0].parentElement !== labels[0] || !visible(texts[0]) ||
         !clean(texts[0].innerText) || !members.length) return '';
+    // Opacity-zero sections keep rectangles and innerText but show no question.
+    for (let p = texts[0]; p; p = p.parentElement) {
+      if (Number(getComputedStyle(p).opacity) === 0) return '';
+      if (p === card) break;
+    }
     if (e.type === 'checkbox' ? members.length !== 1 : !clean(e.name)) return '';
     if (!members.every(m => {
       const caption = m.closest('label');

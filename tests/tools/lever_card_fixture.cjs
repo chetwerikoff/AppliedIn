@@ -22,6 +22,18 @@ module.exports = ({spec,node,nodes,form,body}) => {
     };
     const members=[add(kind,0)];
     if(kind==='radio')members.push(add(kind,1));
+    if(spec.role)for(const e of members)e.setAttribute('role',spec.role);
+    if(spec.optional)for(const e of members)e.required=false;
+    if(defect==='label-under-field')move(label,field);
+    if(defect==='split-sections')move(field,node('div',{},card));
+    if(defect==='nested-sections') {
+      const nested=node('div',{},inner);move(label,nested);move(field,nested);
+    }
+    if(defect==='non-div-sections')inner.tagName='SECTION';
+    if(defect==='opacity-label')label.style.opacity='0';
+    if(defect==='opacity-text')text.style.opacity='0';
+    if(defect==='opacity-inner')inner.style.opacity='0';
+    if(defect==='opacity-card')card.style.opacity='0';
     if(defect==='two-names') {
       if(kind==='radio')members[1].name='foreign-answer';
       else {add('radio',1,'foreign-one'); add('radio',2,'foreign-two');}

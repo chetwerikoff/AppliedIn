@@ -137,7 +137,10 @@ if(scenario.fullPhone){
     'aria-activedescendant':''};
   const input=make('input','country',attrs,w);
   make('div','react-select-country-placeholder',{class:phase==='C2'?'select__single-value':'select__placeholder'},v,phase==='C2'?(scenario.countryToken||'Approved country'):'Choose');
-  make('span','country-error',{},owner);
+  if(!scenario.countryErrorAbsent)make('span','country-error',{},
+    scenario.countryErrorOutside?form:scenario.countryErrorForeign?make('form','foreign-form',{},body):owner);
+  if(scenario.countryErrorDuplicate)make('span','country-error',{},owner);
+  if(scenario.countryPlaceholderAbsent)nodes.find(n=>n.id==='react-select-country-placeholder').id='unreferenced-placeholder';
   if(scenario.presentation && phase==='C2'){attrs['aria-describedby']='country-error';attrs['aria-invalid']='true';}
   if(phase==='C1'){
     attrs['aria-controls']='country-options';

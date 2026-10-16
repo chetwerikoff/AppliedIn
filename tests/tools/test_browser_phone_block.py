@@ -295,8 +295,8 @@ async def test_receiverless_history_never_compares_nonexistent_transport(phone_g
     forms.check_approvals('example-co#1', [receipt], page)
 
 
-def served_fixture_dom():
-    # Preserve the native widget regression after the entry page becomes formless.
+def served_fixture_dom(markup=None):
+    # Parsed bytes prove structure only; primary smoke owns browser hydration.
     from html.parser import HTMLParser
     from tools import browser_skill_fixture as fixture
     class Tree(HTMLParser):
@@ -320,7 +320,7 @@ def served_fixture_dom():
             if self.stack:
                 self.stack[-1]['text'] += text
     tree = Tree()
-    tree.feed(fixture._closed_form().decode())
+    tree.feed((markup if markup is not None else fixture._closed_form()).decode())
     return dom(fixtureTree=tree.root, fixtureUrl=fixture.URL)
 
 

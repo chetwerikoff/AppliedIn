@@ -64,7 +64,7 @@ def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch):
     """Existing control/submit guards isolate transport; witness regressions
     exercise the real static-evaluate adapter in test_browser_bootstrap.py.
     """
-    async def observed(session, current):
+    async def observed(session, current, **kwargs):
         return current, {c['selector']: {
             'visible': True, 'readonly': False, 'disabled': bool(c.get('disabled')),
             'inert': False,
@@ -2374,7 +2374,14 @@ def test_greenhouse_nonvisible_parity(change, shape):
         scoped = _gh_dom(spec)
         assert ordinary['unsupported_frames'] == scoped['unsupported_frames'] == []
         assert scoped['greenhouse']['frames'] == []
-        _gh_safe(scoped)
+        if scoped['greenhouse']['root'] is None:
+            # No frame exemption can authorize an action-time null root. Only
+            # the bounded waiter may defer this root-dependent check.
+            with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+                _gh_safe(scoped)
+            forms._greenhouse_safety(scoped, lambda url: url == _GH_URL, _GH_ALIAS, readiness=True)
+        else:
+            _gh_safe(scoped)
 
 
 def test_greenhouse_ordinary_reader_never_trusts_badge():
@@ -2585,6 +2592,9 @@ def test_greenhouse_typed_guard_removal_detected():
              "        raise Gate('Greenhouse frame observation lacks typed same-job provenance.')\n")
     assert guard in source
     scope = dict(vars(forms))
+    # Destination validation is now unconditional even without frames. Isolate
+    # this guard-removal experiment from that independent mandatory check.
+    scope['check_form_destination'] = lambda *args, **kwargs: None
     exec(source.replace(guard, ''), scope)
     observed = _gh_dom({'frames': []})
     def negative(check):

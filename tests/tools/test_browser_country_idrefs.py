@@ -100,6 +100,10 @@ def test_native_fixture_bytes_are_absent_error_c0(source):
     assert b'id="country-error"' not in markup
     assert b'aria-describedby="react-select-country-placeholder country-error"' in markup
     assert b'aria-errormessage="country-error"' in markup
+    if source == '_greenhouse_form':
+        # This reference test inspects the mounted country widget. The parser
+        # cannot run hydration; initial nonqualification is tested separately.
+        markup = markup.replace(b'<template id="greenhouse-template">', b'').replace(b'</template>', b'')
     snapshot = served_fixture_dom(markup)
     assert snapshot['page']['inventory_verified'] and not snapshot['page']['opaque_controls']
     assert [c['selector'] for c in snapshot['page']['controls']] == [c['selector'] for c in snapshot['witness']['controls']]

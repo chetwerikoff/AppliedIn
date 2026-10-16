@@ -1001,7 +1001,8 @@ def _greenhouse_session(monkeypatch, tmp_path, page=None, *, careers_url=GH_CARE
     def scoped(observed):
         observed = deepcopy(observed)
         observed['greenhouse'] = {
-            'root': {'selector': '#application', 'action': GH_DIRECT}, 'frames': []}
+            'root': {'selector': '#application', 'action': GH_DIRECT},
+            'frames': [], 'response_controls': False, 'badge_responses': 0}
         return observed
 
     async def call(*args, **kwargs):
@@ -1191,10 +1192,14 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
     assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
     assert (q['label'], q['selector'], q['form_selector']) == (
         'Email', '#email', '#application')
-    assert browser.calls == [('navigate', GH_DIRECT),
-                             ('evaluate', forms.GREENHOUSE_PAGE),
-                             ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-                             ('evaluate', forms.GREENHOUSE_PAGE)]
+    # Two complete independently witnessed/re-read pairs, then bootstrap's own
+    # fresh witness and re-read before disclosing the original question.
+    assert browser.calls == [('navigate', GH_DIRECT)] + [
+        ('evaluate', forms.GREENHOUSE_PAGE),
+        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
+        ('evaluate', forms.GREENHOUSE_PAGE)] * 2 + [
+        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
+        ('evaluate', forms.GREENHOUSE_PAGE)]
     assert not decide.await_count
 
     # The same synthetic tracking-status seam used by the actual direct writer.

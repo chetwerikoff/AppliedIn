@@ -214,7 +214,24 @@ def _greenhouse_form() -> bytes:
              'style="width:256px;height:60px;border:0;padding:0;visibility:visible;display:block">'
              '</iframe><textarea class="g-recaptcha-response" id="g-recaptcha-response-123" '
              'name="g-recaptcha-response" style="display:none"></textarea></div></div>')
-    return _closed_form().replace(b'</form>', ('</form>' + badge).encode())
+    text = _closed_form().decode('utf-8')
+    text = text.replace('<svg></svg>', '<svg><circle></circle><line></line></svg>')
+    text = text.replace('hidden>Clear search</button>',
+                        'hidden><svg><line></line><mask id="synthetic-clear-mask">'
+                        '<rect></rect><path></path></mask><circle></circle></svg></button>')
+    # The native submit keeps a unique root for the passive badge, but NO
+    # applicant field can qualify before the template mounts, at any cadence.
+    start = '<div class="form-group"><label for="name"'
+    text = text.replace(start, '<template id="greenhouse-template">' + start, 1)
+    text = text.replace('<button id="submit"', '</template><button id="submit"', 1)
+    text = text.replace('for (const [id,answer]',
+                        'setTimeout(() => {\n'
+                        'const template=document.getElementById("greenhouse-template");\n'
+                        'document.getElementById("application-form").insertBefore('
+                        'template.content,document.getElementById("submit"));\n'
+                        'for (const [id,answer]')
+    text = text.replace('</script>', '}, 3000);\n</script>')
+    return text.replace('</form>', '</form>' + badge).encode('utf-8')
 
 
 _COMMITTED_VALIDITY = r"""(() => {
@@ -657,8 +674,14 @@ class _SyntheticRun:
                     structural = ((observed.get('entry', {}).get('formless') or {}) if state.ashby
                                   else observed.get('entry', {}))
                     if args[1] == page_script:
-                        if not state.entry_observations and not state.greenhouse:
-                            state.entry_initial_not_ready = not structural.get('root')
+                        if not state.entry_observations:
+                            if state.greenhouse:
+                                from tools.browser_skill_apply import _native_answer
+                                state.entry_initial_not_ready = not any(
+                                    _native_answer(c) and c.get('in_form')
+                                    for c in observed.get('controls', []))
+                            else:
+                                state.entry_initial_not_ready = not structural.get('root')
                         state.observe_page(observed)
                         await diagnose(observed)
                     elif any(f.get('status') not in ({'R'} if state.greenhouse else {'H','R','W','X','Z'})
@@ -668,7 +691,8 @@ class _SyntheticRun:
                         'reader':'page' if args[1] == page_script else 'witness',
                         'root':bool(observed.get(field, {}).get('root') if state.greenhouse else structural.get('root')),
                         'frames':[f.get('status') for f in frames],
-                        **({'badge_responses':observed.get(field, {}).get('badge_responses')}
+                        **({'badge_responses':observed.get(field, {}).get('badge_responses'),
+                            'controls':[c.get('selector') for c in observed.get('controls', [])]}
                            if state.greenhouse else {})})
                     return result
                 if not state.positive:

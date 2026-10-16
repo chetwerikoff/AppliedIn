@@ -2,13 +2,20 @@
 const spec = JSON.parse(process.argv[2]);
 const nodes = [];
 const node = (tag, attrs={}, parent=null) => {
-  const e = {tagName:tag.toUpperCase(),nodeType:1,children:[],parentElement:parent,
+  const e = {tagName:tag.toUpperCase(),localName:tag.toLowerCase(),nodeType:1,children:[],parentElement:parent,
+    namespaceURI:'http://www.w3.org/1999/xhtml',
     id:attrs.id || 'node-'+nodes.length,name:attrs.name || '',type:attrs.type || '',
-    value:'',innerText:attrs.text || '',labels:[],disabled:false,readOnly:false,
+    value:'',disabled:false,readOnly:false,shadowRoot:null,
+    get innerText() {return (attrs.text || '')+e.children.map(n=>n.innerText).join('');},
+    get textContent() {return (attrs.text || '')+e.children.map(n=>n.textContent).join('');},
+    get labels() {return nodes.filter(n=>n.tagName==='LABEL' && (n.contains(e) || n.getAttribute('for')===e.id));},
+    get elements() {return nodes.filter(n=>n.form===e && n.matches('input,button,select,textarea,output,object'));},
     getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
     hasAttribute:k=>Object.hasOwn(attrs,k),
-    attributes:Object.keys(attrs).filter(k=>!['rect','bounds','text'].includes(k)).map(name=>({name})),
     getAttributeNames:()=>Object.keys(attrs),
+    setAttribute:(k,v)=> {attrs[k]=String(v); if(['id','name','type'].includes(k))e[k]=String(v);},
+    removeAttribute:k=> {delete attrs[k]; if(['name','type'].includes(k))e[k]='';},
+    get attributes() {return Object.keys(attrs).filter(k=>!['rect','bounds','text','pseudo'].includes(k)).map(name=>({name,value:String(attrs[name])}));},
     getClientRects:()=>attrs.rect===null ? [] : [attrs.rect || {width:100,height:30,right:100,bottom:30}],
     getBoundingClientRect:()=> {if(attrs.bounds===null) throw Error('unreadable'); return attrs.bounds || attrs.rect || {width:100,height:30};},
     matches:q=>q.split(',').some(s=>match(e,s)),
@@ -17,6 +24,7 @@ const node = (tag, attrs={}, parent=null) => {
     querySelectorAll:q=>nodes.filter(n=>n!==e && e.contains(n) && n.matches(q)),
     querySelector:q=>e.querySelectorAll(q)[0] || null,
     style:{display:'block',visibility:'visible',opacity:'1',position:'static',...attrs.style},
+    pseudo:attrs.pseudo || {},
     required:!!attrs.required
   };
   nodes.push(e); if(parent) parent.children.push(e);
@@ -124,13 +132,44 @@ function frame(kind, edit={}) {
     }
     attrs={...attrs,src:'https://www.recaptcha.net/recaptcha/enterprise/'+(kind==='B' ? 'bframe' : 'anchor'),style:{visibility:spec.visible ? 'visible':'hidden'},bounds:{width:256,height:60}};
   } else if(kind==='W') {
-    parent=node('li',{class:'application-question awli-application-row',...(spec.required ? {required:true}: {}),
-      ...(spec.rowRole ? {id:'w-row',role:spec.rowRole}: {})},form || body);
-    if(spec.extra) node('input',{type:'text'},parent);
-    if(spec.extraRole) node('span',{id:'aria-applicant',role:spec.extraRole,'aria-checked':'false',text:'Synthetic consent'},parent);
-    parent=node('div',{class:'application-field'},parent);
-    parent=node('div',{class:'awli-button-container'},parent);
-    parent=node('span',{class:'IN-widget'},parent);
+    const w=spec.w || {};
+    const row=node('li',{id:'w-row',class:'application-question awli-application-row',
+      ...(spec.required ? {required:true}: {}),...(spec.rowRole ? {role:spec.rowRole}: {}),...w.row},
+      spec.wOutside ? body : form || body);
+    parent=row;
+    if(w.rowPropertyRequired)row.required=true;
+    if(w.rowAttributeRequired) {row.setAttribute('required','');row.required=false;}
+    if(spec.extra) node('input',{type:'text'},row);
+    if(spec.extraRole) node('span',{id:'aria-applicant',role:spec.extraRole,'aria-checked':'false',text:'Synthetic consent'},row);
+    const field=node('div',{class:'application-field',...w.field},row);
+    const container=node('div',{class:'awli-button-container',...w.container},field);
+    parent=node('span',{class:'IN-widget',...w.span},container);
+    if(!w.missingButton) {
+      let owner=container;
+      if(w.wrappingLabel)owner=node('label',{text:'Synthetic label'},container);
+      const button=node('button',{id:'w-button',class:'awli-button',type:'button',...w.button},owner);
+      if(w.buttonNamespace)button.namespaceURI=w.buttonNamespace;
+      if(w.missingType)button.removeAttribute('type');
+      if(w.externalLabel)node('label',{'for':button.id,text:'Synthetic external label'},body);
+      if(w.labelledby) {button.setAttribute('aria-labelledby','w-caption');node('span',{id:'w-caption',text:'Synthetic caption'},body);}
+      if(w.child)node(w.child.tag || 'span',w.child.attrs || {},button);
+      if(w.unknown)Object.defineProperty(w.unknown==='elements' ? form : button,w.unknown==='elements' ? 'elements' : w.unknown,
+        {get:()=>{throw Error('unreadable W evidence');}});
+    }
+    if(!w.noLink) {
+      const link=node('a',{id:'w-link',class:'learn-more-link',href:'https://widgets.example-co.test',...w.link},container);
+      if(w.linkNamespace)link.namespaceURI=w.linkNamespace;
+      if(w.missingHref)link.removeAttribute('href');
+    }
+    for(const extra of w.extra || []) {
+      const owner=extra.parent ? node(extra.parent,{},row) : row;
+      const added=node(extra.tag || 'div',{id:'w-extra',...extra.attrs},owner);
+      if(extra.shadow) {
+        const child={nodeType:1,localName:'input',tagName:'INPUT',type:'text'};
+        added.shadowRoot={children:[child],querySelectorAll:()=>[child],querySelector:()=>null};
+      }
+    }
+    if(w.unreadableRow)Object.defineProperty(row,w.unreadableRow,{get:()=>{throw Error('unreadable row evidence');}});
     attrs={...attrs,title:'LinkedIn Embedded Content',rect:{width:236,height:48,right:236,bottom:48}};
   } else if(kind==='X') attrs={...attrs,style:{visibility:'hidden'},rect:{width:1,height:1,right:1,bottom:1}};
   else if(kind==='Z') {
@@ -146,7 +185,9 @@ function frame(kind, edit={}) {
   else if(spec.bounds==='nan') attrs.bounds={width:NaN,height:60};
   else if(spec.bounds==='infinity') attrs.bounds={width:256,height:Infinity};
   else if(spec.bounds) attrs.bounds=spec.bounds;
-  return node('iframe',{...attrs,...edit},parent);
+  const result=node('iframe',{...attrs,...edit},parent);
+  if(kind==='W' && spec.w?.iframe)for(const [k,v] of Object.entries(spec.w.iframe))result.setAttribute(k,v);
+  return result;
 }
 for(const k of spec.frames || []) frame(k,spec.edit || {});
 if(spec.sibling) frame('R',{src:'https://untrusted.example-co.test/widget'});
@@ -180,5 +221,6 @@ global.document={baseURI:'https://example-co.test/',readyState:'complete',body,t
   querySelector:q=>document.querySelectorAll(q)[0] || null,
   getElementById:id=>nodes.find(n=>n.id===id) || null};
 global.CSS={escape:s=>s}; global.location={href:spec.url || form?.action || 'https://example-co.test/'};
-global.scrollX=0; global.scrollY=0; global.getComputedStyle=e=>e.style;
+global.scrollX=0; global.scrollY=0;
+global.getComputedStyle=(e,pseudo)=>pseudo ? {content:e.pseudo[pseudo] ?? 'none'} : e.style;
 console.log(JSON.stringify(eval(process.argv[3])));

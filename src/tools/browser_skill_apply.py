@@ -1072,7 +1072,7 @@ _ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
 _GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
 
 
-def _greenhouse_safety(page, allowed, provenance, *, readiness=False):
+def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=False):
     if not isinstance(provenance, GreenhouseJobAlias):
         raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
     if not isinstance(page, dict) or not allowed(page.get('url', '')):
@@ -1094,9 +1094,9 @@ def _greenhouse_safety(page, allowed, provenance, *, readiness=False):
     if readiness:
         _greenhouse_control_shape(page)
     root = observed['root']
-    if root is None and readiness:
-        # Zero and multiple roots have identical output. Qualification still
-        # requires a unique checked destination; only this wait may defer it.
+    if root is None and (readiness or (submitted and not frames)):
+        # Only the waiter may defer a missing receiver before a click. After
+        # commit, a frameless thank-you page may legitimately replace the form.
         return
     if (not isinstance(root, dict) or not isinstance(root.get('selector'), str)
             or not root['selector'] or not isinstance(root.get('action'), str)):
@@ -1108,10 +1108,11 @@ def _greenhouse_safety(page, allowed, provenance, *, readiness=False):
 
 class _GreenhouseSession:
     """Every PAGE and independent witness re-proves current alias and visible frames."""
-    def __init__(self, raw, allowed, provenance, step=None):
+    def __init__(self, raw, allowed, provenance, step=None, *, submitted=None):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
         self._readiness = False
+        self._submitted = submitted
 
     async def page(self):
         return (await self.call('evaluate', GREENHOUSE_PAGE))['value']
@@ -1127,7 +1128,8 @@ class _GreenhouseSession:
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
-            _greenhouse_safety(page, self.allowed, self.provenance, readiness=self._readiness)
+            _greenhouse_safety(page, self.allowed, self.provenance, readiness=self._readiness,
+                               submitted=bool(self._submitted and self._submitted()))
             if self._readiness:
                 if args == ('evaluate', GREENHOUSE_PAGE):
                     reason = _greenhouse_not_ready(page)
@@ -2778,7 +2780,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     if not allowed(direct_url):
                         raise Gate('Greenhouse route or current row/config changed.')
                     await session.call('navigate', direct_url)
-                    session = _GreenhouseSession(session, allowed, provenance, step)
+                    session = _GreenhouseSession(
+                        session, allowed, provenance, step, submitted=lambda: submitted)
                     deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS
                     page = await _stable_application_form(
                         session, allowed, provenance, deadline=deadline)

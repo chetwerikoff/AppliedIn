@@ -3137,7 +3137,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 raise Gate('The form needs review after reaching the browser step limit.')
     except (Exception, asyncio.CancelledError) as exc:
         if (getattr(session, 'upload_attempted', False)
-                and not (isinstance(exc, Gate) and exc.form_question)):
+                and not isinstance(exc, Gate)):
             message = 'Résumé upload interrupted after the browser command; inspect manually'
             if isinstance(exc, asyncio.CancelledError):
                 # Persist the existing terminal outcome before propagating cancellation.

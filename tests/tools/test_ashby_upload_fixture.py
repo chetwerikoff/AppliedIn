@@ -170,8 +170,40 @@ async def test_post_upload_interruption_is_terminal_before_cancellation(authorit
         detail = authority.row.get('fail_reason')
     else:
         result = await task
-        detail = result.get('detail')
-    assert result['status'] == 'uncertain'
-    assert detail == 'Résumé upload interrupted after the browser command; inspect manually'
-    assert is_retryable(result) == (False, 'uncertain')
+        detail = result.get('question')
+    if cancel:
+        assert result['status'] == 'uncertain'
+        assert detail == 'Résumé upload interrupted after the browser command; inspect manually'
+        assert is_retryable(result) == (False, 'uncertain')
+    else:
+        assert result['status'] == 'gate'
+        assert 'Upload structural/file witness is unavailable' in detail
+        assert is_retryable(result) == (False, 'waiting on the owner')
+    assert len(raw.uploads) == 1
+
+
+async def test_definitive_no_effect_refusal_keeps_its_gate_reason(authority, monkeypatch):
+    from core.apply_queue import is_retryable
+    from tools.browser_skill import Unavailable
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    raw = FixtureRaw(authority)
+    original = raw.call
+    async def refused(method, *args, **kwargs):
+        if method == 'upload':
+            raw.uploads.append(((method, *args), kwargs))
+            exc = Unavailable('synthetic definitive refusal')
+            exc.code, exc.effect_state = 'unsupported', 'none'
+            raise exc
+        return await original(method, *args, **kwargs)
+    raw.call = refused
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_args: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert result['status'] == 'gate', result
+    assert ('BrowserSkill upload unsupported with no effect; the original input is empty. '
+            'Complete the attachment manually; no retry was attempted.') in result['question']
+    assert is_retryable(result) == (False, 'waiting on the owner')
     assert len(raw.uploads) == 1

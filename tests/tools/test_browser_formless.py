@@ -292,9 +292,7 @@ async def test_real_presubmit_retains_independent_invariants(monkeypatch, failur
     monkeypatch.setattr(forms, 'check_before_committing_click', final_check)
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
-    # The upload already disclosed the file, even though submit was prevented.
-    assert result['status'] == 'uncertain', result
-    assert result['detail'] == 'Résumé upload interrupted after the browser command; inspect manually'
+    assert result['status'] == 'gate', result
     assert not any(c[0] == 'click' for c in raw.calls)
 
 
@@ -691,8 +689,8 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
     assert not any(c[0] == 'click' for c in raw.calls), result
-    assert result['status'] == 'uncertain', result
-    assert result['detail'] == 'Résumé upload interrupted after the browser command; inspect manually'
+    assert result['status'] == 'gate', result
+    assert ('root identity drift' if drift == 'root' else 'changed before submit') in result['question']
 
 
 def test_cleared_optional_structural_answer_is_not_a_verified_receipt(monkeypatch):

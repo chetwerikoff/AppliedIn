@@ -446,7 +446,17 @@ _APPLICATION_ROOT = r"""
               'finish application','apply now'].includes(clean(t).toLowerCase())));
     }));
   const nativeRoot = forms.length===1 ? forms[0] : null;
-  // Observe the production three-sibling boundary independently in each reader.
+  const rectOf = (e, bounding=false) => {
+    try {
+      const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
+      return r && Number.isFinite(r.width) && Number.isFinite(r.height) &&
+        r.width>=0 && r.height>=0 ? {width:r.width,height:r.height} : null;
+    } catch (_) { return null; }
+  };
+"""
+
+# Structural admission belongs only to ApplicationEntryProvenance, never an alias.
+_ASHBY_ROOT = r"""
   // The pane is structural evidence only: never read its values or build targets.
   const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
   const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
@@ -524,13 +534,6 @@ _APPLICATION_ROOT = r"""
     excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),
     pane:panes.length===1 ? selector(panes[0]) : '',
     error:structuralError,truncated:evidenceNodes.length>500} : null;
-  const rectOf = (e, bounding=false) => {
-    try {
-      const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
-      return r && Number.isFinite(r.width) && Number.isFinite(r.height) &&
-        r.width>=0 && r.height>=0 ? {width:r.width,height:r.height} : null;
-    } catch (_) { return null; }
-  };
 """
 
 # Hidden R and the other providers stay exclusively in the entry classifier.
@@ -555,7 +558,7 @@ _CAPTCHA_RESPONSE_NODES = r"""
 _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
   const excluded = new Set([...responseNodes, ...reservedButtons]);
-""" + _APPLICATION_ROOT + _VISIBLE_RECAPTCHA + r"""
+""" + _APPLICATION_ROOT + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
   const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='';
@@ -655,11 +658,11 @@ def entry_reader(script: str) -> str:
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
     script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
-    script = script.replace('return {selector:ownSelector, unique:',
+    script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
                             "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
                             "submit:['submit','image'].includes(e.type), "
                             "required:!!e.required,files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
-                            'selector:ownSelector, unique:')
+                            'selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')
     script = script.replace('return {url: location.href, controls:', 'return {entry, url: location.href, controls:')
     script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"
@@ -676,6 +679,7 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   const excluded = new Set(responseNodes);
 """ + _APPLICATION_ROOT.replace('filter(e=>!excluded.has(e))',
                                 'filter(e=>e.form===f && !excluded.has(e))') + _VISIBLE_RECAPTCHA + r"""
+  const root=nativeRoot;
   // Both readers use ordinary PAGE's frame visibility, not witness editability.
   // Otherwise a collapse/transparent transition could disappear from the witness.
   const greenhouseFrames = Array.from(document.querySelectorAll('iframe')).filter(e =>

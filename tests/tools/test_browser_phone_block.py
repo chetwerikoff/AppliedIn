@@ -296,7 +296,7 @@ async def test_receiverless_history_never_compares_nonexistent_transport(phone_g
 
 
 def served_fixture_dom():
-    # Parse the actual served bytes: no HTTP server, network or second fixture.
+    # Preserve the native widget regression after the entry page becomes formless.
     from html.parser import HTMLParser
     from tools import browser_skill_fixture as fixture
     class Tree(HTMLParser):
@@ -320,7 +320,7 @@ def served_fixture_dom():
             if self.stack:
                 self.stack[-1]['text'] += text
     tree = Tree()
-    tree.feed(fixture._FORM.decode())
+    tree.feed(fixture._closed_form().decode())
     return dom(fixtureTree=tree.root, fixtureUrl=fixture.URL)
 
 

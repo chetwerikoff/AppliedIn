@@ -851,6 +851,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           (e.getAttribute('type') || e.tagName.toLowerCase()));
       const ownSelector = selector(e), formSelector = form ? selector(form) : '';
       const graph = newGraphs.get(e);
+      const exactNodes = graphNodes.get(e);
       const list = type === 'combobox' ? currentListbox(e) : null;
       const opts = list ? Array.from(list.querySelectorAll('[role="option"]'))
         .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
@@ -881,6 +882,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
+        ...(graph ? {graph_label_strict_visible:!!exactNodes && visible(exactNodes.label),
+          graph_display_strict_visible:!!exactNodes && visible(exactNodes.display)} : {}),
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
@@ -1076,7 +1079,7 @@ _ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
 _GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
 
 
-def _greenhouse_safety(page, allowed, provenance):
+def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=False):
     if not isinstance(provenance, GreenhouseJobAlias):
         raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
     if not isinstance(page, dict) or not allowed(page.get('url', '')):
@@ -1092,20 +1095,31 @@ def _greenhouse_safety(page, allowed, provenance):
         raise Gate('CAPTCHA response control requires manual inspection; no values read.')
     if any(not isinstance(f, dict) or f.get('status') != 'R' for f in frames):
         raise Gate('unknown/untrusted application frame; inspect manually.')
-    root = observed.get('root')
-    if frames:
-        if not isinstance(root, dict) or not root.get('selector'):
-            raise Gate('unknown/untrusted application frame; inspect manually.')
-        check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
-                                          form_action=root.get('action'), formaction=''),
-                               provenance=provenance)
+    if (type(observed.get('response_controls')) is not bool or 'root' not in observed
+            or page.get('unsupported_frames')):
+        raise Gate('The current form control inventory is malformed or has unsupported frames.')
+    if readiness:
+        _greenhouse_control_shape(page)
+    root = observed['root']
+    if root is None and (readiness or (submitted and not frames)):
+        # Only the waiter may defer a missing receiver before a click. After
+        # commit, a frameless thank-you page may legitimately replace the form.
+        return
+    if (not isinstance(root, dict) or not isinstance(root.get('selector'), str)
+            or not root['selector'] or not isinstance(root.get('action'), str)):
+        raise Gate('unknown/untrusted application frame; inspect manually.')
+    check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
+                                      form_action=root['action'], formaction=''),
+                           provenance=provenance)
 
 
 class _GreenhouseSession:
     """Every PAGE and independent witness re-proves current alias and visible frames."""
-    def __init__(self, raw, allowed, provenance, step=None):
+    def __init__(self, raw, allowed, provenance, step=None, *, submitted=None):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
+        self._readiness = False
+        self._submitted = submitted
 
     async def page(self):
         return (await self.call('evaluate', GREENHOUSE_PAGE))['value']
@@ -1121,7 +1135,17 @@ class _GreenhouseSession:
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
-            _greenhouse_safety(page, self.allowed, self.provenance)
+            _greenhouse_safety(page, self.allowed, self.provenance, readiness=self._readiness,
+                               submitted=bool(self._submitted and self._submitted()))
+            if self._readiness:
+                if args == ('evaluate', GREENHOUSE_PAGE):
+                    reason = _greenhouse_not_ready(page)
+                else:
+                    # Witnesses do not serialize PAGE's inventory flags, but any
+                    # flags present must not conceal a not-ready intermediate read.
+                    reason = _greenhouse_not_ready(page, witness=True)
+                if reason:
+                    raise _EntryNotReady(reason)
         return result
 
 
@@ -1508,6 +1532,75 @@ def _entry_not_ready(page):
         return 'no unique application root' if _formless_root(page) else 'no qualifying application form'
     return ''
 
+def _greenhouse_control_shape(page):
+    controls = page.get('controls')
+    if (not isinstance(controls, list) or any(not isinstance(c, dict) or
+            not isinstance(c.get('selector'), str) or not c['selector']
+            or not isinstance(c.get('tag'), str) or not isinstance(c.get('type'), str)
+            or type(c.get('in_form')) is not bool
+            or (c['in_form'] and not c.get('form_selector')) for c in controls)):
+        raise Gate('The current form control inventory is malformed.')
+    if len({c['selector'] for c in controls}) != len(controls):
+        raise Gate('The current DOM witness is unavailable or changed; predicate=selector.unique')
+    for c in controls:
+        for key in ('form_selector', 'form_action', 'formaction', 'native_form_owner_selector'):
+            if not isinstance(c.get(key), str):
+                raise Gate('The current form control inventory is malformed.')
+        if type(c.get('disabled')) is not bool:
+            raise Gate('The current form control inventory is malformed.')
+        if c['type'] == 'combobox':
+            combo = c.get('combobox')
+            if not isinstance(combo, dict):
+                raise Gate('The current form control inventory is malformed.')
+            for key, value in combo.items():
+                expected = (bool if key in {'quarantined', 'required_proxy_mounted', 'receiverless_country', 'linked'}
+                            else list if key in {'country_graph', 'options'} else str)
+                if not isinstance(value, expected):
+                    raise Gate('The current form control inventory is malformed.')
+            if (type(combo.get('linked')) is not bool
+                    or not isinstance(combo.get('link_id'), str)
+                    or (combo['linked'] and (not isinstance(combo.get('listbox_selector'), str)
+                                           or not isinstance(combo.get('options'), list)))
+                    or (not combo['linked'] and combo.get('options') not in (None, []))):
+                raise Gate('The current form control inventory is malformed.')
+
+
+def _greenhouse_not_ready(page, *, witness=False):
+    _greenhouse_control_shape(page)
+    if witness:
+        for c in page['controls']:
+            if (c.get('unique') is not True or c.get('unique_form') is not True
+                    or any(type(c.get(k)) is not bool for k in ('visible', 'readonly', 'inert'))
+                    or (c['type'] in {'radio', 'checkbox'} and not isinstance(c.get('visible_text'), str))):
+                raise Gate('The current form control inventory is malformed.')
+    else:
+        if any(not isinstance(c.get('label'), str) or not isinstance(c.get('question'), str)
+               for c in page['controls']):
+            raise Gate('The current form control inventory is malformed.')
+    flags = ('inventory_verified', 'truncated', 'opaque_controls', 'shadow_roots')
+    if any(type(page.get(k)) is not bool for k in flags if not witness or k in page):
+        raise Gate('The current form control inventory is malformed.')
+    if any(page.get(k) is (False if k == 'inventory_verified' else True)
+           for k in flags if not witness or k in page):
+        return 'unverified application inventory'
+    return 'no qualifying application form' if page['greenhouse']['root'] is None else ''
+
+
+_GREENHOUSE_READINESS_PREDICATES = frozenset({
+    'greenhouse.equal', 'controls.length.equal', 'visible_text.required_nonempty',
+    'combobox.link_id.required_nonempty', 'selector.equal', 'visible_text.equal',
+    'options.equal', 'combobox.equal', 'inventory.identity.equal',
+    *(k + '.equal' for k in ('tag', 'type', 'in_form', 'form_selector', 'form_action',
+                             'formaction', 'disabled', 'native_form_owner_selector')),
+    *('combobox.' + k + '.equal' for k in (
+        'mode', 'phase', 'quarantined', 'required_proxy_mounted', 'label_selector',
+        'field_selector', 'value_container_selector', 'input_wrapper_selector',
+        'receiverless_country', 'country_graph', 'link_id', 'linked', 'listbox_selector',
+        'options', 'selected_text', 'displayed_text', 'selected_value', 'hidden_selector',
+        'hidden_value')),
+})
+
+
 
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
                                    initial=None) -> dict:
@@ -1516,52 +1609,64 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
     previous, seen = None, False
     last_reason = 'no qualifying application form'
     page = initial
-    while loop.time() < deadline:
-        try:
-            async with asyncio.timeout_at(deadline):
-                page = await session.page() if page is None else page
-                _entry_safety(page, allowed, provenance)
-                reason = _entry_not_ready(page)
-                if reason:
-                    raise _EntryNotReady(reason)
-                page, witness = await _observe_controls(session, page, readiness=True)
-                if loop.time() >= deadline:
-                    raise TimeoutError
-                reason = _entry_not_ready(page)
-                if reason:
-                    raise _EntryNotReady(reason)
-                qualifying = any(
-                    not _formless_root(page) and c.get('in_form')
-                    and _application_marker(_form_subject(page, c))
-                    and (_native_answer(c) or (c.get('tag') == 'input'
-                         and c.get('type') in {'radio', 'checkbox'}))
-                    and witness[c['selector']].get('visible') is True
-                    and witness[c['selector']].get('readonly') is False
-                    and witness[c['selector']].get('inert') is False
-                    and not c.get('disabled') for c in page['controls'])
-                if _formless_root(page) and provenance.ats == 'ashby':
-                    qualifying = bool(_formless_boundary(page, provenance))
-                identity = (_page_identity(page), repr(witness)) if qualifying else None
-                if qualifying:
-                    seen = True
-                    if identity == previous and loop.time() < deadline:
-                        _observe_closed_admissions(session, page)
-                        if _formless_root(page):
-                            session.formless_identity = _root_identity(page)
-                        return page
-                last_reason = ('unstable application form inventory' if seen else
-                               'no qualifying application form')
-                previous = identity
-        except _EntryNotReady as exc:
-            last_reason, previous = str(exc), None
-        except TimeoutError:
-            last_reason = 'application form inventory read timed out/unavailable'
-            break
-        except (OSError, bsk.Unavailable):
-            last_reason, previous = 'application form inventory read timed out/unavailable', None
-        page = None
-        await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
-    raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
+    greenhouse = isinstance(session, _GreenhouseSession)
+    prior_readiness = session._readiness if greenhouse else False
+    if greenhouse:
+        session._readiness = True
+    try:
+        while loop.time() < deadline:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    page = await session.page() if page is None else page
+                    if greenhouse:
+                        _greenhouse_safety(page, allowed, provenance, readiness=True)
+                        reason = _greenhouse_not_ready(page)
+                    else:
+                        _entry_safety(page, allowed, provenance)
+                        reason = _entry_not_ready(page)
+                    if reason:
+                        raise _EntryNotReady(reason)
+                    page, witness = await _observe_controls(session, page, readiness=True)
+                    if loop.time() >= deadline:
+                        raise TimeoutError
+                    reason = _greenhouse_not_ready(page) if greenhouse else _entry_not_ready(page)
+                    if reason:
+                        raise _EntryNotReady(reason)
+                    qualifying = any(
+                        not _formless_root(page) and c.get('in_form')
+                        and _application_marker(_form_subject(page, c))
+                        and (_native_answer(c) or (c.get('tag') == 'input'
+                             and c.get('type') in {'radio', 'checkbox'}))
+                        and witness[c['selector']].get('visible') is True
+                        and witness[c['selector']].get('readonly') is False
+                        and witness[c['selector']].get('inert') is False
+                        and not c.get('disabled') for c in page['controls'])
+                    if _formless_root(page) and provenance.ats == 'ashby':
+                        qualifying = bool(_formless_boundary(page, provenance))
+                    identity = (_page_identity(page), repr(witness)) if qualifying else None
+                    if qualifying:
+                        seen = True
+                        if identity == previous and loop.time() < deadline:
+                            _observe_closed_admissions(session, page)
+                            if _formless_root(page):
+                                session.formless_identity = _root_identity(page)
+                            return page
+                    last_reason = ('unstable application form inventory' if seen else
+                                   'no qualifying application form')
+                    previous = identity
+            except _EntryNotReady as exc:
+                last_reason, previous = str(exc), None
+            except TimeoutError:
+                last_reason = 'application form inventory read timed out/unavailable'
+                break
+            except (OSError, bsk.Unavailable):
+                last_reason, previous = 'application form inventory read timed out/unavailable', None
+            page = None
+            await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
+        raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
+    finally:
+        if greenhouse:
+            session._readiness = prior_readiness
 
 
 
@@ -1601,6 +1706,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                         'form_action', 'formaction', 'disabled', 'native_form_owner_selector'):
                 require(original.get(key) == observed.get(key), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
+                if isinstance(session, _GreenhouseSession) and readiness:
+                    require(isinstance(observed.get('visible_text'), str), 'visible_text.string')
                 require(isinstance(observed.get('visible_text'), str) and
                         bool(observed['visible_text'].strip()), 'visible_text.required_nonempty')
                 require(observed['visible_text'] == original.get('label'), 'visible_text.equal')
@@ -1621,6 +1728,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                     require(source.get(key) == combo.get(key), 'combobox.' + key + '.equal')
                 require(source == combo, 'combobox.equal')
                 if not _closed_mode(original):
+                    if isinstance(session, _GreenhouseSession) and readiness:
+                        require(isinstance(combo.get('link_id'), str), 'combobox.link_id.string')
                     require(bool(combo.get('link_id')), 'combobox.link_id.required_nonempty')
                 require((combo.get('linked') is True
                          and isinstance(combo.get('listbox_selector'), str)
@@ -1637,11 +1746,20 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         _inventory_ok(current)
         require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
         if not readiness:
+            # Graph equality is recognition only. These fresh witness-only flags
+            # preserve strict label/value visibility at every phase and pre-submit read.
+            for target in current['controls']:
+                _require_graph_visibility(target, lookup[target['selector']])
             _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
     except Gate:
         raise
     except (Exception, asyncio.CancelledError) as exc:
+        if isinstance(session, _GreenhouseSession) and readiness and session._readiness:
+            if isinstance(exc, (asyncio.CancelledError, OSError, bsk.Unavailable)):
+                raise
+            if isinstance(exc, ValueError) and predicate in _GREENHOUSE_READINESS_PREDICATES:
+                raise _EntryNotReady('unstable application form inventory') from None
         if isinstance(session, _EntrySession):
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -1861,6 +1979,12 @@ def _same_key(value: str) -> str:
     return ' '.join(value.casefold().split())
 
 
+def _require_graph_visibility(target, witness):
+    if _closed_mode(target) and any(witness.get(k) is not True for k in (
+            'graph_label_strict_visible', 'graph_display_strict_visible')):
+        raise Gate('This control is not visibly editable.')
+
+
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None) -> dict:
@@ -1898,6 +2022,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         raise Gate('Complete native labels and questions are required.')
     for member in members:
         dom = witness.get(member['selector'])
+        _require_graph_visibility(member, dom or {})
         if (not dom or dom.get('visible') is not True
                 or dom.get('readonly') is True or dom.get('disabled') is True
                 or dom.get('inert') is True or member.get('disabled')
@@ -2841,8 +2966,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     if not allowed(direct_url):
                         raise Gate('Greenhouse route or current row/config changed.')
                     await session.call('navigate', direct_url)
-                    session = _GreenhouseSession(session, allowed, provenance, step)
-                    page = await session.page()
+                    session = _GreenhouseSession(
+                        session, allowed, provenance, step, submitted=lambda: submitted)
+                    deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS
+                    page = await _stable_application_form(
+                        session, allowed, provenance, deadline=deadline)
                 else:
                     page = await session.navigate(direct_url)
                     step['url'] = page['url']

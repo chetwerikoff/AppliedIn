@@ -10,6 +10,10 @@ _DIAGNOSTIC_TAGS = (
 _WIDGET_GRAPH = r"""
   // Executed afresh in each reader. No page attributes or model flags retain admission.
   const nativeForm = e => e.form || e.closest('form');
+  // Recognition must classify the same proxy owners in each independent reader.
+  // Action evidence still uses the witness's stricter visible() on these exact nodes.
+  const graphVisible = e => !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+  const graphNodes = new WeakMap();
   const uniqueNode = e => !!e && document.querySelectorAll(selector(e)).length === 1;
   const byId = id => {
     const hits = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
@@ -94,15 +98,15 @@ _WIDGET_GRAPH = r"""
     return path.map(selector);
   };
   const closedGraph = e => {
-    if (e.tagName !== 'INPUT' || attr(e,'role') !== 'combobox' || !visible(e) ||
+    if (e.tagName !== 'INPUT' || attr(e,'role') !== 'combobox' || !graphVisible(e) ||
         attr(e,'aria-haspopup') !== 'true' || attr(e,'aria-autocomplete') !== 'list') return null;
     const id = attr(e,'aria-labelledby'), L = byId(id), W = e.parentElement, V = W?.parentElement;
     const form = nativeForm(e);
-    if (!id.endsWith('-label') || !L || !visible(L) || !form || !W || !V ||
+    if (!id.endsWith('-label') || !L || !graphVisible(L) || !form || !W || !V ||
         W.querySelectorAll(editable).length !== 1 || !W.contains(e)) return null;
     const branches = Array.from(V.children);
     if (branches.filter(n=>n===W || n.querySelectorAll(editable).length).length !== 1) return null;
-    const display = branches.filter(n=>n!==W && visible(n) &&
+    const display = branches.filter(n=>n!==W && graphVisible(n) &&
       (singleBranch(n) || placeholderBranch(n)));
     if (display.length !== 1 || display[0].querySelectorAll(editable).length) return null;
     let F = V; while (F && !F.contains(L)) F = F.parentElement;
@@ -127,6 +131,7 @@ _WIDGET_GRAPH = r"""
     const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
     if (e.id==='country' && e.closest('fieldset.phone-input') && !country) return null;
     if (extras.length) requiredProxies.add(extras[0]);
+    graphNodes.set(e, {label:L, display:display[0]});
     return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),
       field_selector:selector(F),value_container_selector:selector(V),
       input_wrapper_selector:selector(W),hidden_selector:country ? undefined : H ? selector(H) : '',
@@ -143,7 +148,7 @@ _WIDGET_GRAPH = r"""
     if (e.tagName!=='INPUT' || attr(e,'role')!=='combobox' || newGraphs.get(e)) return false;
     const W=e.parentElement, V=W?.parentElement;
     if (e.form && W?.contains(e) && V && Array.from(V.children).some(n=>n!==W &&
-        visible(n) && (singleBranch(n) || placeholderBranch(n)))) return true;
+        graphVisible(n) && (singleBranch(n) || placeholderBranch(n)))) return true;
     const L=byId(attr(e,'aria-labelledby'));
     let F=e.parentElement; while (F && F.tagName!=='FORM' && !F.contains(L)) F=F.parentElement;
     return !!L && !!F && F.tagName!=='FORM' && Array.from(F.querySelectorAll(editable)).some(n=> {
@@ -244,12 +249,17 @@ _WIDGET_GRAPH = r"""
     const parts=[container,...container.querySelectorAll('*')];
     const structural=new Set([container,button,dialog,searchWrapper,search,clear,list,...options]);
     const auxiliary=n => {
-      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE'].includes(n.tagName.toUpperCase()) ||
+      const tag=n.tagName.toUpperCase(), newTag=['LINE','MASK','RECT'].includes(tag);
+      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE','LINE','MASK','RECT'].includes(tag) ||
           attr(n,'role') || n.matches('input,button,a,select,textarea,[contenteditable]')) return false;
+      const svg=n.closest('svg'), icon=n.closest('.iti__search-icon');
+      const iconPlacement=!!icon && icon.parentElement===searchWrapper;
+      const clearPlacement=!!svg && svg.parentElement===clear;
+      // Neither pre-existing containment shortcut grants these new SVG tags.
+      if (newTag && (!svg || (!iconPlacement && !clearPlacement))) return false;
       if (button.contains(n) || options.some(o=>o.contains(n))) return true;
       if (n.parentElement===dialog) return n.matches('span.iti__a11y-text,div.iti__no-results');
-      const icon=n.closest('.iti__search-icon');
-      return !!icon && icon.parentElement===searchWrapper;
+      return iconPlacement || clearPlacement;
     };
     const claimants=Array.from(document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]'));
     if (options.length!==244 || list.children.length!==244 ||

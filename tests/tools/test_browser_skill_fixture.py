@@ -1,7 +1,7 @@
 """Offline adversarial proof of the daemon-exclusive synthetic BrowserSkill fixture.
 
 Tests never start Chrome/BSK, reach owner stores or queue an apply. One
-operator-authorized teardown regression opens only an ephemeral loopback socket.
+architect-authorized teardown regression opens only an ephemeral loopback socket.
 """
 from __future__ import annotations
 
@@ -772,6 +772,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
             def serve_forever(self):
                 pass
             def shutdown(self):
+                pass
+            def server_close(self):
                 pass
         http.server.HTTPServer = OfflineHTTPServer
 

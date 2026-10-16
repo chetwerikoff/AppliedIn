@@ -312,6 +312,37 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
+  const leverQuestion = e => {
+    const cardSelector = 'li.application-question.custom-question';
+    if (e.tagName !== 'INPUT' || !['radio','checkbox'].includes(e.type)) return null;
+    const card = e.closest(cardSelector);
+    if (!card) return null;
+    // A question is approval identity: prove the whole nearest card, never a subset.
+    const owner = e.form;
+    const labels = Array.from(card.querySelectorAll('div.application-label'));
+    const fields = Array.from(card.querySelectorAll('div.application-field'));
+    const texts = labels.length === 1 ? Array.from(labels[0].querySelectorAll('div.text')) : [];
+    const members = Array.from(card.querySelectorAll(
+      'input,textarea,select,button,[role="button"],[role="combobox"],'+
+      '[role="radio"],[role="checkbox"],[contenteditable="true"]'));
+    if (!owner || !owner.contains(card) || !owner.contains(e) ||
+        labels.length !== 1 || fields.length !== 1 || texts.length !== 1 ||
+        texts[0].parentElement !== labels[0] || !visible(texts[0]) ||
+        !clean(texts[0].innerText) || !members.length) return '';
+    if (e.type === 'checkbox' ? members.length !== 1 : !clean(e.name)) return '';
+    if (!members.every(m => {
+      const caption = m.closest('label');
+      const item = caption?.parentElement;
+      const list = item?.parentElement;
+      return m.tagName === 'INPUT' && m.type === e.type &&
+        (e.type !== 'radio' || m.name === e.name) &&
+        m.closest(cardSelector) === card && m.form === owner && owner.contains(m) &&
+        caption?.tagName === 'LABEL' && item?.tagName === 'LI' &&
+        list?.tagName === 'UL' && list.hasAttribute('data-qa') &&
+        list.parentElement === fields[0];
+    })) return '';
+    return clean(texts[0].innerText);
+  };
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
@@ -319,8 +350,10 @@ PAGE = r"""(() => {
     const group = e.closest(
       'fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
     const graph = newGraphs.get(e);
-    const question = graph ? label(e) : clean(group?.querySelector(
+    let question = graph ? label(e) : clean(group?.querySelector(
       'legend,[data-automation-id="formLabel"]')?.innerText || group?.innerText || '');
+    const lever = group === null ? leverQuestion(e) : null;
+    if (lever !== null) question = lever;
     const type = e.getAttribute('role') ||
       ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
         (e.getAttribute('type') || e.tagName.toLowerCase()));
@@ -333,6 +366,7 @@ PAGE = r"""(() => {
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
+      ...(lever === '' ? {lever_card_unresolved:true} : {}),
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',

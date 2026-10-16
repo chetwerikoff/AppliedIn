@@ -1,7 +1,7 @@
 """Offline adversarial proof of the daemon-exclusive synthetic BrowserSkill fixture.
 
-Tests never start Chrome/BSK, reach owner stores or queue an apply. One
-architect-authorized teardown regression opens only an ephemeral loopback socket.
+No test opens a socket, starts Chrome/BSK, reaches owner stores or queues an apply.
+The eventual native-positive primary-checkout traversal is operator-only.
 """
 from __future__ import annotations
 
@@ -25,48 +25,104 @@ from tools import browser_skill_apply as forms
 from tools import browser_skill_fixture as fixture
 
 
-def test_idle_loopback_preconnect_cannot_block_fixture_shutdown():
-    """A browser may preconnect without sending a request between smoke legs."""
-    import socket
-    import time
-    from http.server import HTTPServer
+def _assert_handler_socket_timeout():
+    from socketserver import StreamRequestHandler
 
-    accepted, stopped = threading.Event(), threading.Event()
+    calls = []
+    connection = SimpleNamespace(
+        settimeout=lambda seconds: calls.append(seconds),
+        makefile=lambda *_args: io.BytesIO())
+    handler = object.__new__(fixture._FixtureHandler)
+    handler.request = connection
+    StreamRequestHandler.setup(handler)
+    assert calls == [2]
+    assert fixture._FixtureHandler.timeout == 2
 
-    class Handler(fixture._FixtureHandler):
-        def setup(self):
-            super().setup()
-            accepted.set()
 
-    server = HTTPServer(('127.0.0.1', 0), Handler)
-    serving = threading.Thread(target=server.serve_forever, daemon=True)
-    serving.start()
-    idle = socket.create_connection(server.server_address, timeout=1)
-    shutdown = None
-    try:
-        assert accepted.wait(1), 'idle connection must be accepted before shutdown'
-        started = time.monotonic()
+def test_handler_applies_timeout_to_accepted_connection(monkeypatch):
+    """StreamRequestHandler, not HTTPServer.timeout, bounds the accepted read."""
+    _assert_handler_socket_timeout()
+    with monkeypatch.context() as removed:
+        removed.delattr(fixture._FixtureHandler, 'timeout')
+        with pytest.raises(AssertionError):
+            _assert_handler_socket_timeout()
+    _assert_handler_socket_timeout()
 
-        def stop():
-            server.shutdown()
-            server.server_close()
-            serving.join(timeout=3)
-            stopped.set()
 
-        shutdown = threading.Thread(target=stop, daemon=True)
-        shutdown.start()
-        assert stopped.wait(5), 'idle preconnect trapped the single-threaded fixture teardown'
-        assert time.monotonic() - started < 5
-        assert not serving.is_alive()
-    finally:
-        # Also clean up the deliberate RED run, whose handler has no timeout.
-        idle.close()
-        if shutdown is not None:
-            shutdown.join(timeout=3)
-        else:
-            server.shutdown()
-        server.server_close()
-        serving.join(timeout=3)
+def _assert_scenario_teardown(monkeypatch, capsys, *, alive, reader=None):
+    events = []
+
+    class BodyStopped(Exception):
+        pass
+
+    class Server:
+        def __init__(self, *_args):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            pass
+        def serve_forever(self):
+            raise AssertionError('fake thread must never serve or bind a socket')
+        def shutdown(self):
+            events.append('shutdown')
+        def server_close(self):
+            events.append('server_close')
+
+    class Thread:
+        def __init__(self, **_kwargs):
+            pass
+        def start(self):
+            pass
+        def join(self, timeout):
+            assert timeout == 3
+            events.append('join')
+        def is_alive(self):
+            return alive
+
+    async def stop_body(*_args, **_kwargs):
+        raise BodyStopped()
+
+    with monkeypatch.context() as fake:
+        fake.setattr(fixture, 'HTTPServer', Server)
+        fake.setattr(threading, 'Thread', Thread)
+        fake.setattr(fixture, '_daemon_origin', lambda: True)
+        fake.setattr(fixture._SyntheticRun, 'enable_positive_fixture', lambda self: None)
+        fake.setattr(forms, 'apply', stop_body)
+        if reader is not None:
+            reader.__globals__.update(_daemon_origin=fixture._daemon_origin,
+                                      HTTPServer=Server)
+            fake.setattr(fixture, '_run_scenario', reader)
+        with pytest.raises(Exception) as raised:
+            fixture.run()
+    assert events == ['shutdown', 'server_close', 'join']
+    if alive:
+        assert type(raised.value) is RuntimeError
+        assert str(raised.value) == 'Synthetic fixture harness server did not stop.'
+    else:
+        assert type(raised.value) is BodyStopped
+    # run() must not turn an incomplete scenario/teardown into aggregate PASS.
+    assert capsys.readouterr().out == ''
+
+
+@pytest.mark.parametrize('guard,alive', [
+    ('            if thread.is_alive():\n'
+     "                raise RuntimeError('Synthetic fixture harness server did not stop.')", True),
+    ('            server.server_close()', False),
+])
+def test_scenario_teardown_guards_and_removal_sensitivity(monkeypatch, capsys, guard, alive):
+    """Each actual teardown guard is sensitive without a listener or live thread."""
+    import inspect
+
+    _assert_scenario_teardown(monkeypatch, capsys, alive=alive)
+    source = inspect.getsource(fixture._run_scenario)
+    assert source.count(guard) == 1, 'counterfactual must remove exactly its own guard'
+    namespace = dict(fixture.__dict__)
+    exec(compile(source.replace(guard, ''), '<teardown-guard-removed>', 'exec'), namespace)
+    with pytest.raises(AssertionError):
+        _assert_scenario_teardown(monkeypatch, capsys, alive=alive,
+                                  reader=namespace['_run_scenario'])
+    _assert_scenario_teardown(monkeypatch, capsys, alive=alive)
 
 
 @pytest.fixture

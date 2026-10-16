@@ -189,6 +189,27 @@ if(!flat){
 }
 const list=make('ul','country-list',{class:'iti__country-list',role:'listbox'},dd);
 for(let i=0;i<244;i++)make('li','picker-option-'+i,{class:'iti__country',role:'option'},list,'Synthetic '+i);
+if(scenario.svgParts){
+  const icon=nodes.find(n=>n.id==='search-icon'), svg=nodes.find(n=>n.id==='search-svg');
+  make('circle','icon-circle',{},svg);
+  make('line','icon-line',{},scenario.svgParts==='outside-svg'?icon:svg);
+  const clear=nodes.find(n=>n.id==='country-clear');
+  const parent=scenario.svgParts==='selected'?button:scenario.svgParts==='option'?list.children[0]:
+    scenario.svgParts==='wrong-button'?make('button','other-clear',{type:'button'},sw):clear;
+  const tree=make('svg','clear-svg',{},parent);
+  make('line','clear-line',{},tree);
+  const mask=make('mask','clear-mask',{},tree);
+  const rect=make('rect','clear-rect',{},mask);
+  if(scenario.svgParts==='rect-visible')rect.rects=[{width:10,height:10,right:10,bottom:10}];
+  make('path','clear-path',{},mask);
+  make('circle','clear-circle',{},tree);
+}
+if(scenario.oldSvgDecoration){
+  for(const parent of [button,list.children[0]]){
+    const svg=make('svg','decoration-'+parent.id,{},parent);
+    make('path','path-'+parent.id,{},svg);make('circle','circle-'+parent.id,{},svg);
+  }
+}
 if(scenario.secondIti){
   const clone=(n,parent)=>{
     const attrs={...n.attrs};

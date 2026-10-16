@@ -249,12 +249,17 @@ _WIDGET_GRAPH = r"""
     const parts=[container,...container.querySelectorAll('*')];
     const structural=new Set([container,button,dialog,searchWrapper,search,clear,list,...options]);
     const auxiliary=n => {
-      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE'].includes(n.tagName.toUpperCase()) ||
+      const tag=n.tagName.toUpperCase(), newTag=['LINE','MASK','RECT'].includes(tag);
+      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE','LINE','MASK','RECT'].includes(tag) ||
           attr(n,'role') || n.matches('input,button,a,select,textarea,[contenteditable]')) return false;
+      const svg=n.closest('svg'), icon=n.closest('.iti__search-icon');
+      const iconPlacement=!!icon && icon.parentElement===searchWrapper;
+      const clearPlacement=!!svg && svg.parentElement===clear;
+      // Neither pre-existing containment shortcut grants these new SVG tags.
+      if (newTag && (!svg || (!iconPlacement && !clearPlacement))) return false;
       if (button.contains(n) || options.some(o=>o.contains(n))) return true;
       if (n.parentElement===dialog) return n.matches('span.iti__a11y-text,div.iti__no-results');
-      const icon=n.closest('.iti__search-icon');
-      return !!icon && icon.parentElement===searchWrapper;
+      return iconPlacement || clearPlacement;
     };
     const claimants=Array.from(document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]'));
     if (options.length!==244 || list.children.length!==244 ||

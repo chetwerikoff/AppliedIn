@@ -851,6 +851,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           (e.getAttribute('type') || e.tagName.toLowerCase()));
       const ownSelector = selector(e), formSelector = form ? selector(form) : '';
       const graph = newGraphs.get(e);
+      const exactNodes = graphNodes.get(e);
       const list = type === 'combobox' ? currentListbox(e) : null;
       const opts = list ? Array.from(list.querySelectorAll('[role="option"]'))
         .filter(o=>o.closest('[role="listbox"]') === list && visible(o))
@@ -881,6 +882,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
+        ...(graph ? {graph_label_strict_visible:!!exactNodes && visible(exactNodes.label),
+          graph_display_strict_visible:!!exactNodes && visible(exactNodes.display)} : {}),
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
@@ -1470,6 +1473,10 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         _inventory_ok(current)
         require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
         if not readiness:
+            # Graph equality is recognition only. These fresh witness-only flags
+            # preserve strict label/value visibility at every phase and pre-submit read.
+            for target in current['controls']:
+                _require_graph_visibility(target, lookup[target['selector']])
             _observe_closed_admissions(session, current, transition=closed_transition)
         return current, lookup
     except Gate:
@@ -1694,6 +1701,12 @@ def _same_key(value: str) -> str:
     return ' '.join(value.casefold().split())
 
 
+def _require_graph_visibility(target, witness):
+    if _closed_mode(target) and any(witness.get(k) is not True for k in (
+            'graph_label_strict_visible', 'graph_display_strict_visible')):
+        raise Gate('This control is not visibly editable.')
+
+
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None) -> dict:
@@ -1731,6 +1744,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         raise Gate('Complete native labels and questions are required.')
     for member in members:
         dom = witness.get(member['selector'])
+        _require_graph_visibility(member, dom or {})
         if (not dom or dom.get('visible') is not True
                 or dom.get('readonly') is True or dom.get('disabled') is True
                 or dom.get('inert') is True or member.get('disabled')

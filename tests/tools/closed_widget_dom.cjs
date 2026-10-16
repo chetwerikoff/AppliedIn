@@ -10,7 +10,7 @@ function make(tag,id,attrs={},parent=null,text='') {
     closest:q=>{for(let p=n;p;p=p.parentElement)if(matches(p,q))return p;return null;},
     querySelectorAll:q=>nodes.filter(o=>o!==n&&n.contains(o)&&matches(o,q)),
     querySelector:q=>n.querySelectorAll(q)[0]||null,
-    getClientRects:()=>n.closest('[hidden]')||n.type==='hidden'?[]:[{width:120,height:24,right:120,bottom:24}]};
+    getClientRects:()=>n.rects!==undefined?n.rects:n.closest('[hidden]')||n.type==='hidden'?[]:[{width:120,height:24,right:120,bottom:24}]};
   Object.defineProperty(n,'attributes',{get:()=>Object.keys(attrs).map(name=>({name,value:attrs[name]}))});
   Object.defineProperty(n,'form',{get:()=>Object.hasOwn(n,'formOwner')?n.formOwner:tag==='input'||tag==='button'||tag==='textarea'?n.closest('form'):undefined});
   Object.defineProperty(n,'innerText',{get:()=>text+n.children.map(c=>c.innerText).join('')});
@@ -45,7 +45,7 @@ const root=make('html','root'),body=make('body','body',{},root);
 const form=make('form','application',{},body);form.action='https://example-co.test/job/1';
 const keys=['location','school','degree','discipline'];
 function proxyFor(key,input,F,shell,phase){
-  if(!scenario.requiredProxy)return;
+  if(!scenario.requiredProxy || (scenario.proxyKeys && !scenario.proxyKeys.includes(key)))return;
   input.attrs['aria-required']='true';
   const change=scenario.proxyMutation?.key===key?scenario.proxyMutation:{};
   if(change.ownerAttr){const [k,v]=change.ownerAttr;if(v===null)delete input.attrs[k];else input.attrs[k]=v;}
@@ -240,11 +240,19 @@ if(scenario.fixtureTree){
   };
   build(scenario.fixtureTree);
 }
+// Style/geometry contrasts are applied to identical nodes for each independent reader.
+for(const change of scenario.visibility || []){
+  const n=nodes.find(n=>n.id===change.id);
+  if(change.style)n.computed={...(n.computed||{}),...change.style};
+  if(change.parentStyle)n.parentElement.computed={...change.parentStyle};
+  if(change.rects!==undefined)n.rects=change.rects;
+}
 global.document={readyState:'complete',title:'Synthetic',body:nodes.find(n=>n.tagName==='BODY'),
   querySelectorAll:q=>nodes.filter(n=>matches(n,q)),querySelector:q=>nodes.find(n=>matches(n,q))||null,
   getElementById:id=>nodes.find(n=>n.id===id)||null};
-global.location={href:scenario.fixtureUrl||form.action};global.CSS={escape:s=>s};global.scrollX=0;global.scrollY=0;
+global.location={href:scenario.fixtureUrl||form.action};global.CSS={escape:s=>s};global.scrollX=scenario.scrollX||0;global.scrollY=scenario.scrollY||0;
 global.getComputedStyle=n=>({visibility:'visible',display:'block',opacity:'1',position:'static',pointerEvents:'auto',...(n.computed||{}),
   ...(scenario.fixtureTree&&n.attrs.class==='validation-only'?{opacity:'0',position:'absolute',pointerEvents:'none'}:{})});
+global.__graphs=[];
 const page=eval(process.argv[3]),witness=eval(process.argv[4]);
-console.log(JSON.stringify({page,witness}));
+console.log(JSON.stringify({page,witness,...(global.__graphs.length?{graphs:global.__graphs}:{})}));

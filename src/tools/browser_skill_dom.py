@@ -550,6 +550,93 @@ _ASHBY_ROOT = r"""
     paneNodes.add(p); p.querySelectorAll('*').forEach(n=>paneNodes.add(n));
   }
   paneNodes.forEach(n=>excluded.add(n));
+  // This full-node witness is compared only by the single upload transition.
+  // Signatures never export raw static text or value-bearing attributes.
+  const signature = text => {
+    const h=[2166136261,2246822519,3266489917,668265263];
+    for (const c of text) for(let i=0;i<h.length;i++)
+      h[i]=Math.imul(h[i]^c.codePointAt(0),16777619+i*2)>>>0;
+    return h.map(n=>n.toString(16).padStart(8,'0')).join('');
+  };
+  const uploadTree={complete:false,nodes:[],input:null,container:null,dropzone:null,
+    items:[],svgs:[],attached:false};
+  if (structuralRoot) try {
+    const source=[], stack=[[structuralRoot,-1]];
+    while(stack.length) {
+      const [n,parent]=stack.pop();
+      if (![1,3].includes(n.nodeType)) throw Error('unreadable structural node');
+      if(source.length>=4096) throw Error('structural node bound');
+      const index=source.length; source.push(n);
+      let attrs=[], text='';
+      if(n.nodeType===1) {
+        if(n.shadowRoot || !n.attributes || !n.childNodes) throw Error('unreadable subtree');
+        attrs=Array.from(n.attributes,a=>[a.name,
+          /value|token|response|password/i.test(a.name)
+            ? '' : signature(a.value)]).sort((a,b)=>a[0].localeCompare(b[0]));
+      } else {
+        // Never read an applicant value, autofill, script or CAPTCHA response.
+        const p=n.parentElement;
+        if(!p || !p.closest('input,textarea,select,[contenteditable],script,style,.ashby-application-form-autofill-pane')
+            && !responseNodes.some(r=>r===p || r.contains(p))) text=signature(n.textContent);
+      }
+      uploadTree.nodes.push({parent,tag:n.nodeType===3 ? '#text' : n.localName,
+        attrs,text,selector:n.nodeType===1 ? (n.id ? '#'+signature(n.id) : selector(n)) : ''});
+      if(n.nodeType===1) {
+        const children=Array.from(n.childNodes);
+        if(children.length!==n.childNodes.length) throw Error('incomplete subtree');
+        for(let i=children.length-1;i>=0;i--) stack.push([children[i],index]);
+      }
+    }
+    const inputs=source.filter(n=>n.nodeType===1 && n.id==='_systemfield_resume');
+    const input=inputs.length===1 ? inputs[0] : null;
+    const file=input?.closest('div.ashby-application-form-input-file');
+    const drops=file ? Array.from(file.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')) : [];
+    const drop=drops.length===1 ? drops[0] : null;
+    if(!input || input.type!=='file' || !file || !container.contains(file) ||
+        file.querySelectorAll('input').length!==1 || !drop || drop.form ||
+        structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload').length!==1 ||
+        drop.hasAttribute('form') || drop.hasAttribute('formaction') ||
+        drop.disabled || drop.closest('[inert]') || !visible(drop)) throw Error('ambiguous file container');
+    uploadTree.input=source.indexOf(input); uploadTree.container=source.indexOf(file);
+    uploadTree.dropzone=source.indexOf(drop);
+    uploadTree.nodes[uploadTree.input].target_selector=selector(input);
+    uploadTree.nodes[uploadTree.dropzone].target_selector=selector(drop);
+    uploadTree.svgs=Array.from(drop.querySelectorAll('svg')).filter(n=>
+      !n.parentElement.closest('svg')).map(n=>source.indexOf(n));
+    const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));
+    uploadTree.items=items.map(n=>source.indexOf(n));
+    if(items.length===1) {
+      const item=items[0], names=item.querySelectorAll('p.ashby-application-form-input-file-item-name'),
+        deletes=item.querySelectorAll('button.ashby-application-form-input-file-item-delete[title]');
+      const name=names[0], del=deletes[0];
+      const passiveAttrs=(n,allowed)=>Array.from(n.attributes).every(a=>allowed.includes(a.name));
+      const passiveIcon=n=>n.namespaceURI==='http://www.w3.org/2000/svg' &&
+        ['svg','g','path','circle','ellipse','line','polyline','polygon','rect'].includes(n.localName) &&
+        Array.from(n.attributes).every(a=>!/^on|href|tabindex|role|form/i.test(a.name));
+      const passiveName=n=>['span','strong','em','b','i'].includes(n.localName) &&
+        Array.from(n.attributes).every(a=>!/^on|^(role|tabindex|href|contenteditable)$/i.test(a.name));
+      const valid=item.parentElement===file && names.length===1 && deletes.length===1 &&
+        item.children.length===2 && name.parentElement===item && del.parentElement===item &&
+        Array.from(name.querySelectorAll('*')).every(passiveName) &&
+        Array.from(del.querySelectorAll('*')).every(passiveIcon) &&
+        !clean(del.textContent) &&
+        passiveAttrs(item,['id','class']) && passiveAttrs(name,['id','class']) &&
+        passiveAttrs(del,['id','class','title','type']) &&
+        [null,'button'].includes(del.getAttribute('type')) &&
+        Array.from(item.childNodes).every(n=>n===name || n===del ||
+          n.nodeType===3 && !n.textContent.trim()) &&
+        !del.form && !del.hasAttribute('form') && !del.hasAttribute('formaction') &&
+        !del.getAttribute('role') && !del.disabled && !del.closest('[inert]') &&
+        input.files?.length===1 && clean(name.innerText)===input.files[0].name;
+      if(valid) {
+        uploadTree.attached=true; uploadTree.filename=clean(name.innerText);
+        uploadTree.delete=source.indexOf(del);
+        // A proven passive delete never enters any downstream action consumer.
+        excluded.add(del);
+      }
+    }
+    uploadTree.complete=true;
+  } catch (_) { uploadTree.complete=false; }
   // Description links remain in the original PAGE inventory; they are not
   // input/receiver candidates. Role-button links still enter this census and
   // no link acquires action authority through the structural branch.
@@ -771,7 +858,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   }
   const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
     root:nativeRoot ? {selector:selector(nativeRoot),action:nativeRoot.action} : null,
-    formless,root_evidence:rootEvidence,
+    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,
     helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
         getComputedStyle(e).display!=='none'))};

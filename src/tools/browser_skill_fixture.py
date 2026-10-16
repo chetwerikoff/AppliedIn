@@ -31,6 +31,7 @@ _COMBO_SELECTORS = {
 _CHOICE_SELECTORS = {**_COMBO_SELECTORS, 'Country': '#country'}
 _FACTS = {
     'Name': 'Test User', 'Additional question': 'Synthetic answer',
+    'Email': 'test@example-co.test',
     'Where are you located?': 'Synthetic Example City',
     'School': 'Synthetic School', 'Degree': 'Synthetic Degree',
     'Discipline': 'Synthetic Discipline', 'Phone': '+12025550123',
@@ -162,6 +163,32 @@ label {display:block} .clipped {position:absolute;width:1px;height:1px;clip:rect
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/anchor" style="display:none"></iframe>
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/bframe" style="display:none"></iframe>
 <div><iframe style="display:none"></iframe></div></body></html>'''
+
+def _ashby_upload_form() -> bytes:
+    # Keep the original first-human Gate intact; this is a separate chooser leg.
+    document = _ashby_form().replace(b'>Application answer</label>', b'>Name</label>')
+    document = document.replace(
+        b'<button type="button" class="ashby-application-form-input-file-dropzone-upload">Upload</button>',
+        b'<button id="ashby-upload-dropzone" type="button" '
+        b'class="ashby-application-form-input-file-dropzone-upload">'
+        b'<svg viewBox="0 0 10 10"><path d="M0 0L10 10"></path></svg>Upload</button>')
+    script = b'''<script>
+const input=document.getElementById('_systemfield_resume');
+const drop=document.getElementById('ashby-upload-dropzone');
+drop.addEventListener('click',()=>input.click());
+input.addEventListener('change',()=>{
+ if(input.files.length!==1)return;
+ const item=document.createElement('div');item.className='ashby-application-form-input-file-item';
+ const name=document.createElement('p');name.className='ashby-application-form-input-file-item-name';
+ name.textContent=input.files[0].name;
+ const remove=document.createElement('button');remove.title='Remove attachment';
+ remove.className='ashby-application-form-input-file-item-delete';
+ item.append(name,remove);input.parentElement.insertBefore(item,drop);
+ drop.querySelector('svg')?.remove();
+});
+</script>'''
+    return document.replace(b'</body>', script + b'</body>')
+
 
 
 def _entry_form() -> bytes:
@@ -359,7 +386,8 @@ class _SyntheticRun:
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
                  "greenhouse", "visible_badge_anchor", "native_validity",
-                 "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc")
+                 "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
+                 "ashby_upload", "upload_ipc")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -408,6 +436,8 @@ class _SyntheticRun:
         self.ashby = False
         self.custom_question = ''
         self.choice_ipc = 0
+        self.ashby_upload = False
+        self.upload_ipc = 0
         self.observe_page(None)
 
     def entry_provenance(self):
@@ -431,6 +461,20 @@ class _SyntheticRun:
                 and (self.ashby or self.custom_question or (self.entry_initial_not_ready and
                     {f['status'] for f in page['entry']['frames']} == {'H', 'R', 'W', 'X'}))):
             self.entry_wait = 'PASS'
+            if self.ashby_upload:
+                # Synthetic-only grants bind to the already independently admitted
+                # root. No owner facts, approval service or persistence is involved.
+                from tools.browser_skill_apply import _disclosure_question
+                witness = {c['selector']: c for c in page['entry']['root_evidence']}
+                for target in page['controls']:
+                    if target['selector'] not in {'#_systemfield_name', '#_systemfield_email'}:
+                        continue
+                    q = _disclosure_question(page, target, witness, URL,
+                                             provenance=self.entry_provenance())
+                    self.row['human_approved_answers'][q['label']] = {
+                        'value': _FACTS[q['label']], 'label': q['control_label'],
+                        **{k: q[k] for k in ('selector', 'url', 'question', 'tag', 'type',
+                                             'form_selector', 'form_action')}}
 
 
     def enable_positive_fixture(self) -> None:
@@ -454,6 +498,10 @@ class _SyntheticRun:
             }
 
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
+        if self.ashby_upload:
+            return (('fill', '#_systemfield_name', '--value', _FACTS['Name']),
+                    ('fill', '#_systemfield_email', '--value', _FACTS['Email']),
+                    ('upload', '#ashby-upload-dropzone', '--file', self.resume_path))
         return (('fill', '#name', '--value', _FACTS['Name']),
                 *(ipc for selector in _CHOICE_SELECTORS.values()
                   for ipc in (('click', selector), ('click', selector+'-option'))),
@@ -566,6 +614,13 @@ class _SyntheticRun:
             {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
             {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},
         )
+        if self.ashby_upload:
+            actions = (
+                {'action': 'fill', 'selector': '#_systemfield_name', 'fact': 'Name'},
+                {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'},
+                {'action': 'upload', 'selector': '#_systemfield_resume'},
+                {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},
+            )
         if model != "synthetic-fixture" or self.decisions >= len(actions):
             raise ValueError("Synthetic decision sequence exhausted; rerun fixture.")
         action = actions[self.decisions]
@@ -708,7 +763,7 @@ class _SyntheticRun:
                     state.submit_call_entered += 1
                     state.submit_guard = "denied: fixture forbids committing BSK IPC"
                     raise PermissionError("Fixture never permits submission-capable IPC.")
-                if state.ashby:
+                if state.ashby and not state.ashby_upload:
                     raise PermissionError("Fixture never permits applicant or committing BSK IPC.")
                 sequence = state._positive_ipc()
                 if (state.ipc_index >= len(sequence) or args != sequence[state.ipc_index]
@@ -724,6 +779,8 @@ class _SyntheticRun:
                     selector = _CHOICE_SELECTORS[key]
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
+                if args[0] == 'upload':
+                    state.upload_ipc += 1
                 await raw.call(*args, **kwargs)
                 if state.greenhouse and args[0] == 'click' and args[1] in _OPTION_SELECTORS:
                     result = await raw.call('evaluate', _COMMITTED_VALIDITY)
@@ -770,6 +827,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         document = _greenhouse_form() if type(state) is _SyntheticRun and state.greenhouse else _FORM
         if type(state) is not _SyntheticRun or state.ashby:
             document = _ashby_form()
+        if type(state) is _SyntheticRun and state.ashby_upload:
+            document = _ashby_upload_form()
         if type(state) is _SyntheticRun and state.w_lookalike:
             document = document.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
         if type(state) is _SyntheticRun and state.custom_question:
@@ -809,7 +868,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         pass  # Never log request headers, URLs or session data.
 
 
-def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_question='') -> int:
+def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
+                  custom_question='', ashby_upload=False) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -826,8 +886,9 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_qu
                 state = _SyntheticRun(str(document))
                 state.greenhouse = greenhouse
                 state.w_lookalike = w_lookalike
-                state.ashby = ashby
+                state.ashby = ashby or ashby_upload
                 state.custom_question = custom_question
+                state.ashby_upload = ashby_upload
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -972,6 +1033,22 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_qu
                     gate = {'kind': result.get('reason') or result.get('status'),
                             'field': form_question.get('control_label'),
                             'reason': result.get('question') or result.get('detail')}
+                elif state.ashby_upload:
+                    tree = (state.last_page or {}).get('entry', {}).get('upload_tree') or {}
+                    files = [c.get('files') for c in (state.last_page or {}).get('controls', [])
+                             if c.get('selector') == '#_systemfield_resume']
+                    ok = (result.get('status') == 'gate' and state.entry_wait == 'PASS'
+                          and form_question.get('selector') == '#additional'
+                          and form_question.get('owner_kind') == 'ashby-formless-root'
+                          and state.fills == 2 and state.decisions == 4
+                          and state.ipc_index == 3 and state.upload_ipc == 1 and state.uploaded
+                          and tree.get('complete') is True and tree.get('attached') is True
+                          and tree.get('filename') == Path(state.resume_path).name
+                          and files == [[Path(state.resume_path).name]]
+                          and not tree.get('svgs') and not state.committed
+                          and state.submit_call_entered == state.submit_ipc == 0
+                          and state.post_attempts == state.post_count == 0
+                          and (state.last_page or {}).get('inventory_verified') is True)
                 inventory = {key: (state.last_page or {}).get(key) for key in (
                     "inventory_verified", "truncated", "opaque_controls",
                     "shadow_roots", "unsupported_frames")}
@@ -982,6 +1059,7 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_qu
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
                                   'scenario': ('lever_custom_'+custom_question if custom_question else
+                                               'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
                                                'w_button_aria_label' if w_lookalike else
                                                'greenhouse' if greenhouse else 'entry'),
@@ -996,8 +1074,12 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_qu
                                   "submitted": state.submit_ipc > 0,
                                   "status": result.get("status"),
                                   'applicant_ipc': state.ipc_index, 'model_decisions': state.decisions,
+                                  'upload_ipc': state.upload_ipc, 'submit_ipc': state.submit_ipc,
+                                  'other_ipc': state.ipc_index - state.fills - state.upload_ipc,
+                                  'post_attempts': state.post_attempts, 'post_count': state.post_count,
                                   'root_witnessed': state.entry_wait == 'PASS',
                                   'final_stage': ('unknown-frame-gate' if w_lookalike else
+                                                  'ashby-upload-attached-human-gate' if state.ashby_upload else
                                                   'direct-human-question' if state.ashby else
                                                   'Additional question') if ok else 'premature',
                                   "post_received": state.post_count == 1,
@@ -1022,14 +1104,15 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False, custom_qu
 
 
 def run() -> int:
-    """Every invocation exercises all six isolated, sealed question/frame legs."""
+    """Every invocation exercises all seven isolated, sealed question/frame legs."""
     entry = _run_scenario()
     greenhouse = _run_scenario(greenhouse=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
+    ashby_upload = _run_scenario(ashby_upload=True)
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
-    scenarios = (entry, greenhouse, lookalike, ashby, radio, checkbox)
+    scenarios = (entry, greenhouse, lookalike, ashby, ashby_upload, radio, checkbox)
     ok = all(result == 0 for result in scenarios)
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',

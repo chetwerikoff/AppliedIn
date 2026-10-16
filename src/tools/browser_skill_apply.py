@@ -1000,9 +1000,12 @@ def _identity(target: dict) -> tuple:
         'required', 'has_value', 'value', 'checked', 'name'))
 
 def _page_identity(page: dict) -> tuple:
+    entry = page.get('entry')
+    if isinstance(entry, dict):
+        entry = {k: v for k, v in entry.items() if k != 'upload_tree'}
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
             page.get('opaque_controls'), page.get('shadow_roots'),
-            page.get('unsupported_frames'), repr(page.get('entry')),
+            page.get('unsupported_frames'), repr(entry),
             repr(page.get('greenhouse')),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
@@ -1255,6 +1258,81 @@ def _root_identity(page: dict):
                             if k not in {'value', 'has_value', 'files'}) for c in evidence))
 
 
+def _upload_tree(page):
+    tree = (page.get('entry') or {}).get('upload_tree')
+    if (not isinstance(tree, dict) or tree.get('complete') is not True
+            or not isinstance(tree.get('nodes'), list)
+            or not 1 <= len(tree['nodes']) <= 4096):
+        raise Gate('Incomplete or overflowing upload structural witness; inspect manually.')
+    nodes = tree['nodes']
+    for i, node in enumerate(nodes):
+        if (not isinstance(node, dict) or node.get('tag') is None
+                or type(node.get('parent')) is not int
+                or (node['parent'] != -1 if i == 0 else not 0 <= node['parent'] < i)):
+            raise Gate('Ambiguous upload structural traversal; inspect manually.')
+    for key in ('input', 'container', 'dropzone'):
+        if type(tree.get(key)) is not int or not 0 <= tree[key] < len(nodes):
+            raise Gate('Original upload input/container/dropzone is ambiguous.')
+    return tree
+
+
+def _upload_shape(tree, removed=()):
+    # Re-key edges after the sole allowed insertion/removal, never selectors.
+    nodes, kept, output = tree['nodes'], {}, []
+    removed = set(removed)
+    for i, node in enumerate(nodes):
+        if i in removed or node['parent'] in removed:
+            removed.add(i)
+            continue
+        kept[i] = len(output)
+        output.append((kept.get(node['parent'], -1), node.get('tag'),
+                       node.get('attrs'), node.get('text')))
+    return output
+
+
+def _upload_input(page, tree):
+    selector = tree['nodes'][tree['input']]['target_selector']
+    matches = [c for c in page['entry']['root_evidence']
+               if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
+               and c.get('selector') == selector]
+    if len(matches) != 1:
+        raise Gate('Original semantic résumé input is no longer proven.')
+    return matches[0]
+
+
+def _upload_delta(before, after, filename):
+    pre, post = _upload_tree(before), _upload_tree(after)
+    current = _upload_input(after, post)
+    if _formless_root(before) != _formless_root(after) or before['url'] != after['url']:
+        raise Gate('Original application root or submit changed during upload.')
+    if current.get('files') != [filename]:
+        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
+    # Candidate semantics and values must survive positional selector re-keying.
+    def candidates(page):
+        original = _upload_input(page, _upload_tree(page))
+        # The chooser sets fakepath/value flags; only this verified input may change them.
+        return [{k: v for k, v in c.items()
+                 if k not in {'selector', 'label_selector', 'files'}
+                 and (c is not original or k not in {'value', 'has_value'})}
+                for c in page['entry']['root_evidence']]
+    if candidates(before) != candidates(after):
+        raise Gate('Application control semantics changed during upload.')
+    if _upload_shape(pre) == _upload_shape(post) and not post.get('items'):
+        return False
+    if (pre.get('items') or not post.get('attached') or post.get('filename') != filename
+            or len(post.get('items', [])) != 1):
+        raise Gate('The exact passive attached-file item was not proven.')
+    # Retained input, dropzone and container are bound by their original subtree,
+    # semantic input ID and the independently observed complete ordered tree.
+    removed = post['items']
+    unchanged = _upload_shape(pre) == _upload_shape(post, removed)
+    without_icon = (len(pre.get('svgs', [])) == 1 and not post.get('svgs')
+                    and _upload_shape(pre, pre['svgs']) == _upload_shape(post, removed))
+    if not (unchanged or without_icon):
+        raise Gate('Unexpected structural mutation during résumé attachment; inspect manually.')
+    return True
+
+
 def _entry_safety(page, allowed, provenance):
     if not isinstance(page, dict):
         raise Gate('The current form control inventory is malformed.')
@@ -1307,19 +1385,102 @@ _ASHBY_WAIT_SECONDS = 90.0
 
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
-    def __init__(self, raw, allowed, provenance, step=None):
+    def __init__(self, raw, allowed, provenance, step=None, *, resume_path=''):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
         self.formless_identity = None
         self.committing = False
         self.submit_authorized = None
         self.on_committing_click = None
+        self.upload_attempted = False
+        self.upload_pending = False
+        self.upload_result = None
+        self.resume_path = resume_path
 
     async def page(self):
         result = await self.call('evaluate', ENTRY_PAGE)
         return result['value']
 
+    async def _upload_pair(self):
+        try:
+            page = await self.page()
+            fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
+            _inventory_ok(page)
+        except Gate:
+            raise
+        except Exception:
+            raise Gate('Upload structural/file witness is unavailable; inspect the attachment '
+                       'manually. No automatic repeat was attempted.') from None
+        if (fixed.get('url') != page.get('url')
+                or fixed.get('entry') != page.get('entry')):
+            raise Gate('Upload PAGE/fixed structural witness disagreement.')
+        _upload_tree(page)
+        return page
+
+    async def _upload(self, args, kwargs, selector):
+        if (self.upload_attempted or len(args) != 4 or args[2] != '--file'
+                or not isinstance(args[3], str) or not args[3] or args[3] != self.resume_path
+                or kwargs != {'timeout': 130}):
+            raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
+        before = await self._upload_pair()
+        tree = _upload_tree(before)
+        original = _upload_input(before, tree)
+        if original['selector'] != selector or tree.get('items') or original.get('files') != []:
+            raise Gate('The original empty résumé input changed before upload.')
+        drop = tree['nodes'][tree['dropzone']]['target_selector']
+        if not drop or drop == selector:
+            raise Gate('The unique same-container upload dropzone is not proven.')
+        filename = Path(args[3]).name
+        self.upload_attempted = self.upload_pending = True
+        try:
+            try:
+                result = await self.raw.call('upload', drop, '--file', args[3], timeout=130)
+            except (Exception, asyncio.CancelledError) as exc:
+                if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
+                    raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
+                               "dedicated profile; inspect the attachment before retrying.") from None
+                definitive = False
+                if (isinstance(exc, bsk.Unavailable) and exc.code == 'unsupported'
+                        and exc.effect_state == 'none'):
+                    try:
+                        fresh = await self._upload_pair()
+                        fresh_tree = _upload_tree(fresh)
+                        definitive = (_upload_input(fresh, fresh_tree).get('files') == []
+                                      and _upload_shape(tree) == _upload_shape(fresh_tree)
+                                      and _root_identity(before) == _root_identity(fresh))
+                    except (Exception, asyncio.CancelledError):
+                        pass
+                if definitive:
+                    raise Gate('BrowserSkill upload unsupported with no effect; the original input '
+                               'is empty. Complete the attachment manually; no retry was attempted.') from None
+                raise Gate('The résumé upload outcome is unclear; inspect the attachment manually. '
+                           'No automatic repeat was attempted.') from None
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 2.0
+            try:
+                async with asyncio.timeout_at(deadline):
+                    for attempt in range(5):
+                        after = await self._upload_pair()
+                        if loop.time() >= deadline:
+                            raise TimeoutError
+                        if _upload_delta(before, after, filename):
+                            self.formless_identity = _root_identity(after)
+                            self.upload_result = after
+                            return result
+                        if attempt < 4:
+                            await asyncio.sleep(min(0.05, max(0, deadline - loop.time())))
+            except TimeoutError:
+                raise Gate('Attached-file render-settle deadline expired; inspect manually.') from None
+            raise Gate('Attached-file render did not settle within five observation pairs.')
+        finally:
+            self.upload_pending = False
+
+
     async def call(self, *args, **kwargs):
+        if self.upload_pending and (kwargs or args not in {
+                ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
+                ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)}):
+            raise Gate('Only read-only observations are permitted during upload settling.')
         if args and args[0] != 'evaluate' and self.formless_identity is not None:
             if self.committing:
                 raise Gate('A possible structural submit cannot be retried automatically.')
@@ -1335,6 +1496,8 @@ class _EntrySession:
                     or (args[0] == 'upload' and typ == 'file')
                     or (args[0] == 'click' and selector == root['submit'])):
                 raise Gate('autofill or unsupported root target forbidden at IPC producer.')
+            if args[0] == 'upload':
+                return await self._upload(args, kwargs, selector)
             if args[0] == 'click':
                 if not self.submit_authorized:
                     raise Gate('Structural submit lacks final approval, attachment and hold checks.')
@@ -1353,7 +1516,7 @@ class _EntrySession:
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
             _entry_safety(page, self.allowed, self.provenance)
-            if (self.formless_identity is not None and not self.committing
+            if (self.formless_identity is not None and not self.committing and not self.upload_pending
                     and _root_identity(page) != self.formless_identity):
                 raise Gate('application root identity drift; inspect manually.')
         return result
@@ -2598,6 +2761,24 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 session, page, action, target, provenance, fixture_context=ctx)
         check_form_destination(page, target, job_url or page.get('url', ''),
                                provenance=provenance)
+        if _formless_root(page):
+            if not isinstance(session, _EntrySession):
+                raise Gate('The structural upload producer is unavailable.')
+            await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
+            observed, _ = await _observe_controls(session, await session.page())
+            tree = _upload_tree(observed)
+            _upload_input(observed, tree)
+            if not tree.get('attached') or tree.get('filename') != Path(resume_path).name:
+                raise Gate('The exact passive résumé attachment did not remain proven.')
+            # Existing approved fields may have shifted nth-of-type selectors.
+            rebound = {new['selector']: filled[old['selector']]
+                       for old, new in zip(page['entry']['root_evidence'],
+                                           observed['entry']['root_evidence'])
+                       if old['selector'] in filled}
+            for old in page['entry']['root_evidence']:
+                filled.pop(old['selector'], None)
+            filled.update(rebound)
+            return {'action': verb, 'label': target['label'], 'uploaded': True}
         try:
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
@@ -2695,6 +2876,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
     uploaded = False
+    session = None
     try:
         verify_dispatch()
         if greenhouse_alias_candidate(url):
@@ -2775,7 +2957,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     await session.call('navigate', direct_url)
                     deadline = asyncio.get_running_loop().time() + (
                         _ASHBY_WAIT_SECONDS if provenance.ats == 'ashby' else _APPLICATION_WAIT_SECONDS)
-                    session = _EntrySession(session, allowed, provenance, step)
+                    session = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
                     page = await _stable_application_form(
                         session, allowed, provenance, deadline=deadline)
                     if ctx:
@@ -2819,8 +3001,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance,
                         **({'fixture_context': ctx} if ctx else {}))
+                    # Transition-only structural evidence is not a model action list.
+                    model_page = page
+                    if isinstance(page.get('entry'), dict):
+                        model_page = {**page, 'entry': {k: v for k, v in page['entry'].items()
+                                                       if k != 'upload_tree'}}
                     action = await (ctx.decision if ctx else bsk.decision)(
-                        task + progress, page, history, model=model)
+                        task + progress, model_page, history, model=model)
                     verb = action.get('action')
                     if action.get('selector'):
                         old = control(page, action)
@@ -2948,17 +3135,33 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'fields': [{'label': r['label'], 'value': filled[r['selector']]}
                                            for r in history if r.get('selector') in filled]}
                 raise Gate('The form needs review after reaching the browser step limit.')
-    except Gate as exc:
-        if submitted:
-            context = handoff(
-                'A submission-capable step was executed before the form stopped. '
-                'Check the employer portal before retrying.', step)
-            return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-        context = handoff(str(exc), step)
-        return {'status': 'gate', 'reason': 'unknown_field',
-                'question': context['text'], 'step': context['step'],
-                'form_question': exc.form_question}
     except (Exception, asyncio.CancelledError) as exc:
+        if (getattr(session, 'upload_attempted', False)
+                and not isinstance(exc, Gate)):
+            message = 'Résumé upload interrupted after the browser command; inspect manually'
+            if isinstance(exc, asyncio.CancelledError):
+                # Persist the existing terminal outcome before propagating cancellation.
+                if ctx is not None:
+                    tracking = ctx
+                else:
+                    from core.stores import make_stores
+                    tracking = make_stores().tracking
+                tracking.set_status(
+                    pk, 'needs_human', gate_reason='submit_uncertain',
+                    gate_pending={'question': message}, gate_call_id=None,
+                    fail_kind='uncertain', fail_reason=message)
+                raise
+            return {'status': 'uncertain', 'detail': message, 'step': step}
+        if isinstance(exc, Gate):
+            if submitted:
+                context = handoff(
+                    'A submission-capable step was executed before the form stopped. '
+                    'Check the employer portal before retrying.', step)
+                return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+            context = handoff(str(exc), step)
+            return {'status': 'gate', 'reason': 'unknown_field',
+                    'question': context['text'], 'step': context['step'],
+                    'form_question': exc.form_question}
         if submitted:
             context = handoff(
                 'Submission outcome uncertain after a browser interruption. '

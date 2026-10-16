@@ -8,6 +8,7 @@ const node = (tag, attrs={}, parent=null) => {
     value:'',disabled:false,readOnly:false,shadowRoot:null,
     get innerText() {return (attrs.text || '')+e.children.map(n=>n.innerText).join('');},
     get textContent() {return (attrs.text || '')+e.children.map(n=>n.textContent).join('');},
+    get childNodes() {return [...(attrs.text ? [{nodeType:3,parentElement:e,textContent:attrs.text}] : []),...e.children];},
     get labels() {return nodes.filter(n=>n.tagName==='LABEL' && (n.contains(e) || n.getAttribute('for')===e.id));},
     get elements() {return nodes.filter(n=>n.form===e && n.matches('input,button,select,textarea,output,object'));},
     getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
@@ -74,7 +75,7 @@ if(spec.formless) {
   const container=node('div',{id:'application-fields',class:'ashby-application-form-container'},wrapper);
   const field=(tag,id,type,text,required=false) => {
     const entry=node('div',{class:'ashby-application-form-field-entry'},container);
-    const l=node('label',{'for':id,class:'ashby-application-form-question-title',text},entry);
+    const l=node('label',{id:id+'-label','for':id,class:'ashby-application-form-question-title',text},entry);
     const e=node(tag,{id,type,required},entry); e.labels=[l]; e.files=type==='file' ? [] : undefined;
     return e;
   };
@@ -82,7 +83,26 @@ if(spec.formless) {
   field('input','_systemfield_email','email','Email',true);
   const resume=field('input','_systemfield_resume','file','Resume',true);
   resume.getClientRects=()=>[{width:1,height:1,right:1,bottom:1}];
-  node('button',{id:'dropzone',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},resume.parentElement);
+  const file=node('div',{id:'file-container',class:'ashby-application-form-input-file'},resume.parentElement);
+  resume.parentElement.children.splice(resume.parentElement.children.indexOf(resume),1);
+  resume.parentElement=file;file.children.push(resume);
+  const drop=node('button',{id:'dropzone',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);
+  const icon=node('svg',{id:'upload-icon'},drop);node('path',{id:'icon-path',d:'M0 0'},icon);
+  if(spec.files) resume.files=spec.files.map(name=>({name}));
+  if(spec.attached) {
+    for(let i=0;i<(spec.twoItems ? 2:1);i++) {
+      const item=node('div',{id:'attached-'+i,class:'ashby-application-form-input-file-item'},spec.outsideItem ? container:file);
+      node('p',{id:'filename-'+i,class:'ashby-application-form-input-file-item-name',text:spec.displayName || 'Resume.pdf'},item);
+      const del=node('button',{id:'delete-'+i,class:'ashby-application-form-input-file-item-delete',
+        ...(spec.noTitle ? {}:{title:'Remove attachment'}),...(spec.deleteText ? {text:'Delete'}:{})},spec.outsideDelete ? file:item);
+      del.type='submit';
+    }
+    if(!spec.keepIcon) {drop.children=[];for(const n of [icon,...icon.querySelectorAll('*')])nodes.splice(nodes.indexOf(n),1);}
+  }
+  if(spec.extraInert) node('div',{id:'extra-inert'},container);
+  if(spec.adjacentText) node('p',{id:'adjacent',text:'Unexpected structure'},container);
+  if(spec.changedDrop)drop.setAttribute('title','Changed dropzone');
+  if(spec.secondDrop)node('button',{id:'second-drop',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);
   field('textarea','additional','textarea','Additional information');
   const submit=node('button',{id:'structural-submit',class:'ashby-application-form-submit-button',text:'Submit application',...(spec.submitAttrs || {})},wrapper);
   submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
@@ -118,6 +138,11 @@ if(spec.formless) {
     node('input',{id:'job-search',type:spec.searchForm==='foreign' ? 'text':'search'},search);
     node('button',{id:'search-submit',type:'submit',text:'Search jobs'},search);
   }
+  if(spec.treeNodes) {
+    const count=()=> {let total=0,stack=[wrapper];while(stack.length){const n=stack.pop();total++;if(n.nodeType===1)stack.push(...n.childNodes);}return total;};
+    for(let i=count();i<spec.treeNodes;i++)node('span',{id:'padding-'+i},container);
+  }
+  if(spec.unreadableTree)Object.defineProperty(file,'childNodes',{get:()=>{throw Error('unreadable subtree');}});
 }
 function frame(kind, edit={}) {
   let parent=body, attrs={id:'frame-'+nodes.length};
@@ -216,10 +241,12 @@ for(let i=0;i<(spec.tokens || []).length;i++) {
   if(spec.claim) node('input',{role:'combobox',type:'text','data-value-input':token.id,'aria-haspopup':'true','aria-autocomplete':'list'},token.parentElement);
 }
 if(spec.tokenSiblingBadge)node('div',{class:'grecaptcha-badge'},body);
+// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.
+const ids=new Map();for(const n of nodes){if(!ids.has(n.id))ids.set(n.id,[]);ids.get(n.id).push(n);}
 global.document={baseURI:'https://example-co.test/',readyState:'complete',body,title:'Synthetic',
-  querySelectorAll:q=>nodes.filter(n=>n.matches(q)),
+  querySelectorAll:q=>/^#[\w-]+$/.test(q) ? ids.get(q.slice(1)) || [] : nodes.filter(n=>n.matches(q)),
   querySelector:q=>document.querySelectorAll(q)[0] || null,
-  getElementById:id=>nodes.find(n=>n.id===id) || null};
+  getElementById:id=>ids.get(id)?.[0] || null};
 global.CSS={escape:s=>s}; global.location={href:spec.url || form?.action || 'https://example-co.test/'};
 global.scrollX=0; global.scrollY=0;
 global.getComputedStyle=(e,pseudo)=>pseudo ? {content:e.pseudo[pseudo] ?? 'none'} : e.style;

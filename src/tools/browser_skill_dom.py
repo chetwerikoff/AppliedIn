@@ -78,7 +78,7 @@ _WIDGET_GRAPH = r"""
     // Mutable error/placeholder references are current safety evidence, not identity.
     for (const k of ['aria-describedby','aria-errormessage']) {
       let resolved=0;
-      for (const id of attr(e,k).split(/\s+/)) {
+      for (const id of attr(e,k).trim().split(/\s+/)) {
         if (!id) return null;
         const hits=document.querySelectorAll('#'+CSS.escape(id));
         // Validation mounts this exact error lazily; duplicates are never absence.

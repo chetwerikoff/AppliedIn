@@ -32,6 +32,21 @@ def test_absent_exact_error_in_both_independent_readers(phase):
         assert graph['selected_text'] == graph['displayed_text'] == 'Approved country'
 
 
+@pytest.mark.parametrize('attr', ['aria-describedby', 'aria-errormessage'])
+async def test_padded_idref_list_is_valid_in_both_readers(phone_grants, attr):
+    # ARIA lists may have surrounding whitespace; only an empty list is malformed.
+    session = PhoneSession(countryErrorAbsent=True, countryAttr=[
+        attr, ' react-select-country-placeholder country-error '])
+    page, _ = await forms._observe_controls(session, await session.page())
+    assert page['inventory_verified'] and not page['opaque_controls']
+    graph = combo({'page': page}, 'country')['combobox']
+    assert graph['receiverless_country'] and graph['phase'] == 'C0'
+    witness = next(c for c in session.snapshot['witness']['controls']
+                   if c['selector'] == '#country')
+    assert graph == witness['combobox']
+    assert session.calls == []
+
+
 @pytest.mark.parametrize('scenario', [
     *({'countryErrorAbsent': True, 'countryAttr': [attr, 'react-select-country-placeholder '+bad]}
       for attr in ('aria-describedby', 'aria-errormessage') for bad in ('foo-error', 'location-error')),
@@ -41,8 +56,7 @@ def test_absent_exact_error_in_both_independent_readers(phase):
     {'countryErrorAbsent': True, 'countryPlaceholderAbsent': True},
     *({'countryErrorAbsent': True, 'countryAttr': [attr, value]}
       for attr in ('aria-describedby', 'aria-errormessage')
-      for value in (None, '', ' ', '\t', ' country-error', 'country-error ',
-                    'react-select-country-placeholder country-error\t')),
+      for value in (None, '', ' ', '\t')),
 ])
 async def test_unproven_reference_still_gates_before_ipc(phone_grants, scenario):
     session = PhoneSession(**scenario)

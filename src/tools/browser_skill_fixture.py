@@ -940,10 +940,11 @@ def run() -> int:
     greenhouse = _run_scenario(greenhouse=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    ok = entry == greenhouse == lookalike == ashby == 0
+    scenarios = (entry, greenhouse, lookalike, ashby)
+    ok = all(result == 0 for result in scenarios)
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
                       'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
-                      'sessions': 3}))
+                      'sessions': len(scenarios)}))
     return 0 if ok else 1

@@ -13,7 +13,7 @@ function make(tag,id,attrs={},parent=null,text='') {
     getClientRects:()=>n.rects!==undefined?n.rects:n.closest('[hidden]')||n.type==='hidden'?[]:[{width:120,height:24,right:120,bottom:24}]};
   Object.defineProperty(n,'attributes',{get:()=>Object.keys(attrs).map(name=>({name,value:attrs[name]}))});
   Object.defineProperty(n,'form',{get:()=>Object.hasOwn(n,'formOwner')?n.formOwner:tag==='input'||tag==='button'||tag==='textarea'?n.closest('form'):undefined});
-  Object.defineProperty(n,'innerText',{get:()=>text+n.children.map(c=>c.innerText).join('')});
+  Object.defineProperty(n,'innerText',{configurable:true,get:()=>text+n.children.map(c=>c.innerText).join('')});
   if(parent)parent.children.push(n);nodes.push(n);return n;
 }
 function matches(n,q){return q.split(',').some(s=>{
@@ -271,6 +271,10 @@ for(const change of scenario.visibility || []){
   if(change.style)n.computed={...(n.computed||{}),...change.style};
   if(change.parentStyle)n.parentElement.computed={...change.parentStyle};
   if(change.rects!==undefined)n.rects=change.rects;
+  if(change.text!==undefined)Object.defineProperty(n,'innerText',{get:()=>change.text});
+  if(change.attrs)for(const [key,value] of Object.entries(change.attrs)){
+    if(value===null)delete n.attrs[key];else n.attrs[key]=value;
+  }
 }
 global.document={readyState:'complete',title:'Synthetic',body:nodes.find(n=>n.tagName==='BODY'),
   querySelectorAll:q=>nodes.filter(n=>matches(n,q)),querySelector:q=>nodes.find(n=>matches(n,q))||null,

@@ -96,7 +96,10 @@ if(spec.formless) {
   if(spec.attached) {
     for(let i=0;i<(spec.twoItems ? 2:1);i++) {
       const item=node('div',{id:'attached-'+i,class:'ashby-application-form-input-file-item'},spec.outsideItem ? container:file);
-      node('p',{id:'filename-'+i,class:'ashby-application-form-input-file-item-name',text:spec.displayName || 'Resume.pdf'},item);
+      const name=node('p',{id:'filename-'+i,class:'ashby-application-form-input-file-item-name',
+        ...(spec.filenameChild ? {}:{text:spec.displayName || 'Resume.pdf'})},item);
+      if(spec.filenameChild) node(spec.filenameChild,{text:spec.displayName || 'Resume.pdf',
+        ...(spec.filenameAttrs || {})},name);
       const del=node('button',{id:'delete-'+i,class:'ashby-application-form-input-file-item-delete',
         ...(spec.noTitle ? {}:{title:'Remove attachment'}),...(spec.deleteText ? {text:'Delete'}:{})},spec.outsideDelete ? file:item);
       del.type='submit';
@@ -108,7 +111,7 @@ if(spec.formless) {
     }
     if(!spec.keepIcon) {drop.children=[];for(const n of [icon,...icon.querySelectorAll('*')])nodes.splice(nodes.indexOf(n),1);}
   }
-  if(spec.extraInert) node('div',{id:'extra-inert'},container);
+  if(spec.extraInert) node('div',{id:spec.inertId || 'extra-inert'},container);
   if(spec.adjacentText) node('p',{id:'adjacent',text:'Unexpected structure'},container);
   if(spec.changedDrop)drop.setAttribute('title','Changed dropzone');
   if(spec.secondDrop)node('button',{id:'second-drop',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);

@@ -570,7 +570,7 @@ _ASHBY_ROOT = r"""
             && !responseNodes.some(r=>r===p || r.contains(p))) text=signature(n.textContent);
       }
       uploadTree.nodes.push({parent,tag:n.nodeType===3 ? '#text' : n.localName,
-        attrs,text,selector:n.nodeType===1 ? selector(n) : ''});
+        attrs,text,selector:n.nodeType===1 ? (n.id ? '#'+signature(n.id) : selector(n)) : ''});
       if(n.nodeType===1) {
         const children=Array.from(n.childNodes);
         if(children.length!==n.childNodes.length) throw Error('incomplete subtree');
@@ -589,6 +589,8 @@ _ASHBY_ROOT = r"""
         drop.disabled || drop.closest('[inert]') || !visible(drop)) throw Error('ambiguous file container');
     uploadTree.input=source.indexOf(input); uploadTree.container=source.indexOf(file);
     uploadTree.dropzone=source.indexOf(drop);
+    uploadTree.nodes[uploadTree.input].target_selector=selector(input);
+    uploadTree.nodes[uploadTree.dropzone].target_selector=selector(drop);
     uploadTree.svgs=Array.from(drop.querySelectorAll('svg')).filter(n=>
       !n.parentElement.closest('svg')).map(n=>source.indexOf(n));
     const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));
@@ -601,9 +603,12 @@ _ASHBY_ROOT = r"""
       const passiveIcon=n=>n.namespaceURI==='http://www.w3.org/2000/svg' &&
         ['svg','g','path','circle','ellipse','line','polyline','polygon','rect'].includes(n.localName) &&
         Array.from(n.attributes).every(a=>!/^on|href|tabindex|role|form/i.test(a.name));
+      const passiveName=n=>['span','strong','em','b','i'].includes(n.localName) &&
+        Array.from(n.attributes).every(a=>!/^on|^(role|tabindex|href|contenteditable)$/i.test(a.name));
       const valid=item.parentElement===file && names.length===1 && deletes.length===1 &&
         item.children.length===2 && name.parentElement===item && del.parentElement===item &&
-        name.children.length===0 && Array.from(del.querySelectorAll('*')).every(passiveIcon) &&
+        Array.from(name.querySelectorAll('*')).every(passiveName) &&
+        Array.from(del.querySelectorAll('*')).every(passiveIcon) &&
         !clean(del.textContent) &&
         passiveAttrs(item,['id','class']) && passiveAttrs(name,['id','class']) &&
         passiveAttrs(del,['id','class','title','type']) &&

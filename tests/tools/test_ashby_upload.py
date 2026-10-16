@@ -1,5 +1,6 @@
 """Upload transition proof uses the real shared DOM readers, never a browser."""
 import asyncio
+import json
 from copy import deepcopy
 
 import pytest
@@ -339,10 +340,10 @@ async def test_original_input_semantically_rebinds_shifted_selectors(monkeypatch
             elif c['selector'] == '#dropzone':
                 c['selector'] = 'div.ashby-application-form-input-file > button:nth-of-type(2)'
         for n in snapshot['entry']['upload_tree']['nodes']:
-            if n['selector'] == '#_systemfield_resume':
-                n['selector'] = 'div.ashby-application-form-input-file > input:nth-of-type(1)'
-            elif n['selector'] == '#dropzone':
-                n['selector'] = 'div.ashby-application-form-input-file > button:nth-of-type(2)'
+            if n.get('target_selector') == '#_systemfield_resume':
+                n['target_selector'] = 'div.ashby-application-form-input-file > input:nth-of-type(1)'
+            elif n.get('target_selector') == '#dropzone':
+                n['target_selector'] = 'div.ashby-application-form-input-file > button:nth-of-type(2)'
     raw, session, _ = setup_upload(monkeypatch, after=after)
     await upload(session)
     assert forms._upload_input(session.upload_result, forms._upload_tree(session.upload_result))['id'] == '_systemfield_resume'
@@ -365,3 +366,28 @@ async def test_unavailable_paired_reader_is_a_gate_not_unknown(monkeypatch, afte
         await upload(session)
     assert len(raw.mutations) == int(after_ipc)
     assert session.formless_identity == identity
+
+
+@pytest.mark.parametrize('attrs,name,accepted', [
+    ({}, 'Resume.pdf', True),
+    ({'role': 'button'}, 'Resume.pdf', False),
+    ({'tabindex': '0'}, 'Resume.pdf', False),
+    ({}, 'Other.pdf', False),
+])
+async def test_filename_child_is_passive_and_exact(monkeypatch, attrs, name, accepted):
+    after = observed(attached=True, files=['Resume.pdf'], filenameChild='span',
+                     filenameAttrs=attrs, displayName=name)
+    if not accepted:
+        assert not after[0]['entry']['upload_tree']['attached']
+        return
+    raw, session, _ = setup_upload(monkeypatch, after=after)
+    await upload(session)
+    assert session.upload_result['entry']['upload_tree']['attached']
+    assert len(raw.mutations) == 1
+
+
+def test_upload_tree_hashes_inert_applicant_like_id():
+    page, _ = observed(extraInert=True, inertId='test-user-private-contact')
+    tree = page['entry']['upload_tree']
+    assert tree['complete']
+    assert 'test-user-private-contact' not in json.dumps(tree)

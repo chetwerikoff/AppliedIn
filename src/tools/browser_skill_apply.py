@@ -1267,7 +1267,7 @@ def _upload_shape(tree, removed=()):
 
 
 def _upload_input(page, tree):
-    selector = tree['nodes'][tree['input']]['selector']
+    selector = tree['nodes'][tree['input']]['target_selector']
     matches = [c for c in page['entry']['root_evidence']
                if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
                and c.get('selector') == selector]
@@ -1403,7 +1403,7 @@ class _EntrySession:
         original = _upload_input(before, tree)
         if original['selector'] != selector or tree.get('items') or original.get('files') != []:
             raise Gate('The original empty résumé input changed before upload.')
-        drop = tree['nodes'][tree['dropzone']]['selector']
+        drop = tree['nodes'][tree['dropzone']]['target_selector']
         if not drop or drop == selector:
             raise Gate('The unique same-container upload dropzone is not proven.')
         filename = Path(args[3]).name
@@ -2751,6 +2751,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
     uploaded = False
+    session = None
     try:
         verify_dispatch()
         if greenhouse_alias_candidate(url):
@@ -3006,17 +3007,33 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'fields': [{'label': r['label'], 'value': filled[r['selector']]}
                                            for r in history if r.get('selector') in filled]}
                 raise Gate('The form needs review after reaching the browser step limit.')
-    except Gate as exc:
-        if submitted:
-            context = handoff(
-                'A submission-capable step was executed before the form stopped. '
-                'Check the employer portal before retrying.', step)
-            return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-        context = handoff(str(exc), step)
-        return {'status': 'gate', 'reason': 'unknown_field',
-                'question': context['text'], 'step': context['step'],
-                'form_question': exc.form_question}
     except (Exception, asyncio.CancelledError) as exc:
+        if (getattr(session, 'upload_attempted', False)
+                and not (isinstance(exc, Gate) and exc.form_question)):
+            message = 'Résumé upload interrupted after the browser command; inspect manually'
+            if isinstance(exc, asyncio.CancelledError):
+                # Persist the existing terminal outcome before propagating cancellation.
+                if ctx is not None:
+                    tracking = ctx
+                else:
+                    from core.stores import make_stores
+                    tracking = make_stores().tracking
+                tracking.set_status(
+                    pk, 'needs_human', gate_reason='submit_uncertain',
+                    gate_pending={'question': message}, gate_call_id=None,
+                    fail_kind='uncertain', fail_reason=message)
+                raise
+            return {'status': 'uncertain', 'detail': message, 'step': step}
+        if isinstance(exc, Gate):
+            if submitted:
+                context = handoff(
+                    'A submission-capable step was executed before the form stopped. '
+                    'Check the employer portal before retrying.', step)
+                return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+            context = handoff(str(exc), step)
+            return {'status': 'gate', 'reason': 'unknown_field',
+                    'question': context['text'], 'step': context['step'],
+                    'form_question': exc.form_question}
         if submitted:
             context = handoff(
                 'Submission outcome uncertain after a browser interruption. '

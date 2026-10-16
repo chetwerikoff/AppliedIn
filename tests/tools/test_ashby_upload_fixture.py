@@ -21,8 +21,8 @@ def snapshot(authority, attached=False):
             if c['selector'] == '#dropzone':
                 c['selector'] = '#ashby-upload-dropzone'
         for n in page['entry']['upload_tree']['nodes']:
-            if n['selector'] == '#dropzone':
-                n['selector'] = '#ashby-upload-dropzone'
+            if n.get('target_selector') == '#dropzone':
+                n['target_selector'] = '#ashby-upload-dropzone'
     return pair
 
 
@@ -137,3 +137,41 @@ console.log(JSON.stringify({class:item.className,names:item.children.map(n=>n.cl
                                'ashby-application-form-input-file-item-delete'],
                      'name': 'Synthetic-Resume.pdf', 'title': 'Remove attachment',
                      'text': '', 'iconRemoved': True}
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+async def test_post_upload_interruption_is_terminal_before_cancellation(authority, monkeypatch, cancel):
+    import asyncio
+    from core.apply_queue import is_retryable
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    raw = FixtureRaw(authority)
+    reached = asyncio.Event()
+    original = raw.call
+    async def interrupted(method, *args, **kwargs):
+        if method == 'evaluate' and raw.uploads:
+            reached.set()
+            if cancel:
+                await asyncio.Future()
+            raise OSError('synthetic post-upload fault')
+        return await original(method, *args, **kwargs)
+    raw.call = interrupted
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_args: raw)
+    task = asyncio.create_task(forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority))
+    if cancel:
+        await asyncio.wait_for(reached.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        result = {'status': authority.row.get('fail_kind')}
+        detail = authority.row.get('fail_reason')
+    else:
+        result = await task
+        detail = result.get('detail')
+    assert result['status'] == 'uncertain'
+    assert detail == 'Résumé upload interrupted after the browser command; inspect manually'
+    assert is_retryable(result) == (False, 'uncertain')
+    assert len(raw.uploads) == 1

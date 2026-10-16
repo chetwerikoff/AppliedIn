@@ -1514,6 +1514,30 @@ def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_requi
             in fixture._greenhouse_form())
 
 
+async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
+    """Ashby's intentional zero-grant Gate must not erase the native leg's grants."""
+    import runpy
+    helpers = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
+    snapshot = helpers['served_fixture_dom']()
+    authority.greenhouse = True
+    authority.enable_positive_fixture()
+    provenance = authority.entry_provenance()
+
+    # The real served native bytes and production readers still admit the
+    # untouched hidden-receiver graph. The failure was before opening it:
+    # bootstrap asks again for a grant the fixture previously supplied.
+    location = next(c for c in snapshot['page']['controls'] if c['selector'] == '#location')
+    assert location['combobox']['mode'] == 'closed-react-select'
+    assert location['combobox']['phase'] == 'C0'
+    assert location['combobox']['options'] == []
+    forms.exact_approval(
+        fixture.PK, 'Where are you located?', fixture._FACTS['Where are you located?'],
+        target=forms._bound_target(snapshot['page'], location), url=fixture.URL,
+        fixture_context=authority, provenance=provenance)
+    assert authority.ipc_index == authority.decisions == 0
+    assert authority.submit_ipc == authority.post_attempts == 0
+
+
 @pytest.mark.parametrize('reader_name', ['entry_reader', 'greenhouse_reader'])
 def test_fixture_reader_rewrite_anchors_all_match_current_inputs(reader_name):
     """A stale replacement silently removes a safety witness from fixture readers."""

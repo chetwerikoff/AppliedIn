@@ -18,6 +18,8 @@ function make(tag,id,attrs={},parent=null,text='') {
 }
 function matches(n,q){return q.split(',').some(s=>{
   s=s.trim();if(s==='*')return true;if(s===':disabled')return n.disabled;
+  // Native selector parsing rejects an empty ID; silently matching masks reader faults.
+  if(s==='#')throw new SyntaxError("'#' is not a valid selector");
   if(s.includes(':nth-of-type(')||s.includes(':nth-child(')){
     let p=n;
     for(const part of s.split(' > ').reverse()){

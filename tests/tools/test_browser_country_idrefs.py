@@ -40,7 +40,9 @@ def test_absent_exact_error_in_both_independent_readers(phase):
     {'countryErrorAbsent': True, 'countryAttr': ['aria-describedby', 'country-error']},
     {'countryErrorAbsent': True, 'countryPlaceholderAbsent': True},
     *({'countryErrorAbsent': True, 'countryAttr': [attr, value]}
-      for attr in ('aria-describedby', 'aria-errormessage') for value in (None, '', ' ')),
+      for attr in ('aria-describedby', 'aria-errormessage')
+      for value in (None, '', ' ', '\t', ' country-error', 'country-error ',
+                    'react-select-country-placeholder country-error\t')),
 ])
 async def test_unproven_reference_still_gates_before_ipc(phone_grants, scenario):
     session = PhoneSession(**scenario)

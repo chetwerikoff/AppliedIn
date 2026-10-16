@@ -110,7 +110,7 @@ async def test_forbidden_producer_ipc_never_reaches_transport(monkeypatch, args,
     {'twoItems': True}, {'displayName': 'Other.pdf'}, {'deleteText': True},
     {'outsideItem': True}, {'outsideDelete': True}, {'noTitle': True},
     {'secondDrop': True}, {'extraType': 'text'}, {'unreadableTree': True},
-    {'treeNodes': 4097},
+    {'treeNodes': 4097}, {'deleteIcon': True, 'iconAction': True},
 ])
 async def test_unexpected_after_structure_never_promotes(monkeypatch, shape):
     after = observed(attached=True, files=['Resume.pdf'], **shape)
@@ -249,10 +249,11 @@ async def test_file_permission_refusal_retains_specific_gate(monkeypatch):
     assert len(raw.mutations) == 1 and raw.post_pairs == 0
 
 
-def test_optional_original_icon_removal_only():
+@pytest.mark.parametrize('delete_icon', [False, True])
+def test_optional_original_icon_removal_only(delete_icon):
     before, _ = observed()
     for keep in (True, False):
-        after, _ = observed(attached=True, files=['Resume.pdf'], keepIcon=keep)
+        after, _ = observed(attached=True, files=['Resume.pdf'], keepIcon=keep, deleteIcon=delete_icon)
         assert forms._upload_delta(before, after, 'Resume.pdf')
         assert all('Test User' not in str(n) for n in after['entry']['upload_tree']['nodes'])
 
@@ -319,3 +320,21 @@ async def test_original_input_semantically_rebinds_shifted_selectors(monkeypatch
     await upload(session)
     assert forms._upload_input(session.upload_result, forms._upload_tree(session.upload_result))['id'] == '_systemfield_resume'
     assert session.formless_identity == forms._root_identity(after[0])
+
+
+@pytest.mark.parametrize('after_ipc', [False, True])
+async def test_unavailable_paired_reader_is_a_gate_not_unknown(monkeypatch, after_ipc):
+    raw, session, _ = setup_upload(monkeypatch)
+    original = raw.call
+    async def unavailable(method, *args, **kwargs):
+        if method == 'evaluate' and raw.uploaded == after_ipc:
+            # Let the ordinary producer check finish; break its final pre-pair.
+            if after_ipc or sum(c[0] == 'evaluate' for c in raw.calls) >= 3:
+                raise OSError('synthetic reader failure')
+        return await original(method, *args, **kwargs)
+    raw.call = unavailable
+    identity = session.formless_identity
+    with pytest.raises(forms.Gate, match='witness is unavailable'):
+        await upload(session)
+    assert len(raw.mutations) == int(after_ipc)
+    assert session.formless_identity == identity

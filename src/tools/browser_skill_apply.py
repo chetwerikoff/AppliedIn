@@ -1371,9 +1371,15 @@ class _EntrySession:
         return result['value']
 
     async def _upload_pair(self):
-        page = await self.page()
-        fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
-        _inventory_ok(page)
+        try:
+            page = await self.page()
+            fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
+            _inventory_ok(page)
+        except Gate:
+            raise
+        except Exception:
+            raise Gate('Upload structural/file witness is unavailable; inspect the attachment '
+                       'manually. No automatic repeat was attempted.') from None
         if (fixed.get('url') != page.get('url')
                 or fixed.get('entry') != page.get('entry')):
             raise Gate('Upload PAGE/fixed structural witness disagreement.')
@@ -2859,8 +2865,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance,
                         **({'fixture_context': ctx} if ctx else {}))
+                    # Transition-only structural evidence is not a model action list.
+                    model_page = page
+                    if isinstance(page.get('entry'), dict):
+                        model_page = {**page, 'entry': {k: v for k, v in page['entry'].items()
+                                                       if k != 'upload_tree'}}
                     action = await (ctx.decision if ctx else bsk.decision)(
-                        task + progress, page, history, model=model)
+                        task + progress, model_page, history, model=model)
                     verb = action.get('action')
                     if action.get('selector'):
                         old = control(page, action)

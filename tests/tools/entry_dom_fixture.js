@@ -96,6 +96,11 @@ if(spec.formless) {
       const del=node('button',{id:'delete-'+i,class:'ashby-application-form-input-file-item-delete',
         ...(spec.noTitle ? {}:{title:'Remove attachment'}),...(spec.deleteText ? {text:'Delete'}:{})},spec.outsideDelete ? file:item);
       del.type='submit';
+      if(spec.deleteIcon) {
+        const svg=node('svg',{id:'delete-icon'},del), path=node('path',{id:'delete-path',d:'M0 0L1 1'},svg);
+        svg.namespaceURI=path.namespaceURI='http://www.w3.org/2000/svg';
+        if(spec.iconAction)path.setAttribute('onclick','syntheticAction()');
+      }
     }
     if(!spec.keepIcon) {drop.children=[];for(const n of [icon,...icon.querySelectorAll('*')])nodes.splice(nodes.indexOf(n),1);}
   }

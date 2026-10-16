@@ -549,9 +549,13 @@ _ASHBY_ROOT = r"""
         deletes=item.querySelectorAll('button.ashby-application-form-input-file-item-delete[title]');
       const name=names[0], del=deletes[0];
       const passiveAttrs=(n,allowed)=>Array.from(n.attributes).every(a=>allowed.includes(a.name));
+      const passiveIcon=n=>n.namespaceURI==='http://www.w3.org/2000/svg' &&
+        ['svg','g','path','circle','ellipse','line','polyline','polygon','rect'].includes(n.localName) &&
+        Array.from(n.attributes).every(a=>!/^on|href|tabindex|role|form/i.test(a.name));
       const valid=item.parentElement===file && names.length===1 && deletes.length===1 &&
         item.children.length===2 && name.parentElement===item && del.parentElement===item &&
-        name.children.length===0 && del.children.length===0 && !clean(del.textContent) &&
+        name.children.length===0 && Array.from(del.querySelectorAll('*')).every(passiveIcon) &&
+        !clean(del.textContent) &&
         passiveAttrs(item,['id','class']) && passiveAttrs(name,['id','class']) &&
         passiveAttrs(del,['id','class','title','type']) &&
         [null,'button'].includes(del.getAttribute('type')) &&

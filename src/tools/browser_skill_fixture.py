@@ -324,6 +324,22 @@ class _SyntheticRun:
     def enable_positive_fixture(self) -> None:
         self.positive = True
         self.row['human_approved_answers'] = {}
+        # Only Ashby stops before applicant IPC; the independent native leg
+        # retains its pre-existing exact grants to exercise picker readbacks.
+        if not self.greenhouse:
+            return
+        specs = {
+            'Name': ('#name', 'Name', 'Name', 'input', 'text'),
+            'Phone': ('#phone', 'Phone', 'Phone', 'input', 'tel'),
+            **{key: (selector, key, key, 'input', 'combobox')
+               for key, selector in _CHOICE_SELECTORS.items()},
+        }
+        for key, (selector, label, question, tag, typ) in specs.items():
+            self.row['human_approved_answers'][key] = {
+                'value': _FACTS[key], 'selector': selector, 'label': label,
+                'question': question, 'url': URL, 'tag': tag, 'type': typ,
+                'form_selector': '#application-form', 'form_action': URL,
+            }
 
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
         return (('fill', '#name', '--value', _FACTS['Name']),

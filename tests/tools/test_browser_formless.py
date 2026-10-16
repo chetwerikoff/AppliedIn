@@ -243,6 +243,12 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
     assert result['status'] == ('applied' if outcome == 'confirmed' else 'uncertain'), result
+    task = decide.await_args_list[0].args[0]
+    assert ('Approved VALUES are deliberately hidden from you: name the fact KEY and the server '
+            'writes the exact approved value, so a listed key is NOT missing. ') in task
+    assert ('For the required résumé file input, use upload with its selector; '
+            'the server attaches the staged file. ') in task
+    assert f'Exact human-authorized fact KEYS on this tracked job: {list(facts)}. ' in task
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('fill', '#_systemfield_name', '--value', 'Test User'),
         ('fill', '#_systemfield_email', '--value', 'test@example-co.test'),

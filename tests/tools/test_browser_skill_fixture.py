@@ -1514,6 +1514,47 @@ def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_requi
             in fixture._greenhouse_form())
 
 
+@pytest.mark.parametrize('reader_name', ['entry_reader', 'greenhouse_reader'])
+def test_fixture_reader_rewrite_anchors_all_match_current_inputs(reader_name):
+    """A stale replacement silently removes a safety witness from fixture readers."""
+    import ast
+    import inspect
+    from tools import browser_skill_dom as dom
+
+    reader = getattr(dom, reader_name)
+    calls = [node for node in ast.walk(ast.parse(inspect.getsource(reader)))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == 'script' and node.func.attr == 'replace']
+    assert calls, 'The audit must enumerate the actual reader replacements.'
+
+    class AuditedScript(str):
+        def __new__(cls, value, observations):
+            instance = super().__new__(cls, value)
+            instance.observations = observations
+            return instance
+
+        def replace(self, old, new, count=-1):
+            result = super().replace(old, new, count)
+            self.observations.append((old, old in self, result != self))
+            return type(self)(result, self.observations)
+
+    runs = []
+    for script in (dom.PAGE, forms._FIXED_CONTROL_WITNESS):
+        observations = []
+        assert reader(AuditedScript(script, observations)) == reader(script)
+        assert len(observations) == len(calls), 'Every declared rewrite must be audited.'
+        runs.append(observations)
+
+    # PAGE-only and fixed-only anchors intentionally differ. Each replacement
+    # must really change at least one current input, rather than silently no-op
+    # on both as the stale fixed-witness selector anchor did after the rebase.
+    for index, observations in enumerate(zip(*runs, strict=True)):
+        assert len({old for old, _, _ in observations}) == 1
+        assert any(present and changed for _, present, changed in observations), (
+            reader_name, index, observations[0][0])
+
+
 @pytest.mark.parametrize('native_valid', [False, True])
 async def test_greenhouse_fixture_records_native_validity_after_existing_choice(authority, native_valid):
     authority.enable_positive_fixture()

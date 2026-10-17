@@ -321,10 +321,96 @@ def _synthetic(fixture_context, *, pk: str = '', company: str = '',
     return fixture_context
 
 
-def control(page: dict, action: dict) -> dict:
+_CONTROL_ACTIONS = frozenset({
+    'click', 'fill', 'select', 'choose', 'combobox', 'upload', 'submit',
+    'navigate', 'gate', 'finish', 'wait',
+})
+_CONTROL_CALLERS = frozenset({
+    'external',
+    'approval-history',
+    'bootstrap-field',
+    'native-receiver',
+    'closed-initial',
+    'closed-preflight',
+    'combobox-observe',
+    'combobox-open',
+    'combobox-options',
+    'combobox-verify',
+    'execute-formless',
+    'execute-initial',
+    'execute-observe',
+    'execute-identity',
+    'execute-prewrite',
+    'execute-readback',
+    'execute-phone',
+    'decision-initial',
+    'decision-fresh',
+    'decision-submit',
+    'submit-reobserve',
+    'decision-action',
+    'click-reobserve',
+})
+# Selector display is diagnostic, never an authority for selecting a browser target.
+# Entire ID, class and attribute selectors are opaque even when they are short.
+_CONTROL_TAG_NAMES = (
+    'a', 'article', 'body', 'button', 'div', 'fieldset', 'form', 'input',
+    'label', 'li', 'main', 'option', 'section', 'select', 'span', 'textarea', 'ul',
+)
+_CONTROL_SEGMENT = (r'(?:' + '|'.join(_CONTROL_TAG_NAMES)
+                    + r')(?:\:nth-of-type\([0-9]{1,5}\))?')
+_CONTROL_STRUCTURAL = re.compile(
+    _CONTROL_SEGMENT + r'(?: *> *' + _CONTROL_SEGMENT + r')*')
+
+
+def _control_selector_display(raw) -> str:
+    if not isinstance(raw, str) or not _CONTROL_STRUCTURAL.fullmatch(raw):
+        return '[redacted]'
+    display = re.sub(r' *> *', ' > ', raw)
+    if len(display) <= 120:
+        return display
+    # Keep only complete, already-validated structural path segments.
+    prefix = display[:120]
+    return prefix.rsplit(' > ', 1)[0] if ' > ' in prefix else '[redacted]'
+
+
+class ControlGate(Gate):
+    """A control-resolution Gate carries only code-owned safe diagnostic fields."""
+
+    def __init__(self, diagnostics: dict[str, str]):
+        self.diagnostics = diagnostics
+        super().__init__(
+            'The chosen control is absent, disabled or ambiguous; inspect the current page. '
+            + '; '.join(f'{key}={diagnostics[key]}'
+                        for key in ('action', 'selector', 'reason', 'caller')))
+
+
+def _control_gate_handoff(exc: ControlGate, step: dict) -> dict:
+    # A previously clicked control label is untrusted and unrelated to this Gate.
+    context = handoff(str(exc), {**step, 'last_button': ''})
+    context['step']['last_button'] = ''
+    context['step'].update(exc.diagnostics)
+    return context
+
+
+def control(page: dict, action: dict, caller: str = 'external') -> dict:
     matches = [c for c in page.get('controls', []) if c['selector'] == action.get('selector')]
     if len(matches) != 1 or matches[0].get('disabled'):
-        raise Gate('The chosen control is absent, disabled or ambiguous; inspect the current page.')
+        if not matches:
+            reason = 'absent: 0 matches'
+        elif len(matches) > 1:
+            reason = f'ambiguous: {len(matches)} matches'
+        else:
+            reason = 'disabled'
+        operation = action.get('action')
+        diagnostics = {
+            'action': operation if isinstance(operation, str) and operation in _CONTROL_ACTIONS
+                      else 'control',
+            'selector': _control_selector_display(action.get('selector')),
+            'reason': reason,
+            'caller': caller if isinstance(caller, str) and caller in _CONTROL_CALLERS
+                      else 'external',
+        }
+        raise ControlGate(diagnostics)
     return matches[0]
 
 
@@ -484,7 +570,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
         if receipt.get('fact'):
             if page is None or receipt.get('url') != page.get('url'):
                 raise Gate('The approved control URL changed; human review is required.')
-            target = control(page, receipt)
+            target = control(page, receipt, 'approval-history')
             if any(target.get(k, '') != receipt.get(k, '')
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
@@ -2284,7 +2370,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         for observed in members:
             if observed['type'] == 'file':
                 continue
-            item = control(page, observed)
+            item = control(page, observed, 'bootstrap-field')
             key = _key(page, item)
             value = str(facts.get(_fact_key(facts, key)) or '').strip()
             previous = (_row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)).get(
@@ -2445,7 +2531,7 @@ async def _fresh_native_receiver(session, page: dict, action: dict,
         raise Gate('The original same-job tenant mapping changed during native inspection.')
     if not navigation_allowed(observed.get('url', ''), provenance=provenance):
         raise Gate('The current native receiver is not on the tracked job route.')
-    current = control(observed, action)
+    current = control(observed, action, 'native-receiver')
     if _identity(current) != _identity(original):
         raise Gate('The native receiver changed before disclosure.')
     check_form_destination(observed, current, provenance.wrapper,
@@ -2460,7 +2546,7 @@ def _combobox_stable_identity(target: dict) -> tuple:
 
 async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
                                    job_url, ctx, provenance):
-    target = control(page, action)
+    target = control(page, action, 'closed-initial')
     stable = _closed_key(target)
     selector = target['selector']
     admission = session._closed_admissions.get(selector)
@@ -2478,7 +2564,7 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     async def preflight(transition=None):
         fresh = await session.page()
         fresh, witness = await _observe_controls(session, fresh, closed_transition=transition)
-        current = control(fresh, action)
+        current = control(fresh, action, 'closed-preflight')
         if (_closed_key(current) != stable or not _closed_mode(current)
                 or not navigation_allowed(fresh.get('url', ''), job_url or page['url'],
                                           provenance=provenance)
@@ -2615,7 +2701,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     if provenance is not None and not _alias_current(
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed during combobox observation.')
-    target = control(observed, action)
+    target = control(observed, action, 'combobox-observe')
     if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
         return await _execute_closed_combobox(
             session, observed, action, facts=facts, filled=filled, pk=pk,
@@ -2658,7 +2744,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
             raise Gate('The verified posting changed while opening the picker; '
                        'inspect the current configured board and tracked job manually.')
-        current = control(latest, action)
+        current = control(latest, action, 'combobox-open')
         if (_combobox_stable_identity(current) != stable
                 or (current.get('combobox') or {}).get('link_id') != link_id
                 or not navigation_allowed(latest.get('url', ''),
@@ -2675,7 +2761,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         for attempt in range(20):
             refreshed = await session.page()
             refreshed, refreshed_witness = await _observe_controls(session, refreshed)
-            current = control(refreshed, action)
+            current = control(refreshed, action, 'combobox-options')
             if (_combobox_stable_identity(current) != stable
                     or (current.get('combobox') or {}).get('link_id') != link_id
                     or not navigation_allowed(refreshed.get('url', ''),
@@ -2706,7 +2792,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     # compares the receiver on both sides of this exact selection action.
     before_page = await session.page()
     before_page, before_witness = await _observe_controls(session, before_page)
-    before_target = control(before_page, action)
+    before_target = control(before_page, action, 'combobox-verify')
     if provenance is not None and not _alias_current(
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed before combobox selection.')
@@ -2820,8 +2906,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         _formless_boundary(page, provenance)
         if not isinstance(session, _EntrySession) or session.formless_identity != _root_identity(page):
             raise Gate('formless root lacks stable independent admission.')
-        check_form_destination(page, control(page, action), provenance=provenance)
-    target = control(page, action)
+        check_form_destination(page, control(page, action, 'execute-formless'), provenance=provenance)
+    target = control(page, action, 'execute-initial')
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
@@ -2840,14 +2926,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not navigation_allowed(observed.get('url', ''),
                                           provenance=provenance)):
             raise Gate('The same-job page or mapping changed before a field gate.')
-        target = control(observed, action)
+        target = control(observed, action, 'execute-observe')
         if verb == 'choose':
             _require_native_choice(target)
             if not _unanswered(observed, target):
                 raise Gate('Only required, unanswered native choices can be selected.')
         else:
             _require_native_action(target, verb)
-        if _identity(target) != _identity(control(page, action)):
+        if _identity(target) != _identity(control(page, action, 'execute-identity')):
             raise Gate('The selected field changed before human authorization.')
         page = observed
         form_question = _disclosure_question(
@@ -2924,7 +3010,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
         latest, latest_witness = await _observe_controls(session, page)
-        current = control(latest, action)
+        current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_native_choice(current)
             if not _unanswered(latest, current):
@@ -2976,7 +3062,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             await session.call('click', current['selector'])
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page())
-            actual = control(readback, action)
+            actual = control(readback, action, 'execute-readback')
             if actual.get('value') != write_value or not actual.get('has_value'):
                 raise Gate('The approved structural field value did not read back exactly.')
             exact_approval(pk, form_question['label'], write_value, target=_bound_target(readback, actual),
@@ -2984,7 +3070,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                            **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':
             readback, _ = await _observe_controls(session, await session.page())
-            phone = control(readback, action)
+            phone = control(readback, action, 'execute-phone')
             if (_combobox_stable_identity(phone) != _combobox_stable_identity(current)
                     or phone.get('value') != write_value or phone.get('has_value') is not True):
                 raise Gate('The full approved international phone did not read back exactly.')
@@ -3280,12 +3366,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')
                     if action.get('selector'):
-                        old = control(page, action)
+                        old = control(page, action, 'decision-initial')
                         page = await session.page()
                         step['url'] = page['url']
                         if not allowed(page['url']):
                             raise Gate('Destination changed to an unrelated job or tenant.')
-                        current = control(page, action)
+                        current = control(page, action, 'decision-fresh')
                         if current.get('tag') == 'a' and current.get('href') and not (
                                 allowed(current['href'])):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
@@ -3310,7 +3396,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # application. Observing it does not prove a read-only GET.
                         raise Gate('Unproven application navigation may commit; inspect it yourself.')
                     elif verb == 'submit':
-                        target = control(page, action)
+                        target = control(page, action, 'decision-submit')
                         structural = bool(_formless_root(page))
                         if not ((_structural_submit(page, target, provenance) if structural else
                                  is_submission(target) and native_submit(target))):
@@ -3324,7 +3410,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         elif getattr(session, '_closed_admissions', None):
                             # Direct routes still need current C3 parity for admitted widgets.
                             page, _ = await _observe_controls(session, page)
-                            target = control(page, action)
+                            target = control(page, action, 'submit-reobserve')
                         check_form_destination(page, target, *trusted_origins,
                                                provenance=provenance)
                         check_form(page, filled, uploaded, Path(resume_path).name, history)
@@ -3361,7 +3447,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
                     else:
-                        target = control(page, action)
+                        target = control(page, action, 'decision-action')
                         if verb == 'click' and _NEXT.match(target['label']):
                             if not native_submit(target):
                                 raise Gate('A JS-backed Continue has no proven native destination.')
@@ -3372,7 +3458,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     fixture_context=ctx)
                             elif getattr(session, '_closed_admissions', None):
                                 page, _ = await _observe_controls(session, page)
-                                target = control(page, action)
+                                target = control(page, action, 'click-reobserve')
                             check_form_destination(page, target, *trusted_origins,
                                                    provenance=provenance)
                             check_form(page, filled, uploaded, Path(resume_path).name, history)
@@ -3428,7 +3514,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'A submission-capable step was executed before the form stopped. '
                     'Check the employer portal before retrying.', step)
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-            context = handoff(str(exc), step)
+            context = (_control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
+                       else handoff(str(exc), step))
             return {'status': 'gate', 'reason': 'unknown_field',
                     'question': context['text'], 'step': context['step'],
                     'form_question': exc.form_question}

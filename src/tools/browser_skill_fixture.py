@@ -407,7 +407,8 @@ class _SyntheticRun:
                  "greenhouse", "greenhouse_empty_placeholder", "visible_badge_anchor", "native_validity",
                  "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
                  "ashby_upload", "ashby_upload_transient", "upload_ipc",
-                 "upload_before_tree", "upload_pair_page", "upload_pair_trace")
+                 "upload_before_tree", "upload_pair_page", "upload_pair_trace",
+                 "upload_pair_complete")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -463,6 +464,7 @@ class _SyntheticRun:
         self.upload_before_tree = None
         self.upload_pair_page = None
         self.upload_pair_trace = []
+        self.upload_pair_complete = False
         self.observe_page(None)
 
     def entry_provenance(self):
@@ -748,7 +750,7 @@ class _SyntheticRun:
                     result = await raw.call(*args)
                     observed = result.get('value') if isinstance(result, dict) else None
                     if (state.ashby_upload_transient and state.upload_ipc
-                            and isinstance(observed, dict)):
+                            and not state.upload_pair_complete and isinstance(observed, dict)):
                         if args[1] == page_script:
                             state.upload_pair_page = deepcopy(observed)
                         elif state.upload_pair_page is not None:
@@ -763,8 +765,14 @@ class _SyntheticRun:
                                     tree['complete'] = False
                                 observed['entry']['upload_tree'] = tree
                                 result = {'value': observed}
+                            page = state.upload_pair_page
                             state.upload_pair_trace.append({
-                                'page': state.upload_pair_page, 'fixed': deepcopy(observed)})
+                                'page': page, 'fixed': deepcopy(observed)})
+                            if (page['entry'] == observed['entry']
+                                    and page['entry']['upload_tree'].get('complete') is True
+                                    and page['entry']['upload_tree'].get('attached') is True):
+                                # Later form reads are not upload-settle pairs.
+                                state.upload_pair_complete = True
                             state.upload_pair_page = None
                     if not isinstance(observed, dict) or observed.get('url') != URL:
                         raise PermissionError('Fixture page escaped the fixed job URL.')

@@ -387,6 +387,7 @@ class ControlGate(Gate):
 def _control_gate_handoff(exc: ControlGate, step: dict) -> dict:
     # A previously clicked control label is untrusted and unrelated to this Gate.
     context = handoff(str(exc), {**step, 'last_button': ''})
+    context['step']['last_button'] = ''
     context['step'].update(exc.diagnostics)
     return context
 

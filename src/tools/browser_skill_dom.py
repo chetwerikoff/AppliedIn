@@ -617,7 +617,9 @@ _ASHBY_ROOT = r"""
         Array.from(n.attributes).every(a=>!/^on|^(role|tabindex|href|contenteditable)$/i.test(a.name));
       const valid=item.parentElement===file && names.length===1 && deletes.length===1 &&
         item.children.length===2 && name.parentElement===item && del.parentElement===item &&
-        Array.from(name.querySelectorAll('*')).every(passiveName) &&
+        name.querySelectorAll('svg').length<=1 &&
+        Array.from(name.querySelectorAll('*')).every(n=>
+          n.closest('svg') ? passiveIcon(n) : passiveName(n)) &&
         Array.from(del.querySelectorAll('*')).every(passiveIcon) &&
         !clean(del.textContent) &&
         passiveAttrs(item,['id','class']) && passiveAttrs(name,['id','class']) &&

@@ -116,18 +116,24 @@ def test_real_local_handler_opens_chooser_and_renders_only_passive_item():
     assert not re.search(r'input\.files\s*=', script)
     harness = r'''
 const handlers={}, elements=[];
-const make=tag=>({tag,children:[],append(...nodes){this.children.push(...nodes);}});
+const make=tag=>({tag,children:[],append(...nodes){this.children.push(...nodes);},setAttribute(k,v){this[k]=v;}});
+let settle, delay;global.setTimeout=(fn,ms)=>{settle=fn;delay=ms;};
 const icon={remove(){drop.iconRemoved=true;}};
 const file=make('div');file.insertBefore=(n,other)=>{if(other!==drop)throw Error('wrong container');file.children.unshift(n);};
 const input={files:[],parentElement:file,click(){this.clicked=(this.clicked||0)+1;},addEventListener(e,fn){handlers[e]=fn;}};
 const drop={addEventListener(e,fn){handlers['drop-'+e]=fn;},querySelector(q){if(q!=='svg')throw Error('unexpected target');return icon;}};
-global.document={getElementById:id=>id==='_systemfield_resume'?input:drop,createElement:make};
+global.document={getElementById:id=>id==='_systemfield_resume'?input:drop,createElement:make,
+ createElementNS:(ns,tag)=>({...make(tag),namespaceURI:ns})};
 eval(process.argv[1]);handlers['drop-click']();
 if(input.clicked!==1 || input.files.length)throw Error('chooser was bypassed');
 input.files=[{name:'Synthetic-Resume.pdf'}];handlers.change();
+if(!drop.disabled || delay!==1800 || file.children.length)throw Error('missing disabled pending window');
+settle();if(drop.disabled)throw Error('dropzone stayed disabled');
 const item=file.children[0];
 console.log(JSON.stringify({class:item.className,names:item.children.map(n=>n.className),
- name:item.children[0].textContent,title:item.children[1].title,
+ name:item.children[0].children[1].textContent,title:item.children[1].title,
+ nameChildren:item.children[0].children.map(n=>n.tag),
+ iconNS:item.children[0].children[0].namespaceURI,
  text:item.children[1].textContent||'',iconRemoved:drop.iconRemoved}));
 '''
     result = subprocess.run(['node', '-e', harness, script], capture_output=True, text=True, check=True)
@@ -136,6 +142,8 @@ console.log(JSON.stringify({class:item.className,names:item.children.map(n=>n.cl
                      'names': ['ashby-application-form-input-file-item-name',
                                'ashby-application-form-input-file-item-delete'],
                      'name': 'Synthetic-Resume.pdf', 'title': 'Remove attachment',
+                     'nameChildren': ['svg', 'span'],
+                     'iconNS': 'http://www.w3.org/2000/svg',
                      'text': '', 'iconRemoved': True}
 
 
@@ -207,3 +215,84 @@ async def test_definitive_no_effect_refusal_keeps_its_gate_reason(authority, mon
             'Complete the attachment manually; no retry was attempted.') in result['question']
     assert is_retryable(result) == (False, 'waiting on the owner')
     assert len(raw.uploads) == 1
+
+
+async def _timed_upload(authority, monkeypatch, *, settles):
+    from copy import deepcopy
+    from tests.tools.test_ashby_upload import UploadClock
+    from core.apply_queue import is_retryable
+    clock = UploadClock()
+    monkeypatch.setattr(forms, '_upload_clock', lambda: clock.now)
+    monkeypatch.setattr(forms, '_upload_sleep', clock.sleep)
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    raw = FixtureRaw(authority)
+    # Real independent readers supply both pending and attached observations.
+    pending = observed(disabledDrop=True, files=[Path(authority.resume_path).name])
+    attached = observed(attached=True, files=[Path(authority.resume_path).name],
+                        displayName=Path(authority.resume_path).name,
+                        filenameChild='span', filenameSvgs=1)
+    for pair in (pending, attached):
+        for page in pair:
+            page['url'] = fixture.URL
+            for c in page['controls'] + page['entry']['root_evidence']:
+                if c['selector'] == '#dropzone':
+                    c['selector'] = '#ashby-upload-dropzone'
+            for n in page['entry']['upload_tree']['nodes']:
+                if n.get('target_selector') == '#dropzone':
+                    n['target_selector'] = '#ashby-upload-dropzone'
+    original = raw.call
+    async def timed(method, *args, **kwargs):
+        if method == 'evaluate' and raw.uploads:
+            pair = attached if settles and clock.now >= 1.8 else pending
+            for source, target in zip((raw.current, raw.fixed), pair):
+                lookup = {c['selector']: c for c in source['entry']['root_evidence']}
+                for c in target['controls'] + target['entry']['root_evidence']:
+                    for key in ('value', 'has_value'):
+                        if c.get('type') != 'file' and key in lookup.get(c['selector'], {}):
+                            c[key] = lookup[c['selector']][key]
+            raw.current, raw.fixed = deepcopy(pair)
+        return await original(method, *args, **kwargs)
+    raw.call = timed
+    promotions, sessions = [], []
+    parent = forms._EntrySession
+    class TrackedEntry(parent):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            sessions.append(self)
+
+        def __setattr__(self, key, value):
+            if key == 'formless_identity' and getattr(self, 'upload_pending', False):
+                promotions.append(value)
+            super().__setattr__(key, value)
+    monkeypatch.setattr(forms, '_EntrySession', TrackedEntry)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_args: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert len(raw.uploads) == authority.upload_ipc == 1
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert authority.post_attempts == authority.post_count == 0
+    assert all(not session.upload_pending for session in sessions)
+    assert all(step == 0.25 for step in clock.steps)
+    if settles:
+        assert result['status'] == 'gate', result
+        assert result['form_question']['selector'] == '#additional', result
+        assert 1.8 <= clock.now < 2.25
+        assert len(promotions) == 1
+        assert sessions[0].upload_result['entry']['upload_tree']['attached']
+    else:
+        assert clock.now == 8.0 and len(clock.steps) == 32
+        assert result['status'] == 'uncertain', result
+        assert result['detail'] == 'Résumé upload interrupted after the browser command; inspect manually'
+        assert is_retryable(result) == (False, 'uncertain')
+        assert promotions == [] and sessions[0].upload_result is None
+
+
+async def test_ashby_upload_disabled_dropzone_1_8s_settles_one_ipc(authority, monkeypatch):
+    await _timed_upload(authority, monkeypatch, settles=True)
+
+
+async def test_ashby_upload_never_settles_8s_terminal_one_ipc(authority, monkeypatch):
+    await _timed_upload(authority, monkeypatch, settles=False)

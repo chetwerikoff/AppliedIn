@@ -11,6 +11,24 @@ from tests.tools.test_browser_formless import observed, root_world, RootSession
 from tests.tools.test_browser_application_entry import entry
 
 
+class UploadClock:
+    def __init__(self):
+        self.now = 0.0
+        self.steps = []
+
+    async def sleep(self, seconds):
+        self.steps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture(autouse=True)
+def upload_clock(monkeypatch):
+    clock = UploadClock()
+    monkeypatch.setattr(forms, '_upload_clock', lambda: clock.now)
+    monkeypatch.setattr(forms, '_upload_sleep', clock.sleep)
+    return clock
+
+
 class UploadSession(RootSession):
     def __init__(self, before, after, *, unchanged=0, refusal=None):
         super().__init__(*before)
@@ -144,12 +162,38 @@ async def test_unexpected_after_structure_never_promotes(monkeypatch, shape):
     after = observed(attached=True, files=['Resume.pdf'], **shape)
     raw, session, _ = setup_upload(monkeypatch, after=after)
     identity = session.formless_identity
+    # An attached but unadmitted delete is independently unsafe even when the
+    # tree is opaque; the item-free opaque cases below isolate read-only settling.
     with pytest.raises(forms.Gate):
         await upload(session)
     assert session.formless_identity == identity
     assert len(raw.mutations) == 1
     assert raw.post_pairs == 1
     assert not session.upload_pending
+
+
+@pytest.mark.parametrize('shape', [
+    {'secondDrop': True}, {'unreadableTree': True}, {'treeNodes': 4097},
+    {'disabledDrop': True},
+])
+async def test_opaque_post_ipc_only_observes_until_deadline(monkeypatch, upload_clock, shape):
+    raw, session, _ = setup_upload(monkeypatch, after=observed(files=['Resume.pdf'], **shape))
+    identity = session.formless_identity
+    with pytest.raises(TimeoutError):
+        await upload(session)
+    assert upload_clock.now == 8.0 and upload_clock.steps == [0.25] * 32
+    assert raw.post_pairs == 32 and len(raw.mutations) == 1
+    assert session.formless_identity == identity and session.upload_result is None
+    assert not session.upload_pending
+
+
+async def test_unchanged_empty_pending_tree_waits_without_promotion(monkeypatch, upload_clock):
+    raw, session, _ = setup_upload(monkeypatch, after=observed())
+    identity = session.formless_identity
+    with pytest.raises(TimeoutError):
+        await upload(session)
+    assert upload_clock.steps == [0.25] * 32
+    assert session.formless_identity == identity and len(raw.mutations) == 1
 
 
 @pytest.mark.parametrize('files', [[], ['Other.pdf'], ['Resume.pdf', 'Other.pdf'], ['Resume.pdf', 'Resume.pdf']])
@@ -162,29 +206,32 @@ async def test_display_without_exact_original_file_proof_gates(monkeypatch, file
     assert len(raw.mutations) == 1
 
 
-async def test_sixth_pair_is_forbidden(monkeypatch):
-    raw, session, _ = setup_upload(monkeypatch, unchanged=5)
+async def test_sixth_pair_is_forbidden(monkeypatch, upload_clock):
+    # The old five-pair cap is replaced by time, never extra mutation authority.
+    raw, session, _ = setup_upload(monkeypatch, unchanged=32)
     identity = session.formless_identity
-    with pytest.raises(forms.Gate, match='five observation pairs'):
+    with pytest.raises(TimeoutError):
         await upload(session)
-    assert raw.post_pairs == 5
+    assert raw.post_pairs == 32
+    assert upload_clock.steps == [0.25] * 32
     assert session.formless_identity == identity
     assert len(raw.mutations) == 1
 
 
-async def test_deadline_and_pending_readonly_authority(monkeypatch):
+async def test_deadline_and_pending_readonly_authority(monkeypatch, upload_clock):
     raw, session, _ = setup_upload(monkeypatch, unchanged=1)
     original = session._upload_pair
     async def delayed_pair():
         if raw.uploaded:
-            await asyncio.sleep(2.01)
+            upload_clock.now += 8.0
         return await original()
     monkeypatch.setattr(session, '_upload_pair', delayed_pair)
     identity = session.formless_identity
-    with pytest.raises(forms.Gate, match='deadline'):
+    with pytest.raises(TimeoutError):
         await upload(session)
     assert session.formless_identity == identity
     assert len(raw.mutations) == 1
+    assert not session.upload_pending
 
 
 async def test_pending_window_has_no_mutation_authority(monkeypatch):
@@ -391,3 +438,36 @@ def test_upload_tree_hashes_inert_applicant_like_id():
     tree = page['entry']['upload_tree']
     assert tree['complete']
     assert 'test-user-private-contact' not in json.dumps(tree)
+
+
+async def _filename_case(monkeypatch, attrs=None, count=1, accepted=False):
+    after = observed(attached=True, files=['Resume.pdf'], filenameChild='span',
+                     filenameSvgs=count, filenameSvgAttrs=attrs or {})
+    assert after[0]['entry'] == after[1]['entry']
+    raw, session, _ = setup_upload(monkeypatch, after=after)
+    identity = session.formless_identity
+    if accepted:
+        await upload(session)
+        assert session.upload_result['entry']['upload_tree']['attached']
+    else:
+        with pytest.raises(forms.Gate):
+            await upload(session)
+        assert session.formless_identity == identity
+    assert len(raw.mutations) == 1
+    assert not session.submit_authorized
+
+
+async def test_ashby_filename_one_passive_svg_plus_span_passes(monkeypatch):
+    await _filename_case(monkeypatch, accepted=True)
+
+
+async def test_ashby_filename_two_svgs_gate(monkeypatch):
+    await _filename_case(monkeypatch, count=2)
+
+
+async def test_ashby_filename_svg_role_gate(monkeypatch):
+    await _filename_case(monkeypatch, attrs={'role': 'img'})
+
+
+async def test_ashby_filename_svg_handler_gate(monkeypatch):
+    await _filename_case(monkeypatch, attrs={'onclick': 'syntheticAction()'})

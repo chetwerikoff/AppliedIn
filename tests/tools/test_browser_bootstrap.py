@@ -2385,3 +2385,67 @@ async def test_greenhouse_marked_label_never_invents_grant_or_chooses_alias(
     assert caught.value.form_question["label"] == "First Name*"
     assert not decide.await_count
     assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
+
+
+
+async def test_marked_select_uses_canonical_fact_and_original_grant(monkeypatch, tmp_path):
+    options = [{"value": "remote", "label": "Remote"},
+               {"value": "hybrid", "label": "Hybrid"}]
+    target = field("Work mode*", "#work", tag="select", type="select",
+                   options=options, form_action=GH_DIRECT)
+    p = inventory(target, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {
+        "Work mode*": {
+            "value": "Remote", "selector": "#work", "url": GH_DIRECT,
+            "label": "Work mode*", "question": "", "tag": "select",
+            "type": "select", "form_selector": "#application",
+            "form_action": GH_DIRECT, "options": deepcopy(options),
+        },
+    }
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "select", "selector": "#work",
+         "fact": "Work mode", "value": "remote"},
+        facts={"Work mode": "Remote"}, filled={}, resume_path="Resume.pdf",
+        company="example-co", jd_text="", resume_tex="", github="",
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "Work mode*"
+    assert receipt["approved_value"] == "Remote"
+    assert [call for call in browser.calls if call[0] == "select"] == [
+        ("select", "#work", "--value", "remote"),
+    ]
+
+
+async def test_marked_native_choice_keeps_observed_question_as_grant_key(
+        monkeypatch, tmp_path):
+    target = field("Email contact", "#choice", tag="input", type="checkbox",
+                   question="Contact preference*", required=True, value="yes",
+                   has_value=True, checked=False, form_action=GH_DIRECT)
+    p = inventory(target, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {
+        "Contact preference*": {
+            "value": "yes", "selector": "#choice", "url": GH_DIRECT,
+            "label": "Email contact", "question": "Contact preference*",
+            "tag": "input", "type": "checkbox",
+            "form_selector": "#application", "form_action": GH_DIRECT,
+            "visible_text": "Email contact",
+        },
+    }
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "choose", "selector": "#choice", "fact": "Contact preference"},
+        facts={"Contact preference": "yes"}, filled={},
+        resume_path="Resume.pdf", company="example-co",
+        jd_text="", resume_tex="", github="", pk=GH_PK,
+        job_url=GH_WRAP, provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "Contact preference*"
+    assert receipt["approved_value"] == "yes"
+    assert [call for call in browser.calls if call[0] == "click"] == [
+        ("click", "#choice"),
+    ]

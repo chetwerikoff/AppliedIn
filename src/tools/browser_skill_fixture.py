@@ -752,6 +752,18 @@ class _SyntheticRun:
                     if (state.ashby_upload_transient and state.upload_ipc
                             and not state.upload_pair_complete and isinstance(observed, dict)):
                         if args[1] == page_script:
+                            if len(state.upload_pair_trace) <= 1:
+                                # Fix two sequential states before the live tree may settle:
+                                # first split, then an agreeing opaque-pending sample.
+                                tree = (observed.get('entry') or {}).get('upload_tree')
+                                if isinstance(tree, dict) and tree.get('complete') is True:
+                                    if not isinstance(state.upload_before_tree, dict):
+                                        raise PermissionError('Synthetic pre-upload tree was not observed.')
+                                    observed = deepcopy(observed)
+                                    pending = deepcopy(state.upload_before_tree)
+                                    pending.update(complete=False, attached=False, filename='', items=[])
+                                    observed['entry']['upload_tree'] = pending
+                                    result = {'value': observed}
                             state.upload_pair_page = deepcopy(observed)
                         elif state.upload_pair_page is not None:
                             if not state.upload_pair_trace:
@@ -764,6 +776,14 @@ class _SyntheticRun:
                                 if tree == state.upload_pair_page['entry']['upload_tree']:
                                     tree['complete'] = False
                                 observed['entry']['upload_tree'] = tree
+                                result = {'value': observed}
+                            elif (len(state.upload_pair_trace) == 1
+                                  and (observed.get('entry') or {}).get('upload_tree', {}).get('complete') is True):
+                                # The real timer may complete between PAGE and fixed;
+                                # retain the sequence-controlled pending sample in both.
+                                observed = deepcopy(observed)
+                                observed['entry']['upload_tree'] = deepcopy(
+                                    state.upload_pair_page['entry']['upload_tree'])
                                 result = {'value': observed}
                             page = state.upload_pair_page
                             state.upload_pair_trace.append({
@@ -949,11 +969,9 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 state.ashby = bool(ashby or ashby_upload or ashby_upload_transient)
                 state.custom_question = custom_question
                 state.ashby_upload = bool(ashby_upload or ashby_upload_transient)
-                # An unconditional eight-leg run names only ashby_upload. Its
-                # first sequential witness split is built into that leg; the
-                # explicit False override retains the original ordinary case.
-                state.ashby_upload_transient = (
-                    ashby_upload if ashby_upload_transient is None else ashby_upload_transient)
+                # The normal Ashby upload remains the default; only the explicit
+                # transient sub-case perturbs sequential observations.
+                state.ashby_upload_transient = ashby_upload_transient is True
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -1135,6 +1153,8 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
+                                  'variant': ('transient' if state.ashby_upload_transient else 'ordinary')
+                                             if state.ashby_upload else None,
                                   'scenario': ('lever_custom_'+custom_question if custom_question else
                                                'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
@@ -1191,6 +1211,13 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 raise RuntimeError('Synthetic fixture harness server did not stop.')
 
 
+def _ashby_upload_leg() -> int:
+    """Keep both upload variants inside the existing top-level Ashby leg."""
+    ordinary = _run_scenario(ashby_upload=True)
+    transient = _run_scenario(ashby_upload=True, ashby_upload_transient=True)
+    return 0 if ordinary == transient == 0 else 1
+
+
 def run() -> int:
     """Every invocation exercises all eight isolated, sealed question/frame legs."""
     entry = _run_scenario()
@@ -1198,9 +1225,8 @@ def run() -> int:
     empty_placeholder = _run_scenario(greenhouse_empty_placeholder=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    # The deterministic split is a read boundary within the existing upload
-    # leg, not a ninth dispatch; ordinary upload remains directly exercisable.
-    ashby_upload = _run_scenario(ashby_upload=True)
+    # Both upload cases remain one logical Ashby fixture leg.
+    ashby_upload = _ashby_upload_leg()
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
     legs = {
@@ -1221,5 +1247,5 @@ def run() -> int:
                       'lever_custom_checkbox': 'PASS' if checkbox == 0 else 'FAIL',
                       'legs': {name: 'PASS' if status == 0 else 'FAIL'
                                for name, status in legs.items()},
-                      'sessions': len(legs)}))
+                      'sessions': len(legs) + 1}))
     return 0 if ok else 1

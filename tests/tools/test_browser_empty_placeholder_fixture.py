@@ -129,9 +129,12 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
     monkeypatch.setattr(forms, 'apply', apply)
     assert fixture.run() == int(premature)
     reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert reports[-1]['sessions'] == len(STAGES) == 8
+    assert reports[-1]['sessions'] == 9
+    assert len(reports[-1]['legs']) == len(STAGES) == 8
     assert set(reports[-1]['legs']) == set(STAGES)
     assert {r['scenario'] for r in reports[:-1]} == set(STAGES)
+    upload_reports = [r for r in reports[:-1] if r['scenario'] == 'ashby-upload']
+    assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient'}
     for report in reports[:-1]:
         failed = premature and report['scenario'] in {'entry', 'greenhouse', 'greenhouse_empty_placeholder'}
         assert report['final_stage'] == ('premature' if failed else STAGES[report['scenario']])
@@ -141,15 +144,18 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
         assert report['submit']['post_attempts'] == 0 and report['submit']['receipts'] == []
         assert report['post_received'] is False
         if report['scenario'] == 'ashby-upload':
-            trace = report['upload_pair_trace']
-            assert [pair['entry_agrees'] for pair in trace] == [False, True, True]
-            assert [pair['page_complete'] for pair in trace] == [False, False, True]
-            assert [pair['fixed_complete'] for pair in trace] == [True, False, True]
-            assert all(pair['page_url'] == pair['fixed_url'] == fixture.URL
-                       and pair['original_root_agrees']
-                       and pair['page_inventory_verified'] for pair in trace)
-            assert trace[-1]['page_attached'] is True
             assert report['upload_ipc'] == 1
+            trace = report['upload_pair_trace']
+            if report['variant'] == 'transient':
+                assert [pair['entry_agrees'] for pair in trace] == [False, True, True]
+                assert [pair['page_complete'] for pair in trace] == [False, False, True]
+                assert [pair['fixed_complete'] for pair in trace] == [True, False, True]
+                assert all(pair['page_url'] == pair['fixed_url'] == fixture.URL
+                           and pair['original_root_agrees']
+                           and pair['page_inventory_verified'] for pair in trace)
+                assert trace[-1]['page_attached'] is True
+            else:
+                assert trace == []
         else:
             assert report['upload_ipc'] == 0
     assert reports[-1]['legs'] == {

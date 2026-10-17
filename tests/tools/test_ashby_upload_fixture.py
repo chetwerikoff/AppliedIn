@@ -52,7 +52,7 @@ class FixtureRaw(RootSession):
 
 async def test_separate_sealed_grants_reach_existing_next_human_gate(authority, monkeypatch):
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
-    authority.ashby = authority.ashby_upload = True
+    authority.ashby = authority.ashby_upload = authority.ashby_upload_transient = True
     authority.enable_positive_fixture()
     raw = FixtureRaw(authority)
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_args: raw)
@@ -70,6 +70,12 @@ async def test_separate_sealed_grants_reach_existing_next_human_gate(authority, 
     assert raw.uploads == [(('upload', '#ashby-upload-dropzone', '--file', authority.resume_path),
                             {'timeout': 130})]
     assert set(authority.row['human_approved_answers']) == {'Name', 'Email'}
+    pairs = authority.upload_pair_trace
+    assert len(pairs) == 3
+    assert [p['page']['entry'] == p['fixed']['entry'] for p in pairs] == [False, True, True]
+    assert [p['page']['entry']['upload_tree']['complete'] for p in pairs] == [False, False, True]
+    assert pairs[-1]['page']['entry']['upload_tree']['attached'] is True
+    assert all(p['page']['url'] == p['fixed']['url'] == fixture.URL for p in pairs)
 
 
 @pytest.mark.parametrize('attempt', ['logical-input', 'mode', 'click', 'wrong-file', 'repeat'])
@@ -106,9 +112,11 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
     assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
                      {'w_lookalike': True}, {'ashby': True},
                      {'ashby_upload': True},
+                     {'ashby_upload': True, 'ashby_upload_transient': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
-    assert report['sessions'] == 8
+    assert report['sessions'] == 9
+    assert len(report['legs']) == 8
     assert set(report['legs']) == {
         'entry', 'greenhouse', 'greenhouse_empty_placeholder',
         'w_button_aria_label', 'ashby', 'ashby-upload',

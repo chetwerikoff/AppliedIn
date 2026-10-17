@@ -594,10 +594,27 @@ async def test_persistent_benign_entry_split_hits_original_eight_second_deadline
     ('page-inventory', 'The current form inventory is incomplete'),
     ('page-url', 'Application entry route or current row/config changed'),
     ('fixed-url', 'Application entry route or current row/config changed'),
+    ('page-candidate', 'Application control semantics changed during upload'),
+    ('fixed-candidate', 'Application control semantics changed during upload'),
+    ('page-wrong-file', '(Only the exact staged résumé|unsupported custom control)'),
+    ('fixed-wrong-file', '(Only the exact staged résumé|unsupported custom control)'),
+    ('page-wrong-tree-filename', '(The exact passive attached-file item|unsupported custom control)'),
+    ('fixed-wrong-tree-filename', '(The exact passive attached-file item|unsupported custom control)'),
 ])
 async def test_entry_split_never_masks_one_sided_definitive_gate(
         monkeypatch, upload_clock, drift, reason):
-    first = observed(disabledDrop=True, files=['Resume.pdf'])
+    if drift.endswith('wrong-file'):
+        first = list(observed(attached=True, files=['Other.pdf']))
+        normal = observed(attached=True, files=['Resume.pdf'])
+        target = 0 if drift.startswith('page-') else 1
+        first[1 - target] = normal[1 - target]
+    elif drift.endswith('wrong-tree-filename'):
+        first = list(observed(attached=True, files=['Resume.pdf'], displayName='Other.pdf'))
+        normal = observed(attached=True, files=['Resume.pdf'], displayName='Resume.pdf')
+        target = 0 if drift.startswith('page-') else 1
+        first[1 - target] = normal[1 - target]
+    else:
+        first = list(observed(disabledDrop=True, files=['Resume.pdf']))
     first[1]['entry']['upload_tree']['nodes'][0]['text'] = 'pre-transition'
     page = first[0] if drift.startswith('page-') else first[1]
     if drift.endswith('root'):
@@ -606,8 +623,37 @@ async def test_entry_split_never_masks_one_sided_definitive_gate(
         page['entry']['formless']['submit'] = '#changed-submit'
     elif drift == 'page-inventory':
         page['inventory_verified'] = False
-    else:
+    elif drift.endswith('url'):
         page['url'] += '/changed'
+    elif drift.endswith('candidate'):
+        resume = next(c for c in page['entry']['root_evidence']
+                      if c.get('id') == '_systemfield_name')
+        selector = resume['selector']
+        for control in page['controls'] + page['entry']['root_evidence']:
+            if control.get('selector') == selector:
+                control['label'] = 'Changed synthetic candidate'
+    raw, session, _ = sequenced_upload(monkeypatch, [first])
+    identity = session.formless_identity
+    with pytest.raises(forms.Gate, match=reason):
+        await upload(session)
+    assert raw.post_pairs == 1 and upload_clock.steps == []
+    assert len(raw.mutations) == 1
+    assert session.formless_identity == identity and session.upload_result is None
+    assert not session.upload_pending and not session.submit_authorized
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
+    if drift.endswith('root'):
+        page['entry']['formless']['root'] = '#changed-application-root'
+    elif drift.endswith('submit'):
+        page['entry']['formless']['submit'] = '#changed-submit'
+    elif drift == 'page-inventory':
+        page['inventory_verified'] = False
+    elif drift.endswith('url'):
+        page['url'] += '/changed'
+    elif drift.endswith('candidate'):
+        for collection in (page['controls'], page['entry']['root_evidence']):
+            for control in collection:
+                if control.get('id') == '_systemfield_name':
+                    control['label'] = 'Changed synthetic candidate'
     raw, session, _ = sequenced_upload(monkeypatch, [first])
     identity = session.formless_identity
     with pytest.raises(forms.Gate, match=reason):

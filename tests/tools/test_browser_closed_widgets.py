@@ -567,6 +567,43 @@ def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, exp
     assert reason.count('control=') <= 3
 
 
+def test_repeated_deep_opaque_nodes_remain_fail_closed():
+    # Two distinct sibling subtrees have the same final twelve structural
+    # segments. The inventory must still Gate even while AC3 diagnostics await
+    # a separately authorized change to the bounded log-safe CSS grammar.
+    p = dom(diagnostics={'count': 2, 'depth': 14})['page']
+    assert p['opaque_count'] == 2
+    assert p['opaque_controls'] is True and p['inventory_verified'] is False
+    assert len(p['opaque_locators']) == 2
+    with pytest.raises(forms.Gate, match='opaque_count=2'):
+        forms._inventory_ok(p)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='Issue #110 AC3: safe Gate grammar permits only 12 direct-parent segments; '
+           'repeated deeper branches require a separately approved validator scope change',
+)
+def test_repeated_deep_opaque_nodes_have_distinct_safe_locators():
+    # Regression required by review #5558913444. The two canvases are present
+    # and unique in the DOM but have identical last-12-segment selectors.
+    # Keep the desired outcome explicit rather than silently weakening the
+    # existing _safe_diagnostic validator or pretending this AC has passed.
+    p = dom(diagnostics={'count': 2, 'depth': 14})['page']
+    assert p['opaque_count'] == 2
+    paths = p['opaque_locators']
+    assert len(paths) == 2
+    assert all(isinstance(x, str) and x != 'unavailable'
+               and forms._safe_diagnostic(x) == x for x in paths)
+    assert len(set(paths)) == 2
+    with pytest.raises(forms.Gate) as caught:
+        forms._inventory_ok(p)
+    detail = str(caught.value)
+    assert detail.count('control=') == 2
+    assert 'control=unavailable' not in detail
+    assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
+
+
 @pytest.mark.parametrize('fresh', [False, True])
 @pytest.mark.parametrize('flags', [
     {'opaque_controls': True, 'opaque_count': 1, 'opaque_locators': ['#test-user@example-co.test']},

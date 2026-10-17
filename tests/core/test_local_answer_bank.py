@@ -116,3 +116,15 @@ def test_existing_trailing_star_row_reloads_untouched_answer(tmp_path):
     assert bank._load()["global"] == [
         ("First Name*", "New User"), ("Inner**Star", "Test** User"),
     ]
+
+
+
+def test_hand_edited_legacy_delimiter_without_space_is_readable(tmp_path):
+    path = tmp_path / "facts.md"
+    path.write_text("# AppliedIn facts\n\n## global\n- **Email**:old@example.test\n")
+    bank = MarkdownAnswerBank(path)
+    assert bank.lookup("Email ✱", "example-co") == "old@example.test"
+    bank.put("Email*", "new@example.test", AnswerScope.GLOBAL)
+    assert MarkdownAnswerBank(path)._load()["global"] == [
+        ("Email", "new@example.test")
+    ]

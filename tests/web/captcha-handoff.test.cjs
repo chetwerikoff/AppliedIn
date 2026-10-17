@@ -158,6 +158,7 @@ test('every CAPTCHA row is excluded from bulk picks, even Ready-to-apply conflic
   assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), (r) => r.pk),
     ['ordinary-ready', 'ordinary-approval']);
   h.state.tab = 'pipeline';
+  // An unknown_field ready-prefix row is selectable in Needs-you, not in the Ready lane.
   assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), (r) => r.pk),
-    ['ordinary-ready', 'ordinary-approval', 'ordinary-tailored']);
+    ['ordinary-approval', 'ordinary-tailored']);
 });

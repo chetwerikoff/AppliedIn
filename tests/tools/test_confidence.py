@@ -81,3 +81,36 @@ def test_all_high_confidence():
     assert all_high_confidence([high, high]) is True
     assert all_high_confidence([high, low]) is False
     assert all_high_confidence([]) is True
+
+
+
+def test_bounded_marker_direct_lookup_and_existing_lever_synonym(bank):
+    assert resolve_field("First name*", "greenhouse", bank, "example-co") == (
+        FieldResolution(value="Alex", high_confidence=True)
+    )
+    assert resolve_field("Notice period?", "lever", bank, "example-co") == (
+        FieldResolution(value="2 weeks", high_confidence=True)
+    )
+    bank.put("resume", "synthetic_resume.pdf", AnswerScope.GLOBAL)
+    assert resolve_field("Resume/CV", "lever", bank, "example-co") == (
+        FieldResolution(value="synthetic_resume.pdf", high_confidence=True)
+    )
+
+
+def test_sign_and_currency_labels_never_borrow_wrong_approved_answer(bank):
+    bank.put("C", "standalone", AnswerScope.GLOBAL)
+    bank.put("$ Salary", "USD", AnswerScope.GLOBAL)
+    for label in ("C++", "C#", "C++ experience", "€ Salary"):
+        assert resolve_field(label, "greenhouse", bank, "example-co") == (
+            FieldResolution(value=None, high_confidence=False)
+        )
+    bank.put("C++", "cplusplus", AnswerScope.GLOBAL)
+    bank.put("C#", "csharp", AnswerScope.GLOBAL)
+    bank.put("€ Salary", "EUR", AnswerScope.GLOBAL)
+    for label, expected in [
+        ("C", "standalone"), ("C++", "cplusplus"), ("C#", "csharp"),
+        ("$ Salary", "USD"), ("€ Salary", "EUR"),
+    ]:
+        assert resolve_field(label, "greenhouse", bank, "example-co") == (
+            FieldResolution(value=expected, high_confidence=True)
+        )

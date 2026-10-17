@@ -2270,3 +2270,355 @@ async def test_apply_without_synthetic_context_checks_approved_history_before_su
     assert 'Submission clicked' in result['detail']
     assert any(call[0] == 'fill' for call in browser.calls)
     assert ('click', '#submit') in browser.calls
+
+
+
+def _marked_name_grant(*, selector="#first", value="Test User", url=GH_DIRECT):
+    return {
+        "value": value, "selector": selector, "url": url,
+        "label": "First Name*", "question": "", "tag": "input", "type": "text",
+        "form_selector": "#application", "form_action": GH_DIRECT,
+    }
+
+
+def _marked_greenhouse_page():
+    return inventory(
+        field("First Name*", "#first", form_action=GH_DIRECT),
+        field("Email", "#email", form_action=GH_DIRECT),
+        submit(form_action=GH_DIRECT), url=GH_DIRECT,
+    )
+
+
+async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
+        monkeypatch, tmp_path):
+    """First grant -> real Markdown put/reload -> next fake observe; no new gate."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+
+    path = tmp_path / "facts.md"
+    first = MarkdownAnswerBank(path)
+    first.put("First Name*", "Test User", AnswerScope.GLOBAL,
+              source="synthetic_gate")
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {"First Name": "Test User"}
+    assert "- **First Name**: Test User" in path.read_text()
+
+    p = _marked_greenhouse_page()
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    approved = forms.exact_approval
+    checked = []
+
+    def observe(pk, key, value, **kwargs):
+        checked.append((key, value, kwargs["target"]["selector"]))
+        return approved(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", observe)
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(
+            browser, p, GH_PK, facts, GH_WRAP,
+            provenance=_greenhouse_provenance(row),
+        )
+    assert caught.value.form_question["label"] == "Email"
+    assert ("First Name*", "Test User", "#first") in checked
+    assert not decide.await_count
+    assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
+
+
+async def test_greenhouse_marked_label_execute_retains_grant_and_receipt_identity(
+        monkeypatch, tmp_path):
+    p = _marked_greenhouse_page()
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    checked = []
+    original = forms.exact_approval
+
+    def observe(pk, key, value, **kwargs):
+        checked.append((key, value))
+        return original(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", observe)
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "fill", "selector": "#first", "fact": "First Name"},
+        facts={"First Name": "Test User"}, filled={},
+        resume_path="Resume.pdf", company="example-co",
+        jd_text="", resume_tex="", github="", pk=GH_PK, job_url=GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "First Name*"
+    assert receipt["approved_value"] == "Test User"
+    assert checked and all(pair == ("First Name*", "Test User") for pair in checked)
+    assert [c for c in browser.calls if c[0] == "fill"] == [
+        ("fill", "#first", "--value", "Test User"),
+    ]
+
+
+@pytest.mark.parametrize("problem", [
+    "missing-grant", "wrong-value", "stale-url", "changed-control",
+    "ambiguous-facts",
+])
+async def test_greenhouse_marked_label_never_invents_grant_or_chooses_alias(
+        monkeypatch, tmp_path, problem):
+    p = _marked_greenhouse_page()
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    grant = _marked_name_grant()
+    facts = {"First Name": "Test User"}
+    if problem == "missing-grant":
+        row["human_approved_answers"] = {}
+    else:
+        if problem == "wrong-value":
+            grant["value"] = "Other User"
+        elif problem == "stale-url":
+            grant["url"] = "https://example.invalid/job/old"
+        elif problem == "changed-control":
+            grant["selector"] = "#old"
+        elif problem == "ambiguous-facts":
+            facts["first name"] = "Different User"
+        row["human_approved_answers"] = {"First Name*": grant}
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(
+            browser, p, GH_PK, facts, GH_WRAP,
+            provenance=_greenhouse_provenance(row),
+        )
+    assert caught.value.form_question["label"] == "First Name*"
+    assert not decide.await_count
+    assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
+
+
+
+async def test_marked_select_uses_canonical_fact_and_original_grant(monkeypatch, tmp_path):
+    options = [{"value": "remote", "label": "Remote"},
+               {"value": "hybrid", "label": "Hybrid"}]
+    target = field("Work mode*", "#work", tag="select", type="select",
+                   options=options, form_action=GH_DIRECT)
+    p = inventory(target, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {
+        "Work mode*": {
+            "value": "Remote", "selector": "#work", "url": GH_DIRECT,
+            "label": "Work mode*", "question": "", "tag": "select",
+            "type": "select", "form_selector": "#application",
+            "form_action": GH_DIRECT, "options": deepcopy(options),
+        },
+    }
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "select", "selector": "#work",
+         "fact": "Work mode", "value": "remote"},
+        facts={"Work mode": "Remote"}, filled={}, resume_path="Resume.pdf",
+        company="example-co", jd_text="", resume_tex="", github="",
+        pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "Work mode*"
+    assert receipt["approved_value"] == "Remote"
+    assert [call for call in browser.calls if call[0] == "select"] == [
+        ("select", "#work", "--value", "remote"),
+    ]
+
+
+async def test_marked_native_choice_keeps_observed_question_as_grant_key(
+        monkeypatch, tmp_path):
+    target = field("Email contact", "#choice", tag="input", type="checkbox",
+                   question="Contact preference*", required=True, value="yes",
+                   has_value=True, checked=False, form_action=GH_DIRECT)
+    p = inventory(target, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {
+        "Contact preference*": {
+            "value": "yes", "selector": "#choice", "url": GH_DIRECT,
+            "label": "Email contact", "question": "Contact preference*",
+            "tag": "input", "type": "checkbox",
+            "form_selector": "#application", "form_action": GH_DIRECT,
+            "visible_text": "Email contact",
+        },
+    }
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "choose", "selector": "#choice", "fact": "Contact preference"},
+        facts={"Contact preference": "yes"}, filled={},
+        resume_path="Resume.pdf", company="example-co",
+        jd_text="", resume_tex="", github="", pk=GH_PK,
+        job_url=GH_WRAP, provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "Contact preference*"
+    assert receipt["approved_value"] == "yes"
+    assert [call for call in browser.calls if call[0] == "click"] == [
+        ("click", "#choice"),
+    ]
+
+
+
+async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
+        monkeypatch, tmp_path):
+    """Gate -> bank/reload -> real apply decision sees the canonical fact key."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+
+    page = inventory(
+        field("First Name*", "#first", form_action=GH_DIRECT),
+        submit(form_action=GH_DIRECT), url=GH_DIRECT,
+    )
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, page)
+
+    first = await forms.apply(
+        GH_WRAP, "example-co", {}, "synthetic", pk=GH_PK,
+        resume_path="Resume.pdf",
+    )
+    assert first["status"] == "gate"
+    assert first["form_question"]["label"] == "First Name*"
+    assert not decide.await_count
+
+    path = tmp_path / "facts.md"
+    MarkdownAnswerBank(path).put("First Name*", "Test User", AnswerScope.GLOBAL)
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {"First Name": "Test User"}
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    browser.allow_mutations = True
+    checked = []
+    original_exact = forms.exact_approval
+
+    def capture_exact(pk, key, value, **kwargs):
+        checked.append((key, value, kwargs["target"]["selector"]))
+        return original_exact(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", capture_exact)
+    advertised = []
+
+    async def decision(prompt, observed, history, *, model):
+        advertised.append((prompt, deepcopy(history)))
+        if len(advertised) == 1:
+            return {"action": "fill", "selector": "#first", "fact": "First Name"}
+        # Stop via a human gate, never approach upload or submission.
+        return {"action": "gate", "question": "Synthetic stop before submission"}
+
+    monkeypatch.setattr(bsk, "decision", decision)
+    result = await forms.apply(
+        GH_WRAP, "example-co", facts, "synthetic", pk=GH_PK,
+        resume_path="Resume.pdf",
+    )
+    assert result["status"] == "gate"
+    assert "Synthetic stop before submission" in result["question"]
+    assert len(advertised) == 2
+    assert ("Exact human-authorized fact KEYS on this tracked job: "
+            "['First Name'].") in advertised[0][0]
+    assert advertised[0][1] == []
+    assert advertised[1][1][0]["fact"] == "First Name*"
+    assert advertised[1][1][0]["approved_value"] == "Test User"
+    assert checked and all(item == ("First Name*", "Test User", "#first")
+                           for item in checked)
+    assert row["human_approved_answers"] == {"First Name*": _marked_name_grant()}
+    assert [c for c in browser.calls if c[0] == "fill"] == [
+        ("fill", "#first", "--value", "Test User"),
+    ]
+    assert not [c for c in browser.calls
+                if c[0] in {"submit", "click", "upload", "select"}]
+
+@pytest.mark.parametrize("facts,observed,expected", [
+    ({"First name": "Ada", "First Name": "Ada"}, "First Name*", "First Name"),
+    ({"Last name": "Lovelace", "Last Name": "Lovelace"}, "Last Name*", "Last Name"),
+    ({"First name": " Ada ", "First Name": "Ada"}, "First Name*", "First Name"),
+    ({"First name": "Ada", "First Name": "Eve"}, "First Name*", None),
+    ({"First Name*": "Eve", "First Name": "Ada"}, "First Name*", "First Name*"),
+    ({"Unrelated": "Ada"}, "First Name*", None),
+])
+def test_marked_native_fact_key_deduplicates_only_identical_value_aliases(
+        facts, observed, expected):
+    assert forms._fact_key(facts, observed) == expected
+
+
+async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliases(
+        monkeypatch, tmp_path):
+    """Production wrapper derives name twins; neither creates a new approval."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+    from tools import browser_apply, browser_runtime, submit_hold
+
+    path = tmp_path / "wrapper-names.md"
+    bank = MarkdownAnswerBank(path)
+    bank.put("Full name", "Ada Lovelace", AnswerScope.GLOBAL)
+    bank.put("First Name*", "Ada", AnswerScope.GLOBAL)
+    bank.put("Last Name*", "Lovelace", AnswerScope.GLOBAL)
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {
+        "Full name": "Ada Lovelace",
+        "First Name": "Ada",
+        "Last Name": "Lovelace",
+    }
+    page = inventory(
+        field("First Name*", "#first", form_action=GH_DIRECT),
+        field("Last Name*", "#last", form_action=GH_DIRECT),
+        submit(form_action=GH_DIRECT), url=GH_DIRECT,
+    )
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, page)
+    row["human_approved_answers"] = {
+        "First Name*": _marked_name_grant(value="Ada"),
+        "Last Name*": {
+            **_marked_name_grant(selector="#last", value="Lovelace"),
+            "label": "Last Name*",
+        },
+        # Previously granted spellings must not duplicate model-visible data
+        # or substitute for the raw First Name*/Last Name* control grants.
+        "First name": {**_marked_name_grant(value="Ada"), "label": "First name"},
+        "Last name": {
+            **_marked_name_grant(selector="#last", value="Lovelace"),
+            "label": "Last name",
+        },
+    }
+    original_grants = deepcopy(row["human_approved_answers"])
+
+    # Only the outside runtime/store are fake: actual browser_apply.apply ->
+    # browser_runtime.apply -> browser_skill_apply.apply and its exact guards run.
+    monkeypatch.setattr(
+        "core.stores.make_stores",
+        lambda: SimpleNamespace(tracking=SimpleNamespace(get=lambda _pk: row)),
+    )
+    monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: False)
+    monkeypatch.setattr(browser_runtime, "available", lambda: (True, ""))
+    dispatched = []
+
+    async def offline_engine(url, company, enriched, model, **kwargs):
+        dispatched.append(dict(enriched))
+        assert enriched["First name"] == enriched["First Name"] == "Ada"
+        assert enriched["Last name"] == enriched["Last Name"] == "Lovelace"
+        return await forms.apply(url, company, enriched, model, **kwargs)
+
+    monkeypatch.setattr(
+        browser_runtime, "backend",
+        lambda: SimpleNamespace(apply_chrome=offline_engine),
+    )
+    checked = []
+    exact = forms.exact_approval
+
+    def capture_exact(pk, key, value, **kwargs):
+        checked.append((key, value, kwargs["target"]["selector"]))
+        return exact(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", capture_exact)
+    prompts = []
+
+    async def stop_before_write(prompt, observed, history, *, model):
+        prompts.append(prompt)
+        return {"action": "gate", "question": "Synthetic stop before any write"}
+
+    monkeypatch.setattr(bsk, "decision", stop_before_write)
+    result = await browser_apply.apply(
+        GH_WRAP, "example-co", facts, "synthetic", pk=GH_PK,
+        resume_path="Resume.pdf",
+    )
+    assert result["status"] == "gate", result
+    assert "Synthetic stop before any write" in result["question"]
+    assert len(dispatched) == 1
+    assert checked == [
+        ("First Name*", "Ada", "#first"),
+        ("Last Name*", "Lovelace", "#last"),
+    ]
+    assert len(prompts) == 1
+    assert ("Exact human-authorized fact KEYS on this tracked job: "
+            "['First Name', 'Last Name'].") in prompts[0]
+    assert row["human_approved_answers"] == original_grants
+    assert not [call for call in browser.calls
+                if call[0] in {"fill", "select", "click", "upload"}]

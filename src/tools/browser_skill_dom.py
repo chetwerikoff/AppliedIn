@@ -31,13 +31,14 @@ _WIDGET_GRAPH = r"""
   const diagnosticTags = new Set('DIAGNOSTIC_TAGS'.split(' '));
   const diagnosticLocator = e => {
     const parts = [];
+    // An opaque node comes from document.querySelectorAll, so its full
+    // root-to-node structural path is unique. A depth cap hid both deep phone
+    // diagnostics as "unavailable"; never substitute page-supplied IDs.
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
-      if (parts.length===12) return 'unavailable';
       const tag=n.tagName.toLowerCase(), siblings=n.parentElement ? Array.from(n.parentElement.children) : [n];
       parts.unshift(diagnosticTags.has(tag) ? tag+':nth-of-type('+(siblings.filter(x=>x.tagName===n.tagName).indexOf(n)+1)+')' : '*:nth-child('+(siblings.indexOf(n)+1)+')');
     }
-    const path=parts.join(' > ');
-    return path && document.querySelectorAll(path).length===1 ? path : 'unavailable';
+    return parts.join(' > ');
   };
   const requiredProxies = new Set();
   const requiredProxy = (p,e,F,L,form) => {

@@ -16,6 +16,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from core.ids import normalize_label
+
 from tools import browser_skill as bsk
 from tools.claude_chrome import (
     _SAFE_OPTION_RX, _SANCTIONS_RX, _alias_https_parts, GreenhouseJobAlias,
@@ -1849,6 +1851,15 @@ def _key(page: dict, target: dict) -> str:
     return key
 
 
+def _fact_key(facts: dict, observed_label: str) -> str | None:
+    """Resolve approved fact DATA, never an approval grant or control identity."""
+    if observed_label in facts:
+        return observed_label
+    wanted = normalize_label(observed_label)
+    candidates = [k for k in facts if isinstance(k, str) and normalize_label(k) == wanted]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _unanswered(page: dict, target: dict) -> bool:
     if target.get('type') == 'checkbox':
         return bool(target.get('required')) and not target.get('checked')
@@ -2135,7 +2146,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 continue
             item = control(page, observed)
             key = _key(page, item)
-            value = str(facts.get(key) or '').strip()
+            value = str(facts.get(_fact_key(facts, key)) or '').strip()
             previous = (_row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)).get(
                 'human_approved_answers', {}).get(key)
             if isinstance(previous, dict) and any(previous.get(k) != expected for k, expected in (
@@ -2199,7 +2210,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             continue
         question['pk'] = pk
         key = question['label']
-        value = str(facts.get(key) or '').strip()
+        value = str(facts.get(_fact_key(facts, key)) or '').strip()
         grant = (_row(pk, fixture_context=fixture_context) if fixture_context
                  else _row(pk)).get('human_approved_answers') or {}
         previous = grant.get(key) if isinstance(grant, dict) else None
@@ -2255,7 +2266,9 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     stable = _closed_key(target)
     selector = target['selector']
     admission = session._closed_admissions.get(selector)
-    answer = facts.get(action.get('fact'))
+    observed_key = _key(page, target)
+    fact_key = action.get('fact')
+    answer = facts.get(fact_key) if fact_key == _fact_key(facts, observed_key) else None
     country = _receiverless_country(target)
     if not admission or admission['phase'] != 'C0':
         raise Gate('closed_select.precondition.initial_C0')
@@ -2275,9 +2288,9 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
             raise Gate('The closed combobox identity or destination changed.')
         question = _disclosure_question(fresh, current, witness, job_url or page['url'],
                                         provenance=provenance)
-        if action.get('fact') != question['label']:
+        if fact_key != _fact_key(facts, question['label']):
             raise Gate('The exact closed question is not approved.')
-        exact_approval(pk, action['fact'], answer, target=current, url=fresh['url'],
+        exact_approval(pk, question['label'], answer, target=current, url=fresh['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
         guarded_value(current, answer)
@@ -2334,7 +2347,7 @@ async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
     receipt = _ClosedReceipt({
         'action':'combobox', 'selector':selector, 'label':current['label'],
         'question':current.get('question', ''), 'url':fresh['url'],
-        'fact':action['fact'], 'approved_value':answer,
+        'fact':observed_key, 'approved_value':answer,
         # Attribute-less react-select options commit the witnessed exact caption;
         # the independently current receiver/token must still prove that value.
         'committed_caption':option['label'],
@@ -2414,11 +2427,11 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     form_question['pk'] = pk
     key = action.get('fact', '')
     answer = str(facts.get(key) or '').strip() if key in facts else ''
-    if not answer or not _same(key, form_question['label']):
+    if not answer or key != _fact_key(facts, form_question['label']):
         raise Gate('Choose an exact approved answer for this combobox.',
                    form_question=form_question)
     try:
-        exact_approval(pk, key, answer, target=target, url=observed['url'],
+        exact_approval(pk, form_question['label'], answer, target=target, url=observed['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
     except Gate:
@@ -2437,7 +2450,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     if not options:
         # Opening/filtering a picker can asynchronously mount its options. The only
         # typed value is the exact approved answer, and each refresh is witnessed.
-        exact_approval(pk, key, answer, target=current, url=latest['url'],
+        exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
         await session.call('click', current['selector'])
@@ -2456,7 +2469,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         _disclosure_question(latest, current, latest_witness,
                              job_url or latest['url'], provenance=provenance)
         if current.get('tag') == 'input':
-            exact_approval(pk, key, answer, target=current, url=latest['url'],
+            exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
                            provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
             guarded_value(current, answer)
@@ -2487,7 +2500,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     option = matches[0]
     _disclosure_question(latest, current, latest_witness,
                          job_url or latest['url'], provenance=provenance)
-    exact_approval(pk, key, answer, target=current, url=latest['url'],
+    exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
                    provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
@@ -2507,7 +2520,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                       if o.get('selector') == option.get('selector')]
     check_form_destination(
         before_page, before_target, job_url or observed['url'], provenance=provenance)
-    exact_approval(pk, key, answer, target=before_target, url=before_page['url'],
+    exact_approval(pk, form_question['label'], answer, target=before_target, url=before_page['url'],
                    provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     if (len(before_options) != 1
@@ -2529,7 +2542,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                 or not isinstance(hidden_value_before, str)
                 or linked_inputs[0].get('value') != hidden_value_before):
             raise Gate('A hidden form value is not independently authorized.')
-    exact_approval(pk, key, answer, target=current, url=latest['url'],
+    exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
                    provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
@@ -2570,7 +2583,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     filled[current['selector']] = option['label']
     return {'action': 'combobox', 'label': current['label'],
             'selector': current['selector'], 'question': current.get('question', ''),
-            'url': latest['url'], 'fact': key, 'approved_value': answer,
+            'url': latest['url'], 'fact': form_question['label'], 'approved_value': answer,
             'committed_caption': option['label'],
             'committed_value': combo['selected_value'],
             'hidden_selector': hidden_selector,
@@ -2649,20 +2662,18 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         key = action.get('fact', '')
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
-            matches = [k for k in facts if _same(k, target['label'])]
-            if len(matches) == 1:
-                key = matches[0]
+            key = _fact_key(facts, target['label']) or key
         if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
             value = str(facts[key]).strip()
         else:
             raise Gate(gate_prompt, form_question=form_question)
-        if not _same(key, form_question['label']):
+        if key != _fact_key(facts, form_question['label']):
             detail = 'An exact human-approved fact key for this observed question is required.'
             if verb == 'select':
                 detail += '\n' + gate_prompt
             raise Gate(detail, form_question=form_question)
         try:
-            exact_approval(pk, key, value, target=_bound_target(page, target),
+            exact_approval(pk, form_question['label'], value, target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         except Gate as exc:
@@ -2720,7 +2731,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
-        exact_approval(pk, key, str(facts[key]).strip(),
+        exact_approval(pk, form_question['label'], str(facts[key]).strip(),
                        target=_bound_target(latest, current), url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
@@ -2748,7 +2759,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             actual = control(readback, action)
             if actual.get('value') != write_value or not actual.get('has_value'):
                 raise Gate('The approved structural field value did not read back exactly.')
-            exact_approval(pk, key, write_value, target=_bound_target(readback, actual),
+            exact_approval(pk, form_question['label'], write_value, target=_bound_target(readback, actual),
                            url=readback['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':
@@ -2830,7 +2841,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],
                'question': target.get('question', ''), 'url': page.get('url', '')}
     if verb in {'fill', 'select', 'choose'}:
-        receipt.update(fact=key, approved_value=str(facts.get(key, value)).strip())
+        receipt.update(fact=form_question['label'], approved_value=str(facts.get(key, value)).strip())
     return receipt
 
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',

@@ -92,6 +92,7 @@ if(spec.formless) {
   resume.parentElement=file;file.children.push(resume);
   const drop=node('button',{id:'dropzone',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);
   const icon=node('svg',{id:'upload-icon'},drop);node('path',{id:'icon-path',d:'M0 0'},icon);
+  if(spec.disabledDrop)drop.disabled=true;
   if(spec.files) resume.files=spec.files.map(name=>({name}));
   if(spec.attached) {
     for(let i=0;i<(spec.twoItems ? 2:1);i++) {
@@ -100,6 +101,11 @@ if(spec.formless) {
         ...(spec.filenameChild ? {}:{text:spec.displayName || 'Resume.pdf'})},item);
       if(spec.filenameChild) node(spec.filenameChild,{text:spec.displayName || 'Resume.pdf',
         ...(spec.filenameAttrs || {})},name);
+      for(let j=0;j<(spec.filenameSvgs || 0);j++) {
+        const svg=node('svg',{...(spec.filenameSvgAttrs || {})},name);
+        const path=node('path',{d:'M0 0'},svg);
+        svg.namespaceURI=path.namespaceURI='http://www.w3.org/2000/svg';
+      }
       const del=node('button',{id:'delete-'+i,class:'ashby-application-form-input-file-item-delete',
         ...(spec.noTitle ? {}:{title:'Remove attachment'}),...(spec.deleteText ? {text:'Delete'}:{})},spec.outsideDelete ? file:item);
       del.type='submit';

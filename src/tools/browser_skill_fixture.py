@@ -178,13 +178,21 @@ const drop=document.getElementById('ashby-upload-dropzone');
 drop.addEventListener('click',()=>input.click());
 input.addEventListener('change',()=>{
  if(input.files.length!==1)return;
+ drop.disabled=true;
+ setTimeout(()=>{
  const item=document.createElement('div');item.className='ashby-application-form-input-file-item';
  const name=document.createElement('p');name.className='ashby-application-form-input-file-item-name';
- name.textContent=input.files[0].name;
+ const icon=document.createElementNS('http://www.w3.org/2000/svg','svg');
+ const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+ path.setAttribute('d','M0 0L10 10');icon.append(path);
+ const caption=document.createElement('span');caption.textContent=input.files[0].name;
+ name.append(icon,caption);
  const remove=document.createElement('button');remove.title='Remove attachment';
  remove.className='ashby-application-form-input-file-item-delete';
  item.append(name,remove);input.parentElement.insertBefore(item,drop);
  drop.querySelector('svg')?.remove();
+ drop.disabled=false;
+ },1800);
 });
 </script>'''
     return document.replace(b'</body>', script + b'</body>')

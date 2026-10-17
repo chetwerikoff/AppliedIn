@@ -315,8 +315,12 @@ class MarkdownAnswerBank(AbstractAnswerBank):
                 # Closing **: must be selected as a delimiter, not the first
                 # overlapping ** inside a literal starred question.
                 end = body.rfind("**: ")
+                width = 4
+                if end == -1:
+                    # Historical hand-edited rows also allowed no space after :.
+                    end, width = body.rfind("**:"), 3
                 if end != -1:
-                    sections[cur].append((body[2:end], body[end + 4:]))
+                    sections[cur].append((body[2:end], body[end + width:]))
         return sections
 
     def _write(self, data: dict[str, list[tuple[str, str]]]) -> None:

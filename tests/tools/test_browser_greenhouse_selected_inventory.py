@@ -28,8 +28,9 @@ def _find(node, node_id):
 
 def selected_snapshot(mutation=''):
     markup = fixture._greenhouse_form().decode()
-    # Hydration mounts the template before selection; the original script changes
-    # display branches and drops both validation-only proxies on commitment.
+    # Hydration mounts the template before selection. The Greenhouse-specific
+    # country commit replaces its placeholder with an ID-less single-value
+    # branch; location and the other selected controls retain their receivers.
     markup = re.sub(r'</form>.*?<script>', '</form><script>', markup, flags=re.S)
     markup = markup.replace('<template id="greenhouse-template">', '').replace('</template>', '')
     location_placeholder = '<div class="react-select__placeholder">Choose</div>'
@@ -41,13 +42,15 @@ def selected_snapshot(mutation=''):
     assert markup.count(proxy) == 2
     markup = markup.replace(location_placeholder,
                             '<div class="react-select__single-value">Synthetic Example City</div>', 1)
-    # A settled react-select can replace its placeholder branch with a new
-    # single-value node rather than retaining the placeholder's ID. This is a
-    # separate diagnostic probe, not evidence for the reported second opaque node.
-    selected_country = ('<div class="select__single-value">Synthetic Country</div>'
-                        if mutation == 'unmounted-country-placeholder' else
-                        '<div id="react-select-country-placeholder" class="select__single-value">'
-                        'Synthetic Country</div>')
+    # The actual Greenhouse fixture replaces, rather than renames, the C0
+    # placeholder on selection. Retained-ID is a compatibility/control contrast.
+    if mutation == 'retained-country-placeholder':
+        selected_country = ('<div id="react-select-country-placeholder" '
+                            'class="select__single-value">Synthetic Country</div>')
+    elif mutation == 'unmounted-placeholder-c0':
+        selected_country = '<div class="select__placeholder">Choose</div>'
+    else:
+        selected_country = '<div class="select__single-value">Synthetic Country</div>'
     markup = markup.replace(country_placeholder, selected_country, 1)
     markup = markup.replace(proxy, '')
     markup = markup.replace(
@@ -60,6 +63,22 @@ def selected_snapshot(mutation=''):
     country = _find(tree.root, 'country')
     fieldset = _find(tree.root, 'country-label')
     assert form is not None and country is not None and fieldset is not None
+    if mutation == 'unknown-country-reference':
+        country['attrs']['aria-describedby'] += ' synthetic-unresolved-ref'
+    elif mutation == 'only-missing-country-error':
+        country['attrs']['aria-describedby'] = 'country-error'
+    elif mutation in {'duplicate-country-placeholder', 'foreign-country-placeholder'}:
+        placeholder = dict(tag='span', attrs={'id': 'react-select-country-placeholder'},
+                           text='', children=[])
+        if mutation == 'duplicate-country-placeholder':
+            owner = _find(tree.root, 'country-owner')
+            assert owner is not None
+            owner['children'].extend([placeholder, dict(
+                tag='span', attrs={'id': 'react-select-country-placeholder'},
+                text='', children=[])])
+        else:
+            form['children'].append(placeholder)
+
     if mutation == 'country-outside-fieldset':
         def detach(node, target):
             for child in node['children']:
@@ -87,7 +106,11 @@ def selected_snapshot(mutation=''):
             assert phone is not None
             phone['children'].append(contender)
     else:
-        assert mutation in {'', 'unmounted-country-placeholder'}
+        assert mutation in {
+            '', 'retained-country-placeholder', 'unmounted-placeholder-c0',
+            'unknown-country-reference', 'only-missing-country-error',
+            'duplicate-country-placeholder', 'foreign-country-placeholder',
+        }
 
     return json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
@@ -117,33 +140,60 @@ def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
 
 
 
-def test_unmounted_selected_country_placeholder_is_one_opaque_node_not_two():
-    # React-select may remove the placeholder element on C2. The fixture's
-    # ordinary C2 branch retains the placeholder ID, so it cannot detect this
-    # distinct countryGraph reference failure. Preserve the actual observed
-    # scope of this synthetic probe: it demonstrates ONE opaque node, not the
-    # unexplained two-node Issue #110 failure.
-    out = selected_snapshot('unmounted-country-placeholder')
+def test_selected_country_without_placeholder_is_main_failing_regression():
+    # main rejects this exact C2 shape in countryGraph: its aria-describedby
+    # still mentions react-select-country-placeholder, but the selected-value
+    # DOM has replaced that node. The location picker remains a valid C2.
+    out = selected_snapshot()
+    page, witness = out['page'], out['witness']
+    assert page['inventory_verified'] is True
+    assert page['opaque_controls'] is False and page['opaque_count'] == 0
+    assert page['opaque_locators'] == []
+    forms._inventory_ok(page)
+    for source in (page, witness):
+        country = next(c for c in source['controls'] if c['selector'] == '#country')
+        location = next(c for c in source['controls'] if c['selector'] == '#location')
+        assert country['combobox']['mode'] == 'closed-react-select'
+        assert country['combobox']['phase'] == 'C2'
+        assert country['combobox']['receiverless_country'] is True
+        assert country['combobox']['selected_text'] == fixture._FACTS['Country']
+        assert not {'selected_value', 'hidden_value', 'hidden_selector'} & country['combobox'].keys()
+        assert location['combobox']['mode'] == 'closed-react-select'
+        assert location['combobox']['phase'] == 'C2'
+    for graph in out['graphs']:
+        assert '#country' not in graph['quarantined']
+        assert next(g for selector, g in graph['graphs']
+                    if selector == '#country')['phase'] == 'C2'
+        assert next(g for selector, g in graph['graphs']
+                    if selector == '#location')['phase'] == 'C2'
+
+
+@pytest.mark.parametrize('mutation', [
+    'unknown-country-reference',
+    'only-missing-country-error',
+    'duplicate-country-placeholder',
+    'foreign-country-placeholder',
+    'unmounted-placeholder-c0',
+])
+def test_selected_country_placeholder_exception_is_exact_and_c2_only(mutation):
+    out = selected_snapshot(mutation)
     page = out['page']
-    assert page['inventory_verified'] is False and page['opaque_controls'] is True
-    assert page['opaque_count'] == 1
+    assert page['inventory_verified'] is False
+    assert page['opaque_controls'] is True and page['opaque_count'] == 1
     assert len(page['opaque_locators']) == 1
     assert forms._safe_diagnostic(page['opaque_locators'][0]) == page['opaque_locators'][0]
-    # countryGraph rejects the absent non-error IDREF in aria-describedby,
-    # closedGraph rejects the fieldset owner, and quarantined blocks fallback
-    # in linkedComboboxes. No other node is justified by this mutation.
     country = next(c for c in page['controls'] if c['selector'] == '#country')
-    assert country['combobox']['quarantined'] is True
     assert country['combobox'].get('mode') != 'closed-react-select'
+    assert country['combobox']['quarantined'] is True
     location = next(c for c in page['controls'] if c['selector'] == '#location')
-    assert location['combobox']['mode'] == 'closed-react-select'
     assert location['combobox']['phase'] == 'C2'
-    for reader in out['graphs']:
-        assert '#country' in reader['quarantined']
-        assert not next(g for selector, g in reader['graphs']
-                        if selector == '#country')
-        assert next(g for selector, g in reader['graphs']
-                    if selector == '#location')['phase'] == 'C2'
+
+
+def test_retained_country_placeholder_c2_remains_classifiable():
+    out = selected_snapshot('retained-country-placeholder')
+    assert out['page']['inventory_verified'] is True
+    assert out['page']['opaque_count'] == 0
+
 
 @pytest.mark.parametrize('mutation,opaque', [
     ('valued-unknown', 1),

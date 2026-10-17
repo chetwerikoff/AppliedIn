@@ -1419,19 +1419,29 @@ class _EntrySession:
         result = await self.call('evaluate', ENTRY_PAGE)
         return result['value']
 
-    async def _upload_pair(self):
+    async def _upload_pair(self, *, settle_before=None):
         try:
             page = await self.page()
             fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
             _inventory_ok(page)
+            if settle_before is not None:
+                # A split read cannot mask a definitive change on either witness.
+                # The opaque upload subtree is deliberately not root identity.
+                for witness in (page, fixed):
+                    if (witness.get('url') != settle_before['url']
+                            or _formless_root(witness) != _formless_root(settle_before)):
+                        raise Gate('Original application root or submit changed during upload.')
+            if (fixed.get('url') != page.get('url')
+                    or fixed.get('entry') != page.get('entry')):
+                if (settle_before is not None
+                        and page.get('url') == fixed.get('url') == settle_before['url']):
+                    return None  # Entry-only disagreement cannot prove attachment.
+                raise Gate('Upload PAGE/fixed structural witness disagreement.')
         except Gate:
             raise
         except Exception:
             raise Gate('Upload structural/file witness is unavailable; inspect the attachment '
                        'manually. No automatic repeat was attempted.') from None
-        if (fixed.get('url') != page.get('url')
-                or fixed.get('entry') != page.get('entry')):
-            raise Gate('Upload PAGE/fixed structural witness disagreement.')
         return page
 
     async def _upload(self, args, kwargs, selector):
@@ -1477,9 +1487,12 @@ class _EntrySession:
             # handler converting deadline exhaustion into a human Gate.
             async with asyncio.timeout(8.0):
                 while _upload_clock() < deadline:
-                    after = await self._upload_pair()
+                    after = await self._upload_pair(settle_before=before)
                     if _upload_clock() >= deadline:
                         raise TimeoutError
+                    if after is None:
+                        await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
+                        continue
                     if (_formless_root(before) != _formless_root(after)
                             or before['url'] != after['url']):
                         raise Gate('Original application root or submit changed during upload.')

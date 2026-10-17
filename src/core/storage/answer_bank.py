@@ -93,6 +93,28 @@ class AnswerBank(AbstractAnswerBank):
     def _conditional_update(self, row: dict, *, answer: str, source: str,
                             approved_at: str) -> None:
         """Update value/metadata only, preserving raw key and unrelated fields."""
+        names = {
+            "#raw": "question_raw", "#answer": "answer",
+            "#source": "source", "#approved": "approved_at",
+            "#count": "use_count",
+        }
+        values = {
+            ":raw": row["question_raw"], ":previous": row["answer"],
+            ":answer": answer, ":source": source,
+            ":approved": approved_at, ":zero": 0,
+        }
+        predicates = [
+            "attribute_exists(pk)", "#raw = :raw", "#answer = :previous",
+        ]
+        for alias, column in (("#source", "source"),
+                              ("#approved", "approved_at"),
+                              ("#count", "use_count")):
+            if column in row:
+                prior = ":previous_" + column
+                values[prior] = row[column]
+                predicates.append(f"{alias} = {prior}")
+            else:
+                predicates.append(f"attribute_not_exists({alias})")
         try:
             self._table.update_item(
                 Key={"pk": row["pk"], "sk": row["sk"]},
@@ -100,20 +122,9 @@ class AnswerBank(AbstractAnswerBank):
                     "SET #answer = :answer, #source = :source, "
                     "#approved = :approved, #count = :zero"
                 ),
-                ConditionExpression=(
-                    "attribute_exists(pk) AND #raw = :raw "
-                    "AND #answer = :previous"
-                ),
-                ExpressionAttributeNames={
-                    "#raw": "question_raw", "#answer": "answer",
-                    "#source": "source", "#approved": "approved_at",
-                    "#count": "use_count",
-                },
-                ExpressionAttributeValues={
-                    ":raw": row["question_raw"], ":previous": row["answer"],
-                    ":answer": answer, ":source": source,
-                    ":approved": approved_at, ":zero": 0,
-                },
+                ConditionExpression=" AND ".join(predicates),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
             )
         except ClientError as exc:
             if _conditional_conflict(exc):

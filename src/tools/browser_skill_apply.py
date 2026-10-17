@@ -310,6 +310,10 @@ class Gate(ValueError):
         self.form_question = form_question
 
 
+class CaptchaGate(Gate):
+    """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
+
+
 def _synthetic(fixture_context, *, pk: str = '', company: str = '',
                url: str = ''):
     """Untrusted kwargs cannot activate the daemon's synthetic authority."""
@@ -1201,7 +1205,7 @@ def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=
     frames = observed['frames']
     # Challenge precedence must cover the whole observation, not just the first frame.
     if any(isinstance(f, dict) and f.get('status') == 'visible-recaptcha' for f in frames):
-        raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+        raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
     if observed.get('response_controls'):
         raise Gate('CAPTCHA response control requires manual inspection; no values read.')
     if any(not isinstance(f, dict) or f.get('status') != 'R' for f in frames):
@@ -1487,16 +1491,16 @@ def _entry_safety(page, allowed, provenance):
     for frame in entry['frames']:
         status = frame.get('status') if isinstance(frame, dict) else None
         if status == 'visible-recaptcha':
-            raise Gate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+            raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
         if status == 'visible-hcaptcha':
-            raise Gate('visible hCaptcha challenge; inspect manually.')
+            raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
         if status not in {'H', 'R', 'W', 'X'} and not (
                 status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
             raise Gate('unknown/untrusted application frame; inspect manually.')
     if entry.get('response_error'):
         raise Gate('untrusted captcha response control; ambiguous owner or provider.')
     if entry.get('helper_challenge'):
-        raise Gate('visible hCaptcha challenge control; inspect manually.')
+        raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
     root = entry.get('root')
     if root:
         check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
@@ -3516,7 +3520,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
             context = (_control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
                        else handoff(str(exc), step))
-            return {'status': 'gate', 'reason': 'unknown_field',
+            return {'status': 'gate',
+                    'reason': 'captcha' if isinstance(exc, CaptchaGate) else 'unknown_field',
                     'question': context['text'], 'step': context['step'],
                     'form_question': exc.form_question}
         if submitted:

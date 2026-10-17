@@ -133,3 +133,25 @@ def test_selected_country_does_not_hide_unproven_widgets(mutation, opaque):
         # This is the deliberate two-opaque synthetic case: the country graph
         # rejects the extra fieldset branch, and the unknown combobox has no link.
         assert any(c['selector'] == '#unknown-selected' for c in page['controls'])
+
+def test_existing_greenhouse_smoke_leg_observes_selected_country_with_location():
+    # The extra inventory assertion belongs to the existing selected-state
+    # observation, not to a tenth fixture session or a real browser.
+    state = fixture._SyntheticRun('Synthetic-only.pdf')
+    state.greenhouse = True
+    state.combo_touched.add('Country')
+    state.observe_page(selected_snapshot()['page'])
+    capture = state.country_choice_inventory
+    assert capture is not None and capture['verified'] is True
+    assert capture['opaque_count'] == 0 and capture['opaque_locators'] == []
+    assert capture['country_phase'] == capture['location_phase'] == 'C2'
+    assert capture['country_selected'] == fixture._FACTS['Country']
+    assert capture['location_selected'] == fixture._FACTS['Where are you located?']
+    # An unrelated opaque control must not be hidden by the country sub-case.
+    state = fixture._SyntheticRun('Synthetic-only.pdf')
+    state.greenhouse = True
+    state.combo_touched.add('Country')
+    state.observe_page(selected_snapshot('valued-unknown')['page'])
+    assert state.country_choice_inventory is not None
+    assert state.country_choice_inventory['verified'] is False
+    assert state.country_choice_inventory['opaque_count'] == 1

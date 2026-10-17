@@ -41,9 +41,14 @@ def selected_snapshot(mutation=''):
     assert markup.count(proxy) == 2
     markup = markup.replace(location_placeholder,
                             '<div class="react-select__single-value">Synthetic Example City</div>', 1)
-    markup = markup.replace(country_placeholder,
-                            '<div id="react-select-country-placeholder" class="select__single-value">'
-                            'Synthetic Country</div>', 1)
+    # A settled react-select can replace its placeholder branch with a new
+    # single-value node rather than retaining the placeholder's ID. This is a
+    # separate diagnostic probe, not evidence for the reported second opaque node.
+    selected_country = ('<div class="select__single-value">Synthetic Country</div>'
+                        if mutation == 'unmounted-country-placeholder' else
+                        '<div id="react-select-country-placeholder" class="select__single-value">'
+                        'Synthetic Country</div>')
+    markup = markup.replace(country_placeholder, selected_country, 1)
     markup = markup.replace(proxy, '')
     markup = markup.replace(
         '<input type="hidden" id="location-code" name="location_value">',
@@ -82,7 +87,7 @@ def selected_snapshot(mutation=''):
             assert phone is not None
             phone['children'].append(contender)
     else:
-        assert not mutation
+        assert mutation in {'', 'unmounted-country-placeholder'}
 
     return json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
@@ -110,6 +115,35 @@ def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
     assert len(country['combobox']['country_graph']) == 13
     assert not {'hidden_selector', 'hidden_value', 'selected_value'} & country['combobox'].keys()
 
+
+
+def test_unmounted_selected_country_placeholder_is_one_opaque_node_not_two():
+    # React-select may remove the placeholder element on C2. The fixture's
+    # ordinary C2 branch retains the placeholder ID, so it cannot detect this
+    # distinct countryGraph reference failure. Preserve the actual observed
+    # scope of this synthetic probe: it demonstrates ONE opaque node, not the
+    # unexplained two-node Issue #110 failure.
+    out = selected_snapshot('unmounted-country-placeholder')
+    page = out['page']
+    assert page['inventory_verified'] is False and page['opaque_controls'] is True
+    assert page['opaque_count'] == 1
+    assert len(page['opaque_locators']) == 1
+    assert forms._safe_diagnostic(page['opaque_locators'][0]) == page['opaque_locators'][0]
+    # countryGraph rejects the absent non-error IDREF in aria-describedby,
+    # closedGraph rejects the fieldset owner, and quarantined blocks fallback
+    # in linkedComboboxes. No other node is justified by this mutation.
+    country = next(c for c in page['controls'] if c['selector'] == '#country')
+    assert country['combobox']['quarantined'] is True
+    assert country['combobox'].get('mode') != 'closed-react-select'
+    location = next(c for c in page['controls'] if c['selector'] == '#location')
+    assert location['combobox']['mode'] == 'closed-react-select'
+    assert location['combobox']['phase'] == 'C2'
+    for reader in out['graphs']:
+        assert '#country' in reader['quarantined']
+        assert not next(g for selector, g in reader['graphs']
+                        if selector == '#country')
+        assert next(g for selector, g in reader['graphs']
+                    if selector == '#location')['phase'] == 'C2'
 
 @pytest.mark.parametrize('mutation,opaque', [
     ('valued-unknown', 1),

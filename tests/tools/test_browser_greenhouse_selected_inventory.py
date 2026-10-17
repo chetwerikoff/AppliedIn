@@ -124,7 +124,7 @@ def test_selected_country_does_not_hide_unproven_widgets(mutation, opaque):
     assert page['opaque_count'] == opaque
     assert len(page['opaque_locators']) == opaque
     # A deep present country node must be diagnosable rather than 'unavailable'.
-    assert all(path.startswith('html:nth-of-type(1) > ') and path != 'unavailable'
+    assert all(forms._safe_diagnostic(path) == path
                for path in page['opaque_locators'])
     if mutation == 'second-in-phone-fieldset':
         country = next(c for c in page['controls'] if c['selector'] == '#country')

@@ -2644,6 +2644,36 @@ def _choice_grant_from_page(page, target, answer):
     return question['label'], grant
 
 
+@pytest.mark.parametrize(('question', 'affirmative_caption'), [
+    ('Gender identity', 'Yes, I identify as a protected group'),
+    ('Sanctions declaration', 'Yes, I am subject to sanctions'),
+])
+async def test_negative_machine_radio_grant_cannot_click_affirmative_caption(
+        monkeypatch, question, affirmative_caption):
+    # An exact negative machine value is not permission to select a visibly
+    # affirmative protected/sanctions answer. Reject before any model disclosure.
+    affirmative = field(affirmative_caption, '#affirmative', type='radio',
+                        name='disclosure', question=question, value='no',
+                        has_value=True)
+    decline = field('No, I do not', '#decline', type='radio',
+                    name='disclosure', question=question, value='decline',
+                    has_value=True)
+    page = inventory(affirmative, decline, submit())
+    key, grant = _choice_grant_from_page(page, affirmative, 'no')
+    browser, decide, row = world(monkeypatch, page)
+    row['human_approved_answers'] = {key: grant}
+    browser.allow_mutations = True
+    decide.return_value = {'action': 'choose', 'selector': '#affirmative',
+                           'fact': key, 'value': 'no'}
+
+    report = await attempt(page)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert not decide.await_count
+    assert not affirmative['checked']
+    assert not any(call[0] in {'click', 'fill', 'select', 'upload'}
+                   for call in browser.calls)
+
+
 async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_recheck(monkeypatch):
     morning = field('Morning', '#morning', type='radio', name='schedule',
                     question='Schedule preference', value='am', has_value=True)

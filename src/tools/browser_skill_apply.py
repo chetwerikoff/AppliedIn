@@ -517,7 +517,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                         raise Gate('The approved radio answer is no longer selected.')
                 else:
                     raise Gate('The approved native choice control changed.')
-                guarded_value(target, answer)
+                _guard_native_choice_answer(target, answer)
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
                            provenance=provenance,
@@ -2009,6 +2009,14 @@ def _require_native_choice(target: dict) -> None:
         raise Gate('Only an unchecked, enabled native checkbox/radio can be chosen.')
 
 
+def _guard_native_choice_answer(selected: dict, answer: str) -> None:
+    """Guard both a choice's approved machine value and its visible meaning."""
+    guarded_value(selected, answer)
+    if selected.get('type') == 'radio':
+        # A negative machine value can still select an affirmative protected caption.
+        guarded_value(selected, selected['label'])
+
+
 def _approved_native_choice(page: dict, target: dict, pk: str, *,
                             provenance=None, fixture_context=None):
     """Resolve a PAGE-bound native choice from the existing exact grant, not facts."""
@@ -2040,7 +2048,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     exact_approval(pk, key, answer, target=_bound_target(page, target),
                    url=page['url'], provenance=provenance,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
-    guarded_value(selected, answer)
+    _guard_native_choice_answer(selected, answer)
     return answer, selected
 
 
@@ -2901,7 +2909,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                           if (_same(value, c['label']) or _same(value, c['value']))]
                 if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
                     raise Gate('The selected radio does not match the exact owner answer.')
-                guarded_value(target, value)
+                _guard_native_choice_answer(target, value)
                 write_value = target['value']
         else:
             guarded_value(target, value)
@@ -2964,7 +2972,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                or _same(value, c['value']))]
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
-            guarded_value(current, value)
+            _guard_native_choice_answer(current, value)
             await session.call('click', current['selector'])
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page())

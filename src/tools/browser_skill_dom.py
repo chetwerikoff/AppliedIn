@@ -7,6 +7,10 @@ _DIAGNOSTIC_TAGS = (
 )
 
 
+# One structural-only selector bound shared by the browser reader and Gate validator.
+_DIAGNOSTIC_MAX_SEGMENTS = 24
+
+
 _WIDGET_GRAPH = r"""
   // Executed afresh in each reader. No page attributes or model flags retain admission.
   const nativeForm = e => e.form || e.closest('form');
@@ -31,15 +35,18 @@ _WIDGET_GRAPH = r"""
   const diagnosticTags = new Set('DIAGNOSTIC_TAGS'.split(' '));
   const diagnosticLocator = e => {
     const parts = [];
-    // The Gate formatter accepts up to twelve structural segments. Deep
-    // phone widgets need a UNIQUE suffix within that grammar: a full path
-    // would be sanitized back to "unavailable", while page IDs leak answers.
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
       const tag=n.tagName.toLowerCase(), siblings=n.parentElement ? Array.from(n.parentElement.children) : [n];
       parts.unshift(diagnosticTags.has(tag) ? tag+':nth-of-type('+(siblings.filter(x=>x.tagName===n.tagName).indexOf(n)+1)+')' : '*:nth-child('+(siblings.indexOf(n)+1)+')');
     }
-    const path=parts.slice(-12).join(' > ');
-    return path && document.querySelectorAll(path).length===1 ? path : 'unavailable';
+    // Use the shortest unique, value-free suffix. Repeated deep trees need
+    // their distinguishing ancestor; never substitute DOM ids or page values.
+    for (let depth=1; depth<=Math.min(parts.length,DIAGNOSTIC_LIMIT); depth++) {
+      const path=parts.slice(-depth).join(' > ');
+      if (path.length>600) break;
+      if (document.querySelectorAll(path).length===1) return path;
+    }
+    return 'unavailable';
   };
   const requiredProxies = new Set();
   const requiredProxy = (p,e,F,L,form) => {
@@ -283,7 +290,8 @@ _WIDGET_GRAPH = r"""
               (n===search && k==='aria-controls' && id===list.id)))))) continue;
     parts.forEach(n=>pickerParts.add(n));
   }
-""".replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS)
+""".replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS).replace(
+    'DIAGNOSTIC_LIMIT', str(_DIAGNOSTIC_MAX_SEGMENTS))
 
 PAGE = r"""(() => {
   const visible = e => !!e.getClientRects().length &&

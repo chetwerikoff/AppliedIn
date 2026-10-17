@@ -2673,7 +2673,7 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
     monkeypatch.setattr(forms, 'exact_approval', capture_approval)
     decisions = []
 
-    async def decide(prompt, model_page, history, *, model):
+    async def route_decision(prompt, model_page, history, *, model):
         decisions.append((prompt, deepcopy(model_page), deepcopy(history)))
         if len(decisions) == 1:
             return {'action': 'choose', 'selector': '#evening',
@@ -2683,7 +2683,7 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
                     'fact': key_checkbox, 'value': 'no'}
         return {'action': 'gate', 'question': 'Synthetic stop before submit'}
 
-    decide.side_effect = decide
+    decide.side_effect = route_decision
     report = await attempt(page, facts={'First name': 'Test User'})
     assert report['status'] == 'gate' and report['form_question'] is None
     assert len(decisions) == 3
@@ -2744,13 +2744,13 @@ async def test_bad_native_choice_grants_refuse_unbound_without_ipc(monkeypatch, 
         b = field('Evening', '#evening', type='radio', name='schedule',
                   question='Schedule preference', value='pm', has_value=True)
         page = inventory(a, b, submit())
-        key, grant = _choice_grant_from_page(page, a, 'Evening')
         if failure == 'collision':
-            # One caption and another member's machine value match the grant.
+            # Current captions and machine values collide even under an exact grant.
             a['value'] = 'Evening'
-        elif failure == 'group_changed':
+        key, grant = _choice_grant_from_page(page, a, 'Evening')
+        if failure == 'group_changed':
             b['label'] = 'Changed evening'
-        else:
+        elif failure == 'leader_changed':
             grant['selector'] = '#evening'  # group grant always binds leader
     else:
         box = field('Confirm details', '#confirm', type='checkbox',

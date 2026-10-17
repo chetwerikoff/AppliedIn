@@ -545,15 +545,19 @@ def test_untouched_required_proxy_and_outside_F_cannot_submit(key):
 
 
 @pytest.mark.parametrize('scenario,expected', [
-    ({'custom': True}, '*:nth-child('), ({'depth': 14}, 'unavailable'),
+    ({'custom': True}, '*:nth-child('),
+    ({'depth': 14}, 'html:nth-of-type(1) > body:nth-of-type(1)'),
+    ({'depth': 14, 'count': 2}, 'canvas:nth-of-type('),
     ({'count': 8}, 'canvas:nth-of-type('),
 ])
-def test_diagnostic_locators_are_bounded_unique_and_never_page_identifiers(scenario, expected):
+def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, expected):
     snapshot = dom(diagnostics=scenario)
     p = snapshot['page']
     assert p['opaque_count'] == scenario.get('count', 1)
     assert len(p['opaque_locators']) == min(3, p['opaque_count'])
     assert all(expected in x for x in p['opaque_locators'])
+    assert all(x.startswith('html:nth-of-type(1) > ') and x != 'unavailable'
+               for x in p['opaque_locators'])
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     reason = str(caught.value)

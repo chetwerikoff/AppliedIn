@@ -971,11 +971,12 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                    and (e["dotenv"], e["cost"]) != ("1", "True")
                    for e in events)
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
-    # W positive/negative, both Greenhouse legs, both Ashby legs and both Lever choices
-    # use independent sessions; none may inherit a previous missing witness.
-    assert actions.count('session_start') == actions.count('session_stop') == 9
-    assert actions.count('navigate') == 9
-    assert actions.count('evaluate_page') == 9
+    # The incomplete fake page opens seven BSK subprocess sessions before gating;
+    # the separate all-leg test still pins nine dispatches across eight legs,
+    # with both Ashby upload sub-cases sharing the original dispatch shape.
+    assert actions.count('session_start') == actions.count('session_stop') == 7
+    assert actions.count('navigate') == 7
+    assert actions.count('evaluate_page') == 7
     assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)

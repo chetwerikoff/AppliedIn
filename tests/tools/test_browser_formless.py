@@ -535,7 +535,14 @@ async def test_structural_fill_requires_exact_independent_readback(monkeypatch):
 
 
 async def test_upload_requires_independent_fixed_readback(monkeypatch):
+    # A benign post-IPC disagreement is never attachment proof, even when
+    # the PAGE side is complete: it exhausts the read-only budget without retry.
+    from tests.tools.test_ashby_upload import UploadClock
+    clock = UploadClock()
+    monkeypatch.setattr(forms, '_upload_clock', lambda: clock.now)
+    monkeypatch.setattr(forms, '_upload_sleep', clock.sleep)
     _, raw, session, page, provenance = await admitted(monkeypatch)
+    identity = session.formless_identity
     original = raw.call
     async def corrupt(method, *args, **kw):
         result = await original(method, *args, **kw)
@@ -545,12 +552,16 @@ async def test_upload_requires_independent_fixed_readback(monkeypatch):
                     c['files'] = []
         return result
     raw.call = corrupt
-    with pytest.raises(forms.Gate, match='witness disagreement'):
+    with pytest.raises(TimeoutError):
         await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
                             resume_path='Resume.pdf', company=COMPANY, jd_text='',
                             resume_tex='', github='', pk=PK, job_url=posting('ashby'),
                             provenance=provenance)
+    assert clock.now == 8.0 and clock.steps == [0.25] * 32
+    assert session.formless_identity == identity and session.upload_result is None
+    assert not session.upload_pending and not session.submit_authorized
     assert len([c for c in raw.calls if c[0] == 'upload']) == 1
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
 
 async def test_previous_structural_grant_drift_is_not_reasked(monkeypatch):

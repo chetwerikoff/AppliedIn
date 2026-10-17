@@ -863,3 +863,59 @@ def test_missing_pane_does_not_waive_proven_wrong_sibling_edges(monkeypatch, cha
     _, raw, _, provenance = root_world(monkeypatch, missingPane=True, **changes)
     with pytest.raises(forms.Gate, match='sibling identity mismatch'):
         forms._entry_safety(raw.current, lambda url: True, provenance)
+
+
+
+async def test_formless_bootstrap_uses_canonical_fact_only_with_raw_grant(
+        monkeypatch, tmp_path):
+    """Structural owner identity remains raw while bank fact is canonical."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+
+    row, raw, _, provenance = root_world(monkeypatch)
+    # The independent PAGE and fixed root census witness the same starred label.
+    for snapshot in (raw.current, raw.fixed):
+        for target in snapshot['controls'] + snapshot['entry']['root_evidence']:
+            if target.get('selector') == '#_systemfield_name':
+                target['label'] = 'Name*'
+    session = forms._EntrySession(
+        raw, lambda url: url == entry('ashby'), provenance,
+        resume_path='Resume.pdf',
+    )
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10,
+    )
+    path = tmp_path / 'facts.md'
+    MarkdownAnswerBank(path).put("Name*", "Test User", AnswerScope.GLOBAL)
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {"Name": "Test User"}
+    row['human_approved_answers'] = {
+        "Name*": {
+            "value": "Test User", "selector": "#_systemfield_name",
+            "url": page['url'], "label": "Name*", "question": "",
+            "tag": "input", "type": "text",
+            "form_selector": "#application-root",
+            "form_action": "#structural-submit",
+        },
+    }
+    checked = []
+    approved = forms.exact_approval
+
+    def capture(pk, key, value, **kwargs):
+        checked.append((key, value))
+        return approved(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", capture)
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
+    assert caught.value.form_question['label'] == "Email"
+    assert ("Name*", "Test User") in checked
+    no_mutations(raw)
+
+    # The same canonically banked data is never an implicit approval grant.
+    row['human_approved_answers'] = {}
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
+    assert caught.value.form_question['label'] == "Name*"
+    no_mutations(raw)

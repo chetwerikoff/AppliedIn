@@ -9,12 +9,13 @@ Artifacts (PDFs) live on disk, not in Redis. Local mode is the real product.
 from __future__ import annotations
 
 import json
+import re
 from redis.exceptions import WatchError
 from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from ..ids import is_internal_pk, normalize_label
+from ..ids import is_internal_pk, normalize_label, strip_label_decoration
 from ..models import AnswerScope, JobRecord, Status
 from .base import (
     AbstractAnswerBank,
@@ -310,12 +311,35 @@ class MarkdownAnswerBank(AbstractAnswerBank):
                        if title.startswith("company:") else None)
                 if cur:
                     sections.setdefault(cur, [])
-            elif cur and line.strip().startswith("- **"):
-                body = line.strip()[2:]
-                end = body.find("**", 2)
+            elif cur and line.lstrip().startswith("- **"):
+                body = line.lstrip()[2:]
+                # The FIRST unescaped **: closes the question. The trailing
+                # star in an old raw key (***:) belongs to that key; a **:
+                # later in the answer is not another question delimiter.
+                end = body.find("**:", 2)
                 if end != -1:
-                    sections[cur].append((body[2:end], body[end + 2:].lstrip(": ").strip()))
+                    escaped = body[2:end]
+                    question = re.sub(
+                        r"\*\*(\\+):",
+                        lambda match: "**" + "\\" * (len(match.group(1)) - 1) + ":",
+                        escaped,
+                    )
+                    # Only the single separator space belongs to the format.
+                    # Leading spaces and literal stars in approved values survive.
+                    answer = body[end + 3:]
+                    sections[cur].append((
+                        question, answer[1:] if answer.startswith(" ") else answer,
+                    ))
         return sections
+
+    @staticmethod
+    def _escape_question(question: str) -> str:
+        """Escape a question's literal **: without changing the Markdown row."""
+        return re.sub(
+            r"\*\*(\\*):",
+            lambda match: "**" + "\\" * (len(match.group(1)) + 1) + ":",
+            question,
+        )
 
     def _write(self, data: dict[str, list[tuple[str, str]]]) -> None:
         out = ["# AppliedIn facts", "",
@@ -324,7 +348,7 @@ class MarkdownAnswerBank(AbstractAnswerBank):
             if pk not in data:
                 continue
             out.append(f"## {'global' if pk == 'global' else 'company: ' + pk.split('#', 1)[1]}")
-            out += [f"- **{q}**: {a}" for q, a in data[pk]]
+            out += [f"- **{self._escape_question(q)}**: {a}" for q, a in data[pk]]
             out.append("")
         self.path.write_text("\n".join(out))
 
@@ -343,10 +367,10 @@ class MarkdownAnswerBank(AbstractAnswerBank):
         label = normalize_label(question)
         for i, (q, _) in enumerate(entries):
             if normalize_label(q) == label:
-                entries[i] = (question, answer)
+                entries[i] = (q, answer)  # historical raw key remains stable
                 break
         else:
-            entries.append((question, answer))
+            entries.append((strip_label_decoration(question), answer))
         self._write(data)
 
     def seed_global(self, entries: dict[str, str], *, source: str = "seed") -> None:
@@ -355,11 +379,13 @@ class MarkdownAnswerBank(AbstractAnswerBank):
 
     def all_facts(self, company: str) -> dict[str, str]:
         data = self._load()
-        facts: dict[str, str] = {}
+        # Shadow by semantic comparison, not by raw question spelling.
+        # Return only each winning row's actual stored key.
+        selected: dict[str, tuple[str, str]] = {}
         for pk in ("global", f"company#{company.strip().lower()}"):
             for q, a in data.get(pk, []):
-                facts[q] = a  # company entries override global
-        return facts
+                selected[normalize_label(q)] = (q, a)
+        return {q: a for q, a in selected.values()}
 
 
 class RedisQueue(AbstractQueue):

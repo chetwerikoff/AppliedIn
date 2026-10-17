@@ -28,7 +28,9 @@ function matches(n,q){return q.split(',').some(s=>{
       const sib=p.parentElement?p.parentElement.children.filter(x=>m[2]==='child'||x.tagName===p.tagName):[p];
       if(sib.indexOf(p)+1!==Number(m[3]))return false;p=p.parentElement;
     }
-    return !p;
+    // CSS structural chains may begin at any ancestor, not only at html.
+    // Deep Gate diagnostics legitimately use a unique twelve-segment suffix.
+    return true;
   }
   let neg=null;s=s.replace(/:not\(([^)]+)\)/g,(_,x)=>{neg=x;return '';});
   if(neg&&matches(n,neg))return false;

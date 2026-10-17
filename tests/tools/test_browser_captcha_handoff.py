@@ -143,7 +143,9 @@ async def synthetic_controller(monkeypatch, case):
     assert result["status"] == "gate"
     assert result["question"] and URL in result["question"]
     assert result["step"]["url"] == URL
-    assert result["step"]["last_button"] == ""
+    # handoff() deliberately makes an absent button safe and explicit.
+    assert result["step"]["last_button"] == "(unavailable)"
+    assert "Last button: (unavailable)." in result["question"]
     return result
 
 

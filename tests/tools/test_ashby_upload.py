@@ -221,10 +221,10 @@ async def test_sixth_pair_is_forbidden(monkeypatch, upload_clock):
 async def test_deadline_and_pending_readonly_authority(monkeypatch, upload_clock):
     raw, session, _ = setup_upload(monkeypatch, unchanged=1)
     original = session._upload_pair
-    async def delayed_pair():
+    async def delayed_pair(*, settle_before=None):
         if raw.uploaded:
             upload_clock.now += 8.0
-        return await original()
+        return await original(settle_before=settle_before)
     monkeypatch.setattr(session, '_upload_pair', delayed_pair)
     identity = session.formless_identity
     with pytest.raises(TimeoutError):
@@ -244,13 +244,16 @@ async def test_pending_window_has_no_mutation_authority(monkeypatch):
     assert len(raw.mutations) == 1
 
 
-async def test_independent_post_witness_disagreement_is_specific(monkeypatch):
+async def test_independent_post_witness_disagreement_never_proves_attachment(monkeypatch, upload_clock):
     after = observed(attached=True, files=['Resume.pdf'])
     after[1]['entry']['upload_tree']['nodes'][0]['text'] = 'different'
     raw, session, _ = setup_upload(monkeypatch, after=after)
-    with pytest.raises(forms.Gate, match='witness disagreement'):
+    identity = session.formless_identity
+    with pytest.raises(TimeoutError):
         await upload(session)
-    assert len(raw.mutations) == 1
+    assert upload_clock.steps == [0.25] * 32
+    assert raw.post_pairs == 32 and len(raw.mutations) == 1
+    assert session.formless_identity == identity and session.upload_result is None
 
 
 @pytest.mark.parametrize('count, admitted', [(4096, True), (4097, False)])
@@ -471,3 +474,146 @@ async def test_ashby_filename_svg_role_gate(monkeypatch):
 
 async def test_ashby_filename_svg_handler_gate(monkeypatch):
     await _filename_case(monkeypatch, attrs={'onclick': 'syntheticAction()'})
+
+
+class PairSequence(RootSession):
+    """Two genuinely independent read values per fake-clock upload sample."""
+    def __init__(self, before, pairs):
+        super().__init__(*before)
+        self.pairs = deepcopy(pairs)
+        self.post_pairs = 0
+        self.mutations = []
+
+    async def call(self, method, *args, **kwargs):
+        if method == 'upload':
+            self.mutations.append(((method, *args), kwargs))
+            return {}
+        if method == 'evaluate' and self.mutations and args == (forms.ENTRY_PAGE,):
+            self.current, self.fixed = deepcopy(self.pairs[
+                min(self.post_pairs, len(self.pairs) - 1)])
+            self.post_pairs += 1
+        return await super().call(method, *args, **kwargs)
+
+
+def sequenced_upload(monkeypatch, pairs):
+    _, _, _, provenance = root_world(monkeypatch)
+    before = observed()
+    raw = PairSequence(before, pairs)
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'),
+                                  provenance, resume_path='Resume.pdf')
+    session.formless_identity = forms._root_identity(before[0])
+    return raw, session, before[0]
+
+
+@pytest.mark.parametrize('drift,gate', [
+    ('entry', 'Upload PAGE/fixed structural witness disagreement'),
+    ('url', 'Application entry route or current row/config changed'),
+])
+async def test_pre_upload_pair_retains_two_distinct_immediate_gates(monkeypatch, drift, gate):
+    before = observed()
+    if drift == 'entry':
+        before[1]['entry']['upload_tree']['nodes'][0]['text'] = 'different'
+    else:
+        before[1]['url'] += '/changed'
+    raw, session, _ = setup_upload(monkeypatch, before=before)
+    with pytest.raises(forms.Gate, match=gate):
+        await upload(session)
+    assert raw.mutations == [] and not session.upload_attempted
+
+
+async def test_no_effect_fresh_pair_disagreement_keeps_unclear_outcome(monkeypatch):
+    exc = Unavailable('synthetic unsupported')
+    exc.code, exc.effect_state = 'unsupported', 'none'
+    raw, session, _ = setup_upload(monkeypatch, refusal=exc)
+    original = raw.call
+
+    async def disagree_on_refusal(method, *args, **kwargs):
+        if method == 'upload':
+            raw.fixed['entry']['upload_tree']['nodes'][0]['text'] = 'different'
+        return await original(method, *args, **kwargs)
+
+    raw.call = disagree_on_refusal
+    with pytest.raises(forms.Gate, match='The résumé upload outcome is unclear'):
+        await upload(session)
+    assert len(raw.mutations) == 1 and raw.post_pairs == 0
+    assert not session.upload_pending
+
+
+async def test_one_entry_split_then_opaque_agreement_then_exact_attachment(monkeypatch, upload_clock):
+    first = observed(disabledDrop=True, files=['Resume.pdf'])
+    first[1]['entry']['upload_tree']['nodes'][0]['text'] = 'pre-transition'
+    pending = observed(disabledDrop=True, files=['Resume.pdf'])
+    complete = observed(attached=True, files=['Resume.pdf'], displayName='Resume.pdf',
+                        filenameChild='span', filenameSvgs=1)
+    raw, session, before = sequenced_upload(monkeypatch, [first, pending, complete])
+    promotions = []
+
+    class TrackedEntry(forms._EntrySession):
+        def __setattr__(self, key, value):
+            if key == 'formless_identity':
+                promotions.append(value)
+            super().__setattr__(key, value)
+
+    session.__class__ = TrackedEntry
+    assert first[0]['url'] == first[1]['url'] == before['url']
+    assert forms._formless_root(first[0]) == forms._formless_root(first[1]) == forms._formless_root(before)
+    assert first[0]['entry'] != first[1]['entry']
+    assert pending[0]['entry'] == pending[1]['entry']
+    assert complete[0]['entry'] == complete[1]['entry']
+    await upload(session)
+    assert raw.post_pairs == 3 and upload_clock.steps == [0.25, 0.25]
+    assert raw.mutations == [(('upload', '#dropzone', '--file', 'Resume.pdf'), {'timeout': 130})]
+    assert len(promotions) == 1 and session.formless_identity == promotions[0]
+    assert session.upload_result == complete[0]
+    assert forms._upload_delta(before, session.upload_result, 'Resume.pdf') is True
+    assert session.upload_result['entry']['upload_tree']['attached'] is True
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
+    assert not session.upload_pending and not session.submit_authorized
+
+
+async def test_persistent_benign_entry_split_hits_original_eight_second_deadline(
+        monkeypatch, upload_clock):
+    disagree = observed(disabledDrop=True, files=['Resume.pdf'])
+    disagree[1]['entry']['upload_tree']['nodes'][0]['text'] = 'pre-transition'
+    raw, session, _ = sequenced_upload(monkeypatch, [disagree])
+    identity = session.formless_identity
+    with pytest.raises(TimeoutError):
+        await upload(session)
+    assert upload_clock.now == 8.0 and upload_clock.steps == [0.25] * 32
+    assert raw.post_pairs == 32 and len(raw.mutations) == 1
+    assert session.formless_identity == identity and session.upload_result is None
+    assert not session.upload_pending and not session.submit_authorized
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
+
+
+@pytest.mark.parametrize('drift,reason', [
+    ('page-root', 'Original application root or submit changed during upload'),
+    ('fixed-root', 'Original application root or submit changed during upload'),
+    ('page-submit', 'exact structural submit changed'),
+    ('fixed-submit', 'exact structural submit changed'),
+    ('page-inventory', 'The current form inventory is incomplete'),
+    ('page-url', 'Application entry route or current row/config changed'),
+    ('fixed-url', 'Application entry route or current row/config changed'),
+])
+async def test_entry_split_never_masks_one_sided_definitive_gate(
+        monkeypatch, upload_clock, drift, reason):
+    first = observed(disabledDrop=True, files=['Resume.pdf'])
+    first[1]['entry']['upload_tree']['nodes'][0]['text'] = 'pre-transition'
+    page = first[0] if drift.startswith('page-') else first[1]
+    if drift.endswith('root'):
+        page['entry']['formless']['root'] = '#changed-application-root'
+    elif drift.endswith('submit'):
+        page['entry']['formless']['submit'] = '#changed-submit'
+    elif drift == 'page-inventory':
+        page['inventory_verified'] = False
+    else:
+        page['url'] += '/changed'
+    raw, session, _ = sequenced_upload(monkeypatch, [first])
+    identity = session.formless_identity
+    with pytest.raises(forms.Gate, match=reason):
+        await upload(session)
+    assert raw.post_pairs == 1 and upload_clock.steps == []
+    assert len(raw.mutations) == 1
+    assert session.formless_identity == identity and session.upload_result is None
+    assert not session.upload_pending and not session.submit_authorized
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)

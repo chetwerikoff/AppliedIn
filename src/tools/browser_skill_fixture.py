@@ -403,6 +403,7 @@ class _SyntheticRun:
                  "last_page", "combo_observations", "combo_touched",
                  "submit_call_entered", "submit_guard", "post_attempts",
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
+                  "country_choice_inventory",
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
                  "greenhouse", "greenhouse_empty_placeholder", "visible_badge_anchor", "native_validity",
                  "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
@@ -446,6 +447,7 @@ class _SyntheticRun:
         self.post_receipts = []
         self.inventory_diagnostics = None
         self.widget_receipts = []
+        self.country_choice_inventory = None
         self.entry_initial_not_ready = False
         self.entry_wait = 'PENDING'
         self.entry_observations = []
@@ -558,6 +560,23 @@ class _SyntheticRun:
             'selected_text': combo.get('selected_text', ''),
             'displayed_text': combo.get('displayed_text', ''),
         }
+        # Inspect settled C2 after the original Greenhouse country choice, without
+        # adding another session or granting any new control authority.
+        if (self.greenhouse and self.country_choice_inventory is None
+                and 'Country' in self.combo_touched and combo.get('phase') == 'C2'):
+            location = [c for c in controls if c.get('selector') == '#location']
+            location_combo = (location[0].get('combobox') or {}) if len(location) == 1 else {}
+            self.country_choice_inventory = {
+                'verified': (observed.get('inventory_verified') is True
+                             and observed.get('opaque_controls') is False
+                             and observed.get('opaque_count') == 0),
+                'opaque_count': observed.get('opaque_count'),
+                'opaque_locators': observed.get('opaque_locators'),
+                'country_phase': combo.get('phase'),
+                'location_phase': location_combo.get('phase'),
+                'country_selected': combo.get('selected_text'),
+                'location_selected': location_combo.get('selected_text'),
+            }
         for key, selector in _COMBO_SELECTORS.items():
             if key not in self.combo_touched:
                 self.combo_observations[key] = {
@@ -1012,6 +1031,14 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                       and phone_ok
                       and receipt_ok
                       and state.combo_observations['Country']['outcome'] == 'committed'
+                      and (not greenhouse or (
+                          isinstance(state.country_choice_inventory, dict)
+                          and state.country_choice_inventory.get('verified') is True
+                          and state.country_choice_inventory.get('country_phase') == 'C2'
+                          and state.country_choice_inventory.get('location_phase') == 'C2'
+                          and state.country_choice_inventory.get('country_selected') == _FACTS['Country']
+                          and state.country_choice_inventory.get('location_selected')
+                              == _FACTS['Where are you located?']))
                       and state.ipc_index == len(state._positive_ipc())
                       and state.last_page.get('inventory_verified') is True
                       and state.last_page.get('opaque_controls') is False
@@ -1166,6 +1193,7 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                                   'safe_gate': ok,
                                   'visible_badge_anchor': state.visible_badge_anchor,
                                   'native_committed_validity': state.native_validity,
+                                   'country_choice_inventory': state.country_choice_inventory,
                                   'entry_wait': state.entry_wait,
                                   'entry_initial_not_ready': state.entry_initial_not_ready,
                                   'entry_observations': state.entry_observations,

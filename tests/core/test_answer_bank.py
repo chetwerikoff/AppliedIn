@@ -247,3 +247,76 @@ def test_seed_new_metadata_and_cloud_empty_key_boundary(aws):
     assert "approved_at" not in row
     with pytest.raises(ClientError):
         bank.put("*", "invalid cloud empty key", AnswerScope.GLOBAL)
+
+
+def test_dual_key_seed_transaction_accepts_resource_native_values(aws, monkeypatch):
+    """Table.meta.client handles AttributeValue serialization once, for both actions."""
+    make_answer_bank_table()
+    bank = AnswerBank("answer_bank")
+    client = bank._table.meta.client
+    real_transaction = client.transact_write_items
+    calls = []
+
+    def inspect(**kwargs):
+        (condition, put) = kwargs["TransactItems"]
+        assert condition["ConditionCheck"] == {
+            "TableName": "answer_bank",
+            "Key": {"pk": "global", "sk": "c experience"},
+            "ConditionExpression": "attribute_not_exists(pk)",
+        }
+        assert put["Put"] == {
+            "TableName": "answer_bank",
+            "Item": {
+                "pk": "global", "sk": "c++ experience",
+                "question_raw": "C++ experience", "answer": "fresh",
+                "source": "fixture", "use_count": 0,
+            },
+            "ConditionExpression": "attribute_not_exists(pk)",
+        }
+        calls.append(kwargs)
+        return real_transaction(**kwargs)
+
+    monkeypatch.setattr(client, "transact_write_items", inspect)
+    bank.seed_global({"C++ experience": "fresh"}, source="fixture")
+    assert len(calls) == 1
+    assert bank.lookup("C++ experience", "example-co") == "fresh"
+    assert bank.lookup("C experience", "example-co") is None
+
+
+def test_dual_key_insert_checks_existing_incompatible_legacy_row(
+        aws, monkeypatch):
+    """An unrelated legacy occupant must remain stable across the atomic insert."""
+    make_answer_bank_table()
+    bank = AnswerBank("answer_bank")
+    _legacy(bank, raw="Different", answer="old")
+    client = bank._table.meta.client
+    real_transaction = client.transact_write_items
+    calls = []
+
+    def inspect(**kwargs):
+        (condition, put) = kwargs["TransactItems"]
+        check = condition["ConditionCheck"]
+        assert check["Key"] == {"pk": "global", "sk": "c experience"}
+        assert check["ConditionExpression"] == "#raw = :raw AND #answer = :old"
+        assert check["ExpressionAttributeValues"] == {
+            ":raw": "Different", ":old": "old",
+        }
+        assert check["ExpressionAttributeNames"] == {
+            "#raw": "question_raw", "#answer": "answer",
+        }
+        assert put["Put"]["Item"]["sk"] == "c++ experience"
+        assert put["Put"]["ConditionExpression"] == "attribute_not_exists(pk)"
+        calls.append(kwargs)
+        return real_transaction(**kwargs)
+
+    monkeypatch.setattr(client, "transact_write_items", inspect)
+    bank.put("C++ experience", "new", AnswerScope.GLOBAL)
+    assert len(calls) == 1
+    assert bank._table.get_item(
+        Key={"pk": "global", "sk": "c experience"}
+    )["Item"]["answer"] == "old"
+    assert bank._table.get_item(
+        Key={"pk": "global", "sk": "c++ experience"}
+    )["Item"]["answer"] == "new"
+    assert bank.lookup("C++ experience", "example-co") == "new"
+    assert bank.lookup("C experience", "example-co") is None

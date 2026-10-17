@@ -252,6 +252,16 @@ def _greenhouse_form() -> bytes:
              'name="g-recaptcha-response" style="display:none"></textarea></div></div>')
     text = _closed_form().decode('utf-8')
     text = text.replace('<svg></svg>', '<svg><circle></circle><line></line></svg>')
+    # Only Greenhouse's selected country swaps the C0 placeholder node for a
+    # distinct, ID-less single-value branch. Leave the other receiver-backed
+    # fields and the separate entry fixture unmodified.
+    text = text.replace(
+        "display.className='react-select__single-value';display.textContent=option.innerText;",
+        "if(id==='country'){const selected=document.createElement('div');"
+        "selected.className='select__single-value';selected.textContent=option.innerText;"
+        "display.replaceWith(selected);}else{"
+        "display.className='react-select__single-value';display.textContent=option.innerText;}"
+    )
     text = text.replace('hidden>Clear search</button>',
                         'hidden><svg><line></line><mask id="synthetic-clear-mask">'
                         '<rect></rect><path></path></mask><circle></circle></svg></button>')

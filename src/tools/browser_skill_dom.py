@@ -82,18 +82,26 @@ _WIDGET_GRAPH = r"""
         !e.hasAttribute('aria-activedescendant') ||
         !attr(e,'aria-describedby') || !attr(e,'aria-errormessage')) return null;
     // Mutable error/placeholder references are current safety evidence, not identity.
+    // At C2 react-select can replace the placeholder with an ID-less single-value
+    // branch. closedGraph already proved that unique, visible C2 branch; only
+    // its exact now-absent placeholder IDREF may lag that DOM replacement.
     for (const k of ['aria-describedby','aria-errormessage']) {
-      let resolved=0;
+      let resolved=0, replacedPlaceholder=false;
       for (const id of attr(e,k).trim().split(/\s+/)) {
         if (!id) return null;
         const hits=document.querySelectorAll('#'+CSS.escape(id));
         // Validation mounts this exact error lazily; duplicates are never absence.
         if (!hits.length && id===e.id+'-error') continue;
+        if (!hits.length && k==='aria-describedby' && phase==='C2' &&
+            id==='react-select-country-placeholder') {
+          replacedPlaceholder=true;
+          continue;
+        }
         const ref=hits.length===1 ? hits[0] : null;
         if (!ref || nativeForm(ref)!==form || !path[8].contains(ref)) return null;
         resolved++;
       }
-      if (k==='aria-describedby' && !resolved) return null;
+      if (k==='aria-describedby' && !resolved && !replacedPlaceholder) return null;
     }
     if (phase!=='C1' && (e.hasAttribute('aria-controls') || e.hasAttribute('aria-owns') ||
         attr(e,'aria-activedescendant') || e.value)) return null;

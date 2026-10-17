@@ -1314,8 +1314,6 @@ def _upload_delta(before, after, filename):
     current = _upload_input(after, post)
     if _formless_root(before) != _formless_root(after) or before['url'] != after['url']:
         raise Gate('Original application root or submit changed during upload.')
-    if current.get('files') != [filename]:
-        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
     # Candidate semantics and values must survive positional selector re-keying.
     def candidates(page):
         original = _upload_input(page, _upload_tree(page))
@@ -1326,7 +1324,13 @@ def _upload_delta(before, after, filename):
                 for c in page['entry']['root_evidence']]
     if candidates(before) != candidates(after):
         raise Gate('Application control semantics changed during upload.')
-    if _upload_shape(pre) == _upload_shape(post) and not post.get('items'):
+    unchanged_pending = (_upload_shape(pre) == _upload_shape(post)
+                         and not post.get('items'))
+    if unchanged_pending and current.get('files') == []:
+        return False
+    if current.get('files') != [filename]:
+        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
+    if unchanged_pending:
         return False
     if (pre.get('items') or not post.get('attached') or post.get('filename') != filename
             or len(post.get('items', [])) != 1):
@@ -1392,6 +1396,13 @@ def _entry_safety(page, allowed, provenance):
 _ASHBY_WAIT_SECONDS = 90.0
 
 
+def _upload_clock():
+    return asyncio.get_running_loop().time()
+
+
+_upload_sleep = asyncio.sleep
+
+
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
     def __init__(self, raw, allowed, provenance, step=None, *, resume_path=''):
@@ -1423,7 +1434,6 @@ class _EntrySession:
         if (fixed.get('url') != page.get('url')
                 or fixed.get('entry') != page.get('entry')):
             raise Gate('Upload PAGE/fixed structural witness disagreement.')
-        _upload_tree(page)
         return page
 
     async def _upload(self, args, kwargs, selector):
@@ -1464,23 +1474,25 @@ class _EntrySession:
                                'is empty. Complete the attachment manually; no retry was attempted.') from None
                 raise Gate('The résumé upload outcome is unclear; inspect the attachment manually. '
                            'No automatic repeat was attempted.') from None
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + 2.0
-            try:
-                async with asyncio.timeout_at(deadline):
-                    for attempt in range(5):
-                        after = await self._upload_pair()
-                        if loop.time() >= deadline:
-                            raise TimeoutError
-                        if _upload_delta(before, after, filename):
-                            self.formless_identity = _root_identity(after)
-                            self.upload_result = after
-                            return result
-                        if attempt < 4:
-                            await asyncio.sleep(min(0.05, max(0, deadline - loop.time())))
-            except TimeoutError:
-                raise Gate('Attached-file render-settle deadline expired; inspect manually.') from None
-            raise Gate('Attached-file render did not settle within five observation pairs.')
+            deadline = _upload_clock() + 8.0
+            # Cancellation bounds even a hanging reader without its generic Exception
+            # handler converting deadline exhaustion into a human Gate.
+            async with asyncio.timeout(8.0):
+                while _upload_clock() < deadline:
+                    after = await self._upload_pair()
+                    if _upload_clock() >= deadline:
+                        raise TimeoutError
+                    if (_formless_root(before) != _formless_root(after)
+                            or before['url'] != after['url']):
+                        raise Gate('Original application root or submit changed during upload.')
+                    post = (after.get('entry') or {}).get('upload_tree')
+                    opaque = isinstance(post, dict) and post.get('complete') is False
+                    if not opaque and _upload_delta(before, after, filename):
+                        self.formless_identity = _root_identity(after)
+                        self.upload_result = after
+                        return result
+                    await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
+            raise TimeoutError
         finally:
             self.upload_pending = False
 

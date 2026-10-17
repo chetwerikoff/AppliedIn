@@ -2270,3 +2270,118 @@ async def test_apply_without_synthetic_context_checks_approved_history_before_su
     assert 'Submission clicked' in result['detail']
     assert any(call[0] == 'fill' for call in browser.calls)
     assert ('click', '#submit') in browser.calls
+
+
+
+def _marked_name_grant(*, selector="#first", value="Test User", url=GH_DIRECT):
+    return {
+        "value": value, "selector": selector, "url": url,
+        "label": "First Name*", "question": "", "tag": "input", "type": "text",
+        "form_selector": "#application", "form_action": GH_DIRECT,
+    }
+
+
+def _marked_greenhouse_page():
+    return inventory(
+        field("First Name*", "#first", form_action=GH_DIRECT),
+        field("Email", "#email", form_action=GH_DIRECT),
+        submit(form_action=GH_DIRECT), url=GH_DIRECT,
+    )
+
+
+async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
+        monkeypatch, tmp_path):
+    """First grant -> real Markdown put/reload -> next fake observe; no new gate."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+
+    path = tmp_path / "facts.md"
+    first = MarkdownAnswerBank(path)
+    first.put("First Name*", "Test User", AnswerScope.GLOBAL,
+              source="synthetic_gate")
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {"First Name": "Test User"}
+    assert "- **First Name**: Test User" in path.read_text()
+
+    p = _marked_greenhouse_page()
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    approved = forms.exact_approval
+    checked = []
+
+    def observe(pk, key, value, **kwargs):
+        checked.append((key, value, kwargs["target"]["selector"]))
+        return approved(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", observe)
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(
+            browser, p, GH_PK, facts, GH_WRAP,
+            provenance=_greenhouse_provenance(row),
+        )
+    assert caught.value.form_question["label"] == "Email"
+    assert ("First Name*", "Test User", "#first") in checked
+    assert not decide.await_count
+    assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
+
+
+async def test_greenhouse_marked_label_execute_retains_grant_and_receipt_identity(
+        monkeypatch, tmp_path):
+    p = _marked_greenhouse_page()
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    browser.allow_mutations = True
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    checked = []
+    original = forms.exact_approval
+
+    def observe(pk, key, value, **kwargs):
+        checked.append((key, value))
+        return original(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", observe)
+    receipt = await forms.execute(
+        browser, p,
+        {"action": "fill", "selector": "#first", "fact": "First Name"},
+        facts={"First Name": "Test User"}, filled={},
+        resume_path="Resume.pdf", company="example-co",
+        jd_text="", resume_tex="", github="", pk=GH_PK, job_url=GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert receipt["fact"] == "First Name*"
+    assert receipt["approved_value"] == "Test User"
+    assert checked and all(pair == ("First Name*", "Test User") for pair in checked)
+    assert [c for c in browser.calls if c[0] == "fill"] == [
+        ("fill", "#first", "--value", "Test User"),
+    ]
+
+
+@pytest.mark.parametrize("problem", [
+    "missing-grant", "wrong-value", "stale-url", "changed-control",
+    "ambiguous-facts",
+])
+async def test_greenhouse_marked_label_never_invents_grant_or_chooses_alias(
+        monkeypatch, tmp_path, problem):
+    p = _marked_greenhouse_page()
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
+    grant = _marked_name_grant()
+    facts = {"First Name": "Test User"}
+    if problem == "missing-grant":
+        row["human_approved_answers"] = {}
+    else:
+        if problem == "wrong-value":
+            grant["value"] = "Other User"
+        elif problem == "stale-url":
+            grant["url"] = "https://example.invalid/job/old"
+        elif problem == "changed-control":
+            grant["selector"] = "#old"
+        elif problem == "ambiguous-facts":
+            facts["first name"] = "Test User"
+        row["human_approved_answers"] = {"First Name*": grant}
+    with pytest.raises(forms.Gate) as caught:
+        await forms._bootstrap(
+            browser, p, GH_PK, facts, GH_WRAP,
+            provenance=_greenhouse_provenance(row),
+        )
+    assert caught.value.form_question["label"] == "First Name*"
+    assert not decide.await_count
+    assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]

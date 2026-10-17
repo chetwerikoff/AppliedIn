@@ -220,7 +220,7 @@ const GATE_LABEL = {
 const gateLabel = (r) => GATE_LABEL[r] || String(r || "review").replace(/_/g, " ");
 function defaultGateText(r) {
   if (r.gate_reason === "no_account") return "Automatic signup was blocked. Approve once the account exists.";
-  if (r.gate_reason === "captcha") return "A CAPTCHA blocked the bot. Apply manually, then approve to mark it done.";
+  if (r.gate_reason === "captcha") return "CAPTCHA present; complete the application manually and verify the result in the employer portal before marking it applied.";
   return "Paused for your approval. Approve to continue.";
 }
 
@@ -1077,8 +1077,8 @@ function laneCard(r) {
     retry = `<button class="kc-retry" data-act="retry" data-pk="${esc(r.pk)}"
        title="Run this application again with human style clicks">↻ Retry</button>`;
   } else if (r.status === "needs_human" && r.gate_reason === "captcha") {
-    retry = `<button class="kc-retry kc-apply" data-act="answer" data-pk="${esc(r.pk)}"
-       title="Opens the filled application in Chrome again. Solve the CAPTCHA there and click Submit">▶ Solve &amp; submit</button>`;
+    retry = `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
+       title="View manual completion and portal verification details">View details</button>`;
   } else if (canApply(r)) {
     // Everything tailored is already queued, so Apply no longer means "add this"
     // — it means "do this one first". Remove and Skip are the other two things
@@ -1267,8 +1267,8 @@ const moreBtn = (key, shown, total, step = REVEAL) =>
 function gateMini(r) {
   const captcha = r.gate_reason === "captcha";
   const act = captcha
-    ? `<button class="kc-retry kc-apply" data-act="answer" data-pk="${esc(r.pk)}"
-         title="Opens the filled application in Chrome again. Solve the CAPTCHA there and click Submit">▶ Solve &amp; submit</button>`
+    ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
+         title="View manual completion and portal verification details">View details</button>`
     : `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
          title="Open the question and type an answer">✎ Answer</button>`;
   // Cut at a WORD, not at character 200. "create a Perplexity.ai thread (Option
@@ -2243,20 +2243,25 @@ function viewApps() {
 
 // --- Needs-you cards -------------------------------------------------------
 function needsCard(r) {
+  const captcha = r.gate_reason === "captcha";
   return `<article class="gatecard">
     <header>
       <div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
       <div class="gc-side">
         <span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
-        <button class="btn btn-ghost" data-open="${esc(r.pk)}">Details</button>
+        <button class="btn btn-ghost" data-open="${esc(r.pk)}">${captcha ? "View details" : "Details"}</button>
       </div>
     </header>
     <div class="gc-q md">${md(r.gate_question || defaultGateText(r))}</div>
+    ${captcha && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
     <div class="gc-answer">
-      <textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
-        placeholder="Type an answer — or leave blank to just approve…"></textarea>
+      ${captcha ? "" : `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
+        placeholder="Type an answer — or leave blank to just approve…"></textarea>`}
       <div class="gc-actions">
-        <button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>
+        ${captcha
+          ? `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
+               title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`
+          : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip job</button>
         ${r.jd_url ? `<a class="gc-jd" href="${esc(r.jd_url)}" target="_blank" rel="noopener">view posting ↗</a>` : ""}
       </div>
@@ -2285,7 +2290,9 @@ function viewNeeds() {
         <option value="">Choose an applied application</option>${eligible.map((app) => `<option value="${esc(app.pk)}">${esc(app.company)} · ${esc(app.title)}</option>`).join("")}
       </select></label><button type="button" class="btn btn-ghost" data-reply-assign="${esc(reply.record_id)}" ${state.replyAssigning.has(reply.record_id) ? "disabled" : ""}>Assign</button></article>`).join("")}</section>` : "";
   const gateHtml = items.length ? `<section class="gate-section"><div class="pane-note">
-    <span>${items.length} waiting on you — answer or approve to continue.</span>
+    <span>${items.length} waiting on you — ${items.some((a) => a.gate_reason === "captcha")
+       ? "complete CAPTCHA applications manually in the employer portal; answer or approve other questions to continue."
+       : "answer or approve to continue."}</span>
     ${items.filter(approveAllPicks).length ? `<button class="btn btn-amber" data-approve-all="1">Approve all ${items.filter(approveAllPicks).length} ready</button>` : ""}
     </div>${items.map(needsCard).join("")}</section>` :
     (all.length && filtersActive() && !matched.length && !unassigned.length ? emptyFiltered() : "");
@@ -4353,10 +4360,11 @@ async function stopRun(what = "discover", ask = true) {
 // Confirm and enqueue the same visible jobs. A company filter used to change
 // the button count while the request still approved the entire application list.
 const approveAllPicks = (a) =>
-  a.status === "tailored"
-  || (a.status === "needs_human"
-      && (a.gate_reason === "approval"
-          || String(a.gate_question || "").startsWith("Ready to apply")));
+  a.gate_reason !== "captcha"
+  && (a.status === "tailored"
+      || (a.status === "needs_human"
+          && (a.gate_reason === "approval"
+              || String(a.gate_question || "").startsWith("Ready to apply"))));
 
 function visibleApprovalPicks() {
   const queued = queuedPks();
@@ -4375,7 +4383,7 @@ async function approveAll() {
   if (!n) { toast("Nothing shown here is waiting for approval."); return; }
   const scope = company === "__all__" ? "shown here across all companies" : `at ${company}`;
   const after = state.mode === "auto" && !state.paused
-    ? "They will be applied for a few at a time — finish any CAPTCHA windows as they open."
+    ? "They will be applied for a few at a time — CAPTCHA Gates require manual completion in the employer portal."
     : "They go to the apply queue and wait. Nothing is submitted until you run them.";
   if (!confirm(`Approve ${n} job${n === 1 ? "" : "s"} ${scope}?\n\n${after}`)) return;
   state.approvingAll = true;
@@ -4489,14 +4497,16 @@ function openDrawer(pk) {
       </div>
     </div>` : "";
 
+  const captchaHandoff = r.status === "needs_human" && r.gate_reason === "captcha";
   const gate = (r.status === "needs_human" || canApply(r)) ? `
     <div class="section gate-box">
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
-      <textarea id="gate-answer" class="gate-input" rows="2"
-        placeholder="Type your answer, or leave blank to approve &amp; continue…"></textarea>
+      ${captchaHandoff && r.gate_question ? `<div class="gate-q md">${esc(defaultGateText(r))}</div>` : ""}
+      ${captchaHandoff ? "" : `<textarea id="gate-answer" class="gate-input" rows="2"
+        placeholder="Type your answer, or leave blank to approve &amp; continue…"></textarea>`}
       <div class="drawer-actions">
-        <button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>
+        ${captchaHandoff ? "" : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
         <button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
           title="It already went through (you got the email / saw the confirmation) — mark applied, don't resubmit">✓ Already applied</button>
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip</button>

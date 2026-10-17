@@ -1358,13 +1358,36 @@ def _upload_delta(before, after, filename):
         raise Gate('The exact passive attached-file item was not proven.')
     # Retained input, dropzone and container are bound by their original subtree,
     # semantic input ID and the independently observed complete ordered tree.
-    removed = post['items']
-    unchanged = _upload_shape(pre) == _upload_shape(post, removed)
-    without_icon = (len(pre.get('svgs', [])) == 1 and not post.get('svgs')
-                    and _upload_shape(pre, pre['svgs']) == _upload_shape(post, removed))
-    if not (unchanged or without_icon):
-        raise Gate('Unexpected structural mutation during résumé attachment; inspect manually.')
-    return True
+    target = _upload_shape(post, post['items'])
+    removals = [()]
+    if len(pre.get('svgs', [])) == 1 and not post.get('svgs'):
+        removals.append(pre['svgs'])
+    if any(_upload_shape(pre, icons) == target for icons in removals):
+        return True
+    # Ashby also flattens one text-only span inside the original dropzone.
+    # Compare each single collapse, never repeatedly normalize arbitrary markup.
+    nodes = pre['nodes']
+    children = [[] for _ in nodes]
+    inside = set()
+    for i, node in enumerate(nodes):
+        if node['parent'] >= 0:
+            children[node['parent']].append(i)
+        if node['parent'] == pre['dropzone'] or node['parent'] in inside:
+            inside.add(i)
+    for inner in inside:
+        outer = nodes[inner]['parent']
+        if (nodes[inner]['tag'] != 'span' or outer not in inside
+                or nodes[outer]['tag'] != 'span' or children[outer] != [inner]
+                or len(children[inner]) != 1):
+            continue
+        text = children[inner][0]
+        if nodes[text]['tag'] != '#text' or children[text]:
+            continue
+        collapsed = dict(pre, nodes=[dict(node) for node in nodes])
+        collapsed['nodes'][text]['parent'] = outer
+        if any(_upload_shape(collapsed, [inner, *icons]) == target for icons in removals):
+            return True
+    raise Gate('Unexpected structural mutation during résumé attachment; inspect manually.')
 
 
 def _entry_safety(page, allowed, provenance):

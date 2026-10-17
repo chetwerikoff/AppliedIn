@@ -2854,15 +2854,16 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 and target.get('tag') == 'textarea'):
             key = _fact_key(facts, target['label']) or key
         if verb == 'choose':
-            # The model's fact is a routing label; the grant supplies the answer.
-            if (not isinstance(key, str)
-                    or key not in {form_question['label'],
-                                   _fact_key(facts, form_question['label'])}):
-                raise Gate('The chosen native control does not match its observed grant key.')
+            # Missing safe answers still produce the original bound question.
+            # Once granted, the model's fact is only a routing label.
             approved = _approved_native_choice(
                 page, target, pk, provenance=provenance, fixture_context=ctx)
             if approved is None:
                 raise Gate(gate_prompt, form_question=form_question)
+            if (not isinstance(key, str)
+                    or key not in {form_question['label'],
+                                   _fact_key(facts, form_question['label'])}):
+                raise Gate('The chosen native control does not match its observed grant key.')
             value, chosen = approved
             if chosen['selector'] != target['selector']:
                 raise Gate('The selected radio does not match the exact owner answer.')

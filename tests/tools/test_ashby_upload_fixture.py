@@ -105,7 +105,7 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
     assert fixture.run() == 0
     assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
                      {'w_lookalike': True}, {'ashby': True},
-                     {'ashby_upload': True, 'ashby_upload_transient': True},
+                     {'ashby_upload': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
     assert report['sessions'] == 8

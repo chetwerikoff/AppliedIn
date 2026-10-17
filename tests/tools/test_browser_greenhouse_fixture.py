@@ -82,9 +82,9 @@ def test_fixture_run_always_executes_every_leg_even_after_failure(monkeypatch, c
         return 1 if not kwargs else 0
     monkeypatch.setattr(fixture, '_run_scenario', leg)
     assert fixture.run() == 1
-    assert calls == [{}, {'greenhouse': True}, {'w_lookalike': True}, {'ashby': True},
-                     {'ashby_upload': True}, {'custom_question': 'radio'},
-                     {'custom_question': 'checkbox'}]
+    assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
+                     {'w_lookalike': True}, {'ashby': True}, {'ashby_upload': True},
+                     {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
     assert report['safe_gate'] is False
-    assert report['sessions'] == len(calls) == 7
+    assert report['sessions'] == len(calls) == 8

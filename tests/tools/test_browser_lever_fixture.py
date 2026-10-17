@@ -155,8 +155,8 @@ async def test_custom_leg_forwards_no_applicant_or_choice_ipc(state, kind):
     assert state.row['human_approved_answers'] == {}
 
 
-@pytest.mark.parametrize('failure', [None, 0, 1, 2, 3, 4, 5, 6, 7])
-def test_run_unconditionally_executes_all_eight_legs_and_propagates_each_failure(monkeypatch, capsys, failure):
+@pytest.mark.parametrize('failure', [None, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+def test_run_unconditionally_executes_all_fixture_scenarios_and_propagates_each_failure(monkeypatch, capsys, failure):
     calls = []
     def scenario(**kwargs):
         calls.append(kwargs)
@@ -165,7 +165,8 @@ def test_run_unconditionally_executes_all_eight_legs_and_propagates_each_failure
     assert fixture.run() == (0 if failure is None else 1)
     assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
                      {'w_lookalike': True}, {'ashby': True}, {'ashby_upload': True},
+                     {'ashby_upload': True, 'ashby_upload_transient': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
-    assert report['sessions'] == 8
+    assert report['sessions'] == 9 and len(report['legs']) == 8
     assert report['safe_gate'] is (failure is None)

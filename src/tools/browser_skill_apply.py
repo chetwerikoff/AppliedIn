@@ -1518,7 +1518,17 @@ class _EntrySession:
                 raise Gate('A possible structural submit cannot be retried automatically.')
             # This is the actual IPC producer, including adversarial direct calls.
             current = await self.page()
-            current, _ = await _observe_controls(self, current)
+            try:
+                current, _ = await _observe_controls(self, current)
+            except Gate as exc:
+                # This independent pre-IPC read already checked both original
+                # routes. Report the existing strict upload-pair Gate instead
+                # of the generic witness diagnostic for entry-only disagreement.
+                if (args[0] == 'upload' and str(exc) ==
+                        'The current DOM witness is unavailable or changed; '
+                        'exception=ValueError; predicate=entry.equal; control=unavailable'):
+                    raise Gate('Upload PAGE/fixed structural witness disagreement.') from None
+                raise
             members = _formless_boundary(current, self.provenance)
             root = _formless_root(current)
             selector = args[1] if len(args) > 1 else ''

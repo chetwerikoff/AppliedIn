@@ -502,6 +502,22 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                         or combo.get('hidden_selector') != receipt.get('hidden_selector')
                         or combo.get('hidden_value') != receipt.get('hidden_value')):
                     raise Gate('The committed combobox value changed before submission.')
+            if receipt.get('action') == 'choose':
+                answer = receipt.get('approved_value', '')
+                if target.get('type') == 'checkbox':
+                    if not target.get('checked') or not _same(answer, 'yes'):
+                        raise Gate('The approved checkbox is no longer checked.')
+                elif target.get('type') == 'radio':
+                    group = _radio_group(page, target)
+                    matches = [c for c in group
+                               if _same(answer, c['label']) or _same(answer, c['value'])]
+                    if (len(matches) != 1 or matches[0]['selector'] != target['selector']
+                            or not target.get('checked')
+                            or sum(bool(c.get('checked')) for c in group) != 1):
+                        raise Gate('The approved radio answer is no longer selected.')
+                else:
+                    raise Gate('The approved native choice control changed.')
+                guarded_value(target, answer)
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
                            provenance=provenance,
@@ -2837,15 +2853,29 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if (key not in facts and verb == 'fill' and action.get('essay')
                 and target.get('tag') == 'textarea'):
             key = _fact_key(facts, target['label']) or key
-        if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
-            value = str(facts[key]).strip()
+        if verb == 'choose':
+            # The model's fact is a routing label; the grant supplies the answer.
+            if (not isinstance(key, str)
+                    or key not in {form_question['label'],
+                                   _fact_key(facts, form_question['label'])}):
+                raise Gate('The chosen native control does not match its observed grant key.')
+            approved = _approved_native_choice(
+                page, target, pk, provenance=provenance, fixture_context=ctx)
+            if approved is None:
+                raise Gate(gate_prompt, form_question=form_question)
+            value, chosen = approved
+            if chosen['selector'] != target['selector']:
+                raise Gate('The selected radio does not match the exact owner answer.')
         else:
-            raise Gate(gate_prompt, form_question=form_question)
-        if key != _fact_key(facts, form_question['label']):
-            detail = 'An exact human-approved fact key for this observed question is required.'
-            if verb == 'select':
-                detail += '\n' + gate_prompt
-            raise Gate(detail, form_question=form_question)
+            if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
+                value = str(facts[key]).strip()
+            else:
+                raise Gate(gate_prompt, form_question=form_question)
+            if key != _fact_key(facts, form_question['label']):
+                detail = 'An exact human-approved fact key for this observed question is required.'
+                if verb == 'select':
+                    detail += '\n' + gate_prompt
+                raise Gate(detail, form_question=form_question)
         try:
             exact_approval(pk, form_question['label'], value, target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
@@ -2905,7 +2935,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
-        exact_approval(pk, form_question['label'], str(facts[key]).strip(),
+        if verb == 'choose':
+            fresh_choice = _approved_native_choice(
+                latest, current, pk, provenance=provenance, fixture_context=ctx)
+            if (fresh_choice is None or fresh_choice[0] != value
+                    or fresh_choice[1]['selector'] != current['selector']):
+                raise Gate('The exact native choice grant changed before a browser write.')
+        exact_approval(pk, form_question['label'],
+                       value if verb == 'choose' else str(facts[key]).strip(),
                        target=_bound_target(latest, current), url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
@@ -2918,15 +2955,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             await session.call('select', current['selector'], '--value', write_value)
         else:
             if current['type'] == 'checkbox':
-                if not _same(str(facts[key]).strip(), 'yes'):
+                if not _same(value, 'yes'):
                     raise Gate('Checkbox grant no longer contains an explicit owner yes.')
             else:
                 matches = [c for c in _radio_group(latest, current)
-                           if (_same(str(facts[key]).strip(), c['label'])
-                               or _same(str(facts[key]).strip(), c['value']))]
+                           if (_same(value, c['label'])
+                               or _same(value, c['value']))]
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
-            guarded_value(current, str(facts[key]).strip())
+            guarded_value(current, value)
             await session.call('click', current['selector'])
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page())
@@ -3015,7 +3052,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],
                'question': target.get('question', ''), 'url': page.get('url', '')}
     if verb in {'fill', 'select', 'choose'}:
-        receipt.update(fact=form_question['label'], approved_value=str(facts.get(key, value)).strip())
+        receipt.update(fact=form_question['label'],
+                       approved_value=value if verb == 'choose'
+                       else str(facts.get(key, value)).strip())
     return receipt
 
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',

@@ -1869,7 +1869,15 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
         return observed_label
     wanted = normalize_label(observed_label)
     candidates = [k for k in facts if isinstance(k, str) and normalize_label(k) == wanted]
-    return candidates[0] if len(candidates) == 1 else None
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    # The apply wrapper derives convenience name aliases from Full name. Same-
+    # valued keys describe one fact; differing answers are not safe to choose.
+    if len({str(facts[k]).strip() for k in candidates}) == 1:
+        return sorted(candidates)[0]
+    return None
 
 
 def _unanswered(page: dict, target: dict) -> bool:
@@ -2962,14 +2970,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         # retains the decorated observed label. Matching only chooses fact
         # DATA; exact_approval still requires the untouched raw grant identity.
         approved_keys = []
+        advertised_facts = set()
         if isinstance(approved, dict):
             for grant_key, grant in approved.items():
                 if not isinstance(grant_key, str) or not isinstance(grant, dict):
                     continue
                 fact_key = _fact_key(facts, grant_key)
-                if (fact_key is not None
-                        and grant.get('value') == str(facts[fact_key]).strip()
-                        and fact_key not in approved_keys):
+                if fact_key is None:
+                    continue
+                banked_value = str(facts[fact_key]).strip()
+                if grant.get('value') != banked_value:
+                    continue
+                # Separate raw grants can refer to the same approved fact data.
+                # Advertise that fact once without merging approval identities.
+                identity = (normalize_label(fact_key), banked_value)
+                if identity not in advertised_facts:
+                    advertised_facts.add(identity)
                     approved_keys.append(fact_key)
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '

@@ -320,3 +320,27 @@ def test_dual_key_insert_checks_existing_incompatible_legacy_row(
     )["Item"]["answer"] == "new"
     assert bank.lookup("C++ experience", "example-co") == "new"
     assert bank.lookup("C experience", "example-co") is None
+
+def test_sharp_s_legacy_cloud_row_and_strasse_seed_remain_distinct(aws):
+    """The old lower()-based identity must not alias a different new seed."""
+    make_answer_bank_table()
+    bank = AnswerBank("answer_bank")
+    _legacy(bank, sk="straße", raw="Straße", answer="old")
+
+    assert bank.lookup("Straße", "example-co") == "old"
+    assert bank.lookup("Strasse", "example-co") is None
+    bank.seed_global({"Strasse": "new"}, source="synthetic_seed")
+
+    old = bank._table.get_item(Key={"pk": "global", "sk": "straße"})["Item"]
+    new = bank._table.get_item(Key={"pk": "global", "sk": "strasse"})["Item"]
+    assert (old["question_raw"], old["answer"], old["source"]) == (
+        "Straße", "old", "legacy"
+    )
+    assert (new["question_raw"], new["answer"], new["source"]) == (
+        "Strasse", "new", "synthetic_seed"
+    )
+    assert bank.lookup("Straße", "example-co") == "old"
+    assert bank.lookup("Strasse", "example-co") == "new"
+    assert bank.all_facts("example-co") == {
+        "Straße": "old", "Strasse": "new",
+    }

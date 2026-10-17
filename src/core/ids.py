@@ -44,7 +44,7 @@ def normalize_label(question: str) -> str:
     Preserve meaningful internal and standalone signs, unlike the historical
     cloud sort key algorithm. The edge-star convention is deliberately finite.
     """
-    s = strip_label_decoration(question).casefold()
+    s = strip_label_decoration(question).lower()
     return _WHITESPACE.sub(" ", _LABEL_SEPARATORS.sub(" ", s)).strip()
 
 

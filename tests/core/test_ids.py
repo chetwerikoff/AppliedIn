@@ -50,3 +50,10 @@ def test_important_signs_do_not_alias_approved_facts():
 def test_original_synonym_separators_are_supported():
     assert normalize_label("Resume/CV") == "resume cv"
     assert normalize_label("Notice period?") == normalize_label("notice period")
+
+def test_unicode_case_comparison_preserves_legacy_sharp_s_identity():
+    # Prior cloud SKs used lower(), not casefold(): a semantic expansion to "ss"
+    # would make the old row unreachable by the bounded old/new key probes.
+    assert normalize_label("Straße") == normalize_label("straße") == "straße"
+    assert normalize_label("Strasse") == normalize_label("STRASSE") == "strasse"
+    assert normalize_label("Straße") != normalize_label("Strasse")

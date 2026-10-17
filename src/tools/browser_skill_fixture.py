@@ -269,6 +269,16 @@ def _greenhouse_form() -> bytes:
     return text.replace('</form>', '</form>' + badge).encode('utf-8')
 
 
+def _greenhouse_empty_placeholder_form() -> bytes:
+    # Isolate the collapsed blank C0 display; selection restores normal C2 height.
+    text = _greenhouse_form().decode('utf-8')
+    text = text.replace('<div class="react-select__placeholder">Choose</div>',
+                        '<div id="empty-placeholder" class="select__placeholder"></div>', 1)
+    text = text.replace('</style>', '#empty-placeholder.select__placeholder{'
+                        'display:block;width:120px;height:0;padding:0;border:0}</style>', 1)
+    return text.encode('utf-8')
+
+
 _COMMITTED_VALIDITY = r"""(() => {
   const selectors=['#location','#school','#degree','#discipline','#country'];
   return Object.fromEntries(selectors.map(s => {
@@ -393,7 +403,7 @@ class _SyntheticRun:
                  "submit_call_entered", "submit_guard", "post_attempts",
                  "post_rejection", "post_receipts", "inventory_diagnostics", "widget_receipts",
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
-                 "greenhouse", "visible_badge_anchor", "native_validity",
+                 "greenhouse", "greenhouse_empty_placeholder", "visible_badge_anchor", "native_validity",
                  "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
                  "ashby_upload", "upload_ipc")
     def __init__(self, resume_path: str):
@@ -437,6 +447,7 @@ class _SyntheticRun:
         self.entry_wait = 'PENDING'
         self.entry_observations = []
         self.greenhouse = False
+        self.greenhouse_empty_placeholder = False
         self.visible_badge_anchor = 'PENDING'
         self.native_validity = {}
         self.w_lookalike = False
@@ -833,6 +844,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             return
         state = getattr(getattr(self, 'server', None), 'synthetic_run', None)
         document = _greenhouse_form() if type(state) is _SyntheticRun and state.greenhouse else _FORM
+        if type(state) is _SyntheticRun and state.greenhouse_empty_placeholder:
+            document = _greenhouse_empty_placeholder_form()
         if type(state) is not _SyntheticRun or state.ashby:
             document = _ashby_form()
         if type(state) is _SyntheticRun and state.ashby_upload:
@@ -876,8 +889,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         pass  # Never log request headers, URLs or session data.
 
 
-def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
-                  custom_question='', ashby_upload=False) -> int:
+def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
+                  w_lookalike=False, ashby=False, custom_question='', ashby_upload=False) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -892,7 +905,9 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
                 document = Path(root) / "Synthetic-Resume.pdf"
                 document.write_bytes(_RESUME_BYTES)
                 state = _SyntheticRun(str(document))
-                state.greenhouse = greenhouse
+                state.greenhouse = greenhouse or greenhouse_empty_placeholder
+                state.greenhouse_empty_placeholder = greenhouse_empty_placeholder
+                greenhouse = state.greenhouse
                 state.w_lookalike = w_lookalike
                 state.ashby = ashby or ashby_upload
                 state.custom_question = custom_question
@@ -1070,6 +1085,7 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
                                                'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
                                                'w_button_aria_label' if w_lookalike else
+                                               'greenhouse_empty_placeholder' if greenhouse_empty_placeholder else
                                                'greenhouse' if greenhouse else 'entry'),
                                   'w_target_ipc': state.w_target_ipc,
                                   'session_safe_gate': ok,
@@ -1112,19 +1128,21 @@ def _run_scenario(*, greenhouse=False, w_lookalike=False, ashby=False,
 
 
 def run() -> int:
-    """Every invocation exercises all seven isolated, sealed question/frame legs."""
+    """Every invocation exercises all eight isolated, sealed question/frame legs."""
     entry = _run_scenario()
     greenhouse = _run_scenario(greenhouse=True)
+    empty_placeholder = _run_scenario(greenhouse_empty_placeholder=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
     ashby_upload = _run_scenario(ashby_upload=True)
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
-    scenarios = (entry, greenhouse, lookalike, ashby, ashby_upload, radio, checkbox)
+    scenarios = (entry, greenhouse, empty_placeholder, lookalike, ashby, ashby_upload, radio, checkbox)
     ok = all(result == 0 for result in scenarios)
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
+                      'greenhouse_empty_placeholder': 'PASS' if empty_placeholder == 0 else 'FAIL',
                       'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
                       'lever_custom_radio': 'PASS' if radio == 0 else 'FAIL',
                       'lever_custom_checkbox': 'PASS' if checkbox == 0 else 'FAIL',

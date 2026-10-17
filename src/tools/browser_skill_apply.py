@@ -883,7 +883,14 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
         ...(graph ? {graph_label_strict_visible:!!exactNodes && visible(exactNodes.label),
-          graph_display_strict_visible:!!exactNodes && visible(exactNodes.display)} : {}),
+          graph_display_strict_visible:!!exactNodes && (visible(exactNodes.display) || (() => {
+            // An untouched blank placeholder can collapse while its selectable box stays shown.
+            const display = exactNodes.display, V = e.parentElement?.parentElement;
+            if (!placeholderBranch(display) || singleBranch(display) || clean(display.innerText) !== '' ||
+                !visible(V) || !visible(exactNodes.label)) return false;
+            const rects = Array.from(display.getClientRects());
+            return rects.some(r=>r.width > 0 && r.height === 0) && rects.every(r=>r.height === 0);
+          })())} : {}),
         visible_text:type === 'radio' || type === 'checkbox' ? visibleText(e) : '',
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],

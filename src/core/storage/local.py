@@ -9,6 +9,7 @@ Artifacts (PDFs) live on disk, not in Redis. Local mode is the real product.
 from __future__ import annotations
 
 import json
+import re
 from redis.exceptions import WatchError
 from datetime import UTC
 from pathlib import Path
@@ -312,16 +313,33 @@ class MarkdownAnswerBank(AbstractAnswerBank):
                     sections.setdefault(cur, [])
             elif cur and line.lstrip().startswith("- **"):
                 body = line.lstrip()[2:]
-                # Closing **: must be selected as a delimiter, not the first
-                # overlapping ** inside a literal starred question.
-                end = body.rfind("**: ")
-                width = 4
-                if end == -1:
-                    # Historical hand-edited rows also allowed no space after :.
-                    end, width = body.rfind("**:"), 3
+                # The FIRST unescaped **: closes the question. The trailing
+                # star in an old raw key (***:) belongs to that key; a **:
+                # later in the answer is not another question delimiter.
+                end = body.find("**:", 2)
                 if end != -1:
-                    sections[cur].append((body[2:end], body[end + width:]))
+                    escaped = body[2:end]
+                    question = re.sub(
+                        r"\*\*(\\+):",
+                        lambda match: "**" + "\\" * (len(match.group(1)) - 1) + ":",
+                        escaped,
+                    )
+                    # Only the single separator space belongs to the format.
+                    # Leading spaces and literal stars in approved values survive.
+                    answer = body[end + 3:]
+                    sections[cur].append((
+                        question, answer[1:] if answer.startswith(" ") else answer,
+                    ))
         return sections
+
+    @staticmethod
+    def _escape_question(question: str) -> str:
+        """Escape a question's literal **: without changing the Markdown row."""
+        return re.sub(
+            r"\*\*(\\*):",
+            lambda match: "**" + "\\" * (len(match.group(1)) + 1) + ":",
+            question,
+        )
 
     def _write(self, data: dict[str, list[tuple[str, str]]]) -> None:
         out = ["# AppliedIn facts", "",
@@ -330,7 +348,7 @@ class MarkdownAnswerBank(AbstractAnswerBank):
             if pk not in data:
                 continue
             out.append(f"## {'global' if pk == 'global' else 'company: ' + pk.split('#', 1)[1]}")
-            out += [f"- **{q}**: {a}" for q, a in data[pk]]
+            out += [f"- **{self._escape_question(q)}**: {a}" for q, a in data[pk]]
             out.append("")
         self.path.write_text("\n".join(out))
 

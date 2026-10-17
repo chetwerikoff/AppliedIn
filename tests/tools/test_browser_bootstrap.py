@@ -2449,3 +2449,70 @@ async def test_marked_native_choice_keeps_observed_question_as_grant_key(
     assert [call for call in browser.calls if call[0] == "click"] == [
         ("click", "#choice"),
     ]
+
+
+
+async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
+        monkeypatch, tmp_path):
+    """Gate -> bank/reload -> real apply decision sees the canonical fact key."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+
+    page = inventory(
+        field("First Name*", "#first", form_action=GH_DIRECT),
+        submit(form_action=GH_DIRECT), url=GH_DIRECT,
+    )
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, page)
+
+    first = await forms.apply(
+        GH_WRAP, "example-co", {}, "synthetic", pk=GH_PK,
+        resume_path="Resume.pdf",
+    )
+    assert first["status"] == "gate"
+    assert first["form_question"]["label"] == "First Name*"
+    assert not decide.await_count
+
+    path = tmp_path / "facts.md"
+    MarkdownAnswerBank(path).put("First Name*", "Test User", AnswerScope.GLOBAL)
+    facts = MarkdownAnswerBank(path).all_facts("example-co")
+    assert facts == {"First Name": "Test User"}
+    row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
+    browser.allow_mutations = True
+    checked = []
+    original_exact = forms.exact_approval
+
+    def capture_exact(pk, key, value, **kwargs):
+        checked.append((key, value, kwargs["target"]["selector"]))
+        return original_exact(pk, key, value, **kwargs)
+
+    monkeypatch.setattr(forms, "exact_approval", capture_exact)
+    advertised = []
+
+    async def decision(prompt, observed, history, *, model):
+        advertised.append((prompt, deepcopy(history)))
+        if len(advertised) == 1:
+            return {"action": "fill", "selector": "#first", "fact": "First Name"}
+        # Stop via a human gate, never approach upload or submission.
+        return {"action": "gate", "question": "Synthetic stop before submission"}
+
+    monkeypatch.setattr(bsk, "decision", decision)
+    result = await forms.apply(
+        GH_WRAP, "example-co", facts, "synthetic", pk=GH_PK,
+        resume_path="Resume.pdf",
+    )
+    assert result["status"] == "gate"
+    assert "Synthetic stop before submission" in result["question"]
+    assert len(advertised) == 2
+    assert ("Exact human-authorized fact KEYS on this tracked job: "
+            "['First Name'].") in advertised[0][0]
+    assert advertised[0][1] == []
+    assert advertised[1][1][0]["fact"] == "First Name*"
+    assert advertised[1][1][0]["approved_value"] == "Test User"
+    assert checked and all(item == ("First Name*", "Test User", "#first")
+                           for item in checked)
+    assert row["human_approved_answers"] == {"First Name*": _marked_name_grant()}
+    assert [c for c in browser.calls if c[0] == "fill"] == [
+        ("fill", "#first", "--value", "Test User"),
+    ]
+    assert not [c for c in browser.calls
+                if c[0] in {"submit", "click", "upload", "select"}]

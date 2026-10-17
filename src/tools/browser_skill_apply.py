@@ -2958,9 +2958,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                  and not re.search(r'password|login|credential|token', k, re.I)}
         approved = ((_row(pk, fixture_context=ctx) if ctx else _row(pk))
                     .get('human_approved_answers') or {})
-        approved_keys = [k for k, v in facts.items()
-                         if isinstance(approved.get(k), dict)
-                         and approved[k].get('value') == str(v).strip()]
+        # Model-visible fact keys may be canonical while a per-control grant
+        # retains the decorated observed label. Matching only chooses fact
+        # DATA; exact_approval still requires the untouched raw grant identity.
+        approved_keys = []
+        if isinstance(approved, dict):
+            for grant_key, grant in approved.items():
+                if not isinstance(grant_key, str) or not isinstance(grant, dict):
+                    continue
+                fact_key = _fact_key(facts, grant_key)
+                if (fact_key is not None
+                        and grant.get('value') == str(facts[fact_key]).strip()
+                        and fact_key not in approved_keys):
+                    approved_keys.append(fact_key)
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '
                 'The server rechecks both exact value and current approval before writing. '

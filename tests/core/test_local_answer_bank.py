@@ -1,5 +1,7 @@
 """Offline Markdown fact identity regressions (synthetic data only)."""
 
+import pytest
+
 from core.models import AnswerScope
 from core.storage.local import MarkdownAnswerBank
 
@@ -127,4 +129,47 @@ def test_hand_edited_legacy_delimiter_without_space_is_readable(tmp_path):
     bank.put("Email*", "new@example.test", AnswerScope.GLOBAL)
     assert MarkdownAnswerBank(path)._load()["global"] == [
         ("Email", "new@example.test")
+    ]
+
+
+
+@pytest.mark.parametrize("question,answer", [
+    ("Email", "**Role**: Test User"),
+    ("Email", "Test**: User"),
+    ("First* Name", "Test* User"),
+    ("Role**: Name", "Test**: User"),
+    (r"Role**\: Name", r"Test**: \ User"),
+])
+def test_delimiter_like_markdown_question_and_answer_round_trip(tmp_path, question, answer):
+    """An answer containing **: must not become part of the stored raw key."""
+    path = tmp_path / "facts.md"
+    bank = MarkdownAnswerBank(path)
+    bank.put(question, answer, AnswerScope.GLOBAL)
+    reopened = MarkdownAnswerBank(path)
+    assert reopened._load()["global"] == [(question, answer)]
+    assert reopened.lookup(question, "example-co") == answer
+    # Matched updates must preserve the exact key through another disk write.
+    reopened.put(question, answer + "!", AnswerScope.GLOBAL)
+    again = MarkdownAnswerBank(path)
+    assert again._load()["global"] == [(question, answer + "!")]
+    assert again.lookup(question, "example-co") == answer + "!"
+
+
+def test_legacy_trailing_star_with_delimiter_like_approved_answer(tmp_path):
+    path = tmp_path / "facts.md"
+    path.write_text(
+        "# AppliedIn facts\n\n## global\n"
+        "- **First Name***: **Role**: Test User\n"
+        "- **Email ✱**: Test**: User\n"
+    )
+    reopened = MarkdownAnswerBank(path)
+    assert reopened._load()["global"] == [
+        ("First Name*", "**Role**: Test User"),
+        ("Email ✱", "Test**: User"),
+    ]
+    assert reopened.lookup("First Name", "example-co") == "**Role**: Test User"
+    reopened.put("First Name*", "Test**: User", AnswerScope.GLOBAL)
+    assert MarkdownAnswerBank(path)._load()["global"] == [
+        ("First Name*", "Test**: User"),
+        ("Email ✱", "Test**: User"),
     ]

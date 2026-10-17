@@ -1041,10 +1041,14 @@ def _unrelated_search_form(controls: list[dict]) -> bool:
 
 def _safe_diagnostic(value) -> str:
     # Validate the reader's bounded structural grammar again at the log boundary.
+    # Share the segment cap with diagnosticLocator; never accept DOM IDs or values.
+    from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS
     tags = '|'.join(_DIAGNOSTIC_TAGS.split())
     segment = rf'(?:(?:{tags}):nth-of-type\([1-9][0-9]*\)|\*:nth-child\([1-9][0-9]*\))'
     return value if (isinstance(value, str) and len(value) <= 600
-                     and re.fullmatch(segment + rf'(?: > {segment}){{0,11}}', value)) else 'unavailable'
+                     and re.fullmatch(
+                         segment + rf'(?: > {segment}){{0,{_DIAGNOSTIC_MAX_SEGMENTS - 1}}}',
+                         value)) else 'unavailable'
 
 
 def _required_proxy_validity(target, *, submitting=False) -> None:

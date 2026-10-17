@@ -1309,6 +1309,27 @@ def _upload_input(page, tree):
     return matches[0]
 
 
+def _upload_candidates(page):
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if (not isinstance(evidence, list)
+            or any(not isinstance(control, dict) for control in evidence)):
+        raise Gate('Original semantic résumé input is no longer proven.')
+    originals = [control for control in evidence
+                 if control.get('id') == '_systemfield_resume'
+                 and control.get('type') == 'file']
+    if len(originals) != 1:
+        raise Gate('Original semantic résumé input is no longer proven.')
+    original = originals[0]
+    original_semantics = {key: value for key, value in original.items()
+                         if key not in {'selector', 'label_selector', 'files',
+                                        'value', 'has_value'}}
+    candidates = [{key: value for key, value in control.items()
+                   if key not in {'selector', 'label_selector', 'files'}}
+                  for control in evidence
+                  if control is not original and control.get('dropzone') is not True]
+    return original_semantics, candidates
+
+
 def _upload_delta(before, after, filename):
     pre, post = _upload_tree(before), _upload_tree(after)
     current = _upload_input(after, post)
@@ -1421,19 +1442,46 @@ class _EntrySession:
         result = await self.call('evaluate', ENTRY_PAGE)
         return result['value']
 
-    async def _upload_pair(self):
+    async def _upload_pair(self, *, settle_before=None):
         try:
             page = await self.page()
             fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
             _inventory_ok(page)
+            if settle_before is not None:
+                # A split read cannot mask a definitive change on either witness.
+                # The opaque upload subtree is deliberately not root identity.
+                filename = Path(self.resume_path).name
+                for witness in (page, fixed):
+                    if (witness.get('url') != settle_before['url']
+                            or _formless_root(witness) != _formless_root(settle_before)):
+                        raise Gate('Original application root or submit changed during upload.')
+                    if (_upload_candidates(settle_before)
+                            != _upload_candidates(witness)):
+                        raise Gate('Application control semantics changed during upload.')
+                    evidence = witness['entry']['root_evidence']
+                    original = next(c for c in evidence
+                                    if c.get('id') == '_systemfield_resume'
+                                    and c.get('type') == 'file')
+                    if original.get('files') not in ([], [filename]):
+                        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
+                    tree = (witness.get('entry') or {}).get('upload_tree')
+                    if not isinstance(tree, dict) or type(tree.get('complete')) is not bool:
+                        raise Gate('Incomplete or overflowing upload structural witness; inspect manually.')
+                    if tree.get('filename') not in (None, '', filename):
+                        raise Gate('The exact passive attached-file item was not proven.')
+                    if tree['complete'] is True:
+                        _upload_tree(witness)
+            if (fixed.get('url') != page.get('url')
+                    or fixed.get('entry') != page.get('entry')):
+                if (settle_before is not None
+                        and page.get('url') == fixed.get('url') == settle_before['url']):
+                    return None  # Entry-only disagreement cannot prove attachment.
+                raise Gate('Upload PAGE/fixed structural witness disagreement.')
         except Gate:
             raise
         except Exception:
             raise Gate('Upload structural/file witness is unavailable; inspect the attachment '
                        'manually. No automatic repeat was attempted.') from None
-        if (fixed.get('url') != page.get('url')
-                or fixed.get('entry') != page.get('entry')):
-            raise Gate('Upload PAGE/fixed structural witness disagreement.')
         return page
 
     async def _upload(self, args, kwargs, selector):
@@ -1479,9 +1527,12 @@ class _EntrySession:
             # handler converting deadline exhaustion into a human Gate.
             async with asyncio.timeout(8.0):
                 while _upload_clock() < deadline:
-                    after = await self._upload_pair()
+                    after = await self._upload_pair(settle_before=before)
                     if _upload_clock() >= deadline:
                         raise TimeoutError
+                    if after is None:
+                        await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
+                        continue
                     if (_formless_root(before) != _formless_root(after)
                             or before['url'] != after['url']):
                         raise Gate('Original application root or submit changed during upload.')
@@ -1507,7 +1558,17 @@ class _EntrySession:
                 raise Gate('A possible structural submit cannot be retried automatically.')
             # This is the actual IPC producer, including adversarial direct calls.
             current = await self.page()
-            current, _ = await _observe_controls(self, current)
+            try:
+                current, _ = await _observe_controls(self, current)
+            except Gate as exc:
+                # This independent pre-IPC read already checked both original
+                # routes. Report the existing strict upload-pair Gate instead
+                # of the generic witness diagnostic for entry-only disagreement.
+                if (args[0] == 'upload' and str(exc) ==
+                        'The current DOM witness is unavailable or changed; '
+                        'exception=ValueError; predicate=entry.equal; control=unavailable'):
+                    raise Gate('Upload PAGE/fixed structural witness disagreement.') from None
+                raise
             members = _formless_boundary(current, self.provenance)
             root = _formless_root(current)
             selector = args[1] if len(args) > 1 else ''

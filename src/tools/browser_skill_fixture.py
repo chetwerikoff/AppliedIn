@@ -927,7 +927,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
 
 def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                   w_lookalike=False, ashby=False, custom_question='', ashby_upload=False,
-                  ashby_upload_transient=False) -> int:
+                  ashby_upload_transient=None) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -946,10 +946,14 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 state.greenhouse_empty_placeholder = greenhouse_empty_placeholder
                 greenhouse = state.greenhouse
                 state.w_lookalike = w_lookalike
-                state.ashby = ashby or ashby_upload or ashby_upload_transient
+                state.ashby = bool(ashby or ashby_upload or ashby_upload_transient)
                 state.custom_question = custom_question
-                state.ashby_upload = ashby_upload or ashby_upload_transient
-                state.ashby_upload_transient = ashby_upload_transient
+                state.ashby_upload = bool(ashby_upload or ashby_upload_transient)
+                # An unconditional eight-leg run names only ashby_upload. Its
+                # first sequential witness split is built into that leg; the
+                # explicit False override retains the original ordinary case.
+                state.ashby_upload_transient = (
+                    ashby_upload if ashby_upload_transient is None else ashby_upload_transient)
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -1196,7 +1200,7 @@ def run() -> int:
     ashby = _run_scenario(ashby=True)
     # The deterministic split is a read boundary within the existing upload
     # leg, not a ninth dispatch; ordinary upload remains directly exercisable.
-    ashby_upload = _run_scenario(ashby_upload=True, ashby_upload_transient=True)
+    ashby_upload = _run_scenario(ashby_upload=True)
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
     legs = {

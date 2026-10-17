@@ -14,7 +14,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from ..ids import is_internal_pk, normalize_label
+from ..ids import is_internal_pk, normalize_label, strip_label_decoration
 from ..models import AnswerScope, JobRecord, Status
 from .base import (
     AbstractAnswerBank,
@@ -310,11 +310,13 @@ class MarkdownAnswerBank(AbstractAnswerBank):
                        if title.startswith("company:") else None)
                 if cur:
                     sections.setdefault(cur, [])
-            elif cur and line.strip().startswith("- **"):
-                body = line.strip()[2:]
-                end = body.find("**", 2)
+            elif cur and line.lstrip().startswith("- **"):
+                body = line.lstrip()[2:]
+                # Closing **: must be selected as a delimiter, not the first
+                # overlapping ** inside a literal starred question.
+                end = body.rfind("**: ")
                 if end != -1:
-                    sections[cur].append((body[2:end], body[end + 2:].lstrip(": ").strip()))
+                    sections[cur].append((body[2:end], body[end + 4:]))
         return sections
 
     def _write(self, data: dict[str, list[tuple[str, str]]]) -> None:
@@ -343,10 +345,10 @@ class MarkdownAnswerBank(AbstractAnswerBank):
         label = normalize_label(question)
         for i, (q, _) in enumerate(entries):
             if normalize_label(q) == label:
-                entries[i] = (question, answer)
+                entries[i] = (q, answer)  # historical raw key remains stable
                 break
         else:
-            entries.append((question, answer))
+            entries.append((strip_label_decoration(question), answer))
         self._write(data)
 
     def seed_global(self, entries: dict[str, str], *, source: str = "seed") -> None:
@@ -355,11 +357,13 @@ class MarkdownAnswerBank(AbstractAnswerBank):
 
     def all_facts(self, company: str) -> dict[str, str]:
         data = self._load()
-        facts: dict[str, str] = {}
+        # Shadow by semantic comparison, not by raw question spelling.
+        # Return only each winning row's actual stored key.
+        selected: dict[str, tuple[str, str]] = {}
         for pk in ("global", f"company#{company.strip().lower()}"):
             for q, a in data.get(pk, []):
-                facts[q] = a  # company entries override global
-        return facts
+                selected[normalize_label(q)] = (q, a)
+        return {q: a for q, a in selected.values()}
 
 
 class RedisQueue(AbstractQueue):

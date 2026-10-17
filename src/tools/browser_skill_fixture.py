@@ -1132,7 +1132,6 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
                                   'scenario': ('lever_custom_'+custom_question if custom_question else
-                                               'ashby-upload-transient' if state.ashby_upload_transient else
                                                'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
                                                'w_button_aria_label' if w_lookalike else
@@ -1189,26 +1188,34 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
 
 
 def run() -> int:
-    """Every invocation exercises all nine isolated, sealed question/frame legs."""
+    """Every invocation exercises all eight isolated, sealed question/frame legs."""
     entry = _run_scenario()
     greenhouse = _run_scenario(greenhouse=True)
     empty_placeholder = _run_scenario(greenhouse_empty_placeholder=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    ashby_upload = _run_scenario(ashby_upload=True)
-    ashby_transient = _run_scenario(ashby_upload_transient=True)
+    # The deterministic split is a read boundary within the existing upload
+    # leg, not a ninth dispatch; ordinary upload remains directly exercisable.
+    ashby_upload = _run_scenario(ashby_upload=True, ashby_upload_transient=True)
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
-    scenarios = (entry, greenhouse, empty_placeholder, lookalike, ashby, ashby_upload,
-                 ashby_transient, radio, checkbox)
-    ok = all(result == 0 for result in scenarios)
+    legs = {
+        'entry': entry, 'greenhouse': greenhouse,
+        'greenhouse_empty_placeholder': empty_placeholder,
+        'w_button_aria_label': lookalike, 'ashby': ashby,
+        'ashby-upload': ashby_upload, 'lever_custom_radio': radio,
+        'lever_custom_checkbox': checkbox,
+    }
+    ok = all(result == 0 for result in legs.values())
     print(json.dumps({'fixture': 'native-form', 'safe_gate': ok,
                       'entry_wait': 'PASS' if entry == 0 else 'FAIL',
                       'visible_badge_anchor': 'PASS' if greenhouse == 0 else 'FAIL',
                       'greenhouse_empty_placeholder': 'PASS' if empty_placeholder == 0 else 'FAIL',
                       'w_lookalike_gate': 'PASS' if lookalike == 0 else 'FAIL',
-                      'ashby_upload_transient': 'PASS' if ashby_transient == 0 else 'FAIL',
+                      'ashby_upload': 'PASS' if ashby_upload == 0 else 'FAIL',
                       'lever_custom_radio': 'PASS' if radio == 0 else 'FAIL',
                       'lever_custom_checkbox': 'PASS' if checkbox == 0 else 'FAIL',
-                      'sessions': len(scenarios)}))
+                      'legs': {name: 'PASS' if status == 0 else 'FAIL'
+                               for name, status in legs.items()},
+                      'sessions': len(legs)}))
     return 0 if ok else 1

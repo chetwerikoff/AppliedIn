@@ -113,10 +113,9 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
                      {'w_lookalike': True}, {'ashby': True},
                      {'ashby_upload': True},
                      {'ashby_upload': True, 'ashby_upload_transient': True},
-                     {'ashby_upload': True, 'ashby_upload_unwrap': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
-    assert report['sessions'] == 10
+    assert report['sessions'] == len(calls) == 9
     assert len(report['legs']) == 8
     assert set(report['legs']) == {
         'entry', 'greenhouse', 'greenhouse_empty_placeholder',

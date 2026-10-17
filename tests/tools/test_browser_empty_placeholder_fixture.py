@@ -13,6 +13,7 @@ from tools import browser_skill_apply as forms, browser_skill_fixture as fixture
 from tests.tools.test_browser_lever_fixture import observed
 from tests.tools.test_browser_greenhouse_fixture import Tree
 from tests.tools.test_ashby_upload_fixture import snapshot
+from tests.tools.test_ashby_upload_unwrap import tree_pair
 
 
 def test_empty_fixture_is_separate_required_blank_with_zero_height_box():
@@ -62,6 +63,12 @@ def traversal(state, *, premature=False):
         state.last_page['controls'] = [dict(selector='#_systemfield_resume', files=[filename])]
         state.fills, state.decisions, state.ipc_index, state.upload_ipc = 2, 4, 3, 1
         state.uploaded = True
+        if state.ashby_upload_unwrap:
+            # The stubbed upload must retain the exact one-span shape proof.
+            before, after = tree_pair()
+            state.upload_before_tree = before['entry']['upload_tree']
+            state.last_page['entry']['upload_tree'] = after['entry']['upload_tree']
+            state.last_page['entry']['upload_tree']['filename'] = filename
         if state.ashby_upload_transient:
             # The aggregate traversal mocks the apply loop. Feed its real
             # fixture adjudicator the same three ordered pairs proven by the
@@ -134,7 +141,7 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
     assert set(reports[-1]['legs']) == set(STAGES)
     assert {r['scenario'] for r in reports[:-1]} == set(STAGES)
     upload_reports = [r for r in reports[:-1] if r['scenario'] == 'ashby-upload']
-    assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient'}
+    assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient+unwrap'}
     for report in reports[:-1]:
         failed = premature and report['scenario'] in {'entry', 'greenhouse', 'greenhouse_empty_placeholder'}
         assert report['final_stage'] == ('premature' if failed else STAGES[report['scenario']])
@@ -146,7 +153,7 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
         if report['scenario'] == 'ashby-upload':
             assert report['upload_ipc'] == 1
             trace = report['upload_pair_trace']
-            if report['variant'] == 'transient':
+            if report['variant'] == 'transient+unwrap':
                 assert [pair['entry_agrees'] for pair in trace] == [False, True, True]
                 assert [pair['page_complete'] for pair in trace] == [False, False, True]
                 assert [pair['fixed_complete'] for pair in trace] == [True, False, True]

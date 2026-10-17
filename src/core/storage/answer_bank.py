@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 
 import boto3
-from boto3.dynamodb.types import TypeSerializer
 from botocore.exceptions import ClientError
 
 from ..ids import make_pk, normalize_label
@@ -20,7 +19,6 @@ from .base import AbstractAnswerBank
 _GLOBAL_PK = "global"
 _WHITESPACE = re.compile(r"\s+")
 _LEGACY_PUNCT = re.compile(r"[^\w\s]")
-_SERIALIZER = TypeSerializer()
 
 
 class AnswerBankAmbiguityError(RuntimeError):
@@ -43,10 +41,6 @@ def _legacy_label(question: str) -> str:
 def _candidates(question: str) -> list[str]:
     revised, legacy = normalize_label(question), _legacy_label(question)
     return [revised] if revised == legacy or not legacy else [revised, legacy]
-
-
-def _typed(data: dict) -> dict:
-    return {key: _SERIALIZER.serialize(value) for key, value in data.items()}
 
 
 def _conditional_conflict(exc: ClientError) -> bool:
@@ -150,7 +144,7 @@ class AnswerBank(AbstractAnswerBank):
                 return
             check = {
                 "TableName": self._table.name,
-                "Key": _typed({"pk": item["pk"], "sk": legacy}),
+                "Key": {"pk": item["pk"], "sk": legacy},
                 "ConditionExpression": "attribute_not_exists(pk)",
             }
             if legacy_row is not None:
@@ -158,16 +152,19 @@ class AnswerBank(AbstractAnswerBank):
                 check["ExpressionAttributeNames"] = {
                     "#raw": "question_raw", "#answer": "answer",
                 }
-                check["ExpressionAttributeValues"] = _typed({
+                check["ExpressionAttributeValues"] = {
                     ":raw": legacy_row["question_raw"],
                     ":old": legacy_row["answer"],
-                })
+                }
+            # Table.meta.client is resource-backed: boto3 serializes Python
+            # values at the request boundary. Manual AttributeValue wrapping
+            # would serialize both transaction actions twice.
             self._table.meta.client.transact_write_items(
                 TransactItems=[
                     {"ConditionCheck": check},
                     {"Put": {
                         "TableName": self._table.name,
-                        "Item": _typed(item),
+                        "Item": item,
                         "ConditionExpression": "attribute_not_exists(pk)",
                     }},
                 ],

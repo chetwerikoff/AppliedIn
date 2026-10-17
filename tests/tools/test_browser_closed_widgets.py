@@ -578,22 +578,26 @@ def test_repeated_deep_opaque_nodes_remain_fail_closed():
         forms._inventory_ok(p)
 
 
-def test_repeated_deep_opaque_nodes_have_distinct_safe_locators():
-    # Regression for review #5558913444: both present canvases have
+@pytest.mark.parametrize('count', [2, 3])
+def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(count):
+    # Regression for review #5558913444: all present canvases have
     # identical last-twelve segments but different value-free ancestors.
     # This test failed on the original 12-segment-only diagnostic locator.
-    p = dom(diagnostics={'count': 2, 'depth': 14})['page']
-    assert p['opaque_count'] == 2
+    p = dom(diagnostics={'count': count, 'depth': 14})['page']
+    assert p['opaque_count'] == count
+    assert p['opaque_controls'] is True and p['inventory_verified'] is False
     paths = p['opaque_locators']
-    assert len(paths) == 2
+    assert len(paths) == count
     assert all(isinstance(x, str) and x != 'unavailable'
                and forms._safe_diagnostic(x) == x for x in paths)
-    assert len(set(paths)) == 2
+    assert len(set(paths)) == count
     assert all(x.count(' > ') >= 14 for x in paths)
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     detail = str(caught.value)
-    assert detail.count('control=') == 2
+    assert 'opaque_count=' + str(count) in detail
+    assert detail.count('control=') == count
+    assert all(detail.count('control=' + path) == 1 for path in paths)
     assert 'control=unavailable' not in detail
     assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
 

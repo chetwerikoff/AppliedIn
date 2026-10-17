@@ -103,10 +103,18 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(fixture, '_run_scenario', lambda **kwargs: calls.append(kwargs) or 0)
     assert fixture.run() == 0
-    assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True}, {'w_lookalike': True},
-                     {'ashby': True}, {'ashby_upload': True}, {'ashby_upload_transient': True},
+    assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
+                     {'w_lookalike': True}, {'ashby': True},
+                     {'ashby_upload': True, 'ashby_upload_transient': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
-    assert json.loads(capsys.readouterr().out)['sessions'] == 9
+    report = json.loads(capsys.readouterr().out)
+    assert report['sessions'] == 8
+    assert set(report['legs']) == {
+        'entry', 'greenhouse', 'greenhouse_empty_placeholder',
+        'w_button_aria_label', 'ashby', 'ashby-upload',
+        'lever_custom_radio', 'lever_custom_checkbox',
+    }
+    assert set(report['legs'].values()) == {'PASS'}
 
 
 def test_real_local_handler_opens_chooser_and_renders_only_passive_item():
@@ -332,7 +340,10 @@ async def _transient_fixture_run(authority, monkeypatch, *, persistent=False):
         nonlocal samples, before_upload
         if method == 'upload':
             before_upload = deepcopy(raw.current)
-        if method == 'evaluate' and raw.uploads and args == (forms.ENTRY_PAGE,):
+        if (method == 'evaluate' and raw.uploads and args == (forms.ENTRY_PAGE,)
+                and not authority.upload_pair_complete):
+            # Follow-up answer reads do not belong to upload settling and
+            # must not inflate the three deterministic paired observations.
             samples += 1
             # The local fixture boundary, not elapsed wall time, owns the
             # first split and the later opaque-to-complete sequence.

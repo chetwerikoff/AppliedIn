@@ -143,9 +143,15 @@ async def synthetic_controller(monkeypatch, case):
     assert result["status"] == "gate"
     assert result["question"] and URL in result["question"]
     assert result["step"]["url"] == URL
-    # handoff() deliberately makes an absent button safe and explicit.
-    assert result["step"]["last_button"] == "(unavailable)"
-    assert "Last button: (unavailable)." in result["question"]
+    if case == "control":
+        # ControlGate clears stale button metadata, retaining code-owned diagnostics.
+        assert result["step"]["last_button"] == ""
+        assert "action=fill" in result["question"]
+        assert "selector=[redacted]" in result["question"]
+    else:
+        # Ordinary Gates retain the handoff's sanitized missing-button marker.
+        assert result["step"]["last_button"] == "(unavailable)"
+        assert "Last button: (unavailable)." in result["question"]
     return result
 
 

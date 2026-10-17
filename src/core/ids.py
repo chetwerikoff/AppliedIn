@@ -27,16 +27,25 @@ def normalize_text(s: str) -> str:
     return s
 
 
-def normalize_label(question: str) -> str:
-    """Normalize a form question into a stable answer-bank sort key.
+# Only known required markers and harmless sentence-edge punctuation are
+# decorations. Technical suffixes (C++, C#) and currencies ($, €) are facts.
+_LABEL_EDGE = re.compile(r"^[\s*✱✳†?!.:;？！。：；]+|[\s*✱✳†?!.:;？！。：；]+$")
+_LABEL_SEPARATORS = re.compile(r"[/\\,-]|[?!.:;？！。：；]")
 
-    Lowercase, remove all punctuation, collapse whitespace. So
-    "Notice period?" and "notice  period" map to the same label.
+
+def strip_label_decoration(question: str) -> str:
+    """Strip only finite edge decoration; keep case and literal inner stars."""
+    return _LABEL_EDGE.sub("", question)
+
+
+def normalize_label(question: str) -> str:
+    """Comparable label: bounded edge decoration, case, separators and spaces.
+
+    Preserve meaningful internal and standalone signs, unlike the historical
+    cloud sort key algorithm. The edge-star convention is deliberately finite.
     """
-    s = question.lower()
-    s = _PUNCT_ALL.sub(" ", s)
-    s = _WHITESPACE.sub(" ", s).strip()
-    return s
+    s = strip_label_decoration(question).casefold()
+    return _WHITESPACE.sub(" ", _LABEL_SEPARATORS.sub(" ", s)).strip()
 
 
 def jd_hash(jd_text: str) -> str:

@@ -164,7 +164,7 @@ def test_run_unconditionally_executes_all_eight_legs_and_propagates_each_failure
     monkeypatch.setattr(fixture, '_run_scenario', scenario)
     assert fixture.run() == (0 if failure is None else 1)
     assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
-                     {'w_lookalike': True}, {'ashby': True}, {'ashby_upload': True, 'ashby_upload_transient': True},
+                     {'w_lookalike': True}, {'ashby': True}, {'ashby_upload': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
     assert report['sessions'] == 8

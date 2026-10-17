@@ -135,9 +135,11 @@ test('delegated View details action dispatches only to the existing drawer', () 
   };
   const clicks = h.node('#pane').listeners.click;
   assert.ok(clicks?.length);
+  // wire() makes unrelated initial reads; View details must add none.
+  const beforeClickRequests = h.requests.length;
   clicks.at(-1)({ target });
   assert.equal(h.context.opened, 'captcha-routed');
-  assert.equal(h.requests.length, 0);
+  assert.equal(h.requests.length, beforeClickRequests);
 });
 
 test('every CAPTCHA row is excluded from bulk picks, even Ready-to-apply conflicts', () => {

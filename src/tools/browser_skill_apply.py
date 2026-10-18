@@ -1077,7 +1077,7 @@ def _inventory_ok(page: dict) -> None:
             causes.append('opaque_count=' + str(count if type(count) is int and count >= 0 else 'unavailable'))
             locators = page.get('opaque_locators')
             causes.extend('control=' + _safe_diagnostic(x) for x in (
-                locators if isinstance(locators, list) and locators else [None]))
+                locators[:3] if isinstance(locators, list) and locators else [None]))
         if not causes:
             causes.append('inventory_verified=false/readiness')
         raise Gate('The current form inventory is incomplete; ' + '; '.join(causes))

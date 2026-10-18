@@ -4358,6 +4358,16 @@ function retailorFoot(pk, busy, kept) {
 
 function paneAction(act, pk, el) {
   if (demoGuard()) return;
+  if (["rot-co", "drain-co"].includes(act)) {
+    const co = el?.dataset?.company || "";
+    if (!co || !companyActionAllowed(co)) {
+      toast("Resolve held or unverified rows before a company-wide action.");
+      return;
+    }
+  } else if (act !== "qsel-bulk" && !rowActionAllowed(pk, act)) {
+    toast("Read-only until this application is reconciled or its cause is verified.");
+    return;
+  }
   if (act === "force-apply") { forceApply(pk); return; }
   if (act === "answer") {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
@@ -4414,9 +4424,10 @@ function paneAction(act, pk, el) {
     // endpoint one at a time — a bulk button is a convenience over the existing
     // action, never a second path that could disagree with it about what
     // skipping means.
-    const pks = [...state.qPicked];
-    if (!pks.length) return;
     const skip = el.dataset.mode === "skip";
+    const pks = [...state.qPicked].filter((pk) =>
+      rowActionAllowed(pk, skip ? "queue-skip" : "queue-remove"));
+    if (!pks.length) return;
     if (skip && !confirm(`Skip ${pks.length} job${pks.length === 1 ? "" : "s"}?`
         + `\n\nThey leave the queue and move to closed. Removing instead keeps`
         + ` them on the board under Ready to apply.`)) return;
@@ -6349,7 +6360,10 @@ function wire() {
     const undo = e.target.closest("[data-review-undo]");
     if (undo) { reviewAction("undo", undo.dataset.reviewUndo, state.reviewNotices[undo.dataset.reviewUndo]?.undo || []); return; }
     const reviewTick = e.target.closest("[data-review-pick]");
-    if (reviewTick) { paintReviewSelection(reviewTick, e.shiftKey); return; }
+    if (reviewTick) {
+      if (!rowActionAllowed(reviewTick.dataset.reviewPick, "review-pick")) return;
+      paintReviewSelection(reviewTick, e.shiftKey); return;
+    }
     const reviewClear = e.target.closest("[data-review-clear]");
     if (reviewClear) { state.apps.filter((r) => r.company === reviewClear.dataset.reviewClear && (reviewClear.dataset.reviewDay == null || reviewDay(r) === reviewClear.dataset.reviewDay || !reviewSelectable(r))).forEach((r) => state.reviewPicked.delete(r.pk)); paintReviewControls(); return; }
     const reviewSelect = e.target.closest("[data-review-select]");
@@ -6367,6 +6381,7 @@ function wire() {
     const runNow = e.target.closest('[data-act="run-now"]');
     if (runNow) {
       e.stopPropagation();
+      if (!rowActionAllowed(runNow.dataset.pk, "run-now")) return;
       if (!demoGuard()) {
         const pk = runNow.dataset.pk;
         // Move the card OUT of Found straight away. Scoring and tailoring take a
@@ -6387,6 +6402,7 @@ function wire() {
     if (rotOn) {
       if (demoGuard()) return;
       const company = rotOn.dataset.rotOn;
+      if (!companyActionAllowed(company)) return;
       rotOn.disabled = true;
       rotOn.classList.add("is-busy");
       post("/actions/rotation", { company, profile_id: rotOn.dataset.profile })
@@ -6403,6 +6419,7 @@ function wire() {
     if (rotOff) {
       if (demoGuard()) return;
       const company = rotOff.dataset.rotOff;
+      if (!companyActionAllowed(company)) return;
       post("/actions/rotation", { company, profile_id: "" }).then(async () => {
         await loadRotation();
         toast(`${company} no longer rotates. Addresses already used are kept.`);
@@ -6413,12 +6430,14 @@ function wire() {
     const tick = e.target.closest("[data-qsel]");
     if (tick) {
       const pk = tick.dataset.qsel;
+      if (!rowActionAllowed(pk, "queue-remove")) return;
       state.qPicked.has(pk) ? state.qPicked.delete(pk) : state.qPicked.add(pk);
       qselPaint(tick.closest(".un-row"), state.qPicked.has(pk));
       return;
     }
     if (e.target.closest("[data-qsel-all]")) {
       document.querySelectorAll("[data-qsel]").forEach((cb) => {
+        if (!rowActionAllowed(cb.dataset.qsel, "queue-remove")) return;
         state.qPicked.add(cb.dataset.qsel);
         cb.checked = true;
         qselPaint(cb.closest(".un-row"), true);
@@ -6590,6 +6609,7 @@ function wire() {
     if (ra) {
       if (!ra.value || demoGuard()) return;
       const pk = ra.dataset.reapplyProf, profile_id = ra.value;
+      if (!rowActionAllowed(pk, "reapply")) { ra.value = ""; return; }
       const p = state.profiles.find((x) => x.id === profile_id) || {};
       if (!confirm(`Apply to this posting again as ${p.label} (${p.email})?\n\nThe employer will receive a second application from a different address. The one already sent is kept as is.`)) { ra.value = ""; return; }
       ra.disabled = true;
@@ -6661,6 +6681,7 @@ function wire() {
     const sel = e.target.closest("[data-job-profile]");
     if (!sel || demoGuard()) return;
     const pk = sel.dataset.jobProfile;
+    if (!rowActionAllowed(pk, "job-profile")) return;
     const d = await post(`/actions/job-profile/${encodeURIComponent(pk)}`,
                          { profile_id: sel.value });
     if (!d || !d.ok) { toast((d && d.error) || "Couldn't set the profile."); return; }
@@ -6680,6 +6701,7 @@ function wire() {
     if (demoGuard()) return;
     const pk = act.dataset.pk;
     const kind = act.dataset.act;
+    if (!rowActionAllowed(pk, kind)) return;
     if (kind === "force-apply") {
       return forceApply(pk).then((started) => { if (started) closeDrawer(); });
     }

@@ -223,6 +223,87 @@ _WIDGET_GRAPH = r"""
     for (let n=o;n;n=n.parentElement) if (dangerous(n)) return true;
     return Array.from(o.querySelectorAll('*')).some(dangerous);
   };
+  // Only a native Lever Current location input gets these read-only
+  // witnesses. The Python controller separately proves tracked-job provenance.
+  const leverLocationField = e => {
+    if (location.protocol!=='https:' || location.host!=='jobs.lever.co' ||
+        e.tagName!=='INPUT' || attr(e,'role')!=='combobox') return false;
+    const labels=Array.from(e.labels || []).map(n=>n.innerText).join(' ');
+    const refs=attr(e,'aria-labelledby').split(/\s+/).filter(Boolean)
+      .map(id=>byId(id)?.innerText || '').join(' ');
+    return clean(labels || refs || attr(e,'aria-label'))==='Current location';
+  };
+  // The generic linked-combobox rule is unchanged. This location-only proof
+  // checks BOTH ownership attributes and all global claimant types.
+  const leverLocationOwner = e => {
+    const claims=['aria-controls','aria-owns'].map(k=>attr(e,k).split(/\s+/).filter(Boolean));
+    const ids=claims.flat();
+    const id=ids.length && claims.every(group=>group.length<=1) &&
+      ids.every(value=>value===ids[0]) ? ids[0] : '';
+    const list=byId(id), form=nativeForm(e);
+    if (!id || !list || attr(list,'role')!=='listbox' || !form ||
+        (nativeForm(list) && nativeForm(list)!==form) ||
+        list.querySelector('[role="listbox"]')) return {valid:false,link_id:id};
+    const options=Array.from(list.querySelectorAll('[role="option"]'));
+    if (options.some(o=>o.closest('[role="listbox"]')!==list || !uniqueNode(o)))
+      return {valid:false,link_id:id};
+    const identifiers=new Set([id,...options.map(o=>attr(o,'id')).filter(Boolean)]);
+    const active=attr(e,'aria-activedescendant');
+    if (active && !options.some(o=>attr(o,'id')===active && byId(active)===o))
+      return {valid:false,link_id:id};
+    const claimants=Array.from(document.querySelectorAll(
+      '[aria-controls],[aria-owns],[aria-activedescendant]'));
+    if (claimants.some(n=>n!==e && ['aria-controls','aria-owns','aria-activedescendant']
+        .some(k=>attr(n,k).split(/\s+/).some(ref=>ref && identifiers.has(ref)))))
+      return {valid:false,link_id:id};
+    return {valid:true,link_id:id,listbox_selector:selector(list)};
+  };
+  const leverLocationReceiver = (e, form) => {
+    const hasId=e.hasAttribute('data-value-input'), hasName=e.hasAttribute('data-value-name');
+    const id=attr(e,'data-value-input'), name=attr(e,'data-value-name');
+    const hidden=Array.from(document.querySelectorAll('input[type="hidden"]'))
+      .filter(h=>h.form===form);
+    const ids=id ? hidden.filter(h=>h.id===id) : [];
+    const names=name ? hidden.filter(h=>h.name===name) : [];
+    const resolved=hidden.filter(h=>(id && h.id===id) || (name && h.name===name) || e.contains(h));
+    const valid=hasId || hasName
+      ? resolved.length===1 && uniqueNode(resolved[0]) &&
+        (!hasId || (id && ids.length===1 &&
+          document.querySelectorAll('#'+CSS.escape(id)).length===1)) &&
+        (!hasName || (name && names.length===1))
+      : resolved.length===0;
+    return {declared:hasId||hasName, count:resolved.length,
+      id_reference:id, name_reference:name, valid:!!form && !!valid};
+  };
+  // The popup may close after selection; the selected option still needs
+  // independent node/selector/caption/value evidence even while hidden.
+  const leverLocationSelected = (e, owner) => {
+    if (!owner.valid) return null;
+    const list=byId(owner.link_id);
+    if (!list) return null;
+    const selected=Array.from(list.querySelectorAll('[role="option"]')).filter(o=>
+      o.closest('[role="listbox"]')===list && attr(o,'aria-selected')==='true');
+    if (selected.length!==1 || !uniqueNode(selected[0]) ||
+        (nativeForm(selected[0]) && nativeForm(selected[0])!==nativeForm(e))) return null;
+    const o=selected[0];
+    return {selector:selector(o), label:clean(o.innerText), value:attr(o,'data-value') || attr(o,'value'),
+      tag:o.tagName.toLowerCase(), selected:true, safe:!unsafeOption(o)};
+  };
+  const leverLocationVisible = e => {
+    if (!e) return false;
+    const rects=Array.from(e.getClientRects());
+    if (!rects.length) return false;
+    let fixed=false;
+    for (let n=e;n;n=n.parentElement) {
+      const style=getComputedStyle(n);
+      if (!style || style.display==='none' || style.visibility!=='visible' ||
+          !(Number(style.opacity)>0)) return false;
+      if (style.position==='fixed') fixed=true;
+    }
+    return rects.some(r=>r.width>0 && r.height>0 &&
+      r.right+scrollX>0 && r.bottom+scrollY>0 &&
+      (!fixed || (r.right>0 && r.bottom>0)));
+  };
   const pickerParts = new Set();
   // Failed ITI ownership must not fall through to legacy popup omission.
   const pickerCandidate = e => !!e.closest('.iti,.iti__dropdown-content') ||
@@ -434,6 +515,8 @@ PAGE = r"""(() => {
             submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
               o.type === 'submit' || o.type === 'image',
             navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
+            // Independent option safety is consumed only by the Lever location path.
+            safe:!unsafeOption(o),
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',
             ...(graph ? {value_attributes:['data-value','value']
               .filter(k=>o.hasAttribute(k)).map(k=>o.getAttribute(k))} : {}),
@@ -444,9 +527,14 @@ PAGE = r"""(() => {
           .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
+        const locationOnly=leverLocationField(e);
+        const locationOwner=locationOnly ? leverLocationOwner(e) : null;
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
+          ...(locationOnly ? {listbox_visible:leverLocationVisible(list),
+            location_owner:locationOwner, location_receiver:leverLocationReceiver(e, form),
+            location_selected_option:leverLocationSelected(e, locationOwner)} : {}),
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),

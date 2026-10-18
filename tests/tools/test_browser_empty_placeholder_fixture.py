@@ -51,6 +51,14 @@ def traversal(state, *, premature=False):
     state.last_page = {'controls': [], 'inventory_verified': True, 'opaque_controls': False}
     state.combo_observations['Country'] = {'outcome': 'not_reached'}
     state.entry_wait = state.visible_badge_anchor = 'PASS'
+    if state.greenhouse:
+        # The traversal stubs IPC but must exercise the selected country/location
+        # inventory through the same two production readers as fixture smoke.
+        # Populating only combo_observations bypasses the inventory safety gate.
+        from tests.tools.test_browser_greenhouse_selected_inventory import selected_snapshot
+        state.combo_touched.add('Country')
+        state.observe_page(selected_snapshot()['page'])
+        state.last_page = {'controls': [], 'inventory_verified': True, 'opaque_controls': False}
     if state.custom_question:
         return observed(state, state.custom_question)
     if state.w_lookalike:
@@ -143,6 +151,15 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
     upload_reports = [r for r in reports[:-1] if r['scenario'] == 'ashby-upload']
     assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient+unwrap'}
     for report in reports[:-1]:
+        if report['scenario'] in {'greenhouse', 'greenhouse_empty_placeholder'}:
+            choice = report['country_choice_inventory']
+            assert choice is not None and choice['verified'] is True
+            assert choice['opaque_count'] == 0 and choice['opaque_locators'] == []
+            assert choice['country_phase'] == choice['location_phase'] == 'C2'
+            assert choice['country_selected'] == fixture._FACTS['Country']
+            assert choice['location_selected'] == fixture._FACTS['Where are you located?']
+        else:
+            assert report['country_choice_inventory'] is None
         failed = premature and report['scenario'] in {'entry', 'greenhouse', 'greenhouse_empty_placeholder'}
         assert report['final_stage'] == ('premature' if failed else STAGES[report['scenario']])
         assert report['safe_gate'] is (not failed)

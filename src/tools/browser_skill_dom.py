@@ -7,6 +7,12 @@ _DIAGNOSTIC_TAGS = (
 )
 
 
+# Share conservative per-locator size bounds with the Gate validator; the
+# inventory must still include every present opaque node, not just the first few.
+_DIAGNOSTIC_MAX_SEGMENTS = 256
+_DIAGNOSTIC_MAX_CHARS = 8192
+
+
 _WIDGET_GRAPH = r"""
   // Executed afresh in each reader. No page attributes or model flags retain admission.
   const nativeForm = e => e.form || e.closest('form');
@@ -32,12 +38,17 @@ _WIDGET_GRAPH = r"""
   const diagnosticLocator = e => {
     const parts = [];
     for (let n=e; n && n.nodeType===1; n=n.parentElement) {
-      if (parts.length===12) return 'unavailable';
       const tag=n.tagName.toLowerCase(), siblings=n.parentElement ? Array.from(n.parentElement.children) : [n];
       parts.unshift(diagnosticTags.has(tag) ? tag+':nth-of-type('+(siblings.filter(x=>x.tagName===n.tagName).indexOf(n)+1)+')' : '*:nth-child('+(siblings.indexOf(n)+1)+')');
     }
-    const path=parts.join(' > ');
-    return path && document.querySelectorAll(path).length===1 ? path : 'unavailable';
+    // Use the shortest unique, value-free suffix. Repeated deep trees need
+    // their distinguishing ancestor; never substitute DOM ids or page values.
+    for (let depth=1; depth<=Math.min(parts.length,DIAGNOSTIC_LIMIT); depth++) {
+      const path=parts.slice(-depth).join(' > ');
+      if (path.length>DIAGNOSTIC_CHARS) break;
+      if (document.querySelectorAll(path).length===1) return path;
+    }
+    return 'unavailable';
   };
   const requiredProxies = new Set();
   const requiredProxy = (p,e,F,L,form) => {
@@ -80,18 +91,26 @@ _WIDGET_GRAPH = r"""
         !e.hasAttribute('aria-activedescendant') ||
         !attr(e,'aria-describedby') || !attr(e,'aria-errormessage')) return null;
     // Mutable error/placeholder references are current safety evidence, not identity.
+    // At C2 react-select can replace the placeholder with an ID-less single-value
+    // branch. closedGraph already proved that unique, visible C2 branch; only
+    // its exact now-absent placeholder IDREF may lag that DOM replacement.
     for (const k of ['aria-describedby','aria-errormessage']) {
-      let resolved=0;
+      let resolved=0, replacedPlaceholder=false;
       for (const id of attr(e,k).trim().split(/\s+/)) {
         if (!id) return null;
         const hits=document.querySelectorAll('#'+CSS.escape(id));
         // Validation mounts this exact error lazily; duplicates are never absence.
         if (!hits.length && id===e.id+'-error') continue;
+        if (!hits.length && k==='aria-describedby' && phase==='C2' &&
+            id==='react-select-country-placeholder') {
+          replacedPlaceholder=true;
+          continue;
+        }
         const ref=hits.length===1 ? hits[0] : null;
         if (!ref || nativeForm(ref)!==form || !path[8].contains(ref)) return null;
         resolved++;
       }
-      if (k==='aria-describedby' && !resolved) return null;
+      if (k==='aria-describedby' && !resolved && !replacedPlaceholder) return null;
     }
     if (phase!=='C1' && (e.hasAttribute('aria-controls') || e.hasAttribute('aria-owns') ||
         attr(e,'aria-activedescendant') || e.value)) return null;
@@ -129,7 +148,9 @@ _WIDGET_GRAPH = r"""
     const phase = expanded==='true' ? 'C1' : expanded==='false' && noLinks ? (token ? 'C2' : 'C0') : '';
     if (!phase) return null;
     const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
-    if (e.id==='country' && e.closest('fieldset.phone-input') && !country) return null;
+    // Only the exact phone graph can admit receiverless #country. An unrelated
+    // #country with a proven receiver keeps ordinary closed-select authority.
+    if (e.id==='country' && !country && (!H || e.closest('fieldset.phone-input'))) return null;
     if (extras.length) requiredProxies.add(extras[0]);
     graphNodes.set(e, {label:L, display:display[0]});
     return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),
@@ -273,7 +294,9 @@ _WIDGET_GRAPH = r"""
               (n===search && k==='aria-controls' && id===list.id)))))) continue;
     parts.forEach(n=>pickerParts.add(n));
   }
-""".replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS)
+""".replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS).replace(
+    'DIAGNOSTIC_LIMIT', str(_DIAGNOSTIC_MAX_SEGMENTS)).replace(
+    'DIAGNOSTIC_CHARS', str(_DIAGNOSTIC_MAX_CHARS))
 
 PAGE = r"""(() => {
   const visible = e => !!e.getClientRects().length &&
@@ -461,6 +484,10 @@ PAGE = r"""(() => {
         if (list) { linkedParts.add(list); list.querySelectorAll('[role="option"]').forEach(o=>linkedParts.add(o)); }
         return true;
       }
+      // This quarantine is phone-fieldset-only: an unrelated #country with
+      // its own ARIA listbox (or absent provisional target) must retain the
+      // existing generic linked-combobox checks below. Receiverless C2 is
+      // excluded by closedGraph and has no legacy linkId to downgrade through.
       if (e.id==='country' && e.closest('fieldset.phone-input')) return false;
       const list = currentListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
@@ -489,7 +516,7 @@ PAGE = r"""(() => {
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
-    opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.slice(0,3).map(diagnosticLocator),
+    opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.map(diagnosticLocator),
     inventory_verified:inventoryVerified};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 

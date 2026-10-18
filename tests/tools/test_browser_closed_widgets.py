@@ -53,6 +53,27 @@ def test_four_fields_same_graph_in_both_production_readers(phase, active_only):
             assert graph['linked'] and graph['options'][0]['value'] == 'Approved '+key
 
 
+def test_receiver_backed_country_outside_phone_fieldset_is_valid_closed_c2():
+    # Unlike the receiverless Greenhouse phone widget, a normal #country with
+    # one proven hidden receiver must not be quarantined merely by its ID.
+    snapshot = dom(receiverBackedCountry=True, phases={'location': 'C2'})
+    page, witness = snapshot['page'], snapshot['witness']
+    assert page['inventory_verified'] is True and page['opaque_controls'] is False
+    assert page['opaque_count'] == 0 and page['opaque_locators'] == []
+    forms._inventory_ok(page)
+    for reader in (page, witness):
+        target = next(c for c in reader['controls'] if c['selector'] == '#country')
+        graph = target['combobox']
+        assert graph['mode'] == 'closed-react-select' and graph['phase'] == 'C2'
+        assert graph['label_selector'] == '#country-label'
+        assert graph['hidden_selector'] == '#location-hidden'
+        assert graph['hidden_value'] == graph['selected_value'] == 'Approved location'
+        assert graph['selected_text'] == graph['displayed_text'] == 'Approved location'
+        assert graph.get('receiverless_country') is not True
+        assert graph.get('quarantined') is not True
+    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
+
+
 @pytest.mark.parametrize('scenario', [
     {'badGraph': True}, {'multipleReceiver': True}, {'searchToken': True},
     {'extraPicker': True}, {'nestedPicker': True}, {'unsafePicker': True},
@@ -545,22 +566,125 @@ def test_untouched_required_proxy_and_outside_F_cannot_submit(key):
 
 
 @pytest.mark.parametrize('scenario,expected', [
-    ({'custom': True}, '*:nth-child('), ({'depth': 14}, 'unavailable'),
+    ({'custom': True}, '*:nth-child('),
+    ({'depth': 14}, 'canvas:nth-of-type('),
+    ({'count': 2}, 'canvas:nth-of-type('),
     ({'count': 8}, 'canvas:nth-of-type('),
 ])
-def test_diagnostic_locators_are_bounded_unique_and_never_page_identifiers(scenario, expected):
+def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, expected):
     snapshot = dom(diagnostics=scenario)
     p = snapshot['page']
     assert p['opaque_count'] == scenario.get('count', 1)
-    assert len(p['opaque_locators']) == min(3, p['opaque_count'])
+    assert len(p['opaque_locators']) == p['opaque_count']
     assert all(expected in x for x in p['opaque_locators'])
+    assert all(forms._safe_diagnostic(x) == x for x in p['opaque_locators'])
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     reason = str(caught.value)
     assert 'opaque_controls' in reason
+    assert 'control=unavailable' not in reason
     assert 'test-user' not in reason and '@' not in reason
     assert 'private-' not in reason
-    assert reason.count('control=') <= 3
+    # The reader keeps every locator; the unchanged Gate names at most three.
+    assert reason.count('control=') == min(3, p['opaque_count'])
+    assert all(reason.count('control=' + path) == 1 for path in p['opaque_locators'][:3])
+    assert all('control=' + path not in reason for path in p['opaque_locators'][3:])
+
+
+def test_repeated_deep_opaque_nodes_remain_fail_closed():
+    # The initial twelve-segment suffix collided in these sibling trees.
+    # Inventory must still Gate after expanding only the safe locator grammar.
+    p = dom(diagnostics={'count': 2, 'depth': 14})['page']
+    assert p['opaque_count'] == 2
+    assert p['opaque_controls'] is True and p['inventory_verified'] is False
+    assert len(p['opaque_locators']) == 2
+    with pytest.raises(forms.Gate, match='opaque_count=2'):
+        forms._inventory_ok(p)
+
+
+@pytest.mark.parametrize('depth,count', [(14, 2), (14, 3), (30, 2), (30, 8)])
+def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(depth, count):
+    # Regression for review #5558913444: all present canvases have
+    # identical last-twelve segments but different value-free ancestors.
+    # This test failed on the original 12-segment-only diagnostic locator.
+    p = dom(diagnostics={'count': count, 'depth': depth})['page']
+    assert p['opaque_count'] == count
+    assert p['opaque_controls'] is True and p['inventory_verified'] is False
+    paths = p['opaque_locators']
+    assert len(paths) == count
+    assert all(isinstance(x, str) and x != 'unavailable'
+               and forms._safe_diagnostic(x) == x for x in paths)
+    assert len(set(paths)) == count
+    assert all(x.count(' > ') >= depth for x in paths)
+    with pytest.raises(forms.Gate) as caught:
+        forms._inventory_ok(p)
+    detail = str(caught.value)
+    assert 'opaque_count=' + str(count) in detail
+    assert detail.count('control=') == min(3, count)
+    assert all(detail.count('control=' + path) == 1 for path in paths[:3])
+    assert all('control=' + path not in detail for path in paths[3:])
+    assert 'control=unavailable' not in detail
+    assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
+
+
+def test_safe_diagnostic_accepts_only_bounded_structural_segments():
+    # The browser and Gate share the same per-locator limits. Over-limit
+    # untrusted diagnostics are still redacted, not echoed into a Gate.
+    from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS, _DIAGNOSTIC_MAX_CHARS
+    path = ' > '.join(['div:nth-of-type(1)'] * (_DIAGNOSTIC_MAX_SEGMENTS - 1)
+                      + ['canvas:nth-of-type(1)'])
+    assert len(path) < _DIAGNOSTIC_MAX_CHARS
+    assert forms._safe_diagnostic(path) == path
+    over_limit = path + ' > div:nth-of-type(1)'
+    assert len(over_limit) < _DIAGNOSTIC_MAX_CHARS
+    assert forms._safe_diagnostic(over_limit) == 'unavailable'
+    too_long = ' > '.join(
+        ['div:nth-of-type(' + '1234567890' * 4 + ')'] * _DIAGNOSTIC_MAX_SEGMENTS)
+    assert len(too_long) > _DIAGNOSTIC_MAX_CHARS
+    assert forms._safe_diagnostic(too_long) == 'unavailable'
+
+
+@pytest.mark.parametrize('unsafe', [
+    '#test-user@example-co.test',
+    'div:nth-of-type(1) > input[data-answer="synthetic-secret"]',
+    'div:nth-of-type(1) > div.synthetic-secret',
+    'canvas:nth-of-type(0)',
+    'canvas:nth-of-type(01)',
+    'input:nth-child(1)',
+    'div:nth-of-type(1) > canvas:nth-of-type(1),body:nth-of-type(1)',
+    'div:nth-of-type(1)\ncanvas:nth-of-type(1)',
+    '',
+])
+def test_safe_diagnostic_rejects_untrusted_or_nonstructural_paths(unsafe):
+    assert forms._safe_diagnostic(unsafe) == 'unavailable'
+    page = {'inventory_verified': False, 'opaque_controls': True,
+            'opaque_count': 1, 'opaque_locators': [unsafe]}
+    with pytest.raises(forms.Gate) as caught:
+        forms._inventory_ok(page)
+    assert 'control=unavailable' in str(caught.value)
+    assert 'synthetic-secret' not in str(caught.value)
+    assert '@example-co.test' not in str(caught.value)
+
+
+@pytest.mark.parametrize('count', [2, 8])
+def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(count):
+    # Even deeply nested present controls keep distinct real reader locators.
+    # The Gate still refuses the form and reports only its first three controls.
+    page = dom(diagnostics={'count': count, 'depth': 30})['page']
+    assert page['opaque_count'] == count and page['opaque_controls'] is True
+    assert page['inventory_verified'] is False
+    paths = page['opaque_locators']
+    assert len(paths) == count and len(set(paths)) == count
+    assert all(forms._safe_diagnostic(path) == path and path != 'unavailable'
+               for path in paths)
+    with pytest.raises(forms.Gate, match='opaque_count=' + str(count)) as caught:
+        forms._inventory_ok(page)
+    message = str(caught.value)
+    assert message.count('control=') == min(3, count)
+    assert all(message.count('control=' + path) == 1 for path in paths[:3])
+    assert all('control=' + path not in message for path in paths[3:])
+    assert 'control=unavailable' not in message
+    assert 'test-user' not in message and 'example-co' not in message and '@' not in message
 
 
 @pytest.mark.parametrize('fresh', [False, True])

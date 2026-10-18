@@ -68,6 +68,11 @@ def test_greenhouse_hydration_script_is_valid_and_other_leg_content_unchanged():
     script = re.search(r'<script>(.*?)</script>', markup, re.S).group(1)
     subprocess.run(['node', '-e', 'new Function(process.argv[1]);', script], check=True)
     assert 'template.content,document.getElementById("submit")' in script
+    # Only the Greenhouse phone-country commit destroys the C0 placeholder ID;
+    # the separate entry fixture and four receiver-backed choices keep their DOM.
+    assert script.count("display.replaceWith(selected)") == 1
+    assert "if(id==='country')" in script
+    assert "display.replaceWith(selected)" not in fixture._closed_form().decode()
     assert markup.count('class="validation-only"') == 2
     assert '<svg><circle></circle><line></line></svg>' in markup
     assert '<svg><line></line><mask id="synthetic-clear-mask"><rect></rect><path></path></mask><circle></circle></svg>' in markup

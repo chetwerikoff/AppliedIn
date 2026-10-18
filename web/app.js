@@ -319,11 +319,11 @@ function companyActionAllowed(co) {
 
 const FILTERS = [
   ["all", "all", () => true],
-  ["pipeline", "in pipeline", (r) => ["found", "tailored", "submitting", "capped"].includes(r.status)],
+  ["pipeline", "in pipeline", (r) => !isReadOnly(r) && ["found", "tailored", "submitting", "capped"].includes(r.status)],
   ["needs", "needs you", (r) => INTERVENTION_ROUTES.has(routeOf(r))],
-  ["applied", "applied", (r) => ["applied", "applied_manual"].includes(r.status)],
+  ["applied", "applied", (r) => ["applied", "applied_manual"].includes(routeOf(r))],
   ["stuck", "unable", isStuck],
-  ["closed", "closed", (r) => ["skipped", "job_gone", "capped"].includes(r.status)],
+  ["closed", "closed", (r) => !isReadOnly(r) && ["skipped", "job_gone", "capped"].includes(r.status)],
 ];
 
 // Confidence → colour. 0 = red … 10 = green, continuous through amber.
@@ -2733,7 +2733,7 @@ function demoFresh() {
 function freshRow(j, byPk) {
   const r = byPk.get(j.pk) || j;
   const hot = (Number(j.age_hours) || 0) <= 24;
-  const run = r.status === "found"
+  const run = rowActionAllowed(j.pk, "run-now")
     ? `<button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(j.pk)}"
         title="Score and tailor this job now. It stops before applying">▶ Run now</button>` : "";
   return `<div class="jrow fresh-row${hot ? " hot" : ""}" data-open="${esc(j.pk)}"
@@ -3234,6 +3234,8 @@ function appsSig() {
     s += a.pk + "\u0001" + a.status + "\u0001" + (a.updated_at || "") + "\u0001"
        + (a.applied_at || "") + "\u0001"
        + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
+       + (a.submit_hold_state || "missing") + ":" + (a.possible_submission ? "p" : "")
+       + ":" + (a.fail_kind || "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
        + (a.jd_read_error || "") + "\u0001" + (a.score_override ? "o" : "") + "\u0001"
        + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "")
@@ -3903,7 +3905,11 @@ async function loadApps() {
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
     renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
-  } catch { /* transient — next poll wins */ }
+  } catch {
+    // A failed authoritative projection may not leave stale "clear" controls.
+    state.apps = state.apps.map((r) => ({ ...r, submit_hold_state: "unknown" }));
+    renderTabs(); refreshPane();
+  }
 }
 
 // Poll /stats every ~3s: drives the running-state of the two buttons, the
@@ -4227,6 +4233,10 @@ async function runCompany(name, careersUrl, again = false, silent = false) {
 
 async function runProcess(again = false) {
   if (demoGuard() || state.stats.processing) return;
+  if (!companyActionAllowed("__all__")) {
+    toast("Review unresolved portal, code or triage rows before starting bulk processing.");
+    return;
+  }
   if (!state.picked.size) { toast("Select at least one company to process."); return; }
   const n = state.stats.found_waiting ?? 0;
   const scope = discoverScope();  // same picked companies as Discover
@@ -4258,7 +4268,8 @@ async function runProcess(again = false) {
    overwrites this on its next poll, so a failed start corrects itself. */
 function markTailoring(pk) {
   const row = state.apps.find((a) => a.pk === pk);
-  if (row) row.status = "tailoring";
+  if (!row || isReadOnly(row)) return;
+  row.status = "tailoring";
   state.activity[pk] = { detail: "scoring and tailoring…", at: Date.now() / 1000,
                          kind: "running" };
   renderPane();
@@ -4267,7 +4278,8 @@ function markTailoring(pk) {
 
 function markBusy(pk, detail) {
   const row = state.apps.find((a) => a.pk === pk);
-  if (row) row.status = "submitting";
+  if (!row || isReadOnly(row)) return;
+  row.status = "submitting";
   state.activity[pk] = { detail, at: Date.now() / 1000, kind: "running" };
   renderPane();        // move the card into its working state
   scheduleLive(pk);    // and show the live line, same path the SSE feed uses

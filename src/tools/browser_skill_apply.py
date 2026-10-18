@@ -2399,7 +2399,7 @@ _BOOTSTRAP_TYPES = frozenset({
 })
 
 
-def _bootstrap_log(item: dict, ordinal: int, decision: str) -> None:
+def _bootstrap_log(item: dict, ordinal: int, decision: str, *, required: bool) -> None:
     raw = item.get('question') or item.get('label')
     category = (_BOOTSTRAP_LABELS.get(normalize_label(raw))
                 if isinstance(raw, str) else None)
@@ -2407,7 +2407,7 @@ def _bootstrap_log(item: dict, ordinal: int, decision: str) -> None:
     _LOG.info('bootstrap field decision %s', {
         'label': category or f'field-{ordinal}',
         'type': kind if kind in _BOOTSTRAP_TYPES else 'unknown',
-        'required': bool(item.get('required')),
+        'required': required,
         'decision': decision,
     })
 
@@ -2548,8 +2548,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         kind = item.get('type')
         eligible = kind in _BOOTSTRAP_TYPES and (
             kind != 'select' or item.get('tag') == 'select')
+        required = (any(c.get('required') for c in _radio_group(page, item))
+                    if kind == 'radio' else bool(item.get('required')))
         if not ((_native_answer(item) or kind in {'radio', 'checkbox', 'combobox'})
-                and item.get('required')):
+                and required):
             continue
         group = ((item.get('form_selector'), item.get('name'))
                  if kind == 'radio' else item['selector'])
@@ -2563,7 +2565,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
         def record(decision):
             if eligible:
-                _bootstrap_log(item, ordinal, decision)
+                _bootstrap_log(item, ordinal, decision, required=required)
 
         if not _unanswered(page, item):
             # Without a previously validated controller receipt this is not a

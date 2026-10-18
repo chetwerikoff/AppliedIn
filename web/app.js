@@ -2355,34 +2355,45 @@ function viewApps() {
 
 // --- Needs-you cards -------------------------------------------------------
 function needsCard(r) {
-  const captcha = r.gate_reason === "captcha";
+  const kind = routeOf(r);
+  const manual = kind === "captcha" || kind === "no_account";
+  const owner = kind === "owner_question";
+  const decision = kind === "approval" || kind === "low_confidence";
+  if (isReadOnly(r)) return `<article class="gatecard diag-card">
+    <header><div><span class="gc-co">${esc(r.company)}</span>
+      <span class="gc-role">${esc(r.title)}</span></div>${routeTag(r)}</header>
+    ${routeNotice(r)}
+    <div class="gc-actions"><button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
+  </article>`;
   return `<article class="gatecard">
-    <header>
-      <div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
-      <div class="gc-side">
-        <span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
-        <button class="btn btn-ghost" data-open="${esc(r.pk)}">${captcha ? "View details" : "Details"}</button>
-      </div>
-    </header>
+    <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
+      <div class="gc-side"><span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
+        <button class="btn btn-ghost" data-open="${esc(r.pk)}">Details</button></div></header>
     <div class="gc-q md">${md(r.gate_question || defaultGateText(r))}</div>
-    ${captcha && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
+    ${manual && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
     <div class="gc-answer">
-      ${captcha ? "" : `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
-        placeholder="Type an answer — or leave blank to just approve…"></textarea>`}
+      ${owner ? `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
+        placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="gc-actions">
-        ${captcha
-          ? `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
-               title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`
-          : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
+        ${owner || decision
+          ? `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">
+               ${owner ? "Answer &amp; continue" : kind === "approval" ? "Approve &amp; continue" : "Review &amp; approve"}</button>`
+          : `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
+               title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`}
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip job</button>
         ${r.jd_url ? `<a class="gc-jd" href="${esc(r.jd_url)}" target="_blank" rel="noopener">view posting ↗</a>` : ""}
-      </div>
-    </div>
+      </div></div>
   </article>`;
 }
 function viewNeeds() {
-  const all = state.apps.filter((a) => a.status === "needs_human");
+  const all = state.apps.filter((a) => INTERVENTION_ROUTES.has(routeOf(a)));
   const items = visible(all);
+  const portal = visible(state.apps).filter((r) => routeOf(r) === "portal_check");
+  const fixes = visible(state.apps).filter((r) => routeOf(r) === "waiting_for_fix");
+  const triage = visible(state.apps).filter((r) => routeOf(r) === "manual_triage");
+  const diagnostics = diagnosticSec(portal, "Portal verification", "Reconcile portal outcome before any later attempt.", "portal")
+    + diagnosticSec(fixes, "Waiting for fix", "A verified code defect is not an answerable question.", "fix")
+    + diagnosticSec(triage, "Manual triage", "Unknown or contradictory evidence must be inspected.", "triage");
   const matched = visible(state.apps).filter((app) => (app.replies || []).length)
     .flatMap((app) => app.replies.map((reply) => ({ app, reply })))
     .sort((a, b) => replyTime(b.reply.date) - replyTime(a.reply.date));
@@ -2395,7 +2406,7 @@ function viewNeeds() {
   const search = state.query.trim().toLowerCase();
   const unassigned = (state.unassignedReplies || []).filter((reply) =>
     !search || `${reply.sender || ""} ${reply.subject || ""}`.toLowerCase().includes(search));
-  const eligible = state.apps.filter((app) => ["applied", "applied_manual"].includes(app.status));
+  const eligible = state.apps.filter((app) => ["applied", "applied_manual"].includes(routeOf(app)));
   const unassignedHtml = unassigned.length ? `<section class="reply-section"><h3>Unassigned replies</h3>
     ${unassigned.map((reply) => `<article class="reply-card">${replySummaryHtml(reply)}
       <label>Assign to application<select data-reply-target="${esc(reply.record_id)}">
@@ -2408,10 +2419,10 @@ function viewNeeds() {
     ${items.filter(approveAllPicks).length ? `<button class="btn btn-amber" data-approve-all="1">Approve all ${items.filter(approveAllPicks).length} ready</button>` : ""}
     </div>${items.map(needsCard).join("")}</section>` :
     (all.length && filtersActive() && !matched.length && !unassigned.length ? emptyFiltered() : "");
-  if (!items.length && !matched.length && !unassigned.length) return all.length && filtersActive() ? emptyFiltered()
+  if (!items.length && !matched.length && !unassigned.length && !diagnostics) return all.length && filtersActive() ? emptyFiltered()
     : `<div class="empty"><div class="empty-big">Nothing needs you</div>
-        The pipeline is running clean — questions and approvals will land here.</div>`;
-  return gateHtml + matchedHtml + unassignedHtml;
+        Questions and approvals will land here.</div>`;
+  return diagnostics + gateHtml + matchedHtml + unassignedHtml;
 }
 
 // --- Unable-to-do-it cards -------------------------------------------------

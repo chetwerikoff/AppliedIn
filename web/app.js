@@ -1877,6 +1877,7 @@ function queuedSec(rows) {
   const single = groups.size === 1;
   const body = [...groups.entries()].map(([co, list]) => {
     const busy = running.has((co || "").trim().toLowerCase());
+    const safeCompany = companyActionAllowed(co);
     const open = single || state.coFilter === co || state.openQCos.has(co);
     const head = list[0];
     const stateTxt = busy ? "one in flight now"
@@ -1892,11 +1893,11 @@ function queuedSec(rows) {
           <span class="un-gn mono" title="${list.length} job${list.length === 1 ? "" : "s"} queued">${list.length}</span>
           <span class="un-gstate${busy ? "" : head.first ? " next" : ""}">${stateTxt}</span>
         </button>
-        ${(state.rotation || []).some((r) => r.company === (co || "").trim().toLowerCase())
+        ${safeCompany && (state.rotation || []).some((r) => r.company === (co || "").trim().toLowerCase())
           ? `<button class="ps-link un-rot" data-act="rot-co" data-company="${esc(co)}"
               title="Re-point ${esc(co)}'s un-sent jobs at its rotating address — including these, which were queued under the old one — and put every tailored one in line. It stops at the queue; Process runs them."
             >↻ Rotate &amp; queue</button>` : ""}
-        ${(state.profiles || []).some((p) => p.kind !== "rotating") ? (() => {
+        ${safeCompany && (state.profiles || []).some((p) => p.kind !== "rotating") ? (() => {
             const bound = (state.companyProfiles || {})[(co || "").trim().toLowerCase()] || "";
             return `<select class="ps-link un-as${bound ? " on" : ""}" data-co-prof="${esc(co)}"
               title="${bound
@@ -1907,11 +1908,12 @@ function queuedSec(rows) {
                 `<option value="${esc(p.id)}"${p.id === bound ? " selected" : ""}>${esc(p.label)}${p.id === bound ? " ✓" : ""}</option>`).join("")}
             </select>`;
           })() : ""}
-        <button class="ps-link un-go${busy ? "" : " on"}" data-act="drain-co"
+        ${safeCompany ? `<button class="ps-link un-go${busy ? "" : " on"}" data-act="drain-co"
           data-company="${esc(co)}"${busy ? " disabled" : ""}
           title="${busy ? `${esc(co)} already has one running`
                         : `Work through ${esc(co)}'s ${list.length} queued job${list.length === 1 ? "" : "s"}, one after another`}"
-        >${busy ? "● Running" : "▶ Run company queue"}</button>
+        >${busy ? "● Running" : "▶ Run company queue"}</button>`
+        : `<span class="diag-unlinked">Resolve held or unclassified rows before a company-wide queue action.</span>`}
       </div>
       ${open ? `<ol class="un-list">${list.map(row).join("")}</ol>` : ""}
     </div>`;
@@ -6655,7 +6657,7 @@ function wire() {
     }
     const rc = e.target.closest("[data-rule-co]");
     if (rc) {
-      if (demoGuard()) return;
+      if (demoGuard() || !companyActionAllowed(rc.dataset.ruleCo)) return;
       const company = rc.dataset.ruleCo, k = coKey(company);
       const was = (state.companyProfiles || {})[k] || "";
       const rotB = (state.rotation || []).find((r) => coKey(r.company) === k) || null;
@@ -6669,7 +6671,7 @@ function wire() {
     }
     const pc = e.target.closest("[data-prof-co]");
     if (pc) {
-      if (!pc.value || demoGuard()) return;
+      if (!pc.value || demoGuard() || !companyActionAllowed(pc.value)) return;
       const company = pc.value, profile_id = pc.dataset.profCo;
       const p = state.profiles.find((x) => x.id === profile_id) || {};
       pc.disabled = true;
@@ -6685,7 +6687,7 @@ function wire() {
       return;
     }
     const sel = e.target.closest("[data-co-prof]");
-    if (!sel || demoGuard()) return;
+    if (!sel || demoGuard() || !companyActionAllowed(sel.dataset.coProf)) return;
     const co = sel.dataset.coProf, profile_id = sel.value;
     const was = (state.companyProfiles || {})[(co || "").trim().toLowerCase()] || "";
     if (profile_id === was) return;

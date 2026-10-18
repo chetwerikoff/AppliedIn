@@ -86,6 +86,9 @@ for(const key of keys){
   if(scenario.badGraph&&key==='location')attrs['aria-haspopup']='false';
   if(scenario.searchToken&&key==='location'){v.children.pop();input.value='Approved location';}
   if(key==='location'){
+    if(scenario.receiverBackedCountry){
+      input.id='country';label.id='country-label';attrs['aria-labelledby']=label.id;
+    }
     if(scenario.drift==='field')field.id+='-drift';
     if(scenario.drift==='value')v.id+='-drift';
     if(scenario.drift==='wrapper')w.id+='-drift';

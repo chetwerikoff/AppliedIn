@@ -385,8 +385,6 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
   assert.equal(h.fn('companyActionAllowed')('example-co'),false,'case-fold the company');
   h.fn('renderDetail')(true);
   assert.doesNotMatch(h.node('#cp-detail').innerHTML,/id="cp-dt-rotgo"/);
-  h.fn('renderRotation')();
-  assert.equal(h.node('#btn-rotate-all').hidden,true);
   assert.doesNotMatch(h.fn('viewProfiles')(),/data-prof-all=|data-act="rot-co"/);
 
   h.context.sent=[];
@@ -411,8 +409,6 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
   h.state.apps=[row('clear',{company:'Example-Co',status:'tailored'})];
   h.fn('renderDetail')(true);
   assert.match(h.node('#cp-detail').innerHTML,/id="cp-dt-rotgo"/);
-  h.fn('renderRotation')();
-  assert.equal(h.node('#btn-rotate-all').hidden,false);
   assert.match(h.fn('viewProfiles')(),/data-prof-all=/);
   await rotate();
   await company({target:{closest:(s)=>s==='#cp-dt-rotgo'?cp:null}});

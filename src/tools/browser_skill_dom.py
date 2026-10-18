@@ -484,7 +484,11 @@ PAGE = r"""(() => {
         if (list) { linkedParts.add(list); list.querySelectorAll('[role="option"]').forEach(o=>linkedParts.add(o)); }
         return true;
       }
-      if (e.id==='country') return false;
+      // This quarantine is phone-fieldset-only: an unrelated #country with
+      // its own ARIA listbox (or absent provisional target) must retain the
+      // existing generic linked-combobox checks below. Receiverless C2 is
+      // excluded by closedGraph and has no legacy linkId to downgrade through.
+      if (e.id==='country' && e.closest('fieldset.phone-input')) return false;
       const list = currentListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;

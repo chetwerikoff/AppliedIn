@@ -2646,6 +2646,7 @@ def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> Non
             or receipt.get('action') != 'combobox'
             or not _lever_location_attempt(page, target)
             or target.get('type') != 'combobox' or target.get('disabled')
+            or _closed_mode(target) or combo.get('quarantined')
             or page.get('url') != receipt.get('url')
             or target.get('selector') != selector
             or target.get('label') != receipt.get('label')
@@ -2662,6 +2663,7 @@ def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> Non
             or combo.get('linked') is not True
             or combo.get('link_id') != receipt.get('location_link_id')
             or combo.get('listbox_selector') != receipt.get('location_listbox_selector')
+            or target.get('value') != chosen or target.get('has_value') is not True
             or combo.get('selected_text') != chosen
             or combo.get('displayed_text') != chosen
             or combo.get('selected_value') != value

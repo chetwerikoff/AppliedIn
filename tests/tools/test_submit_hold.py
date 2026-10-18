@@ -853,3 +853,64 @@ def test_mark_applied_default_note_does_not_require_hold(world):
     row = stores.tracking.get(PK)
     assert row["status"] == "applied_manual"
     assert row["confirmation_id"] == "Confirmed by you (email / on-screen ACK)."
+
+
+def test_ui_projection_reads_independent_hold_before_any_row_collapse(world):
+    """The read-only dashboard cannot trust a stale full-row overwrite."""
+    stores, _ = world
+    old = stores.tracking.get(PK)
+    assert server._project_submit_hold(PK, old, stores.tracking) == "clear"
+    submit_hold.mark(PK, tracking=stores.tracking)
+    stores.tracking._write(PK, old, prev_status='submitting')
+    assert stores.tracking.get(PK) == old
+    assert server._project_submit_hold(PK, old, stores.tracking) == "blocked"
+    assert submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+@pytest.mark.parametrize('legacy', [
+    {'possible_submission': True},
+    {'fail_kind': 'uncertain'},
+    {'gate_reason': 'submit_uncertain'},
+])
+def test_ui_projection_preserves_raw_legacy_evidence_without_redis(legacy):
+    keyless = SimpleNamespace(r=None)
+    assert server._project_submit_hold(PK, legacy, keyless) == "blocked"
+    assert server._project_submit_hold(
+        PK, legacy, keyless, no_independent_key=True) == "blocked"
+
+
+def test_ui_projection_fail_closed_for_unknown_local_store_and_read_error(world, monkeypatch):
+    stores, _ = world
+    raw = stores.tracking.get(PK)
+    assert server._project_submit_hold(PK, raw, SimpleNamespace(r=None)) == "unknown"
+    # Keyless cloud is only clear when the absence of an independent key is
+    # part of the deployment contract, not when a local Redis read fails.
+    assert server._project_submit_hold(
+        PK, raw, SimpleNamespace(r=None), no_independent_key=True) == "clear"
+    monkeypatch.setattr(submit_hold, 'blocked', lambda *a, **kw:
+                        (_ for _ in ()).throw(RuntimeError('synthetic read failed')))
+    assert server._project_submit_hold(PK, raw, stores.tracking) == "unknown"
+
+
+def test_applications_projects_read_only_hold_and_raw_reason(world, monkeypatch):
+    stores, _ = world
+    stores.artifacts = SimpleNamespace(exists=lambda *_: False, version=lambda *_: '')
+    monkeypatch.setattr('core.reply_ingest.local_credentials', lambda *_: None)
+    endpoint = next(route.endpoint for route in server.create_app().routes
+                    if getattr(route, 'path', '') == '/applications')
+    old_row = stores.tracking.get(PK)
+    response = endpoint()
+    old_ui = next(item for item in response['items'] if item['pk'] == PK)
+    assert old_ui['submit_hold_state'] == "clear"
+    assert old_ui['submit_hold_reason'] == submit_hold.REASON
+    assert old_ui['possible_submission'] is False
+    assert stores.tracking.get(PK) == old_row
+    submit_hold.mark(PK, tracking=stores.tracking)
+    # A separate submit_hold key persists despite the same stale row payload.
+    stores.tracking._write(PK, old_row, prev_status='submitting')
+    response = endpoint()
+    held = next(item for item in response['items'] if item['pk'] == PK)
+    assert held['submit_hold_state'] == "blocked"
+    assert held['submit_hold_reason'] == submit_hold.REASON
+    assert stores.tracking.get(PK) == old_row
+    assert submit_hold.is_held(PK, tracking=stores.tracking)

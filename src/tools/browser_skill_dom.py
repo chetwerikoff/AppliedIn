@@ -7,8 +7,10 @@ _DIAGNOSTIC_TAGS = (
 )
 
 
-# One structural-only selector bound shared by the browser reader and Gate validator.
-_DIAGNOSTIC_MAX_SEGMENTS = 24
+# Share conservative per-locator size bounds with the Gate validator; the
+# inventory must still include every present opaque node, not just the first few.
+_DIAGNOSTIC_MAX_SEGMENTS = 256
+_DIAGNOSTIC_MAX_CHARS = 8192
 
 
 _WIDGET_GRAPH = r"""
@@ -43,7 +45,7 @@ _WIDGET_GRAPH = r"""
     // their distinguishing ancestor; never substitute DOM ids or page values.
     for (let depth=1; depth<=Math.min(parts.length,DIAGNOSTIC_LIMIT); depth++) {
       const path=parts.slice(-depth).join(' > ');
-      if (path.length>600) break;
+      if (path.length>DIAGNOSTIC_CHARS) break;
       if (document.querySelectorAll(path).length===1) return path;
     }
     return 'unavailable';
@@ -146,7 +148,9 @@ _WIDGET_GRAPH = r"""
     const phase = expanded==='true' ? 'C1' : expanded==='false' && noLinks ? (token ? 'C2' : 'C0') : '';
     if (!phase) return null;
     const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
-    if (e.id==='country' && e.closest('fieldset.phone-input') && !country) return null;
+    // #country is never an ordinary receiverless closed select, even if moved
+    // entirely out of the phone fieldset with its valid local label/display.
+    if (e.id==='country' && !country) return null;
     if (extras.length) requiredProxies.add(extras[0]);
     graphNodes.set(e, {label:L, display:display[0]});
     return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),
@@ -291,7 +295,8 @@ _WIDGET_GRAPH = r"""
     parts.forEach(n=>pickerParts.add(n));
   }
 """.replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS).replace(
-    'DIAGNOSTIC_LIMIT', str(_DIAGNOSTIC_MAX_SEGMENTS))
+    'DIAGNOSTIC_LIMIT', str(_DIAGNOSTIC_MAX_SEGMENTS)).replace(
+    'DIAGNOSTIC_CHARS', str(_DIAGNOSTIC_MAX_CHARS))
 
 PAGE = r"""(() => {
   const visible = e => !!e.getClientRects().length &&
@@ -479,7 +484,7 @@ PAGE = r"""(() => {
         if (list) { linkedParts.add(list); list.querySelectorAll('[role="option"]').forEach(o=>linkedParts.add(o)); }
         return true;
       }
-      if (e.id==='country' && e.closest('fieldset.phone-input')) return false;
+      if (e.id==='country') return false;
       const list = currentListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;
@@ -507,7 +512,7 @@ PAGE = r"""(() => {
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
-    opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.slice(0,3).map(diagnosticLocator),
+    opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.map(diagnosticLocator),
     inventory_verified:inventoryVerified};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 

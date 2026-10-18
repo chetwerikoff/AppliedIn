@@ -393,7 +393,10 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
   vm.runInContext('post = async (path, body) => { globalThis.sent.push({path,body}); return {ok:true}; };'
     + 'toast=()=>{}; reload=()=>{}; loadQueue=()=>{}; loadApps=()=>{};'
     + 'loadProfiles=()=>{}; loadRotation=()=>{};',h.context);
+  // wire() starts offline initial profile reads; restore the synthetic bulk scope.
+  const rotation=h.state.rotation, profiles=h.state.profiles;
   h.fn('wire')();
+  h.state.rotation=rotation; h.state.profiles=profiles;
   const rotate=h.node('#btn-rotate-all').listeners.click.at(-1);
   const company=h.node('#cp-detail').listeners.click.find(fn=>fn.toString().includes('#cp-dt-rotgo'));
   const profile=h.document.listeners.click.find(fn=>fn.toString().includes('data-prof-all'));

@@ -110,10 +110,12 @@ def evidence(page, *, visible_label=True):
 class FakeLever:
     """Fixture-shaped fake: press opens options, only an option click commits."""
     def __init__(self, *, caption='Testville, USA', options=None, drift='',
-                 failed_commit='', press_unsupported=False, visible_label=True):
+                 failed_commit='', press_unsupported=False, visible_label=True,
+                 click_uncertain=False):
         self.fixture = _lever_location_form(caption=caption)
         self.caption, self.options, self.drift = caption, options, drift
         self.failed_commit, self.press_unsupported = failed_commit, press_unsupported
+        self.click_uncertain = click_uncertain
         self.visible_label = visible_label
         self.buffer, self.selected, self.typed_reads = '', False, 0
         self.calls = []
@@ -171,6 +173,8 @@ class FakeLever:
                 self.buffer += ' ' if args[1] == 'Space' else args[1]
             return {}
         if args == ('click', '#location-option'):
+            if self.click_uncertain:
+                raise RuntimeError('simulated uncertain BrowserSkill option click')
             if not self.buffer or self.selected:
                 pytest.fail('Option click was not the single authorized selection')
             self.selected = True
@@ -328,6 +332,18 @@ async def test_post_click_uncertain_commit_never_retries_or_submits(grant_row, f
     assert [call for call in session.calls if call[0] == 'click'] == [
         ('click', '#location-option')]
     assert all(call[0] != 'submit' for call in session.calls)
+
+
+
+@pytest.mark.asyncio
+async def test_uncertain_option_ipc_gates_without_a_second_click(grant_row):
+    session = FakeLever(click_uncertain=True)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert [call for call in session.calls if call[0] == 'click'] == [
+        ('click', '#location-option')]
+    assert not any(call[0] in {'submit', 'navigate'} for call in session.calls)
 
 
 @pytest.mark.asyncio

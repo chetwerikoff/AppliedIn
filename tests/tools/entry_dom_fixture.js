@@ -75,6 +75,12 @@ if(form) {
   // A missing/empty raw action can still resolve to PAGE as a property.
   form.action=spec.actionAttr==='absent' || spec.actionAttr==='empty'
     ? (spec.url || canonicalAction) : canonicalAction;
+  if(spec.searchOnly) {
+    // Complete, separately owned native search shell with no application
+    // marker; both production readers must inventory it before waiting.
+    node('input',{id:'job-search',type:'search'},form);
+    node('button',{id:'search-submit',type:'submit',text:'Search jobs'},form);
+  } else {
   node('label',{'for':'email',text:'Email'},form);
   node('input',{id:'email',name:'Email',type:'email',required:true},form);
   if(spec.nativeCheckbox) {
@@ -91,6 +97,7 @@ if(form) {
     if(marker==='value') submit.value='Submit application';
     if(spec.foreignMarker)submit.form=null;
     if(marker==='labelledby') node('span',{id:'submit-caption',text:'Submit application'},body);
+  }
   }
 }
 if(spec.lever) {

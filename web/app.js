@@ -1365,7 +1365,7 @@ function gateMini(r) {
     ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
          title="View manual completion and portal verification details">View details</button>`
     : `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
-         title="Open the question and type an answer">✎ Answer</button>`;
+         title="${kind === "owner_question" ? "Open the verified question" : "Open the approval decision"}">${kind === "owner_question" ? "✎ Answer" : kind === "approval" ? "Review approval" : "Review decision"}</button>`;
   // Cut at a WORD, not at character 200. "create a Perplexity.ai thread (Option
   // 1: teach ..." stopped mid-phrase, so the card asked you to open the drawer to
   // find out what the question even was — which is the one thing this card exists
@@ -1489,7 +1489,7 @@ function needsSec(rows) {
       <span class="ps-dot${n ? " on" : ""}"></span>
       <span class="ps-name">Needs you</span>
       <span class="ps-n mono${n ? " hot" : ""}">${n}</span>
-      <span class="ps-hint">${n ? "A question is blocking each of these applications."
+      <span class="ps-hint">${n ? "Verified questions, decisions and manual handoffs need attention."
                                 : "Nothing is waiting on you."}</span>
       ${n ? `<button class="ps-link on" data-goto-needs="1"
         title="The Needs you tab has room to write answers">Open the Needs you tab</button>` : ""}

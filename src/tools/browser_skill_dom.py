@@ -434,6 +434,8 @@ PAGE = r"""(() => {
             submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
               o.type === 'submit' || o.type === 'image',
             navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
+            // Independent option safety is consumed only by the Lever location path.
+            safe:!unsafeOption(o),
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',
             ...(graph ? {value_attributes:['data-value','value']
               .filter(k=>o.hasAttribute(k)).map(k=>o.getAttribute(k))} : {}),
@@ -446,7 +448,7 @@ PAGE = r"""(() => {
             (hiddenName && h.name === hiddenName)));
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
-          listbox_selector:list ? selector(list) : '', options,
+          listbox_selector:list ? selector(list) : '', listbox_visible:!!list && visible(list), options,
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),

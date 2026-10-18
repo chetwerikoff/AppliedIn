@@ -4784,7 +4784,7 @@ function openDrawer(pk) {
 
     ${tl ? `<div class="section"><div class="section-t">timeline</div><div class="timeline">${tl}</div></div>` : ""}
 
-    <div class="section"><div class="section-t">applying as</div>
+    ${!guarded ? `<div class="section"><div class="section-t">applying as</div>
       <div class="profpick">
         <select id="job-profile" data-job-profile="${esc(r.pk)}">
           <option value=""${r.profile_id ? "" : " selected"}>default${
@@ -4800,6 +4800,9 @@ function openDrawer(pk) {
             and is counted against its limit; picking another one here leaves it
             counted, because the slot is what protects the address.` : ""}</div>
       </div></div>
+` : `<div class="section"><div class="section-t">applying as</div>
+      <p class="diag-unlinked">Read-only until this blocker or portal outcome is reconciled.</p>
+    </div>`}
 
     <div class="section"><div class="section-t">everything the agent did
       <button class="cp-lk agentlog-re" data-agentlog="${esc(r.pk)}" type="button">refresh</button></div>
@@ -4808,16 +4811,6 @@ function openDrawer(pk) {
     <div class="section"><div class="section-t">artifacts</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">${links}</div></div>
   `;
-  if (guarded) {
-    // Even fields in the read-only detail pane must not expose mutation affordances.
-    const select = $("#drawer-body #job-profile");
-    if (select) {
-      const note = document.createElement("p");
-      note.className = "diag-unlinked";
-      note.textContent = "Read-only until this blocker or portal outcome is reconciled.";
-      select.closest(".profpick")?.replaceWith(note);
-    }
-  }
   $("#drawer-title").textContent = r.company;
   // The posting URL, always one click away — not buried in the artifacts row.
   const loc = r.location ? ` · <span class="drawer-loc">${esc(r.location)}</span>` : "";

@@ -741,6 +741,15 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
+    # A selected location must remain proved even if a page disables, relabels
+    # or replaces it; the ordinary field loop skips disabled controls.
+    for receipt in receipts or []:
+        if isinstance(receipt, _LeverLocationReceipt):
+            matching = [c for c in controls
+                        if c.get('selector') == receipt.get('selector')]
+            if len(matching) != 1:
+                raise Gate('The committed Lever location control disappeared.')
+            _check_lever_location_commit(page, matching[0], receipt)
     for target in controls:
         _required_proxy_validity(target, submitting=True)
         typ = target.get('type', '')
@@ -2593,6 +2602,10 @@ def _combobox_stable_identity(target: dict) -> tuple:
         'form_selector', 'form_action', 'formaction', 'disabled', 'required'))
 
 
+def _combobox_options_target(page: dict, action: dict) -> dict:
+    """Reuse the existing fixed combobox-options resolution in both paths."""
+    return control(page, action, 'combobox-options')
+
 
 def _lever_location_attempt(page: dict, target: dict) -> bool:
     """Recognize only the native Lever Current location entry, never a model hint."""
@@ -2684,14 +2697,13 @@ def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> Non
         raise Gate('Lever location receiver identity changed.')
 
 
-async def _execute_lever_location(session, page: dict, action: dict, *, facts: dict,
+async def _execute_lever_location(session, observed: dict, witness: dict,
+                                  target: dict, action: dict, *, facts: dict,
                                   filled: dict, pk: str, job_url: str, ctx,
                                   provenance) -> dict:
     """Bounded key input; unsafe or uncertain Lever widgets remain human gates."""
     if not isinstance(provenance, ApplicationEntryProvenance) or provenance.ats != 'lever':
         raise Gate('Current location lacks tracked Lever application provenance.')
-    observed, witness = await _observe_controls(session, page)
-    target = control(observed, action, 'combobox-observe')
     if (not _lever_location_field(observed, target, provenance)
             or not _alias_current(provenance, fixture_context=ctx)
             or not navigation_allowed(observed['url'], provenance=provenance)):
@@ -2734,7 +2746,7 @@ async def _execute_lever_location(session, page: dict, action: dict, *, facts: d
     async def current_state():
         try:
             current_page, current_witness = await _observe_controls(session, await session.page())
-            current = control(current_page, action, 'combobox-options')
+            current = _combobox_options_target(current_page, action)
             dom = current_witness.get(current['selector'], {})
             if (not _lever_location_field(current_page, current, provenance)
                     or _combobox_stable_identity(current) != initial
@@ -3028,6 +3040,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action, 'combobox-observe')
+    if _lever_location_attempt(observed, target):
+        return await _execute_lever_location(
+            session, observed, witness, target, action, facts=facts,
+            filled=filled, pk=pk, job_url=job_url, ctx=ctx, provenance=provenance)
     if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
         return await _execute_closed_combobox(
             session, observed, action, facts=facts, filled=filled, pk=pk,
@@ -3087,7 +3103,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         for attempt in range(20):
             refreshed = await session.page()
             refreshed, refreshed_witness = await _observe_controls(session, refreshed)
-            current = control(refreshed, action, 'combobox-options')
+            current = _combobox_options_target(refreshed, action)
             if (_combobox_stable_identity(current) != stable
                     or (current.get('combobox') or {}).get('link_id') != link_id
                     or not navigation_allowed(refreshed.get('url', ''),
@@ -3237,11 +3253,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
-    if verb in {'combobox', 'fill'} and _lever_location_attempt(page, target):
-        return await _execute_lever_location(session, page, action, facts=facts,
-                                             filled=filled, pk=pk, job_url=job_url,
-                                             ctx=ctx, provenance=provenance)
-    if verb == 'combobox':
+    if verb == 'combobox' or (verb == 'fill' and _lever_location_attempt(page, target)):
         return await _execute_combobox(session, page, action, facts=facts,
                                        filled=filled, pk=pk, job_url=job_url,
                                        ctx=ctx, provenance=provenance)

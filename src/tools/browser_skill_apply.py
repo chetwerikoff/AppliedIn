@@ -2824,7 +2824,13 @@ async def _execute_lever_location(session, page: dict, action: dict, *, facts: d
                 or hidden_before == selected_option['value']):
             raise location_gate('Current location hidden receiver was already set or unowned.')
     # The only option IPC is a non-submitting, non-navigating witnessed selector.
-    await session.call('click', selected_option['selector'])
+    try:
+        await session.call('click', selected_option['selector'])
+    except (Exception, asyncio.CancelledError) as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        # IPC can fail after a click was delivered; never attempt a second click.
+        raise location_gate('Lever location option-click outcome is uncertain; inspect manually.') from None
     committed_page, committed = await current_state()
     combo = committed.get('combobox') or {}
     literal = selected_option['label']

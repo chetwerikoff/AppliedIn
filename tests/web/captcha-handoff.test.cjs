@@ -15,7 +15,8 @@ const MANUAL = 'CAPTCHA present; complete the application manually and verify th
 
 function row(pk, gate_reason = 'captcha', gate_question = '', status = 'needs_human') {
   return { pk, company: 'example-co', title: 'Synthetic Engineer', status,
-    gate_reason, gate_question, fields: [], timeline: [], location: '',
+    gate_reason, gate_question, submit_hold_state: 'clear', fail_kind: '',
+    fields: [], timeline: [], location: '',
     match_score: 5, jd_url: 'https://example.test/jobs/synthetic' };
 }
 
@@ -31,11 +32,13 @@ function harness() {
       getClientRects: () => [], querySelectorAll: () => [],
       addEventListener(name, cb) { (this.listeners[name] ||= []).push(cb); },
       appendChild() {}, setAttribute() {}, focus() {}, click() {}, scrollIntoView() {},
+      closest() { return null; },
     });
     return nodes.get(selector);
   }
   const document = {
     querySelector: node, querySelectorAll: () => [], addEventListener() {},
+    createElement: () => ({ textContent: '', className: '' }),
     documentElement: { dataset: {}, style: { setProperty() {} } },
     body: { appendChild() {}, classList: { toggle() {}, add() {}, remove() {} } },
   };
@@ -80,7 +83,7 @@ test('CAPTCHA lane and compact actions navigate to nonmutating details, not answ
     assert.match(html, /data-open="captcha-lane"/);
     assert.doesNotMatch(html, /data-act="answer"|Solve &amp; submit|Opens the filled application/);
   }
-  const regular = h.fn('gateMini')(row('regular', 'unknown_field', 'A real question'));
+  const regular = h.fn('gateMini')(row('regular', 'owner_question', 'A real question'));
   assert.match(regular, /Answer/);
   assert.doesNotMatch(regular, /View details/);
   assert.doesNotMatch(source, /captcha_wait/);
@@ -97,10 +100,10 @@ test('Needs-you CAPTCHA has manual controls, no answer field or approval-to-resu
   assert.ok(captcha.includes(MANUAL));
   assert.doesNotMatch(captcha, /data-act="answer"|data-answer-for|Approve &amp; continue/);
 
-  const regular = h.fn('needsCard')(row('regular-needs', 'unknown_field', 'Can you clarify?'));
+  const regular = h.fn('needsCard')(row('regular-needs', 'owner_question', 'Can you clarify?'));
   assert.match(regular, /data-answer-for="regular-needs"/);
   assert.match(regular, /data-act="answer"/);
-  assert.match(regular, /Approve &amp; continue/);
+  assert.match(regular, /Answer &amp; continue/);
 });
 
 test('details drawer contains manual portal guidance and keeps explicit mark-applied/skip', () => {
@@ -117,12 +120,12 @@ test('details drawer contains manual portal guidance and keeps explicit mark-app
   assert.doesNotMatch(html, /id="gate-answer"|data-act="answer"|Approve &amp; continue/);
   assert.equal(h.requests.length, 0);
 
-  h.state.apps = [row('regular-drawer', 'unknown_field', 'What is your preferred schedule?')];
+  h.state.apps = [row('regular-drawer', 'owner_question', 'What is your preferred schedule?')];
   h.fn('openDrawer')('regular-drawer');
   const regular = h.node('#drawer-body').innerHTML;
   assert.match(regular, /id="gate-answer"/);
   assert.match(regular, /data-act="answer"/);
-  assert.match(regular, /Approve &amp; continue/);
+  assert.match(regular, /Answer &amp; continue/);
 });
 
 test('delegated View details action dispatches only to the existing drawer', () => {
@@ -142,7 +145,7 @@ test('delegated View details action dispatches only to the existing drawer', () 
   assert.equal(h.requests.length, beforeClickRequests);
 });
 
-test('every CAPTCHA row is excluded from bulk picks, even Ready-to-apply conflicts', () => {
+test('only currently active gate codes classify rows; stale metadata never creates answer authority', () => {
   const h = harness();
   const cases = [
     row('captcha-ready', 'captcha', 'Ready to apply after CAPTCHA'),
@@ -154,13 +157,13 @@ test('every CAPTCHA row is excluded from bulk picks, even Ready-to-apply conflic
     row('ordinary-gate', 'unknown_field', 'Provide missing answer'),
   ];
   const pick = h.fn('approveAllPicks');
-  assert.deepEqual(cases.map(pick), [false, false, false, true, true, true, false]);
+  assert.deepEqual(cases.map(pick), [false, false, true, false, true, true, false]);
   h.state.apps = cases;
   h.state.tab = 'needs';
   assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), (r) => r.pk),
-    ['ordinary-ready', 'ordinary-approval']);
+    ['ordinary-approval']);
   h.state.tab = 'pipeline';
-  // An unknown_field ready-prefix row is selectable in Needs-you, not in the Ready lane.
+  // A stale CAPTCHA code on an ordinary tailored row is not a live CAPTCHA gate.
   assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), (r) => r.pk),
-    ['ordinary-approval', 'ordinary-tailored']);
+    ['captcha-tailored', 'ordinary-approval', 'ordinary-tailored']);
 });

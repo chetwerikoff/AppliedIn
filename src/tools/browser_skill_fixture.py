@@ -406,6 +406,9 @@ input.addEventListener('input', () => {{
 input.addEventListener('blur', () => {{
   if (!input.getAttribute('data-selected-value')) input.value = '';
 }});
+// Keep focus through the option click: blur normally precedes click and
+// otherwise clears a typed-but-uncommitted location before the option runs.
+option.addEventListener('mousedown', event => event.preventDefault());
 option.addEventListener('click', () => {{
   if (list.hidden || !input.value.trim()) return;
   input.value = chosen;

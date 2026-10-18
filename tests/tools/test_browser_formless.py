@@ -481,17 +481,19 @@ async def test_formless_captcha_does_not_borrow_native_passive_waiver(monkeypatc
     no_mutations(raw)
 
 
-@pytest.mark.parametrize('spec', [
-    {'wrapperTag': 'section'}, {'wrapperClass': 'generic'}, {'paneTag': 'section'},
-    {'extraChild': True}, {'movePane': True}, {'moveSubmit': True},
-    {'duplicate': True}, {'duplicateSubmit': True}, {'duplicatePane': True},
-    {'wrongOrder': True},
+@pytest.mark.parametrize('spec,admitted', [
+    ({'wrapperTag': 'section'}, False), ({'wrapperClass': 'generic'}, False),
+    ({'paneTag': 'section'}, False), ({'movePane': True}, False),
+    ({'moveSubmit': True}, False), ({'duplicate': True}, False),
+    ({'duplicateSubmit': True}, False), ({'duplicatePane': True}, False),
+    # These preserve the semantic owner and complete actionable census.
+    ({'extraChild': True}, True), ({'wrongOrder': True}, True),
 ])
-def test_dom_root_predicate_is_local_to_each_reader(spec):
+def test_dom_root_predicate_is_local_to_each_reader(spec, admitted):
     for page in observed(**spec):
-        assert page['entry']['formless']['root'] == ''
-        assert page['entry']['formless']['error']
-
+        root = page['entry']['formless']
+        assert bool(root['root']) is admitted
+        assert bool(root['error']) is not admitted
 
 def test_native_form_has_priority_over_structural_markup():
     spec = dict(formless=True)

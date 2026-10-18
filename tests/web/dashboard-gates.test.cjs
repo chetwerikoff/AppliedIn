@@ -15,6 +15,7 @@ function row(pk, fields = {}) {
   return { pk, company: 'example-co', title: 'Synthetic role', status: 'needs_human',
     gate_reason: 'owner_question', gate_question: 'What is your preferred location?',
     submit_hold_state: 'clear', possible_submission: false, fail_kind: '',
+    gate_has_form_question: fields.gate_reason == null || fields.gate_reason === 'owner_question',
     fail_reason: '', fields: [], timeline: [], location: '',
     match_score: 7, jd_url: 'https://example.test/jobs/1', ...fields };
 }
@@ -33,19 +34,20 @@ function harness() {
     return nodes.get(selector);
   };
   const document = { querySelector: node, querySelectorAll: () => [],
-    createElement: () => ({textContent: '', className: ''}), addEventListener() {},
+    listeners: {}, createElement: () => ({textContent: '', className: ''}),
+    addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); },
     documentElement: { dataset: {}, style: {setProperty() {}} },
     body: { appendChild() {}, classList: {add() {}, remove() {}, toggle() {}} } };
   const context = vm.createContext({ document, location: {search: '', hash: '', pathname: '/'},
     window: {APPLIEDIN_CONFIG: {}, addEventListener() {}}, console, URLSearchParams,
-    CSS: {escape: (v) => v}, localStorage: {getItem: () => null, setItem() {}},
+    CSS: {escape: (v) => v}, confirm: () => true, localStorage: {getItem: () => null, setItem() {}},
     requestAnimationFrame: (fn) => fn(), setTimeout: () => 0, clearTimeout() {},
     setInterval: () => 0, clearInterval() {},
     fetch(...args) { requests.push(args); throw Error('Offline test forbids fetch'); } });
   vm.runInContext(source, context, { filename: 'web/app.js' });
   const state = vm.runInContext('state', context);
   state.trackerLoaded = true;
-  return { state, context, node, requests,
+  return { state, context, node, requests, document,
     fn: (name) => vm.runInContext(name, context) };
 }
 
@@ -283,4 +285,135 @@ test('the drawer delegate rejects stale action and tracker controls for held sub
     for (const handler of (drawer.listeners.input || [])) handler({target: input});
     assert.equal(h.state.trackerDrafts.held, undefined, `${hold}:tracker-input`);
   }
+});
+
+
+test('active owner questions require a projected native witness; contradictory defects triage', () => {
+  const h = harness(), route = h.fn('routeOf');
+  const bad = [row('missing', {gate_has_form_question:undefined}),
+    row('false', {gate_has_form_question:false}),
+    row('spoof', {gate_has_form_question:'true'}),
+    row('contradictory-defect', {gate_reason:'defect_structural',gate_has_form_question:true})];
+  for (const r of bad) {
+    assert.equal(route(r),'manual_triage',r.pk);
+    assert.equal(h.fn('sectionOf')(r,new Set()),'triage');
+    assert.doesNotMatch(h.fn('needsCard')(r),/data-act="answer"|data-answer-for=/);
+  }
+  assert.equal(route(row('real')),'owner_question');
+  assert.equal(route(row('real-defect',{gate_reason:'defect_structural'})),'waiting_for_fix');
+  h.state.apps=bad;
+  h.fn('wire')();
+  const before=h.requests.length, onClick=h.node('#pane').listeners.click.at(-1);
+  for (const item of bad) {
+    assert.equal(h.fn('rowActionAllowed')(item.pk,'answer'),false);
+    const ctrl={dataset:{act:'answer',pk:item.pk}};
+    onClick({target:{closest:(s)=>s==='[data-act]'?ctrl:null},stopPropagation(){}});
+    assert.equal(h.requests.length,before,'stale Answer must not post: '+item.pk);
+  }
+});
+
+test('blank owner text never turns into approved in Needs-you or drawer', () => {
+  const h=harness();
+  h.state.apps=[row('q'),row('approval',{gate_reason:'approval'}),
+    row('tailored',{status:'tailored',gate_reason:''})];
+  h.context.sent=[];
+  vm.runInContext('post = async (path, body) => { globalThis.sent.push({path,body}); return {ok:true}; };'
+    + 'markBusy=()=>{}; loadQueue=()=>{}; renderPane=()=>{};'
+    + 'toast=()=>{}; closeDrawer=()=>{}; loadAgentLog=()=>{};',h.context);
+  const field=h.node('#pane textarea[data-answer-for="q"]');
+  field.value='   ';
+  h.fn('paneAction')('answer','q');
+  assert.equal(h.context.sent.length,0,'blank pane answer must not POST');
+  field.value='  synthetic location  ';
+  h.fn('paneAction')('answer','q');
+  assert.equal(h.context.sent.length,1);
+  assert.equal(h.context.sent[0].body.answer,'synthetic location');
+  h.fn('paneAction')('answer','approval');
+  assert.equal(h.context.sent[1].body.answer,'approved','approval remains a decision');
+
+  h.fn('wire')();
+  const drawerClick=h.node('#drawer').listeners.click.at(-1);
+  const invoke=(pk)=>{
+    const ctrl={dataset:{act:'answer',pk}};
+    drawerClick({target:{closest:(s)=>s==='[data-act]'?ctrl:null}});
+  };
+  h.node('#gate-answer').value='   ';
+  invoke('q');
+  assert.equal(h.context.sent.length,2,'blank drawer answer must not POST');
+  h.node('#gate-answer').value='  synthetic schedule  ';
+  invoke('q');
+  assert.equal(h.context.sent[2].body.answer,'synthetic schedule');
+  h.node('#gate-answer').value='';
+  assert.equal(h.fn('rowActionAllowed')('tailored','answer'),true);
+  h.fn('openDrawer')('tailored');
+  assert.match(h.node('#drawer-body').innerHTML,/data-act="answer"/);
+  invoke('tailored');
+  assert.equal(h.context.sent[3].body.answer,'approved','tailored approval must work');
+});
+
+test('Process prepares a selected clean company despite a different company hold',async()=>{
+  const h=harness();
+  h.state.apps=[row('held',{company:'held-co',status:'tailored',submit_hold_state:'blocked'}),
+    row('safe',{company:'clean-co',status:'found'})];
+  h.state.companies=['held-co','clean-co'];
+  h.state.picked=new Set(['clean-co']);
+  h.context.sent=[];
+  vm.runInContext('post = async (path, body) => { globalThis.sent.push({path,body}); return {ok:true}; };'
+    + 'beginLaunch=()=>true; finishLaunch=()=>{}; renderDeck=()=>{};'
+    + 'renderPane=()=>{}; closeAllPickers=()=>{}; pollStats=()=>{}; toast=()=>{};',h.context);
+  await h.fn('runProcess')();
+  assert.equal(h.context.sent.length,1);
+  assert.equal(h.context.sent[0].path,'/actions/process');
+  assert.equal(JSON.stringify(h.context.sent[0].body),'{"companies":["clean-co"]}');
+  h.state.stats.processing=false;
+  h.state.picked=new Set(h.state.companies);
+  await h.fn('runProcess')();
+  assert.equal(h.context.sent.length,1,'all-company scope must still protect held rows');
+});
+
+test('stale rotation and profile bulk controls cannot mutate held jobs',async()=>{
+  const h=harness();
+  h.state.apps=[row('held',{company:'Example-Co',status:'tailored',submit_hold_state:'blocked'})];
+  h.state.rotation=[{company:'example-co',email:'synthetic@example.test',profile:'rot',
+    used:0,limit:5,style:'plus'}];
+  h.state.profiles=[{id:'standard',kind:'standard',label:'Test User',
+    email:'synthetic@example.test',usage:{}},
+    {id:'rot',kind:'rotating',label:'Synthetic rotating identity',
+      email:'rotate@example.test',usage:{}}];
+  h.state.detailCo='example-co';
+  h.state.cprefs={};h.state.cpDrafts={};h.state.prefs={};
+  assert.equal(h.fn('companyActionAllowed')('example-co'),false,'case-fold the company');
+  h.fn('renderDetail')(true);
+  assert.doesNotMatch(h.node('#cp-detail').innerHTML,/id="cp-dt-rotgo"/);
+  h.fn('renderRotation')();
+  assert.equal(h.node('#btn-rotate-all').hidden,true);
+  assert.doesNotMatch(h.fn('viewProfiles')(),/data-prof-all=|data-act="rot-co"/);
+
+  h.context.sent=[];
+  vm.runInContext('post = async (path, body) => { globalThis.sent.push({path,body}); return {ok:true}; };'
+    + 'toast=()=>{}; reload=()=>{}; loadQueue=()=>{}; loadApps=()=>{};'
+    + 'loadProfiles=()=>{}; loadRotation=()=>{};',h.context);
+  h.fn('wire')();
+  const rotate=h.node('#btn-rotate-all').listeners.click.at(-1);
+  const company=h.node('#cp-detail').listeners.click.find(fn=>fn.toString().includes('#cp-dt-rotgo'));
+  const profile=h.document.listeners.click.find(fn=>fn.toString().includes('data-prof-all'));
+  assert.ok(rotate&&company&&profile);
+  const cp={dataset:{co:'example-co'}}, prof={dataset:{profAll:'standard'},textContent:'Whole board'};
+  await rotate();
+  await company({target:{closest:(s)=>s==='#cp-dt-rotgo'?cp:null}});
+  profile({target:{closest:(s)=>s==='[data-prof-all]'?prof:null}});
+  assert.equal(h.context.sent.length,0,'stale held bulk clicks must not POST');
+
+  h.state.apps=[row('clear',{company:'Example-Co',status:'tailored'})];
+  h.fn('renderDetail')(true);
+  assert.match(h.node('#cp-detail').innerHTML,/id="cp-dt-rotgo"/);
+  h.fn('renderRotation')();
+  assert.equal(h.node('#btn-rotate-all').hidden,false);
+  assert.match(h.fn('viewProfiles')(),/data-prof-all=/);
+  await rotate();
+  await company({target:{closest:(s)=>s==='#cp-dt-rotgo'?cp:null}});
+  profile({target:{closest:(s)=>s==='[data-prof-all]'?prof:null}});
+  assert.deepEqual(Array.from(h.context.sent,x=>x.path),[
+    '/actions/rotate-and-approve','/actions/rotate-and-approve',
+    '/actions/apply-profile-to-all']);
 });

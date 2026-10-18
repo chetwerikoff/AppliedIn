@@ -1600,12 +1600,16 @@ def _root_identity(page: dict):
 
     envelope = tuple((key, repr(semantic_locator(value)))
                      for key, value in root.items() if key != 'excluded')
-    excluded = tuple(semantic_locator(value) for value in root.get('excluded', []))
+    # DOM query order may change when inert siblings/panes move. Compare the
+    # exhaustive semantic multiset rather than positional enumeration order.
+    excluded = tuple(sorted(repr(semantic_locator(value))
+                            for value in root.get('excluded', [])))
     evidence = page['entry'].get('root_evidence', [])
-    members = tuple(tuple((key, repr(semantic_locator(value)))
-                          for key, value in c.items()
-                          if key not in {'value', 'has_value', 'files'})
-                    for c in evidence)
+    members = tuple(sorted(
+        tuple((key, repr(semantic_locator(value)))
+              for key, value in c.items()
+              if key not in {'value', 'has_value', 'files'})
+        for c in evidence))
     return envelope, excluded, members
 
 

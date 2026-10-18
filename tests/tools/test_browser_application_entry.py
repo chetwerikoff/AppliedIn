@@ -1020,11 +1020,9 @@ async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypat
             assert len(candidates[1]['controls']) == 3
             assert {c['selector'] for c in candidates[1]['controls']} == {
                 '#foreign-email', '#foreign-resume', '#foreign-submit'}
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    assert result['form_question']['label'] == 'Email', result
-    assert not decide.await_count
-    no_mutations(raw)
+    # Root admission and the field/human-question boundary are separately
+    # observable. A later ordinary form gate must not be mistaken for failure
+    # to identify the tracked native owner.
     session = forms._EntrySession(raw, lambda u: u == proof.url, proof)
     admitted = await forms._stable_application_form(
         session, session.allowed, proof,
@@ -1033,6 +1031,22 @@ async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypat
     assert {c['selector'] for c in admitted['controls']} == {'#email', '#submit'}
     assert admitted['entry']['quarantined_native_owners'] == (
         ['#foreign-application'] if pair else [])
+    with pytest.raises(forms.Gate) as owner_gate:
+        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
+                               provenance=proof)
+    assert owner_gate.value.form_question['label'] == 'Email'
+    no_mutations(raw)
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert not any(reason in result['question'] for reason in (
+        'ambiguous application roots', 'root lacks tracked job binding',
+        'incomplete native candidate/control census'))
+    if result['form_question'] is not None:
+        assert result['form_question']['label'] == 'Email', result
+    if decide.await_count:
+        model_page = decide.await_args.args[1]
+        assert {c['selector'] for c in model_page['controls']} == {'#email', '#submit'}
+        assert 'native_candidates' not in model_page['entry']
     no_mutations(raw)
 
 
@@ -1151,10 +1165,26 @@ async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positio
             '#foreign-application', '#application-form']
         assert candidates[0]['action_attr'] != proof.url
         assert candidates[1]['action_attr'] == proof.url
+    session = forms._EntrySession(raw, lambda u: u == proof.url, proof)
+    admitted = await forms._stable_application_form(
+        session, session.allowed, proof,
+        deadline=asyncio.get_running_loop().time() + 10)
+    assert admitted['entry']['selected_native_owner'] == '#application-form'
+    assert admitted['entry']['quarantined_native_owners'] == ['#foreign-application']
+    with pytest.raises(forms.Gate) as owner_gate:
+        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
+                               provenance=proof)
+    assert owner_gate.value.form_question['label'] == 'Email'
     result = await attempt()
     assert result['status'] == 'gate', result
-    assert result['form_question']['label'] == 'Email'
-    assert not decide.await_count
+    assert not any(reason in result['question'] for reason in (
+        'ambiguous application roots', 'root lacks tracked job binding',
+        'incomplete native candidate/control census'))
+    if result['form_question'] is not None:
+        assert result['form_question']['label'] == 'Email'
+    if decide.await_count:
+        assert {c['selector'] for c in decide.await_args.args[1]['controls']} == {
+            '#email', '#submit'}
     no_mutations(raw)
 
 

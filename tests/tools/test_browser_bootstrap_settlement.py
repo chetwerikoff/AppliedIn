@@ -545,3 +545,22 @@ async def test_positive_observed_challenge_keeps_captcha_reason(
     result = await _apply(case)
     assert result['status'] == 'gate' and result['reason'] == 'captcha'
     assert not raw.writes
+
+@pytest.mark.parametrize('route', ['lever', 'greenhouse'])
+async def test_changed_native_receiver_at_prewrite_witness_never_authorizes_ipc(
+        monkeypatch, route):
+    """Readiness alone is not permission: every write needs its own current receiver."""
+    case, raw = _world(monkeypatch, route)
+    # The stable entry uses two witness pairs, bootstrap one, and execute()
+    # must independently witness the raw receiver again before writing.
+    raw.drift_at_witness = 4
+
+    async def no_decision(*args, **kwargs):
+        pytest.fail('A drifting current receiver must gate before model access')
+
+    monkeypatch.setattr(bsk, 'decision', no_decision)
+    result = await _apply(case)
+    assert result['status'] == 'gate' and result['form_question'] is None
+    assert raw.witnesses >= 4
+    assert raw.writes == []
+    assert not any(c[0] == 'click' for c in raw.calls)

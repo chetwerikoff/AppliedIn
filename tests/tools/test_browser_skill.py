@@ -2887,6 +2887,9 @@ async def test_bootstrap_unapproved_existing_fact_cannot_masquerade_as_new_quest
 async def test_execute_missing_fact_requires_current_observed_unanswered_question(
         monkeypatch, required, expected):
     current = page(target(label='Location', required=required), application_marker=True)
+    # Keep this witness test offline; _row otherwise reads the configured tracking store.
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: {
+        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate) as gated:
         await forms.execute(session, current,

@@ -234,6 +234,7 @@ def test_offline_location_fixture_only_commits_on_option_click(caption):
     assert 'role="listbox"' in html and 'role="option"' in html
     assert 'data-value-input="location-token"' in html
     assert "input.addEventListener('input'" in html
+    assert "option.addEventListener('mousedown'" in html
     assert "option.addEventListener('click'" in html
     assert "input.addEventListener('blur'" in html
     assert "input.removeAttribute('data-selected-value')" in html
@@ -385,6 +386,9 @@ async def test_submit_checks_reject_missing_or_changed_selection_and_grant(grant
     for change in (
         {'combo.selected_text': ''},
         {'combo.displayed_text': ''},
+        {'value': ''},
+        {'has_value': False},
+        {'disabled': True},
         {'combo.selected_value': ''},
         {'combo.hidden_value': 'OTHER'},
         {'combo.link_id': 'orphan'},

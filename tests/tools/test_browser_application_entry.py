@@ -978,6 +978,12 @@ class NativeReadSession:
                         c['value'] = value
                         c['has_value'] = True
             return {}
+        if method == 'click' and args == ('#native-choice',):
+            for snapshot in (self.current, self.fixed):
+                for c in snapshot['controls']:
+                    if c['selector'] == '#native-choice':
+                        c['checked'] = True
+            return {}
         pytest.fail(f'Unexpected mutating IPC: {method}')
 
 
@@ -1124,3 +1130,35 @@ async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positio
     assert result['form_question']['label'] == 'Email'
     assert not decide.await_count
     no_mutations(raw)
+
+
+async def test_ashby_approved_native_checkbox_is_not_mistaken_for_submit(monkeypatch):
+    """The real guarded choose path must not arm an uncertain submit hold."""
+    row, raw, decide, provenance = native_real_world(monkeypatch, nativeCheckbox=True)
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    committing = []
+    session.on_committing_click = lambda: committing.append(True)
+    target = next(c for c in page['controls'] if c['selector'] == '#native-choice')
+    witness = {c['selector']: c for c in raw.fixed['controls']}
+    question = forms._disclosure_question(
+        page, target, witness, posting('ashby'), provenance=provenance)
+    row['human_approved_answers'][question['label']] = {
+        'value': 'yes', 'label': question['control_label'],
+        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
+                                    'type', 'form_selector', 'form_action')}}
+    receipt = await forms.execute(
+        session, page, {'action': 'choose', 'selector': '#native-choice',
+                        'fact': question['label']},
+        facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
+        jd_text='', resume_tex='', github='', pk=PK,
+        job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'choose'
+    assert [call for call in raw.calls if call[0] == 'click'] == [
+        ('click', '#native-choice')]
+    assert committing == [] and session.committing is False
+    assert any(c['selector'] == '#native-choice' and c['checked']
+               for c in (await session.page())['controls'])
+    assert not decide.await_count

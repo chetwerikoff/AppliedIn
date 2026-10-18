@@ -32,8 +32,10 @@ function harness() {
 }
 const reply = (fields = {}) => ({ record_id: 'record-1', label: 'assessment', date: '2026-10-01',
   sender: 'recruiter@example-co.test', subject: 'Next steps', ...fields });
-const app = (fields = {}) => ({ pk: 'example-co#role-1', company: 'example-co', title: 'Engineer',
-  status: 'applied', applied_at: '2026-09-30', updated_at: '2026-09-30', replies: [], ...fields });
+const app = (fields = {}) => ({
+  pk: 'example-co#role-1', company: 'example-co', title: 'Engineer', status: 'applied',
+  submit_hold_state: 'clear', applied_at: '2026-09-30', updated_at: '2026-09-30', replies: [], ...fields,
+});
 
  test('matched reply renders in Needs and Applications with escaped metadata, without gate actions', () => {
   const h = harness();

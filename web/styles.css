@@ -4570,3 +4570,33 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .t-role .reply-summary { display: block; line-height: 1.5; }
 .t-role .reply-summary > * { margin-right: 7px; }
 @media (prefers-reduced-motion: reduce) { .bd-seg, .ncard, .rowlk { transition: none; } }
+
+/* Issue #121 — read-only diagnostic lanes. Color is secondary to explicit text. */
+.pill.s-warn { color: var(--run); border-color: var(--run-deep); }
+.ps-diagnostic { border: 1px solid var(--border-2); border-radius: var(--r-lg);
+  margin: 0 0 14px; padding: 14px 16px; background: var(--panel); }
+.ps-diagnostic .ps-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 12px; }
+.ps-diagnostic .ps-name { font-weight: 700; }
+.ps-diagnostic .ps-n { color: var(--run); }
+.ps-diagnostic.ps-portal .ps-n { color: var(--bad); }
+.diag-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(min(100%,320px),1fr));
+  gap: 12px; }
+.diag-card { min-width: 0; padding: 14px; border: 1px solid var(--border);
+  border-radius: var(--r-md); background: var(--card); }
+.diag-card > b { display: block; margin-bottom: 10px; overflow-wrap: anywhere; }
+.diag-card > .btn { margin-top: 10px; }
+.diag-note { border-inline-start: 3px solid var(--run); padding: 9px 12px;
+  background: var(--card-2); border-radius: var(--r-sm); color: var(--fg);
+  font-size: 13px; line-height: 1.5; }
+.diag-portal { border-inline-start-color: var(--bad); }
+.diag-triage { border-inline-start-color: var(--muted); }
+.diag-note b { display: block; font-size: 13px; }
+.diag-note p { margin: 7px 0 0; overflow-wrap: anywhere; }
+.diag-raw { white-space: pre-wrap; color: var(--muted); }
+.diag-link { display: inline-block; margin-top: 9px; color: var(--info);
+  text-decoration: underline; text-underline-offset: 3px; }
+.diag-unlinked, .diag-mini { display: inline-block; margin-top: 8px;
+  color: var(--muted); font-size: 12px; }
+.gatecard.diag-card { padding: 15px; }
+.gatecard.diag-card .diag-note { margin: 12px 0; }

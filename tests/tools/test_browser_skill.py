@@ -2842,3 +2842,139 @@ async def test_greenhouse_exact_badge_textarea_reaches_guarded_decision(monkeypa
     assert outcome['status'] == 'gate'
     assert not any(c[0] in {'fill', 'upload', 'select', 'click'} for c in browser.calls)
     assert 'g-recaptcha-response' not in json.dumps(decide.await_args.args[1])
+
+
+def test_diagnostic_gate_allowlist_never_infers_from_model_text():
+    assert forms.Gate('owner_question; defect_structural; captcha').reason == 'unknown_field'
+    assert forms.Gate('random', reason='not-a-code').reason == 'unknown_field'
+    assert forms.Gate('verified', reason='defect_provenance').reason == 'defect_provenance'
+    assert forms.CaptchaGate('visible challenge').form_question is None
+    assert forms.CaptchaGate('visible challenge').reason == 'unknown_field'
+
+
+async def test_bootstrap_positive_required_unanswered_witness_is_owner_question(monkeypatch):
+    current = page(target(label='Location', required=True), application_marker=True)
+    monkeypatch.setattr(forms, '_row', lambda *a, **k: {
+        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate) as gated:
+        await forms._bootstrap(session, current, 'example-co#synthetic', {},
+                               current['url'])
+    assert gated.value.reason == 'owner_question'
+    question = gated.value.form_question
+    assert question['label'] == 'Location'
+    assert question['selector'] == '#field'
+    assert question['pk'] == 'example-co#synthetic'
+    session.call.assert_not_awaited()
+
+
+async def test_bootstrap_unapproved_existing_fact_cannot_masquerade_as_new_question(monkeypatch):
+    current = page(target(label='Location', required=True), application_marker=True)
+    monkeypatch.setattr(forms, '_row', lambda *a, **k: {
+        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate) as gated:
+        await forms._bootstrap(session, current, 'example-co#synthetic',
+                               {'Location': 'Synthetic Place'}, current['url'])
+    assert gated.value.reason == 'unknown_field'
+    assert gated.value.form_question['label'] == 'Location'
+    session.call.assert_not_awaited()
+
+
+@pytest.mark.parametrize('required,expected', [
+    (True, 'owner_question'), (False, 'unknown_field'),
+])
+async def test_execute_missing_fact_requires_current_observed_unanswered_question(
+        monkeypatch, required, expected):
+    current = page(target(label='Location', required=required), application_marker=True)
+    # Keep this witness test offline; _row otherwise reads the configured tracking store.
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: {
+        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate) as gated:
+        await forms.execute(session, current,
+                            {'action': 'fill', 'selector': '#field', 'fact': ''},
+                            facts={}, filled={}, resume_path='',
+                            company='example-co', jd_text='', resume_tex='', github='',
+                            pk='example-co#synthetic', job_url=current['url'])
+    assert gated.value.reason == expected
+    assert gated.value.form_question['selector'] == '#field'
+    session.call.assert_not_awaited()
+
+
+def test_missing_independent_visible_control_witness_is_defect_not_owner_answer():
+    current = page(target(label='Location', required=True), application_marker=True)
+    with pytest.raises(forms.Gate) as gated:
+        forms._disclosure_question(current, current['controls'][0], {}, current['url'])
+    assert gated.value.reason == 'defect_witness'
+    assert gated.value.form_question is None
+
+
+@pytest.mark.parametrize('error,cause', [
+    ('ambiguous application roots', 'defect_ashby_root_identity'),
+    ('application root sibling identity mismatch', 'defect_ashby_root_identity'),
+    ('unsupported synthetic root evidence', 'defect_structural'),
+])
+def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
+    job_id = '12345678-1234-1234-1234-123456789012'
+    pk = 'example-co#' + job_id
+    posting = 'https://jobs.ashbyhq.com/example-co/' + job_id
+    provenance = forms.ApplicationEntryProvenance(
+        pk=pk, company='example-co', ats='ashby', job_id=job_id,
+        wrapper=posting, board='example-co', url=posting+'/application')
+    observed = {'url': provenance.url,
+                'entry': {'formless': {'root': '#application', 'error': error}}}
+    with pytest.raises(forms.Gate) as gated:
+        forms._formless_boundary(observed, provenance)
+    assert gated.value.reason == cause
+
+
+def test_greenhouse_missing_board_diagnostic_is_verified_from_row_and_config(monkeypatch, tmp_path):
+    from core.ids import make_pk
+    pk = make_pk('example-co', '101')
+    url = 'https://careers.example.test/jobs?gh_jid=101'
+    row = {'pk': pk, 'company': 'example-co', 'job_id': '101',
+           'ats': 'greenhouse', 'jd_url': url}
+    config = SimpleNamespace(name='example-co', ats='greenhouse', board=None,
+                             careers_url='https://careers.example.test/')
+    monkeypatch.setattr(forms, '_row', lambda *_: row)
+    monkeypatch.setattr('core.config.get_settings', lambda: SimpleNamespace(config_dir=tmp_path))
+    monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
+    assert forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    config.board = 'verified-board'
+    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    config.board = None
+    config.careers_url = 'https://different.example.test/'
+    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    assert not forms._greenhouse_wrapper_missing_board(pk, 'wrong-company', url)
+
+
+@pytest.mark.parametrize('narrow', [False, True])
+async def test_greenhouse_missing_board_returns_specific_or_generic_tenant_gate_without_browser(
+        monkeypatch, narrow):
+    url = 'https://careers.example.test/jobs?gh_jid=101'
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **k: None)
+    monkeypatch.setattr(forms, '_configured_alias', lambda *a, **k: None)
+    monkeypatch.setattr(forms, '_greenhouse_wrapper_missing_board', lambda *a: narrow)
+    monkeypatch.setattr(bsk, 'Session', lambda *_: pytest.fail('Never start browser'))
+    result = await forms.apply(url, 'example-co', {}, 'synthetic',
+                               pk='example-co#101', resume_path='Resume.pdf')
+    assert result['status'] == 'gate'
+    assert result['reason'] == ('defect_greenhouse_tenant_alias'
+                                if narrow else 'defect_tenant')
+
+
+async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
+    target_url = 'https://jobs.ashbyhq.com/example-co/12345678-1234-1234-1234-123456789012/application'
+    provenance = forms.ApplicationEntryProvenance(
+        pk='example-co#synthetic', company='example-co', ats='ashby', job_id='synthetic',
+        wrapper=target_url, board='example-co', url=target_url)
+    session = SimpleNamespace(call=AsyncMock())
+    with pytest.raises(forms.Gate) as gated:
+        await forms.execute(session, page(target(required=True)),
+                            {'action': 'fill', 'selector': '#field', 'fact': 'Location'},
+                            facts={}, filled={}, resume_path='', company='example-co',
+                            jd_text='', resume_tex='', github='', pk='example-co#wrong',
+                            job_url=target_url, provenance=provenance)
+    assert gated.value.reason == 'defect_provenance'
+    session.call.assert_not_awaited()

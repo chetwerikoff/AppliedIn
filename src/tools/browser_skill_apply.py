@@ -308,10 +308,19 @@ def handoff(message: str, step: dict) -> dict:
     context = {'last_button': button, 'url': url}
     return {'text': f'{message} Last button: {button}. Page: {url}', 'step': context}
 
+_GATE_DIAGNOSTICS = frozenset({
+    'owner_question', 'defect_structural', 'defect_provenance',
+    'defect_tenant', 'defect_witness', 'defect_ashby_root_identity',
+    'defect_greenhouse_tenant_alias',
+})
+
+
 class Gate(ValueError):
-    def __init__(self, message: str, *, form_question: dict | None = None):
+    def __init__(self, message: str, *, form_question: dict | None = None,
+                 reason: str = 'unknown_field'):
         super().__init__(message)
         self.form_question = form_question
+        self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
 
 
 class CaptchaGate(Gate):
@@ -500,6 +509,40 @@ def _row(pk: str, *, fixture_context=None) -> dict:
     from core.stores import make_stores
     return make_stores().tracking.get(pk) or {}
 
+
+
+def _greenhouse_wrapper_missing_board(pk: str, company: str, url: str) -> bool:
+    """Match the exact #118 cause; an alias failure alone is not evidence."""
+    try:
+        from core.config import get_settings
+        from core.ids import make_pk
+        from discovery.watchlist import load_watchlist
+        row = _row(pk)
+        job_id = row.get('job_id')
+        match = re.fullmatch(r'gh_jid=([0-9]+)', urlsplit(url).query)
+        if (row.get('pk') != pk or row.get('company') != company
+                or row.get('jd_url') != url or row.get('ats') != 'greenhouse'
+                or not isinstance(job_id, str) or not match
+                or match.group(1) != job_id or make_pk(company, job_id) != pk):
+            return False
+        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        matches = [c for c in configs if isinstance(getattr(c, 'name', None), str)
+                   and c.name.strip().lower() == company.strip().lower()]
+        if len(matches) != 1:
+            return False
+        cfg = matches[0]
+        if getattr(cfg, 'ats', None) != 'greenhouse' or getattr(cfg, 'board', None) not in (None, ''):
+            return False
+        careers = cfg.careers_url
+        if isinstance(careers, str) and re.fullmatch(r'https://[^/?#]+', careers):
+            careers += '/'
+        source = _alias_https_parts(careers)
+        wrapper = _alias_https_parts(url, query=True)
+        return bool(source and wrapper and source[0] == wrapper[0]
+                    and (source[1] == '/' or wrapper[1] == source[1]
+                         or wrapper[1].startswith(source[1].rstrip('/') + '/')))
+    except Exception:
+        return False
 
 
 def _configured_alias(pk: str, company: str, url: str, *,
@@ -1317,7 +1360,11 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             or not navigation_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('formless structural recipient not proven; inspect manually.')
     if root.get('error'):
-        raise Gate(root['error'] + '; inspect the application manually.')
+        reason = ('defect_ashby_root_identity' if root['error'] in {
+            'ambiguous application roots',
+            'application root sibling identity mismatch',
+        } else 'defect_structural')
+        raise Gate(root['error'] + '; inspect the application manually.', reason=reason)
     if not root.get('root'):
         raise _EntryNotReady('no unique application root')
     evidence = page['entry'].get('root_evidence')
@@ -1327,7 +1374,8 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     selectors = [c.get('selector') for c in evidence]
     if len(set(selectors)) != len(selectors) or any(
             not c.get('unique') for c in evidence):
-        raise Gate('ambiguous application root control identity; inspect manually.')
+        raise Gate('ambiguous application root control identity; inspect manually.',
+                   reason='defect_structural')
     # A null native owner never establishes shared ownership. Only a proven
     # unrelated native search form can be omitted from this global census.
     ignored = set()
@@ -1640,7 +1688,8 @@ class _EntrySession:
                 if (settle_before is not None
                         and page.get('url') == fixed.get('url') == settle_before['url']):
                     return None  # Entry-only disagreement cannot prove attachment.
-                raise Gate('Upload PAGE/fixed structural witness disagreement.')
+                raise Gate('Upload PAGE/fixed structural witness disagreement.',
+                           reason='defect_witness')
         except Gate:
             raise
         except Exception:
@@ -1731,7 +1780,8 @@ class _EntrySession:
                 if (args[0] == 'upload' and str(exc) ==
                         'The current DOM witness is unavailable or changed; '
                         'exception=ValueError; predicate=entry.equal; control=unavailable'):
-                    raise Gate('Upload PAGE/fixed structural witness disagreement.') from None
+                    raise Gate('Upload PAGE/fixed structural witness disagreement.',
+                           reason='defect_witness') from None
                 raise
             members = _formless_boundary(current, self.provenance)
             root = _formless_root(current)
@@ -2300,7 +2350,8 @@ def _same_key(value: str) -> str:
 def _require_graph_visibility(target, witness):
     if _closed_mode(target) and any(witness.get(k) is not True for k in (
             'graph_label_strict_visible', 'graph_display_strict_visible')):
-        raise Gate('This control is not visibly editable.')
+        raise Gate('This control is not visibly editable.',
+                       reason='defect_witness')
 
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
@@ -2351,7 +2402,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                 or (choice and dom.get('visible_text') != member['label'])
                 or (member.get('type') == 'combobox'
                     and dom.get('combobox') != member.get('combobox'))):
-            raise Gate('This control is not visibly editable.')
+            raise Gate('This control is not visibly editable.',
+                       reason='defect_witness')
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
@@ -2519,7 +2571,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if provenance is not None and (
             provenance.pk != pk
             or not _alias_current(provenance, fixture_context=fixture_context)):
-        raise Gate('The configured job/tenant correspondence changed; review the form.')
+        raise Gate('The configured job/tenant correspondence changed; review the form.',
+                   reason='defect_provenance')
     _inventory_ok(page)
     if not navigation_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
@@ -2559,7 +2612,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 question = _disclosure_question(page, item, witness, *origins, provenance=provenance)
                 question['pk'] = pk
                 raise Gate(f'An exact human-approved answer is needed for "{key}".',
-                           form_question=question)
+                           form_question=question,
+                           reason=('owner_question' if item.get('required')
+                                   and _unanswered(page, item) and not previous
+                                   and not value else 'unknown_field'))
         return page
     filled = filled if filled is not None else {}
     history = history if history is not None else []
@@ -2673,7 +2729,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                       or item.get('tag') == 'select'
                       else f'An exact human-approved answer is needed for "{key}".')
             record('needs-human')
-            raise Gate(prompt, form_question=question)
+            raise Gate(prompt, form_question=question,
+                       reason=('owner_question' if previous is None and not value
+                               else 'unknown_field'))
 
         if not _unanswered(page, item):
             # Without a previously validated controller receipt this is not a
@@ -2713,7 +2771,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                   else f'An exact human-approved answer is needed for "{key}".')
         if authority == 'stale':
             record('blocked')
-            raise Gate('The earlier control approval has changed; inspect manually.')
+            raise Gate('The earlier control approval has changed; inspect manually.',
+                       reason='defect_witness')
 
         # #103: a grant-only choice is deliberately left for the existing model
         # choose action. Its PAGE-bound approved_choices remains independent.
@@ -2732,7 +2791,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
         if not value or authority in {'missing', 'incomplete'}:
             record('needs-human')
-            raise Gate(prompt, form_question=question)
+            raise Gate(prompt, form_question=question,
+                       reason=('owner_question' if previous is None and not value
+                               else 'unknown_field'))
         try:
             exact_approval(
                 pk, key, value, target=_bound_target(page, item),
@@ -3388,7 +3449,9 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     answer = str(facts.get(key) or '').strip() if key in facts else ''
     if not answer or key != _fact_key(facts, form_question['label']):
         raise Gate('Choose an exact approved answer for this combobox.',
-                   form_question=form_question)
+                   form_question=form_question,
+                   reason='owner_question' if _unanswered(observed, target)
+                   and not answer else 'unknown_field')
     try:
         exact_approval(pk, form_question['label'], answer, target=target, url=observed['url'],
                        provenance=provenance,
@@ -3564,7 +3627,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 or not _alias_current(provenance, fixture_context=ctx)
                 or not navigation_allowed(page.get('url', ''),
                                           provenance=provenance)):
-            raise Gate('This page lacks current same-job provenance.')
+            raise Gate('This page lacks current same-job provenance.',
+                   reason='defect_provenance')
     elif pk and (verb in {'fill', 'select', 'choose', 'combobox', 'upload'}
                  or (verb == 'click' and allow_click)):
         # A non-committing, unapproved click is refused on existing local
@@ -3628,7 +3692,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             approved = _approved_native_choice(
                 page, target, pk, provenance=provenance, fixture_context=ctx)
             if approved is None:
-                raise Gate(gate_prompt, form_question=form_question)
+                raise Gate(gate_prompt, form_question=form_question,
+                           reason='owner_question' if _unanswered(page, target)
+                           else 'unknown_field')
             if (not isinstance(key, str)
                     or key not in {form_question['label'],
                                    _fact_key(facts, form_question['label'])}):
@@ -3640,7 +3706,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
                 value = str(facts[key]).strip()
             else:
-                raise Gate(gate_prompt, form_question=form_question)
+                raise Gate(gate_prompt, form_question=form_question,
+                           reason='owner_question' if _unanswered(page, target)
+                           and not key else 'unknown_field')
             if key != _fact_key(facts, form_question['label']):
                 detail = 'An exact human-approved fact key for this observed question is required.'
                 if verb == 'select':
@@ -3890,7 +3958,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             provenance = _configured_alias(
                 pk, company, url, fixture_context=ctx)
             if provenance is None:
-                raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.')
+                raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.',
+                           reason=('defect_greenhouse_tenant_alias'
+                                   if ctx is None and _greenhouse_wrapper_missing_board(pk, company, url)
+                                   else 'defect_tenant'))
             direct_url = provenance.url
             trusted_origins = (url,)
         else:
@@ -3906,7 +3977,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 provenance = _configured_alias(pk, company, url, fixture_context=ctx)
                 if not isinstance(provenance, ApplicationEntryProvenance):
                     raise Gate('Current explicit ATS board and canonical tracked job not proven; '
-                               'inspect the persisted company configuration manually.')
+                               'inspect the persisted company configuration manually.',
+                               reason='defect_tenant')
                 direct_url = provenance.url
                 trusted_origins = (url,)
             if tracked.get('ats') in _VENDOR_PATH:
@@ -4195,7 +4267,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             context = (_control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
                        else handoff(str(exc), step))
             return {'status': 'gate',
-                    'reason': 'captcha' if isinstance(exc, CaptchaGate) else 'unknown_field',
+                    'reason': 'captcha' if isinstance(exc, CaptchaGate) else exc.reason,
                     'question': context['text'], 'step': context['step'],
                     'form_question': exc.form_question}
         if submitted:

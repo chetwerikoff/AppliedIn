@@ -56,6 +56,7 @@ function harness() {
   state.prefs = { titles: ['Software Engineer'], min_match_score: 7, remote_only: false };
   return { context, state, node, requests, timers, storage };
 }
+const clearHoldRows = rows => rows.map(row => ({ submit_hold_state: 'clear', ...row }));
 
 function edit(h, field, value) {
   const target = { dataset: { co: 'Acme', cpref: field }, value,
@@ -228,19 +229,19 @@ test('follow-up reminders ignore completed outcomes and dates filter by actual s
 
 test('jobs still being tailored are never presented as ready with a missing completion date', () => {
   const h = harness();
-  assert.equal(h.context.sectionOf({status:'tailoring'}, new Set()), 'preparing');
-  assert.equal(h.context.sectionOf({status:'tailored'}, new Set()), 'ready');
+  assert.equal(h.context.sectionOf(clearHoldRows([{status:'tailoring'}])[0], new Set()), 'preparing');
+  assert.equal(h.context.sectionOf(clearHoldRows([{status:'tailored'}])[0], new Set()), 'ready');
 });
 
 test('company Approve all confirms and sends only visible eligible jobs', async () => {
   const h = harness(), confirmations = [], busy = [];
   h.state.coFilter = 'Acme'; h.state.query = 'Staff';
-  h.state.apps = [
+  h.state.apps = clearHoldRows([
     {pk:'acme#1',company:'Acme',title:'Staff Engineer',status:'tailored'},
     {pk:'acme#2',company:'Acme',title:'Senior Engineer',status:'tailored'},
     {pk:'beta#1',company:'Beta',title:'Staff Engineer',status:'tailored'},
     {pk:'acme#3',company:'Acme',title:'Staff Engineer',status:'applied'},
-  ];
+  ]);
   h.context.confirm = (message) => { confirmations.push(message); return true; };
   h.context.markBusy = (pk) => busy.push(pk);
   h.context.loadQueue = () => {}; h.context.scheduleReload = () => {};
@@ -253,28 +254,28 @@ test('company Approve all confirms and sends only visible eligible jobs', async 
 
 test('the Needs you approval never pulls in tailored jobs from another view', () => {
   const h = harness(); h.state.tab = 'needs'; h.state.coFilter = 'Acme';
-  h.state.apps = [
+  h.state.apps = clearHoldRows([
     {pk:'acme#1',company:'Acme',title:'Engineer',status:'tailored'},
     {pk:'acme#2',company:'Acme',title:'Engineer',status:'needs_human',gate_reason:'approval'},
     {pk:'acme#3',company:'Acme',title:'Engineer',status:'needs_human',gate_reason:'unknown_field'},
-  ];
+  ]);
   assert.deepEqual(Array.from(h.context.visibleApprovalPicks(), r => r.pk), ['acme#2']);
 });
 
 test('ready approvals exclude jobs already in the queue and honor the location filter', () => {
   const h = harness(); h.state.locFilter = h.context.locTier('Seattle').key;
-  h.state.apps = [
+  h.state.apps = clearHoldRows([
     {pk:'1',company:'Acme',title:'Engineer',status:'tailored',location:'Seattle'},
     {pk:'2',company:'Acme',title:'Engineer',status:'tailored',location:'Seattle'},
     {pk:'3',company:'Acme',title:'Engineer',status:'tailored',location:'London'},
-  ];
+  ]);
   h.state.queue = {pending:[{pk:'2'}]};
   assert.deepEqual(Array.from(h.context.visibleApprovalPicks(), r => r.pk), ['1']);
 });
 
 test('a cancelled approval sends nothing and a second pending click cannot widen it', async () => {
   const h = harness(); h.state.coFilter = 'Acme';
-  h.state.apps = [{pk:'1',company:'Acme',title:'Engineer',status:'tailored'}];
+  h.state.apps = clearHoldRows([{pk:'1',company:'Acme',title:'Engineer',status:'tailored'}]);
   h.context.confirm = () => false;
   await h.context.approveAll(); assert.equal(h.requests.length, 0);
   h.context.confirm = () => true; h.context.markBusy = () => {};
@@ -290,11 +291,11 @@ test('a cancelled approval sends nothing and a second pending click cannot widen
 
 function reviewHarness() {
   const h = harness();
-  h.state.apps = [
+  h.state.apps = clearHoldRows([
     {pk:'openai#keep',company:'OpenAI',title:'Staff Engineer',status:'tailored'},
     {pk:'openai#reject',company:'OpenAI',title:'Senior Engineer',status:'tailored'},
     {pk:'beta#keep',company:'Beta',title:'Staff Engineer',status:'tailored'},
-  ];
+  ]);
   h.context.confirm = () => true; h.context.markBusy = () => {};
   h.context.loadQueue = () => {}; h.context.scheduleReload = () => {};
   h.context.reply = async (url, body) => ({ok:true,queued:body.pks.length, results:body.pks.map(pk => ({pk,ok:true}))});
@@ -358,7 +359,7 @@ test('new roles and double clicks cannot widen a pending Apply selection', async
   h.context.reply = (url) => url === '/actions/apply-selection'
     ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({ok:true,queued:1});
   const pending = h.context.reviewAction('apply','OpenAI');
-  h.state.apps.push({pk:'openai#new',company:'OpenAI',title:'New',status:'tailored'});
+  h.state.apps.push({pk:'openai#new',company:'OpenAI',title:'New',status:'tailored',submit_hold_state:'clear'});
   await h.context.reviewAction('apply','Beta');
   assert.equal(h.requests.length, 1);
   assert.deepEqual(h.requests[0].body, {company:'OpenAI',pks:['openai#keep']});
@@ -382,7 +383,7 @@ test('partial rejection retains failures and Undo restores only successful rejec
 
 test('shift-click selects only a contiguous range in the visible company', () => {
   const h = reviewHarness();
-  h.state.apps.push({pk:'openai#third',company:'OpenAI',title:'Third role',status:'tailored'});
+  h.state.apps.push({pk:'openai#third',company:'OpenAI',title:'Third role',status:'tailored',submit_hold_state:'clear'});
   const tick = (pk, checked) => ({dataset:{reviewPick:pk},checked,closest:()=>null});
   h.context.paintReviewSelection(tick('openai#keep',true));
   h.context.paintReviewSelection(tick('openai#third',true),true);
@@ -448,7 +449,7 @@ test('a selection that starts or completes applying never falls back to Apply al
 
 test('phase filters preserve exact company scope and skip running roles in a range', () => {
   const h = reviewHarness();
-  h.state.apps.push({pk:'openai#third',company:'OpenAI',status:'tailored',title:'Third'});
+  h.state.apps.push({pk:'openai#third',company:'OpenAI',status:'tailored',title:'Third',submit_hold_state:'clear'});
   h.state.queue = {pending:[],in_flight:['openai#reject']};
   h.context.paintReviewSelection({dataset:{reviewPick:'openai#keep'},checked:true});
   h.context.paintReviewSelection({dataset:{reviewPick:'openai#third'},checked:true}, true);
@@ -521,12 +522,12 @@ const septemberLocalMidday = (day) => new Date(2026, 8, day, 12).toISOString();
 
 function datedReviewHarness() {
   const h=reviewHarness();
-  h.state.apps = [
+  h.state.apps = clearHoldRows([
     {pk:'openai#old',company:'OpenAI',title:'Old',status:'tailored',tailored_at:septemberLocalMidday(7)},
     {pk:'beta#new',company:'Beta',title:'New',status:'tailored',tailored_at:septemberLocalMidday(9)},
     {pk:'openai#new',company:'OpenAI',title:'New',status:'tailored',tailored_at:septemberLocalMidday(9)},
     {pk:'openai#unknown',company:'OpenAI',title:'Unknown',status:'tailored',tailored_at:'invalid',updated_at:septemberLocalMidday(10)},
-  ];
+  ]);
   return h;
 }
 

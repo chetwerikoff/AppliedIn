@@ -15,7 +15,7 @@ const DATE = '2026-10-01T00:00:00Z';
 
 function fixture(fields = {}, pk = 'synthetic-row') {
   return { pk, company: 'example-co', title: 'Test Role', status: 'applied',
-    match_score: 5, applied_at: DATE, updated_at: DATE, ...fields };
+    submit_hold_state: 'clear', match_score: 5, applied_at: DATE, updated_at: DATE, ...fields };
 }
 
 function harness({ initial = {}, throwStorage = false } = {}) {

@@ -77,6 +77,10 @@ if(form) {
     ? (spec.url || canonicalAction) : canonicalAction;
   node('label',{'for':'email',text:'Email'},form);
   node('input',{id:'email',name:'Email',type:'email',required:true},form);
+  if(spec.nativeCheckbox) {
+    node('label',{'for':'native-choice',text:'Synthetic choice'},form);
+    node('input',{id:'native-choice',type:'checkbox',required:true},form);
+  }
   if(spec.marker!=='absent') {
     const marker=spec.marker || 'text';
     const submit=node(marker==='value' || marker==='image' ? 'input':'button',

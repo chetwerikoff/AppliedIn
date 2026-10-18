@@ -148,9 +148,9 @@ _WIDGET_GRAPH = r"""
     const phase = expanded==='true' ? 'C1' : expanded==='false' && noLinks ? (token ? 'C2' : 'C0') : '';
     if (!phase) return null;
     const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
-    // #country is never an ordinary receiverless closed select, even if moved
-    // entirely out of the phone fieldset with its valid local label/display.
-    if (e.id==='country' && !country) return null;
+    // Only the exact phone graph can admit receiverless #country. An unrelated
+    // #country with a proven receiver keeps ordinary closed-select authority.
+    if (e.id==='country' && !country && (!H || e.closest('fieldset.phone-input'))) return null;
     if (extras.length) requiredProxies.add(extras[0]);
     graphNodes.set(e, {label:L, display:display[0]});
     return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),

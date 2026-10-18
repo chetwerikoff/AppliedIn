@@ -1001,6 +1001,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
           (typeof e.contains === 'function' && e.contains(h)) ||
           (hiddenName && h.name === hiddenName)));
+      const locationOnly=leverLocationField(e);
+      const locationOwner=locationOnly ? leverLocationOwner(e) : null;
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
@@ -1027,7 +1029,10 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
         combobox:type === 'combobox' ? {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
-          listbox_selector:list ? selector(list) : '', listbox_visible:!!list && visible(list), options:opts,
+          listbox_selector:list ? selector(list) : '', options:opts,
+          ...(locationOnly ? {listbox_visible:leverLocationVisible(list),
+            location_owner:locationOwner, location_receiver:leverLocationReceiver(e, form),
+            location_selected_option:leverLocationSelected(e, locationOwner)} : {}),
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),
@@ -1960,11 +1965,23 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 keys = ('mode', 'phase', 'quarantined', 'required_proxy_mounted',
                         'label_selector', 'field_selector', 'value_container_selector',
                         'input_wrapper_selector', 'receiverless_country', 'country_graph',
-                        'link_id', 'linked', 'listbox_selector', 'listbox_visible', 'options', 'selected_text',
+                        'link_id', 'linked', 'listbox_selector', 'options', 'selected_text',
                         'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value')
                 for key in keys:
                     require(source.get(key) == combo.get(key), 'combobox.' + key + '.equal')
-                require(source == combo, 'combobox.equal')
+                # listbox_visible is new Lever-only evidence: a generic combobox
+                # with opacity:0 must retain its original PAGE/witness contract.
+                location_keys = ('listbox_visible', 'location_owner',
+                                 'location_receiver', 'location_selected_option')
+                if _lever_location_attempt(page, original):
+                    for key in location_keys:
+                        require(source.get(key) == combo.get(key),
+                                'combobox.' + key + '.equal')
+                    require(source == combo, 'combobox.equal')
+                else:
+                    require({k: v for k, v in source.items() if k not in location_keys}
+                            == {k: v for k, v in combo.items() if k not in location_keys},
+                            'combobox.equal')
                 if not _closed_mode(original):
                     if isinstance(session, _GreenhouseSession) and readiness:
                         require(isinstance(combo.get('link_id'), str), 'combobox.link_id.string')

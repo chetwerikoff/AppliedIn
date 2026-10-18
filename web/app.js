@@ -1823,6 +1823,10 @@ function queuedSec(rows) {
   const pend = (q.pending || [])
     .map((it, gi) => ({ ...it, pos: gi + 1, first: gi < cap && !it.blocked }))
     .filter((it) => byPk[it.pk] && !isReadOnly(byPk[it.pk]));
+  // Even if the entire visible queue became read-only, drop stale selections
+  // before deciding whether there is a queue section to render.
+  const live = new Set(pend.map((it) => it.pk));
+  for (const pk of [...state.qPicked]) if (!live.has(pk)) state.qPicked.delete(pk);
   if (!pend.length) return "";
 
   const running = new Set(q.running || []);
@@ -1868,8 +1872,6 @@ function queuedSec(rows) {
 
   // Ticks are kept for jobs still IN the queue only, so one that drained or was
   // skipped elsewhere cannot sit in the selection and be acted on twice.
-  const live = new Set(pend.filter((it) => !isReadOnly(byPk[it.pk])).map((it) => it.pk));
-  for (const pk of [...state.qPicked]) if (!live.has(pk)) state.qPicked.delete(pk);
   const picked = state.qPicked.size;
 
   const single = groups.size === 1;
@@ -2070,6 +2072,10 @@ function companyBar() {
   const rot = (state.rotation || []).find((r) => r.company === co.trim().toLowerCase());
   const rotators = (state.profiles || []).filter((p) => p.kind === "rotating");
   if (!rot && !rotators.length) return "";   // nothing to offer until one exists
+  if (!companyActionAllowed(co)) return `<div class="cbar">
+    <span class="cbar-co">${esc(co)}</span>
+    <span class="cbar-hint">Company-wide actions are unavailable while a row needs portal reconciliation or diagnostic repair.</span>
+  </div>`;
 
   const body = rot ? `
     <span class="cbar-mark">↻</span>

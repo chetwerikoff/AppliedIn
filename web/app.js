@@ -212,7 +212,14 @@ function tagHtml(s) {
 // Honest, human labels for WHY a job is waiting — never jargon.
 const GATE_LABEL = {
   approval: "awaiting your approval",
-  unknown_field: "needs an answer from you",
+  unknown_field: "manual triage needed",
+  owner_question: "verified question, needs an answer",
+  defect_structural: "structural blocker",
+  defect_provenance: "provenance blocker",
+  defect_tenant: "tenant proof blocker",
+  defect_witness: "witness blocker",
+  defect_ashby_root_identity: "application-root blocker",
+  defect_greenhouse_tenant_alias: "Greenhouse tenant blocker",
   captcha: "CAPTCHA, finish it manually",
   no_account: "account/login needed",
   low_confidence: "needs review",
@@ -228,13 +235,92 @@ function defaultGateText(r) {
 // not finish — each with its reason, screenshot and timeline, nothing hidden.
 // (Skipped/capped are deliberate outcomes, so they live under the closed
 // filter instead.)
-const isStuck = (r) => ["failed", "error", "job_gone", "uncertain"].includes(r.status);
-const RETRYABLE = ["failed", "error", "capped", "uncertain"];
+const DEFECT_CODES = new Set(["defect_structural", "defect_provenance", "defect_tenant",
+  "defect_witness", "defect_ashby_root_identity", "defect_greenhouse_tenant_alias"]);
+const DEFECT_ISSUE_URLS = Object.freeze({
+  defect_ashby_root_identity: "https://github.com/chetwerikoff/AppliedIn/issues/120",
+  defect_greenhouse_tenant_alias: "https://github.com/chetwerikoff/AppliedIn/issues/118",
+});
+const READ_ONLY_ROUTES = new Set(["portal_check", "waiting_for_fix", "manual_triage"]);
+const INTERVENTION_ROUTES = new Set(["owner_question", "approval", "low_confidence", "captcha", "no_account"]);
+// No text-based diagnosis: raw prose and stale non-active gate codes are never
+// authority to answer, approve, or claim a source-specific defect.
+function routeOf(r) {
+  if (!r || typeof r !== "object") return "manual_triage";
+  if (r.submit_hold_state !== "clear" || r.possible_submission === true
+      || r.fail_kind === "uncertain" || r.gate_reason === "submit_uncertain"
+      || r.status === "uncertain") return "portal_check";
+  if (!Object.hasOwn(STATUS_META, r.status)) return "manual_triage";
+  if (r.status !== "needs_human") return r.status;
+  if (r.fail_kind && r.fail_kind !== "") return "manual_triage";
+  if (DEFECT_CODES.has(r.gate_reason)) return "waiting_for_fix";
+  if (r.gate_reason === "owner_question")
+    return typeof r.gate_question === "string" && !!r.gate_question.trim()
+      ? "owner_question" : "manual_triage";
+  if (["approval", "low_confidence", "captcha", "no_account"].includes(r.gate_reason))
+    return r.gate_reason;
+  return "manual_triage";
+}
+const isReadOnly = (r) => READ_ONLY_ROUTES.has(routeOf(r));
+const isStuck = (r) => isReadOnly(r)
+  || ["failed", "error", "job_gone", "uncertain"].includes(r.status);
+const RETRYABLE = ["failed", "error", "capped"];
+function routeTag(r) {
+  const meta = {portal_check:["Portal check","s-bad"],
+    waiting_for_fix:["Waiting for fix","s-warn"],
+    manual_triage:["Manual triage","s-warn"]}[routeOf(r)];
+  return meta ? `<span class="pill ${meta[1]}">${meta[0]}</span>` : tagHtml(r.status);
+}
+function issueLinkHtml(r) {
+  const url = DEFECT_ISSUE_URLS[r.gate_reason];
+  return url && routeOf(r) === "waiting_for_fix"
+    ? `<a class="diag-link" href="${url}" target="_blank" rel="noopener">View Fix Issue ↗</a>`
+    : '<span class="diag-unlinked">Fix Issue not linked</span>';
+}
+function routeNotice(r) {
+  const kind = routeOf(r);
+  if (kind === "portal_check") {
+    const reason = r.fail_reason || r.submit_hold_reason || "";
+    return `<div class="diag-note diag-portal" role="status"><b>Portal verification required</b>
+      <p>Possible submission or an unverified submit hold. Check the employer portal
+      and reconcile the actual outcome before any separate later attempt.</p>
+      ${reason ? `<p class="diag-raw">${esc(reason)}</p>` : ""}</div>`;
+  }
+  if (kind === "waiting_for_fix") return `<div class="diag-note diag-fix" role="status">
+    <b>Waiting for a code fix</b><p>Diagnostic: ${esc(r.gate_reason)}.
+    No form answer or approval can resolve this.</p>
+    ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}
+    ${issueLinkHtml(r)}</div>`;
+  if (kind === "manual_triage") return `<div class="diag-note diag-triage" role="status">
+    <b>Manual triage required</b><p>There is no verified answerable question,
+    or the status evidence conflicts. Inspect the details; do not retry or approve.</p>
+    ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
+  return "";
+}
+// Every delegated action re-checks current rows. DOM visibility cannot authorize.
+function rowActionAllowed(pk, act) {
+  const r = state.apps.find((item) => item.pk === pk);
+  if (!r || isReadOnly(r)) return false;
+  const kind = routeOf(r);
+  if (act === "answer") return ["owner_question", "approval", "low_confidence"].includes(kind);
+  if (act === "run-now") return kind === "found";
+  if (act === "apply-now") return canApply(r);
+  if (act === "force-apply") return kind === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
+  if (act === "retry") return RETRYABLE.includes(r.status);
+  if (act === "queue-apply") return ["failed", "error", "capped"].includes(kind);
+  if (act === "reopen") return ["skipped", "failed", "error", "job_gone", "capped"].includes(kind) && !r.confirmation_id;
+  if (act === "mark-applied") return INTERVENTION_ROUTES.has(kind);
+  return true;
+}
+function companyActionAllowed(co) {
+  return !state.apps.some((r) => (co === "__all__" || r.company === co) && isReadOnly(r));
+}
+
 
 const FILTERS = [
   ["all", "all", () => true],
   ["pipeline", "in pipeline", (r) => ["found", "tailored", "submitting", "capped"].includes(r.status)],
-  ["needs", "needs you", (r) => r.status === "needs_human"],
+  ["needs", "needs you", (r) => INTERVENTION_ROUTES.has(routeOf(r))],
   ["applied", "applied", (r) => ["applied", "applied_manual"].includes(r.status)],
   ["stuck", "unable", isStuck],
   ["closed", "closed", (r) => ["skipped", "job_gone", "capped"].includes(r.status)],
@@ -954,7 +1040,7 @@ function renderTabs() {
   // The Logs tab is the roomy version of the live rail — hide the rail there.
   $(".board").classList.toggle("logs-open", state.tab === "logs" || searching);
   $("#tab-n-apps").textContent = state.apps.length;
-  const needs = state.apps.filter((a) => a.status === "needs_human").length;
+  const needs = state.apps.filter((a) => INTERVENTION_ROUTES.has(routeOf(a))).length;
   const stuck = state.apps.filter(isStuck).length;
   const needsTotal = needs + (state.unassignedReplies || []).length;
   const nb = $("#tab-n-needs"); nb.hidden = !needsTotal; tick(nb, needsTotal);
@@ -978,10 +1064,10 @@ function renderCoFilter() {
 }
 
 // --- Pipeline board (kanban lanes by status) -------------------------------
-const awaitsApproval = (r) => r.gate_reason === "approval" && !!r.gate_question;
+const awaitsApproval = (r) => routeOf(r) === "approval";
 // Every tailored job can be applied with one click — including older rows
 // tailored before approval gates carried the status.
-const canApply = (r) => r.status === "tailored" || awaitsApproval(r);
+const canApply = (r) => routeOf(r) === "tailored" || awaitsApproval(r);
 
 /* The pipeline stack. Rank on screen equals rank in the owner's head:
    1 gates blocking an application, 2 tailored work awaiting a go, 3 live

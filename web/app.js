@@ -212,7 +212,14 @@ function tagHtml(s) {
 // Honest, human labels for WHY a job is waiting — never jargon.
 const GATE_LABEL = {
   approval: "awaiting your approval",
-  unknown_field: "needs an answer from you",
+  unknown_field: "manual triage needed",
+  owner_question: "verified question, needs an answer",
+  defect_structural: "structural blocker",
+  defect_provenance: "provenance blocker",
+  defect_tenant: "tenant proof blocker",
+  defect_witness: "witness blocker",
+  defect_ashby_root_identity: "application-root blocker",
+  defect_greenhouse_tenant_alias: "Greenhouse tenant blocker",
   captcha: "CAPTCHA, finish it manually",
   no_account: "account/login needed",
   low_confidence: "needs review",
@@ -228,16 +235,108 @@ function defaultGateText(r) {
 // not finish — each with its reason, screenshot and timeline, nothing hidden.
 // (Skipped/capped are deliberate outcomes, so they live under the closed
 // filter instead.)
-const isStuck = (r) => ["failed", "error", "job_gone", "uncertain"].includes(r.status);
-const RETRYABLE = ["failed", "error", "capped", "uncertain"];
+const DEFECT_CODES = new Set(["defect_structural", "defect_provenance", "defect_tenant",
+  "defect_witness", "defect_ashby_root_identity", "defect_greenhouse_tenant_alias"]);
+const DEFECT_ISSUE_URLS = Object.freeze({
+  defect_ashby_root_identity: "https://github.com/chetwerikoff/AppliedIn/issues/120",
+  defect_greenhouse_tenant_alias: "https://github.com/chetwerikoff/AppliedIn/issues/118",
+});
+const READ_ONLY_ROUTES = new Set(["portal_check", "waiting_for_fix", "manual_triage"]);
+const INTERVENTION_ROUTES = new Set(["owner_question", "approval", "low_confidence", "captcha", "no_account"]);
+// No text-based diagnosis: raw prose and stale non-active gate codes are never
+// authority to answer, approve, or claim a source-specific defect.
+function routeOf(r) {
+  if (!r || typeof r !== "object") return "manual_triage";
+  if (r.submit_hold_state !== "clear" || r.possible_submission === true
+      || r.fail_kind === "uncertain" || r.gate_reason === "submit_uncertain"
+      || r.status === "uncertain") return "portal_check";
+  if (!Object.hasOwn(STATUS_META, r.status)) return "manual_triage";
+  if (r.status !== "needs_human") return r.status;
+  if (r.fail_kind && r.fail_kind !== "") return "manual_triage";
+  if (DEFECT_CODES.has(r.gate_reason))
+    return r.gate_has_form_question === true ? "manual_triage" : "waiting_for_fix";
+  if (r.gate_reason === "owner_question")
+    return r.gate_has_form_question === true
+      && typeof r.gate_question === "string" && !!r.gate_question.trim()
+      ? "owner_question" : "manual_triage";
+  if (["approval", "low_confidence", "captcha", "no_account"].includes(r.gate_reason))
+    return r.gate_reason;
+  return "manual_triage";
+}
+const isReadOnly = (r) => READ_ONLY_ROUTES.has(routeOf(r));
+const isStuck = (r) => isReadOnly(r)
+  || ["failed", "error", "job_gone", "uncertain"].includes(r.status);
+const RETRYABLE = ["failed", "error", "capped"];
+function routeTag(r) {
+  const meta = {portal_check:["Portal check","s-bad"],
+    waiting_for_fix:["Waiting for fix","s-warn"],
+    manual_triage:["Manual triage","s-warn"]}[routeOf(r)];
+  return meta ? `<span class="pill ${meta[1]}">${meta[0]}</span>` : tagHtml(r.status);
+}
+function issueLinkHtml(r) {
+  const url = DEFECT_ISSUE_URLS[r.gate_reason];
+  return url && routeOf(r) === "waiting_for_fix"
+    ? `<a class="diag-link" href="${url}" target="_blank" rel="noopener">View Fix Issue ↗</a>`
+    : '<span class="diag-unlinked">Fix Issue not linked</span>';
+}
+function routeNotice(r) {
+  const kind = routeOf(r);
+  if (kind === "portal_check") {
+    const reason = r.fail_reason || r.submit_hold_reason || "";
+    return `<div class="diag-note diag-portal" role="status"><b>Portal verification required</b>
+      <p>Possible submission or an unverified submit hold. Check the employer portal
+      and reconcile the actual outcome before any separate later attempt.</p>
+      ${reason ? `<p class="diag-raw">${esc(reason)}</p>` : ""}</div>`;
+  }
+  if (kind === "waiting_for_fix") return `<div class="diag-note diag-fix" role="status">
+    <b>Waiting for a code fix</b><p>Diagnostic: ${esc(r.gate_reason)}.
+    No form answer or approval can resolve this.</p>
+    ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}
+    ${issueLinkHtml(r)}</div>`;
+  if (kind === "manual_triage") return `<div class="diag-note diag-triage" role="status">
+    <b>Manual triage required</b><p>There is no verified answerable question,
+    or the status evidence conflicts. Inspect the details; do not retry or approve.</p>
+    ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
+  return "";
+}
+// Every delegated action re-checks current rows. DOM visibility cannot authorize.
+function rowActionAllowed(pk, act) {
+  const r = state.apps.find((item) => item.pk === pk);
+  // A stale control cannot override a blocked or unverified independent hold.
+  if (!r || r.submit_hold_state !== "clear") return false;
+  const kind = routeOf(r);
+  if (READ_ONLY_ROUTES.has(kind)) return false;
+  if (act === "answer") return ["owner_question", "approval", "low_confidence", "tailored"].includes(kind);
+  if (act === "run-now") return kind === "found";
+  if (act === "apply-now") return canApply(r);
+  if (act === "force-apply") return kind === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
+  if (act === "retry") return RETRYABLE.includes(r.status);
+  if (act === "queue-apply") return ["failed", "error", "capped"].includes(kind);
+  if (act === "reopen") return ["skipped", "failed", "error", "job_gone", "capped"].includes(kind) && !r.confirmation_id;
+  if (act === "mark-applied") return kind === "tailored" || INTERVENTION_ROUTES.has(kind);
+  return true;
+}
+// Only active owner questions accept arbitrary text. Keep the existing decision
+// token for approvals without borrowing stale textarea contents.
+function resumeAnswer(pk, value) {
+  const kind = routeOf(state.apps.find((r) => r.pk === pk));
+  if (kind !== "owner_question") return "approved";
+  return (value || "").trim() || null;
+}
+function companyActionAllowed(co) {
+  const key = String(co || "").trim().toLowerCase();
+  return !state.apps.some((r) => (co === "__all__"
+    || String(r.company || "").trim().toLowerCase() === key) && isReadOnly(r));
+}
+
 
 const FILTERS = [
   ["all", "all", () => true],
-  ["pipeline", "in pipeline", (r) => ["found", "tailored", "submitting", "capped"].includes(r.status)],
-  ["needs", "needs you", (r) => r.status === "needs_human"],
-  ["applied", "applied", (r) => ["applied", "applied_manual"].includes(r.status)],
+  ["pipeline", "in pipeline", (r) => !isReadOnly(r) && ["found", "tailored", "submitting", "capped"].includes(r.status)],
+  ["needs", "needs you", (r) => INTERVENTION_ROUTES.has(routeOf(r))],
+  ["applied", "applied", (r) => ["applied", "applied_manual"].includes(routeOf(r))],
   ["stuck", "unable", isStuck],
-  ["closed", "closed", (r) => ["skipped", "job_gone", "capped"].includes(r.status)],
+  ["closed", "closed", (r) => !isReadOnly(r) && ["skipped", "job_gone", "capped"].includes(r.status)],
 ];
 
 // Confidence → colour. 0 = red … 10 = green, continuous through amber.
@@ -525,7 +624,7 @@ function renderDetail(force = false) {
       <button class="cp-lk cp-add-btn" id="cp-dt-save" type="button">Save preferences</button>
       ${n ? `<button class="cp-lk cp-add-btn" id="cp-dt-reset" type="button"
         title="Drop ${esc(co)}'s own values and share yours again">Use shared</button>` : ""}
-      ${rotc ? `<button class="cp-lk cp-add-btn cp-rot-go" id="cp-dt-rotgo" type="button"
+      ${rotc && companyActionAllowed(co) ? `<button class="cp-lk cp-add-btn cp-rot-go" id="cp-dt-rotgo" type="button"
         data-co="${esc(co)}"
         title="Point every un-sent ${esc(co)} job at the rotating address, tailor what has no résumé yet, and queue it all — no further approvals. Bounded by what the address has room for; anything gated on a real question is left alone.">Rotate &amp; approve all</button>` : ""}
       <button class="cp-lk cp-add-btn cp-add-go" id="cp-dt-scan" type="button"
@@ -954,7 +1053,7 @@ function renderTabs() {
   // The Logs tab is the roomy version of the live rail — hide the rail there.
   $(".board").classList.toggle("logs-open", state.tab === "logs" || searching);
   $("#tab-n-apps").textContent = state.apps.length;
-  const needs = state.apps.filter((a) => a.status === "needs_human").length;
+  const needs = state.apps.filter((a) => INTERVENTION_ROUTES.has(routeOf(a))).length;
   const stuck = state.apps.filter(isStuck).length;
   const needsTotal = needs + (state.unassignedReplies || []).length;
   const nb = $("#tab-n-needs"); nb.hidden = !needsTotal; tick(nb, needsTotal);
@@ -978,10 +1077,10 @@ function renderCoFilter() {
 }
 
 // --- Pipeline board (kanban lanes by status) -------------------------------
-const awaitsApproval = (r) => r.gate_reason === "approval" && !!r.gate_question;
+const awaitsApproval = (r) => routeOf(r) === "approval";
 // Every tailored job can be applied with one click — including older rows
 // tailored before approval gates carried the status.
-const canApply = (r) => r.status === "tailored" || awaitsApproval(r);
+const canApply = (r) => routeOf(r) === "tailored" || awaitsApproval(r);
 
 /* The pipeline stack. Rank on screen equals rank in the owner's head:
    1 gates blocking an application, 2 tailored work awaiting a go, 3 live
@@ -1000,9 +1099,13 @@ function queuedPks() {
 }
 
 function sectionOf(r, queued) {
+  const kind = routeOf(r);
+  if (kind === "portal_check") return "portal";
+  if (kind === "waiting_for_fix") return "fix";
+  if (kind === "manual_triage") return "triage";
   if (r.status === "needs_human") {
-    if (queued && queued.has(r.pk)) return "queued";
-    return awaitsApproval(r) ? "ready" : "needs";
+    if (kind === "approval" && queued && queued.has(r.pk)) return "queued";
+    return kind === "approval" ? "ready" : "needs";
   }
   if (r.status === "tailored" || r.status === "tailoring") {
     if (r.status === "tailoring") return "preparing";
@@ -1073,10 +1176,12 @@ function aliasById(id) {
 
 function laneCard(r) {
   let retry = "";
-  if (r.status === "failed" && r.fail_kind === "spam_flagged") {
+  if (isReadOnly(r)) {
+    retry = '<span class="diag-mini">View details to reconcile</span>';
+  } else if (r.status === "failed" && r.fail_kind === "spam_flagged") {
     retry = `<button class="kc-retry" data-act="retry" data-pk="${esc(r.pk)}"
        title="Run this application again with human style clicks">↻ Retry</button>`;
-  } else if (r.status === "needs_human" && r.gate_reason === "captcha") {
+  } else if (routeOf(r) === "captcha" || routeOf(r) === "no_account") {
     retry = `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
        title="View manual completion and portal verification details">View details</button>`;
   } else if (canApply(r)) {
@@ -1265,17 +1370,21 @@ const moreBtn = (key, shown, total, step = REVEAL) =>
    so triage never needs a click; answering happens in the drawer or the
    Needs you tab, both one click away. */
 function gateMini(r) {
-  const captcha = r.gate_reason === "captcha";
-  const act = captcha
+  const kind = routeOf(r);
+  const captcha = kind === "captcha" || kind === "no_account";
+  const act = isReadOnly(r)
+    ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}">View details</button>`
+    : captcha
     ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
          title="View manual completion and portal verification details">View details</button>`
     : `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
-         title="Open the question and type an answer">✎ Answer</button>`;
+         title="${kind === "owner_question" ? "Open the verified question" : "Open the approval decision"}">${kind === "owner_question" ? "✎ Answer" : kind === "approval" ? "Review approval" : "Review decision"}</button>`;
   // Cut at a WORD, not at character 200. "create a Perplexity.ai thread (Option
   // 1: teach ..." stopped mid-phrase, so the card asked you to open the drawer to
   // find out what the question even was — which is the one thing this card exists
   // to save you.
-  const full = String(r.gate_question || defaultGateText(r))
+  const full = String(isReadOnly(r) ? (r.fail_reason || r.gate_question || "Review details")
+    : (r.gate_question || defaultGateText(r)))
     .replace(/[#*_`>]/g, "").replace(/\s+/g, " ").trim();
   const q = full.length <= 240 ? full
     : full.slice(0, 240).replace(/\s+\S*$/, "") + "…";
@@ -1300,8 +1409,8 @@ function foundRow(r) {
     ${r.location ? `<span class="jr-loc" title="${esc(r.location)}">${esc(String(r.location).slice(0, 40))}</span>` : ""}
     ${postedHtml(r.posted_at)}
     <span class="jr-when mono">${r.updated_at ? esc(ago(r.updated_at)) : ""}</span>
-    <button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(r.pk)}"
-      title="Score and tailor this job now. It stops before applying">▶ Run now</button>
+    ${rowActionAllowed(r.pk, "run-now") ? `<button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(r.pk)}"
+      title="Score and tailor this job now. It stops before applying">▶ Run now</button>` : ""}
   </div>`;
 }
 function againHtml(r) {
@@ -1333,7 +1442,7 @@ function appliedRow(r) {
   </div>`;
 }
 function canForceApply(r) {
-  return r.status === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
+  return !isReadOnly(r) && r.status === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
 }
 function forceApplyButton(r, cls = "btn btn-primary") {
   return canForceApply(r) ? `<button class="${cls}" data-act="force-apply" data-pk="${esc(r.pk)}" title="Bypass this role's match score, tailor the résumé, then review before submission"${state.forcePreparing.has(r.pk) ? " disabled" : ""}>Force apply</button>` : "";
@@ -1361,23 +1470,24 @@ async function forceApply(pk) {
 }
 function closedRow(r) {
   const failed = isStuck(r);
+  const guarded = isReadOnly(r);
   let act = "";
-  if (r.status === "failed" && r.fail_kind === "spam_flagged") {
+  if (!guarded && r.status === "failed" && r.fail_kind === "spam_flagged") {
     act = `<button class="kc-retry jr-act" data-act="retry" data-pk="${esc(r.pk)}"
       title="Run this application again with human style clicks">↻ Retry</button>`;
-  } else if (failed) {
+  } else if (failed && !guarded) {
     act = `<button class="kc-retry kc-queue jr-act" data-act="queue-apply" data-pk="${esc(r.pk)}"
       title="Clear the failure and put this job back on the apply queue">↻ Requeue</button>`;
   }
   if (canForceApply(r)) act = forceApplyButton(r, "kc-retry jr-act");
-  if (r.review_rejected) act = `<button class="ps-link jr-act" data-review-undo-pk="${esc(r.pk)}" data-company="${esc(r.company)}">Undo rejection</button>`;
+  if (!guarded && r.review_rejected) act = `<button class="ps-link jr-act" data-review-undo-pk="${esc(r.pk)}" data-company="${esc(r.company)}">Undo rejection</button>`;
   const whyFull = r.closed_reason || r.fail_reason || r.skip_reason || "";
   const why = String(whyFull).replace(/\s+/g, " ").trim().slice(0, 90);
   return `<div class="jrow" data-open="${esc(r.pk)}" role="button" tabindex="0" title="Open details">
     <span class="jr-dot${failed ? " bad" : ""}"></span>
     <span class="jr-co">${esc(r.company)}</span>
     <span class="jr-title">${esc(r.title)}</span>
-    ${failed ? tagHtml(r.status) : ""}
+    ${failed ? routeTag(r) : ""}
     ${why ? `<span class="jr-why" title="${esc(whyFull)}">${esc(why)}</span>` : ""}
     <span class="jr-when mono">${r.updated_at ? esc(ago(r.updated_at)) : ""}</span>
     ${act}
@@ -1392,7 +1502,7 @@ function needsSec(rows) {
       <span class="ps-dot${n ? " on" : ""}"></span>
       <span class="ps-name">Needs you</span>
       <span class="ps-n mono${n ? " hot" : ""}">${n}</span>
-      <span class="ps-hint">${n ? "A question is blocking each of these applications."
+      <span class="ps-hint">${n ? "Verified questions, decisions and manual handoffs need attention."
                                 : "Nothing is waiting on you."}</span>
       ${n ? `<button class="ps-link on" data-goto-needs="1"
         title="The Needs you tab has room to write answers">Open the Needs you tab</button>` : ""}
@@ -1427,6 +1537,7 @@ function readySec(rows) {
 // before tracking catches up, so a running role cannot remain selectable.
 function reviewIsSkipped(r) { return !!r.review_skipped || state.reviewSkipped.has(r.pk); }
 function reviewPhase(r) {
+  if (isReadOnly(r)) return "";
   if (["applied", "applied_manual", "skipped", "failed", "uncertain", "error", "capped", "job_gone"].includes(r.status)) return "";
   if (r.status === "submitting" || (state.queue?.in_flight || []).includes(r.pk)) return "applying";
   if ((state.queue?.pending || []).some((it) => it.pk === r.pk)) return "waiting";
@@ -1588,8 +1699,9 @@ async function reviewAction(action, company, explicitPks = null, day = null) {
     toast("A selected role has started applying. Clear the selection and choose again.");
     return;
   }
-  const picks = explicitPks ? state.apps.filter((r) => r.company === company && explicitPks.includes(r.pk))
-    : selected.length ? selected : action === "apply" ? rows.filter((r) => reviewSelectable(r) && !reviewIsSkipped(r)) : [];
+  const picks = (explicitPks ? state.apps.filter((r) => r.company === company && explicitPks.includes(r.pk))
+    : selected.length ? selected : action === "apply" ? rows.filter((r) => reviewSelectable(r) && !reviewIsSkipped(r)) : [])
+    .filter((r) => !isReadOnly(r) && (action === "undo" ? r.review_rejected : reviewSelectable(r)));
   if (!picks.length || !["reject", "apply", "skip", "restore", "undo"].includes(action)) return;
   if (["reject", "apply"].includes(action)) {
     const detail = action === "reject" ? "They move to Closed. You can undo this decision."
@@ -1723,7 +1835,11 @@ function queuedSec(rows) {
   // is what makes "filter to Microsoft" show Microsoft's queue and not everyone's.
   const pend = (q.pending || [])
     .map((it, gi) => ({ ...it, pos: gi + 1, first: gi < cap && !it.blocked }))
-    .filter((it) => byPk[it.pk]);
+    .filter((it) => byPk[it.pk] && !isReadOnly(byPk[it.pk]));
+  // Even if the entire visible queue became read-only, drop stale selections
+  // before deciding whether there is a queue section to render.
+  const live = new Set(pend.map((it) => it.pk));
+  for (const pk of [...state.qPicked]) if (!live.has(pk)) state.qPicked.delete(pk);
   if (!pend.length) return "";
 
   const running = new Set(q.running || []);
@@ -1769,13 +1885,12 @@ function queuedSec(rows) {
 
   // Ticks are kept for jobs still IN the queue only, so one that drained or was
   // skipped elsewhere cannot sit in the selection and be acted on twice.
-  const live = new Set(pend.map((it) => it.pk));
-  for (const pk of [...state.qPicked]) if (!live.has(pk)) state.qPicked.delete(pk);
   const picked = state.qPicked.size;
 
   const single = groups.size === 1;
   const body = [...groups.entries()].map(([co, list]) => {
     const busy = running.has((co || "").trim().toLowerCase());
+    const safeCompany = companyActionAllowed(co);
     const open = single || state.coFilter === co || state.openQCos.has(co);
     const head = list[0];
     const stateTxt = busy ? "one in flight now"
@@ -1791,11 +1906,11 @@ function queuedSec(rows) {
           <span class="un-gn mono" title="${list.length} job${list.length === 1 ? "" : "s"} queued">${list.length}</span>
           <span class="un-gstate${busy ? "" : head.first ? " next" : ""}">${stateTxt}</span>
         </button>
-        ${(state.rotation || []).some((r) => r.company === (co || "").trim().toLowerCase())
+        ${safeCompany && (state.rotation || []).some((r) => r.company === (co || "").trim().toLowerCase())
           ? `<button class="ps-link un-rot" data-act="rot-co" data-company="${esc(co)}"
               title="Re-point ${esc(co)}'s un-sent jobs at its rotating address — including these, which were queued under the old one — and put every tailored one in line. It stops at the queue; Process runs them."
             >↻ Rotate &amp; queue</button>` : ""}
-        ${(state.profiles || []).some((p) => p.kind !== "rotating") ? (() => {
+        ${safeCompany && (state.profiles || []).some((p) => p.kind !== "rotating") ? (() => {
             const bound = (state.companyProfiles || {})[(co || "").trim().toLowerCase()] || "";
             return `<select class="ps-link un-as${bound ? " on" : ""}" data-co-prof="${esc(co)}"
               title="${bound
@@ -1806,11 +1921,12 @@ function queuedSec(rows) {
                 `<option value="${esc(p.id)}"${p.id === bound ? " selected" : ""}>${esc(p.label)}${p.id === bound ? " ✓" : ""}</option>`).join("")}
             </select>`;
           })() : ""}
-        <button class="ps-link un-go${busy ? "" : " on"}" data-act="drain-co"
+        ${safeCompany ? `<button class="ps-link un-go${busy ? "" : " on"}" data-act="drain-co"
           data-company="${esc(co)}"${busy ? " disabled" : ""}
           title="${busy ? `${esc(co)} already has one running`
                         : `Work through ${esc(co)}'s ${list.length} queued job${list.length === 1 ? "" : "s"}, one after another`}"
-        >${busy ? "● Running" : "▶ Run company queue"}</button>
+        >${busy ? "● Running" : "▶ Run company queue"}</button>`
+        : `<span class="diag-unlinked">Resolve held or unclassified rows before a company-wide queue action.</span>`}
       </div>
       ${open ? `<ol class="un-list">${list.map(row).join("")}</ol>` : ""}
     </div>`;
@@ -1971,6 +2087,10 @@ function companyBar() {
   const rot = (state.rotation || []).find((r) => r.company === co.trim().toLowerCase());
   const rotators = (state.profiles || []).filter((p) => p.kind === "rotating");
   if (!rot && !rotators.length) return "";   // nothing to offer until one exists
+  if (!companyActionAllowed(co)) return `<div class="cbar">
+    <span class="cbar-co">${esc(co)}</span>
+    <span class="cbar-hint">Company-wide actions are unavailable while a row needs portal reconciliation or diagnostic repair.</span>
+  </div>`;
 
   const body = rot ? `
     <span class="cbar-mark">↻</span>
@@ -1991,19 +2111,32 @@ function companyBar() {
     <span class="cbar-co">${esc(co)}</span>${body}</div>`;
 }
 
+function diagnosticSec(rows, title, hint, cls) {
+  if (!rows.length) return "";
+  return `<section class="psec ps-diagnostic ps-${cls} has">
+    <div class="ps-head"><span class="ps-name">${title}</span>
+      <span class="ps-n mono">${rows.length}</span><span class="ps-hint">${hint}</span></div>
+    <div class="diag-grid">${rows.map((r) => `<article class="diag-card">
+      <b>${esc(r.company)} · ${esc(r.title)}</b>${routeNotice(r)}
+      <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button>
+    </article>`).join("")}</div></section>`;
+}
 function viewPipeline() {
   if (!state.apps.length) {
     return `<div class="empty"><div class="empty-big">No applications yet</div>
       Click <b>Discover · All</b> above to find jobs from your watchlist.<br>
       They move down this board: found, then tailored, then applied.</div>`;
   }
-  const S = { preparing: [], needs: [], ready: [], queued: [], flight: [], applied: [], found: [], closed: [] };
+  const S = { portal: [], fix: [], triage: [], preparing: [], needs: [], ready: [], queued: [], flight: [], applied: [], found: [], closed: [] };
   const inQ = queuedPks();
   for (const r of visible(state.apps)) S[reviewPhase(r) === "applying" ? "flight" : sectionOf(r, inQ)].push(r);
   const shown = Object.values(S).reduce((a, b) => a + b.length, 0);
   if (!shown && filtersActive()) return emptyFiltered();
   return `<div class="pstack">
     ${companyBar()}
+    ${diagnosticSec(S.portal, "Portal verification", "Check employer portal and reconcile the outcome.", "portal")}
+    ${diagnosticSec(S.fix, "Waiting for fix", "Code changes are required; an answer cannot clear these gates.", "fix")}
+    ${diagnosticSec(S.triage, "Manual triage", "The cause is not verified; no action can be inferred.", "triage")}
     ${S.needs.length ? needsSec(S.needs) : ""}
     ${S.preparing.length ? `<section class="psec ps-preparing"><div class="ps-head"><span class="ps-name">Preparing résumés</span><span class="ps-n mono">${S.preparing.length}</span><span class="ps-hint">Scoring and tailoring. The completion date appears when the résumé is saved.</span></div><div class="ps-grid">${S.preparing.map(laneCard).join("")}</div></section>` : ""}
     ${readySec([...S.ready, ...S.queued, ...S.flight])}
@@ -2211,12 +2344,12 @@ function viewApps() {
       ? `<a class="rowlk" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener" title="Last screenshot" aria-label="Last screenshot">${ICON.shot}</a>`
       : `<span class="rowlk off" title="No screenshot">${ICON.shot}</span>`;
     return `<tr data-pk="${esc(r.pk)}">
-      <td>${tagHtml(r.status)}</td>
+      <td>${routeTag(r)}</td>
       <td class="t-co">${esc(r.company)}</td>
-      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
+      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(routeOf(r)) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
       <td>${scoreHtml(r.match_score)}</td>
       <td><span class="t-links">${cv}${jd}${sc}</span></td>
-      <td class="t-when t-applied">${["applied", "applied_manual"].includes(r.status)
+      <td class="t-when t-applied">${["applied", "applied_manual"].includes(routeOf(r))
         ? appliedDateHtml(r.applied_at) : "—"}</td>
       <td class="t-when">${ago(r.updated_at)}</td>
     </tr>`;
@@ -2243,34 +2376,45 @@ function viewApps() {
 
 // --- Needs-you cards -------------------------------------------------------
 function needsCard(r) {
-  const captcha = r.gate_reason === "captcha";
+  const kind = routeOf(r);
+  const manual = kind === "captcha" || kind === "no_account";
+  const owner = kind === "owner_question";
+  const decision = kind === "approval" || kind === "low_confidence";
+  if (isReadOnly(r)) return `<article class="gatecard diag-card">
+    <header><div><span class="gc-co">${esc(r.company)}</span>
+      <span class="gc-role">${esc(r.title)}</span></div>${routeTag(r)}</header>
+    ${routeNotice(r)}
+    <div class="gc-actions"><button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
+  </article>`;
   return `<article class="gatecard">
-    <header>
-      <div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
-      <div class="gc-side">
-        <span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
-        <button class="btn btn-ghost" data-open="${esc(r.pk)}">${captcha ? "View details" : "Details"}</button>
-      </div>
-    </header>
+    <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
+      <div class="gc-side"><span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
+        <button class="btn btn-ghost" data-open="${esc(r.pk)}">Details</button></div></header>
     <div class="gc-q md">${md(r.gate_question || defaultGateText(r))}</div>
-    ${captcha && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
+    ${manual && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
     <div class="gc-answer">
-      ${captcha ? "" : `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
-        placeholder="Type an answer — or leave blank to just approve…"></textarea>`}
+      ${owner ? `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
+        placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="gc-actions">
-        ${captcha
-          ? `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
-               title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`
-          : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
+        ${owner || decision
+          ? `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">
+               ${owner ? "Answer &amp; continue" : kind === "approval" ? "Approve &amp; continue" : "Review &amp; approve"}</button>`
+          : `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
+               title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`}
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip job</button>
         ${r.jd_url ? `<a class="gc-jd" href="${esc(r.jd_url)}" target="_blank" rel="noopener">view posting ↗</a>` : ""}
-      </div>
-    </div>
+      </div></div>
   </article>`;
 }
 function viewNeeds() {
-  const all = state.apps.filter((a) => a.status === "needs_human");
+  const all = state.apps.filter((a) => INTERVENTION_ROUTES.has(routeOf(a)));
   const items = visible(all);
+  const portal = visible(state.apps).filter((r) => routeOf(r) === "portal_check");
+  const fixes = visible(state.apps).filter((r) => routeOf(r) === "waiting_for_fix");
+  const triage = visible(state.apps).filter((r) => routeOf(r) === "manual_triage");
+  const diagnostics = diagnosticSec(portal, "Portal verification", "Reconcile portal outcome before any later attempt.", "portal")
+    + diagnosticSec(fixes, "Waiting for fix", "A verified code defect is not an answerable question.", "fix")
+    + diagnosticSec(triage, "Manual triage", "Unknown or contradictory evidence must be inspected.", "triage");
   const matched = visible(state.apps).filter((app) => (app.replies || []).length)
     .flatMap((app) => app.replies.map((reply) => ({ app, reply })))
     .sort((a, b) => replyTime(b.reply.date) - replyTime(a.reply.date));
@@ -2283,7 +2427,7 @@ function viewNeeds() {
   const search = state.query.trim().toLowerCase();
   const unassigned = (state.unassignedReplies || []).filter((reply) =>
     !search || `${reply.sender || ""} ${reply.subject || ""}`.toLowerCase().includes(search));
-  const eligible = state.apps.filter((app) => ["applied", "applied_manual"].includes(app.status));
+  const eligible = state.apps.filter((app) => ["applied", "applied_manual"].includes(routeOf(app)));
   const unassignedHtml = unassigned.length ? `<section class="reply-section"><h3>Unassigned replies</h3>
     ${unassigned.map((reply) => `<article class="reply-card">${replySummaryHtml(reply)}
       <label>Assign to application<select data-reply-target="${esc(reply.record_id)}">
@@ -2296,10 +2440,10 @@ function viewNeeds() {
     ${items.filter(approveAllPicks).length ? `<button class="btn btn-amber" data-approve-all="1">Approve all ${items.filter(approveAllPicks).length} ready</button>` : ""}
     </div>${items.map(needsCard).join("")}</section>` :
     (all.length && filtersActive() && !matched.length && !unassigned.length ? emptyFiltered() : "");
-  if (!items.length && !matched.length && !unassigned.length) return all.length && filtersActive() ? emptyFiltered()
+  if (!items.length && !matched.length && !unassigned.length && !diagnostics) return all.length && filtersActive() ? emptyFiltered()
     : `<div class="empty"><div class="empty-big">Nothing needs you</div>
-        The pipeline is running clean — questions and approvals will land here.</div>`;
-  return gateHtml + matchedHtml + unassignedHtml;
+        Questions and approvals will land here.</div>`;
+  return diagnostics + gateHtml + matchedHtml + unassignedHtml;
 }
 
 // --- Unable-to-do-it cards -------------------------------------------------
@@ -2315,7 +2459,7 @@ function viewStuck() {
           with the reason and what the browser last saw.</div>`;
   }
   return items.map((r) => {
-    const reason = r.closed_reason || r.gate_question || "Couldn't complete this application.";
+    const reason = isReadOnly(r) ? "" : (r.closed_reason || r.gate_question || "Couldn't complete this application.");
     const shot = imgOk(r.screenshot_url)
       ? `<a class="stuck-shot" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener"
            title="What the browser last saw — click to enlarge">
@@ -2329,16 +2473,16 @@ function viewStuck() {
       <div class="stuck-main">
         <header>
           <div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
-          ${tagHtml(r.status)}
+          ${routeTag(r)}
         </header>
-        <div class="stuck-reason">${esc(reason)}</div>
+        ${isReadOnly(r) ? routeNotice(r) : `<div class="stuck-reason">${esc(reason)}</div>`}
         ${steps ? `<div class="mini-timeline">${steps}</div>` : ""}
         <div class="stuck-meta mono">
           ${r.discovered_at ? `found ${when(r.discovered_at)} · ` : ""}${esc(r.pk)}
           ${r.jd_url ? ` · <a href="${esc(r.jd_url)}" target="_blank" rel="noopener">posting ↗</a>` : ""}
         </div>
         <div class="gc-actions">
-          ${RETRYABLE.includes(r.status)
+          ${!isReadOnly(r) && RETRYABLE.includes(r.status)
             ? `<button class="btn btn-primary" data-act="retry" data-pk="${esc(r.pk)}">Retry</button>` : ""}
           <button class="btn btn-ghost" data-open="${esc(r.pk)}">
             Full details${nf ? ` · ${nf} fields` : ""}</button>
@@ -2610,7 +2754,7 @@ function demoFresh() {
 function freshRow(j, byPk) {
   const r = byPk.get(j.pk) || j;
   const hot = (Number(j.age_hours) || 0) <= 24;
-  const run = r.status === "found"
+  const run = rowActionAllowed(j.pk, "run-now")
     ? `<button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(j.pk)}"
         title="Score and tailor this job now. It stops before applying">▶ Run now</button>` : "";
   return `<div class="jrow fresh-row${hot ? " hot" : ""}" data-open="${esc(j.pk)}"
@@ -3111,6 +3255,8 @@ function appsSig() {
     s += a.pk + "\u0001" + a.status + "\u0001" + (a.updated_at || "") + "\u0001"
        + (a.applied_at || "") + "\u0001"
        + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
+       + (a.submit_hold_state || "missing") + ":" + (a.possible_submission ? "p" : "")
+       + ":" + (a.fail_kind || "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
        + (a.jd_read_error || "") + "\u0001" + (a.score_override ? "o" : "") + "\u0001"
        + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "")
@@ -3158,7 +3304,7 @@ function viewProfiles() {
         ${isDef ? `<span class="pr-tag">DEFAULT</span>` : ""}
         <span class="pv-acts">
           ${isDef ? "" : `<button class="pv-act" data-prof-default="${esc(p.id)}" title="Make this the default identity">Default</button>`}
-          <button class="pv-act" data-prof-all="${esc(p.id)}" title="Re-render every tailored résumé on the whole board with this identity. No model is called.">Whole board</button>
+          ${companyActionAllowed("__all__") ? `<button class="pv-act" data-prof-all="${esc(p.id)}" title="Re-render every tailored résumé on the whole board with this identity. No model is called.">Whole board</button>` : ""}
           <button class="pv-act del" data-prof-del="${esc(p.id)}" title="Remove this identity">✕</button>
         </span>
       </div>
@@ -3178,7 +3324,7 @@ function viewProfiles() {
         <span class="pv-name">${esc(p.label)}</span>
         <span class="pr-tag rot">ROTATING · ${p.limit || 5} each · ${esc(p.style === "dot" ? "gmail dot" : "+tag")}</span>
         <span class="pv-acts">
-          ${mine.length ? `<button class="pv-act" data-act="rot-co" data-company="__all__" title="Re-point every rotating company's un-sent jobs at its current address and queue them">↻ Rotate &amp; queue all</button>` : ""}
+          ${mine.length && companyActionAllowed("__all__") ? `<button class="pv-act" data-act="rot-co" data-company="__all__" title="Re-point every rotating company's un-sent jobs at its current address and queue them">↻ Rotate &amp; queue all</button>` : ""}
           <button class="pv-act del" data-prof-del="${esc(p.id)}" title="Remove this template">✕</button>
         </span>
       </div>
@@ -3780,7 +3926,16 @@ async function loadApps() {
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
     renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
-  } catch { /* transient — next poll wins */ }
+    if (state.openPk && !$("#drawer").hidden) {
+      const current = state.apps.find((item) => item.pk === state.openPk);
+      if (current && routeOf(current) !== state.openRoute) openDrawer(current.pk);
+    }
+  } catch {
+    // A failed authoritative projection may not leave stale "clear" controls.
+    state.apps = state.apps.map((r) => ({ ...r, submit_hold_state: "unknown" }));
+    renderTabs(); refreshPane();
+    if (state.openPk && !$("#drawer").hidden) openDrawer(state.openPk);
+  }
 }
 
 // Poll /stats every ~3s: drives the running-state of the two buttons, the
@@ -4105,8 +4260,16 @@ async function runCompany(name, careersUrl, again = false, silent = false) {
 async function runProcess(again = false) {
   if (demoGuard() || state.stats.processing) return;
   if (!state.picked.size) { toast("Select at least one company to process."); return; }
-  const n = state.stats.found_waiting ?? 0;
   const scope = discoverScope();  // same picked companies as Discover
+  // Preparing selected companies must not be blocked by an unrelated legacy gate.
+  // An unscoped request still covers all companies and requires a clean board.
+  const allowed = scope.length ? scope.every((co) => companyActionAllowed(co))
+    : companyActionAllowed("__all__");
+  if (!allowed) {
+    toast("Review unresolved portal, code or triage rows in the selected companies.");
+    return;
+  }
+  const n = state.stats.found_waiting ?? 0;
   if (!beginLaunch("prepare", "Starting preparation — matching jobs and preparing résumés…")) return;
   state.stats.processing = true;    // optimistic; poll confirms
   renderDeck();
@@ -4135,7 +4298,8 @@ async function runProcess(again = false) {
    overwrites this on its next poll, so a failed start corrects itself. */
 function markTailoring(pk) {
   const row = state.apps.find((a) => a.pk === pk);
-  if (row) row.status = "tailoring";
+  if (!row || isReadOnly(row)) return;
+  row.status = "tailoring";
   state.activity[pk] = { detail: "scoring and tailoring…", at: Date.now() / 1000,
                          kind: "running" };
   renderPane();
@@ -4144,7 +4308,8 @@ function markTailoring(pk) {
 
 function markBusy(pk, detail) {
   const row = state.apps.find((a) => a.pk === pk);
-  if (row) row.status = "submitting";
+  if (!row || isReadOnly(row)) return;
+  row.status = "submitting";
   state.activity[pk] = { detail, at: Date.now() / 1000, kind: "running" };
   renderPane();        // move the card into its working state
   scheduleLive(pk);    // and show the live line, same path the SSE feed uses
@@ -4223,10 +4388,21 @@ function retailorFoot(pk, busy, kept) {
 
 function paneAction(act, pk, el) {
   if (demoGuard()) return;
+  if (["rot-co", "drain-co"].includes(act)) {
+    const co = el?.dataset?.company || "";
+    if (!co || !companyActionAllowed(co)) {
+      toast("Resolve held or unverified rows before a company-wide action.");
+      return;
+    }
+  } else if (act !== "qsel-bulk" && !rowActionAllowed(pk, act)) {
+    toast("Read-only until this application is reconciled or its cause is verified.");
+    return;
+  }
   if (act === "force-apply") { forceApply(pk); return; }
   if (act === "answer") {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
-    const answer = (t?.value || "").trim() || "approved";
+    const answer = resumeAnswer(pk, t?.value);
+    if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
     // Reload the queue as soon as the approve lands, so the card LEAVES "Ready to
     // apply" and reappears under Queued with its position. Without that refresh the
     // row sits exactly where it was until the next poll and the click reads as dead.
@@ -4279,9 +4455,10 @@ function paneAction(act, pk, el) {
     // endpoint one at a time — a bulk button is a convenience over the existing
     // action, never a second path that could disagree with it about what
     // skipping means.
-    const pks = [...state.qPicked];
-    if (!pks.length) return;
     const skip = el.dataset.mode === "skip";
+    const pks = [...state.qPicked].filter((pk) =>
+      rowActionAllowed(pk, skip ? "queue-skip" : "queue-remove"));
+    if (!pks.length) return;
     if (skip && !confirm(`Skip ${pks.length} job${pks.length === 1 ? "" : "s"}?`
         + `\n\nThey leave the queue and move to closed. Removing instead keeps`
         + ` them on the board under Ready to apply.`)) return;
@@ -4359,12 +4536,7 @@ async function stopRun(what = "discover", ask = true) {
 
 // Confirm and enqueue the same visible jobs. A company filter used to change
 // the button count while the request still approved the entire application list.
-const approveAllPicks = (a) =>
-  a.gate_reason !== "captcha"
-  && (a.status === "tailored"
-      || (a.status === "needs_human"
-          && (a.gate_reason === "approval"
-              || String(a.gate_question || "").startsWith("Ready to apply"))));
+const approveAllPicks = (a) => routeOf(a) === "tailored" || routeOf(a) === "approval";
 
 function visibleApprovalPicks() {
   const queued = queuedPks();
@@ -4453,6 +4625,8 @@ function openDrawer(pk) {
   if (!state.trackerLoaded) loadTracker();
   const r = state.apps.find((a) => a.pk === pk);
   if (!r) return;
+  const guarded = isReadOnly(r);
+  const kind = routeOf(r);
   const links = [["JD", r.jd_url], ["Resume PDF", r.resume_url], ["Screenshot", r.screenshot_url]]
     .map(([l, h]) => h
       ? `<a class="lk" href="${esc(h)}" target="_blank" rel="noopener">${l}</a>`
@@ -4472,7 +4646,7 @@ function openDrawer(pk) {
     `<div class="tl"><div class="tl-dot ${t.done ? "done" : ""}"></div>
       <div><div class="tl-label">${esc(t.label)}</div><div class="tl-time">${when(t.at)}</div></div></div>`).join("");
 
-  const canRetailor = !["applied", "applied_manual", "submitting"].includes(r.status);
+  const canRetailor = !guarded && !["applied", "applied_manual", "submitting"].includes(r.status);
   const retailoring = r.status === "tailoring";
   const kept = (r.tailor_note || "").trim();
   const retailor = canRetailor ? `
@@ -4497,27 +4671,33 @@ function openDrawer(pk) {
       </div>
     </div>` : "";
 
-  const captchaHandoff = r.status === "needs_human" && r.gate_reason === "captcha";
-  const gate = (r.status === "needs_human" || canApply(r)) ? `
+  const captchaHandoff = kind === "captcha" || kind === "no_account";
+  const ownerQuestion = kind === "owner_question";
+  const reviewDecision = kind === "approval" || kind === "low_confidence";
+  const gated = !guarded && (INTERVENTION_ROUTES.has(kind) || canApply(r));
+  const gate = gated ? `
     <div class="section gate-box">
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
       ${captchaHandoff && r.gate_question ? `<div class="gate-q md">${esc(defaultGateText(r))}</div>` : ""}
-      ${captchaHandoff ? "" : `<textarea id="gate-answer" class="gate-input" rows="2"
-        placeholder="Type your answer, or leave blank to approve &amp; continue…"></textarea>`}
+      ${ownerQuestion ? `<textarea id="gate-answer" class="gate-input" rows="2"
+        placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="drawer-actions">
-        ${captchaHandoff ? "" : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
+        ${ownerQuestion || reviewDecision || canApply(r)
+          ? `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">${ownerQuestion
+              ? "Answer &amp; continue" : kind === "low_confidence"
+                ? "Review &amp; approve" : "Approve &amp; continue"}</button>` : ""}
         <button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
-          title="It already went through (you got the email / saw the confirmation) — mark applied, don't resubmit">✓ Already applied</button>
+          title="Only after verifying the employer portal confirms submission">✓ Already applied</button>
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip</button>
       </div>
     </div>` : "";
 
-  const canRetry = RETRYABLE.includes(r.status);
+  const canRetry = !guarded && RETRYABLE.includes(r.status);
   // A closed job that was never sent can go back in play. It is offered on the
   // skipped ones especially: a role skipped as a low score under preferences you
   // have since fixed had no way back, and "Run now" silently refused it.
-  const canReopen = !["applied", "applied_manual", "submitting"].includes(r.status)
+  const canReopen = !guarded && !["applied", "applied_manual", "submitting"].includes(r.status)
                     && !r.confirmation_id
                     && ["skipped", "failed", "error", "job_gone", "capped"].includes(r.status);
   const closed = r.closed_reason ? `
@@ -4541,7 +4721,7 @@ function openDrawer(pk) {
         <img src="${esc(r.screenshot_url)}" alt="last screenshot" loading="lazy"></a></div>` : "";
 
   // A job still moving through the pipeline can be pulled out.
-  const active = ["found", "tailored", "submitting"].includes(r.status);
+  const active = !guarded && ["found", "tailored", "submitting"].includes(r.status);
   const cancel = active ? `
     <div class="drawer-actions" style="margin-top:0;margin-bottom:22px">
       <button class="btn btn-danger" data-act="cancel" data-pk="${esc(r.pk)}">
@@ -4558,7 +4738,7 @@ function openDrawer(pk) {
     r.ats ? ["ATS", esc(r.ats)] : null,
     r.mode ? ["mode", esc(r.mode)] : null,
     ["confirmation", `<span class="mono">${esc(r.confirmation_id || "—")}</span>`],
-    ["applied", "applied_manual"].includes(r.status)
+    ["applied", "applied_manual"].includes(kind)
       ? ["applied on", appliedDateHtml(r.applied_at, true)] : null,
     ["job id", `<span class="mono">${esc(r.pk)}</span>`],
   ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
@@ -4577,7 +4757,7 @@ function openDrawer(pk) {
     : "";
 
   $("#drawer-body").innerHTML = `
-    ${trackerEditor(r)}
+    ${guarded ? routeNotice(r) : trackerEditor(r)}
     ${gate}
     ${failBlock}
     ${r.jd_read_error ? `<div class="section drawer-fail"><div class="section-t">Posting read paused</div><div class="fail-text">${esc(r.jd_read_error)}</div><p>Kept in Found. Run preparation again when the reader is available.</p></div>` : ""}
@@ -4585,7 +4765,7 @@ function openDrawer(pk) {
     ${closed}
     <div class="section"><div class="section-t">status</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        ${tagHtml(r.status)}${scoreHtml(r.match_score)}
+        ${routeTag(r)}${scoreHtml(r.match_score)}
         ${r.gate_reason && r.status === "needs_human"
           ? `<span class="mono" style="font-size:12px;color:var(--faint)">${esc(gateLabel(r.gate_reason))}</span>` : ""}
       </div></div>
@@ -4599,7 +4779,7 @@ function openDrawer(pk) {
         View résumé · ${esc(r.resume_version)}</button>` : ""}</div>
 
     ${retailor}
-    ${["applied", "applied_manual"].includes(r.status) ? (() => {
+    ${!guarded && ["applied", "applied_manual"].includes(r.status) ? (() => {
       const usedIds = new Set([r.profile_id || state.profileDefault, ...(state.apps.filter((a) => (a.reapplied_from || "") === r.pk.split("~")[0] || a.pk === r.pk.split("~")[0]).map((a) => a.profile_id || state.profileDefault))]);
       const choices = (state.profiles || []).filter((p) => p.kind !== "rotating" && !usedIds.has(p.id));
       const again = (r.reapplied_as || []);
@@ -4630,7 +4810,7 @@ function openDrawer(pk) {
 
     ${tl ? `<div class="section"><div class="section-t">timeline</div><div class="timeline">${tl}</div></div>` : ""}
 
-    <div class="section"><div class="section-t">applying as</div>
+    ${!guarded ? `<div class="section"><div class="section-t">applying as</div>
       <div class="profpick">
         <select id="job-profile" data-job-profile="${esc(r.pk)}">
           <option value=""${r.profile_id ? "" : " selected"}>default${
@@ -4646,6 +4826,9 @@ function openDrawer(pk) {
             and is counted against its limit; picking another one here leaves it
             counted, because the slot is what protects the address.` : ""}</div>
       </div></div>
+` : `<div class="section"><div class="section-t">applying as</div>
+      <p class="diag-unlinked">Read-only until this blocker or portal outcome is reconciled.</p>
+    </div>`}
 
     <div class="section"><div class="section-t">everything the agent did
       <button class="cp-lk agentlog-re" data-agentlog="${esc(r.pk)}" type="button">refresh</button></div>
@@ -4668,6 +4851,7 @@ function openDrawer(pk) {
     $("#drawer").classList.add("show");
   });
   state.openPk = r.pk;
+  state.openRoute = routeOf(r);
   rtStop();
   if (retailoring) rtBegin(r.pk);
   if (r.has_diff) loadDiff(r.pk);
@@ -5137,14 +5321,16 @@ function wire() {
   $("#drawer").addEventListener("input", (e) => {
     const field = e.target.dataset.track;
     if (!field) return;
-    const pk = e.target.closest("[data-tracker-pk]").dataset.trackerPk;
+    const pk = e.target.closest("[data-tracker-pk]")?.dataset.trackerPk;
+    if (!rowActionAllowed(pk, "save-tracker")) return;
     const draft = state.trackerDrafts[pk] ||= { ...(state.tracker[pk] || {}) };
     draft[field] = e.target.value;
     $("#tracker-state").textContent = "Unsaved changes";
   });
   $("#drawer").addEventListener("click", (e) => {
     const button = e.target.closest("[data-save-tracker]");
-    if (button) saveTracker(button.dataset.saveTracker);
+    if (button && rowActionAllowed(button.dataset.saveTracker, "save-tracker"))
+      saveTracker(button.dataset.saveTracker);
   });
   $("#pane").addEventListener("change", (e) => {
     if (e.target.id === "review-sort") setReviewSort(e.target.value);
@@ -5421,6 +5607,10 @@ function wire() {
     if (rotgo) {
       if (demoGuard()) return;
       const company = rotgo.dataset.co;
+      if (!company || !companyActionAllowed(company)) {
+        toast("Resolve held or unverified rows before rotating this company.");
+        return;
+      }
       rotgo.disabled = true;
       rotgo.classList.add("is-busy");
       rotgo.textContent = "rotating…";
@@ -5653,7 +5843,7 @@ function wire() {
     // rather than in a second place that could disagree with this one.
     const all = $("#btn-rotate-all");
     if (all) {
-      all.hidden = !rows.length;
+      all.hidden = !rows.length || !rows.every((r) => companyActionAllowed(r.company));
       const n = $("#rot-count");
       if (n) { n.hidden = !rows.length; n.textContent = String(rows.length); }
     }
@@ -5774,6 +5964,10 @@ function wire() {
     if (demoGuard()) return;
     const cos = (state.rotation || []).map((r) => r.company);
     if (!cos.length) return;
+    if (!cos.every((co) => companyActionAllowed(co))) {
+      toast("Resolve held or unverified rows before rotating these companies.");
+      return;
+    }
     if (!confirm(`Rotate and queue ${cos.length} compan${cos.length === 1 ? "y" : "ies"}`
                + ` — ${cos.join(", ")}?\n\nEvery un-sent job at these employers is`
                + ` re-pointed at that employer's rotating address, and each one with`
@@ -5840,6 +6034,10 @@ function wire() {
     const all = e.target.closest("[data-prof-all]");
     if (all) {
       if (demoGuard()) return;
+      if (!companyActionAllowed("__all__")) {
+        toast("Resolve held or unverified rows before changing the whole board.");
+        return;
+      }
       const p = state.profiles.find((x) => x.id === all.dataset.profAll) || {};
       if (!confirm(`Re-render every tailored résumé with ${p.label}'s details `
                  + `(${p.email})?\n\nThe tailoring itself is kept — only the contact `
@@ -6219,7 +6417,10 @@ function wire() {
     const undo = e.target.closest("[data-review-undo]");
     if (undo) { reviewAction("undo", undo.dataset.reviewUndo, state.reviewNotices[undo.dataset.reviewUndo]?.undo || []); return; }
     const reviewTick = e.target.closest("[data-review-pick]");
-    if (reviewTick) { paintReviewSelection(reviewTick, e.shiftKey); return; }
+    if (reviewTick) {
+      if (!rowActionAllowed(reviewTick.dataset.reviewPick, "review-pick")) return;
+      paintReviewSelection(reviewTick, e.shiftKey); return;
+    }
     const reviewClear = e.target.closest("[data-review-clear]");
     if (reviewClear) { state.apps.filter((r) => r.company === reviewClear.dataset.reviewClear && (reviewClear.dataset.reviewDay == null || reviewDay(r) === reviewClear.dataset.reviewDay || !reviewSelectable(r))).forEach((r) => state.reviewPicked.delete(r.pk)); paintReviewControls(); return; }
     const reviewSelect = e.target.closest("[data-review-select]");
@@ -6237,6 +6438,7 @@ function wire() {
     const runNow = e.target.closest('[data-act="run-now"]');
     if (runNow) {
       e.stopPropagation();
+      if (!rowActionAllowed(runNow.dataset.pk, "run-now")) return;
       if (!demoGuard()) {
         const pk = runNow.dataset.pk;
         // Move the card OUT of Found straight away. Scoring and tailoring take a
@@ -6257,6 +6459,7 @@ function wire() {
     if (rotOn) {
       if (demoGuard()) return;
       const company = rotOn.dataset.rotOn;
+      if (!companyActionAllowed(company)) return;
       rotOn.disabled = true;
       rotOn.classList.add("is-busy");
       post("/actions/rotation", { company, profile_id: rotOn.dataset.profile })
@@ -6273,6 +6476,7 @@ function wire() {
     if (rotOff) {
       if (demoGuard()) return;
       const company = rotOff.dataset.rotOff;
+      if (!companyActionAllowed(company)) return;
       post("/actions/rotation", { company, profile_id: "" }).then(async () => {
         await loadRotation();
         toast(`${company} no longer rotates. Addresses already used are kept.`);
@@ -6283,12 +6487,14 @@ function wire() {
     const tick = e.target.closest("[data-qsel]");
     if (tick) {
       const pk = tick.dataset.qsel;
+      if (!rowActionAllowed(pk, "queue-remove")) return;
       state.qPicked.has(pk) ? state.qPicked.delete(pk) : state.qPicked.add(pk);
       qselPaint(tick.closest(".un-row"), state.qPicked.has(pk));
       return;
     }
     if (e.target.closest("[data-qsel-all]")) {
       document.querySelectorAll("[data-qsel]").forEach((cb) => {
+        if (!rowActionAllowed(cb.dataset.qsel, "queue-remove")) return;
         state.qPicked.add(cb.dataset.qsel);
         cb.checked = true;
         qselPaint(cb.closest(".un-row"), true);
@@ -6460,6 +6666,7 @@ function wire() {
     if (ra) {
       if (!ra.value || demoGuard()) return;
       const pk = ra.dataset.reapplyProf, profile_id = ra.value;
+      if (!rowActionAllowed(pk, "reapply")) { ra.value = ""; return; }
       const p = state.profiles.find((x) => x.id === profile_id) || {};
       if (!confirm(`Apply to this posting again as ${p.label} (${p.email})?\n\nThe employer will receive a second application from a different address. The one already sent is kept as is.`)) { ra.value = ""; return; }
       ra.disabled = true;
@@ -6482,7 +6689,7 @@ function wire() {
     }
     const rc = e.target.closest("[data-rule-co]");
     if (rc) {
-      if (demoGuard()) return;
+      if (demoGuard() || !companyActionAllowed(rc.dataset.ruleCo)) return;
       const company = rc.dataset.ruleCo, k = coKey(company);
       const was = (state.companyProfiles || {})[k] || "";
       const rotB = (state.rotation || []).find((r) => coKey(r.company) === k) || null;
@@ -6496,7 +6703,7 @@ function wire() {
     }
     const pc = e.target.closest("[data-prof-co]");
     if (pc) {
-      if (!pc.value || demoGuard()) return;
+      if (!pc.value || demoGuard() || !companyActionAllowed(pc.value)) return;
       const company = pc.value, profile_id = pc.dataset.profCo;
       const p = state.profiles.find((x) => x.id === profile_id) || {};
       pc.disabled = true;
@@ -6512,7 +6719,7 @@ function wire() {
       return;
     }
     const sel = e.target.closest("[data-co-prof]");
-    if (!sel || demoGuard()) return;
+    if (!sel || demoGuard() || !companyActionAllowed(sel.dataset.coProf)) return;
     const co = sel.dataset.coProf, profile_id = sel.value;
     const was = (state.companyProfiles || {})[(co || "").trim().toLowerCase()] || "";
     if (profile_id === was) return;
@@ -6531,6 +6738,7 @@ function wire() {
     const sel = e.target.closest("[data-job-profile]");
     if (!sel || demoGuard()) return;
     const pk = sel.dataset.jobProfile;
+    if (!rowActionAllowed(pk, "job-profile")) return;
     const d = await post(`/actions/job-profile/${encodeURIComponent(pk)}`,
                          { profile_id: sel.value });
     if (!d || !d.ok) { toast((d && d.error) || "Couldn't set the profile."); return; }
@@ -6550,11 +6758,13 @@ function wire() {
     if (demoGuard()) return;
     const pk = act.dataset.pk;
     const kind = act.dataset.act;
+    if (!rowActionAllowed(pk, kind)) return;
     if (kind === "force-apply") {
       return forceApply(pk).then((started) => { if (started) closeDrawer(); });
     }
     if (kind === "answer") {
-      const answer = ($("#gate-answer")?.value || "").trim() || "approved";
+      const answer = resumeAnswer(pk, $("#gate-answer")?.value);
+      if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
       post(`/actions/resume/${encodeURIComponent(pk)}`, { answer });
       toast("Sent — pipeline resuming.");
     } else if (kind === "retailor") {

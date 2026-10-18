@@ -354,6 +354,16 @@ for(let i=0;i<(spec.tokens || []).length;i++) {
   if(spec.claim) node('input',{role:'combobox',type:'text','data-value-input':token.id,'aria-haspopup':'true','aria-autocomplete':'list'},token.parentElement);
 }
 if(spec.tokenSiblingBadge)node('div',{class:'grecaptcha-badge'},body);
+if(spec.domOrder) {
+  // Unlike insertion order, actual querySelectorAll follows the current DOM
+  // tree. Reordered inert siblings must genuinely re-key the witness census.
+  const ordered=[];
+  const visit=e=>{ordered.push(e);for(const child of e.children)visit(child);};
+  visit(body);
+  if(ordered.length!==nodes.length || new Set(ordered).size!==nodes.length)
+    throw Error('Incomplete synthetic DOM tree order');
+  nodes.splice(0,nodes.length,...ordered);
+}
 // Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.
 const ids=new Map();for(const n of nodes) {
   if(!n.id)continue;

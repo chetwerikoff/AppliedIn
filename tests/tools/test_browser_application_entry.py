@@ -272,7 +272,13 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     _, _, session, decide = world(monkeypatch, ats, [page])
     report = await attempt(ats)
     assert report['status'] == 'gate'
-    assert 'native form receiver not proven' in report['question']
+    if ats == 'ashby':
+        # The synthetic receiver edit disagrees with the independently read
+        # raw action/override census; this earlier fail-closed gate is correct.
+        assert 'cross-owned or contradictory native application census' in report['question']
+    else:
+        assert 'native form receiver not proven' in report['question']
+    assert report.get('form_question') is None
     assert not decide.await_count
     no_mutations(session)
 

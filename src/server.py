@@ -3006,3 +3006,14 @@ def _recover_stuck(settings) -> None:  # noqa: ANN001
                 len(stuck), len(mid))
     except Exception:  # noqa: BLE001 - never block startup on recovery
         logging.getLogger("server").exception("orphan recovery failed")
+
+
+def serve(host: str = "127.0.0.1", port: int = 8787) -> None:
+    import uvicorn
+
+    _recover_stuck(get_settings())
+    uvicorn.run(create_app(), host=host, port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    serve()

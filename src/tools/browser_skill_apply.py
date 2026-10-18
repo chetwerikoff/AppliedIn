@@ -2671,6 +2671,9 @@ def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> Non
     chosen = receipt.get('committed_caption')
     value = receipt.get('committed_value')
     hidden = receipt.get('hidden_selector', '')
+    owner = combo.get('location_owner')
+    receiver = combo.get('location_receiver')
+    selected_option = combo.get('location_selected_option')
     if (not isinstance(receipt, _LeverLocationReceipt)
             or receipt._witnessed != tuple(sorted(receipt.items()))
             or receipt.get('action') != 'combobox'
@@ -2691,6 +2694,23 @@ def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> Non
             or not isinstance(value, str) or not value
             or not equivalent_location(receipt.get('approved_value'), chosen)
             or combo.get('linked') is not True
+            or not isinstance(owner, dict) or owner.get('valid') is not True
+            or owner.get('link_id') != combo.get('link_id')
+            or owner.get('listbox_selector') != combo.get('listbox_selector')
+            or not isinstance(receiver, dict) or receiver.get('valid') is not True
+            or tuple(sorted(receiver.items())) != receipt.get('location_receiver_proof')
+            or (receiver.get('declared') is True and (
+                receiver.get('count') != 1 or not hidden))
+            or (receiver.get('declared') is False and (
+                receiver.get('count') != 0 or bool(hidden)))
+            or receiver.get('declared') not in (True, False)
+            or not isinstance(selected_option, dict)
+            or selected_option.get('selector') != receipt.get('location_option_selector')
+            or selected_option.get('label') != chosen
+            or selected_option.get('value') != value
+            or selected_option.get('tag') not in {'li', 'div', 'span'}
+            or selected_option.get('selected') is not True
+            or selected_option.get('safe') is not True
             or combo.get('link_id') != receipt.get('location_link_id')
             or combo.get('listbox_selector') != receipt.get('location_listbox_selector')
             or target.get('value') != chosen or target.get('has_value') is not True
@@ -2760,7 +2780,7 @@ async def _execute_lever_location(session, observed: dict, witness: dict,
             or (target.get('combobox') or {}).get('selected_value')):
         raise location_gate('A previous location selection needs human review.')
 
-    async def current_state():
+    async def current_state(*, require_owner=False):
         try:
             current_page, current_witness = await _observe_controls(session, await session.page())
             current = _combobox_options_target(current_page, action)
@@ -2785,6 +2805,24 @@ async def _execute_lever_location(session, observed: dict, witness: dict,
                            **({'fixture_context': ctx} if ctx else {}))
             check_form_destination(current_page, current, job_url or observed['url'],
                                    provenance=provenance)
+            combo = current.get('combobox') or {}
+            receiver = combo.get('location_receiver')
+            hidden = combo.get('hidden_selector', '')
+            # A declared id/name receiver must resolve uniquely within this
+            # native form even while the chosen machine value is still blank.
+            if (not isinstance(receiver, dict) or receiver.get('valid') is not True
+                    or (receiver.get('declared') is True and (
+                        receiver.get('count') != 1 or not hidden))
+                    or (receiver.get('declared') is False and (
+                        receiver.get('count') != 0 or bool(hidden)))
+                    or receiver.get('declared') not in (True, False)):
+                raise location_gate('The Lever location receiver is missing or ambiguous.')
+            if require_owner:
+                owner = combo.get('location_owner')
+                if (not isinstance(owner, dict) or owner.get('valid') is not True
+                        or owner.get('link_id') != combo.get('link_id')
+                        or owner.get('listbox_selector') != combo.get('listbox_selector')):
+                    raise location_gate('The Lever location listbox has unproven exclusive ownership.')
             return current_page, current
         except CaptchaGate:
             raise
@@ -2831,12 +2869,16 @@ async def _execute_lever_location(session, observed: dict, witness: dict,
             raise location_gate('No single verified Current location suggestion matches the approved fact.')
         return matches[0]
 
-    typed_page, typed_target = await current_state()
+    typed_page, typed_target = await current_state(require_owner=True)
     candidate = unique_candidate(typed_target)
     # A new independent PAGE/fixed pair immediately precedes the only option click.
-    before_page, before = await current_state()
+    before_page, before = await current_state(require_owner=True)
     selected_option = unique_candidate(before)
     if (candidate != selected_option
+            or (typed_target.get('combobox') or {}).get('location_receiver')
+                != (before.get('combobox') or {}).get('location_receiver')
+            or (typed_target.get('combobox') or {}).get('location_owner')
+                != (before.get('combobox') or {}).get('location_owner')
             or (typed_target.get('combobox') or {}).get('listbox_selector')
                 != (before.get('combobox') or {}).get('listbox_selector')):
         raise location_gate('The Current location suggestion changed before click.')
@@ -2860,7 +2902,7 @@ async def _execute_lever_location(session, observed: dict, witness: dict,
             raise
         # IPC can fail after a click was delivered; never attempt a second click.
         raise location_gate('Lever location option-click outcome is uncertain; inspect manually.') from None
-    committed_page, committed = await current_state()
+    committed_page, committed = await current_state(require_owner=True)
     combo = committed.get('combobox') or {}
     literal = selected_option['label']
     if (combo.get('selected_text') != literal
@@ -2893,8 +2935,12 @@ async def _execute_lever_location(session, observed: dict, witness: dict,
         'location_link_id': combo['link_id'],
         'location_listbox_selector': combo['listbox_selector'],
         'location_option_selector': selected_option['selector'],
+        'location_receiver_proof': tuple(sorted(combo['location_receiver'].items())),
     })
-    _check_lever_location_commit(committed_page, committed, receipt)
+    try:
+        _check_lever_location_commit(committed_page, committed, receipt)
+    except Gate:
+        raise location_gate('The selected Lever location lost its option or receiver proof.') from None
     filled[committed['selector']] = literal
     return receipt
 

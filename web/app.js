@@ -2333,10 +2333,10 @@ function viewApps() {
     return `<tr data-pk="${esc(r.pk)}">
       <td>${routeTag(r)}</td>
       <td class="t-co">${esc(r.company)}</td>
-      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
+      <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(routeOf(r)) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
       <td>${scoreHtml(r.match_score)}</td>
       <td><span class="t-links">${cv}${jd}${sc}</span></td>
-      <td class="t-when t-applied">${["applied", "applied_manual"].includes(r.status)
+      <td class="t-when t-applied">${["applied", "applied_manual"].includes(routeOf(r))
         ? appliedDateHtml(r.applied_at) : "—"}</td>
       <td class="t-when">${ago(r.updated_at)}</td>
     </tr>`;
@@ -4720,7 +4720,7 @@ function openDrawer(pk) {
     r.ats ? ["ATS", esc(r.ats)] : null,
     r.mode ? ["mode", esc(r.mode)] : null,
     ["confirmation", `<span class="mono">${esc(r.confirmation_id || "—")}</span>`],
-    ["applied", "applied_manual"].includes(r.status)
+    ["applied", "applied_manual"].includes(kind)
       ? ["applied on", appliedDateHtml(r.applied_at, true)] : null,
     ["job id", `<span class="mono">${esc(r.pk)}</span>`],
   ].filter(Boolean).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");

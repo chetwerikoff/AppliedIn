@@ -251,17 +251,36 @@ test('company/search filters and stale queue selection preserve exclusive bucket
   assert.equal(h.fn('rowActionAllowed')('question', 'answer'), true);
 });
 
-test('the drawer delegate rejects stale action controls for held submissions', () => {
+test('the drawer delegate rejects stale action and tracker controls for held submissions', () => {
   const h = harness();
   h.state.apps = [row('held', {submit_hold_state: 'blocked', status: 'applied'})];
   h.fn('wire')();
-  const listeners = h.node('#drawer').listeners.click;
+  const drawer = h.node('#drawer');
+  const listeners = drawer.listeners.click;
   assert.ok(listeners && listeners.length);
-  for (const act of ['answer','skip','cancel','retry','reopen','mark-applied',
-    'force-apply','retailor','apply-now','queue-apply']) {
-    const control = {dataset: {act, pk: 'held'}};
-    const target = {closest: (selector) => selector === '[data-act]' ? control : null};
-    for (const handler of listeners) handler({target, stopPropagation() {}});
-    assert.equal(h.requests.length, 0, act);
+  // wire() performs unrelated initial reads; stale clicks must not add requests.
+  const initialRequests = h.requests.length;
+  vm.runInContext('saveTracker = () => { globalThis.trackerWrites = (globalThis.trackerWrites || 0) + 1; };', h.context);
+  for (const hold of ['blocked', 'unknown']) {
+    h.state.apps[0].submit_hold_state = hold;
+    for (const act of ['answer','skip','cancel','retry','reopen','mark-applied',
+      'force-apply','retailor','apply-now','queue-apply']) {
+      assert.equal(h.fn('rowActionAllowed')('held', act), false, `${hold}:${act}`);
+      const control = {dataset: {act, pk: 'held'}};
+      const target = {closest: (selector) => selector === '[data-act]' ? control : null};
+      for (const handler of listeners) handler({target, stopPropagation() {}});
+      assert.equal(h.requests.length, initialRequests, `${hold}:${act}`);
+    }
+    assert.equal(h.fn('rowActionAllowed')('held', 'save-tracker'), false, hold);
+    const save = {dataset: {saveTracker: 'held'}};
+    const saveTarget = {closest: (selector) => selector === '[data-save-tracker]' ? save : null};
+    for (const handler of listeners) handler({target: saveTarget, stopPropagation() {}});
+    assert.equal(h.context.trackerWrites || 0, 0, `${hold}:save-tracker`);
+    assert.equal(h.requests.length, initialRequests, `${hold}:save-tracker`);
+    const input = {dataset: {track: 'outcome'}, value: 'synthetic',
+      closest: (selector) => selector === '[data-tracker-pk]'
+        ? {dataset: {trackerPk: 'held'}} : null};
+    for (const handler of (drawer.listeners.input || [])) handler({target: input});
+    assert.equal(h.state.trackerDrafts.held, undefined, `${hold}:tracker-input`);
   }
 });

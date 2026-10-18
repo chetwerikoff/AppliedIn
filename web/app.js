@@ -300,8 +300,10 @@ function routeNotice(r) {
 // Every delegated action re-checks current rows. DOM visibility cannot authorize.
 function rowActionAllowed(pk, act) {
   const r = state.apps.find((item) => item.pk === pk);
-  if (!r || isReadOnly(r)) return false;
+  // A stale control cannot override a blocked or unverified independent hold.
+  if (!r || r.submit_hold_state !== "clear") return false;
   const kind = routeOf(r);
+  if (READ_ONLY_ROUTES.has(kind)) return false;
   if (act === "answer") return ["owner_question", "approval", "low_confidence"].includes(kind);
   if (act === "run-now") return kind === "found";
   if (act === "apply-now") return canApply(r);
@@ -5303,14 +5305,16 @@ function wire() {
   $("#drawer").addEventListener("input", (e) => {
     const field = e.target.dataset.track;
     if (!field) return;
-    const pk = e.target.closest("[data-tracker-pk]").dataset.trackerPk;
+    const pk = e.target.closest("[data-tracker-pk]")?.dataset.trackerPk;
+    if (!rowActionAllowed(pk, "save-tracker")) return;
     const draft = state.trackerDrafts[pk] ||= { ...(state.tracker[pk] || {}) };
     draft[field] = e.target.value;
     $("#tracker-state").textContent = "Unsaved changes";
   });
   $("#drawer").addEventListener("click", (e) => {
     const button = e.target.closest("[data-save-tracker]");
-    if (button) saveTracker(button.dataset.saveTracker);
+    if (button && rowActionAllowed(button.dataset.saveTracker, "save-tracker"))
+      saveTracker(button.dataset.saveTracker);
   });
   $("#pane").addEventListener("change", (e) => {
     if (e.target.id === "review-sort") setReviewSort(e.target.value);

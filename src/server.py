@@ -508,7 +508,7 @@ def create_app() -> FastAPI:
                 "submit_hold_reason": submit_hold.REASON,
             }
             for r in rows
-        ]
+        ]}
         if reply_error:
             payload.update(replies=[], error=reply_error)
         return payload

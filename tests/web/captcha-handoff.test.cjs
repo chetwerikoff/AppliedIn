@@ -92,7 +92,7 @@ test('CAPTCHA lane and compact actions navigate to nonmutating details, not answ
 test('Needs-you CAPTCHA has manual controls, no answer field or approval-to-resume', () => {
   const h = harness();
   const captcha = h.fn('needsCard')(row('captcha-needs', 'captcha', 'Check the challenge.'));
-  assert.match(captcha, /View details/);
+  assert.match(captcha, /\bDetails\b/);
   assert.match(captcha, /Already applied/);
   assert.match(captcha, /data-act="mark-applied"/);
   assert.match(captcha, /data-act="skip"/);

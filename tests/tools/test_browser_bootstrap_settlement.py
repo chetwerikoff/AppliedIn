@@ -150,6 +150,7 @@ class NativeTransport:
         self.witnesses = 0
         self.ignore_commit = False
         self.invalid_witness_after_write = False
+        self.invalid_witness_always = False
         self.drift_at_witness = None
 
     async def __aenter__(self):
@@ -186,7 +187,7 @@ class NativeTransport:
             for category in ('entry', 'greenhouse'):
                 if category in source:
                     independent[category] = deepcopy(source[category])
-            if self.invalid_witness_after_write and self.writes:
+            if self.invalid_witness_always or (self.invalid_witness_after_write and self.writes):
                 independent['controls'][0]['unique'] = False
             return {'value': independent}
         assert command in {'fill', 'select', 'click', 'upload'}, command
@@ -392,8 +393,7 @@ async def test_bank_grant_and_failure_matrix_never_writes_without_authority(
             'Gender identification': _grant(case.phone, case.url, 'Yes')}
         raw.state['controls'][0]['label'] = 'Gender identification'
     elif case_kind == 'no-witness':
-        raw.invalid_witness_after_write = False
-        raw.drift_at_witness = 1
+        raw.invalid_witness_always = True
     elif case_kind == 'option-ambiguous':
         case.facts.pop('Phone')
         case.row['human_approved_answers'].pop('Phone')

@@ -2595,7 +2595,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         grants = (_row(pk, fixture_context=fixture_context) if fixture_context
                   else _row(pk)).get('human_approved_answers')
         previous = grants.get(key) if isinstance(grants, dict) else None
-        authority = _bootstrap_grant_state(previous, item, question, value)
+        grant_value = (previous.get('value', '') if kind in {'radio', 'checkbox'}
+                       and not value and isinstance(previous, dict) else value)
+        authority = _bootstrap_grant_state(previous, item, question, grant_value)
         prompt = (_choice_prompt(item, question)
                   if kind in {'radio', 'checkbox', 'combobox'} or kind == 'select'
                   else f'An exact human-approved answer is needed for "{key}".')
@@ -2686,11 +2688,14 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 pk, [receipt], committed, provenance=provenance,
                 **({'fixture_context': fixture_context} if fixture_context else {}))
             _bootstrap_receipt_current(committed, receipt, trial)
-        except Gate:
-            # Once an authorized IPC was attempted, never retry on uncertain
-            # readback: the unbound Gate prevents a second or model write.
+        except (Exception, asyncio.CancelledError) as exc:
+            # A transport failure after an authorized IPC is not proof that the
+            # browser did nothing. Stop without an automatic repeat.
             record('blocked')
-            raise
+            if isinstance(exc, (Gate, asyncio.CancelledError)):
+                raise
+            raise Gate('Native write/readback outcome unclear; inspect manually. '
+                       'No automatic repeat was attempted.') from None
         filled.update(trial)
         history.append(receipt)
         page, witness = committed, observed_witness

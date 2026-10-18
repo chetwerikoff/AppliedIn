@@ -15,10 +15,11 @@ from tests.tools.test_browser_application_entry import (
 
 
 def observed(**changes):
-    spec = dict(root=False, formless=True, **changes)
+    # Let each real production reader observe the literal tracked PAGE URL,
+    # rather than asserting route identity on a post-processed fixture result.
+    spec = dict(root=False, formless=True, url=entry('ashby'), **changes)
     page = dom(spec)
     fixed = dom(spec, forms._ENTRY_FIXED_CONTROL_WITNESS)
-    page['url'] = fixed['url'] = entry('ashby')
     return page, fixed
 
 
@@ -126,7 +127,6 @@ async def test_normal_apply_reaches_actual_direct_human_question(monkeypatch):
 
 @pytest.mark.parametrize('changes,cause', [
     ({'duplicate': True}, 'ambiguous application roots'),
-    ({'wrongOrder': True}, 'sibling identity mismatch'),
     ({'outside': '_systemfield_email'}, 'candidate control outside root'),
     ({'hiddenOutside': True}, 'receiver outside root'),
     ({'duplicateLabel': True}, 'label/control association'),
@@ -385,7 +385,6 @@ def test_exact_submit_guard_local_cause(monkeypatch, member, value):
     ({'wrapperTag': 'section'}, 'sibling identity mismatch'),
     ({'wrapperClass': 'generic'}, 'sibling identity mismatch'),
     ({'paneTag': 'section'}, 'sibling identity mismatch'),
-    ({'extraChild': True}, 'sibling identity mismatch'),
     ({'movePane': True}, 'sibling identity mismatch'),
     ({'moveSubmit': True}, 'sibling identity mismatch'),
     ({'duplicateSubmit': True}, 'ambiguous application roots'),
@@ -715,6 +714,10 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     assert not any(c[0] == 'click' for c in raw.calls), result
     assert result['status'] == 'gate', result
     assert ('root identity drift' if drift == 'root' else 'changed before submit') in result['question']
+    # This is a post-admission drift, not a zero-total-IPC admission refusal.
+    assert [c for c in raw.calls if c[0] == 'fill'], result
+    assert len([c for c in raw.calls if c[0] == 'upload']) == 1
+    assert not [c for c in raw.calls if c[0] == 'click']
 
 
 def test_cleared_optional_structural_answer_is_not_a_verified_receipt(monkeypatch):
@@ -932,3 +935,86 @@ async def test_formless_bootstrap_uses_canonical_fact_only_with_raw_grant(
         await forms._bootstrap(session, page, PK, facts, provenance=provenance)
     assert caught.value.form_question['label'] == "Name*"
     no_mutations(raw)
+
+@pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
+def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_duplicate(reader):
+    spec = dict(root=False, formless=True, url=entry('ashby'), secondFormlessComplete=True)
+    result = dom(spec, reader)
+    # Two separate populated label/receiver/file/submit graphs, not an extra
+    # empty wrapper. There is no independently observable per-root job ID.
+    assert result['entry']['formless']['error'] == 'ambiguous application roots'
+    controls = result['entry']['root_evidence']
+    assert len([c for c in controls if c.get('submit')]) == 0  # no unique exact submit
+    assert {'#_systemfield_name', '#second-name'} <= {c['selector'] for c in controls}
+    assert {'#_systemfield_resume', '#second-resume'} <= {c['selector'] for c in controls}
+
+
+async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch):
+    _, raw, decide, _ = root_world(monkeypatch, secondFormlessComplete=True)
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert 'ambiguous application roots' in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('changes', [
+    {'wrongOrder': True},
+    {'extraChild': True},
+    {'inertSibling': True, 'inertBeforeContainer': True},
+    {'idless': True, 'leadingInert': True, 'wrongOrder': True,
+     'inertSibling': True, 'inertBeforeContainer': True},
+])
+async def test_benign_ashby_restructuring_preserves_normal_human_question(
+        monkeypatch, changes):
+    _, raw, decide, _ = root_world(monkeypatch, **changes)
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert result['form_question']['label'] == 'Name', result
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
+        monkeypatch):
+    row, raw, decide, provenance = root_world(monkeypatch, idless=True)
+    session = forms._EntrySession(
+        raw, lambda u: u == entry('ashby'), provenance, resume_path='Resume.pdf')
+    old = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    assert ':nth-of-type(' in old['entry']['formless']['root']
+    old_submit = old['entry']['formless']['submit']
+    newer = observed(idless=True, leadingInert=True, wrongOrder=True,
+                     inertSibling=True, inertBeforeContainer=True)
+    raw.current, raw.fixed = deepcopy(newer)
+    fresh = await session.page()
+    assert old['entry']['formless']['root'] != fresh['entry']['formless']['root']
+    assert old_submit != fresh['entry']['formless']['submit']
+    assert forms._root_identity(old) == forms._root_identity(fresh)
+    assert forms._formless_boundary(fresh, provenance)
+    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
+        await session.call('click', old_submit)
+    with pytest.raises(forms.Gate, match='lacks final approval'):
+        await session.call('click', fresh['entry']['formless']['submit'])
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def test_one_successful_formless_fill_then_owner_drift_blocks_later_write(monkeypatch):
+    row, raw, session, page, provenance = await admitted(monkeypatch)
+    facts = approve_fields(row, page, raw.fixed, provenance)
+    filled = {}
+    await forms.execute(
+        session, page, action_sequence()[0], facts=facts, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert filled == {'#_systemfield_name': 'Test User'}
+    before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click'}])
+    assert before == 1
+    for snapshot in (raw.current, raw.fixed):
+        snapshot['entry']['formless']['submit'] = '#foreign-submit'
+    with pytest.raises(forms.Gate, match='submit changed|root identity drift'):
+        await session.call('fill', '#_systemfield_email', '--value', facts['Email'])
+    assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click'}]) == before
+    assert not [c for c in raw.calls if c[0] == 'click']

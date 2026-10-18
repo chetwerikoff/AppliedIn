@@ -39,6 +39,36 @@ def application(ats, **extra):
     return {**page, **extra}
 
 
+def synthetic_ashby_entry_shape(page):
+    """Compatibility for old hand-built control tests; real-reader cases use dom()."""
+    entry_snapshot = page.get('entry')
+    if not isinstance(entry_snapshot, dict) or page.get('url') != entry('ashby'):
+        return
+    controls = page.get('controls') or []
+    owner = (entry_snapshot.get('root') or {}).get('selector')
+    if not owner:
+        entry_snapshot['native_candidates'] = []
+        return
+    siblings = [c for c in controls if c.get('form_selector') == owner]
+    for c in siblings:
+        c.update(form_action_attr_present=True, form_action_raw=entry('ashby'),
+                 formaction_attr_present=False, formaction_raw=None)
+    entry_snapshot['native_candidates'] = [{
+        'selector': owner, 'plausible': True, 'action': entry('ashby'),
+        'action_attr_present': True, 'action_attr': entry('ashby'),
+        'controls': [{
+            'selector': c['selector'], 'tag': c['tag'], 'type': c['type'],
+            'submit': bool(c.get('submit')), 'caption': c.get('label', ''),
+            'owned': True, 'native_owner': owner, 'declared_owner': None,
+            'label_count': 1 if not c.get('submit') else 0,
+            'labels_owned': True, 'disabled': c.get('disabled', False),
+            'required': c.get('required', False), 'visible': True,
+            'readonly': False, 'override_present': False,
+            'override_raw': None, 'override_resolved': '',
+        } for c in siblings],
+    }]
+
+
 class Session:
     def __init__(self, pages):
         self.snapshots = iter(pages)
@@ -81,11 +111,21 @@ class Session:
                                           helper_challenge=False, root=(
                         dict(selector=owner, action=value['url']) if owner else None))
                     self.current = deepcopy(value)
+                if isinstance(value, dict) and value.get('url') == entry('ashby'):
+                    synthetic_ashby_entry_shape(value)
+                    self.current = deepcopy(value)
                 return {'value': value}
             assert args in {(forms._ENTRY_FIXED_CONTROL_WITNESS,), (forms._FIXED_CONTROL_WITNESS,)}
             if self.on_evaluate:
                 await self.on_evaluate(self)
             value = witness(self.current)
+            if self.current.get('url') == entry('ashby'):
+                for item, source in zip(value['controls'], self.current['controls']):
+                    for key in ('form_action_attr_present', 'form_action_raw',
+                                'formaction_attr_present', 'formaction_raw',
+                                'label', 'submit', 'required'):
+                        if key in source:
+                            item[key] = deepcopy(source[key])
             if 'entry' in self.current:
                 value['entry'] = deepcopy(self.current['entry'])
             return {'value': value}
@@ -900,4 +940,187 @@ async def test_independent_provider_identity_mismatch_resets_admission(monkeypat
     raw.on_evaluate = different_provider
     with pytest.raises(forms._EntryNotReady, match='unstable application form inventory'):
         await forms._observe_controls(session, page, readiness=True)
+    no_mutations(raw)
+# Issue #120: use the actual two read-only production JS readers (not fabricated
+# candidate/job metadata) to exercise native ownership and raw HTML attributes.
+def native_observed(**changes):
+    spec = {'url': entry('ashby'), **changes}
+    page = dom(spec)
+    fixed = dom(spec, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    return page, fixed
+
+
+class NativeReadSession:
+    def __init__(self, page, fixed):
+        self.current, self.fixed = deepcopy(page), deepcopy(fixed)
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def call(self, method, *args, **kwargs):
+        self.calls.append((method, *args))
+        if method == 'navigate':
+            return {}
+        if method == 'evaluate':
+            if args == (forms.ENTRY_PAGE,):
+                return {'value': deepcopy(self.current)}
+            assert args == (forms._ENTRY_FIXED_CONTROL_WITNESS,)
+            return {'value': deepcopy(self.fixed)}
+        if method == 'fill':
+            selector, _, value = args
+            for snapshot in (self.current, self.fixed):
+                for c in snapshot['controls']:
+                    if c['selector'] == selector:
+                        c['value'] = value
+                        c['has_value'] = True
+            return {}
+        pytest.fail(f'Unexpected mutating IPC: {method}')
+
+
+def native_real_world(monkeypatch, **changes):
+    row, configs, _, decide = world(monkeypatch)
+    page, fixed = native_observed(**changes)
+    raw = NativeReadSession(page, fixed)
+    monkeypatch.setattr(bsk, 'Session', lambda *a: raw)
+    proof = forms._application_entry(row, PK, COMPANY, posting('ashby'), configs)
+    return row, raw, decide, proof
+
+
+@pytest.mark.parametrize('pair', [False, True])
+async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypatch, pair):
+    row, raw, decide, proof = native_real_world(monkeypatch, nativePair=pair)
+    for snapshot in (raw.current, raw.fixed):
+        candidates = snapshot['entry']['native_candidates']
+        assert len(candidates) == (2 if pair else 1)
+        assert candidates[0]['action_attr_present'] is True
+        assert candidates[0]['action_attr'] == proof.url
+        if pair:
+            assert candidates[1]['action_attr_present'] is True
+            assert candidates[1]['action_attr'] != proof.url
+            assert len(candidates[1]['controls']) == 3
+            assert {c['selector'] for c in candidates[1]['controls']} == {
+                '#foreign-email', '#foreign-resume', '#foreign-submit'}
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert result['form_question']['label'] == 'Email', result
+    assert not decide.await_count
+    no_mutations(raw)
+    session = forms._EntrySession(raw, lambda u: u == proof.url, proof)
+    admitted = await forms._stable_application_form(
+        session, session.allowed, proof,
+        deadline=asyncio.get_running_loop().time() + 10)
+    assert admitted['entry']['selected_native_owner'] == '#application-form'
+    assert {c['selector'] for c in admitted['controls']} == {'#email', '#submit'}
+    assert admitted['entry']['quarantined_native_owners'] == (
+        ['#foreign-application'] if pair else [])
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('raw_action', ['absent', 'empty'])
+async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw_action):
+    _, raw, decide, proof = native_real_world(monkeypatch, actionAttr=raw_action)
+    for snapshot in (raw.current, raw.fixed):
+        owner = snapshot['entry']['native_candidates'][0]
+        assert snapshot['entry']['root'] is None  # unproven resolved action selects nothing
+        assert owner['action_attr_present'] == (raw_action != 'absent')
+        assert owner['action_attr'] == ('' if raw_action == 'empty' else None)
+        assert owner['action'] == proof.url
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert 'raw action not proven' in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('case,options,cause', [
+    ('contrary-job', {'action':
+        'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application'},
+     'lacks tracked job binding'),
+    ('indistinguishable', {'nativePair': True, 'foreignAction': entry('ashby')},
+     'ambiguous application roots'),
+    ('cross-owner-borrow', {'nativePair': True, 'foreignBorrow': True},
+     'cross-owned or contradictory'),
+    ('foreign-override', {'nativePair': True, 'foreignOverride': entry('ashby')},
+     'formaction override conflicts'),
+])
+async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
+        monkeypatch, case, options, cause):
+    _, raw, decide, _ = native_real_world(monkeypatch, **options)
+    assert raw.current['entry']['root'] is None
+    result = await attempt()
+    assert result['status'] == 'gate', (case, result)
+    assert cause in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def test_ashby_unavailable_or_contradictory_fixed_native_witness(monkeypatch):
+    _, raw, decide, _ = native_real_world(monkeypatch, nativePair=True)
+    raw.fixed['entry']['native_candidates'][0]['action_attr'] = None
+    result = await attempt()
+    assert result['status'] == 'gate'
+    assert 'raw action not proven' in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def native_admitted_with_one_safe_fill(monkeypatch):
+    row, raw, _, provenance = native_real_world(monkeypatch, nativePair=True)
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    item = next(c for c in page['controls'] if c['selector'] == '#email')
+    fresh = {c['selector']: c for c in raw.fixed['controls']}
+    question = forms._disclosure_question(
+        page, item, fresh, posting('ashby'), provenance=provenance)
+    row['human_approved_answers'][question['label']] = {
+        'value': 'test@example-co.test', 'label': question['control_label'],
+        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
+                                    'type', 'form_selector', 'form_action')}}
+    filled = {}
+    receipt = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example-co.test'}, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    assert [c for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]
+    return raw, session, filled
+
+
+@pytest.mark.parametrize('at', ['before-next-fill', 'before-submit'])
+async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkeypatch, at):
+    raw, session, filled = await native_admitted_with_one_safe_fill(monkeypatch)
+    assert filled == {'#email': 'test@example-co.test'}
+    for snapshot in (raw.current, raw.fixed):
+        snapshot['entry']['native_candidates'][0]['action_attr'] = (
+            'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application')
+    before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}])
+    next_verb, selector = ('fill', '#email') if at == 'before-next-fill' else ('click', '#submit')
+    with pytest.raises(forms.Gate, match='raw action not proven|root identity drift'):
+        await session.call(next_verb, selector, '--value', 'another' if at == 'before-next-fill' else '')
+    assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}]) == before == 1
+    assert not [c for c in raw.calls if c[0] == 'click']
+
+
+async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positional_choice(
+        monkeypatch):
+    _, raw, decide, proof = native_real_world(monkeypatch, nativePair=True,
+                                               foreignFirst=True)
+    for snapshot in (raw.current, raw.fixed):
+        candidates = snapshot['entry']['native_candidates']
+        assert [c['selector'] for c in candidates] == [
+            '#foreign-application', '#application-form']
+        assert candidates[0]['action_attr'] != proof.url
+        assert candidates[1]['action_attr'] == proof.url
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    assert result['form_question']['label'] == 'Email'
+    assert not decide.await_count
     no_mutations(raw)

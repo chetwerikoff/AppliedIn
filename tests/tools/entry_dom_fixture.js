@@ -4,18 +4,18 @@ const nodes = [];
 const node = (tag, attrs={}, parent=null) => {
   const e = {tagName:tag.toUpperCase(),localName:tag.toLowerCase(),nodeType:1,children:[],parentElement:parent,
     namespaceURI:'http://www.w3.org/1999/xhtml',
-    id:attrs.id || 'node-'+nodes.length,name:attrs.name || '',type:attrs.type || '',
+    id:Object.hasOwn(attrs,'id') ? String(attrs.id) : '',name:attrs.name || '',type:attrs.type || '',
     value:'',disabled:false,readOnly:false,shadowRoot:null,
     get innerText() {return (attrs.text || '')+e.children.map(n=>n.innerText).join('');},
     get textContent() {return (attrs.text || '')+e.children.map(n=>n.textContent).join('');},
     get childNodes() {return [...(attrs.text ? [{nodeType:3,parentElement:e,textContent:attrs.text}] : []),...e.children];},
-    get labels() {return nodes.filter(n=>n.tagName==='LABEL' && (n.contains(e) || n.getAttribute('for')===e.id));},
+    get labels() {return nodes.filter(n=>n.tagName==='LABEL' && (n.contains(e) || (e.id && n.getAttribute('for')===e.id)));},
     get elements() {return nodes.filter(n=>n.form===e && n.matches('input,button,select,textarea,output,object'));},
-    getAttribute:k => k==='id' ? e.id : Object.hasOwn(attrs,k) ? attrs[k] : null,
+    getAttribute:k => Object.hasOwn(attrs,k) ? attrs[k] : null,
     hasAttribute:k=>Object.hasOwn(attrs,k),
     getAttributeNames:()=>Object.keys(attrs),
     setAttribute:(k,v)=> {attrs[k]=String(v); if(['id','name','type'].includes(k))e[k]=String(v);},
-    removeAttribute:k=> {delete attrs[k]; if(['name','type'].includes(k))e[k]='';},
+    removeAttribute:k=> {delete attrs[k]; if(['id','name','type'].includes(k))e[k]='';},
     get attributes() {return Object.keys(attrs).filter(k=>!['rect','bounds','text','pseudo'].includes(k)).map(name=>({name,value:String(attrs[name])}));},
     getClientRects:()=>attrs.rect===null ? [] : [attrs.rect || {width:100,height:30,right:100,bottom:30}],
     getBoundingClientRect:()=> {if(attrs.bounds===null) throw Error('unreadable'); return attrs.bounds || attrs.rect || {width:100,height:30};},
@@ -34,6 +34,26 @@ const node = (tag, attrs={}, parent=null) => {
 };
 function match(e,q) {
   q=q.trim(); if(q==='*') return true;
+  // Resolve real positional selector paths for nodes without id attributes.
+  if(q.includes(' > ')) {
+    const parts=q.split(' > ');let current=e;
+    for(let i=parts.length-1;i>=0;i--) {
+      if(!current || !match(current,parts[i]))return false;
+      current=current.parentElement;
+    }
+    return true;
+  }
+  const nth=q.match(/:nth-of-type\((\d+)\)/);
+  if(nth) {
+    const siblings=e.parentElement ? e.parentElement.children.filter(n=>n.tagName===e.tagName) : [e];
+    if(siblings.indexOf(e)+1!==Number(nth[1]))return false;
+    q=q.replace(/:nth-of-type\(\d+\)/,'');
+  }
+  const child=q.match(/:nth-child\((\d+)\)/);
+  if(child) {
+    if(!e.parentElement || e.parentElement.children.indexOf(e)+1!==Number(child[1]))return false;
+    q=q.replace(/:nth-child\(\d+\)/,'');
+  }
   if(q===':disabled') return false;
   if(q.includes(':not(')) {const [_,base,neg]=q.match(/^(.*):not\((.*)\)$/); return match(e,base) && !match(e,neg);}
   const tag=q.match(/^[a-zA-Z][\w-]*/)?.[0];
@@ -46,10 +66,17 @@ function match(e,q) {
   return true;
 }
 const body=node('body',{id:'body'});
-const form=spec.root===false ? null : node('form',{id:'application-form'},body);
+const canonicalAction=spec.action || spec.url ||
+  'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
+const actionAttrs=spec.actionAttr==='absent' ? {} :
+  {action:spec.actionAttr==='empty' ? '' : canonicalAction};
+const form=spec.root===false ? null : node('form',{id:'application-form',...actionAttrs},body);
 if(form) {
-  form.action=spec.action || spec.url || 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc/apply';
-  node('input',{id:'email',name:'Email',type:'email'},form);
+  // A missing/empty raw action can still resolve to PAGE as a property.
+  form.action=spec.actionAttr==='absent' || spec.actionAttr==='empty'
+    ? (spec.url || canonicalAction) : canonicalAction;
+  node('label',{'for':'email',text:'Email'},form);
+  node('input',{id:'email',name:'Email',type:'email',required:true},form);
   if(spec.marker!=='absent') {
     const marker=spec.marker || 'text';
     const submit=node(marker==='value' || marker==='image' ? 'input':'button',
@@ -70,13 +97,51 @@ if(spec.ambiguous) {
   const other=node('form',{id:'other-application'},body);other.action=form.action;
   node('button',{type:'submit',text:'Submit application'},other);
 }
+if(spec.nativePair) {
+  const foreignAction=spec.foreignAction ||
+    'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application';
+  const other=node('form',{id:'foreign-application',action:foreignAction},body);
+  other.action=foreignAction;
+  node('label',{'for':'foreign-email',text:'Email'},other);
+  node('input',{id:'foreign-email',name:'Foreign email',type:'email',required:true},other);
+  node('label',{'for':'foreign-resume',text:'Résumé'},other);
+  const file=node('input',{id:'foreign-resume',type:'file',required:true},other);
+  file.files=[];
+  node('button',{id:'foreign-submit',type:'submit',text:'Submit application'},other);
+  if(spec.foreignBorrow) {
+    const borrowed=node('input',{id:'foreign-borrow',type:'email',
+      form:'foreign-application'},form);
+    borrowed.form=other;
+    node('label',{'for':'foreign-borrow',text:'Borrowed email'},form);
+  }
+  if(spec.foreignOverride) {
+    const member=nodes.find(n=>n.id==='foreign-email');
+    member.setAttribute('formaction',spec.foreignOverride);
+    member.formAction=spec.foreignOverride;
+  }
+}
+if(spec.nativePair && spec.foreignFirst) {
+  // Reorder DOM and query enumeration so the tracked owner is LAST.
+  const foreign=nodes.find(n=>n.id==='foreign-application');
+  const subtree=nodes.filter(n=>foreign.contains(n));
+  const remainder=nodes.filter(n=>!foreign.contains(n));
+  const position=remainder.indexOf(form);
+  nodes.splice(0,nodes.length,...remainder.slice(0,position),...subtree,
+    ...remainder.slice(position));
+  body.children.splice(body.children.indexOf(foreign),1);
+  body.children.splice(body.children.indexOf(form),0,foreign);
+}
 if(spec.formless) {
-  const wrapper=node(spec.wrapperTag || 'div',{id:'application-root',class:spec.wrapperClass || ''},body);
-  const pane=node(spec.paneTag || 'div',{id:'autofill',class:'ashby-application-form-autofill-pane'},wrapper);
+  if(spec.leadingInert)node('div',{},body);
+  const wrapper=node(spec.wrapperTag || 'div',
+    {...(spec.idless ? {} : {id:'application-root'}),class:spec.wrapperClass || ''},body);
+  const pane=node(spec.paneTag || 'div',
+    {...(spec.idless ? {} : {id:'autofill'}),class:'ashby-application-form-autofill-pane'},wrapper);
   const helper=node('input',{id:'autofill-file',type:'file'},pane);
   node('button',{id:'autofill-button',type:'button',text:'Autofill'},pane);
   if(!form) Object.defineProperty(helper,'value',{get:()=> {throw Error('AUTOFILL VALUE READ');}});
-  const container=node('div',{id:'application-fields',class:'ashby-application-form-container'},wrapper);
+  const container=node('div',
+    {...(spec.idless ? {} : {id:'application-fields'}),class:'ashby-application-form-container'},wrapper);
   const field=(tag,id,type,text,required=false) => {
     const entry=node('div',{class:'ashby-application-form-field-entry'},container);
     const l=node('label',{id:id+'-label','for':id,class:'ashby-application-form-question-title',text},entry);
@@ -122,17 +187,43 @@ if(spec.formless) {
   if(spec.changedDrop)drop.setAttribute('title','Changed dropzone');
   if(spec.secondDrop)node('button',{id:'second-drop',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);
   field('textarea','additional','textarea','Additional information');
-  const submit=node('button',{id:'structural-submit',class:'ashby-application-form-submit-button',text:'Submit application',...(spec.submitAttrs || {})},wrapper);
+  const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),
+    class:'ashby-application-form-submit-button',text:'Submit application',
+    ...(spec.submitAttrs || {})},wrapper);
   submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
   const move=(e,to)=> {e.parentElement.children.splice(e.parentElement.children.indexOf(e),1); e.parentElement=to; to.children.push(e);};
   if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
   if(spec.extraType) node(spec.extraType==='select' ? 'select':'input',
     {id:'unsupported',type:spec.extraType,required:true,...(spec.extraAttrs || {})},container);
   if(spec.duplicate) node('div',{class:'ashby-application-form-container'},body);
+  if(spec.secondFormlessComplete) {
+    const second=node('div',{},body);
+    node('div',{class:'ashby-application-form-autofill-pane'},second);
+    const fields=node('div',{class:'ashby-application-form-container'},second);
+    const field=(id,type,caption)=>{
+      const parent=node('div',{},fields);
+      node('label',{'for':id,class:'ashby-application-form-question-title',text:caption},parent);
+      const input=node('input',{id,type,required:true},parent);
+      if(type==='file')input.files=[];
+    };
+    field('second-name','text','Name');
+    field('second-email','email','Email');
+    field('second-resume','file','Résumé');
+    const other=node('button',{class:'ashby-application-form-submit-button',
+      text:'Submit application'},second);
+    other.type='submit';
+  }
   if(spec.wrongOrder) wrapper.children.reverse();
   if(spec.duplicateLabel) node('label',{'for':'_systemfield_name',class:'ashby-application-form-question-title',text:'Other'},container);
   if(spec.hiddenOutside) node('input',{id:'outside-hidden',type:'hidden',rect:null},body);
   if(spec.extraChild) node('span',{},wrapper);
+  if(spec.inertSibling) {
+    const sibling=node('div',{},wrapper);
+    if(spec.inertBeforeContainer) {
+      wrapper.children.splice(wrapper.children.indexOf(sibling),1);
+      wrapper.children.splice(wrapper.children.indexOf(container),0,sibling);
+    }
+  }
   if(spec.movePane) move(pane,body);
   if(spec.moveSubmit) move(submit,container);
   if(spec.duplicateSubmit) node('button',{class:'ashby-application-form-submit-button'},body);
@@ -260,12 +351,18 @@ for(let i=0;i<(spec.tokens || []).length;i++) {
 }
 if(spec.tokenSiblingBadge)node('div',{class:'grecaptcha-badge'},body);
 // Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.
-const ids=new Map();for(const n of nodes){if(!ids.has(n.id))ids.set(n.id,[]);ids.get(n.id).push(n);}
-global.document={baseURI:'https://example-co.test/',readyState:'complete',body,title:'Synthetic',
+const ids=new Map();for(const n of nodes) {
+  if(!n.id)continue;
+  if(!ids.has(n.id))ids.set(n.id,[]);
+  ids.get(n.id).push(n);
+}
+const currentUrl=new URL(spec.url || form?.action || 'https://example-co.test/');
+global.document={baseURI:currentUrl.href,readyState:'complete',body,title:'Synthetic',
   querySelectorAll:q=>/^#[\w-]+$/.test(q) ? ids.get(q.slice(1)) || [] : nodes.filter(n=>n.matches(q)),
   querySelector:q=>document.querySelectorAll(q)[0] || null,
-  getElementById:id=>ids.get(id)?.[0] || null};
-global.CSS={escape:s=>s}; global.location={href:spec.url || form?.action || 'https://example-co.test/'};
+  getElementById:id=>id ? ids.get(id)?.[0] || null : null};
+global.CSS={escape:s=>s}; global.location={href:currentUrl.href,protocol:currentUrl.protocol,
+  hostname:currentUrl.hostname,host:currentUrl.host};
 global.scrollX=0; global.scrollY=0;
 global.getComputedStyle=(e,pseudo)=>pseudo ? {content:e.pseudo[pseudo] ?? 'none'} : e.style;
 console.log(JSON.stringify(eval(process.argv[3])));

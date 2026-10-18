@@ -499,6 +499,10 @@ PAGE = r"""(() => {
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
+      ...(ashbyNative ? {form_action_attr_present:!!form && form.hasAttribute('action'),
+        form_action_raw:form ? form.getAttribute('action') : null,
+        formaction_attr_present:e.hasAttribute('formaction'),
+        formaction_raw:e.getAttribute('formaction')} : {}),
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),
@@ -627,6 +631,35 @@ _APPLICATION_ROOT = r"""
               'finish application','apply now'].includes(clean(t).toLowerCase())));
     }));
   const nativeRoot = forms.length===1 ? forms[0] : null;
+  // PAGE route alone is not a job witness. Both independently evaluated readers
+  // report explicit raw attributes plus a complete non-value native census.
+  const ashbyNative = location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com';
+  const nativeCandidates = ashbyNative ? Array.from(document.querySelectorAll('form'))
+    .map(f => {
+      const members=Array.from(document.querySelectorAll(query)).filter(e=>
+        !excluded.has(e) && (e.form || e.closest('form'))===f);
+      return {selector:selector(f), plausible:forms.includes(f),
+        action:f.action || '', action_attr_present:f.hasAttribute('action'),
+        action_attr:f.getAttribute('action'),
+        controls:members.map(e => {
+          const type=e.getAttribute('role') ||
+            (['INPUT','BUTTON'].includes(e.tagName) ? e.type :
+              (e.getAttribute('type') || e.tagName.toLowerCase()));
+          const labels=Array.from(e.labels || []);
+          return {selector:selector(e),tag:e.tagName.toLowerCase(),type,
+            submit:['submit','image'].includes(type) && ['INPUT','BUTTON'].includes(e.tagName),
+            caption:entryLabel(e),owned:f.contains(e),native_owner:e.form ? selector(e.form) : '',
+            declared_owner:e.getAttribute('form'),label_count:labels.length,
+            labels_owned:labels.every(l=>f.contains(l)),
+            disabled:!!e.disabled || e.getAttribute('aria-disabled')==='true',
+            required:!!e.required || e.getAttribute('aria-required')==='true',
+            visible:!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden',
+            readonly:!!e.readOnly || e.hasAttribute('readonly'),
+            override_present:e.hasAttribute('formaction'),
+            override_raw:e.getAttribute('formaction'),
+            override_resolved:e.hasAttribute('formaction') ? (e.formAction || '') : ''};
+        })};
+    }) : [];
   const rectOf = (e, bounding=false) => {
     try {
       const r = bounding ? e.getBoundingClientRect() : e.getClientRects()[0];
@@ -645,11 +678,18 @@ _ASHBY_ROOT = r"""
   const container=containers.length===1 ? containers[0] : null;
   const exactSubmit=submitters.length===1 ? submitters[0] : null;
   const wrapper=container?.parentElement;
+  // Layout order is decoration, not authority. Every additional sibling must
+  // be inert; the pane remains quarantined and all controls stay inventoried.
+  const inertSibling=e=>['DIV','SPAN'].includes(e.tagName) && !e.attributes.length &&
+    !e.querySelectorAll(query+',iframe,[contenteditable],[role],[tabindex]').length &&
+    !e.shadowRoot && !e.getAttribute('onclick');
+  const siblings=wrapper ? Array.from(wrapper.children) : [];
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit?.parentElement===wrapper && wrapper.children.length===3 &&
-    wrapper.children[0].matches('div.ashby-application-form-autofill-pane') &&
-    wrapper.children[1]===container && wrapper.children[2]===exactSubmit &&
-    panes.length===1 && panes[0]===wrapper.children[0];
+    container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
+    panes.length===1 && panes[0].tagName==='DIV' && panes[0].parentElement===wrapper &&
+    exactSubmit?.parentElement===wrapper &&
+    siblings.filter(n=>[container,panes[0],exactSubmit].includes(n)).length===3 &&
+    siblings.every(n=>n===container || n===panes[0] || n===exactSubmit || inertSibling(n));
   const structuralRoot=!forms.length && ordered ? wrapper : null;
   const root=nativeRoot || structuralRoot;
   let structuralError='';
@@ -974,7 +1014,11 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       responseError=true;
   }
   const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
-    root:nativeRoot ? {selector:selector(nativeRoot),action:nativeRoot.action} : null,
+    // A native Ashby element is only a CANDIDATE until Python binds the raw
+    // action to the typed tracked job. A defaulted action cannot set root.
+    root:ashbyNative ? null : nativeRoot ?
+      {selector:selector(nativeRoot),action:nativeRoot.action} : null,
+    ...(ashbyNative ? {native_candidates:nativeCandidates} : {}),
     formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,
     helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&

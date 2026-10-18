@@ -979,7 +979,7 @@ async def test_benign_ashby_restructuring_preserves_normal_human_question(
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
         monkeypatch):
-    row, raw, decide, provenance = root_world(monkeypatch, idless=True)
+    row, raw, decide, provenance = root_world(monkeypatch, idless=True, domOrder=True)
     session = forms._EntrySession(
         raw, lambda u: u == entry('ashby'), provenance, resume_path='Resume.pdf')
     old = await forms._stable_application_form(
@@ -987,12 +987,18 @@ async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_c
         deadline=asyncio.get_running_loop().time() + 10)
     assert ':nth-of-type(' in old['entry']['formless']['root']
     old_submit = old['entry']['formless']['submit']
-    newer = observed(idless=True, leadingInert=True, wrongOrder=True,
+    newer = observed(idless=True, domOrder=True, leadingInert=True, wrongOrder=True,
                      inertSibling=True, inertBeforeContainer=True)
     raw.current, raw.fixed = deepcopy(newer)
     fresh = await session.page()
     assert old['entry']['formless']['root'] != fresh['entry']['formless']['root']
     assert old_submit != fresh['entry']['formless']['submit']
+    # querySelectorAll must follow the rebuilt tree order, not creation order.
+    def ordered_semantic_roles(page):
+        return ['submit' if c['submit'] else 'name' for c in page['entry']['root_evidence']
+                if c['submit'] or c['id'] == '_systemfield_name']
+    assert ordered_semantic_roles(old) == ['name', 'submit']
+    assert ordered_semantic_roles(fresh) == ['submit', 'name']
     assert forms._root_identity(old) == forms._root_identity(fresh)
     assert forms._formless_boundary(fresh, provenance)
     with pytest.raises(forms.Gate, match='forbidden at IPC producer'):

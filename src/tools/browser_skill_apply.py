@@ -2622,8 +2622,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     # Only verified Lever/Greenhouse application-entry routes may write before
     # a model decision. Direct, redirect and unrelated native flows keep their
     # already-established question and guarded model-action behavior.
-    settlement_route = isinstance(provenance, (
-        ApplicationEntryProvenance, GreenhouseJobAlias))
+    settlement_route = (isinstance(provenance, GreenhouseJobAlias)
+                        or (isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'lever'))
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
@@ -2670,9 +2671,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                  if kind == 'radio' else item['selector'])
         if group in seen:
             continue
-        seen.add(group)
         if kind == 'radio' and _radio_group(page, item)[0] is not item:
             continue
+        seen.add(group)
         if eligible:
             ordinal += 1
 
@@ -2855,10 +2856,15 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     or (provenance is not None and not _alias_current(
                         provenance, fixture_context=fixture_context))):
                 raise Gate('The job route changed during native commit readback.')
+            # A later native picker may reset a previously committed field.
+            # Revalidate all receipts before passing the refreshed PAGE to a model.
+            pending = [*history, receipt]
             check_approvals(
-                pk, [receipt], committed, provenance=provenance,
+                pk, pending, committed, provenance=provenance,
                 **({'fixture_context': fixture_context} if fixture_context else {}))
-            _bootstrap_receipt_current(committed, receipt, trial)
+            for prior in pending:
+                if prior.get('fact'):
+                    _bootstrap_receipt_current(committed, prior, trial)
         except (Exception, asyncio.CancelledError) as exc:
             # A transport failure after an authorized IPC is not proof that the
             # browser did nothing. Stop without an automatic repeat.

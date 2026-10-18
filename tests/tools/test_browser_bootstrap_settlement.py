@@ -24,6 +24,9 @@ JOB = '12345678-1234-4234-8234-123456789abc'
 LEVER_PK = make_pk(COMPANY, JOB)
 LEVER_POSTING = f'https://jobs.lever.co/{COMPANY}/{JOB}'
 LEVER_APPLY = LEVER_POSTING + '/apply'
+ASHBY_PK = make_pk(COMPANY, JOB)
+ASHBY_POSTING = f'https://jobs.ashbyhq.com/{COMPANY}/{JOB}'
+ASHBY_APPLY = ASHBY_POSTING + '/application'
 GH_PK = 'example-co#123456'
 GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
 GH_APPLY = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
@@ -59,7 +62,13 @@ def _fixture(route, *, kind=None, noisy=False):
         row = {'pk': pk, 'company': COMPANY, 'ats': 'lever', 'job_id': JOB,
                'jd_url': wrapper, 'status': 'submitting',
                'possible_submission': False, 'human_approved_answers': {}}
-    else:
+    elif route == 'ashby':
+        url, wrapper, pk = ASHBY_APPLY, ASHBY_POSTING, ASHBY_PK
+        config = CompanyConfig(name=COMPANY, ats='ashby', board=COMPANY)
+        row = {'pk': pk, 'company': COMPANY, 'ats': 'ashby', 'job_id': JOB,
+               'jd_url': wrapper, 'status': 'submitting',
+               'possible_submission': False, 'human_approved_answers': {}}
+    elif route == 'greenhouse':
         url, wrapper, pk = GH_APPLY, GH_WRAP, GH_PK
         config = CompanyConfig(
             name=COMPANY, ats='greenhouse', board=COMPANY,
@@ -67,12 +76,14 @@ def _fixture(route, *, kind=None, noisy=False):
         row = {'pk': pk, 'company': COMPANY, 'ats': 'greenhouse',
                'job_id': '123456', 'jd_url': wrapper, 'status': 'submitting',
                'possible_submission': False, 'human_approved_answers': {}}
+    else:
+        raise AssertionError(route)
     phone_label = 'Phone - PRIVATE-LABEL-SENTINEL' if noisy else 'Phone'
     phone = field(phone_label, '#phone', type='tel', form_action=url)
     controls = [phone]
     facts = {phone_label: PHONE, 'Full name': 'Test User'}
     row['human_approved_answers'][phone_label] = _grant(phone, url, PHONE)
-    kind = kind or ('select' if route == 'lever' else 'combobox')
+    kind = kind or ('combobox' if route == 'greenhouse' else 'select')
     if kind == 'select':
         picker = field(
             'Work mode', '#mode', tag='select', type='select',
@@ -124,7 +135,7 @@ def _fixture(route, *, kind=None, noisy=False):
     file_control = field('Resume', '#resume', type='file', form_action=url)
     controls.extend([file_control, submit(form_action=url)])
     page = inventory(*controls, url=url)
-    if route == 'lever':
+    if route in {'lever', 'ashby'}:
         page['entry'] = {
             'root': {'selector': '#application', 'action': url},
             'frames': [], 'responses': [], 'response_error': False,
@@ -562,3 +573,106 @@ async def test_changed_native_receiver_at_prewrite_witness_never_authorizes_ipc(
     assert raw.witnesses >= 4
     assert raw.writes == []
     assert not any(c[0] == 'click' for c in raw.calls)
+
+
+async def test_ashby_native_entry_retains_prior_model_only_behavior(monkeypatch):
+    """An Ashby native application form must not gain Lever/Greenhouse prefill."""
+    case, raw = _world(monkeypatch, 'ashby', kind='select')
+    admitted_sessions = []
+    original_bootstrap = forms._bootstrap
+
+    async def observe_bootstrap(session, *args, **kwargs):
+        admitted_sessions.append(type(session))
+        return await original_bootstrap(session, *args, **kwargs)
+
+    async def decide(prompt, page, history, *, model):
+        assert history == []
+        assert raw.writes == []
+        assert {c['selector'] for c in page['controls']} >= {'#phone', '#mode'}
+        assert all(not next(c for c in page['controls'] if c['selector'] == key)['has_value']
+                   for key in ('#phone', '#mode'))
+        return {'action': 'gate', 'question': 'Synthetic stop before writing'}
+
+    monkeypatch.setattr(forms, '_bootstrap', observe_bootstrap)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await _apply(case)
+    assert result['status'] == 'gate' and result['reason'] == 'unknown_field'
+    assert admitted_sessions == [forms._EntrySession]
+    assert raw.writes == []
+
+
+@pytest.mark.parametrize(('route', 'kind', 'picker_ipc'), [
+    ('lever', 'select', ('select', '#mode')),
+    ('greenhouse', 'combobox', ('click', '#city-choice')),
+])
+async def test_later_picker_clears_earlier_phone_and_cumulative_readback_gates(
+        monkeypatch, caplog, route, kind, picker_ipc):
+    """A reactive picker may erase an earlier fact despite a valid latest receipt."""
+    caplog.set_level(logging.INFO, logger=forms.__name__)
+    case, raw = _world(monkeypatch, route, kind=kind)
+    native_call = raw.call
+
+    async def reactive_call(command, *args, **kwargs):
+        result = await native_call(command, *args, **kwargs)
+        if (command, args[0] if args else None) == picker_ipc:
+            phone = raw.target('#phone')
+            phone['has_value'] = False
+            phone['value'] = ''
+        return result
+
+    raw.call = reactive_call
+
+    async def no_decision(*args, **kwargs):
+        pytest.fail('Cleared earlier committed phone must never reach first model decision')
+
+    monkeypatch.setattr(bsk, 'decision', no_decision)
+    result = await _apply(case)
+    assert result['status'] == 'gate' and result['form_question'] is None
+    assert raw.writes == [('fill', '#phone'), picker_ipc]
+    assert raw.target('#phone')['has_value'] is False
+    if kind == 'select':
+        assert raw.target('#mode')['has_value'] is True
+    else:
+        assert raw.target('#city')['combobox']['selected_text'] == 'Test City'
+    assert [d['decision'] for d in _decisions(caplog)] == [
+        'settled-from-bank', 'blocked']
+
+
+async def test_reordered_radio_after_phone_fill_still_gets_one_bound_gate(
+        monkeypatch, caplog):
+    """Group membership is counted only after its current first member is visited."""
+    caplog.set_level(logging.INFO, logger=forms.__name__)
+    case, raw = _world(monkeypatch, 'lever', kind='radio')
+    case.facts.pop('Schedule preference')
+    case.row['human_approved_answers'].pop('Schedule preference')
+    native_call = raw.call
+
+    async def reorder_after_phone(command, *args, **kwargs):
+        result = await native_call(command, *args, **kwargs)
+        if command == 'fill' and args[0] == '#phone':
+            controls = raw.state['controls']
+            radio_indices = [i for i, c in enumerate(controls) if c['type'] == 'radio']
+            assert len(radio_indices) == 2
+            first, second = radio_indices
+            controls[first], controls[second] = controls[second], controls[first]
+        return result
+
+    raw.call = reorder_after_phone
+
+    async def no_decision(*args, **kwargs):
+        pytest.fail('An unapproved reordered required radio must gate before model')
+
+    monkeypatch.setattr(bsk, 'decision', no_decision)
+    result = await _apply(case)
+    assert result['status'] == 'gate'
+    assert result['form_question']['label'] == 'Schedule preference'
+    assert result['form_question']['selector'] == '#evening'
+    assert [c['selector'] for c in raw.state['controls'] if c['type'] == 'radio'] == [
+        '#evening', '#morning']
+    assert raw.writes == [('fill', '#phone')]
+    decisions = _decisions(caplog)
+    assert [d['decision'] for d in decisions] == [
+        'settled-from-bank', 'needs-human']
+    assert [d['type'] for d in decisions] == ['tel', 'radio']
+    assert all(set(d) == {'label', 'type', 'required', 'decision'}
+               and d['required'] is True for d in decisions)

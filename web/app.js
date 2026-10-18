@@ -309,7 +309,7 @@ function rowActionAllowed(pk, act) {
   if (act === "retry") return RETRYABLE.includes(r.status);
   if (act === "queue-apply") return ["failed", "error", "capped"].includes(kind);
   if (act === "reopen") return ["skipped", "failed", "error", "job_gone", "capped"].includes(kind) && !r.confirmation_id;
-  if (act === "mark-applied") return INTERVENTION_ROUTES.has(kind);
+  if (act === "mark-applied") return kind === "tailored" || INTERVENTION_ROUTES.has(kind);
   return true;
 }
 function companyActionAllowed(co) {
@@ -3905,10 +3905,15 @@ async function loadApps() {
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
     renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
+    if (state.openPk && !$("#drawer").hidden) {
+      const current = state.apps.find((item) => item.pk === state.openPk);
+      if (current && routeOf(current) !== state.openRoute) openDrawer(current.pk);
+    }
   } catch {
     // A failed authoritative projection may not leave stale "clear" controls.
     state.apps = state.apps.map((r) => ({ ...r, submit_hold_state: "unknown" }));
     renderTabs(); refreshPane();
+    if (state.openPk && !$("#drawer").hidden) openDrawer(state.openPk);
   }
 }
 
@@ -4594,6 +4599,8 @@ function openDrawer(pk) {
   if (!state.trackerLoaded) loadTracker();
   const r = state.apps.find((a) => a.pk === pk);
   if (!r) return;
+  const guarded = isReadOnly(r);
+  const kind = routeOf(r);
   const links = [["JD", r.jd_url], ["Resume PDF", r.resume_url], ["Screenshot", r.screenshot_url]]
     .map(([l, h]) => h
       ? `<a class="lk" href="${esc(h)}" target="_blank" rel="noopener">${l}</a>`
@@ -4613,7 +4620,7 @@ function openDrawer(pk) {
     `<div class="tl"><div class="tl-dot ${t.done ? "done" : ""}"></div>
       <div><div class="tl-label">${esc(t.label)}</div><div class="tl-time">${when(t.at)}</div></div></div>`).join("");
 
-  const canRetailor = !["applied", "applied_manual", "submitting"].includes(r.status);
+  const canRetailor = !guarded && !["applied", "applied_manual", "submitting"].includes(r.status);
   const retailoring = r.status === "tailoring";
   const kept = (r.tailor_note || "").trim();
   const retailor = canRetailor ? `
@@ -4638,27 +4645,33 @@ function openDrawer(pk) {
       </div>
     </div>` : "";
 
-  const captchaHandoff = r.status === "needs_human" && r.gate_reason === "captcha";
-  const gate = (r.status === "needs_human" || canApply(r)) ? `
+  const captchaHandoff = kind === "captcha" || kind === "no_account";
+  const ownerQuestion = kind === "owner_question";
+  const reviewDecision = kind === "approval" || kind === "low_confidence";
+  const gated = !guarded && (INTERVENTION_ROUTES.has(kind) || canApply(r));
+  const gate = gated ? `
     <div class="section gate-box">
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
       ${captchaHandoff && r.gate_question ? `<div class="gate-q md">${esc(defaultGateText(r))}</div>` : ""}
-      ${captchaHandoff ? "" : `<textarea id="gate-answer" class="gate-input" rows="2"
-        placeholder="Type your answer, or leave blank to approve &amp; continue…"></textarea>`}
+      ${ownerQuestion ? `<textarea id="gate-answer" class="gate-input" rows="2"
+        placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="drawer-actions">
-        ${captchaHandoff ? "" : `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">Approve &amp; continue</button>`}
+        ${ownerQuestion || reviewDecision || canApply(r)
+          ? `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">${ownerQuestion
+              ? "Answer &amp; continue" : kind === "low_confidence"
+                ? "Review &amp; approve" : "Approve &amp; continue"}</button>` : ""}
         <button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
-          title="It already went through (you got the email / saw the confirmation) — mark applied, don't resubmit">✓ Already applied</button>
+          title="Only after verifying the employer portal confirms submission">✓ Already applied</button>
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip</button>
       </div>
     </div>` : "";
 
-  const canRetry = RETRYABLE.includes(r.status);
+  const canRetry = !guarded && RETRYABLE.includes(r.status);
   // A closed job that was never sent can go back in play. It is offered on the
   // skipped ones especially: a role skipped as a low score under preferences you
   // have since fixed had no way back, and "Run now" silently refused it.
-  const canReopen = !["applied", "applied_manual", "submitting"].includes(r.status)
+  const canReopen = !guarded && !["applied", "applied_manual", "submitting"].includes(r.status)
                     && !r.confirmation_id
                     && ["skipped", "failed", "error", "job_gone", "capped"].includes(r.status);
   const closed = r.closed_reason ? `
@@ -4682,7 +4695,7 @@ function openDrawer(pk) {
         <img src="${esc(r.screenshot_url)}" alt="last screenshot" loading="lazy"></a></div>` : "";
 
   // A job still moving through the pipeline can be pulled out.
-  const active = ["found", "tailored", "submitting"].includes(r.status);
+  const active = !guarded && ["found", "tailored", "submitting"].includes(r.status);
   const cancel = active ? `
     <div class="drawer-actions" style="margin-top:0;margin-bottom:22px">
       <button class="btn btn-danger" data-act="cancel" data-pk="${esc(r.pk)}">
@@ -4718,7 +4731,7 @@ function openDrawer(pk) {
     : "";
 
   $("#drawer-body").innerHTML = `
-    ${trackerEditor(r)}
+    ${guarded ? routeNotice(r) : trackerEditor(r)}
     ${gate}
     ${failBlock}
     ${r.jd_read_error ? `<div class="section drawer-fail"><div class="section-t">Posting read paused</div><div class="fail-text">${esc(r.jd_read_error)}</div><p>Kept in Found. Run preparation again when the reader is available.</p></div>` : ""}
@@ -4726,7 +4739,7 @@ function openDrawer(pk) {
     ${closed}
     <div class="section"><div class="section-t">status</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        ${tagHtml(r.status)}${scoreHtml(r.match_score)}
+        ${routeTag(r)}${scoreHtml(r.match_score)}
         ${r.gate_reason && r.status === "needs_human"
           ? `<span class="mono" style="font-size:12px;color:var(--faint)">${esc(gateLabel(r.gate_reason))}</span>` : ""}
       </div></div>
@@ -4740,7 +4753,7 @@ function openDrawer(pk) {
         View résumé · ${esc(r.resume_version)}</button>` : ""}</div>
 
     ${retailor}
-    ${["applied", "applied_manual"].includes(r.status) ? (() => {
+    ${!guarded && ["applied", "applied_manual"].includes(r.status) ? (() => {
       const usedIds = new Set([r.profile_id || state.profileDefault, ...(state.apps.filter((a) => (a.reapplied_from || "") === r.pk.split("~")[0] || a.pk === r.pk.split("~")[0]).map((a) => a.profile_id || state.profileDefault))]);
       const choices = (state.profiles || []).filter((p) => p.kind !== "rotating" && !usedIds.has(p.id));
       const again = (r.reapplied_as || []);
@@ -4795,6 +4808,16 @@ function openDrawer(pk) {
     <div class="section"><div class="section-t">artifacts</div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">${links}</div></div>
   `;
+  if (guarded) {
+    // Even fields in the read-only detail pane must not expose mutation affordances.
+    const select = $("#drawer-body #job-profile");
+    if (select) {
+      const note = document.createElement("p");
+      note.className = "diag-unlinked";
+      note.textContent = "Read-only until this blocker or portal outcome is reconciled.";
+      select.closest(".profpick")?.replaceWith(note);
+    }
+  }
   $("#drawer-title").textContent = r.company;
   // The posting URL, always one click away — not buried in the artifacts row.
   const loc = r.location ? ` · <span class="drawer-loc">${esc(r.location)}</span>` : "";
@@ -4809,6 +4832,7 @@ function openDrawer(pk) {
     $("#drawer").classList.add("show");
   });
   state.openPk = r.pk;
+  state.openRoute = routeOf(r);
   rtStop();
   if (retailoring) rtBegin(r.pk);
   if (r.has_diff) loadDiff(r.pk);

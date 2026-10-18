@@ -1944,7 +1944,11 @@ class _EntrySession:
             check_form_destination(current, matches[0], provenance=self.provenance)
             if args[0] not in {'fill', 'select', 'upload', 'click'}:
                 raise Gate('unapproved native IPC verb.')
-            if args[0] == 'click' and self.on_committing_click is not None:
+            # A guarded radio/checkbox choice is not a potentially committing
+            # native submit; classifying every click as submission would turn a
+            # successful safe choice into a false uncertain-result hold.
+            if (args[0] == 'click' and native_submit(matches[0])
+                    and self.on_committing_click is not None):
                 self.committing = True
                 self.on_committing_click()
         if args and args[0] != 'evaluate' and self.formless_identity is not None:

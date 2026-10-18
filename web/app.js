@@ -1086,9 +1086,13 @@ function queuedPks() {
 }
 
 function sectionOf(r, queued) {
+  const kind = routeOf(r);
+  if (kind === "portal_check") return "portal";
+  if (kind === "waiting_for_fix") return "fix";
+  if (kind === "manual_triage") return "triage";
   if (r.status === "needs_human") {
-    if (queued && queued.has(r.pk)) return "queued";
-    return awaitsApproval(r) ? "ready" : "needs";
+    if (kind === "approval" && queued && queued.has(r.pk)) return "queued";
+    return kind === "approval" ? "ready" : "needs";
   }
   if (r.status === "tailored" || r.status === "tailoring") {
     if (r.status === "tailoring") return "preparing";
@@ -1159,10 +1163,12 @@ function aliasById(id) {
 
 function laneCard(r) {
   let retry = "";
-  if (r.status === "failed" && r.fail_kind === "spam_flagged") {
+  if (isReadOnly(r)) {
+    retry = '<span class="diag-mini">View details to reconcile</span>';
+  } else if (r.status === "failed" && r.fail_kind === "spam_flagged") {
     retry = `<button class="kc-retry" data-act="retry" data-pk="${esc(r.pk)}"
        title="Run this application again with human style clicks">↻ Retry</button>`;
-  } else if (r.status === "needs_human" && r.gate_reason === "captcha") {
+  } else if (routeOf(r) === "captcha" || routeOf(r) === "no_account") {
     retry = `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
        title="View manual completion and portal verification details">View details</button>`;
   } else if (canApply(r)) {
@@ -1351,8 +1357,11 @@ const moreBtn = (key, shown, total, step = REVEAL) =>
    so triage never needs a click; answering happens in the drawer or the
    Needs you tab, both one click away. */
 function gateMini(r) {
-  const captcha = r.gate_reason === "captcha";
-  const act = captcha
+  const kind = routeOf(r);
+  const captcha = kind === "captcha" || kind === "no_account";
+  const act = isReadOnly(r)
+    ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}">View details</button>`
+    : captcha
     ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
          title="View manual completion and portal verification details">View details</button>`
     : `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
@@ -1361,7 +1370,8 @@ function gateMini(r) {
   // 1: teach ..." stopped mid-phrase, so the card asked you to open the drawer to
   // find out what the question even was — which is the one thing this card exists
   // to save you.
-  const full = String(r.gate_question || defaultGateText(r))
+  const full = String(isReadOnly(r) ? (r.fail_reason || r.gate_question || "Review details")
+    : (r.gate_question || defaultGateText(r)))
     .replace(/[#*_`>]/g, "").replace(/\s+/g, " ").trim();
   const q = full.length <= 240 ? full
     : full.slice(0, 240).replace(/\s+\S*$/, "") + "…";
@@ -1386,8 +1396,8 @@ function foundRow(r) {
     ${r.location ? `<span class="jr-loc" title="${esc(r.location)}">${esc(String(r.location).slice(0, 40))}</span>` : ""}
     ${postedHtml(r.posted_at)}
     <span class="jr-when mono">${r.updated_at ? esc(ago(r.updated_at)) : ""}</span>
-    <button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(r.pk)}"
-      title="Score and tailor this job now. It stops before applying">▶ Run now</button>
+    ${rowActionAllowed(r.pk, "run-now") ? `<button class="kc-retry kc-run jr-act" data-act="run-now" data-pk="${esc(r.pk)}"
+      title="Score and tailor this job now. It stops before applying">▶ Run now</button>` : ""}
   </div>`;
 }
 function againHtml(r) {
@@ -1419,7 +1429,7 @@ function appliedRow(r) {
   </div>`;
 }
 function canForceApply(r) {
-  return r.status === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
+  return !isReadOnly(r) && r.status === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
 }
 function forceApplyButton(r, cls = "btn btn-primary") {
   return canForceApply(r) ? `<button class="${cls}" data-act="force-apply" data-pk="${esc(r.pk)}" title="Bypass this role's match score, tailor the résumé, then review before submission"${state.forcePreparing.has(r.pk) ? " disabled" : ""}>Force apply</button>` : "";
@@ -1447,23 +1457,24 @@ async function forceApply(pk) {
 }
 function closedRow(r) {
   const failed = isStuck(r);
+  const guarded = isReadOnly(r);
   let act = "";
-  if (r.status === "failed" && r.fail_kind === "spam_flagged") {
+  if (!guarded && r.status === "failed" && r.fail_kind === "spam_flagged") {
     act = `<button class="kc-retry jr-act" data-act="retry" data-pk="${esc(r.pk)}"
       title="Run this application again with human style clicks">↻ Retry</button>`;
-  } else if (failed) {
+  } else if (failed && !guarded) {
     act = `<button class="kc-retry kc-queue jr-act" data-act="queue-apply" data-pk="${esc(r.pk)}"
       title="Clear the failure and put this job back on the apply queue">↻ Requeue</button>`;
   }
   if (canForceApply(r)) act = forceApplyButton(r, "kc-retry jr-act");
-  if (r.review_rejected) act = `<button class="ps-link jr-act" data-review-undo-pk="${esc(r.pk)}" data-company="${esc(r.company)}">Undo rejection</button>`;
+  if (!guarded && r.review_rejected) act = `<button class="ps-link jr-act" data-review-undo-pk="${esc(r.pk)}" data-company="${esc(r.company)}">Undo rejection</button>`;
   const whyFull = r.closed_reason || r.fail_reason || r.skip_reason || "";
   const why = String(whyFull).replace(/\s+/g, " ").trim().slice(0, 90);
   return `<div class="jrow" data-open="${esc(r.pk)}" role="button" tabindex="0" title="Open details">
     <span class="jr-dot${failed ? " bad" : ""}"></span>
     <span class="jr-co">${esc(r.company)}</span>
     <span class="jr-title">${esc(r.title)}</span>
-    ${failed ? tagHtml(r.status) : ""}
+    ${failed ? routeTag(r) : ""}
     ${why ? `<span class="jr-why" title="${esc(whyFull)}">${esc(why)}</span>` : ""}
     <span class="jr-when mono">${r.updated_at ? esc(ago(r.updated_at)) : ""}</span>
     ${act}
@@ -1513,6 +1524,7 @@ function readySec(rows) {
 // before tracking catches up, so a running role cannot remain selectable.
 function reviewIsSkipped(r) { return !!r.review_skipped || state.reviewSkipped.has(r.pk); }
 function reviewPhase(r) {
+  if (isReadOnly(r)) return "";
   if (["applied", "applied_manual", "skipped", "failed", "uncertain", "error", "capped", "job_gone"].includes(r.status)) return "";
   if (r.status === "submitting" || (state.queue?.in_flight || []).includes(r.pk)) return "applying";
   if ((state.queue?.pending || []).some((it) => it.pk === r.pk)) return "waiting";
@@ -1674,8 +1686,9 @@ async function reviewAction(action, company, explicitPks = null, day = null) {
     toast("A selected role has started applying. Clear the selection and choose again.");
     return;
   }
-  const picks = explicitPks ? state.apps.filter((r) => r.company === company && explicitPks.includes(r.pk))
-    : selected.length ? selected : action === "apply" ? rows.filter((r) => reviewSelectable(r) && !reviewIsSkipped(r)) : [];
+  const picks = (explicitPks ? state.apps.filter((r) => r.company === company && explicitPks.includes(r.pk))
+    : selected.length ? selected : action === "apply" ? rows.filter((r) => reviewSelectable(r) && !reviewIsSkipped(r)) : [])
+    .filter((r) => !isReadOnly(r) && (action === "undo" ? r.review_rejected : reviewSelectable(r)));
   if (!picks.length || !["reject", "apply", "skip", "restore", "undo"].includes(action)) return;
   if (["reject", "apply"].includes(action)) {
     const detail = action === "reject" ? "They move to Closed. You can undo this decision."
@@ -1809,7 +1822,7 @@ function queuedSec(rows) {
   // is what makes "filter to Microsoft" show Microsoft's queue and not everyone's.
   const pend = (q.pending || [])
     .map((it, gi) => ({ ...it, pos: gi + 1, first: gi < cap && !it.blocked }))
-    .filter((it) => byPk[it.pk]);
+    .filter((it) => byPk[it.pk] && !isReadOnly(byPk[it.pk]));
   if (!pend.length) return "";
 
   const running = new Set(q.running || []);
@@ -1855,7 +1868,7 @@ function queuedSec(rows) {
 
   // Ticks are kept for jobs still IN the queue only, so one that drained or was
   // skipped elsewhere cannot sit in the selection and be acted on twice.
-  const live = new Set(pend.map((it) => it.pk));
+  const live = new Set(pend.filter((it) => !isReadOnly(byPk[it.pk])).map((it) => it.pk));
   for (const pk of [...state.qPicked]) if (!live.has(pk)) state.qPicked.delete(pk);
   const picked = state.qPicked.size;
 
@@ -2077,19 +2090,32 @@ function companyBar() {
     <span class="cbar-co">${esc(co)}</span>${body}</div>`;
 }
 
+function diagnosticSec(rows, title, hint, cls) {
+  if (!rows.length) return "";
+  return `<section class="psec ps-diagnostic ps-${cls} has">
+    <div class="ps-head"><span class="ps-name">${title}</span>
+      <span class="ps-n mono">${rows.length}</span><span class="ps-hint">${hint}</span></div>
+    <div class="diag-grid">${rows.map((r) => `<article class="diag-card">
+      <b>${esc(r.company)} · ${esc(r.title)}</b>${routeNotice(r)}
+      <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button>
+    </article>`).join("")}</div></section>`;
+}
 function viewPipeline() {
   if (!state.apps.length) {
     return `<div class="empty"><div class="empty-big">No applications yet</div>
       Click <b>Discover · All</b> above to find jobs from your watchlist.<br>
       They move down this board: found, then tailored, then applied.</div>`;
   }
-  const S = { preparing: [], needs: [], ready: [], queued: [], flight: [], applied: [], found: [], closed: [] };
+  const S = { portal: [], fix: [], triage: [], preparing: [], needs: [], ready: [], queued: [], flight: [], applied: [], found: [], closed: [] };
   const inQ = queuedPks();
   for (const r of visible(state.apps)) S[reviewPhase(r) === "applying" ? "flight" : sectionOf(r, inQ)].push(r);
   const shown = Object.values(S).reduce((a, b) => a + b.length, 0);
   if (!shown && filtersActive()) return emptyFiltered();
   return `<div class="pstack">
     ${companyBar()}
+    ${diagnosticSec(S.portal, "Portal verification", "Check employer portal and reconcile the outcome.", "portal")}
+    ${diagnosticSec(S.fix, "Waiting for fix", "Code changes are required; an answer cannot clear these gates.", "fix")}
+    ${diagnosticSec(S.triage, "Manual triage", "The cause is not verified; no action can be inferred.", "triage")}
     ${S.needs.length ? needsSec(S.needs) : ""}
     ${S.preparing.length ? `<section class="psec ps-preparing"><div class="ps-head"><span class="ps-name">Preparing résumés</span><span class="ps-n mono">${S.preparing.length}</span><span class="ps-hint">Scoring and tailoring. The completion date appears when the résumé is saved.</span></div><div class="ps-grid">${S.preparing.map(laneCard).join("")}</div></section>` : ""}
     ${readySec([...S.ready, ...S.queued, ...S.flight])}
@@ -2297,7 +2323,7 @@ function viewApps() {
       ? `<a class="rowlk" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener" title="Last screenshot" aria-label="Last screenshot">${ICON.shot}</a>`
       : `<span class="rowlk off" title="No screenshot">${ICON.shot}</span>`;
     return `<tr data-pk="${esc(r.pk)}">
-      <td>${tagHtml(r.status)}</td>
+      <td>${routeTag(r)}</td>
       <td class="t-co">${esc(r.company)}</td>
       <td class="t-role" title="${esc(r.title)}"><span class="t-role-t">${esc(r.title)}</span>${["applied", "applied_manual"].includes(r.status) ? appliedProfHtml(r) : ""}${againHtml(r)}${state.tracker[r.pk]?.outcome ? `<span class="tracker-outcome">${esc(TRACK_OUTCOMES.find(([v]) => v === state.tracker[r.pk].outcome)?.[1] || "")}</span>` : ""}${state.tracker[r.pk]?.follow_up ? `<span class="tracker-followup ${followupDue(state.tracker[r.pk]) ? "due" : ""}">Follow up ${esc(state.tracker[r.pk].follow_up)}</span>` : ""}${(r.replies || []).map(replySummaryHtml).join("")}</td>
       <td>${scoreHtml(r.match_score)}</td>
@@ -2401,7 +2427,7 @@ function viewStuck() {
           with the reason and what the browser last saw.</div>`;
   }
   return items.map((r) => {
-    const reason = r.closed_reason || r.gate_question || "Couldn't complete this application.";
+    const reason = isReadOnly(r) ? "" : (r.closed_reason || r.gate_question || "Couldn't complete this application.");
     const shot = imgOk(r.screenshot_url)
       ? `<a class="stuck-shot" href="${esc(r.screenshot_url)}" target="_blank" rel="noopener"
            title="What the browser last saw — click to enlarge">
@@ -2415,16 +2441,16 @@ function viewStuck() {
       <div class="stuck-main">
         <header>
           <div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
-          ${tagHtml(r.status)}
+          ${routeTag(r)}
         </header>
-        <div class="stuck-reason">${esc(reason)}</div>
+        ${isReadOnly(r) ? routeNotice(r) : `<div class="stuck-reason">${esc(reason)}</div>`}
         ${steps ? `<div class="mini-timeline">${steps}</div>` : ""}
         <div class="stuck-meta mono">
           ${r.discovered_at ? `found ${when(r.discovered_at)} · ` : ""}${esc(r.pk)}
           ${r.jd_url ? ` · <a href="${esc(r.jd_url)}" target="_blank" rel="noopener">posting ↗</a>` : ""}
         </div>
         <div class="gc-actions">
-          ${RETRYABLE.includes(r.status)
+          ${!isReadOnly(r) && RETRYABLE.includes(r.status)
             ? `<button class="btn btn-primary" data-act="retry" data-pk="${esc(r.pk)}">Retry</button>` : ""}
           <button class="btn btn-ghost" data-open="${esc(r.pk)}">
             Full details${nf ? ` · ${nf} fields` : ""}</button>
@@ -4445,12 +4471,7 @@ async function stopRun(what = "discover", ask = true) {
 
 // Confirm and enqueue the same visible jobs. A company filter used to change
 // the button count while the request still approved the entire application list.
-const approveAllPicks = (a) =>
-  a.gate_reason !== "captcha"
-  && (a.status === "tailored"
-      || (a.status === "needs_human"
-          && (a.gate_reason === "approval"
-              || String(a.gate_question || "").startsWith("Ready to apply"))));
+const approveAllPicks = (a) => routeOf(a) === "tailored" || routeOf(a) === "approval";
 
 function visibleApprovalPicks() {
   const queued = queuedPks();

@@ -49,7 +49,18 @@ def location_page(*, typed='', selected=False, caption='Testville, USA',
             'linked': True, 'link_id': 'location-options',
             'listbox_selector': '#location-options',
             'listbox_visible': bool(typed and not selected),
-            'options': current_options, 'selected_text': caption if selected else '',
+            'options': current_options,
+            'location_owner': {'valid': True, 'link_id': 'location-options',
+                               'listbox_selector': '#location-options'},
+            'location_receiver': {'declared': True, 'count': 1,
+                                  'id_reference': 'location-token',
+                                  'name_reference': '', 'valid': True},
+            'location_selected_option': ({
+                'selector': '#location-option', 'label': caption,
+                'value': 'testville-verified', 'tag': 'li',
+                'selected': True, 'safe': True,
+            } if selected else None),
+            'selected_text': caption if selected else '',
             'displayed_text': caption if selected else typed,
             'selected_value': commit_value,
             'hidden_selector': '#location-token',
@@ -111,12 +122,16 @@ class FakeLever:
     """Fixture-shaped fake: press opens options, only an option click commits."""
     def __init__(self, *, caption='Testville, USA', options=None, drift='',
                  failed_commit='', press_unsupported=False, visible_label=True,
-                 click_uncertain=False):
+                 click_uncertain=False, receiver_shape='', owner_shape='',
+                 selected_option_shape='', witness_receiver_drift=False):
         self.fixture = _lever_location_form(caption=caption)
         self.caption, self.options, self.drift = caption, options, drift
         self.failed_commit, self.press_unsupported = failed_commit, press_unsupported
         self.click_uncertain = click_uncertain
         self.visible_label = visible_label
+        self.receiver_shape, self.owner_shape = receiver_shape, owner_shape
+        self.selected_option_shape = selected_option_shape
+        self.witness_receiver_drift = witness_receiver_drift
         self.buffer, self.selected, self.typed_reads = '', False, 0
         self.calls = []
         self.started = False
@@ -144,9 +159,51 @@ class FakeLever:
                 changed['receiver.value'] = 'wrong'
             elif self.failed_commit == 'hidden':
                 changed['combo.hidden_value'] = 'wrong'
-        return location_page(typed=typed, selected=self.selected,
+        page = location_page(typed=typed, selected=self.selected,
                              caption=self.caption, options=state_options,
                              changed=changed)
+        combo = page['controls'][0]['combobox']
+        shape = self.receiver_shape
+        if shape.startswith('post_') and not self.selected:
+            shape = ''
+        else:
+            shape = shape.removeprefix('post_')
+        if shape in {'dangling', 'dangling_name', 'duplicate'}:
+            combo['hidden_selector'] = ''
+            combo['hidden_value'] = ''
+            combo['location_receiver'] = {
+                'declared': True, 'count': 2 if shape == 'duplicate' else 0,
+                'id_reference': '' if shape == 'dangling_name' else 'location-token',
+                'name_reference': 'location_token' if shape == 'dangling_name' else '',
+                'valid': False,
+            }
+            if shape == 'duplicate':
+                # Two distinct structural inventory selectors for duplicate
+                # same-form id="location-token" elements in the synthetic DOM.
+                second = deepcopy(page['controls'][1])
+                second['selector'] = 'form > input:nth-of-type(3)'
+                page['controls'].append(second)
+            else:
+                page['controls'].pop(1)
+        elif shape == 'none':
+            combo['hidden_selector'] = ''
+            combo['hidden_value'] = ''
+            combo['location_receiver'] = {
+                'declared': False, 'count': 0,
+                'id_reference': '', 'name_reference': '', 'valid': True,
+            }
+            page['controls'].pop(1)
+        if self.owner_shape:
+            combo['location_owner'] = {'valid': False, 'link_id': 'location-options'}
+        if self.selected and self.selected_option_shape == 'lost':
+            combo['location_selected_option'] = None
+        elif self.selected and self.selected_option_shape == 'replaced':
+            combo['location_selected_option'] = {
+                'selector': '#different-location-option',
+                'label': self.caption, 'value': 'testville-verified',
+                'tag': 'li', 'selected': True, 'safe': True,
+            }
+        return page
 
     async def page(self):
         if self.buffer and not self.selected:
@@ -156,7 +213,10 @@ class FakeLever:
     async def call(self, *args, **kwargs):
         self.calls.append(args)
         if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-            return {'value': evidence(self._snapshot(), visible_label=self.visible_label)}
+            observed = evidence(self._snapshot(), visible_label=self.visible_label)
+            if self.witness_receiver_drift and self.buffer and not self.selected:
+                observed['controls'][0]['combobox']['location_receiver']['count'] = 0
+            return {'value': observed}
         if args == ('focus', '#current-location'):
             self.started = True
             return {}

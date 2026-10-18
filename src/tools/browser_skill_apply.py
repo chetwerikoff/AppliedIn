@@ -1383,6 +1383,10 @@ def _ashby_native_classify(page: dict, provenance: ApplicationEntryProvenance) -
             selected.append(owner)
         else:
             foreign.append(owner)
+    if not selected and len(passive_search) == len(candidates):
+        # An exhaustive, disjoint search-only shell has no application owner
+        # yet. Preserve bounded readiness without granting a target or IPC.
+        raise _EntryNotReady('no qualifying application form')
     if len(selected) != 1:
         raise Gate(('ambiguous application roots' if len(selected) > 1
                     else 'native application root lacks tracked job binding')

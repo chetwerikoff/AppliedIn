@@ -28,7 +28,9 @@ function matches(n,q){return q.split(',').some(s=>{
       const sib=p.parentElement?p.parentElement.children.filter(x=>m[2]==='child'||x.tagName===p.tagName):[p];
       if(sib.indexOf(p)+1!==Number(m[3]))return false;p=p.parentElement;
     }
-    return !p;
+    // CSS structural chains may begin at any ancestor, not only at html.
+    // Deep Gate diagnostics legitimately use a unique twelve-segment suffix.
+    return true;
   }
   let neg=null;s=s.replace(/:not\(([^)]+)\)/g,(_,x)=>{neg=x;return '';});
   if(neg&&matches(n,neg))return false;
@@ -84,6 +86,9 @@ for(const key of keys){
   if(scenario.badGraph&&key==='location')attrs['aria-haspopup']='false';
   if(scenario.searchToken&&key==='location'){v.children.pop();input.value='Approved location';}
   if(key==='location'){
+    if(scenario.receiverBackedCountry){
+      input.id='country';label.id='country-label';attrs['aria-labelledby']=label.id;
+    }
     if(scenario.drift==='field')field.id+='-drift';
     if(scenario.drift==='value')v.id+='-drift';
     if(scenario.drift==='wrapper')w.id+='-drift';

@@ -15,7 +15,8 @@ const MANUAL = 'CAPTCHA present; complete the application manually and verify th
 
 function row(pk, gate_reason = 'captcha', gate_question = '', status = 'needs_human') {
   return { pk, company: 'example-co', title: 'Synthetic Engineer', status,
-    gate_reason, gate_question, submit_hold_state: 'clear', fail_kind: '',
+    gate_reason, gate_question, gate_has_form_question: gate_reason === 'owner_question',
+    submit_hold_state: 'clear', fail_kind: '',
     fields: [], timeline: [], location: '',
     match_score: 5, jd_url: 'https://example.test/jobs/synthetic' };
 }

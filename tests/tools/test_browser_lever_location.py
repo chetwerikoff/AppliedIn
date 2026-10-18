@@ -519,7 +519,7 @@ def test_lever_dom_witnesses_are_shared_by_both_production_readers():
         assert 'const leverLocationReceiver = (e, form) =>' in script
         assert 'const leverLocationOwner = e =>' in script
         assert 'const leverLocationSelected = (e, owner) =>' in script
-        assert "document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]')" not in script
+        assert 'const identifiers=new Set([id,...options.map' in script
         assert "[aria-controls],[aria-owns],[aria-activedescendant]" in script
         assert "document.querySelectorAll('#'+CSS.escape(id)).length===1" in script
         assert 'location_receiver:leverLocationReceiver(e, form)' in script

@@ -554,7 +554,7 @@ def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, exp
     snapshot = dom(diagnostics=scenario)
     p = snapshot['page']
     assert p['opaque_count'] == scenario.get('count', 1)
-    assert len(p['opaque_locators']) == min(3, p['opaque_count'])
+    assert len(p['opaque_locators']) == p['opaque_count']
     assert all(expected in x for x in p['opaque_locators'])
     assert all(forms._safe_diagnostic(x) == x for x in p['opaque_locators'])
     with pytest.raises(forms.Gate) as caught:
@@ -564,7 +564,7 @@ def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, exp
     assert 'control=unavailable' not in reason
     assert 'test-user' not in reason and '@' not in reason
     assert 'private-' not in reason
-    assert reason.count('control=') <= 3
+    assert reason.count('control=') == p['opaque_count']
 
 
 def test_repeated_deep_opaque_nodes_remain_fail_closed():
@@ -578,12 +578,12 @@ def test_repeated_deep_opaque_nodes_remain_fail_closed():
         forms._inventory_ok(p)
 
 
-@pytest.mark.parametrize('count', [2, 3])
-def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(count):
+@pytest.mark.parametrize('depth,count', [(14, 2), (14, 3), (30, 2), (30, 8)])
+def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(depth, count):
     # Regression for review #5558913444: all present canvases have
     # identical last-twelve segments but different value-free ancestors.
     # This test failed on the original 12-segment-only diagnostic locator.
-    p = dom(diagnostics={'count': count, 'depth': 14})['page']
+    p = dom(diagnostics={'count': count, 'depth': depth})['page']
     assert p['opaque_count'] == count
     assert p['opaque_controls'] is True and p['inventory_verified'] is False
     paths = p['opaque_locators']
@@ -591,7 +591,7 @@ def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(count):
     assert all(isinstance(x, str) and x != 'unavailable'
                and forms._safe_diagnostic(x) == x for x in paths)
     assert len(set(paths)) == count
-    assert all(x.count(' > ') >= 14 for x in paths)
+    assert all(x.count(' > ') >= depth for x in paths)
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     detail = str(caught.value)
@@ -603,18 +603,19 @@ def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(count):
 
 
 def test_safe_diagnostic_accepts_only_bounded_structural_segments():
-    # The browser and Gate share the same 24-segment bound; a 25th segment
-    # is rejected even when the selector's entire length is below 600.
-    path = ' > '.join(['div:nth-of-type(1)'] * 23 + ['canvas:nth-of-type(1)'])
-    assert len(path) < 600
+    # The browser and Gate share the same per-locator limits. Over-limit
+    # untrusted diagnostics are still redacted, not echoed into a Gate.
+    from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS, _DIAGNOSTIC_MAX_CHARS
+    path = ' > '.join(['div:nth-of-type(1)'] * (_DIAGNOSTIC_MAX_SEGMENTS - 1)
+                      + ['canvas:nth-of-type(1)'])
+    assert len(path) < _DIAGNOSTIC_MAX_CHARS
     assert forms._safe_diagnostic(path) == path
     over_limit = path + ' > div:nth-of-type(1)'
-    assert len(over_limit) < 600
+    assert len(over_limit) < _DIAGNOSTIC_MAX_CHARS
     assert forms._safe_diagnostic(over_limit) == 'unavailable'
-    # A path with the right number of segments but excessive decimal indexes
-    # must not circumvent the independent output-length cap.
-    too_long = ' > '.join(['div:nth-of-type(123456789123456789)'] * 24)
-    assert len(too_long) > 600
+    too_long = ' > '.join(
+        ['div:nth-of-type(' + '1234567890' * 4 + ')'] * _DIAGNOSTIC_MAX_SEGMENTS)
+    assert len(too_long) > _DIAGNOSTIC_MAX_CHARS
     assert forms._safe_diagnostic(too_long) == 'unavailable'
 
 
@@ -640,17 +641,24 @@ def test_safe_diagnostic_rejects_untrusted_or_nonstructural_paths(unsafe):
     assert '@example-co.test' not in str(caught.value)
 
 
-def test_opaque_locators_exceeding_structural_depth_remain_fail_closed():
-    # Two otherwise identical chains have no unique suffix within 24
-    # consecutive structural segments. Do not expose ids or relax the Gate
-    # when a locator lies beyond the explicitly bounded grammar.
-    page = dom(diagnostics={'count': 2, 'depth': 30})['page']
-    assert page['opaque_count'] == 2 and page['opaque_controls'] is True
+@pytest.mark.parametrize('count', [2, 8])
+def test_depth_thirty_opaque_nodes_are_all_named_without_page_identifiers(count):
+    # The previous 24-segment/600-char diagnostic bound lost present nodes.
+    # Gate must name all of them while still refusing the incomplete inventory.
+    page = dom(diagnostics={'count': count, 'depth': 30})['page']
+    assert page['opaque_count'] == count and page['opaque_controls'] is True
     assert page['inventory_verified'] is False
-    assert page['opaque_locators'] == ['unavailable', 'unavailable']
-    with pytest.raises(forms.Gate, match='opaque_count=2') as caught:
+    paths = page['opaque_locators']
+    assert len(paths) == count and len(set(paths)) == count
+    assert all(forms._safe_diagnostic(path) == path and path != 'unavailable'
+               for path in paths)
+    with pytest.raises(forms.Gate, match='opaque_count=' + str(count)) as caught:
         forms._inventory_ok(page)
-    assert str(caught.value).count('control=unavailable') == 2
+    message = str(caught.value)
+    assert message.count('control=') == count
+    assert all(message.count('control=' + path) == 1 for path in paths)
+    assert 'control=unavailable' not in message
+    assert 'test-user' not in message and 'example-co' not in message and '@' not in message
 
 
 @pytest.mark.parametrize('fresh', [False, True])

@@ -1763,6 +1763,9 @@ def _entry_safety(page, allowed, provenance):
     if (isinstance(provenance, ApplicationEntryProvenance)
             and provenance.ats == 'ashby' and entry.get('formless') is None):
         _ashby_native_classify(page, provenance)
+        # Exhaustive foreign-owner classification precedes destination preflight.
+        # Foreign candidates remain in the read-only census, never action targets.
+        controls = page['controls']
     root = entry.get('root')
     if root:
         check_form_destination(page, dict(in_form=True, form_selector=root['selector'],

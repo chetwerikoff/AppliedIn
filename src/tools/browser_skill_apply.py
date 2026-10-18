@@ -2544,15 +2544,21 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     # PAGE order, one logical record per required control (one per radio group).
     # Rebind after each committed write: a previous PAGE must not authorize the next.
     for initial in list(page['controls']):
-        item = control(page, {'selector': initial['selector']}, 'bootstrap-field')
-        kind = item.get('type')
+        kind = initial.get('type')
+        if not (_native_answer(initial) or kind in {'radio', 'checkbox', 'combobox'}):
+            continue
+        required = (any(c.get('required') for c in _radio_group(page, initial))
+                    if kind == 'radio' else bool(initial.get('required')))
+        if not required:
+            continue
+        # Observation already proved selector uniqueness. Read this control
+        # without prematurely treating a disabled *optional* sibling as a Gate.
+        matches = [c for c in page['controls'] if c['selector'] == initial['selector']]
+        if len(matches) != 1:
+            raise Gate('A previously observed required control disappeared.')
+        item = matches[0]
         eligible = kind in _BOOTSTRAP_TYPES and (
             kind != 'select' or item.get('tag') == 'select')
-        required = (any(c.get('required') for c in _radio_group(page, item))
-                    if kind == 'radio' else bool(item.get('required')))
-        if not ((_native_answer(item) or kind in {'radio', 'checkbox', 'combobox'})
-                and required):
-            continue
         group = ((item.get('form_selector'), item.get('name'))
                  if kind == 'radio' else item['selector'])
         if group in seen:

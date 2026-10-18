@@ -3474,6 +3474,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                        else str(facts.get(key, value)).strip())
     return receipt
 
+def _fields_report(history: list, filled: dict) -> list[dict]:
+    """Report only browser-read-back values, not the immutable bank answer."""
+    return [{'label': r['label'], 'value': filled[r['selector']]}
+            for r in history if r.get('selector') in filled]
+
+
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',
                 resume_path: str = '', fixture_context=None) -> dict:
@@ -3759,10 +3765,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             step['url'] = after['url']
                             if allowed(after['url']) and (phrase := confirmation(before, after)):
                                 return {'status': 'applied', 'confirmation': phrase,
-                                        'fields': [{'label': r['label'],
-                                                    'value': filled[r['selector']]}
-                                                   for r in history
-                                                   if r.get('selector') in filled]}
+                                        'fields': _fields_report(history, filled)}
                         context = handoff(
                             'Submission clicked, but no new employer confirmation was observed. '
                             'Check the portal before retrying.', step)
@@ -3810,8 +3813,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise Gate('Click redirected to an unrelated job or tenant.')
                     if submitted and allowed(page['url']) and (phrase := confirmation(before, page)):
                         return {'status': 'applied', 'confirmation': phrase,
-                                'fields': [{'label': r['label'], 'value': filled[r['selector']]}
-                                           for r in history if r.get('selector') in filled]}
+                                'fields': _fields_report(history, filled)}
                 raise Gate('The form needs review after reaching the browser step limit.')
     except (Exception, asyncio.CancelledError) as exc:
         if (getattr(session, 'upload_attempted', False)

@@ -1041,11 +1041,11 @@ def _unrelated_search_form(controls: list[dict]) -> bool:
 
 def _safe_diagnostic(value) -> str:
     # Validate the reader's bounded structural grammar again at the log boundary.
-    # Share the segment cap with diagnosticLocator; never accept DOM IDs or values.
-    from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS
+    # Share the depth and byte caps with diagnosticLocator; never accept IDs or values.
+    from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS, _DIAGNOSTIC_MAX_CHARS
     tags = '|'.join(_DIAGNOSTIC_TAGS.split())
     segment = rf'(?:(?:{tags}):nth-of-type\([1-9][0-9]*\)|\*:nth-child\([1-9][0-9]*\))'
-    return value if (isinstance(value, str) and len(value) <= 600
+    return value if (isinstance(value, str) and len(value) <= _DIAGNOSTIC_MAX_CHARS
                      and re.fullmatch(
                          segment + rf'(?: > {segment}){{0,{_DIAGNOSTIC_MAX_SEGMENTS - 1}}}',
                          value)) else 'unavailable'
@@ -1077,7 +1077,7 @@ def _inventory_ok(page: dict) -> None:
             causes.append('opaque_count=' + str(count if type(count) is int and count >= 0 else 'unavailable'))
             locators = page.get('opaque_locators')
             causes.extend('control=' + _safe_diagnostic(x) for x in (
-                locators[:3] if isinstance(locators, list) and locators else [None]))
+                locators if isinstance(locators, list) and locators else [None]))
         if not causes:
             causes.append('inventory_verified=false/readiness')
         raise Gate('The current form inventory is incomplete; ' + '; '.join(causes))

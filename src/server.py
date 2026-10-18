@@ -222,6 +222,22 @@ def _reply_sort_timestamp(value) -> float:
 
 
 
+def _project_submit_hold(pk: str, raw_row: dict, tracking, *, no_independent_key=False) -> str:
+    """Expose the existing hold decision without creating or clearing a hold.
+
+    A missing Redis client does not prove a clear hold on local/unknown stores.
+    Only the explicitly keyless cloud deployment can treat that as clear.
+    """
+    try:
+        if submit_hold.blocked(pk, raw_row, tracking=tracking):
+            return "blocked"
+        if getattr(tracking, "r", None) is None:
+            return "clear" if no_independent_key else "unknown"
+        return "clear"
+    except Exception:
+        return "unknown"
+
+
 def _to_ui(row: dict, artifacts) -> dict:
     """Map a tracking row to the shape the dashboard expects."""
     def link(key):
@@ -478,8 +494,18 @@ def create_app() -> FastAPI:
                 })
         for items in grouped.values():
             items.sort(key=lambda item: _reply_sort_timestamp(item["date"]), reverse=True)
-        payload = {"items": [_to_ui(r, stores.artifacts) | {"replies": grouped.get(r.get("pk"), [])}
-                              for r in rows]}
+        # Hold evaluation uses the RAW row and the existing independent key before
+        # the dashboard drops storage-only evidence. No state is written here.
+        payload = {"items": [
+            _to_ui(r, stores.artifacts) | {
+                "replies": grouped.get(r.get("pk"), []),
+                "submit_hold_state": _project_submit_hold(
+                    r.get("pk") or "", r, stores.tracking,
+                    no_independent_key=settings.mode == "cloud"),
+                "submit_hold_reason": submit_hold.REASON,
+            }
+            for r in rows
+        ]
         if reply_error:
             payload.update(replies=[], error=reply_error)
         return payload

@@ -1,0 +1,157 @@
+// Issue #121: typed, read-only gate routing in an offline Node VM.
+// No browser, network, application profile, queue or owner data is involved.
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+const source = fs.readFileSync(path.join(__dirname, '../../web/app.js'), 'utf8')
+  .replace("import { showSteering } from './steering.js';", 'const showSteering = () => {};')
+  .replace('import { auth } from "./auth.js";', 'const auth = { header: () => ({}) };')
+  .replace(/\nboot\(\);\s*$/, '');
+
+function row(pk, fields = {}) {
+  return { pk, company: 'example-co', title: 'Synthetic role', status: 'needs_human',
+    gate_reason: 'owner_question', gate_question: 'What is your preferred location?',
+    submit_hold_state: 'clear', possible_submission: false, fail_kind: '',
+    fail_reason: '', fields: [], timeline: [], location: '',
+    match_score: 7, jd_url: 'https://example.test/jobs/1', ...fields };
+}
+function harness() {
+  const nodes = new Map(), requests = [];
+  const node = (selector) => {
+    if (!nodes.has(selector)) nodes.set(selector, {
+      dataset: {}, value: '', innerHTML: '', hidden: false, style: {},
+      classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+      listeners: {}, textContent: '', querySelectorAll() { return []; },
+      getBoundingClientRect() { return { width: 0, height: 0 }; },
+      addEventListener(event, callback) { (this.listeners[event] ||= []).push(callback); },
+      closest() { return null; }, focus() {}, click() {}, setAttribute() {}, appendChild() {},
+      scrollIntoView() {},
+    });
+    return nodes.get(selector);
+  };
+  const document = { querySelector: node, querySelectorAll: () => [],
+    createElement: () => ({textContent: '', className: ''}), addEventListener() {},
+    documentElement: { dataset: {}, style: {setProperty() {}} },
+    body: { appendChild() {}, classList: {add() {}, remove() {}, toggle() {}} } };
+  const context = vm.createContext({ document, location: {search: '', hash: '', pathname: '/'},
+    window: {APPLIEDIN_CONFIG: {}, addEventListener() {}}, console, URLSearchParams,
+    CSS: {escape: (v) => v}, localStorage: {getItem: () => null, setItem() {}},
+    requestAnimationFrame: (fn) => fn(), setTimeout: () => 0, clearTimeout() {},
+    setInterval: () => 0, clearInterval() {},
+    fetch(...args) { requests.push(args); throw Error('Offline test forbids fetch'); } });
+  vm.runInContext(source, context, { filename: 'web/app.js' });
+  const state = vm.runInContext('state', context);
+  state.trackerLoaded = true;
+  return { state, context, node, requests,
+    fn: (name) => vm.runInContext(name, context) };
+}
+
+test('submit hold and raw uncertainty override every lower-priority status', () => {
+  const h = harness(), route = h.fn('routeOf');
+  for (const status of ['needs_human','tailored','submitting','applied','applied_manual','skipped']) {
+    assert.equal(route(row('held', {status, submit_hold_state: 'blocked'})), 'portal_check');
+    assert.equal(route(row('unknown', {status, submit_hold_state: 'unknown'})), 'portal_check');
+    assert.equal(route(row('missing', {status, submit_hold_state: undefined})), 'portal_check');
+    assert.equal(route(row('raw', {status, possible_submission: true})), 'portal_check');
+    assert.equal(route(row('legacy', {status, fail_kind: 'uncertain'})), 'portal_check');
+    assert.equal(route(row('legacy-gate', {status, gate_reason: 'submit_uncertain'})), 'portal_check');
+  }
+  assert.equal(route(row('uncertain', {status:'uncertain'})), 'portal_check');
+});
+
+test('typed active causes do not borrow authority from prose or stale codes', () => {
+  const h = harness(), route = h.fn('routeOf');
+  assert.equal(route(row('answer')), 'owner_question');
+  for (const cause of ['defect_structural','defect_provenance','defect_tenant',
+    'defect_witness','defect_ashby_root_identity','defect_greenhouse_tenant_alias'])
+    assert.equal(route(row('defect', {gate_reason: cause})), 'waiting_for_fix');
+  for (const cause of ['unknown_field', 'NOT_A_REAL_CODE', '', null])
+    assert.equal(route(row('generic', {gate_reason: cause, gate_question: 'Ready to apply'})), 'manual_triage');
+  assert.equal(route(row('missing-question', {gate_question:''})), 'manual_triage');
+  assert.equal(route(row('bad-status', {status:'unexpected'})), 'manual_triage');
+  assert.equal(route(row('contradictory', {fail_kind:'failed'})), 'manual_triage');
+  assert.equal(route(row('old-defect', {status:'applied', gate_reason:'defect_structural'})), 'applied');
+  assert.equal(route(row('old-answer', {status:'tailored'})), 'tailored');
+  for (const cause of ['approval','low_confidence','captcha','no_account'])
+    assert.equal(route(row(cause, {gate_reason:cause})), cause);
+});
+
+test('fixed Issue URLs are exact, unmapped text cannot invent a link', () => {
+  const h = harness(), notice = h.fn('routeNotice');
+  const ashby = notice(row('ashby', {gate_reason:'defect_ashby_root_identity'}));
+  const gh = notice(row('gh', {gate_reason:'defect_greenhouse_tenant_alias'}));
+  assert.match(ashby, /href="https:\/\/github\.com\/chetwerikoff\/AppliedIn\/issues\/120"/);
+  assert.match(gh, /href="https:\/\/github\.com\/chetwerikoff\/AppliedIn\/issues\/118"/);
+  const untrusted = notice(row('unknown-defect', {
+    gate_reason:'defect_structural',
+    gate_question:'<img src=x onerror=evil()> https://github.com/elsewhere/issues/999',
+  }));
+  assert.match(untrusted, /Fix Issue not linked/);
+  assert.doesNotMatch(untrusted, /<img|href=.*999/);
+  assert.match(untrusted, /&lt;img/);
+  const held = notice(row('held', {status:'applied', submit_hold_state:'blocked',
+    fail_reason:'Unresolved synthetic click'}));
+  assert.match(held, /Check the employer portal/);
+  assert.match(held, /before any separate later attempt/);
+  assert.match(held, /Unresolved synthetic click/);
+});
+
+test('Need, portal, fix and triage sections are exclusive, with correct actions', () => {
+  const h = harness(), section = h.fn('sectionOf'), cards = h.fn('needsCard');
+  const owner = row('owner');
+  const approval = row('approval', {gate_reason:'approval'});
+  const captcha = row('captcha', {gate_reason:'captcha'});
+  const low = row('low', {gate_reason:'low_confidence'});
+  const fix = row('fix', {gate_reason:'defect_structural'});
+  const portal = row('portal', {status:'applied',submit_hold_state:'blocked'});
+  const generic = row('generic', {gate_reason:'unknown_field'});
+  h.state.apps = [owner, approval, captcha, low, fix, portal, generic];
+  const routes = h.state.apps.map((r) => section(r, new Set()));
+  assert.deepEqual(routes, ['needs','ready','needs','needs','fix','portal','triage']);
+  assert.match(cards(owner), /data-answer-for="owner"/);
+  assert.match(cards(owner), /data-act="answer"/);
+  assert.doesNotMatch(cards(captcha), /data-act="answer"|data-answer-for/);
+  assert.doesNotMatch(cards(low), /data-answer-for=/);
+  assert.match(cards(low), /Review &amp; approve/);
+  for (const r of [fix, portal, generic]) {
+    assert.match(cards(r), /View details/);
+    assert.doesNotMatch(cards(r), /data-act=|textarea|data-reapply-prof|data-save-tracker/);
+  }
+  assert.equal(h.fn('approveAllPicks')(approval), true);
+  for (const r of [owner,captcha,fix,portal,generic])
+    assert.equal(h.fn('approveAllPicks')(r), false);
+  const pipe = h.fn('viewPipeline')();
+  assert.match(pipe, /Portal verification/);
+  assert.match(pipe, /Waiting for fix/);
+  assert.match(pipe, /Manual triage/);
+});
+
+test('read-only rows have no drawer mutation controls and stale delegated clicks do not POST', () => {
+  const h = harness();
+  h.state.apps = [row('held', {submit_hold_state:'blocked',status:'applied'}),
+    row('fix', {gate_reason:'defect_structural'}),
+    row('unknown', {gate_reason:'unknown_field'})];
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  for (const r of h.state.apps) {
+    h.fn('openDrawer')(r.pk);
+    const html = h.node('#drawer-body').innerHTML;
+    assert.match(html, /read-only|Read-only|reconcile|triage|fix/i);
+    assert.doesNotMatch(html, /data-act=|data-job-profile=|data-reapply-prof=|data-save-tracker=|data-track=/);
+  }
+  h.fn('wire')();
+  const clicks = h.node('#pane').listeners.click;
+  assert.ok(clicks?.length);
+  const baseline = h.requests.length;
+  for (const pk of ['held','fix','unknown']) {
+    for (const act of ['answer','retry','reopen','retailor','apply-now','queue-apply',
+      'mark-applied','skip','cancel','force-apply']) {
+      const control = { dataset: { act, pk } };
+      const target = { closest: (selector) => selector === '[data-act]' ? control : null };
+      clicks.at(-1)({target,stopPropagation() {}});
+      assert.equal(h.requests.length, baseline, `${pk}:${act} must not POST`);
+    }
+  }
+});

@@ -365,6 +365,63 @@ def authorized(context: object, *, pk: str = "", company: str = "",
 _ORIGIN = object()
 
 
+def _lever_location_form(*, caption: str = 'Testville, USA') -> bytes:
+    """Offline-only ARIA fixture: a plain value assignment cannot commit."""
+    if caption not in {'Testville, USA', 'Testville, United States'}:
+        raise ValueError('Only fixed synthetic country-caption shapes are allowed.')
+    from html import escape
+    from json import dumps
+
+    option_caption = escape(caption)
+    # The synthetic form is never served by the daemon fixture handler: Python
+    # tests inspect it and a fake BrowserSkill IPC models its keyboard semantics.
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>Synthetic Lever location</title></head><body>
+<form id="application-form" action="https://jobs.lever.co/example-co/00000000-0000-0000-0000-000000000001/apply" method="post">
+<label for="current-location">Current location</label>
+<input id="current-location" name="location" type="text" role="combobox"
+ required aria-controls="location-options" aria-expanded="false"
+ aria-autocomplete="list" autocomplete="off" data-value-input="location-token">
+<input id="location-token" type="hidden" name="location_token">
+<ul id="location-options" role="listbox" hidden>
+<li id="location-option" role="option" aria-selected="false"
+ data-value="testville-verified">{option_caption}</li></ul>
+<button id="submit" type="submit">Submit application</button></form>
+<script>
+const form = document.getElementById('application-form');
+const input = document.getElementById('current-location');
+const list = document.getElementById('location-options');
+const option = document.getElementById('location-option');
+const token = document.getElementById('location-token');
+const chosen = {dumps(caption)};
+form.addEventListener('submit', event => event.preventDefault());
+input.addEventListener('input', () => {{
+  input.removeAttribute('aria-valuetext');
+  input.removeAttribute('data-selected-value');
+  token.value = '';
+  option.setAttribute('aria-selected', 'false');
+  list.hidden = !input.value.trim();
+  input.setAttribute('aria-expanded', String(!list.hidden));
+}});
+input.addEventListener('blur', () => {{
+  if (!input.getAttribute('data-selected-value')) input.value = '';
+}});
+// Keep focus through the option click: blur normally precedes click and
+// otherwise clears a typed-but-uncommitted location before the option runs.
+option.addEventListener('mousedown', event => event.preventDefault());
+option.addEventListener('click', () => {{
+  if (list.hidden || !input.value.trim()) return;
+  input.value = chosen;
+  input.setAttribute('aria-valuetext', chosen);
+  input.setAttribute('data-selected-value', 'testville-verified');
+  token.value = 'testville-verified';
+  option.setAttribute('aria-selected', 'true');
+  list.hidden = true;
+  input.setAttribute('aria-expanded', 'false');
+}});
+</script></body></html>'''.encode('utf-8')
+
+
 def _lever_question_form(kind: str) -> bytes:
     # Separate unanswered cards keep either question from masking the other leg.
     options = (('first', 'First option'), ('second', 'Second option')) if kind == 'radio' else (

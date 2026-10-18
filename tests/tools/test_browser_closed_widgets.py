@@ -53,6 +53,27 @@ def test_four_fields_same_graph_in_both_production_readers(phase, active_only):
             assert graph['linked'] and graph['options'][0]['value'] == 'Approved '+key
 
 
+def test_receiver_backed_country_outside_phone_fieldset_is_valid_closed_c2():
+    # Unlike the receiverless Greenhouse phone widget, a normal #country with
+    # one proven hidden receiver must not be quarantined merely by its ID.
+    snapshot = dom(receiverBackedCountry=True, phases={'location': 'C2'})
+    page, witness = snapshot['page'], snapshot['witness']
+    assert page['inventory_verified'] is True and page['opaque_controls'] is False
+    assert page['opaque_count'] == 0 and page['opaque_locators'] == []
+    forms._inventory_ok(page)
+    for reader in (page, witness):
+        target = next(c for c in reader['controls'] if c['selector'] == '#country')
+        graph = target['combobox']
+        assert graph['mode'] == 'closed-react-select' and graph['phase'] == 'C2'
+        assert graph['label_selector'] == '#country-label'
+        assert graph['hidden_selector'] == '#location-hidden'
+        assert graph['hidden_value'] == graph['selected_value'] == 'Approved location'
+        assert graph['selected_text'] == graph['displayed_text'] == 'Approved location'
+        assert graph.get('receiverless_country') is not True
+        assert graph.get('quarantined') is not True
+    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
+
+
 @pytest.mark.parametrize('scenario', [
     {'badGraph': True}, {'multipleReceiver': True}, {'searchToken': True},
     {'extraPicker': True}, {'nestedPicker': True}, {'unsafePicker': True},
@@ -564,7 +585,10 @@ def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, exp
     assert 'control=unavailable' not in reason
     assert 'test-user' not in reason and '@' not in reason
     assert 'private-' not in reason
-    assert reason.count('control=') == p['opaque_count']
+    # The reader keeps every locator; the unchanged Gate names at most three.
+    assert reason.count('control=') == min(3, p['opaque_count'])
+    assert all(reason.count('control=' + path) == 1 for path in p['opaque_locators'][:3])
+    assert all('control=' + path not in reason for path in p['opaque_locators'][3:])
 
 
 def test_repeated_deep_opaque_nodes_remain_fail_closed():
@@ -596,8 +620,9 @@ def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(depth, count):
         forms._inventory_ok(p)
     detail = str(caught.value)
     assert 'opaque_count=' + str(count) in detail
-    assert detail.count('control=') == count
-    assert all(detail.count('control=' + path) == 1 for path in paths)
+    assert detail.count('control=') == min(3, count)
+    assert all(detail.count('control=' + path) == 1 for path in paths[:3])
+    assert all('control=' + path not in detail for path in paths[3:])
     assert 'control=unavailable' not in detail
     assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
 
@@ -642,9 +667,9 @@ def test_safe_diagnostic_rejects_untrusted_or_nonstructural_paths(unsafe):
 
 
 @pytest.mark.parametrize('count', [2, 8])
-def test_depth_thirty_opaque_nodes_are_all_named_without_page_identifiers(count):
-    # The previous 24-segment/600-char diagnostic bound lost present nodes.
-    # Gate must name all of them while still refusing the incomplete inventory.
+def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(count):
+    # Even deeply nested present controls keep distinct real reader locators.
+    # The Gate still refuses the form and reports only its first three controls.
     page = dom(diagnostics={'count': count, 'depth': 30})['page']
     assert page['opaque_count'] == count and page['opaque_controls'] is True
     assert page['inventory_verified'] is False
@@ -655,8 +680,9 @@ def test_depth_thirty_opaque_nodes_are_all_named_without_page_identifiers(count)
     with pytest.raises(forms.Gate, match='opaque_count=' + str(count)) as caught:
         forms._inventory_ok(page)
     message = str(caught.value)
-    assert message.count('control=') == count
-    assert all(message.count('control=' + path) == 1 for path in paths)
+    assert message.count('control=') == min(3, count)
+    assert all(message.count('control=' + path) == 1 for path in paths[:3])
+    assert all('control=' + path not in message for path in paths[3:])
     assert 'control=unavailable' not in message
     assert 'test-user' not in message and 'example-co' not in message and '@' not in message
 

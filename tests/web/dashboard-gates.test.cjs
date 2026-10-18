@@ -155,3 +155,111 @@ test('read-only rows have no drawer mutation controls and stale delegated clicks
     }
   }
 });
+
+test('read-only causes have the same no-action surface in every dashboard view', () => {
+  for (const sample of [
+    row('held-applied', {status: 'applied', submit_hold_state: 'blocked'}),
+    row('held-approval', {gate_reason: 'approval', submit_hold_state: 'unknown'}),
+    row('held-question', {possible_submission: true}),
+    row('old-uncertain', {status: 'uncertain', gate_reason: 'unknown_field'}),
+    row('fix', {gate_reason: 'defect_witness'}),
+    row('manual', {gate_reason: 'unknown_field', gate_question: '<img src=x>'}),
+  ]) {
+    const h = harness();
+    h.state.apps = [sample];
+    h.state.coFilter = 'example-co';
+    h.state.queue = {pending: [{pk: sample.pk, company: 'example-co'}], concurrency: 1};
+    const category = h.fn('routeOf')(sample);
+    for (const name of ['viewPipeline', 'viewNeeds', 'viewStuck', 'viewApps']) {
+      const html = h.fn(name)();
+      if (name !== 'viewApps')
+        assert.match(html, /Portal verification|Waiting for fix|Manual triage/i, sample.pk + '/' + name);
+      assert.doesNotMatch(html,
+        /data-act=|data-answer-for=|class="gate-input"|data-review-action=|data-qsel=|data-approve-all=/,
+        sample.pk + '/' + name);
+    }
+    vm.runInContext('loadAgentLog = () => {};', h.context);
+    h.fn('openDrawer')(sample.pk);
+    const drawer = h.node('#drawer-body').innerHTML;
+    assert.match(drawer, /Read-only until this blocker|Portal verification|code fix|Manual triage/i);
+    assert.doesNotMatch(drawer,
+      /data-act=|data-job-profile=|data-reapply-prof=|data-save-tracker=|data-track=|class="gate-input"/);
+    assert.equal(h.fn('sectionOf')(sample, new Set([sample.pk])),
+      category === 'portal_check' ? 'portal' : category === 'waiting_for_fix' ? 'fix' : 'triage');
+    assert.equal(h.requests.length, 0);
+  }
+});
+
+test('only verified owner questions say Answer; approval and review are decisions', () => {
+  const h = harness();
+  const question = row('q');
+  const approval = row('approval', {gate_reason: 'approval'});
+  const low = row('low', {gate_reason: 'low_confidence'});
+  assert.match(h.fn('gateMini')(question), />✎ Answer/);
+  for (const decision of [approval, low]) {
+    const mini = h.fn('gateMini')(decision);
+    assert.doesNotMatch(mini, />✎ Answer|type an answer/);
+    assert.match(mini, /Review approval|Review decision/);
+    assert.doesNotMatch(h.fn('needsCard')(decision), /data-answer-for=|<textarea/);
+  }
+  h.state.apps = [question, approval, low];
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  for (const item of h.state.apps) {
+    h.fn('openDrawer')(item.pk);
+    const html = h.node('#drawer-body').innerHTML;
+    if (item.pk === 'q') assert.match(html, /id="gate-answer"/);
+    else assert.doesNotMatch(html, /id="gate-answer"/);
+  }
+});
+
+test('company/search filters and stale queue selection preserve exclusive buckets', () => {
+  const h = harness();
+  const clear = row('clear', {status: 'tailored'});
+  const held = row('held', {status: 'tailored', submit_hold_state: 'blocked'});
+  const fix = row('fix', {gate_reason: 'defect_structural'});
+  const triage = row('triage', {gate_reason: 'unknown_field'});
+  const question = row('question');
+  const other = row('other', {company: 'second-co', submit_hold_state: 'unknown'});
+  h.state.apps = [clear, held, fix, triage, question, other];
+  h.state.coFilter = 'example-co';
+  h.state.query = 'Synthetic role';
+  assert.deepEqual(Array.from(h.fn('visible')(h.state.apps), r => r.pk).sort(),
+    ['clear', 'fix', 'held', 'question', 'triage']);
+  const sections = h.fn('visible')(h.state.apps).map((r) => h.fn('sectionOf')(r, new Set()));
+  assert.deepEqual(sections.sort(), ['fix','needs','portal','ready','triage']);
+  h.state.queue = {pending: [], concurrency: 1};
+  assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), r => r.pk), ['clear']);
+  h.state.queue.pending = [{pk:'held', company:'example-co'}, {pk:'clear', company:'example-co'}];
+  h.state.qPicked = new Set(['held','clear']);
+  const queueHtml = h.fn('queuedSec')(h.state.apps);
+  assert.doesNotMatch(queueHtml, /data-qsel="held"/);
+  assert.match(queueHtml, /data-qsel="clear"/);
+  assert.equal(h.state.qPicked.has('held'), false);
+  assert.equal(h.state.qPicked.size, 1);
+  h.state.queue.pending = [{pk:'held', company:'example-co'}];
+  h.state.qPicked = new Set(['held']);
+  assert.equal(h.fn('queuedSec')(h.state.apps), '');
+  assert.equal(h.state.qPicked.size, 0);
+  h.state.qPicked.add('held');
+  h.fn('paneAction')('qsel-bulk', '', {dataset: {mode:'remove'}});
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.fn('rowActionAllowed')('held', 'queue-apply'), false);
+  assert.equal(h.fn('rowActionAllowed')('fix', 'answer'), false);
+  assert.equal(h.fn('rowActionAllowed')('triage', 'retry'), false);
+  assert.equal(h.fn('rowActionAllowed')('question', 'answer'), true);
+});
+
+test('the drawer delegate rejects stale action controls for held submissions', () => {
+  const h = harness();
+  h.state.apps = [row('held', {submit_hold_state: 'blocked', status: 'applied'})];
+  h.fn('wire')();
+  const listeners = h.node('#drawer').listeners.click;
+  assert.ok(listeners && listeners.length);
+  for (const act of ['answer','skip','cancel','retry','reopen','mark-applied',
+    'force-apply','retailor','apply-now','queue-apply']) {
+    const control = {dataset: {act, pk: 'held'}};
+    const target = {closest: (selector) => selector === '[data-act]' ? control : null};
+    for (const handler of listeners) handler({target, stopPropagation() {}});
+    assert.equal(h.requests.length, 0, act);
+  }
+});

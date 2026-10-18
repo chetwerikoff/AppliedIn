@@ -914,3 +914,31 @@ def test_applications_projects_read_only_hold_and_raw_reason(world, monkeypatch)
     assert held['submit_hold_reason'] == submit_hold.REASON
     assert stores.tracking.get(PK) == old_row
     assert submit_hold.is_held(PK, tracking=stores.tracking)
+
+
+
+def test_standalone_server_entrypoint_contract_is_still_present():
+    """Daemon imports serve; an accidental footer deletion must fail offline."""
+    import inspect
+    assert callable(server.serve)
+    names = set(server.serve.__code__.co_names)
+    assert {"get_settings", "_recover_stuck", "create_app"}.issubset(names)
+    assert 'if __name__ == "__main__":\n    serve()' in inspect.getsource(server)
+
+
+def test_dashboard_projects_native_question_witness_not_display_prose():
+    """Only a stored native field object can support the UI's typed Answer."""
+    artifacts = SimpleNamespace(exists=lambda *_: False, version=lambda *_: "")
+    base = {"pk": PK, "company": "example-co", "status": "needs_human",
+            "gate_reason": "owner_question"}
+    for pending, expected in [
+        ({"question": "Synthetic location?"}, False),
+        ({"question": "Synthetic location?", "form_question": "model text"}, False),
+        ({"question": "Synthetic location?", "form_question": {"label": "Location"}}, True),
+    ]:
+        projected = server._to_ui({**base, "gate_pending": pending}, artifacts)
+        assert projected["gate_has_form_question"] is expected
+    defect = server._to_ui({**base, "gate_reason": "defect_structural",
+                            "gate_pending": {"question": "synthetic",
+                                             "form_question": {"label": "Location"}}}, artifacts)
+    assert defect["gate_has_form_question"] is True

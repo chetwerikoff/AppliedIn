@@ -398,7 +398,8 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
   const company=h.node('#cp-detail').listeners.click.find(fn=>fn.toString().includes('#cp-dt-rotgo'));
   const profile=h.document.listeners.click.find(fn=>fn.toString().includes('data-prof-all'));
   assert.ok(rotate&&company&&profile);
-  const cp={dataset:{co:'example-co'}}, prof={dataset:{profAll:'standard'},textContent:'Whole board'};
+  const cp={dataset:{co:'example-co'},classList:{add(){},remove(){}},textContent:''};
+  const prof={dataset:{profAll:'standard'},textContent:'Whole board'};
   await rotate();
   await company({target:{closest:(s)=>s==='#cp-dt-rotgo'?cp:null}});
   profile({target:{closest:(s)=>s==='[data-prof-all]'?prof:null}});

@@ -115,7 +115,7 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
                      {'ashby_upload': True, 'ashby_upload_transient': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
-    assert report['sessions'] == 9
+    assert report['sessions'] == len(calls) == 9
     assert len(report['legs']) == 8
     assert set(report['legs']) == {
         'entry', 'greenhouse', 'greenhouse_empty_placeholder',
@@ -125,11 +125,13 @@ def test_all_fixture_legs_are_unconditional(monkeypatch, capsys):
     assert set(report['legs'].values()) == {'PASS'}
 
 
-def test_real_local_handler_opens_chooser_and_renders_only_passive_item():
+@pytest.mark.parametrize('unwrap', [False, True])
+def test_real_local_handler_opens_chooser_and_renders_only_passive_item(unwrap):
     original = fixture._ashby_form()
     assert b'Application answer' in original
     assert b'addEventListener' not in original
-    document = fixture._ashby_upload_form().decode()
+    document = fixture._ashby_upload_form(unwrap=unwrap).decode()
+    assert ('<span><span>Upload</span></span>' in document) is unwrap
     script = re.search(r'<script>(.*?)</script>', document, re.S).group(1)
     # The handler observes files from the chooser; it never fabricates FileList.
     assert not re.search(r'input\.files\s*=', script)
@@ -140,7 +142,9 @@ let settle, delay;global.setTimeout=(fn,ms)=>{settle=fn;delay=ms;};
 const icon={remove(){drop.iconRemoved=true;}};
 const file=make('div');file.insertBefore=(n,other)=>{if(other!==drop)throw Error('wrong container');file.children.unshift(n);};
 const input={files:[],parentElement:file,click(){this.clicked=(this.clicked||0)+1;},addEventListener(e,fn){handlers[e]=fn;}};
-const drop={addEventListener(e,fn){handlers['drop-'+e]=fn;},querySelector(q){if(q!=='svg')throw Error('unexpected target');return icon;}};
+const text={textContent:'Upload'};
+const inner={childNodes:[text],replaceWith(...nodes){if(nodes.length!==1||nodes[0]!==text)throw Error('text changed');drop.unwrapped=true;}};
+const drop={addEventListener(e,fn){handlers['drop-'+e]=fn;},querySelector(q){if(q==='svg')return icon;if(q==='span > span')return inner;throw Error('unexpected target');}};
 global.document={getElementById:id=>id==='_systemfield_resume'?input:drop,createElement:make,
  createElementNS:(ns,tag)=>({...make(tag),namespaceURI:ns})};
 eval(process.argv[1]);handlers['drop-click']();
@@ -153,7 +157,7 @@ console.log(JSON.stringify({class:item.className,names:item.children.map(n=>n.cl
  name:item.children[0].children[1].textContent,title:item.children[1].title,
  nameChildren:item.children[0].children.map(n=>n.tag),
  iconNS:item.children[0].children[0].namespaceURI,
- text:item.children[1].textContent||'',iconRemoved:drop.iconRemoved}));
+ text:item.children[1].textContent||'',iconRemoved:drop.iconRemoved,unwrapped:!!drop.unwrapped}));
 '''
     result = subprocess.run(['node', '-e', harness, script], capture_output=True, text=True, check=True)
     proof = json.loads(result.stdout)
@@ -163,7 +167,7 @@ console.log(JSON.stringify({class:item.className,names:item.children.map(n=>n.cl
                      'name': 'Synthetic-Resume.pdf', 'title': 'Remove attachment',
                      'nameChildren': ['svg', 'span'],
                      'iconNS': 'http://www.w3.org/2000/svg',
-                     'text': '', 'iconRemoved': True}
+                     'text': '', 'iconRemoved': True, 'unwrapped': unwrap}
 
 
 @pytest.mark.parametrize('cancel', [False, True])

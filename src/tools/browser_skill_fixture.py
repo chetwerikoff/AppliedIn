@@ -165,7 +165,7 @@ label {display:block} .clipped {position:absolute;width:1px;height:1px;clip:rect
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/bframe" style="display:none"></iframe>
 <div><iframe style="display:none"></iframe></div></body></html>'''
 
-def _ashby_upload_form() -> bytes:
+def _ashby_upload_form(*, unwrap=False) -> bytes:
     # Keep the original first-human Gate intact; this is a separate chooser leg.
     document = _ashby_form().replace(b'>Application answer</label>', b'>Name</label>')
     document = document.replace(
@@ -196,6 +196,13 @@ input.addEventListener('change',()=>{
  },1800);
 });
 </script>'''
+    if unwrap:
+        document = document.replace(b'</svg>Upload</button>',
+                                    b'</svg><span><span>Upload</span></span></button>')
+        script = script.replace(b" drop.querySelector('svg')?.remove();",
+                                b" drop.querySelector('svg')?.remove();\n"
+                                b" const inner=drop.querySelector('span > span');\n"
+                                b" inner.replaceWith(...inner.childNodes);")
     return document.replace(b'</body>', script + b'</body>')
 
 
@@ -417,7 +424,7 @@ class _SyntheticRun:
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
                  "greenhouse", "greenhouse_empty_placeholder", "visible_badge_anchor", "native_validity",
                  "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
-                 "ashby_upload", "ashby_upload_transient", "upload_ipc",
+                 "ashby_upload", "ashby_upload_transient", "ashby_upload_unwrap", "upload_ipc",
                  "upload_before_tree", "upload_pair_page", "upload_pair_trace",
                  "upload_pair_complete")
     def __init__(self, resume_path: str):
@@ -472,6 +479,7 @@ class _SyntheticRun:
         self.choice_ipc = 0
         self.ashby_upload = False
         self.ashby_upload_transient = False
+        self.ashby_upload_unwrap = False
         self.upload_ipc = 0
         self.upload_before_tree = None
         self.upload_pair_page = None
@@ -934,7 +942,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         if type(state) is not _SyntheticRun or state.ashby:
             document = _ashby_form()
         if type(state) is _SyntheticRun and state.ashby_upload:
-            document = _ashby_upload_form()
+            document = _ashby_upload_form(unwrap=state.ashby_upload_unwrap)
         if type(state) is _SyntheticRun and state.w_lookalike:
             document = document.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
         if type(state) is _SyntheticRun and state.custom_question:
@@ -998,9 +1006,10 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 state.ashby = bool(ashby or ashby_upload or ashby_upload_transient)
                 state.custom_question = custom_question
                 state.ashby_upload = bool(ashby_upload or ashby_upload_transient)
-                # The normal Ashby upload remains the default; only the explicit
-                # transient sub-case perturbs sequential observations.
+                # The existing transient upload session also exercises the span
+                # unwrap; a separate session would break the sealed dispatch.
                 state.ashby_upload_transient = ashby_upload_transient is True
+                state.ashby_upload_unwrap = state.ashby_upload_transient
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -1169,6 +1178,11 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                           and state.submit_call_entered == state.submit_ipc == 0
                           and state.post_attempts == state.post_count == 0
                           and (state.last_page or {}).get('inventory_verified') is True)
+                    if state.ashby_upload_unwrap:
+                        from tools.browser_skill_apply import _upload_shape
+                        pre_spans = sum(n[1] == 'span' for n in _upload_shape(state.upload_before_tree))
+                        post_spans = sum(n[1] == 'span' for n in _upload_shape(tree, tree.get('items', [])))
+                        ok = ok and pre_spans == post_spans + 1
                     if state.ashby_upload_transient:
                         pairs = state.upload_pair_trace
                         ok = (ok and len(pairs) >= 3
@@ -1190,7 +1204,7 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
-                                  'variant': ('transient' if state.ashby_upload_transient else 'ordinary')
+                                  'variant': ('transient+unwrap' if state.ashby_upload_transient else 'ordinary')
                                              if state.ashby_upload else None,
                                   'scenario': ('lever_custom_'+custom_question if custom_question else
                                                'ashby-upload' if state.ashby_upload else
@@ -1250,7 +1264,7 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
 
 
 def _ashby_upload_leg() -> int:
-    """Keep both upload variants inside the existing top-level Ashby leg."""
+    """Keep every upload sub-case inside the existing top-level Ashby leg."""
     ordinary = _run_scenario(ashby_upload=True)
     transient = _run_scenario(ashby_upload=True, ashby_upload_transient=True)
     return 0 if ordinary == transient == 0 else 1
@@ -1263,7 +1277,7 @@ def run() -> int:
     empty_placeholder = _run_scenario(greenhouse_empty_placeholder=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    # Both upload cases remain one logical Ashby fixture leg.
+    # Both upload sub-cases remain one logical Ashby fixture leg.
     ashby_upload = _ashby_upload_leg()
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')

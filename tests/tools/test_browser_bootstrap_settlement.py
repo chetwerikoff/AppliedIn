@@ -302,8 +302,9 @@ async def test_actual_vendor_apply_commits_before_first_decision_and_upload_stay
         snapshots.append(deepcopy(history))
         assert 'For the required résumé file input, use upload' in prompt
         assert page['approved_choices'] == []
-        assert not any(c.get('selector') == '#resume' and c.get('files')
-                       for c in page['controls']) if len(snapshots) == 1 else True
+        if len(snapshots) == 1:
+            assert not any(c.get('selector') == '#resume' and c.get('files')
+                           for c in page['controls'])
         if len(snapshots) == 1:
             first_page.append(deepcopy(page))
             assert raw.target('#phone')['value'] == PHONE
@@ -472,9 +473,12 @@ async def test_private_labels_and_gate_field_logging_never_emit_untrusted_values
         monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger=forms.__name__)
     case, raw = _world(monkeypatch, 'lever', noisy=True)
-    case.facts[case.phone['label']] = PHONE
-    case.row['human_approved_answers'][case.phone['label']]['synthetic_secret'] = (
-        'PRIVATE-GRANT-SENTINEL')
+    previous = case.row['human_approved_answers'].pop(case.phone['label'])
+    case.facts.pop(case.phone['label'])
+    case.facts['PRIVATE-QUESTION-SENTINEL'] = PHONE
+    previous['question'] = 'PRIVATE-QUESTION-SENTINEL'
+    previous['synthetic_secret'] = 'PRIVATE-GRANT-SENTINEL'
+    case.row['human_approved_answers']['PRIVATE-QUESTION-SENTINEL'] = previous
     case.page['text'] = 'PRIVATE-PAGE-SENTINEL'
     raw.state['text'] = 'PRIVATE-PAGE-SENTINEL'
     case.page['controls'][0]['question'] = 'PRIVATE-QUESTION-SENTINEL'
@@ -507,6 +511,10 @@ async def test_model_captcha_prose_is_not_observed_challenge(monkeypatch, route)
     case, raw = _world(monkeypatch, route)
     case.page['controls'] = [c for c in case.page['controls']
                              if c['type'] not in {'tel', 'select', 'combobox', 'hidden'}]
+    # A non-required native input is enough to prove an application-form
+    # receiver without provoking a new bootstrap question.
+    case.page['controls'].insert(0, field(
+        'Optional note', '#note', required=False, form_action=case.url))
     raw.state['controls'] = deepcopy(case.page['controls'])
     async def decide(*args, **kwargs):
         return {'action': 'gate', 'question': 'A synthetic CAPTCHA might be here'}

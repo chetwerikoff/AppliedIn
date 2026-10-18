@@ -79,7 +79,7 @@ def selected_snapshot(mutation=''):
         else:
             form['children'].append(placeholder)
 
-    if mutation == 'country-outside-fieldset':
+    if mutation in {'country-outside-fieldset', 'country-subtree-outside-fieldset'}:
         def detach(node, target):
             for child in node['children']:
                 if child is target:
@@ -88,8 +88,24 @@ def selected_snapshot(mutation=''):
                 if detach(child, target):
                     return True
             return False
-        assert detach(tree.root, country)
-        form['children'].append(country)
+
+        target = country
+        if mutation == 'country-subtree-outside-fieldset':
+            # Preserve label, input wrapper and selected display together:
+            # the generic C2 graph must not admit this receiverless #country.
+            def country_branch(node):
+                if node['attrs'].get('class') == 'phone-input__country':
+                    return node
+                for child in node['children']:
+                    found = country_branch(child)
+                    if found is not None:
+                        return found
+                return None
+
+            target = country_branch(tree.root)
+            assert target is not None and _find(target, 'country') is country
+        assert detach(tree.root, target)
+        form['children'].append(target)
     elif mutation in {'valued-unknown', 'second-in-phone-fieldset'}:
         contender = dict(tag='input', attrs={'id': 'unknown-selected', 'role': 'combobox',
                                               'value': 'Synthetic unknown'},
@@ -195,9 +211,33 @@ def test_retained_country_placeholder_c2_remains_classifiable():
     assert out['page']['opaque_count'] == 0
 
 
+def test_intact_country_subtree_outside_phone_fieldset_never_downgrades_to_generic_c2():
+    # Moving only the input breaks W/V ownership and misses the old fallback.
+    # Move the entire otherwise-valid selected country widget and its label.
+    out = selected_snapshot('country-subtree-outside-fieldset')
+    page = out['page']
+    assert page['inventory_verified'] is False
+    assert page['opaque_controls'] is True and page['opaque_count'] == 1
+    assert len(page['opaque_locators']) == 1
+    assert forms._safe_diagnostic(page['opaque_locators'][0]) == page['opaque_locators'][0]
+    for reader in (out['page'], out['witness']):
+        country = next(c for c in reader['controls'] if c['selector'] == '#country')
+        location = next(c for c in reader['controls'] if c['selector'] == '#location')
+        assert country['combobox'].get('mode') != 'closed-react-select'
+        assert country['combobox']['quarantined'] is True
+        assert location['combobox']['phase'] == 'C2'
+    for graph in out['graphs']:
+        assert '#country' in graph['quarantined']
+        assert next(g for selector, g in graph['graphs'] if selector == '#country') is None
+    with pytest.raises(forms.Gate, match='opaque_count=1') as caught:
+        forms._inventory_ok(page)
+    assert 'control=unavailable' not in str(caught.value)
+
+
 @pytest.mark.parametrize('mutation,opaque', [
     ('valued-unknown', 1),
     ('country-outside-fieldset', 1),
+    ('country-subtree-outside-fieldset', 1),
     ('second-in-phone-fieldset', 2),
 ])
 def test_selected_country_does_not_hide_unproven_widgets(mutation, opaque):

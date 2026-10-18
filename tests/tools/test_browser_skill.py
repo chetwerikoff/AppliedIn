@@ -1230,7 +1230,12 @@ console.log(JSON.stringify({page,witness}));
         ['node', '-e', script, scenario, PAGE, _FIXED_CONTROL_WITNESS], text=True))
     page, witness = result['page'], result['witness']
     if scenario in {'input', 'div', 'submit-option', 'navigate-option'}:
+        # Regression: the ID #country alone must not disable ordinary ARIA
+        # combobox linkage outside the Greenhouse phone-country fieldset.
         assert page['inventory_verified'] and not page['opaque_controls']
+        assert page['opaque_count'] == 0 and page['opaque_locators'] == []
+        assert all(source['controls'][0]['combobox']['link_id'] == 'choices'
+                   for source in (page, witness))
         assert [c['selector'] for c in page['controls']] == ['#country']
         assert [c['selector'] for c in witness['controls']] == ['#country']
         assert page['controls'][0]['combobox'] == witness['controls'][0]['combobox'], (
@@ -1241,7 +1246,12 @@ console.log(JSON.stringify({page,witness}));
         assert witness['controls'][0]['combobox']['displayed_text'] == 'Example Country'
         assert witness['controls'][0]['combobox']['displayed_text'] == page['controls'][0]['combobox']['selected_text']
     elif scenario == 'provisional':
+        # A uniquely owned but absent ARIA target remains provisional; the
+        # Greenhouse receiverless C2 outside-fieldset negative has no linkId.
         assert page['inventory_verified'] and not page['opaque_controls']
+        assert page['opaque_count'] == 0 and page['opaque_locators'] == []
+        assert all(source['controls'][0]['combobox']['link_id'] == 'missing'
+                   for source in (page, witness))
         assert page['controls'][0]['combobox']['linked'] is False
         assert witness['controls'][0]['combobox']['linked'] is False
     else:

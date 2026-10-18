@@ -308,7 +308,7 @@ def _inventory_diagnostic_script() -> str:
     return script.replace(
         "return {url:location.href, title, text:text.slice(0,100000),",
         "return {ready_state:document.readyState, "
-        "offending_elements:opaqueNodes.slice(0,3).map(e=>({selector:diagnosticLocator(e),"
+        "offending_elements:opaqueNodes.map(e=>({selector:diagnosticLocator(e),"
         "tag:e.tagName.toLowerCase(),role:e.getAttribute('role')})), "
         "shadow_hosts:shadowRoots.map(e=>({selector:selector(e),"
         "tag:e.tagName.toLowerCase()})), "

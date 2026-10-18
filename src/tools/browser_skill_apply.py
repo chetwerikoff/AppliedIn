@@ -7,6 +7,7 @@ validated here before the browser acts. Unsupported controls become human gates.
 from __future__ import annotations
 
 import asyncio
+import logging
 import ipaddress
 import socket
 import re
@@ -28,6 +29,8 @@ from tools import submit_hold
 from tools.browser_skill_dom import (
     ENTRY_PAGE, GREENHOUSE_PAGE, entry_reader, greenhouse_reader,
 )
+
+_LOG = logging.getLogger(__name__)
 
 _SENSITIVE = re.compile(
     r'disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|'
@@ -2383,9 +2386,90 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
             raise Gate('An uninspectable required choice needs human review.')
 
 
+
+# Only whole, exactly recognized semantic labels are permitted into the ordinary
+# daemon log. Untrusted DOM questions (including partial category matches) stay opaque.
+_BOOTSTRAP_LABELS = {
+    'phone': 'phone', 'phone number': 'phone', 'telephone': 'phone',
+    'country': 'country', 'location city': 'location-city',
+    'city': 'location-city', 'visa sponsorship': 'visa-sponsorship',
+}
+_BOOTSTRAP_TYPES = frozenset({
+    'tel', 'select', 'combobox', 'radio', 'checkbox',
+})
+
+
+def _bootstrap_log(item: dict, ordinal: int, decision: str) -> None:
+    raw = item.get('question') or item.get('label')
+    category = (_BOOTSTRAP_LABELS.get(normalize_label(raw))
+                if isinstance(raw, str) else None)
+    kind = item.get('type')
+    _LOG.info('bootstrap field decision %s', {
+        'label': category or f'field-{ordinal}',
+        'type': kind if kind in _BOOTSTRAP_TYPES else 'unknown',
+        'required': bool(item.get('required')),
+        'decision': decision,
+    })
+
+
+def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str:
+    """Missing/incomplete authority asks; contradictory authority fails closed."""
+    if grant is None:
+        return 'missing'
+    if not isinstance(grant, dict):
+        return 'stale'
+    expected = {
+        'value': value, 'selector': item.get('selector'),
+        'url': question.get('url'), 'label': item.get('label'),
+        'question': item.get('question', ''), 'tag': item.get('tag'),
+        'type': item.get('type'), 'form_selector': item.get('form_selector'),
+        'form_action': item.get('form_action'),
+    }
+    if item.get('type') == 'checkbox':
+        expected['visible_text'] = question.get('visible_text')
+    elif item.get('type') == 'radio':
+        expected['radio_name'] = question.get('radio_name')
+        expected['radio_members'] = question.get('radio_members')
+    elif item.get('tag') == 'select':
+        expected['options'] = item.get('options')
+    if any(grant[key] != seen for key, seen in expected.items() if key in grant):
+        return 'stale'
+    if any(key not in grant for key in expected):
+        return 'incomplete'
+    return 'current'
+
+
+def _bootstrap_receipt_current(page: dict, receipt: dict, filled: dict) -> None:
+    """An old receipt without the current native state never means satisfied."""
+    selector = receipt.get('selector')
+    target = control(page, receipt, 'approval-history')
+    if selector not in filled:
+        raise Gate('The earlier approved field has no verified write receipt.')
+    action = receipt.get('action')
+    if action in {'fill', 'select'}:
+        if (target.get('has_value') is not True
+                or target.get('value') != filled[selector]):
+            raise Gate('The earlier approved native value is no longer committed.')
+        if action == 'select':
+            if target.get('tag') != 'select' or target.get('type') != 'select':
+                raise Gate('The earlier native option receiver changed.')
+            if choose_value(target, receipt.get('approved_value', ''), '') != filled[selector]:
+                raise Gate('The earlier approved native option changed.')
+    elif action == 'combobox':
+        combo = target.get('combobox') or {}
+        if (_unanswered(page, target)
+                or not _same(combo.get('selected_text', ''), filled[selector])):
+            raise Gate('The earlier combobox selection is no longer committed.')
+    elif action == 'choose':
+        if target.get('type') not in {'radio', 'checkbox'} or not target.get('checked'):
+            raise Gate('The earlier native choice is no longer committed.')
+
+
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
-                     provenance: Provenance | None = None) -> dict:
+                     provenance: Provenance | None = None,
+                     filled: dict | None = None, history: list | None = None,
+                     resume_path: str = '', company: str = '', job_url: str = '') -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _alias_current(provenance, fixture_context=fixture_context)):
@@ -2431,10 +2515,12 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 raise Gate(f'An exact human-approved answer is needed for "{key}".',
                            form_question=question)
         return page
+    filled = filled if filled is not None else {}
+    history = history if history is not None else []
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not getattr(session, '_closed_admissions', {}) and not any(
+    if not candidate and not history and not getattr(session, '_closed_admissions', {}) and not any(
             _closed_mode(c) or c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
@@ -2445,58 +2531,171 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or not navigation_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
-    for item in page['controls']:
-        if not ((_native_answer(item) or item.get('type') in {'radio', 'checkbox', 'combobox'})
-                and _unanswered(page, item)):
+    if history:
+        check_approvals(
+            pk, history, page, provenance=provenance,
+            **({'fixture_context': fixture_context} if fixture_context else {}))
+        for receipt in history:
+            if receipt.get('fact'):
+                _bootstrap_receipt_current(page, receipt, filled)
+
+    seen = set()
+    ordinal = 0
+    # PAGE order, one logical record per required control (one per radio group).
+    # Rebind after each committed write: a previous PAGE must not authorize the next.
+    for initial in list(page['controls']):
+        item = control(page, {'selector': initial['selector']}, 'bootstrap-field')
+        kind = item.get('type')
+        eligible = kind in _BOOTSTRAP_TYPES and (
+            kind != 'select' or item.get('tag') == 'select')
+        if not ((_native_answer(item) or kind in {'radio', 'checkbox', 'combobox'})
+                and item.get('required')):
             continue
-        if (item.get('type') == 'radio'
-                and _radio_group(page, item)[0] is not item):
+        group = ((item.get('form_selector'), item.get('name'))
+                 if kind == 'radio' else item['selector'])
+        if group in seen:
             continue
-        if item.get('disabled') or (
-                item.get('type') not in {'radio', 'checkbox', 'combobox'}
-                and str(item.get('value') or '').strip()):
+        seen.add(group)
+        if kind == 'radio' and _radio_group(page, item)[0] is not item:
             continue
+        if eligible:
+            ordinal += 1
+
+        def record(decision):
+            if eligible:
+                _bootstrap_log(item, ordinal, decision)
+
+        if not _unanswered(page, item):
+            # Without a previously validated controller receipt this is not a
+            # new bank settlement. Prefilled page values are left untouched.
+            if eligible:
+                members = (_radio_group(page, item) if kind == 'radio' else [item])
+                prior = [r for r in history if r.get('fact')
+                         and r.get('selector') in {c['selector'] for c in members}]
+                if prior:
+                    record('already-satisfied')
+            continue
+        if item.get('disabled'):
+            record('blocked')
+            raise Gate('A required native control is disabled; inspect manually.')
         try:
             if provenance is not None and not _alias_current(
                     provenance, fixture_context=fixture_context):
-                raise Gate('The trusted alias is no longer current.')
+                raise Gate('The trusted same-job provenance is no longer current.')
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=True,
                 provenance=provenance)
         except Gate:
-            continue
+            record('blocked')
+            raise
         question['pk'] = pk
         key = question['label']
-        value = str(facts.get(_fact_key(facts, key)) or '').strip()
-        grant = (_row(pk, fixture_context=fixture_context) if fixture_context
-                 else _row(pk)).get('human_approved_answers') or {}
-        previous = grant.get(key) if isinstance(grant, dict) else None
-        if (item.get('type') == 'radio' and isinstance(previous, dict)
-                and isinstance(previous.get('radio_members'), list)
-                and previous['radio_members'] != question['radio_members']):
-            raise Gate('The previously approved radio group has changed; inspect it again.')
-        if item.get('type') in {'radio', 'checkbox'}:
-            # An existing control grant is authority even without a bank fact.
-            # An unsafe or stale grant is not a newly grantable question.
-            if _approved_native_choice(page, item, pk, provenance=provenance,
-                                       fixture_context=fixture_context) is not None:
-                continue
-        if value:
-            try:
-                exact_approval(pk, key, value, target=_bound_target(page, item),
-                               url=page['url'], provenance=provenance,
-                               **({'fixture_context': fixture_context}
-                                  if fixture_context else {}))
-                continue
-            except Gate:
-                pass
+        fact_key = _fact_key(facts, key)
+        value = str(facts.get(fact_key) or '').strip() if fact_key is not None else ''
+        grants = (_row(pk, fixture_context=fixture_context) if fixture_context
+                  else _row(pk)).get('human_approved_answers')
+        previous = grants.get(key) if isinstance(grants, dict) else None
+        authority = _bootstrap_grant_state(previous, item, question, value)
         prompt = (_choice_prompt(item, question)
-                  if (item.get('type') in {'radio', 'checkbox', 'combobox'}
-                      or item.get('tag') == 'select')
+                  if kind in {'radio', 'checkbox', 'combobox'} or kind == 'select'
                   else f'An exact human-approved answer is needed for "{key}".')
-        raise Gate(prompt, form_question=question)
-    return page
+        if authority == 'stale':
+            record('blocked')
+            raise Gate('The earlier control approval has changed; inspect manually.')
 
+        # #103: a grant-only choice is deliberately left for the existing model
+        # choose action. Its PAGE-bound approved_choices remains independent.
+        if kind in {'radio', 'checkbox'} and not value and authority == 'current':
+            try:
+                approved = _approved_native_choice(
+                    page, item, pk, provenance=provenance,
+                    fixture_context=fixture_context)
+                if approved is None:
+                    raise Gate('The granted native choice is no longer current.')
+            except Gate:
+                record('blocked')
+                raise
+            record('left-to-model')
+            continue
+
+        if not value or authority in {'missing', 'incomplete'}:
+            record('needs-human')
+            raise Gate(prompt, form_question=question)
+        try:
+            exact_approval(
+                pk, key, value, target=_bound_target(page, item),
+                url=page['url'], provenance=provenance,
+                **({'fixture_context': fixture_context} if fixture_context else {}))
+            if kind in {'radio', 'checkbox'}:
+                approved = _approved_native_choice(
+                    page, item, pk, provenance=provenance,
+                    fixture_context=fixture_context)
+                if approved is None or approved[0] != value:
+                    raise Gate('The approved native choice differs from the bank.')
+            else:
+                guarded_value(item, value)
+            if kind == 'select':
+                # No model-supplied candidate: uniquely resolve the approved
+                # current native option before executing the guarded select.
+                option = choose_value(item, value, '')
+            else:
+                option = ''
+        except Gate:
+            record('blocked')
+            raise
+
+        if not eligible:
+            # Other native text controls keep their pre-existing model action
+            # path; this Issue settles only tel and banked native choices.
+            continue
+        if kind == 'radio':
+            selector = approved[1]['selector']
+            verb = 'choose'
+        elif kind == 'checkbox':
+            selector = item['selector']
+            verb = 'choose'
+        else:
+            selector = item['selector']
+            verb = {'tel': 'fill', 'select': 'select',
+                    'combobox': 'combobox'}[kind]
+        action = {'action': verb, 'selector': selector, 'fact': fact_key}
+        if verb == 'select':
+            action['value'] = option
+        trial = dict(filled)
+        try:
+            # Dispatch and the original execute() grant, receiver and form
+            # guards remain the sole writer. No speculative DOM evaluate write.
+            check_dispatch(
+                pk, resume_path,
+                **({'fixture_context': fixture_context} if fixture_context else {}))
+            receipt = await execute(
+                session, page, action, facts=facts, filled=trial,
+                resume_path=resume_path, company=company or getattr(provenance, 'company', ''),
+                jd_text='', resume_tex='', github='', pk=pk,
+                job_url=job_url or getattr(provenance, 'wrapper', '') or (origins[0] if origins else ''),
+                provenance=provenance,
+                **({'fixture_context': fixture_context} if fixture_context else {}))
+            committed, observed_witness = await _observe_controls(
+                session, await session.page())
+            if (not navigation_allowed(committed.get('url', ''), *origins,
+                                       provenance=provenance)
+                    or (provenance is not None and not _alias_current(
+                        provenance, fixture_context=fixture_context))):
+                raise Gate('The job route changed during native commit readback.')
+            check_approvals(
+                pk, [receipt], committed, provenance=provenance,
+                **({'fixture_context': fixture_context} if fixture_context else {}))
+            _bootstrap_receipt_current(committed, receipt, trial)
+        except Gate:
+            # Once an authorized IPC was attempted, never retry on uncertain
+            # readback: the unbound Gate prevents a second or model write.
+            record('blocked')
+            raise
+        filled.update(trial)
+        history.append(receipt)
+        page, witness = committed, observed_witness
+        record('settled-from-bank')
+    return page
 
 
 async def _current_approved_choices(session, page: dict, pk: str,
@@ -3372,6 +3571,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'step': context['step']}
                     if not allowed(page['url']):
                         raise Gate('Current page is not proven to be the same tracked job.')
+                    verify_dispatch()
+                    page = await _bootstrap(
+                        session, page, pk, facts, *trusted_origins,
+                        provenance=provenance, filled=filled, history=history,
+                        resume_path=resume_path, company=company, job_url=url,
+                        **({'fixture_context': ctx} if ctx else {}))
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
                                     r.get('selector') == c['selector'] and r['label'] == c['label']
@@ -3380,11 +3585,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
                                 'values and attachment before submit.')
-                    verify_dispatch()
-                    page = await _bootstrap(
-                        session, page, pk, facts, *trusted_origins,
-                        provenance=provenance,
-                        **({'fixture_context': ctx} if ctx else {}))
                     # Decision-only choice data comes from a fresh independent PAGE witness.
                     choices = await _current_approved_choices(
                         session, page, pk, *trusted_origins, provenance=provenance,

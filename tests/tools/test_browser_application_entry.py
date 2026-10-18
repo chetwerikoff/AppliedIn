@@ -292,12 +292,14 @@ async def test_stable_shell_is_not_application_readiness(monkeypatch, shape):
         page['controls'] = [field('Application', '#tab', tag='a', type='',
                                   in_form=False, form_selector='', form_action='',
                                   href='https://jobs.ashbyhq.com/foreign/forged/application')]
-    elif shape == 'search':
-        page['controls'] = [field('Search jobs', type='search', form_action=entry('ashby')),
-                            submit('Search jobs', form_action=entry('ashby'))]
-    elif shape == 'no-marker':
-        page['controls'] = page['controls'][:1]
-    _, _, session, decide = world(monkeypatch, pages=[page])
+    if shape in {'search', 'no-marker'}:
+        # Real PAGE/fixed readers inventory every native form, even when the
+        # application marker is absent; a hand-built control list does not.
+        _, session, decide, _ = native_real_world(
+            monkeypatch, **({'searchOnly': True} if shape == 'search'
+                            else {'marker': 'absent'}))
+    else:
+        _, _, session, decide = world(monkeypatch, pages=[page])
     if shape == 'readonly':
         original = session.call
         async def call(method, *args):
@@ -310,7 +312,9 @@ async def test_stable_shell_is_not_application_readiness(monkeypatch, shape):
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await attempt()
     assert report['status'] == 'gate'
-    assert 'no qualifying application form after bounded wait' in report['question']
+    expected = ('incomplete native application candidate' if shape == 'no-marker'
+                else 'no qualifying application form')
+    assert expected + ' after bounded wait' in report['question']
     assert not decide.await_count
     no_mutations(session)
 
@@ -1072,7 +1076,15 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
 
 async def test_ashby_unavailable_or_contradictory_fixed_native_witness(monkeypatch):
     _, raw, decide, _ = native_real_world(monkeypatch, nativePair=True)
-    raw.fixed['entry']['native_candidates'][0]['action_attr'] = None
+    owner = raw.fixed['entry']['native_candidates'][0]
+    owner['action_attr_present'] = False
+    owner['action_attr'] = None
+    # The absent raw attribute and the defaulted resolved property are
+    # independently observed; keep the native control evidence coherent.
+    for control_item in raw.fixed['controls']:
+        if control_item['form_selector'] == owner['selector']:
+            control_item['form_action_attr_present'] = False
+            control_item['form_action_raw'] = None
     result = await attempt()
     assert result['status'] == 'gate'
     assert 'raw action not proven' in result['question']
@@ -1110,12 +1122,20 @@ async def native_admitted_with_one_safe_fill(monkeypatch):
 async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkeypatch, at):
     raw, session, filled = await native_admitted_with_one_safe_fill(monkeypatch)
     assert filled == {'#email': 'test@example-co.test'}
+    foreign_route = (
+        'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application')
     for snapshot in (raw.current, raw.fixed):
-        snapshot['entry']['native_candidates'][0]['action_attr'] = (
-            'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application')
+        candidate = snapshot['entry']['native_candidates'][0]
+        candidate['action_attr'] = candidate['action'] = foreign_route
+        # Model the complete observed DOM changing rather than only one
+        # correlated witness slot; the earlier safe fill stays recorded.
+        for control_item in snapshot['controls']:
+            if control_item['form_selector'] == candidate['selector']:
+                control_item['form_action'] = foreign_route
+                control_item['form_action_raw'] = foreign_route
     before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}])
     next_verb, selector = ('fill', '#email') if at == 'before-next-fill' else ('click', '#submit')
-    with pytest.raises(forms.Gate, match='raw action not proven|root identity drift'):
+    with pytest.raises(forms.Gate, match='lacks tracked job binding|root identity drift'):
         await session.call(next_verb, selector, '--value', 'another' if at == 'before-next-fill' else '')
     assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}]) == before == 1
     assert not [c for c in raw.calls if c[0] == 'click']
@@ -1153,6 +1173,7 @@ async def test_ashby_approved_native_checkbox_is_not_mistaken_for_submit(monkeyp
         page, target, witness, posting('ashby'), provenance=provenance)
     row['human_approved_answers'][question['label']] = {
         'value': 'yes', 'label': question['control_label'],
+        'visible_text': question['visible_text'],
         **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
                                     'type', 'form_selector', 'form_action')}}
     receipt = await forms.execute(

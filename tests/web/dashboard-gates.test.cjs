@@ -225,7 +225,7 @@ test('company/search filters and stale queue selection preserve exclusive bucket
   h.state.query = 'Synthetic role';
   assert.deepEqual(Array.from(h.fn('visible')(h.state.apps), r => r.pk).sort(),
     ['clear', 'fix', 'held', 'question', 'triage']);
-  const sections = h.fn('visible')(h.state.apps).map((r) => h.fn('sectionOf')(r, new Set()));
+  const sections = Array.from(h.fn('visible')(h.state.apps), (r) => h.fn('sectionOf')(r, new Set()));
   assert.deepEqual(sections.sort(), ['fix','needs','portal','ready','triage']);
   h.state.queue = {pending: [], concurrency: 1};
   assert.deepEqual(Array.from(h.fn('visibleApprovalPicks')(), r => r.pk), ['clear']);
@@ -234,6 +234,8 @@ test('company/search filters and stale queue selection preserve exclusive bucket
   const queueHtml = h.fn('queuedSec')(h.state.apps);
   assert.doesNotMatch(queueHtml, /data-qsel="held"/);
   assert.match(queueHtml, /data-qsel="clear"/);
+  assert.doesNotMatch(queueHtml, /data-act="drain-co"|data-co-prof=|data-act="rot-co"/);
+  assert.equal(h.fn('companyActionAllowed')('example-co'), false);
   assert.equal(h.state.qPicked.has('held'), false);
   assert.equal(h.state.qPicked.size, 1);
   h.state.queue.pending = [{pk:'held', company:'example-co'}];

@@ -253,9 +253,11 @@ function routeOf(r) {
   if (!Object.hasOwn(STATUS_META, r.status)) return "manual_triage";
   if (r.status !== "needs_human") return r.status;
   if (r.fail_kind && r.fail_kind !== "") return "manual_triage";
-  if (DEFECT_CODES.has(r.gate_reason)) return "waiting_for_fix";
+  if (DEFECT_CODES.has(r.gate_reason))
+    return r.gate_has_form_question === true ? "manual_triage" : "waiting_for_fix";
   if (r.gate_reason === "owner_question")
-    return typeof r.gate_question === "string" && !!r.gate_question.trim()
+    return r.gate_has_form_question === true
+      && typeof r.gate_question === "string" && !!r.gate_question.trim()
       ? "owner_question" : "manual_triage";
   if (["approval", "low_confidence", "captcha", "no_account"].includes(r.gate_reason))
     return r.gate_reason;
@@ -304,7 +306,7 @@ function rowActionAllowed(pk, act) {
   if (!r || r.submit_hold_state !== "clear") return false;
   const kind = routeOf(r);
   if (READ_ONLY_ROUTES.has(kind)) return false;
-  if (act === "answer") return ["owner_question", "approval", "low_confidence"].includes(kind);
+  if (act === "answer") return ["owner_question", "approval", "low_confidence", "tailored"].includes(kind);
   if (act === "run-now") return kind === "found";
   if (act === "apply-now") return canApply(r);
   if (act === "force-apply") return kind === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
@@ -314,8 +316,17 @@ function rowActionAllowed(pk, act) {
   if (act === "mark-applied") return kind === "tailored" || INTERVENTION_ROUTES.has(kind);
   return true;
 }
+// Only active owner questions accept arbitrary text. Keep the existing decision
+// token for approvals without borrowing stale textarea contents.
+function resumeAnswer(pk, value) {
+  const kind = routeOf(state.apps.find((r) => r.pk === pk));
+  if (kind !== "owner_question") return "approved";
+  return (value || "").trim() || null;
+}
 function companyActionAllowed(co) {
-  return !state.apps.some((r) => (co === "__all__" || r.company === co) && isReadOnly(r));
+  const key = String(co || "").trim().toLowerCase();
+  return !state.apps.some((r) => (co === "__all__"
+    || String(r.company || "").trim().toLowerCase() === key) && isReadOnly(r));
 }
 
 
@@ -613,7 +624,7 @@ function renderDetail(force = false) {
       <button class="cp-lk cp-add-btn" id="cp-dt-save" type="button">Save preferences</button>
       ${n ? `<button class="cp-lk cp-add-btn" id="cp-dt-reset" type="button"
         title="Drop ${esc(co)}'s own values and share yours again">Use shared</button>` : ""}
-      ${rotc ? `<button class="cp-lk cp-add-btn cp-rot-go" id="cp-dt-rotgo" type="button"
+      ${rotc && companyActionAllowed(co) ? `<button class="cp-lk cp-add-btn cp-rot-go" id="cp-dt-rotgo" type="button"
         data-co="${esc(co)}"
         title="Point every un-sent ${esc(co)} job at the rotating address, tailor what has no résumé yet, and queue it all — no further approvals. Bounded by what the address has room for; anything gated on a real question is left alone.">Rotate &amp; approve all</button>` : ""}
       <button class="cp-lk cp-add-btn cp-add-go" id="cp-dt-scan" type="button"
@@ -3293,7 +3304,7 @@ function viewProfiles() {
         ${isDef ? `<span class="pr-tag">DEFAULT</span>` : ""}
         <span class="pv-acts">
           ${isDef ? "" : `<button class="pv-act" data-prof-default="${esc(p.id)}" title="Make this the default identity">Default</button>`}
-          <button class="pv-act" data-prof-all="${esc(p.id)}" title="Re-render every tailored résumé on the whole board with this identity. No model is called.">Whole board</button>
+          ${companyActionAllowed("__all__") ? `<button class="pv-act" data-prof-all="${esc(p.id)}" title="Re-render every tailored résumé on the whole board with this identity. No model is called.">Whole board</button>` : ""}
           <button class="pv-act del" data-prof-del="${esc(p.id)}" title="Remove this identity">✕</button>
         </span>
       </div>
@@ -3313,7 +3324,7 @@ function viewProfiles() {
         <span class="pv-name">${esc(p.label)}</span>
         <span class="pr-tag rot">ROTATING · ${p.limit || 5} each · ${esc(p.style === "dot" ? "gmail dot" : "+tag")}</span>
         <span class="pv-acts">
-          ${mine.length ? `<button class="pv-act" data-act="rot-co" data-company="__all__" title="Re-point every rotating company's un-sent jobs at its current address and queue them">↻ Rotate &amp; queue all</button>` : ""}
+          ${mine.length && companyActionAllowed("__all__") ? `<button class="pv-act" data-act="rot-co" data-company="__all__" title="Re-point every rotating company's un-sent jobs at its current address and queue them">↻ Rotate &amp; queue all</button>` : ""}
           <button class="pv-act del" data-prof-del="${esc(p.id)}" title="Remove this template">✕</button>
         </span>
       </div>
@@ -4248,13 +4259,17 @@ async function runCompany(name, careersUrl, again = false, silent = false) {
 
 async function runProcess(again = false) {
   if (demoGuard() || state.stats.processing) return;
-  if (!companyActionAllowed("__all__")) {
-    toast("Review unresolved portal, code or triage rows before starting bulk processing.");
+  if (!state.picked.size) { toast("Select at least one company to process."); return; }
+  const scope = discoverScope();  // same picked companies as Discover
+  // Preparing selected companies must not be blocked by an unrelated legacy gate.
+  // An unscoped request still covers all companies and requires a clean board.
+  const allowed = scope.length ? scope.every((co) => companyActionAllowed(co))
+    : companyActionAllowed("__all__");
+  if (!allowed) {
+    toast("Review unresolved portal, code or triage rows in the selected companies.");
     return;
   }
-  if (!state.picked.size) { toast("Select at least one company to process."); return; }
   const n = state.stats.found_waiting ?? 0;
-  const scope = discoverScope();  // same picked companies as Discover
   if (!beginLaunch("prepare", "Starting preparation — matching jobs and preparing résumés…")) return;
   state.stats.processing = true;    // optimistic; poll confirms
   renderDeck();
@@ -4386,7 +4401,8 @@ function paneAction(act, pk, el) {
   if (act === "force-apply") { forceApply(pk); return; }
   if (act === "answer") {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
-    const answer = (t?.value || "").trim() || "approved";
+    const answer = resumeAnswer(pk, t?.value);
+    if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
     // Reload the queue as soon as the approve lands, so the card LEAVES "Ready to
     // apply" and reappears under Queued with its position. Without that refresh the
     // row sits exactly where it was until the next poll and the click reads as dead.
@@ -5591,6 +5607,10 @@ function wire() {
     if (rotgo) {
       if (demoGuard()) return;
       const company = rotgo.dataset.co;
+      if (!company || !companyActionAllowed(company)) {
+        toast("Resolve held or unverified rows before rotating this company.");
+        return;
+      }
       rotgo.disabled = true;
       rotgo.classList.add("is-busy");
       rotgo.textContent = "rotating…";
@@ -5823,7 +5843,7 @@ function wire() {
     // rather than in a second place that could disagree with this one.
     const all = $("#btn-rotate-all");
     if (all) {
-      all.hidden = !rows.length;
+      all.hidden = !rows.length || !rows.every((r) => companyActionAllowed(r.company));
       const n = $("#rot-count");
       if (n) { n.hidden = !rows.length; n.textContent = String(rows.length); }
     }
@@ -5944,6 +5964,10 @@ function wire() {
     if (demoGuard()) return;
     const cos = (state.rotation || []).map((r) => r.company);
     if (!cos.length) return;
+    if (!cos.every((co) => companyActionAllowed(co))) {
+      toast("Resolve held or unverified rows before rotating these companies.");
+      return;
+    }
     if (!confirm(`Rotate and queue ${cos.length} compan${cos.length === 1 ? "y" : "ies"}`
                + ` — ${cos.join(", ")}?\n\nEvery un-sent job at these employers is`
                + ` re-pointed at that employer's rotating address, and each one with`
@@ -6010,6 +6034,10 @@ function wire() {
     const all = e.target.closest("[data-prof-all]");
     if (all) {
       if (demoGuard()) return;
+      if (!companyActionAllowed("__all__")) {
+        toast("Resolve held or unverified rows before changing the whole board.");
+        return;
+      }
       const p = state.profiles.find((x) => x.id === all.dataset.profAll) || {};
       if (!confirm(`Re-render every tailored résumé with ${p.label}'s details `
                  + `(${p.email})?\n\nThe tailoring itself is kept — only the contact `
@@ -6735,7 +6763,8 @@ function wire() {
       return forceApply(pk).then((started) => { if (started) closeDrawer(); });
     }
     if (kind === "answer") {
-      const answer = ($("#gate-answer")?.value || "").trim() || "approved";
+      const answer = resumeAnswer(pk, $("#gate-answer")?.value);
+      if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
       post(`/actions/resume/${encodeURIComponent(pk)}`, { answer });
       toast("Sent — pipeline resuming.");
     } else if (kind === "retailor") {

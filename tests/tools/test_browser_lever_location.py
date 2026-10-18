@@ -8,6 +8,7 @@ from copy import deepcopy
 import pytest
 
 from tools import browser_skill_apply as forms
+from tools import browser_skill_dom as dom
 from tools.browser_skill_fixture import _lever_location_form
 from tools.lever_location import equivalent_location, parse_location, press_keys
 
@@ -508,3 +509,191 @@ def test_other_combobox_cannot_borrow_location_equivalence():
     # This cannot pass the ordinary exact approved-to-committed check.
     with pytest.raises(forms.Gate, match='committed combobox value changed'):
         forms.check_approvals(PK, [fake], other)
+
+
+def test_lever_dom_witnesses_are_shared_by_both_production_readers():
+    # Both production scripts embed the same fixed, read-only graph. The fake
+    # IPC tests below exercise the response schema; the HTML is synthetic.
+    for script in (dom.PAGE, forms._FIXED_CONTROL_WITNESS):
+        assert 'const leverLocationField = e =>' in script
+        assert 'const leverLocationReceiver = (e, form) =>' in script
+        assert 'const leverLocationOwner = e =>' in script
+        assert 'const leverLocationSelected = (e, owner) =>' in script
+        assert "document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]')" not in script
+        assert "[aria-controls],[aria-owns],[aria-activedescendant]" in script
+        assert "document.querySelectorAll('#'+CSS.escape(id)).length===1" in script
+        assert 'location_receiver:leverLocationReceiver(e, form)' in script
+        assert 'location_selected_option:leverLocationSelected(e, locationOwner)' in script
+        assert 'listbox_visible:leverLocationVisible(list)' in script
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', ['dangling', 'dangling_name', 'duplicate'])
+async def test_declared_receiver_must_resolve_uniquely_before_option_ipc(grant_row, shape):
+    html = _lever_location_form().decode('utf-8')
+    hidden = '<input id="location-token" type="hidden" name="location_token">'
+    assert hidden in html
+    if shape == 'duplicate':
+        html = html.replace(hidden, hidden + hidden)
+        assert html.count('id="location-token"') == 2
+    elif shape == 'dangling_name':
+        html = html.replace('data-value-input="location-token"',
+                            'data-value-name="location_token"').replace(hidden, '')
+        assert 'data-value-name="location_token"' in html
+    else:
+        html = html.replace(hidden, '')
+    session = FakeLever(receiver_shape=shape)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert not any(call[0] == 'click' for call in session.calls)
+    assert not any(call[0] == 'submit' for call in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_receiver_witness_disagreement_has_no_option_click(grant_row):
+    # PAGE still reports the expected single hidden token; the independent
+    # fixed witness now reports a missing token. No PAGE-only admission.
+    session = FakeLever(witness_receiver_drift=True)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert all(call[0] != 'click' for call in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_only_undeclared_location_receiver_can_be_absent(grant_row):
+    html = _lever_location_form().decode('utf-8')
+    html = html.replace(' data-value-input="location-token"', '')
+    html = html.replace('<input id="location-token" type="hidden" name="location_token">', '')
+    assert 'data-value-input=' not in html and 'id="location-token"' not in html
+    session = FakeLever(receiver_shape='none')
+    receipt, filled = await run_choice(session)
+    assert receipt['hidden_selector'] == ''
+    assert receipt['hidden_value'] == ''
+    final = await session.page()
+    forms.check_form(final, filled, uploaded=True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
+    assert [call for call in session.calls if call[0] == 'click'] == [
+        ('click', '#location-option')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', ['post_dangling', 'post_duplicate'])
+async def test_receiver_disappearing_after_option_click_cannot_submit(grant_row, shape):
+    session = FakeLever(receiver_shape=shape)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert [c for c in session.calls if c[0] == 'click'] == [
+        ('click', '#location-option')]
+    assert not any(c[0] == 'submit' for c in session.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', ['post_dangling', 'post_duplicate'])
+async def test_receiver_loss_at_final_submit_gates_both_checks(grant_row, shape):
+    session = FakeLever()
+    receipt, filled = await run_choice(session)
+    session.receiver_shape = shape
+    altered = await session.page()
+    with pytest.raises(forms.Gate):
+        forms.check_form(altered, filled, uploaded=True, receipts=[receipt])
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
+    assert [c for c in session.calls if c[0] == 'click'] == [
+        ('click', '#location-option')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('claimant', ['outside', 'conflicting'])
+async def test_nonexclusive_listbox_owner_gates_before_option_click(grant_row, claimant):
+    html = _lever_location_form().decode('utf-8')
+    if claimant == 'outside':
+        html = html.replace('</form>', '</form><div id="other-widget" '
+                            'aria-controls="location-options"></div>')
+        assert '<div id="other-widget" aria-controls="location-options">' in html
+    else:
+        html = html.replace('aria-controls="location-options"',
+                            'aria-controls="location-options" aria-owns="another-listbox"')
+        assert 'aria-owns="another-listbox"' in html
+    session = FakeLever(owner_shape=claimant)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert all(c[0] != 'click' for c in session.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', ['lost', 'replaced'])
+async def test_selected_option_missing_immediately_after_click_gates(grant_row, shape):
+    session = FakeLever(selected_option_shape=shape)
+    with pytest.raises(forms.Gate) as err:
+        await run_choice(session)
+    assert err.value.form_question['selector'] == '#current-location'
+    assert [c for c in session.calls if c[0] == 'click'] == [
+        ('click', '#location-option')]
+    assert all(c[0] != 'submit' for c in session.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shape', ['lost', 'replaced'])
+async def test_selected_option_removed_or_replaced_before_submit_gates(grant_row, shape):
+    session = FakeLever()
+    receipt, filled = await run_choice(session)
+    session.selected_option_shape = shape
+    altered = await session.page()
+    # The native selected caption, machine value and hidden receiver all
+    # remain unchanged; only the original selected option proof was lost.
+    assert altered['controls'][0]['combobox']['selected_value'] == 'testville-verified'
+    assert altered['controls'][1]['value'] == 'testville-verified'
+    with pytest.raises(forms.Gate):
+        forms.check_form(altered, filled, uploaded=True, receipts=[receipt])
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
+    assert not any(c[0] == 'submit' for c in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_generic_opacity_zero_listbox_does_not_add_a_new_gate():
+    # An unrelated generic combobox's PAGE sees layout rectangles (visible),
+    # while the independent strict witness sees ancestor opacity:0 (not visible).
+    # This Lever-only field cannot change the preexisting generic parity contract.
+    page = location_page(typed='Synthetic', selected=False)
+    page['url'] = 'https://example.test/jobs/synthetic'
+    page['controls'][0]['label'] = 'Skills'
+    combo = page['controls'][0]['combobox']
+    for key in ('location_owner', 'location_receiver', 'location_selected_option'):
+        combo.pop(key)
+    combo['listbox_visible'] = True
+    witness = deepcopy(page)
+    witness['controls'][0]['combobox']['listbox_visible'] = False
+
+    class GenericSession:
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            return {'value': evidence(witness)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    observed, _ = await forms._observe_controls(GenericSession(), page)
+    assert observed['controls'][0]['combobox']['listbox_visible'] is True
+
+
+@pytest.mark.asyncio
+async def test_lever_opacity_disagreement_still_gates():
+    page = location_page(typed='Testville, United States', selected=False)
+    witness = deepcopy(page)
+    witness['controls'][0]['combobox']['listbox_visible'] = False
+
+    class DisagreeSession:
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            return {'value': evidence(witness)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    with pytest.raises(forms.Gate):
+        await forms._observe_controls(DisagreeSession(), page)

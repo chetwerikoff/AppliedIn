@@ -2442,7 +2442,9 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
 def _bootstrap_receipt_current(page: dict, receipt: dict, filled: dict) -> None:
     """An old receipt without the current native state never means satisfied."""
     selector = receipt.get('selector')
-    target = control(page, receipt, 'approval-history')
+    # check_approvals() already requires a unique, enabled receipt selector
+    # before this extra committed-value check; do not add another control() site.
+    target = next(c for c in page['controls'] if c['selector'] == selector)
     if selector not in filled:
         raise Gate('The earlier approved field has no verified write receipt.')
     action = receipt.get('action')
@@ -2517,10 +2519,15 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         return page
     filled = filled if filled is not None else {}
     history = history if history is not None else []
+    # Only verified Lever/Greenhouse application-entry routes may write before
+    # a model decision. Direct, redirect and unrelated native flows keep their
+    # already-established question and guarded model-action behavior.
+    settlement_route = isinstance(provenance, (
+        ApplicationEntryProvenance, GreenhouseJobAlias))
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not history and not getattr(session, '_closed_admissions', {}) and not any(
+    if not candidate and not (settlement_route and history) and not getattr(session, '_closed_admissions', {}) and not any(
             _closed_mode(c) or c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
@@ -2531,7 +2538,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or not navigation_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
-    if history:
+    if settlement_route and history:
         check_approvals(
             pk, history, page, provenance=provenance,
             **({'fixture_context': fixture_context} if fixture_context else {}))
@@ -2572,6 +2579,57 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         def record(decision):
             if eligible:
                 _bootstrap_log(item, ordinal, decision, required=required)
+
+        if not settlement_route or not eligible:
+            # Keep the pre-#119 behavior for every non-settleable field and
+            # route. An ungrantable native question is left to the existing
+            # model Gate; a safe missing fact/grant stays a bound question.
+            if not _unanswered(page, item) or item.get('disabled') or (
+                    kind not in {'radio', 'checkbox', 'combobox'}
+                    and str(item.get('value') or '').strip()):
+                continue
+            try:
+                if provenance is not None and not _alias_current(
+                        provenance, fixture_context=fixture_context):
+                    raise Gate('The trusted alias is no longer current.')
+                question = _disclosure_question(
+                    page, item, witness, *origins, bootstrap=True,
+                    provenance=provenance)
+            except Gate:
+                continue
+            question['pk'] = pk
+            key = question['label']
+            value = str(facts.get(_fact_key(facts, key)) or '').strip()
+            grants = (_row(pk, fixture_context=fixture_context) if fixture_context
+                      else _row(pk)).get('human_approved_answers') or {}
+            previous = grants.get(key) if isinstance(grants, dict) else None
+            if (kind == 'radio' and isinstance(previous, dict)
+                    and isinstance(previous.get('radio_members'), list)
+                    and previous['radio_members'] != question['radio_members']):
+                record('blocked')
+                raise Gate('The previously approved radio group has changed; inspect it again.')
+            if kind in {'radio', 'checkbox'}:
+                if _approved_native_choice(
+                        page, item, pk, provenance=provenance,
+                        fixture_context=fixture_context) is not None:
+                    record('left-to-model')
+                    continue
+            if value:
+                try:
+                    exact_approval(
+                        pk, key, value, target=_bound_target(page, item),
+                        url=page['url'], provenance=provenance,
+                        **({'fixture_context': fixture_context}
+                           if fixture_context else {}))
+                    continue
+                except Gate:
+                    pass
+            prompt = (_choice_prompt(item, question)
+                      if kind in {'radio', 'checkbox', 'combobox'}
+                      or item.get('tag') == 'select'
+                      else f'An exact human-approved answer is needed for "{key}".')
+            record('needs-human')
+            raise Gate(prompt, form_question=question)
 
         if not _unanswered(page, item):
             # Without a previously validated controller receipt this is not a

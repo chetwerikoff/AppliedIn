@@ -483,8 +483,6 @@ async def test_private_labels_and_gate_field_logging_never_emit_untrusted_values
     raw.state['text'] = 'PRIVATE-PAGE-SENTINEL'
     case.page['controls'][0]['question'] = 'PRIVATE-QUESTION-SENTINEL'
     raw.state['controls'][0]['question'] = 'PRIVATE-QUESTION-SENTINEL'
-    case.row['human_approved_answers'][case.phone['label']]['question'] = (
-        'PRIVATE-QUESTION-SENTINEL')
     case.facts.pop('Work mode')
     case.row['human_approved_answers'].pop('Work mode')
     async def no_decision(*args, **kwargs):

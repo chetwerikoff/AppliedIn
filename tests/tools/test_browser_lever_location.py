@@ -391,35 +391,46 @@ async def test_missing_provenance_refuses_before_key_or_option_ipc(grant_row):
 
 
 @pytest.mark.asyncio
-async def test_submit_checks_reject_missing_or_changed_selection_and_grant(grant_row):
+async def test_submit_checks_reject_missing_receipt_or_changed_grant(grant_row):
     session = FakeLever()
     receipt, filled = await run_choice(session)
     committed = await session.page()
     with pytest.raises(forms.Gate, match='selection receipt'):
         forms.check_form(committed, filled, uploaded=True)
+    # A copied dict cannot impersonate the controller's witnessed commit.
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [{**receipt}], committed, provenance=PROVENANCE)
-    for change in (
-        {'combo.selected_text': ''},
-        {'combo.displayed_text': ''},
-        {'value': ''},
-        {'has_value': False},
-        {'disabled': True},
-        {'combo.selected_value': ''},
-        {'combo.hidden_value': 'OTHER'},
-        {'combo.link_id': 'orphan'},
-        {'receiver.value': 'OTHER'},
-        {'label': 'Another location'},
-        {'form_action': 'https://example.invalid/apply'},
-    ):
-        altered = location_page(typed=ANSWER, selected=True, changed=change)
-        with pytest.raises(forms.Gate):
-            forms.check_form(altered, filled, uploaded=True, receipts=[receipt])
-        with pytest.raises(forms.Gate):
-            forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
     grant_row['human_approved_answers']['Current location']['value'] = 'Changed'
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [receipt], committed, provenance=PROVENANCE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', [
+    pytest.param({'combo.selected_text': ''}, id='lost-selection'),
+    pytest.param({'combo.displayed_text': ''}, id='cleared-display'),
+    pytest.param({'value': ''}, id='cleared-native-input'),
+    pytest.param({'has_value': False}, id='native-value-flag-lost'),
+    pytest.param({'disabled': True}, id='disabled-location'),
+    pytest.param({'combo.selected_value': ''}, id='machine-value-lost'),
+    pytest.param({'combo.hidden_value': 'OTHER'}, id='changed-hidden-commit'),
+    pytest.param({'combo.link_id': 'orphan'}, id='lost-listbox-owner'),
+    pytest.param({'receiver.value': 'OTHER'}, id='changed-hidden-receiver'),
+    pytest.param({'label': 'Another location'}, id='relabelled-location'),
+    pytest.param({'type': 'text'}, id='combobox-type-lost'),
+    pytest.param({'selector': '#replaced-location'}, id='replaced-control'),
+    pytest.param({'form_action': 'https://example.invalid/apply'}, id='changed-destination'),
+])
+async def test_submit_checks_reject_each_location_drift(grant_row, change):
+    session = FakeLever()
+    receipt, filled = await run_choice(session)
+    altered = location_page(typed=ANSWER, selected=True, changed=change)
+    # Neither pre-submit check may let a changed/disabled control escape the
+    # original witnessed selection just because its native loop would skip it.
+    with pytest.raises(forms.Gate):
+        forms.check_form(altered, filled, uploaded=True, receipts=[receipt])
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
 
 
 def test_other_combobox_cannot_borrow_location_equivalence():

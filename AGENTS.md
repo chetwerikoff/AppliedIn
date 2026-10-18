@@ -277,6 +277,31 @@ it. Never copy, delete or reset its directory, switch the pinned instance, or
 publish its instance ID. Form smoke uses a local `127.0.0.1` fixture page, run
 by the firefighter or the operator in the primary checkout, never a worktree.
 
+### Dedicated application Chrome health
+
+The AppliedIn orchestrator owns health of the dedicated application Chrome
+profile. Check at every orchestrator start or restart, after every machine
+reboot, and before every smoke needing BrowserSkill. Run
+`curl -s 127.0.0.1:8788/stats` and inspect `browser_status.state`.
+
+If the state is `connected`, take no action. Only if it is `not_running`,
+the orchestrator launches exactly:
+
+```bash
+systemd-run --user --scope -- setsid -f $HOME/.local/bin/appliedin-chrome --user-data-dir=$HOME/.local/share/appliedin/chrome --no-first-run --no-default-browser-check http://127.0.0.1:8788/
+```
+
+Re-check after about 15 seconds; the expected state is `connected`.
+For any other non-connected state (including running but not connected,
+ambiguous, or a different instance), never launch a second Chrome.
+Report the exact state and detail to the architect pane for the operator's
+step. If the post-launch check is not `connected`, report it instead of
+launching again.
+
+Launching is the only action allowed on that Chrome: never close, reload,
+focus, or navigate it; never run bsk. Units never launch it; only the
+orchestrator does.
+
 ## Orchestrator-pack target binding
 
 The block between the `orchestrator-pack` markers below is pack-managed: only

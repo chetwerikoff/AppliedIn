@@ -1330,6 +1330,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         approval = submit_hold.direct_approval()
         q = ApplyQueue(stores.tracking.r)
         if (not approval or approval != row.get("apply_requested_at")
+                or row.get("pre_submit_never_armed") is not True
+                or row.get("pre_submit_engine") != "browser_skill"
                 or row.get("status") != "tailored"
                 or row.get("gate_reason") != "approval"
                 or not sep or not job_id

@@ -977,7 +977,10 @@ def create_app() -> FastAPI:
         if not profile:
             return {"ok": False, "error": "no such profile"}
         stores = make_stores(settings)
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+        original = stores.tracking.get(pk) or {}
+        if original.get("pre_submit_retry_used"):
+            return {'ok': False, 'error': "Recovered pre-submit approval cannot be cloned."}
+        if submit_hold.blocked(pk, original, tracking=stores.tracking):
             return {'ok': False, 'error': submit_hold.REASON}
         out = prof.reapply(pk, profile, stores)
         if not out.get("ok"):
@@ -1487,7 +1490,8 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         row = stores.tracking.get(pk) or {}
         q = ApplyQueue(stores.tracking.r)
-        if (row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
+        if (row.get("pre_submit_retry_used")
+                or row.get("status") != "skipped" or row.get("skip_reason") != "low_score"
                 or submit_hold.blocked(pk, row, tracking=stores.tracking)
                 or row.get("confirmation_id") or pk in q.in_flight()
                 or any(item["pk"] == pk for item in q.pending())):
@@ -1530,6 +1534,8 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "Tracking storage unavailable; restore it before Reopen."}
         if not row:
             return {"ok": False, "error": "unknown job"}
+        if row.get("pre_submit_retry_used"):
+            return {"ok": False, "error": "Recovered pre-submit job cannot be reopened."}
         status = str(row.get("status") or "")
         allowed = {"skipped", "failed", "error", "job_gone", "capped"}
         if status not in allowed:
@@ -1800,8 +1806,10 @@ def create_app() -> FastAPI:
         # the pipeline's next steps stream to the Logs view as they happen.
         from agent.run import resume_job
         stores = make_stores(settings)
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
-            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        row = stores.tracking.get(pk) or {}
+        if row.get("pre_submit_retry_used") or submit_hold.blocked(
+                pk, row, tracking=stores.tracking):
+            return {"ok": False, "error": "Protected application cannot resume through a gate."}
         background.add_task(resume_job, pk, body.get("answer", ""))
         return {"ok": True, "status": "resuming"}
 
@@ -2471,8 +2479,11 @@ def create_app() -> FastAPI:
 
         pk = ((body or {}).get("pk") or "").strip()
         stores = make_stores(settings)
-        if pk and submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
-            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        if pk:
+            row = stores.tracking.get(pk) or {}
+            if row.get("pre_submit_retry_used") or submit_hold.blocked(
+                    pk, row, tracking=stores.tracking):
+                return {"ok": False, "error": "Protected application cannot be revived."}
         n = ApplyQueue(stores.tracking.r).revive(pk)
         return {"ok": True, "revived": n}
 
@@ -2490,8 +2501,9 @@ def create_app() -> FastAPI:
         row = stores.tracking.get(pk) or {}
         if not row:
             return {"ok": False, "error": f"no job {pk!r}"}
-        # Never re-queue something already submitted — a duplicate under a real
-        # name is worse than a missed application.
+        # Never re-queue something already submitted or once recovered.
+        if row.get("pre_submit_retry_used"):
+            return {"ok": False, "error": "A recovered pre-submit job is direct-only."}
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
@@ -2839,6 +2851,8 @@ def create_app() -> FastAPI:
             # board that no posting corresponds to.
             return {"ok": False, "error": "No such job."}
         q = ApplyQueue(stores.tracking.r)
+        if (stores.tracking.get(pk) or {}).get("pre_submit_retry_used"):
+            return {"ok": False, "error": "A recovered pre-submit job has no queued work."}
         if pk in q.in_flight():
             return {"ok": False,
                     "error": "This one is being filled in the browser right now. "
@@ -2910,8 +2924,10 @@ def create_app() -> FastAPI:
         """Re-run a failed/errored job from scratch (clean session, current KB)."""
         from agent.run import retry_job
         stores = make_stores(settings)
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
-            return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        row = stores.tracking.get(pk) or {}
+        if row.get("pre_submit_retry_used") or submit_hold.blocked(
+                pk, row, tracking=stores.tracking):
+            return {"ok": False, "error": "Protected application cannot be retried."}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
 
@@ -2978,7 +2994,8 @@ def create_app() -> FastAPI:
             if company != "__all__" and (r.get("company") or "").strip().lower() != company:
                 continue
             q_ = (r.get("gate_pending") or {}).get("question", "")
-            if (not submit_hold.blocked(r['pk'], r, tracking=stores.tracking) and (r.get("status") == "tailored"
+            if (not r.get("pre_submit_retry_used")
+                    and not submit_hold.blocked(r['pk'], r, tracking=stores.tracking) and (r.get("status") == "tailored"
                     or r.get("gate_reason") == "approval"
                     or q_.startswith("Ready to apply"))):
                 picked.append((r["pk"], r.get("company") or ""))

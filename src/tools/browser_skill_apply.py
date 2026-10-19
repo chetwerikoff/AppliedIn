@@ -323,6 +323,10 @@ class Gate(ValueError):
         self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
 
 
+class UploadInterrupted(Gate):
+    """Only an exception in an actual controller-directed file upload IPC."""
+
+
 class CaptchaGate(Gate):
     """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
 
@@ -4083,7 +4087,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if _formless_root(page):
             if not isinstance(session, _EntrySession):
                 raise Gate('The structural upload producer is unavailable.')
+            session.upload_attempted = True
+            session.upload_pending = True
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
+            session.upload_pending = False
             observed, _ = await _observe_controls(session, await session.page())
             tree = _upload_tree(observed)
             _upload_input(observed, tree)
@@ -4099,17 +4106,22 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             filled.update(rebound)
             return {'action': verb, 'label': target['label'], 'uploaded': True}
         try:
+            session.upload_attempted = True
+            session.upload_pending = True
             await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
+            session.upload_pending = False
             observed = await session.page()
             if _formless_root(page):
                 observed, _ = await _observe_controls(session, observed)
                 _formless_boundary(observed, provenance)
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise  # the controller records terminal cancellation before unwinding
             if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
                            "dedicated profile; inspect the attachment before retrying.") from None
-            raise Gate('The résumé upload outcome is unclear; inspect the attachment '
-                       'before retrying. No automatic repeat was attempted.') from None
+            raise UploadInterrupted('The résumé upload outcome is unclear; inspect the attachment '
+                                    'before retrying. No automatic repeat was attempted.') from None
         matches = [c for c in observed.get('controls', [])
                    if c.get('selector') == target['selector'] and c.get('type') == 'file'
                    and re.search(r'resume|résumé|cv', label(c), re.I)]
@@ -4513,8 +4525,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'fields': _fields_report(history, filled)}
                 raise Gate('The form needs review after reaching the browser step limit.')
     except (Exception, asyncio.CancelledError) as exc:
-        if (getattr(session, 'upload_attempted', False)
-                and not isinstance(exc, Gate)):
+        if (not commit_armed
+                and (isinstance(exc, UploadInterrupted)
+                     or (isinstance(exc, asyncio.CancelledError)
+                         and getattr(session, 'upload_pending', False)))):
             message = 'Résumé upload interrupted after the browser command; inspect manually'
             if isinstance(exc, asyncio.CancelledError):
                 # Persist the existing terminal outcome before propagating cancellation.

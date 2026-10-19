@@ -1265,7 +1265,7 @@ def run_queued(item: dict, q: Any, *, direct_approval: str = "") -> dict:
         result = _run(_apply_direct(pk, stores)) or {}
         log.info("apply: %s", result)
         again, why = is_retryable(result)
-        if again:
+        if again and not row.get("pre_submit_retry_used"):
             # The DETAIL, not the code. `retry()` decides whether a failure spends
             # one of the job's attempts by reading the opening of what it is told,
             # and "Rate limited by the model API…" is an outage that must not.
@@ -1281,6 +1281,8 @@ def run_queued(item: dict, q: Any, *, direct_approval: str = "") -> dict:
             row = failed_stores.tracking.get(pk) or {}
         except Exception:
             row = {"possible_submission": True}  # cannot prove it is safe to retry
+        if row.get("confirmation_id") or row.get("status") in ("applied", "applied_manual"):
+            return {"result": "done", "pk": pk, "reason": "already_applied"}
         if row.get('possible_submission') or submit_hold.blocked(pk, row, tracking=failed_stores.tracking):
             try:
                 make_stores().tracking.set_status(
@@ -1291,8 +1293,17 @@ def run_queued(item: dict, q: Any, *, direct_approval: str = "") -> dict:
             return {"result": "failed", "pk": pk, "reason": "uncertain",
                     "detail": "possible submission; check the employer portal before retrying"}
         if row.get("pre_submit_retry_used"):
-            # The direct click was consumed before the attempt, even on a crash.
-            return {"result": "failed", "pk": pk, "reason": "pre_submit_uncertain"}
+            # Unknown crash phase does not positively prove no commit. The
+            # decision is spent, but the result needs portal reconciliation.
+            try:
+                failed_stores.tracking.set_status(
+                    pk, Status.NEEDS_HUMAN, gate_reason="submit_uncertain",
+                    fail_kind="uncertain", fail_reason=submit_hold.REASON,
+                    gate_pending={"question": submit_hold.REASON})
+            except Exception:
+                log.exception("could not settle recovered uncertain crash for %s", pk)
+            return {"result": "failed", "pk": pk, "reason": "uncertain",
+                    "detail": submit_hold.REASON}
         q.retry(item, f"crashed: {exc}")
         return {"result": "error", "pk": pk, "reason": str(exc)}
     finally:

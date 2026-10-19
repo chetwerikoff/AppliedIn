@@ -759,3 +759,4 @@ def test_redis_initial_board_pin_is_in_conditional_value(monkeypatch):
     assert store.get(job.pk)["greenhouse_board"] == "example-board"
     assert all(row["pk"] == job.pk and row["job_id"] == "731205" for _, row, _ in puts)
     assert len(puts) == 2
+    assert [row["greenhouse_board"] for _, row, _ in puts] == ["example-board", "other-board"]

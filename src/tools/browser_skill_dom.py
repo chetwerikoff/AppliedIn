@@ -401,6 +401,10 @@ PAGE = r"""(() => {
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   const nodes = Array.from(document.querySelectorAll(query));
+  // Ordinary PAGE is evaluated alone; the entry-only native-root reader cannot
+  // supply this predicate to its controls mapper.
+  const pageAshbyNative = location.protocol==='https:' &&
+    location.hostname==='jobs.ashbyhq.com';
   /* WIDGET_GRAPH */
   const linkId = e => {
     const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
@@ -499,7 +503,7 @@ PAGE = r"""(() => {
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
-      ...(ashbyNative ? {form_action_attr_present:!!form && form.hasAttribute('action'),
+      ...(pageAshbyNative ? {form_action_attr_present:!!form && form.hasAttribute('action'),
         form_action_raw:form ? form.getAttribute('action') : null,
         formaction_attr_present:e.hasAttribute('formaction'),
         formaction_raw:e.getAttribute('formaction')} : {}),

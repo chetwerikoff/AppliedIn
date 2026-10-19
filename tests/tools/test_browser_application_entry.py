@@ -622,6 +622,44 @@ def dom(spec, script=None):
     return json.loads(result.stdout)
 
 
+@pytest.mark.parametrize('reader', ['page', 'entry', 'fixed'])
+@pytest.mark.parametrize('ats,raw_action', [
+    ('ashby', 'explicit'), ('ashby', 'absent'), ('ashby', 'empty'),
+    ('lever', 'explicit'),
+])
+def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader, ats, raw_action):
+    """The ordinary PAGE must not depend on variables scoped to entry readers."""
+    from tools.browser_skill_dom import PAGE
+
+    scripts = {'page': PAGE, 'entry': forms.ENTRY_PAGE,
+               'fixed': forms._ENTRY_FIXED_CONTROL_WITNESS}
+    snapshot = dom(dict(url=entry(ats), actionAttr=raw_action,
+                        nativePair=ats == 'ashby' and raw_action == 'explicit'),
+                   scripts[reader])
+    assert snapshot['url'] == entry(ats)
+    controls = {c['selector']: c for c in snapshot['controls']}
+    for selector in ('#email', '#submit'):
+        item = controls[selector]
+        assert item['form_action'] == entry(ats)
+        if ats == 'ashby':
+            assert item['form_action_attr_present'] is (raw_action != 'absent')
+            assert item['form_action_raw'] == (
+                None if raw_action == 'absent' else
+                '' if raw_action == 'empty' else entry(ats))
+            assert item['formaction_attr_present'] is False
+            assert item['formaction_raw'] is None
+        else:
+            for key in ('form_action_attr_present', 'form_action_raw',
+                        'formaction_attr_present', 'formaction_raw'):
+                assert key not in item
+    if ats == 'ashby' and raw_action == 'explicit':
+        for selector in ('#foreign-email', '#foreign-resume', '#foreign-submit'):
+            foreign = controls[selector]
+            assert foreign['form_action_attr_present'] is True
+            assert foreign['form_action_raw'] == foreign['form_action']
+            assert foreign['form_action_raw'] != entry(ats)
+
+
 @pytest.mark.parametrize('reader', ['page', 'witness'])
 @pytest.mark.parametrize('kind', ['H', 'R', 'B', 'W', 'X'])
 def test_complete_passive_signatures_are_element_specific(reader, kind):

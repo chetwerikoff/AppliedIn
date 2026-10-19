@@ -2728,6 +2728,8 @@ def create_app() -> FastAPI:
                                     or current.get("gate_reason") != "approval"
                                     or current.get("apply_requested_at")
                                     or current.get("pre_submit_retry_used") is not True
+                                    or current.get("pre_submit_never_armed") is not True
+                                    or current.get("pre_submit_engine") != "browser_skill"
                                     or submit_hold.legacy_possible(current)
                                     or submit_hold.unresolved_pre_submit(current)
                                     or current.get("confirmation_id")

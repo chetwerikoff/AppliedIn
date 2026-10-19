@@ -2126,12 +2126,19 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
         while loop.time() < deadline:
             try:
                 async with asyncio.timeout_at(deadline):
-                    page = await session.page() if page is None else page
+                    fresh_session_read = page is None
+                    page = await session.page() if fresh_session_read else page
                     if greenhouse:
                         _greenhouse_safety(page, allowed, provenance, readiness=True)
                         reason = _greenhouse_not_ready(page)
                     else:
-                        _entry_safety(page, allowed, provenance)
+                        # _EntrySession.page() already classified the complete raw
+                        # candidate census, then quarantined foreign PAGE targets.
+                        # Re-classifying that filtered copy mistakes quarantine
+                        # for a missing foreign control. Unchecked initial PAGE
+                        # inputs must still pass the full admission gate.
+                        if not (fresh_session_read and isinstance(session, _EntrySession)):
+                            _entry_safety(page, allowed, provenance)
                         reason = _entry_not_ready(page)
                     if reason:
                         raise _EntryNotReady(reason)

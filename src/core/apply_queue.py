@@ -259,9 +259,11 @@ class ApplyQueue:
                 pk = item.get("pk")
                 row_raw = self.r.get(f"app:{pk}") if pk else None
                 row = json.loads(row_raw) if row_raw else {}
-                if row.get("pre_submit_retry_used"):
+                from tools.submit_hold import blocked
+                if row.get("pre_submit_retry_used") or blocked(
+                        pk, row, tracking=self):
                     self.r.lrem(key, 0, raw)
-                    log.warning("removed stale recovered-row queue item for %s", pk)
+                    log.warning("removed non-replayable queue item for %s", pk)
                     continue
                 if pks is not None and item.get("pk") not in pks:
                     continue
@@ -286,10 +288,22 @@ class ApplyQueue:
         # the company before removing an item; only the winner may dispatch it.
         if not self.r.sadd(_BUSY, co):
             return None
+        item = json.loads(raw)
+        pk = item.get("pk", "")
+        from tools.submit_hold import blocked
+        try:
+            raw_row = self.r.get(f"app:{pk}")
+            row = json.loads(raw_row) if raw_row else {}
+            denied = row.get("pre_submit_retry_used") or blocked(pk, row, tracking=self)
+        except Exception:
+            denied = True
+        if denied:
+            self.r.lrem(f"{_KEY}:co:{co}", 0, raw)
+            self.r.srem(_BUSY, co)
+            return None
         if not self.r.lrem(f"{_KEY}:co:{co}", 1, raw):
             self.r.srem(_BUSY, co)
             return None
-        item = json.loads(raw)
         # The pk as well as the company. A company lease cannot tell a job that is
         # genuinely running from one whose worker died, and with two jobs at one
         # employer it cannot tell WHICH is running. Recovery needs that.

@@ -689,8 +689,8 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
     try:
         tracking = make_stores().tracking
         submit_hold.mark(pk, tracking=tracking)
-        if not submit_hold.is_held(pk, tracking=tracking):
-            raise RuntimeError('Submission hold read-back is missing')
+        if not submit_hold.valid_mark(pk, tracking=tracking):
+            raise RuntimeError('Submission hold write/read-back is invalid')
         # Human-visible context is supplemental; stale row writes cannot erase the key.
         tracking.set_status(
             pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain',
@@ -711,7 +711,7 @@ def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
             from core.stores import make_stores
             tracking = make_stores().tracking
             row = tracking.get(pk) or {}
-            held = submit_hold.is_held(pk, tracking=tracking)
+            held = submit_hold.valid_mark(pk, tracking=tracking)
     except Exception as exc:
         raise Gate('Cannot verify current submission outcome or hold before click.') from exc
     if (row.get('pre_submit_retry_used')
@@ -4536,6 +4536,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         gate_call_id=None, fail_kind=submit_hold.PRE_SUBMIT,
                         fail_reason=submit_hold.PRE_SUBMIT_TEXT,
                         pre_submit_never_armed=True, pre_submit_engine='browser_skill',
+                        result={'reason': submit_hold.PRE_SUBMIT},
                         last_button='', last_url=str(step.get('url') or '')[:400])
                 else:
                     tracking.set_status(

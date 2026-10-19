@@ -73,6 +73,7 @@ TERMINAL = frozenset({
     "no_sponsorship",
     "application_limit",    # the employer said no more, and that is not a fault
     "uncertain",            # may already have submitted — the owner must check
+    "pre_submit_uncertain", # only the inspected direct owner path may recover
     "user_skipped",         # the owner said no; retrying would argue with them
     "stale_resume",         # handled by re-tailoring, not by re-applying
 })
@@ -119,7 +120,12 @@ class ApplyQueue:
         """
         from tools.submit_hold import blocked
         raw_row = self.r.get(f"app:{pk}")
-        if blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
+        row = json.loads(raw_row) if raw_row else {}
+        if row.get("pre_submit_retry_used"):
+            self.remove_all(pk)
+            log.warning("dropping queued work for once-recovered %s", pk)
+            return False
+        if blocked(pk, row, tracking=self):
             return False
         co = _norm(company)
         for raw in (self.r.lrange(f"{_KEY}:co:{co}", 0, -1) or []):
@@ -167,7 +173,11 @@ class ApplyQueue:
 
         pk = item['pk']
         raw_row = self.r.get(f'app:{pk}')
-        if reason in TERMINAL or blocked(pk, json.loads(raw_row) if raw_row else {}, tracking=self):
+        row = json.loads(raw_row) if raw_row else {}
+        if row.get("pre_submit_retry_used"):
+            self.remove_all(pk)
+            return False
+        if reason in TERMINAL or blocked(pk, row, tracking=self):
             return False
 
         infra = is_infrastructure(reason)
@@ -246,6 +256,13 @@ class ApplyQueue:
                 continue
             for raw in (self.r.lrange(key, 0, -1) or []):
                 item = json.loads(raw)
+                pk = item.get("pk")
+                row_raw = self.r.get(f"app:{pk}") if pk else None
+                row = json.loads(row_raw) if row_raw else {}
+                if row.get("pre_submit_retry_used"):
+                    self.r.lrem(key, 0, raw)
+                    log.warning("removed stale recovered-row queue item for %s", pk)
+                    continue
                 if pks is not None and item.get("pk") not in pks:
                     continue
                 if float(item.get("not_before") or 0) > now:
@@ -335,6 +352,37 @@ class ApplyQueue:
                     self.r.srem(f"{_KEY}:companies", co)
                 log.info("removed %s from the %s queue", pk, co)
                 return True
+        return False
+
+    def remove_all(self, pk: str, *, flat_queue: str = "") -> int:
+        """Physically delete every exact-pk grouped/flat pending copy.
+
+        A lone remove() is insufficient: priority, backoff and pre-upgrade flat
+        entries can coexist. No list is rewritten wholesale or reordered.
+        """
+        removed = 0
+        keys = [f"{_KEY}:co:{co}" for co in list(
+            self.r.smembers(f"{_KEY}:companies") or [])]
+        if flat_queue:
+            keys.append(f"queue:{flat_queue}")
+        for key in keys:
+            for raw in (self.r.lrange(key, 0, -1) or []):
+                entry = json.loads(raw)
+                if entry.get("pk") == pk:
+                    removed += int(self.r.lrem(key, 0, raw) or 0)
+            if key.startswith(f"{_KEY}:co:") and not self.r.llen(key):
+                self.r.srem(f"{_KEY}:companies", key[len(f"{_KEY}:co:"):])
+        return removed
+
+    def has_pending(self, pk: str, *, flat_queue: str = "") -> bool:
+        keys = [f"{_KEY}:co:{co}" for co in list(
+            self.r.smembers(f"{_KEY}:companies") or [])]
+        if flat_queue:
+            keys.append(f"queue:{flat_queue}")
+        for key in keys:
+            for raw in (self.r.lrange(key, 0, -1) or []):
+                if json.loads(raw).get("pk") == pk:
+                    return True
         return False
 
     def drop_dead_letter(self, pk: str) -> int:
@@ -448,6 +496,10 @@ class ApplyQueue:
             rec = json.loads(raw)
             if pk and rec.get("pk") != pk:
                 kept.append(raw)
+                continue
+            old = self.r.get(f"app:{rec['pk']}")
+            if old and json.loads(old).get("pre_submit_retry_used"):
+                self.remove_all(rec["pk"])
                 continue
             if self.put(rec["pk"], rec.get("company", ""), history=rec.get("history")):
                 revived += 1

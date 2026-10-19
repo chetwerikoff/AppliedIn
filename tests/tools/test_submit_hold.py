@@ -1055,9 +1055,12 @@ def test_exhausted_preclick_allows_close_only_without_new_application(world):
     inspect = next(r.endpoint for r in server.create_app().routes
                    if getattr(r, "path", "") == "/actions/inspect-pre-submit/{pk:path}")
     assert inspect(PK)["ok"]
-    stores.tracking.set_status(
-        PK, Status.NEEDS_HUMAN, gate_reason=submit_hold.PRE_SUBMIT,
-        fail_kind=submit_hold.PRE_SUBMIT, apply_requested_at="spent-stamp")
+    # Simulate the already completed BrowserSkill direct attempt via its stored
+    # outcome; no task or browser is executed in this offline test.
+    row = stores.tracking.get(PK)
+    stores.tracking.r.set(f"app:{PK}", json.dumps({
+        **row, "status": "needs_human", "gate_reason": submit_hold.PRE_SUBMIT,
+        "fail_kind": submit_hold.PRE_SUBMIT, "apply_requested_at": "spent-stamp"}))
     skip = next(r.endpoint for r in server.create_app().routes
                 if getattr(r, "path", "") == "/actions/skip/{pk}")
     assert skip(PK)["ok"]

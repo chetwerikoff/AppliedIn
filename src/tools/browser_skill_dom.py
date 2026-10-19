@@ -623,6 +623,20 @@ _APPLICATION_ROOT = r"""
     (e.getAttribute('aria-labelledby') || '').split(' ')
       .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
     e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const candidateVisible = e => {
+    const rects=Array.from(e.getClientRects());
+    if(!rects.length) return false;
+    let fixed=false;
+    for(let n=e;n && n.nodeType===1;n=n.parentElement) {
+      const style=getComputedStyle(n);
+      if(!style || style.display==='none' || style.visibility==='hidden' ||
+          style.visibility==='collapse' || !(Number(style.opacity)>0)) return false;
+      if(style.position==='fixed') fixed=true;
+    }
+    return rects.some(r=>r.width>0 && r.height>0 &&
+      r.right+scrollX>0 && r.bottom+scrollY>0 &&
+      (!fixed || (r.right>0 && r.bottom>0)));
+  };
   const forms = Array.from(document.querySelectorAll('form')).filter(f =>
     Array.from(f.querySelectorAll('input,button')).filter(e=>!excluded.has(e)).some(e => {
       const group=e.closest('fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
@@ -657,7 +671,7 @@ _APPLICATION_ROOT = r"""
             labels_owned:labels.every(l=>f.contains(l)),
             disabled:!!e.disabled || e.getAttribute('aria-disabled')==='true',
             required:!!e.required || e.getAttribute('aria-required')==='true',
-            visible:!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden',
+            visible:candidateVisible(e),
             readonly:!!e.readOnly || e.hasAttribute('readonly'),
             override_present:e.hasAttribute('formaction'),
             override_raw:e.getAttribute('formaction'),
@@ -684,9 +698,13 @@ _ASHBY_ROOT = r"""
   const wrapper=container?.parentElement;
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
-  const inertSibling=e=>['DIV','SPAN'].includes(e.tagName) && !e.attributes.length &&
-    !e.querySelectorAll(query+',iframe,[contenteditable],[role],[tabindex]').length &&
-    !e.shadowRoot && !e.getAttribute('onclick');
+  const inertSibling=e=>{
+    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;
+    const nodes=[e,...Array.from(e.querySelectorAll('*'))];
+    const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label[for],[autofocus],[controls]';
+    return !e.querySelectorAll(interactive).length && nodes.every(n=>
+      !n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));
+  };
   const siblings=wrapper ? Array.from(wrapper.children) : [];
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
     container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&

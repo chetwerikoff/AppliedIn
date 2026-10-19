@@ -976,6 +976,16 @@ async def test_benign_ashby_restructuring_preserves_normal_human_question(
     assert not decide.await_count
     no_mutations(raw)
 
+@pytest.mark.parametrize('kind', ['onclick', 'summary'])
+async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch, kind):
+    _, raw, decide, _ = root_world(
+        monkeypatch, inertSibling=True, inertDescendant=kind)
+    result = await attempt()
+    assert result['status'] == 'gate', (kind, result)
+    assert 'sibling identity mismatch' in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
         monkeypatch):

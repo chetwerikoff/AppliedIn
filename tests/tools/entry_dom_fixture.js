@@ -83,7 +83,14 @@ if(form) {
   } else {
   if (new URL(spec.url || canonicalAction).hostname === 'jobs.ashbyhq.com') {
     node('label',{'for':'email',text:'Email'},form);
-    node('input',{id:'email',name:'Email',type:'email',required:true},form);
+    const email=node('input',{id:'email',name:'Email',type:'email',required:true},form);
+    if(spec.nativeVisibility==='opacity-zero') email.style.opacity='0';
+    if(spec.nativeVisibility==='zero-width')
+      email.getClientRects=()=>[{width:0,height:30,right:100,bottom:30}];
+    if(spec.nativeVisibility==='zero-height')
+      email.getClientRects=()=>[{width:100,height:0,right:100,bottom:30}];
+    if(spec.nativeHidden)
+      node('input',{id:'native-machine',name:'machine-value',type:'hidden',rect:null},form);
   } else {
     // Generic ATS fixtures keep the pre-existing optional, unlabelled email control.
     node('input',{id:'email',name:'Email',type:'email'},form);
@@ -235,6 +242,9 @@ if(spec.formless) {
   if(spec.extraChild) node('span',{},wrapper);
   if(spec.inertSibling) {
     const sibling=node('div',{},wrapper);
+    if(spec.inertDescendant==='onclick')
+      node('span',{onclick:'syntheticAction()'},sibling);
+    if(spec.inertDescendant==='summary') node('summary',{},sibling);
     if(spec.inertBeforeContainer) {
       wrapper.children.splice(wrapper.children.indexOf(sibling),1);
       wrapper.children.splice(wrapper.children.indexOf(container),0,sibling);

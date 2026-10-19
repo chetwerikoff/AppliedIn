@@ -1106,6 +1106,47 @@ async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw
     no_mutations(raw)
 
 
+@pytest.mark.parametrize('visibility', ['opacity-zero', 'zero-width', 'zero-height'])
+async def test_native_receiver_visibility_must_agree_with_page_and_fixed_witnesses(
+        monkeypatch, visibility):
+    _, raw, decide, _ = native_real_world(
+        monkeypatch, nativeVisibility=visibility)
+    for snapshot in (raw.current, raw.fixed):
+        candidate = snapshot['entry']['native_candidates'][0]
+        email = next(c for c in candidate['controls'] if c['selector'] == '#email')
+        assert email['visible'] is False
+    assert any(c['selector'] == '#email' for c in raw.current['controls'])
+    fixed_email = next(c for c in raw.fixed['controls'] if c['selector'] == '#email')
+    assert fixed_email['visible'] is False
+    result = await attempt()
+    assert result['status'] == 'gate', (visibility, result)
+    assert 'unverified labelled native application receiver' in result['question']
+    assert not decide.await_count
+    no_mutations(raw)
+
+
+async def test_native_hidden_machine_control_remains_separate_from_visible_receivers(
+        monkeypatch):
+    row, raw, decide, proof = native_real_world(monkeypatch, nativeHidden=True)
+    session = forms._EntrySession(raw, lambda url: url == proof.url, proof)
+    admitted = await forms._stable_application_form(
+        session, session.allowed, proof,
+        deadline=asyncio.get_running_loop().time() + 10)
+    machine = next(c for c in admitted['controls'] if c['selector'] == '#native-machine')
+    assert machine['type'] == 'hidden'
+    candidate_machine = next(
+        c for c in raw.current['entry']['native_candidates'][0]['controls']
+        if c['selector'] == '#native-machine')
+    fixed_machine = next(c for c in raw.fixed['controls'] if c['selector'] == '#native-machine')
+    assert candidate_machine['visible'] is False
+    assert fixed_machine['visible'] is False
+    with pytest.raises(forms.Gate) as owner_gate:
+        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
+                               provenance=proof)
+    assert owner_gate.value.form_question['label'] == 'Email'
+    assert not decide.await_count
+    no_mutations(raw)
+
 @pytest.mark.parametrize('case,options,cause', [
     ('contrary-job', {'action':
         'https://jobs.ashbyhq.com/example-co/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application'},

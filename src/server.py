@@ -1850,9 +1850,18 @@ def create_app() -> FastAPI:
                 return {"ok": False, "error": "The job company changed; outcome was not recorded."}
             if failure := stopped_application_attempt(pk, stores.tracking):
                 return {"ok": False, "error": failure}
+            exhausted = _exhausted_pre_submit(pk, row, stores.tracking)
+            if row.get("pre_submit_retry_used") and not exhausted:
+                return {"ok": False, "error": "Recovered approval is not a close-only triage outcome."}
+            if exhausted and ((body or {}).get("confirmed") is not True
+                              or not str((body or {}).get("note") or "").strip()):
+                return {"ok": False, "error": (
+                    "Independently verify the submission and provide the confirmation before marking applied.")}
             stores.tracking.set_status(
-                pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="", gate_pending=None)
-            submit_hold.clear(pk, tracking=stores.tracking)
+                pk, Status.APPLIED_MANUAL, confirmation_id=note, gate_reason="",
+                gate_pending=None, fail_kind="", fail_reason="", possible_submission=False)
+            if not exhausted:
+                submit_hold.clear(pk, tracking=stores.tracking)
             from core.events import emit
             emit("applied", pk=pk, agent="applier", detail="Marked applied by you — no resubmit.")
             return {"ok": True}
@@ -2279,7 +2288,7 @@ def create_app() -> FastAPI:
         return company.strip(), list(dict.fromkeys(pks))
 
     def review_eligible(row: dict) -> bool:
-        return not submit_hold.blocked(row.get('pk', ''), row, tracking=make_stores(settings).tracking) and (row.get("status") == "tailored" or (
+        return not row.get("pre_submit_retry_used") and not submit_hold.blocked(row.get('pk', ''), row, tracking=make_stores(settings).tracking) and (row.get("status") == "tailored" or (
             row.get("status") == "needs_human"
             and (
                 row.get("gate_reason") == "approval"
@@ -2590,6 +2599,27 @@ def create_app() -> FastAPI:
         # click — or any bulk action reaching this endpoint — could erase the
         # record of something an employer had already received. The row is worth
         # more than the click.
+        if row.get("pre_submit_retry_used"):
+            lease, company, error = claim_human_outcome(pk, stores.tracking)
+            if error:
+                return {"ok": False, "error": error}
+            try:
+                current = stores.tracking.get(pk) or {}
+                if (current.get("company") != company
+                        or not _exhausted_pre_submit(pk, current, stores.tracking)
+                        or stopped_application_attempt(pk, stores.tracking)):
+                    return {"ok": False, "error": "Only a stopped, verified pre-submit triage may be skipped."}
+                guarded_q = ApplyQueue(stores.tracking.r)
+                guarded_q.remove_all(pk, flat_queue=stores.apply_queue)
+                if guarded_q.has_pending(pk, flat_queue=stores.apply_queue):
+                    return {"ok": False, "error": "Pending items remain; skip refused."}
+                stores.tracking.set_status(
+                    pk, Status.SKIPPED, skip_reason="user_skipped", gate_reason="",
+                    fail_kind="", fail_reason="", gate_pending=None)
+                guarded_q.drop_dead_letter(pk)
+                return {"ok": True, "dequeued": True}
+            finally:
+                lease.release_human_outcome(company)
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if status in ("applied", "applied_manual") or row.get("confirmation_id"):

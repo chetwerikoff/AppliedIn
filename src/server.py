@@ -2636,6 +2636,96 @@ def create_app() -> FastAPI:
             # dispatched a run for a pk that does not exist, which then sat in the
             # in-flight set holding that company's turn against nothing.
             return {"ok": False, "error": "No such job."}
+        if row.get("pre_submit_retry_used"):
+            # The inspection is not approval. This is the one later exact-row
+            # owner click; its decision is never carried by a queue item.
+            from core.ids import make_pk
+            from agent.run import seed_fingerprint
+            from redis.exceptions import WatchError
+
+            company = row.get("company") or ""
+            _, sep, job_id = pk.partition("#")
+            if not company or not sep or not job_id or make_pk(company, job_id) != pk:
+                return {"ok": False, "error": "The job/company identity is not current."}
+            if not q.claim_human_outcome(company):
+                return {"ok": False, "error": "An application at this company is in flight."}
+            handed_off = False
+            try:
+                current = stores.tracking.get(pk) or {}
+                if (current.get("company") != company
+                        or current.get("status") != "tailored"
+                        or current.get("gate_reason") != "approval"
+                        or current.get("apply_requested_at")
+                        or current.get("pre_submit_retry_used") is not True
+                        or current.get("pre_submit_never_armed") is not True
+                        or current.get("pre_submit_engine") != "browser_skill"
+                        or current.get("confirmation_id")
+                        or submit_hold.legacy_possible(current)
+                        or submit_hold.unresolved_pre_submit(current)
+                        or not submit_hold.raw_absent(pk, tracking=stores.tracking)
+                        or pk in q.in_flight()):
+                    return {"ok": False, "error": "Fresh direct approval is unavailable."}
+                # Late grouped/flat work is stale even if fold timestamps look
+                # newer than the inspection. Remove it, never adopt its request.
+                q.remove_all(pk, flat_queue=stores.apply_queue)
+                if (q.has_pending(pk, flat_queue=stores.apply_queue)
+                        or pk in q.in_flight()):
+                    return {"ok": False, "error": "Stale or running work remains."}
+                stamp = ""
+                for _ in range(16):
+                    try:
+                        with stores.tracking.r.pipeline() as pipe:
+                            pipe.watch(f"app:{pk}", f"submit_hold:{pk}")
+                            raw, held = pipe.get(f"app:{pk}"), pipe.get(f"submit_hold:{pk}")
+                            current = json.loads(raw) if raw else {}
+                            if (held is not None or current.get("company") != company
+                                    or current.get("status") != "tailored"
+                                    or current.get("gate_reason") != "approval"
+                                    or current.get("apply_requested_at")
+                                    or current.get("pre_submit_retry_used") is not True
+                                    or submit_hold.legacy_possible(current)
+                                    or submit_hold.unresolved_pre_submit(current)
+                                    or current.get("confirmation_id")
+                                    or q.has_pending(pk, flat_queue=stores.apply_queue)
+                                    or pk in q.in_flight()):
+                                pipe.unwatch()
+                                return {"ok": False, "error": "Approval evidence changed."}
+                            stamp = datetime.now(timezone.utc).isoformat()
+                            current["apply_requested_at"] = stamp
+                            pipe.multi()
+                            pipe.set(f"app:{pk}", json.dumps(current, default=str))
+                            pipe.execute()
+                            break
+                    except WatchError:
+                        continue
+                if not stamp:
+                    return {"ok": False, "error": "Approval race; refresh the row."}
+                # This clicked decision is already spent. Missing/stale résumé or
+                # an interrupted preflight must not turn it into queued work.
+                if (not current.get("resume_tex_key")
+                        or current.get("resume_seed") != seed_fingerprint()):
+                    return {"ok": False, "error": (
+                        "Résumé is stale or missing; direct approval was consumed. "
+                        "No application was started.")}
+                q.r.sadd("applyq:inflight:pks", pk)
+                item = {"pk": pk, "company": company, "attempts": 0, "history": []}
+
+                def _run_recovered():
+                    try:
+                        run_queued(item, q, direct_approval=stamp)
+                    except Exception:
+                        log.exception("recovered direct apply failed for %s", pk)
+                        q.done(item)
+
+                background.add_task(_run_recovered)
+                handed_off = True
+                return {"ok": True, "started": pk, "retailoring": False}
+            except Exception:
+                log.exception("could not approve recovered direct application for %s", pk)
+                return {"ok": False, "error": "Could not safely approve the recovered job."}
+            finally:
+                if not handed_off:
+                    q.done({"pk": pk, "company": company})
         if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):

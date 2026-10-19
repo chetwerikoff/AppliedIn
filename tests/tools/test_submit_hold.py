@@ -139,7 +139,7 @@ async def test_failed_mark_or_readback_means_gate_and_zero_clicks(world, monkeyp
             if failure == 'readback':
                 raise RuntimeError('synthetic GET failure')
             return False
-        monkeypatch.setattr(submit_hold, 'is_held', read)
+        monkeypatch.setattr(submit_hold, 'valid_mark', read)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
     monkeypatch.setattr(bsk, 'Session', Session)

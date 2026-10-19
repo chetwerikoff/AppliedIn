@@ -1,4 +1,4 @@
-"""Offline native settlement through distinct real Lever/Greenhouse apply routes.
+"""Offline native settlement across Lever, Greenhouse and the Ashby model-only boundary.
 
 Every job, applicant, PAGE, grant and native IPC in this module is synthetic.
 No browser, owner records, network, daemon or submission is used.
@@ -52,6 +52,33 @@ def _grant(item, url, value, *, group=()):
             for c in group
         ]
     return record
+
+def _ashby_native_candidate(url, controls):
+    """Build one explicit synthetic native proof from the reader's control census."""
+    owner = '#application'
+    members = []
+    for control in controls:
+        if not control.get('in_form') or control.get('form_selector') != owner:
+            continue
+        members.append({
+            'selector': control['selector'], 'tag': control['tag'],
+            'type': control['type'], 'submit': bool(control.get('submit')),
+            'caption': control.get('label', ''), 'owned': True,
+            'native_owner': control.get('native_form_owner_selector'),
+            'declared_owner': control.get('declared_owner'),
+            'label_count': 0 if control.get('submit') else 1,
+            'labels_owned': True, 'disabled': control.get('disabled', False),
+            'required': control.get('required', False),
+            'visible': control.get('visible', True), 'readonly': False,
+            'override_present': control.get('formaction_attr_present', False),
+            'override_raw': control.get('formaction_raw'),
+            'override_resolved': control.get('formaction', ''),
+        })
+    return {
+        'selector': owner, 'plausible': True, 'action': url,
+        'action_attr_present': True, 'action_attr': url, 'controls': members,
+    }
+
 
 
 def _fixture(route, *, kind=None, noisy=False):
@@ -197,9 +224,29 @@ class NativeTransport:
             for index, control in enumerate(source['controls']):
                 if control['type'] == 'combobox':
                     independent['controls'][index]['combobox'] = deepcopy(control['combobox'])
-            for category in ('entry', 'greenhouse'):
-                if category in source:
-                    independent[category] = deepcopy(source[category])
+            if source['url'] == ASHBY_APPLY and source.get('entry', {}).get('native_candidates'):
+                # The fixed witness independently reconstructs its candidate census from
+                # its own observed controls; it does not echo PAGE's native_candidates.
+                for observed, control in zip(independent['controls'], source['controls']):
+                    observed.update(
+                        label=control['label'], submit=bool(control.get('submit')),
+                        required=control.get('required', False),
+                        form_action_attr_present=control['form_action_attr_present'],
+                        form_action_raw=control['form_action_raw'],
+                        formaction_attr_present=control['formaction_attr_present'],
+                        formaction_raw=control['formaction_raw'],
+                    )
+                independent['entry'] = {
+                    key: deepcopy(value) for key, value in source['entry'].items()
+                    if key != 'native_candidates'
+                }
+                independent['entry']['native_candidates'] = [
+                    _ashby_native_candidate(source['url'], independent['controls'])
+                ]
+            else:
+                for category in ('entry', 'greenhouse'):
+                    if category in source:
+                        independent[category] = deepcopy(source[category])
             if self.invalid_witness_always or (self.invalid_witness_after_write and self.writes):
                 independent['controls'][0]['unique'] = False
             return {'value': independent}
@@ -246,8 +293,20 @@ class NativeTransport:
         return {}
 
 
-def _world(monkeypatch, route, *, kind=None, noisy=False):
+def _world(monkeypatch, route, *, kind=None, noisy=False, explicit_ashby_native=False):
     case = _fixture(route, kind=kind, noisy=noisy)
+    if explicit_ashby_native:
+        if route != 'ashby':
+            raise AssertionError('Explicit native evidence is Ashby-only')
+        for control in case.page['controls']:
+            if control.get('in_form') and control.get('form_selector') == '#application':
+                control.update(
+                    form_action_attr_present=True, form_action_raw=ASHBY_APPLY,
+                    formaction_attr_present=False, formaction_raw=None,
+                )
+        case.page['entry']['native_candidates'] = [
+            _ashby_native_candidate(ASHBY_APPLY, case.page['controls'])
+        ]
     raw = NativeTransport(case.page)
     monkeypatch.setattr('core.config.get_settings',
                         lambda: SimpleNamespace(config_dir='/synthetic-only'))
@@ -592,7 +651,7 @@ async def test_changed_native_receiver_at_prewrite_witness_never_authorizes_ipc(
 
 async def test_ashby_native_entry_retains_prior_model_only_behavior(monkeypatch):
     """An Ashby native application form must not gain Lever/Greenhouse prefill."""
-    case, raw = _world(monkeypatch, 'ashby', kind='select')
+    case, raw = _world(monkeypatch, 'ashby', kind='select', explicit_ashby_native=True)
     admitted_sessions = []
     original_bootstrap = forms._bootstrap
 

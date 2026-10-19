@@ -81,8 +81,13 @@ if(form) {
     node('input',{id:'job-search',type:'search'},form);
     node('button',{id:'search-submit',type:'submit',text:'Search jobs'},form);
   } else {
-  node('label',{'for':'email',text:'Email'},form);
-  node('input',{id:'email',name:'Email',type:'email',required:true},form);
+  if (new URL(spec.url || canonicalAction).hostname === 'jobs.ashbyhq.com') {
+    node('label',{'for':'email',text:'Email'},form);
+    node('input',{id:'email',name:'Email',type:'email',required:true},form);
+  } else {
+    // Generic ATS fixtures keep the pre-existing optional, unlabelled email control.
+    node('input',{id:'email',name:'Email',type:'email'},form);
+  }
   if(spec.nativeCheckbox) {
     node('label',{'for':'native-choice',text:'Synthetic choice'},form);
     node('input',{id:'native-choice',type:'checkbox',required:true},form);

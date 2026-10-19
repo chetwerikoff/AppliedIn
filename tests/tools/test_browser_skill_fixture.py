@@ -1458,8 +1458,9 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     for page in (complete, fixed):
         page['url'] = fixture.URL
     shell = {**deepcopy(complete), 'controls':[], 'inventory_verified':False,
-             'entry':{'root':None,'frames':[],'responses':[],
-                      'response_error':False,'helper_challenge':False}}
+             'entry':{'root':None, 'native_candidates':[], 'formless':None,
+                      'frames':[], 'responses':[], 'response_error':False,
+                      'helper_challenge':False}}
     class Raw:
         def __init__(self):
             self.calls, self.pages = [], 0

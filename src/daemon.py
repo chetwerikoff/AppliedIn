@@ -185,8 +185,8 @@ _LEASE_SEEN: dict = {}       # pk -> when a lease was first seen with no applica
 
 def _hold_possible_submission(stores, row) -> bool:  # noqa: ANN001
     """Independent pre-click evidence survives stale full-row tracking writes."""
-    from tools.submit_hold import blocked
-    if not blocked(row['pk'], row, tracking=stores.tracking):
+    from tools.submit_hold import possible_state
+    if possible_state(row['pk'], row, tracking=stores.tracking) == "clear":
         return False
     from core.models import Status
 
@@ -228,6 +228,9 @@ def _reclaim_orphans(stores, q) -> None:  # noqa: ANN001
             continue
         if pk in live:
             continue                       # genuinely being filled right now
+        if r.get("pre_submit_retry_used"):
+            q.remove_all(pk, flat_queue=stores.apply_queue)
+            continue                       # direct approval is spent, never requeue
         if _hold_possible_submission(stores, r):
             continue  # no automatic second application after a crash
         stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval")
@@ -349,6 +352,10 @@ def _apply_loop() -> None:
             for it in stores.queue.drain(stores.apply_queue):
                 if (pk := it.get("pk")):
                     row = stores.tracking.get(pk) or {}
+                    if row.get("pre_submit_retry_used"):
+                        q.remove_all(pk, flat_queue=stores.apply_queue)
+                        log.warning("discarded stale flat apply work for recovered %s", pk)
+                        continue
                     q.put(pk, row.get("company", ""),
                           requested=bool(row.get("apply_requested_at")))
             if flags.paused():
@@ -512,6 +519,10 @@ def process_backlog_once(companies: list | None = None,
     for it in stores.queue.drain(stores.apply_queue):
         pk = it.get("pk", "")
         row = stores.tracking.get(pk) or {}
+        if row.get("pre_submit_retry_used"):
+            q.remove_all(pk, flat_queue=stores.apply_queue)
+            log.warning("discarded stale backlog apply work for recovered %s", pk)
+            continue
         if sel or skipped:
             # Scoped run: out of scope jobs go back untouched for a later pass.
             if not _in_scope(row.get("company")):
@@ -543,6 +554,11 @@ def _recover_orphans(stores) -> None:  # noqa: ANN001
             continue
         st = r.get("status")
         if st == "submitting":
+            if r.get("pre_submit_retry_used"):
+                from core.apply_queue import ApplyQueue
+                ApplyQueue(stores.tracking.r).remove_all(pk, flat_queue=stores.apply_queue)
+                release_claim(pk, stores)
+                continue
             if _hold_possible_submission(stores, r):
                 release_claim(pk, stores)
                 continue

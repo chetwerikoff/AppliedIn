@@ -714,6 +714,10 @@ def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
             held = submit_hold.is_held(pk, tracking=tracking)
     except Exception as exc:
         raise Gate('Cannot verify current submission outcome or hold before click.') from exc
+    if (row.get('pre_submit_retry_used')
+            and (not submit_hold.direct_approval()
+                 or row.get('apply_requested_at') != submit_hold.direct_approval())):
+        raise Gate('Recovered approval is no longer current at the committing IPC.')
     if (row.get('status') != 'needs_human'
             or row.get('gate_reason') != 'submit_uncertain' or not held):
         raise Gate('Human outcome changed or submission hold was cleared; no click is safe.')
@@ -755,6 +759,12 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         except Exception as exc:
             raise Gate('Cannot verify a leased queue dispatch; obtain explicit '
                        'approval through the existing ApplyQueue worker.') from exc
+    if row.get('pre_submit_retry_used') and (
+            ctx is not None or not submit_hold.direct_approval()
+            or row.get('apply_requested_at') != submit_hold.direct_approval()
+            or not row.get('pre_submit_never_armed')
+            or row.get('pre_submit_engine') != 'browser_skill'):
+        raise Gate('Only the current direct owner approval may dispatch this recovered job.')
     if ((ctx.blocked(pk, row) if ctx else submit_hold.blocked(pk, row))
             or row.get('status') != 'submitting'
             or row.get('gate_reason') == 'approval'):
@@ -4159,6 +4169,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         from tools.browser_apply import _site_rules
         from tools.claude_chrome import _stage_resume
     submitted = False
+    commit_armed = False
 
     def verify_dispatch():
         if ctx is not None:
@@ -4174,6 +4185,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             check_approvals(pk, history, page, provenance=provenance)
 
     def hold_dispatch(step):
+        nonlocal commit_armed
+        # Arm before even attempting the hold write. Losing that key later does
+        # not transform an attempted committing action into a pre-click outcome.
+        commit_armed = True
         if ctx is not None:
             hold_possible_submission(pk, step, fixture_context=ctx)
         else:
@@ -4186,7 +4201,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             check_before_committing_click(pk)
 
     def mark_click_started():
-        nonlocal submitted
+        nonlocal submitted, commit_armed
+        commit_armed = True
         submitted = True
 
     direct_url = direct_board_url(url) or url
@@ -4507,12 +4523,30 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 else:
                     from core.stores import make_stores
                     tracking = make_stores().tracking
-                tracking.set_status(
-                    pk, 'needs_human', gate_reason='submit_uncertain',
-                    gate_pending={'question': message}, gate_call_id=None,
-                    fail_kind='uncertain', fail_reason=message)
+                # The cancellation path bypasses the caller's ordinary return
+                # settlement, so the controller must persist its own proof.
+                previous = tracking.row if ctx is not None else tracking.get(pk) or {}
+                safe = (not commit_armed and ctx is None
+                        and not submit_hold.legacy_possible(previous)
+                        and submit_hold.possible_state(pk, previous, tracking=tracking) == 'clear')
+                if safe:
+                    tracking.set_status(
+                        pk, 'needs_human', gate_reason=submit_hold.PRE_SUBMIT,
+                        gate_pending={'question': submit_hold.PRE_SUBMIT_TEXT},
+                        gate_call_id=None, fail_kind=submit_hold.PRE_SUBMIT,
+                        fail_reason=submit_hold.PRE_SUBMIT_TEXT,
+                        pre_submit_never_armed=True, pre_submit_engine='browser_skill',
+                        last_button='', last_url=str(step.get('url') or '')[:400])
+                else:
+                    tracking.set_status(
+                        pk, 'needs_human', gate_reason='submit_uncertain',
+                        gate_pending={'question': message}, gate_call_id=None,
+                        fail_kind='uncertain', fail_reason=message)
                 raise
-            return {'status': 'uncertain', 'detail': message, 'step': step}
+            response = {'status': 'uncertain', 'detail': message, 'step': step}
+            if not commit_armed:
+                response['_never_armed'] = submit_hold.NeverArmedProof()
+            return response
         if isinstance(exc, Gate):
             if submitted:
                 context = handoff(

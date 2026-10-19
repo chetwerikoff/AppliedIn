@@ -83,6 +83,7 @@ def _fixture(route, *, kind=None, noisy=False):
     controls = [phone]
     facts = {phone_label: PHONE, 'Full name': 'Test User'}
     row['human_approved_answers'][phone_label] = _grant(phone, url, PHONE)
+    picker = None
     kind = kind or ('combobox' if route == 'greenhouse' else 'select')
     if kind == 'select':
         picker = field(

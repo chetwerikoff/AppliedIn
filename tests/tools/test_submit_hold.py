@@ -1144,3 +1144,71 @@ async def test_true_browser_skill_upload_interrupt_has_same_attempt_positive_pha
             PK, stores.tracking.get(PK) or {}, result, tracking=stores.tracking)
     assert events == ["upload"]
     assert stores.tracking.r.get(f"submit_hold:{PK}") is None
+
+
+@pytest.mark.parametrize("action,label", [
+    ("submit", "Submit application"), ("click", "Continue"),
+])
+async def test_armed_submit_or_continue_cannot_turn_safe_after_losing_hold_and_row(
+        world, monkeypatch, action, label):
+    stores, _ = world
+    stale = stores.tracking.get(PK)
+    current = {
+        "url": URL, "text": "", "inventory_verified": True,
+        "controls": [
+            {"selector": "#resume", "type": "file", "tag": "input",
+             "label": "Resume", "files": ["Resume.pdf"], "in_form": True,
+             "form_action": URL},
+            {"selector": "#submit", "type": "submit", "tag": "button",
+             "label": label, "submit": True, "form_selector": "#application",
+             "native_form_owner_selector": "#application",
+             "in_form": True, "form_action": URL},
+        ]}
+    events = []
+
+    class Session:
+        def __init__(self, *_):
+            self.upload_attempted = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def navigate(self, _):
+            return current
+
+        async def page(self):
+            return current
+
+        async def call(self, name, *_args, **_kwargs):
+            events.append(name)
+            if name == "upload":
+                self.upload_attempted = True
+                return {"action": name, "selector": "#resume", "uploaded": True}
+            if name in ("submit", "click"):
+                # The key is lost after committing IPC was attempted, and an old
+                # snapshot erases legacy row flags. Only the controller's local
+                # commit-armed witness can tell these cases apart.
+                stores.tracking.r.delete(f"submit_hold:{PK}")
+                stores.tracking._write(PK, stale, prev_status="needs_human")
+                self.upload_attempted = True
+                raise bsk.Unavailable("synthetic committing IPC lost response")
+            pytest.fail("Unexpected BrowserSkill action")
+
+    monkeypatch.setattr(forms, "check_dispatch", lambda *_a, **_kw: None)
+    monkeypatch.setattr("tools.claude_chrome._stage_resume", lambda *_: "Resume.pdf")
+    monkeypatch.setattr(bsk, "Session", Session)
+    monkeypatch.setattr(bsk, "decision", AsyncMock(side_effect=[
+        {"action": "upload", "selector": "#resume"},
+        {"action": action, "selector": "#submit"}]))
+    result = await forms.apply(URL, "example-co", {}, "synthetic",
+                               pk=PK, resume_path="Resume.pdf")
+    assert result["status"] == "uncertain"
+    assert "_never_armed" not in result
+    assert events == ["upload", action]
+    assert stores.tracking.r.get(f"submit_hold:{PK}") is None
+    assert not submit_hold.classify_new_pre_submit(
+        PK, stores.tracking.get(PK) or {}, {**result, "_actual_engine": "browser_skill"},
+        tracking=stores.tracking)

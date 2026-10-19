@@ -293,10 +293,18 @@ function routeNotice(r) {
     No form answer or approval can resolve this.</p>
     ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}
     ${issueLinkHtml(r)}</div>`;
-  if (kind === "manual_triage") return `<div class="diag-note diag-triage" role="status">
-    <b>Manual triage required</b><p>There is no verified answerable question,
-    or the status evidence conflicts. Inspect the details; do not retry or approve.</p>
-    ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
+  if (kind === "manual_triage") {
+    if (r.status === "needs_human" && r.gate_reason === "pre_submit_uncertain"
+        && r.fail_kind === "pre_submit_uncertain") return `<div class="diag-note diag-triage" role="status">
+      <b>Pre-submit uncertainty</b><p>No committing action was proven to run.
+      ${r.pre_submit_retry_used ? "The one inspected recovery was consumed; no more applications are permitted." :
+      "Inspect this outcome before any separate future approval. Inspection does not submit an application."}</p>
+      ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
+    return `<div class="diag-note diag-triage" role="status">
+      <b>Manual triage required</b><p>There is no verified answerable question,
+      or the status evidence conflicts. Inspect the details; do not retry or approve.</p>
+      ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
+  }
   return "";
 }
 // Every delegated action re-checks current rows. DOM visibility cannot authorize.
@@ -305,7 +313,15 @@ function rowActionAllowed(pk, act) {
   // A stale control cannot override a blocked or unverified independent hold.
   if (!r || r.submit_hold_state !== "clear") return false;
   const kind = routeOf(r);
+  if (kind === "manual_triage") {
+    if (act === "inspect-pre-submit") return r.pre_submit_inspect_eligible === true;
+    if (["skip", "mark-applied"].includes(act)) return r.pre_submit_close_only === true;
+    return false;
+  }
   if (READ_ONLY_ROUTES.has(kind)) return false;
+  if (r.pre_submit_retry_used === true)
+    return act === "apply-now" && kind === "tailored"
+      && r.gate_reason === "approval" && !r.apply_requested_at;
   if (act === "answer") return ["owner_question", "approval", "low_confidence", "tailored"].includes(kind);
   if (act === "run-now") return kind === "found";
   if (act === "apply-now") return canApply(r);
@@ -2111,6 +2127,17 @@ function companyBar() {
     <span class="cbar-co">${esc(co)}</span>${body}</div>`;
 }
 
+function preSubmitControls(r) {
+  if (rowActionAllowed(r.pk, "inspect-pre-submit"))
+    return `<button class="btn btn-primary" data-act="inspect-pre-submit"
+      data-pk="${esc(r.pk)}">Inspect pre-submit outcome</button>`;
+  if (rowActionAllowed(r.pk, "skip"))
+    return `<button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip</button>
+      <button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
+      title="Only after independent confirmation">✓ Verified applied</button>`;
+  return "";
+}
+
 function diagnosticSec(rows, title, hint, cls) {
   if (!rows.length) return "";
   return `<section class="psec ps-diagnostic ps-${cls} has">
@@ -2119,6 +2146,7 @@ function diagnosticSec(rows, title, hint, cls) {
     <div class="diag-grid">${rows.map((r) => `<article class="diag-card">
       <b>${esc(r.company)} · ${esc(r.title)}</b>${routeNotice(r)}
       <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button>
+      ${preSubmitControls(r)}
     </article>`).join("")}</div></section>`;
 }
 function viewPipeline() {
@@ -2384,7 +2412,8 @@ function needsCard(r) {
     <header><div><span class="gc-co">${esc(r.company)}</span>
       <span class="gc-role">${esc(r.title)}</span></div>${routeTag(r)}</header>
     ${routeNotice(r)}
-    <div class="gc-actions"><button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
+    <div class="gc-actions"><button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button>
+      ${preSubmitControls(r)}</div>
   </article>`;
   return `<article class="gatecard">
     <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
@@ -3256,7 +3285,9 @@ function appsSig() {
        + (a.applied_at || "") + "\u0001"
        + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
        + (a.submit_hold_state || "missing") + ":" + (a.possible_submission ? "p" : "")
-       + ":" + (a.fail_kind || "") + "\u0001"
+       + ":" + (a.fail_kind || "") + ":"
+       + (a.pre_submit_inspect_eligible ? "i" : "") + (a.pre_submit_close_only ? "c" : "")
+       + (a.pre_submit_retry_used ? "u" : "") + (a.apply_requested_at || "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
        + (a.jd_read_error || "") + "\u0001" + (a.score_override ? "o" : "") + "\u0001"
        + (a.profile_id || "") + "\u0001" + (a.review_skipped ? "s" : "") + (a.review_rejected ? "r" : "")
@@ -4399,6 +4430,14 @@ function paneAction(act, pk, el) {
     return;
   }
   if (act === "force-apply") { forceApply(pk); return; }
+  if (act === "inspect-pre-submit") {
+    post(`/actions/inspect-pre-submit/${encodeURIComponent(pk)}`).then((r) => {
+      toast(r && r.ok ? "Inspection recorded. Review the résumé; Apply now requires a separate click."
+        : (r && r.error) || "Pre-submit inspection could not be verified.");
+      loadApps(); loadQueue();
+    });
+    return;
+  }
   if (act === "answer") {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
     const answer = resumeAnswer(pk, t?.value);
@@ -4500,7 +4539,14 @@ function paneAction(act, pk, el) {
     post(`/actions/retry/${encodeURIComponent(pk)}`);
     toast("Retrying — re-running the pipeline for this job.");
   } else if (act === "mark-applied") {
-    post(`/actions/mark-applied/${encodeURIComponent(pk)}`).then((r) => {
+    const row = state.apps.find((r) => r.pk === pk);
+    let body;
+    if (row && row.pre_submit_close_only) {
+      const note = window.prompt?.("Only after independent employer confirmation: enter the confirmation detail.");
+      if (!note || !note.trim()) return;
+      body = {confirmed: true, note: note.trim()};
+    }
+    post(`/actions/mark-applied/${encodeURIComponent(pk)}`, body).then((r) => {
       toast(r && r.ok ? "Marked applied — won't resubmit."
                       : (r && r.error) || "Could not confirm application outcome.");
       loadApps();
@@ -4757,7 +4803,7 @@ function openDrawer(pk) {
     : "";
 
   $("#drawer-body").innerHTML = `
-    ${guarded ? routeNotice(r) : trackerEditor(r)}
+    ${guarded ? routeNotice(r) + preSubmitControls(r) : trackerEditor(r)}
     ${gate}
     ${failBlock}
     ${r.jd_read_error ? `<div class="section drawer-fail"><div class="section-t">Posting read paused</div><div class="fail-text">${esc(r.jd_read_error)}</div><p>Kept in Found. Run preparation again when the reader is available.</p></div>` : ""}

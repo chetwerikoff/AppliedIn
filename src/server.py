@@ -224,8 +224,11 @@ def _reply_sort_timestamp(value) -> float:
 
 def _project_submit_hold(pk: str, raw_row: dict, tracking, *, no_independent_key=False) -> str:
     """Portal projection checks possible submission, not broader replay gates."""
-    return submit_hold.possible_state(
-        pk, raw_row, tracking=tracking, keyless_cloud=no_independent_key)
+    try:
+        return submit_hold.possible_state(
+            pk, raw_row, tracking=tracking, keyless_cloud=no_independent_key)
+    except Exception:
+        return "unknown"
 
 
 def _exhausted_pre_submit(pk: str, row: dict, tracking) -> bool:
@@ -1954,7 +1957,7 @@ def create_app() -> FastAPI:
             if failure := stopped_application_attempt(pk, stores.tracking):
                 return {"ok": False, "error": failure}
             if submit_hold.possible_state(pk, row, tracking=stores.tracking) != "blocked":
-                return {"ok": False, "error": "This row is not a possible submission."}
+                return {"ok": False, "error": "This row is not a held uncertain submission."}
             if outcome == "submitted":
                 evidence = str(body.get("confirmation") or "").strip()[:200]
                 if not evidence:

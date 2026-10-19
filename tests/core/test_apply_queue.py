@@ -450,3 +450,47 @@ def test_a_real_failure_still_spends_them(q):
     assert q.retry(item, "the form could not be filled") is True
     got = next(i for i in q.pending() if i["pk"] == "acme#1")
     assert got["attempts"] == 1
+
+
+def test_pre_submit_uncertainty_is_terminal_and_not_a_queue_retry():
+    assert is_retryable({"result": "failed", "reason": "pre_submit_uncertain"}) == (
+        False, "pre_submit_uncertain")
+
+
+def test_late_grouped_requested_items_never_admit_a_used_preclick_row(q):
+    import json
+    spent = "example-co#spent"
+    unaffected = "other-co#untouched"
+    q.r.set(f"app:{spent}", json.dumps({
+        "pk": spent, "status": "tailored",
+        "pre_submit_retry_used": True,
+        "apply_requested_at": "synthetic-old-direct-stamp"}))
+    assert not q.put(spent, "example-co", requested=True)
+    assert not q.retry({"pk": spent, "company": "example-co"}, "timeout")
+    for ordinal in range(3):
+        q.r.sadd("applyq:companies", "example-co")
+        q.r.rpush("applyq:co:example-co", json.dumps({
+            "pk": spent, "company": "example-co", "queued_at": ordinal,
+            "requested": True, "priority": ordinal % 2 == 0}))
+    q.put(unaffected, "other-co")
+    item = q.next()
+    assert item["pk"] == unaffected
+    assert q.next() is None
+    assert not q.has_pending(spent)
+    q.done(item)
+    assert q.depth()["queued"].get("example-co", 0) == 0
+
+
+def test_remove_all_only_exact_job_from_grouped_and_old_flat_queue(q):
+    import json
+    pk = "example-co#one"
+    other = "example-co#two"
+    q.put(pk, "example-co")
+    q.put(other, "example-co")
+    q.r.rpush("applyq:co:example-co", json.dumps({"pk": pk, "requested": True}))
+    q.r.rpush("queue:legacy", json.dumps({"pk": pk}))
+    q.r.rpush("queue:legacy", json.dumps({"pk": other}))
+    assert q.remove_all(pk, flat_queue="legacy") == 3
+    assert not q.has_pending(pk, flat_queue="legacy")
+    assert q.has_pending(other, flat_queue="legacy")
+    assert q.depth()["queued"]["example-co"] == 1

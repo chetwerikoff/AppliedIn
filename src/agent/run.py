@@ -1519,7 +1519,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
                 result={"reason": submit_hold.PRE_SUBMIT},
                 gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT},
                 gate_call_id=None, last_button="",
-                last_url=str((result.get("step") or {}).get("url") or "")[:400],
+                last_url="",
                 pre_submit_never_armed=True, pre_submit_engine="browser_skill")
             emit("gate", pk=pk, agent="applier",
                  detail=submit_hold.PRE_SUBMIT_TEXT, url=jd_url)

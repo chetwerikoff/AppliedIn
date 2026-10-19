@@ -223,19 +223,20 @@ def _reply_sort_timestamp(value) -> float:
 
 
 def _project_submit_hold(pk: str, raw_row: dict, tracking, *, no_independent_key=False) -> str:
-    """Expose the existing hold decision without creating or clearing a hold.
+    """Portal projection checks possible submission, not broader replay gates."""
+    return submit_hold.possible_state(
+        pk, raw_row, tracking=tracking, keyless_cloud=no_independent_key)
 
-    A missing Redis client does not prove a clear hold on local/unknown stores.
-    Only the explicitly keyless cloud deployment can treat that as clear.
-    """
-    try:
-        if submit_hold.blocked(pk, raw_row, tracking=tracking):
-            return "blocked"
-        if getattr(tracking, "r", None) is None:
-            return "clear" if no_independent_key else "unknown"
-        return "clear"
-    except Exception:
-        return "unknown"
+
+def _exhausted_pre_submit(pk: str, row: dict, tracking) -> bool:
+    return (row.get("status") == "needs_human"
+            and row.get("gate_reason") == submit_hold.PRE_SUBMIT
+            and row.get("fail_kind") == submit_hold.PRE_SUBMIT
+            and row.get("pre_submit_retry_used") is True
+            and row.get("pre_submit_never_armed") is True
+            and row.get("pre_submit_engine") == "browser_skill"
+            and not row.get("confirmation_id")
+            and submit_hold.possible_state(pk, row, tracking=tracking) == "clear")
 
 
 def _to_ui(row: dict, artifacts) -> dict:
@@ -506,6 +507,12 @@ def create_app() -> FastAPI:
                     r.get("pk") or "", r, stores.tracking,
                     no_independent_key=settings.mode == "cloud"),
                 "submit_hold_reason": submit_hold.REASON,
+                "pre_submit_inspect_eligible": submit_hold.eligible_pre_submit(
+                    r.get("pk") or "", r, tracking=stores.tracking),
+                "pre_submit_close_only": _exhausted_pre_submit(
+                    r.get("pk") or "", r, stores.tracking),
+                "pre_submit_retry_used": r.get("pre_submit_retry_used") is True,
+                "apply_requested_at": r.get("apply_requested_at") or "",
             }
             for r in rows
         ]}
@@ -1852,6 +1859,73 @@ def create_app() -> FastAPI:
         finally:
             lease.release_human_outcome(company)
 
+    @app.post("/actions/inspect-pre-submit/{pk:path}")
+    def inspect_pre_submit(pk: str):
+        """Spend one inspection, removing old work before restoring review-only state."""
+        from core.apply_queue import ApplyQueue
+        from core.ids import make_pk
+        from redis.exceptions import WatchError
+
+        stores = make_stores(settings)
+        lease, company, error = claim_human_outcome(pk, stores.tracking)
+        if error:
+            return {"ok": False, "error": error}
+        try:
+            row = stores.tracking.get(pk) or {}
+            _, sep, job_id = pk.partition("#")
+            if (row.get("company") != company or not sep or not job_id
+                    or make_pk(company, job_id) != pk
+                    or not submit_hold.eligible_pre_submit(
+                        pk, row, tracking=stores.tracking)):
+                return {"ok": False, "error": "Pre-submit inspection is not eligible."}
+            if failure := stopped_application_attempt(pk, stores.tracking):
+                return {"ok": False, "error": failure}
+            try:
+                lease.remove_all(pk, flat_queue=stores.apply_queue)
+                if (lease.has_pending(pk, flat_queue=stores.apply_queue)
+                        or pk in lease.in_flight()
+                        or any(it.get("pk") == pk for it in lease.pending())):
+                    return {"ok": False, "error": "Old queued or in-flight work remains."}
+                for _ in range(16):
+                    try:
+                        with stores.tracking.r.pipeline() as pipe:
+                            pipe.watch(f"app:{pk}", f"submit_hold:{pk}")
+                            raw, held = pipe.get(f"app:{pk}"), pipe.get(f"submit_hold:{pk}")
+                            current = json.loads(raw) if raw else {}
+                            if (held is not None
+                                    or current.get("company") != company
+                                    or not submit_hold.eligible_pre_submit(
+                                        pk, current, tracking=stores.tracking)
+                                    or lease.has_pending(pk, flat_queue=stores.apply_queue)
+                                    or pk in lease.in_flight()):
+                                pipe.unwatch()
+                                return {"ok": False, "error": "Evidence changed; refresh before inspecting."}
+                            previous = current.get("status")
+                            current.update(
+                                status="tailored", gate_reason="approval",
+                                pre_submit_retry_used=True, apply_requested_at="",
+                                fail_kind="", fail_reason="", possible_submission=False,
+                                gate_pending=None, gate_call_id=None,
+                                last_button="", last_url="")
+                            result = current.get("result")
+                            if isinstance(result, dict) and result.get("reason") == submit_hold.PRE_SUBMIT:
+                                current["result"] = {k: val for k, val in result.items()
+                                                     if k != "reason"}
+                            pipe.multi()
+                            pipe.set(f"app:{pk}", json.dumps(current, default=str))
+                            if previous != "tailored":
+                                pipe.srem(f"status:{previous}", pk)
+                            pipe.sadd("status:tailored", pk)
+                            pipe.execute()
+                            return {"ok": True, "status": "tailored", "queued": False}
+                    except WatchError:
+                        continue
+                return {"ok": False, "error": "Concurrent change; inspection not committed."}
+            except Exception:
+                return {"ok": False, "error": "Could not verify and clear every pending item."}
+        finally:
+            lease.release_human_outcome(company)
+
     @app.post("/actions/resolve-uncertain/{pk:path}")
     def resolve_uncertain(pk: str, body: dict):
         """Portal-verified human outcome, serialized with the application worker."""
@@ -1870,8 +1944,8 @@ def create_app() -> FastAPI:
                 return {"ok": False, "error": "The job company changed; outcome was not recorded."}
             if failure := stopped_application_attempt(pk, stores.tracking):
                 return {"ok": False, "error": failure}
-            if not submit_hold.blocked(pk, row, tracking=stores.tracking):
-                return {"ok": False, "error": "This row is not a held uncertain submission."}
+            if submit_hold.possible_state(pk, row, tracking=stores.tracking) != "blocked":
+                return {"ok": False, "error": "This row is not a possible submission."}
             if outcome == "submitted":
                 evidence = str(body.get("confirmation") or "").strip()[:200]
                 if not evidence:

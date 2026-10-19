@@ -985,6 +985,13 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       .map(n=>n.innerText).join(' ');
     return clean(labels || aria);
   };
+  // Standalone fixed reads cannot borrow the entry reader's Ashby bindings.
+  const fixedAshbyNative = location.protocol==='https:' &&
+    location.hostname==='jobs.ashbyhq.com';
+  const fixedAshbyLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
+    (e.getAttribute('aria-labelledby') || '').split(' ')
+      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
+    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   /* WIDGET_GRAPH */
@@ -1056,6 +1063,13 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
         formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
+        ...(fixedAshbyNative ? {label:fixedAshbyLabel(e),
+          submit:['submit','image'].includes(type) && ['INPUT','BUTTON'].includes(e.tagName)
+            && !!e.form, required:!!e.required || e.getAttribute('aria-required')==='true',
+          form_action_attr_present:!!form && form.hasAttribute('action'),
+          form_action_raw:form ? form.getAttribute('action') : null,
+          formaction_attr_present:e.hasAttribute('formaction'),
+          formaction_raw:e.getAttribute('formaction')} : {}),
         disabled:!!e.disabled || e.matches(':disabled') ||
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
@@ -1189,7 +1203,9 @@ def _inventory_ok(page: dict) -> None:
 def _identity(target: dict) -> tuple:
     return tuple(target.get(k) for k in (
         'selector', 'label', 'question', 'tag', 'type', 'in_form',
-        'form_selector', 'form_action', 'formaction', 'options', 'combobox', 'disabled',
+        'form_selector', 'form_action', 'formaction', 'form_action_attr_present',
+        'form_action_raw', 'formaction_attr_present', 'formaction_raw',
+        'options', 'combobox', 'disabled',
         'required', 'has_value', 'value', 'checked', 'name'))
 
 def _page_identity(page: dict) -> tuple:
@@ -1266,6 +1282,144 @@ def _application_marker(siblings: list[dict]) -> bool:
         or (c.get('type') == 'file'
             and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
         for c in siblings)
+
+
+
+def _ashby_native_classify(page: dict, provenance: ApplicationEntryProvenance) -> None:
+    """Prove one raw-action job owner; inventory foreign forms without granting access.
+
+    The independent fixed reader repeats this census before the controller
+    exposes any target. Only selected controls survive in the actionable PAGE;
+    the full non-value census remains in entry for subsequent read-only parity.
+    """
+    entry = page['entry']
+    candidates = entry.get('native_candidates')
+    if not isinstance(candidates, list):
+        raise Gate('native Ashby raw action witness unavailable; inspect manually.')
+    controls = page['controls']
+    if not candidates:
+        if entry.get('root') or any(c.get('in_form') for c in controls):
+            raise Gate('native Ashby raw action witness unavailable; inspect manually.')
+        return
+    owners = [c.get('selector') for c in candidates if isinstance(c, dict)]
+    if (len(owners) != len(candidates) or not all(isinstance(o, str) and o for o in owners)
+            or len(set(owners)) != len(owners)):
+        raise Gate('ambiguous native application owners; inspect manually.')
+    for control_item in controls:
+        if control_item.get('in_form') and control_item.get('form_selector') not in owners:
+            raise Gate('unclassified native receiver; inspect manually.')
+        if not control_item.get('in_form'):
+            # Even an external role-button/link can initiate a write or
+            # navigation. Unowned actions are not part of this job graph.
+            raise Gate('unowned actionable native receiver; inspect manually.')
+    selected, foreign, passive_search = [], [], []
+    for candidate in candidates:
+        owner, action = candidate['selector'], candidate.get('action')
+        raw, present = candidate.get('action_attr'), candidate.get('action_attr_present')
+        members = candidate.get('controls')
+        siblings = [c for c in controls if c.get('in_form')
+                    and c.get('form_selector') == owner]
+        if (not isinstance(members, list) or not members or
+                [m.get('selector') for m in members if isinstance(m, dict)]
+                != [c['selector'] for c in siblings] or
+                len(members) != len(siblings) or
+                not all(isinstance(m, dict) for m in members)):
+            raise Gate('incomplete native candidate/control census; inspect manually.')
+        # The previous independently established search-only exception cannot
+        # become a second application owner or a model/action target.
+        if not candidate.get('plausible') and _unrelated_search_form(siblings):
+            passive_search.append(owner)
+            continue
+        if (present is not True or not isinstance(raw, str) or not raw
+                or not isinstance(action, str) or action != raw):
+            raise Gate('native application raw action not proven; inspect manually.')
+        if candidate.get('plausible') is not True:
+            # A still-hydrating tracked form may have no Submit yet. It cannot
+            # gain write authority, but it uses the existing bounded wait.
+            if raw == provenance.url:
+                raise _EntryNotReady('incomplete native application candidate')
+            raise Gate('unproven foreign native application candidate.')
+        match = re.fullmatch(
+            r'https://jobs\.ashbyhq\.com/([^/?#]+)/(' + _JOB_UUID.pattern + r')/application',
+            raw)
+        if not match or not _BOARD_TOKEN.fullmatch(match.group(1)):
+            raise Gate('native application action is not a literal Ashby job route.')
+        real_fields, submits = 0, 0
+        for item, observed in zip(members, siblings):
+            typ = item.get('type')
+            if (item.get('selector') != observed.get('selector')
+                    or item.get('tag') != observed.get('tag')
+                    or typ != observed.get('type')
+                    or item.get('owned') is not True
+                    or item.get('native_owner') != owner
+                    or item.get('declared_owner') is not None
+                    or observed.get('native_form_owner_selector') != owner
+                    or observed.get('form_action_attr_present') is not True
+                    or observed.get('form_action_raw') != raw
+                    or observed.get('form_action') != action
+                    or item.get('override_present') != observed.get('formaction_attr_present')
+                    or item.get('override_raw') != observed.get('formaction_raw')
+                    or item.get('override_resolved') != observed.get('formaction')):
+                raise Gate('cross-owned or contradictory native application census.')
+            if item.get('override_present'):
+                if (item.get('override_raw') != raw
+                        or item.get('override_resolved') != action):
+                    raise Gate('native control formaction override conflicts with its job.')
+            if item.get('submit'):
+                if (not native_submit(observed) or item.get('disabled')
+                        or not item.get('visible') or
+                        not any(_same_key(text) in _APP_SUBMIT_LABELS
+                                for text in _submitter_texts(observed))):
+                    raise Gate('native application submit is not uniquely owned.')
+                submits += 1
+            elif typ in {'text', 'email', 'tel', 'textarea', 'file', 'select', 'radio', 'checkbox'}:
+                if (item.get('disabled') or item.get('readonly')
+                        or item.get('label_count') != 1
+                        or item.get('labels_owned') is not True
+                        or not item.get('caption')
+                        or (typ != 'file' and item.get('visible') is not True)):
+                    raise Gate('unverified labelled native application receiver.')
+                real_fields += 1
+            elif typ == 'hidden':
+                if item.get('visible') is True:
+                    raise Gate('unexplained visible hidden native receiver.')
+            else:
+                # An extra actionable button, role widget, link or unsupported
+                # field cannot be silently quarantined as decoration.
+                raise Gate('unclassified actionable native application control.')
+        if submits != 1 or real_fields < 1:
+            raise Gate('incomplete native application graph; inspect manually.')
+        if raw == provenance.url:
+            selected.append(owner)
+        else:
+            foreign.append(owner)
+    if not selected and len(passive_search) == len(candidates):
+        # An exhaustive, disjoint search-only shell has no application owner
+        # yet. Preserve bounded readiness without granting a target or IPC.
+        raise _EntryNotReady('no qualifying application form')
+    if len(selected) != 1:
+        raise Gate(('ambiguous application roots' if len(selected) > 1
+                    else 'native application root lacks tracked job binding')
+                   + '; inspect manually.')
+    if entry.get('root') and entry['root'].get('selector') not in selected:
+        raise Gate('native application root conflicts with raw job witness.')
+    owner = selected[0]
+    entry['root'] = {'selector': owner, 'action': provenance.url,
+                     'action_attr_present': True, 'action_attr': provenance.url}
+    entry['selected_native_owner'] = owner
+    entry['quarantined_native_owners'] = sorted(foreign + passive_search)
+    # Keep the exhaustive independent candidate census in entry, but never
+    # pass foreign receivers, values or submits to model/action/approval code.
+    page['controls'] = [c for c in controls if
+                        c.get('in_form') and c.get('form_selector') == owner]
+
+
+def _ashby_native_identity(page: dict):
+    entry = page.get('entry') or {}
+    if not entry.get('selected_native_owner'):
+        return None
+    return (entry['selected_native_owner'], repr(entry.get('native_candidates')),
+            tuple(entry.get('quarantined_native_owners', [])))
 
 
 _ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
@@ -1451,9 +1605,26 @@ def _root_identity(page: dict):
     root = _formless_root(page)
     if not root:
         return None
+    # A positional locator is a current action coordinate, not a permanent
+    # form identity. Bind the semantic census while preserving stable IDs and
+    # every actual ownership/association/submit flag. The independent reader
+    # resolves exact current selectors again before each action.
+    def semantic_locator(value):
+        return ':positional' if isinstance(value, str) and ':nth-of-type(' in value else value
+
+    envelope = tuple((key, repr(semantic_locator(value)))
+                     for key, value in root.items() if key != 'excluded')
+    # DOM query order may change when inert siblings/panes move. Compare the
+    # exhaustive semantic multiset rather than positional enumeration order.
+    excluded = tuple(sorted(repr(semantic_locator(value))
+                            for value in root.get('excluded', [])))
     evidence = page['entry'].get('root_evidence', [])
-    return (repr(root), tuple(tuple((k, repr(v)) for k, v in c.items()
-                            if k not in {'value', 'has_value', 'files'}) for c in evidence))
+    members = tuple(sorted(
+        tuple((key, repr(semantic_locator(value)))
+              for key, value in c.items()
+              if key not in {'value', 'has_value', 'files'})
+        for c in evidence))
+    return envelope, excluded, members
 
 
 def _upload_tree(page):
@@ -1607,6 +1778,12 @@ def _entry_safety(page, allowed, provenance):
         raise Gate('untrusted captcha response control; ambiguous owner or provider.')
     if entry.get('helper_challenge'):
         raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
+    if (isinstance(provenance, ApplicationEntryProvenance)
+            and provenance.ats == 'ashby' and entry.get('formless') is None):
+        _ashby_native_classify(page, provenance)
+        # Exhaustive foreign-owner classification precedes destination preflight.
+        # Foreign candidates remain in the read-only census, never action targets.
+        controls = page['controls']
     root = entry.get('root')
     if root:
         check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
@@ -1642,6 +1819,7 @@ class _EntrySession:
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
         self.formless_identity = None
+        self.native_identity = None
         self.committing = False
         self.submit_authorized = None
         self.on_committing_click = None
@@ -1766,6 +1944,31 @@ class _EntrySession:
                 ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
                 ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)}):
             raise Gate('Only read-only observations are permitted during upload settling.')
+        if (args and args[0] != 'evaluate'
+                and self.native_identity is not None and self.formless_identity is None):
+            if self.committing:
+                raise Gate('A possible native submit cannot be retried automatically.')
+            # The same independent witness is required at the actual IPC seam,
+            # including direct producer calls that bypass the model/controller.
+            current, _ = await _observe_controls(self, await self.page())
+            if _ashby_native_identity(current) != self.native_identity:
+                raise Gate('native application owner drift before IPC.')
+            selector = args[1] if len(args) > 1 else ''
+            matches = [c for c in current['controls'] if c['selector'] == selector
+                       and c.get('form_selector') ==
+                       current['entry'].get('selected_native_owner')]
+            if len(matches) != 1:
+                raise Gate('foreign or unsupported native control forbidden at IPC producer.')
+            check_form_destination(current, matches[0], provenance=self.provenance)
+            if args[0] not in {'fill', 'select', 'upload', 'click'}:
+                raise Gate('unapproved native IPC verb.')
+            # A guarded radio/checkbox choice is not a potentially committing
+            # native submit; classifying every click as submission would turn a
+            # successful safe choice into a false uncertain-result hold.
+            if (args[0] == 'click' and native_submit(matches[0])
+                    and self.on_committing_click is not None):
+                self.committing = True
+                self.on_committing_click()
         if args and args[0] != 'evaluate' and self.formless_identity is not None:
             if self.committing:
                 raise Gate('A possible structural submit cannot be retried automatically.')
@@ -1811,7 +2014,27 @@ class _EntrySession:
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
-            _entry_safety(page, self.allowed, self.provenance)
+            if self.committing and self.native_identity is not None:
+                # After a verified potentially committing native click there
+                # are only passive confirmation reads; the form may disappear
+                # and be replaced by links. Never grant another IPC action.
+                entry = page.get('entry') if isinstance(page, dict) else None
+                if (not isinstance(entry, dict)
+                        or not isinstance(entry.get('frames'), list)
+                        or not self.allowed(page.get('url', ''))
+                        or entry.get('response_error') or entry.get('helper_challenge')):
+                    raise Gate('Post-click application evidence is unavailable or changed.')
+                for frame in entry['frames']:
+                    status = frame.get('status') if isinstance(frame, dict) else None
+                    if status in {'visible-recaptcha', 'visible-hcaptcha'}:
+                        raise CaptchaGate('Visible challenge after a committing click.')
+                    if status not in {'H', 'R', 'W', 'X', 'Z'}:
+                        raise Gate('Untrusted frame after a committing click.')
+            else:
+                _entry_safety(page, self.allowed, self.provenance)
+            if (self.native_identity is not None and not self.committing
+                    and _ashby_native_identity(page) != self.native_identity):
+                raise Gate('native application root identity drift; inspect manually.')
             if (self.formless_identity is not None and not self.committing and not self.upload_pending
                     and _root_identity(page) != self.formless_identity):
                 raise Gate('application root identity drift; inspect manually.')
@@ -1913,12 +2136,19 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
         while loop.time() < deadline:
             try:
                 async with asyncio.timeout_at(deadline):
-                    page = await session.page() if page is None else page
+                    fresh_session_read = page is None
+                    page = await session.page() if fresh_session_read else page
                     if greenhouse:
                         _greenhouse_safety(page, allowed, provenance, readiness=True)
                         reason = _greenhouse_not_ready(page)
                     else:
-                        _entry_safety(page, allowed, provenance)
+                        # _EntrySession.page() already classified the complete raw
+                        # candidate census, then quarantined foreign PAGE targets.
+                        # Re-classifying that filtered copy mistakes quarantine
+                        # for a missing foreign control. Unchecked initial PAGE
+                        # inputs must still pass the full admission gate.
+                        if not (fresh_session_read and isinstance(session, _EntrySession)):
+                            _entry_safety(page, allowed, provenance)
                         reason = _entry_not_ready(page)
                     if reason:
                         raise _EntryNotReady(reason)
@@ -1946,6 +2176,10 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                             _observe_closed_admissions(session, page)
                             if _formless_root(page):
                                 session.formless_identity = _root_identity(page)
+                            elif (isinstance(session, _EntrySession)
+                                  and isinstance(provenance, ApplicationEntryProvenance)
+                                  and provenance.ats == 'ashby'):
+                                session.native_identity = _ashby_native_identity(page)
                             return page
                     last_reason = ('unstable application form inventory' if seen else
                                    'no qualifying application form')
@@ -1999,7 +2233,9 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             for key in ('unique', 'unique_form'):
                 require(observed.get(key) is True, key + '.true')
             for key in ('tag', 'type', 'in_form', 'form_selector',
-                        'form_action', 'formaction', 'disabled', 'native_form_owner_selector'):
+                        'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
+                        'form_action_attr_present', 'form_action_raw',
+                        'formaction_attr_present', 'formaction_raw'):
                 require(original.get(key) == observed.get(key), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
                 if isinstance(session, _GreenhouseSession) and readiness:
@@ -3888,7 +4124,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                provenance=provenance)
         check_before_committing_click(
             pk, **({'fixture_context': ctx} if ctx else {}))
-        if on_committing_click:
+        if on_committing_click and not (isinstance(session, _EntrySession)
+                and isinstance(provenance, ApplicationEntryProvenance)
+                and provenance.ats == 'ashby'):
             on_committing_click()
         await session.call('click', target['selector'])
     else:
@@ -4072,6 +4310,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     session = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
                     page = await _stable_application_form(
                         session, allowed, provenance, deadline=deadline)
+                    if provenance.ats == 'ashby':
+                        session.on_committing_click = mark_click_started
                     if ctx:
                         ctx.entry_admitted(page)
                 elif isinstance(provenance, GreenhouseJobAlias):
@@ -4119,9 +4359,16 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, *trusted_origins, provenance=provenance,
                         fixture_context=ctx)
                     model_page = {**page, 'approved_choices': choices}
+                    if (isinstance(session, _EntrySession)
+                            and session.native_identity is not None):
+                        # PAGE text/description/title may include a distinct
+                        # quarantined application. Only independently witnessed
+                        # selected controls and approved choices reach the model.
+                        model_page.update(text='', description='', title='')
                     if isinstance(page.get('entry'), dict):
                         model_page['entry'] = {k: v for k, v in page['entry'].items()
-                                               if k != 'upload_tree'}
+                                               if k not in {'upload_tree', 'native_candidates',
+                                                            'quarantined_native_owners'}}
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')
@@ -4186,7 +4433,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             # and root-evidence file lists, not just the structural edges.
                             session.submit_authorized = _page_identity(page)
                             session.on_committing_click = mark_click_started
-                        else:
+                        elif not (isinstance(session, _EntrySession)
+                                  and isinstance(provenance, ApplicationEntryProvenance)
+                                  and provenance.ats == 'ashby'):
                             submitted = True
                         await session.call('click', target['selector'])
                         for _ in range(30):

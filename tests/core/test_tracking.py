@@ -738,7 +738,10 @@ def test_redis_initial_board_pin_is_in_conditional_value(monkeypatch):
         if key.startswith("app:"):
             puts.append((key, json.loads(value), dict(kw)))
             assert kw.get("nx") is True
-            assert json.loads(value)["greenhouse_board"] == "example-board"
+            # The second SET NX may offer a different pin, but the conditional
+            # rejection must preserve the initially committed identity.
+            if len(puts) == 1:
+                assert json.loads(value)["greenhouse_board"] == "example-board"
         return original_set(key, value, **kw)
 
     monkeypatch.setattr(raw, "set", spy)

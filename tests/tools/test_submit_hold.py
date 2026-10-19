@@ -887,7 +887,7 @@ def test_ui_projection_fail_closed_for_unknown_local_store_and_read_error(world,
     # part of the deployment contract, not when a local Redis read fails.
     assert server._project_submit_hold(
         PK, raw, SimpleNamespace(r=None), no_independent_key=True) == "clear"
-    monkeypatch.setattr(submit_hold, 'blocked', lambda *a, **kw:
+    monkeypatch.setattr(submit_hold, 'possible_state', lambda *a, **kw:
                         (_ for _ in ()).throw(RuntimeError('synthetic read failed')))
     assert server._project_submit_hold(PK, raw, stores.tracking) == "unknown"
 
@@ -942,3 +942,127 @@ def test_dashboard_projects_native_question_witness_not_display_prose():
                             "gate_pending": {"question": "synthetic",
                                              "form_question": {"label": "Location"}}}, artifacts)
     assert defect["gate_has_form_question"] is True
+
+
+@pytest.mark.parametrize("value,absent", [
+    (None, True), ("", False), (b"", False),
+    ("{corrupt-json", False), ('{"reason":"hold"}', False),
+])
+def test_strict_raw_hold_read_distinguishes_absence_from_present_empty(world, value, absent):
+    stores, _ = world
+    key = f"submit_hold:{PK}"
+    stores.tracking.r.delete(key)
+    if value is not None:
+        stores.tracking.r.set(key, value)
+    assert submit_hold.raw_absent(PK, tracking=stores.tracking) is absent
+    assert submit_hold.possible_state(PK, {}, tracking=stores.tracking) == (
+        "clear" if absent else "blocked")
+
+
+def test_historical_status_only_and_unreadable_hold_veto_preclick(world, monkeypatch):
+    stores, _ = world
+    tracking = stores.tracking
+    proof = {"status": "uncertain", "_actual_engine": "browser_skill",
+             "_never_armed": submit_hold.NeverArmedProof()}
+    assert submit_hold.classify_new_pre_submit(PK, {}, proof, tracking=tracking)
+    assert not submit_hold.classify_new_pre_submit(
+        PK, {"status": "uncertain"}, proof, tracking=tracking)
+    assert not submit_hold.classify_new_pre_submit(
+        PK, {}, {**proof, "_actual_engine": "chrome"}, tracking=tracking)
+    assert not submit_hold.classify_new_pre_submit(
+        PK, {}, {**proof, "_never_armed": True}, tracking=tracking)
+    tracking.r.set(f"submit_hold:{PK}", b"")
+    assert not submit_hold.classify_new_pre_submit(PK, {}, proof, tracking=tracking)
+    tracking.r.delete(f"submit_hold:{PK}")
+    monkeypatch.setattr(tracking.r, "get", lambda *_:
+                        (_ for _ in ()).throw(RuntimeError("synthetic GET failure")))
+    assert submit_hold.possible_state(PK, {}, tracking=tracking) == "unknown"
+    assert not submit_hold.classify_new_pre_submit(PK, {}, proof, tracking=tracking)
+
+
+def _synthetic_preclick_row(world):
+    stores, _ = world
+    stores.tracking.set_status(
+        PK, Status.NEEDS_HUMAN, company="example-co", jd_url=URL,
+        gate_reason=submit_hold.PRE_SUBMIT, fail_kind=submit_hold.PRE_SUBMIT,
+        fail_reason=submit_hold.PRE_SUBMIT_TEXT,
+        result={"reason": submit_hold.PRE_SUBMIT},
+        gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT}, gate_call_id="stale",
+        pre_submit_never_armed=True, pre_submit_engine="browser_skill",
+        possible_submission=False, apply_requested_at="old-intent")
+    return stores.tracking.get(PK)
+
+
+def test_one_inspection_cleans_old_work_and_survives_stale_writer(world):
+    stores, q = world
+    old = _synthetic_preclick_row(world)
+    # The old queue has duplicate requested/priority/backoff and flat entries.
+    for offset in (1, 2, 3):
+        q.r.sadd("applyq:companies", "example-co")
+        q.r.rpush("applyq:co:example-co", json.dumps({
+            "pk": PK, "company": "example-co", "queued_at": offset,
+            "priority": offset == 1, "requested": offset == 2}))
+    q.r.rpush("queue:apply", json.dumps({"pk": PK}))
+    q.r.rpush("queue:apply", json.dumps({"pk": "example-co#other"}))
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == "/actions/inspect-pre-submit/{pk:path}")
+    assert endpoint(PK) == {"ok": True, "status": "tailored", "queued": False}
+    after = stores.tracking.get(PK)
+    assert after["pre_submit_retry_used"] is True
+    assert after["status"] == "tailored" and after["gate_reason"] == "approval"
+    assert not after["apply_requested_at"] and not after["fail_kind"]
+    assert not after["fail_reason"] and not after["last_url"]
+    assert after["result"] == {}
+    assert not q.has_pending(PK, flat_queue="apply")
+    assert json.loads(q.r.lindex("queue:apply", 0))["pk"] == "example-co#other"
+    assert not endpoint(PK)["ok"]
+    stores.tracking._write(PK, old, prev_status="needs_human")
+    assert stores.tracking.get(PK) == after
+    assert not q.put(PK, "example-co")
+    assert not q.retry({"pk": PK, "company": "example-co"}, "timeout")
+
+
+def test_only_one_post_inspection_apply_now_stamp_without_browser(world, monkeypatch):
+    from fastapi import BackgroundTasks
+
+    stores, q = world
+    _synthetic_preclick_row(world)
+    inspect = next(r.endpoint for r in server.create_app().routes
+                   if getattr(r, "path", "") == "/actions/inspect-pre-submit/{pk:path}")
+    assert inspect(PK)["ok"]
+    stores.tracking.set_status(
+        PK, Status.TAILORED, resume_tex_key="synthetic.tex",
+        resume_seed="synthetic-seed")
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
+    endpoint = next(r.endpoint for r in server.create_app().routes
+                    if getattr(r, "path", "") == "/actions/apply-now/{pk}")
+    background = BackgroundTasks()
+    first = endpoint(PK, background)
+    assert first == {"ok": True, "started": PK, "retailoring": False}
+    assert len(background.tasks) == 1  # pending fake only, never execute browser
+    stamped = stores.tracking.get(PK)["apply_requested_at"]
+    assert stamped
+    assert q.in_flight() == {PK}
+    assert not endpoint(PK, BackgroundTasks())["ok"]
+    assert stores.tracking.get(PK)["apply_requested_at"] == stamped
+    assert not q.put(PK, "example-co", requested=True)
+    q.done({"pk": PK, "company": "example-co"})
+
+
+def test_exhausted_preclick_allows_close_only_without_new_application(world):
+    stores, q = world
+    _synthetic_preclick_row(world)
+    inspect = next(r.endpoint for r in server.create_app().routes
+                   if getattr(r, "path", "") == "/actions/inspect-pre-submit/{pk:path}")
+    assert inspect(PK)["ok"]
+    stores.tracking.set_status(
+        PK, Status.NEEDS_HUMAN, gate_reason=submit_hold.PRE_SUBMIT,
+        fail_kind=submit_hold.PRE_SUBMIT, apply_requested_at="spent-stamp")
+    skip = next(r.endpoint for r in server.create_app().routes
+                if getattr(r, "path", "") == "/actions/skip/{pk}")
+    assert skip(PK)["ok"]
+    after = stores.tracking.get(PK)
+    assert after["status"] == "skipped"
+    assert after["pre_submit_retry_used"] is True
+    assert after["apply_requested_at"] == "spent-stamp"
+    assert not q.put(PK, "example-co")

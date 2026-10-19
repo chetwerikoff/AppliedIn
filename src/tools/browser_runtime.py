@@ -78,7 +78,14 @@ async def run_task(*args, urls=None, **kwargs):
 
 async def apply(*args, **kwargs):
     engine = backend()
-    return await engine.apply_chrome(*args, **kwargs)
+    result = await engine.apply_chrome(*args, **kwargs)
+    # Actual engine selection is made HERE, not inferred later from mutable
+    # configuration or from a model/page-provided status dictionary.
+    if engine is not claude_chrome and isinstance(result, dict):
+        from tools import browser_skill
+        if engine is browser_skill:
+            result["_actual_engine"] = "browser_skill"
+    return result
 
 
 def applies_running() -> int:

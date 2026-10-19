@@ -622,7 +622,7 @@ def dom(spec, script=None):
     return json.loads(result.stdout)
 
 
-@pytest.mark.parametrize('reader', ['page', 'entry', 'fixed'])
+@pytest.mark.parametrize('reader', ['page', 'plain_fixed', 'entry', 'fixed'])
 @pytest.mark.parametrize('ats,raw_action', [
     ('ashby', 'explicit'), ('ashby', 'absent'), ('ashby', 'empty'),
     ('lever', 'explicit'),
@@ -631,8 +631,9 @@ def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader,
     """The ordinary PAGE must not depend on variables scoped to entry readers."""
     from tools.browser_skill_dom import PAGE
 
-    scripts = {'page': PAGE, 'entry': forms.ENTRY_PAGE,
-               'fixed': forms._ENTRY_FIXED_CONTROL_WITNESS}
+    # Plain fixed reads have no entry-only ashbyNative/entryLabel declarations.
+    scripts = {'page': PAGE, 'plain_fixed': forms._FIXED_CONTROL_WITNESS,
+               'entry': forms.ENTRY_PAGE, 'fixed': forms._ENTRY_FIXED_CONTROL_WITNESS}
     snapshot = dom(dict(url=entry(ats), actionAttr=raw_action,
                         nativePair=ats == 'ashby' and raw_action == 'explicit'),
                    scripts[reader])
@@ -642,6 +643,7 @@ def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader,
         item = controls[selector]
         assert item['form_action'] == entry(ats)
         if ats == 'ashby':
+            assert item['label'] == ('Email' if selector == '#email' else 'Submit application')
             assert item['form_action_attr_present'] is (raw_action != 'absent')
             assert item['form_action_raw'] == (
                 None if raw_action == 'absent' else

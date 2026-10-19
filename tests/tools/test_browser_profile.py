@@ -11,6 +11,8 @@ from tools import browser_profile as profile
 from tools import browser_runtime as runtime
 from tools import browser_skill as bsk
 
+_REAL_BROWSERS = profile._browsers
+
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
@@ -413,3 +415,207 @@ def test_first_time_setup_still_allows_explicit_engine_selection_with_consent(
     updated = yaml.safe_load(path.read_text())
     assert updated["browser"] == "new-synthetic"
     assert updated["engine"] == "browser_skill"
+
+
+
+def _fixture_enumeration(monkeypatch, *, rows=None, unavailable=False):
+    monkeypatch.setattr(profile, '_browsers', _REAL_BROWSERS)
+
+    def sync(command, **_kwargs):
+        if command == 'status':
+            return {'browsers': [{'instance_id': 'status-only'}]}
+        if unavailable:
+            raise bsk.Unavailable('synthetic BrowserSkill enumeration failure')
+        return {'browsers': rows if rows is not None else []}
+    monkeypatch.setattr(bsk, '_sync', sync)
+
+
+@pytest.mark.parametrize('browser_unavailable', [False, True])
+@pytest.mark.parametrize('process_args', [None, ['--user-data-dir=/synthetic/personal']])
+def test_fixture_missing_canonical_process_diagnostic(
+        sandbox, monkeypatch, browser_unavailable, process_args):
+    _, directory = sandbox
+    _fixture_enumeration(monkeypatch, unavailable=browser_unavailable)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter(
+        [] if process_args is None else [(101, ['chrome', *process_args])]))
+    monkeypatch.setattr(profile, '_launch',
+                        lambda *_a, **_kw: pytest.fail('Fixture must not launch Chrome'))
+    monkeypatch.setattr(profile, '_launch_lock',
+                        lambda *_a, **_kw: pytest.fail('Fixture must not lock for launch'))
+    monkeypatch.setattr(bsk, 'ensure_daemon',
+                        lambda: pytest.fail('Fixture must not recover BrowserSkill'))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready
+    assert 'dedicated Chrome not running' in why
+    assert 'responsible orchestrator' in why and 'AGENTS.md' in why
+    assert 'reconnect it' not in why and 'Popen' not in why
+
+
+@pytest.mark.parametrize('flags, expected', [
+    ([], 'dedicated Chrome not running'),
+    (['--user-data-dir=/synthetic/personal'], 'dedicated Chrome not running'),
+    (None, 'pinned extension is absent, disconnected or ambiguous'),
+    (['--user-data-dir=TARGET', '--user-data-dir=TARGET'],
+     'pinned extension is absent, disconnected or ambiguous'),
+    (['--user-data-dir', 'TARGET', '--user-data-dir=/synthetic/personal'],
+     'pinned extension is absent, disconnected or ambiguous'),
+])
+def test_fixture_process_argv_target_scan(sandbox, monkeypatch, flags, expected):
+    _, directory = sandbox
+    _fixture_enumeration(monkeypatch)
+    target = str(directory.resolve())
+    if flags is None:
+        args = ['--user-data-dir=' + target]
+    else:
+        args = [value.replace('TARGET', target) for value in flags]
+    monkeypatch.setattr(profile, '_processes', lambda: iter([(101, ['chrome', *args])]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and expected in why
+    if 'ambiguous' in expected:
+        assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_genuine_empty_browser_snapshot_uses_process_verdict(sandbox, monkeypatch):
+    # Status reports an enumeration candidate; the successful second read is empty.
+    _fixture_enumeration(monkeypatch, rows=[])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'dedicated Chrome not running' in why
+    assert 'AGENTS.md' in why and 'responsible orchestrator' in why
+
+
+def test_fixture_swallowed_browser_unavailable_uses_independent_proc_verdict(
+        sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, unavailable=True)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'dedicated Chrome not running' in why
+    assert 'AGENTS.md' in why
+
+
+def test_fixture_swallowed_browser_unavailable_target_process_keeps_ambiguity(
+        sandbox, monkeypatch):
+    _, directory = sandbox
+    _fixture_enumeration(monkeypatch, unavailable=True)
+    target = str(directory.resolve())
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([
+        (101, ['chrome', '--user-data-dir=' + target, '--user-data-dir=/synthetic/other'])]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready
+    assert why == ('BrowserSkill unavailable: pinned extension is absent, '
+                   'disconnected or ambiguous; reconnect it and rerun fixture.')
+
+
+def test_fixture_proc_enumeration_failure_stays_preflight_failure(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, unavailable=True)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    def failed_process_scan():
+        raise OSError('synthetic /proc iterdir failure')
+    monkeypatch.setattr(profile, '_processes', failed_process_scan)
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'read-only fixture preflight failed (OSError)' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_disconnected_and_ready_paths_remain_distinct(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [101])
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'pinned extension is absent' in why
+    assert 'dedicated Chrome not running' not in why
+
+    _fixture_enumeration(monkeypatch, rows=[{'instance_id': 'pinned'}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [101])
+    assert profile._fixture_read_only_browser() == (True, '')
+
+
+def test_fixture_changed_configuration_wins_over_missing_diagnostic(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch)
+    initial = profile._config()
+    changed = {**initial, 'browser': 'competing-pin'}
+    values = iter([initial, changed])
+    monkeypatch.setattr(profile, '_config', lambda _settings=None: next(values))
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'configuration changed' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_connected_extension_without_owned_process_is_contradictory(
+        sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, rows=[{'instance_id': 'pinned'}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'not independently observed' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+@pytest.mark.parametrize('failure', ['status', 'profile_pids'])
+def test_fixture_propagated_observation_errors_stay_preflight_failures(
+        sandbox, monkeypatch, failure):
+    if failure == 'status':
+        monkeypatch.setattr(bsk, '_sync',
+                            lambda *_a, **_kw: (_ for _ in ()).throw(
+                                bsk.Unavailable('synthetic status failure')))
+    else:
+        _fixture_enumeration(monkeypatch)
+        monkeypatch.setattr(profile, 'profile_pids',
+                            lambda _directory: (_ for _ in ()).throw(
+                                OSError('synthetic profile observation failure')))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'read-only fixture preflight failed' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_multiple_owned_processes_remain_ambiguous(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, rows=[{'instance_id': 'pinned'}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [101, 102])
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'dedicated Chrome process is ambiguous' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_changed_configuration_wins_over_ready_result(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, rows=[{'instance_id': 'pinned'}])
+    initial = profile._config()
+    changed = {**initial, 'browser': 'competing-pin'}
+    values = iter([initial, changed])
+    monkeypatch.setattr(profile, '_config', lambda _settings=None: next(values))
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [101])
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'configuration changed' in why
+    assert 'dedicated Chrome not running' not in why
+
+
+def test_fixture_path_resolution_failure_stays_preflight_failure(
+        sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch)
+    config = profile._config()
+    monkeypatch.setattr(profile, '_config', lambda _settings=None: config)
+    class UnresolvablePath:
+        def __init__(self, _value):
+            pass
+        def expanduser(self):
+            return self
+        def resolve(self):
+            raise OSError('synthetic path resolution failure')
+    monkeypatch.setattr(profile, 'Path', UnresolvablePath)
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'read-only fixture preflight failed (OSError)' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why
+
+
+def test_fixture_duplicate_pinned_rows_remain_ambiguous(sandbox, monkeypatch):
+    _fixture_enumeration(monkeypatch, rows=[
+        {'instance_id': 'pinned'}, {'instance_id': 'pinned'}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [])
+    monkeypatch.setattr(profile, '_processes', lambda: iter([]))
+    ready, why = profile._fixture_read_only_browser()
+    assert not ready and 'pinned extension is absent' in why
+    assert 'dedicated Chrome not running' not in why and 'AGENTS.md' not in why

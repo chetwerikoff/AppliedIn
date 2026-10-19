@@ -2889,3 +2889,49 @@ async def test_non_actionable_granted_checkbox_never_advertised_or_clicked(
         assert decide.await_count == 1
         assert decide.call_args.args[1]['approved_choices'] == []
     assert not any(c[0] == 'click' for c in browser.calls)
+
+async def test_optional_disabled_native_input_does_not_block_required_gate(
+        monkeypatch, caplog):
+    """Required-field traversal must skip non-required, disabled siblings."""
+    optional = field('Optional detail', '#optional', required=False, disabled=True)
+    pending = field('Contact preference', '#choice', type='checkbox',
+                    question='Preferred contact', value='on', has_value=True)
+    page = inventory(optional, pending, submit())
+    browser, decide, _ = world(monkeypatch, page)
+    with caplog.at_level('INFO', logger=forms.__name__):
+        report = await attempt(page)
+    assert report['status'] == 'gate'
+    assert report['form_question']['selector'] == '#choice'
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == forms.__name__ and
+             record.getMessage().startswith('bootstrap field decision ')]
+    assert len(lines) == 1 and "'decision': 'needs-human'" in lines[0]
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+
+
+async def test_required_radio_group_with_optional_leader_has_one_gate_record(
+        monkeypatch, caplog):
+    """The radio group's aggregate requiredness is not its first input's flag."""
+    first = field('Morning', '#morning', type='radio', name='schedule',
+                  question='Schedule preference', value='am',
+                  required=False, has_value=True)
+    second = field('Evening', '#evening', type='radio', name='schedule',
+                   question='Schedule preference', value='pm',
+                   required=True, has_value=True)
+    page = inventory(first, second, submit())
+    browser, decide, _ = world(monkeypatch, page)
+    with caplog.at_level('INFO', logger=forms.__name__):
+        report = await attempt(page)
+    assert report['status'] == 'gate'
+    assert report['form_question']['label'] == 'Schedule preference'
+    assert report['form_question']['radio_members'][1]['selector'] == '#evening'
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == forms.__name__ and
+             record.getMessage().startswith('bootstrap field decision ')]
+    assert len(lines) == 1
+    assert "'type': 'radio'" in lines[0]
+    assert "'required': True" in lines[0]
+    assert "'decision': 'needs-human'" in lines[0]
+    assert not decide.await_count
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)

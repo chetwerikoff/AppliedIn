@@ -1069,3 +1069,78 @@ def test_exhausted_preclick_allows_close_only_without_new_application(world):
     assert after["pre_submit_retry_used"] is True
     assert after["apply_requested_at"] == "spent-stamp"
     assert not q.put(PK, "example-co")
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_true_browser_skill_upload_interrupt_has_same_attempt_positive_phase(
+        world, monkeypatch, cancelled):
+    """Offline controller: upload IPC interrupts before any submit/continue arm."""
+    from tools import browser_runtime
+    stores, _ = world
+    current = {
+        "url": URL, "text": "", "inventory_verified": True,
+        "controls": [
+            {"selector": "#resume", "type": "file", "tag": "input",
+             "label": "Resume", "files": ["Resume.pdf"],
+             "in_form": True, "form_action": URL},
+            {"selector": "#submit", "type": "submit", "tag": "button",
+             "label": "Submit application", "submit": True,
+             "form_selector": "#application",
+             "native_form_owner_selector": "#application",
+             "in_form": True, "form_action": URL},
+        ]}
+    events = []
+
+    class Session:
+        def __init__(self, *_):
+            self.upload_attempted = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def navigate(self, _):
+            return current
+
+        async def page(self):
+            return current
+
+        async def call(self, action, *_args, **_kwargs):
+            events.append(action)
+            if action == "upload":
+                self.upload_attempted = True
+                if cancelled:
+                    raise asyncio.CancelledError()
+                raise bsk.Unavailable("synthetic upload interruption")
+            pytest.fail("No committing BrowserSkill call is allowed in pre-click test")
+
+    monkeypatch.setattr(forms, "check_dispatch", lambda *_a, **_kw: None)
+    monkeypatch.setattr('tools.claude_chrome._stage_resume',
+                        lambda *_args: "Resume.pdf")
+    monkeypatch.setattr(bsk, "Session", Session)
+    monkeypatch.setattr(bsk, "decision", AsyncMock(
+        return_value={"action": "upload", "selector": "#resume"}))
+    monkeypatch.setattr(browser_runtime, "backend", lambda: bsk)
+    monkeypatch.setattr(bsk, "apply_chrome", forms.apply)
+
+    kwargs = {"pk": PK, "resume_path": "Resume.pdf"}
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError):
+            await browser_runtime.apply(URL, "example-co", {}, "synthetic", **kwargs)
+        row = stores.tracking.get(PK)
+        assert row["status"] == "needs_human"
+        assert row["gate_reason"] == submit_hold.PRE_SUBMIT
+        assert row["fail_kind"] == submit_hold.PRE_SUBMIT
+        assert row["result"]["reason"] == submit_hold.PRE_SUBMIT
+        assert row["last_button"] == ""
+    else:
+        result = await browser_runtime.apply(
+            URL, "example-co", {}, "synthetic", **kwargs)
+        assert result["status"] == "uncertain"
+        assert submit_hold.proof_from_result(result)
+        assert submit_hold.classify_new_pre_submit(
+            PK, stores.tracking.get(PK) or {}, result, tracking=stores.tracking)
+    assert events == ["upload"]
+    assert stores.tracking.r.get(f"submit_hold:{PK}") is None

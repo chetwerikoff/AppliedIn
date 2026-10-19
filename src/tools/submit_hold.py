@@ -50,6 +50,20 @@ def raw_absent(pk: str, *, tracking=None) -> bool:
     return _client(tracking).get(f"submit_hold:{pk}") is None
 
 
+def valid_mark(pk: str, *, tracking=None) -> bool:
+    """Verify OUR written hold payload; a present empty/corrupt key is a veto,
+    not proof that the mark-before-IPC write was persisted correctly."""
+    try:
+        raw = _client(tracking).get(f"submit_hold:{pk}")
+        marker = json.loads(raw) if raw is not None else {}
+        return (isinstance(marker, dict) and marker.get("reason") == REASON
+                and isinstance(marker.get("timestamp"), str)
+                and bool(marker["timestamp"]))
+    except (TypeError, ValueError):
+        return False
+
+
+
 def possible_state(pk: str, row: dict, *, tracking=None,
                    keyless_cloud: bool = False) -> str:
     """Possible-submission evidence is narrower than replay blocking."""

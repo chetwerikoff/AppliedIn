@@ -197,6 +197,36 @@ def _fixture_read_only_browser(settings=None) -> tuple[bool, str]:
         rows = _browsers()
         matches = [r for r in rows if r.get('instance_id') == cfg['browser']
                    and not r.get('unresponsive') and not r.get('version_skew')]
+        directory = Path(cfg['user_data_dir']).expanduser().resolve()
+        pids = profile_pids(cfg['user_data_dir'])
+        if not pids:
+            # Empty extension rows can mean either no extension or a swallowed
+            # BrowserSkill enumeration failure; only a complete process scan can
+            # distinguish an absent dedicated Chrome from an unrelated profile.
+            for _, args in _processes():
+                values = [arg.partition('=')[2] if arg.startswith('--user-data-dir=') else (
+                    args[i + 1] if i + 1 < len(args) else '')
+                    for i, arg in enumerate(args)
+                    if arg.startswith('--user-data-dir=') or arg == '--user-data-dir']
+                if any(value and Path(value).expanduser().resolve() == directory
+                       for value in values):
+                    return False, ('BrowserSkill unavailable: pinned extension is absent, '
+                                   'disconnected or ambiguous; reconnect it and rerun fixture.')
+            if len(matches) > 1:
+                return False, ('BrowserSkill unavailable: pinned extension is absent, '
+                               'disconnected or ambiguous; reconnect it and rerun fixture.')
+            if matches:
+                return False, ('BrowserSkill unavailable: pinned extension reports connected, '
+                               'but its dedicated Chrome process was not independently observed.')
+            if _config(settings) != cfg:
+                return False, ('BrowserSkill unavailable: pinned browser configuration changed; '
+                               'inspect the selection and rerun fixture.')
+            return False, ('BrowserSkill unavailable: dedicated Chrome not running; the '
+                           'responsible orchestrator must follow AGENTS.md → Dedicated '
+                           'application Chrome health.')
+        if len(pids) != 1:
+            return False, ('BrowserSkill unavailable: dedicated Chrome process is ambiguous '
+                           'for pinned user-data-dir; inspect the profile and rerun fixture.')
         if len(matches) != 1:
             return False, ('BrowserSkill unavailable: pinned extension is absent, '
                            'disconnected or ambiguous; reconnect it and rerun fixture.')

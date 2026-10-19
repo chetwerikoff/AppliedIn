@@ -1525,7 +1525,10 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "failed", "pk": pk, "reason": "uncertain", "detail": reason}
     if status == "applied":
         conf = result.get("confirmation") or "submitted"
-        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf)
+        stores.tracking.set_status(
+            pk, Status.APPLIED, confirmation_id=conf, gate_reason="",
+            gate_pending=None, fail_kind="", fail_reason="",
+            possible_submission=False)
         if getattr(stores.tracking, 'r', None) is not None:
             submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)
@@ -2150,7 +2153,10 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
     outcome = _apply_outcome(apply_result)
     if outcome.get("status") == "applied":
         confirmation = outcome.get("confirmation") or "submitted"
-        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=confirmation)
+        stores.tracking.set_status(
+            pk, Status.APPLIED, confirmation_id=confirmation, gate_reason="",
+            gate_pending=None, fail_kind="", fail_reason="",
+            possible_submission=False)
         if getattr(stores.tracking, 'r', None) is not None:
             submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)

@@ -2184,7 +2184,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             fail_reason=submit_hold.PRE_SUBMIT_TEXT,
             result={"reason": submit_hold.PRE_SUBMIT},
             pre_submit_never_armed=True, pre_submit_engine="browser_skill",
-            gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT})
+            gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT},
+            gate_call_id=None, last_button="", last_url="")
         return {"result": "failed", "pk": pk, "reason": submit_hold.PRE_SUBMIT}
     if submit_hold.blocked(pk, final, tracking=stores.tracking) or outcome.get('status') == 'uncertain':
         stores.tracking.set_status(

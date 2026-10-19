@@ -56,10 +56,10 @@ from core.logging import get_logger
 from core.models import Status
 from core.stores import make_stores
 
-log = get_logger(__name__)
-
-
 DEFAULT_PORT = 8787
+CONFIGURED_PORT = int(os.environ.get("APPLIEDIN_WEB_PORT") or DEFAULT_PORT)
+
+log = get_logger(__name__)
 
 # Where a second instance keeps its own everything. Every path and connection in
 # the product already derives from three settings — the web port, `local_dir` and
@@ -92,7 +92,7 @@ def _apply_instance(port: int | None, *, fresh: bool = False) -> dict:
     chosen = int(port or os.environ.get("APPLIEDIN_WEB_PORT") or DEFAULT_PORT)
     os.environ["APPLIEDIN_WEB_PORT"] = str(chosen)
     out: dict = {"port": chosen, "instance": "default"}
-    if chosen != DEFAULT_PORT:
+    if chosen != CONFIGURED_PORT:
         out["instance"] = f"port-{chosen}"
         # Set UNCONDITIONALLY. An earlier version deferred to an existing
         # APPLIEDIN_LOCAL_DIR "so an explicit value wins" — but .env already sets
@@ -120,9 +120,9 @@ def _wipe_instance() -> dict:
     import shutil
 
     port = int(os.environ.get("APPLIEDIN_WEB_PORT", DEFAULT_PORT))
-    if port == DEFAULT_PORT:
+    if port == CONFIGURED_PORT:
         return {"refused": "--fresh will not wipe the default instance on port "
-                           f"{DEFAULT_PORT}; give it a --port of its own"}
+                           f"{CONFIGURED_PORT}; give it a --port of its own"}
     s = get_settings()
     done: dict = {"local_dir": s.local_dir, "redis": s.redis_url}
     local = Path(s.local_dir)
@@ -364,13 +364,13 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--fresh", action="store_true",
                     help="wipe this instance's state first, so it starts with no "
                          "history. Requires a --port of its own; it refuses to "
-                         f"wipe the default instance on {DEFAULT_PORT}.")
+                         f"wipe the default instance on {CONFIGURED_PORT}.")
     # Every lifecycle command takes --port, because the port is how an instance is
     # identified: `stop` without it would stop the default one instead.
     for parser in (st, *[sub.add_parser(n) for n in
                          ("stop", "status", "logs", "discover", "work", "run")]):
         parser.add_argument("--port", type=int, default=None,
-                            help=f"web port (default {DEFAULT_PORT}). Any other "
+                            help=f"web port (default {CONFIGURED_PORT}). Any other "
                                  "port is a separate instance with its own .local "
                                  "directory and its own Redis database, so it "
                                  "shares no data with the default one.")

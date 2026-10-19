@@ -161,6 +161,96 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
     return safe
 
 
+
+def _greenhouse_feed_target(url: str, board: str, jid: str, wrapper_url: str) -> bool:
+    """Confirm the configured hosted identity without adopting an API URL."""
+    if not url:
+        return True
+    if url == wrapper_url:
+        return True
+    try:
+        parts = urlsplit(url)
+        return (parts.scheme == "https"
+                and parts.netloc in {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+                and parts.path == f"/{board}/jobs/{jid}"
+                and not parts.query and not parts.fragment)
+    except ValueError:
+        return False
+
+
+def _reconcile_browser_greenhouse(company: CompanyConfig,
+                                  jobs: list[JobRecord]) -> list[JobRecord]:
+    """Promote *new browser listing* identities, never static/crawl/sitemap rows.
+
+    A watchlist tuple supplies independently reviewed company-wide authority;
+    the actual configured-board API supplies independent posting membership.
+    Neither the model's board label nor a redirect may fill either role.
+    """
+    if (company.discovery is not DiscoveryMode.BROWSER
+            or company.ats != "greenhouse" or not company.board or not jobs):
+        return jobs
+    from pathlib import Path
+
+    from core.config import get_settings
+    from tools.claude_chrome import greenhouse_alias_candidate, verified_greenhouse_alias
+    from .adapters.greenhouse import GreenhouseAdapter
+    from .watchlist import load_watchlist
+
+    try:
+        configs = load_watchlist(Path(get_settings().config_dir) / "watchlist.yaml")
+        matches = [cfg for cfg in configs
+                   if cfg.name.strip().lower() == company.name.strip().lower()]
+        if (len(matches) != 1 or matches[0].ats != "greenhouse"
+                or matches[0].discovery is not DiscoveryMode.BROWSER
+                or matches[0].board != company.board
+                or matches[0].careers_url != company.careers_url):
+            return jobs
+    except Exception as exc:
+        log.info("%s: no current unique wrapper authority (%s)", company.name, exc)
+        return jobs
+
+    board = matches[0].board
+    proposed: dict[str, list[tuple[int, JobRecord]]] = {}
+    for index, job in enumerate(jobs):
+        if job.company != company.name or not greenhouse_alias_candidate(job.jd_url):
+            continue
+        jid = urlsplit(job.jd_url).query.split("=", 1)[1]
+        pinned = job.model_copy(update={
+            "job_id": jid, "ats": "greenhouse", "greenhouse_board": board,
+        })
+        row = {"pk": pinned.pk, "company": pinned.company,
+               "job_id": pinned.job_id, "jd_url": pinned.jd_url,
+               "ats": pinned.ats, "greenhouse_board": pinned.greenhouse_board}
+        if verified_greenhouse_alias(
+                row, pk=pinned.pk, company=company.name, url=pinned.jd_url,
+                configs=configs) is not None:
+            proposed.setdefault(jid, []).append((index, pinned))
+    if not proposed:
+        return jobs
+
+    try:
+        with httpx.Client() as client:
+            feed = GreenhouseAdapter().fetch(matches[0], client)
+    except Exception as exc:
+        log.info("%s: configured Greenhouse jobs feed unavailable (%s)", company.name, exc)
+        return jobs
+
+    by_id: dict[str, list[JobRecord]] = {}
+    for item in feed:
+        if item.ats == "greenhouse" and item.job_id in proposed:
+            by_id.setdefault(item.job_id, []).append(item)
+    accepted = list(jobs)
+    for jid, variants in proposed.items():
+        witnesses = by_id.get(jid, [])
+        if len(variants) != 1 or len(witnesses) != 1:
+            continue
+        index, pinned = variants[0]
+        if not _greenhouse_feed_target(
+                witnesses[0].jd_url, board, jid, pinned.jd_url):
+            continue
+        accepted[index] = pinned
+    return accepted
+
 def _render_page(url: str) -> str | None:
     """Deliberately no browser here.
 
@@ -493,6 +583,10 @@ def crawl_company(
             if (listed := _listed_in_sitemap(company, prefs, stores)) is not None:
                 return listed
         found = _browser_extract(company.careers_url, company.name, prefs)
+        # Only this explicit production browser branch may establish the pin.
+        # Both sitemap early-return and crawl fallback remain ordinary identities.
+        if force_browser:
+            found = _reconcile_browser_greenhouse(company, found)
         progress.record(found=len(found), stage="Matching preferences")
         jobs = relevant(found, prefs)
         _note_screened_out(stores, company.name, found, jobs)

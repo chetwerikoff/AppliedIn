@@ -874,7 +874,8 @@ def verified_greenhouse_alias(row: dict, *, pk: str, company: str, url: str,
     board = getattr(cfg, 'board', None)
     careers = getattr(cfg, 'careers_url', None)
     if (getattr(cfg, 'ats', None) != 'greenhouse'
-            or not isinstance(board, str) or not _ALIAS_BOARD.fullmatch(board)):
+            or not isinstance(board, str) or not _ALIAS_BOARD.fullmatch(board)
+            or row.get('greenhouse_board') != board):
         return None
     # Only a pathless configured HTTPS origin borrows the already-accepted root path.
     configured_url = careers

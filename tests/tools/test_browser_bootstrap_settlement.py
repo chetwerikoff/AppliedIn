@@ -101,7 +101,8 @@ def _fixture(route, *, kind=None, noisy=False):
             name=COMPANY, ats='greenhouse', board=COMPANY,
             careers_url='https://careers.example-co.test/openings')
         row = {'pk': pk, 'company': COMPANY, 'ats': 'greenhouse',
-               'job_id': '123456', 'jd_url': wrapper, 'status': 'submitting',
+               'greenhouse_board': COMPANY, 'job_id': '123456',
+               'jd_url': wrapper, 'status': 'submitting',
                'possible_submission': False, 'human_approved_answers': {}}
     else:
         raise AssertionError(route)
@@ -310,7 +311,7 @@ def _world(monkeypatch, route, *, kind=None, noisy=False, explicit_ashby_native=
     monkeypatch.setattr('core.config.get_settings',
                         lambda: SimpleNamespace(config_dir='/synthetic-only'))
     monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda path: [case.config])
-    monkeypatch.setattr(forms, '_row', lambda pk, **kw: case.row)
+    monkeypatch.setattr(forms, '_row', lambda pk, *args, **kw: case.row)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kw: None)
     monkeypatch.setattr('tools.claude_chrome._stage_resume',
                         lambda path, owner: path)
@@ -324,6 +325,19 @@ async def _apply(case, facts=None, *, resume_path='Resume.pdf'):
     return await forms.apply(case.wrapper, COMPANY,
                              case.facts if facts is None else facts,
                              'synthetic', pk=case.pk, resume_path=resume_path)
+
+async def test_greenhouse_positive_fixture_requires_persisted_pin(monkeypatch):
+    case, raw = _world(monkeypatch, 'greenhouse')
+    case.row.pop('greenhouse_board')
+    monkeypatch.setattr(
+        bsk, 'Session', lambda *args: pytest.fail('unpinned row opened browser'))
+
+    result = await _apply(case)
+
+    assert result['status'] == 'gate'
+    assert result['reason'] == 'defect_tenant'
+    assert raw.calls == []
+    assert raw.writes == []
 
 
 def _decisions(caplog):

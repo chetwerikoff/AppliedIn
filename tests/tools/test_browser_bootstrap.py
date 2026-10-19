@@ -970,7 +970,8 @@ GH_CAREERS = 'https://careers.example-co.test/openings'
 
 
 def _greenhouse_row():
-    return {'pk': GH_PK, 'company': 'example-co', 'job_id': '123456',
+    return {'pk': GH_PK, 'company': 'example-co',
+            'greenhouse_board': 'example-co', 'job_id': '123456',
             'ats': 'greenhouse', 'jd_url': GH_WRAP,
             'status': 'submitting', 'human_approved_answers': {},
             'possible_submission': False}
@@ -1022,7 +1023,7 @@ def _greenhouse_session(monkeypatch, tmp_path, page=None, *, careers_url=GH_CARE
 
     monkeypatch.setattr(browser, 'call', call)
     row = _greenhouse_row()
-    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    monkeypatch.setattr(forms, '_row', lambda _pk, *args, **kwargs: row)
     return browser, decide, row
 
 
@@ -1045,6 +1046,9 @@ def test_explicit_greenhouse_tenant_requires_canonical_row_and_config():
     row = _greenhouse_row()
     alias = _greenhouse_provenance(row)
     assert alias and alias.url == GH_DIRECT
+    unpinned = {**row}
+    unpinned.pop('greenhouse_board')
+    assert _greenhouse_provenance(unpinned) is None
     assert direct_board_url(GH_WRAP) == ''  # The Claude engine is unchanged.
     assert _greenhouse_provenance({**row, 'job_id': '654321'}) is None
     assert _greenhouse_provenance({**row, 'pk': 'example-co#654321'}) is None

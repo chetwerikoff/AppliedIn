@@ -502,13 +502,41 @@ def confirmation(before: dict, after: dict) -> str:
     return match.group(0)
 
 
-def _row(pk: str, *, fixture_context=None) -> dict:
+def _row(pk: str, fixture_context=None, alias_read: bool = False) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     if ctx is not None:
         return dict(ctx.row)
     from core.stores import make_stores
-    return make_stores().tracking.get(pk) or {}
+    tracking = make_stores().tracking
+    # Only tenant admission/rechecks need a strongly consistent cloud row.
+    reader = (getattr(tracking, 'get_alias', tracking.get)
+              if alias_read else tracking.get)
+    return reader(pk) or {}
 
+
+
+def _greenhouse_id_query_attempt(url: str) -> bool:
+    """Recognize malformed raw/encoded gh_jid attempts before browser startup.
+
+    This classifier only blocks attempts at the tenant-bearing query key;
+    unrelated custom-careers query parameters stay on their ordinary route.
+    """
+    from urllib.parse import unquote_plus
+
+    if not isinstance(url, str) or '?' not in url:
+        return False
+    query = url.partition('?')[2].partition('#')[0]
+    # Follow stacked escapes to a fixed point; nested query keys must not bypass
+    # the pre-browser tenant gate. A hostile over-depth query fails closed.
+    key_attempt = re.compile(r'(?i)(?:^|[&;=])gh_jid(?:=|[&;]|$)')
+    for _ in range(32):
+        if key_attempt.search(query):
+            return True
+        decoded = unquote_plus(query)
+        if decoded == query:
+            return False
+        query = decoded
+    return True
 
 
 def _greenhouse_wrapper_missing_board(pk: str, company: str, url: str) -> bool:
@@ -517,7 +545,11 @@ def _greenhouse_wrapper_missing_board(pk: str, company: str, url: str) -> bool:
         from core.config import get_settings
         from core.ids import make_pk
         from discovery.watchlist import load_watchlist
-        row = _row(pk)
+        row = _row(pk, None, True)
+        # This diagnostic is exclusively for pre-pin legacy rows. A present
+        # pin, even empty or stale after config change, fails as defect_tenant.
+        if 'greenhouse_board' in row:
+            return False
         job_id = row.get('job_id')
         match = re.fullmatch(r'gh_jid=([0-9]+)', urlsplit(url).query)
         if (row.get('pk') != pk or row.get('company') != company
@@ -555,7 +587,7 @@ def _configured_alias(pk: str, company: str, url: str, *,
         from core.config import get_settings
         from discovery.watchlist import load_watchlist
         row = (_row(pk, fixture_context=fixture_context) if fixture_context
-               else _row(pk))
+               else _row(pk, None, True))
         configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
         if row.get('ats') in _APPLICATION_ENTRY:
             return _application_entry(row, pk, company, url, configs)
@@ -4208,6 +4240,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                    else 'defect_tenant'))
             direct_url = provenance.url
             trusted_origins = (url,)
+        elif _greenhouse_id_query_attempt(url):
+            # Keep the existing explicit derived-board diagnostic for a forged
+            # ?board= target; malformed gh_jid attempts still fail before Chrome.
+            derived_tenant = (
+                direct_url != url
+                and urlsplit(direct_url).hostname == 'job-boards.greenhouse.io')
+            raise Gate(
+                'Derived board tenant or job is not proven to match the tracked URL.'
+                if derived_tenant else
+                'No unique explicit Greenhouse tenant and tracked job were proven.',
+                reason='defect_tenant')
         else:
             # A query-derived Greenhouse tenant is untrusted; reject it before
             # reading tracking, which can be unavailable and would mask the gate.

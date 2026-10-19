@@ -88,10 +88,8 @@ class RedisTracking(AbstractTracking):
         pipe.execute()
 
     def put_new(self, job: JobRecord, *, status: Status = Status.FOUND) -> bool:
-        # SETNX gives the same "conditional create" dedup as DynamoDB's
-        # attribute_not_exists(pk).
-        if not self.r.set(f"app:{job.pk}", "{}", nx=True):
-            return False
+        # Build the full identity first: SET NX must never expose a temporary
+        # placeholder that another preflight might read as a persisted job.
         from datetime import datetime
         row = {
             "pk": job.pk, "jd_hash": job.jd_hash, "status": status.value,
@@ -106,7 +104,18 @@ class RedisTracking(AbstractTracking):
             "apply_requested_at": job.apply_requested_at,
             "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
         }
-        self._write(job.pk, row, prev_status=None)
+        if job.greenhouse_board:
+            row["greenhouse_board"] = job.greenhouse_board
+        if not self.r.set(f"app:{job.pk}", json.dumps(row, default=str), nx=True):
+            return False
+        # Only indexes follow the atomic first row. Never write the row again:
+        # a concurrent update after SET NX must not be overwritten by indexing.
+        pipe = self.r.pipeline()
+        if not is_internal_pk(job.pk):
+            pipe.sadd(f"status:{status.value}", job.pk)
+        if row.get("jd_hash"):
+            pipe.hset("jdhash", row["jd_hash"], job.pk)
+        pipe.execute()
         return True
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:

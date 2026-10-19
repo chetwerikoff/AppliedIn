@@ -1,3 +1,4 @@
+import pytest
 import httpx
 from core.models import DiscoveryMode
 from discovery.resolver import detect_from_url, resolve
@@ -74,3 +75,72 @@ def test_vendor_urls_still_resolve_but_custom_posting_hosts_do_not():
         fallback = resolve(custom)
         assert (fallback.ats, fallback.board, fallback.discovery) == (
             "custom", custom, DiscoveryMode.CRAWL)
+
+
+@pytest.mark.parametrize(("ats", "board", "mode"), [
+    ("", "", DiscoveryMode.CRAWL),
+    ("", "", DiscoveryMode.BROWSER),
+    ("greenhouse", "", DiscoveryMode.BROWSER),
+    ("", "guessed-board", DiscoveryMode.CRAWL),
+])
+def test_custom_wrapper_ignores_greenhouse_page_and_probe_hints(monkeypatch, ats, board, mode):
+    from discovery import handler
+    from discovery.resolver import AtsMatch
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(handler, "resolve",
+                        lambda *a, **kw: AtsMatch("greenhouse", "guessed-board"))
+    company = CompanyConfig(name="example-co", careers_url="https://careers.example-co.test/openings",
+                            ats=ats, board=board, discovery=mode)
+    result = handler.resolve_company(company, httpx.Client())
+    assert result.ats == "custom"
+    assert result.board == company.careers_url
+    assert result.discovery is (DiscoveryMode.BROWSER if mode is DiscoveryMode.BROWSER
+                                else DiscoveryMode.CRAWL)
+
+
+def test_native_hosted_greenhouse_still_resolves_feed(monkeypatch):
+    from discovery import handler
+    from discovery.resolver import AtsMatch
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(handler, "resolve",
+                        lambda *a, **kw: AtsMatch("greenhouse", "example-board"))
+    company = CompanyConfig(name="example-co",
+                            careers_url="https://boards.greenhouse.io/example-board")
+    result = handler.resolve_company(company, httpx.Client())
+    assert (result.ats, result.board, result.discovery) == (
+        "greenhouse", "example-board", DiscoveryMode.FEED)
+
+
+def test_other_ats_hint_is_unaffected_by_wrapper_greenhouse_fence(monkeypatch):
+    from discovery import handler
+    from discovery.resolver import AtsMatch
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(handler, "resolve",
+                        lambda *a, **kw: AtsMatch("ashby", "example-board"))
+    company = CompanyConfig(name="example-co",
+                            careers_url="https://careers.example-co.test/openings")
+    result = handler.resolve_company(company, httpx.Client())
+    assert result.ats == "ashby"
+
+
+@pytest.mark.parametrize("ats", ["ashby", "lever"])
+def test_board_only_configuration_preserves_other_ats_resolution(monkeypatch, ats):
+    from core.models import DiscoveryMode
+    from discovery import handler
+    from discovery.resolver import AtsMatch
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(handler, "resolve",
+                        lambda *a, **kw: AtsMatch(ats, "resolved-board"))
+    company = CompanyConfig(
+        name="example-co",
+        careers_url="https://careers.example-co.test/openings",
+        board="saved-token")
+
+    result = handler.resolve_company(company, httpx.Client())
+
+    assert (result.ats, result.board, result.discovery) == (
+        ats, "resolved-board", DiscoveryMode.FEED)

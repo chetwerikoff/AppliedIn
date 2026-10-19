@@ -982,6 +982,13 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       .map(n=>n.innerText).join(' ');
     return clean(labels || aria);
   };
+  // Standalone fixed reads cannot borrow the entry reader's Ashby bindings.
+  const fixedAshbyNative = location.protocol==='https:' &&
+    location.hostname==='jobs.ashbyhq.com';
+  const fixedAshbyLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
+    (e.getAttribute('aria-labelledby') || '').split(' ')
+      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
+    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   /* WIDGET_GRAPH */
@@ -1053,7 +1060,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
         formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
-        ...(ashbyNative ? {label:entryLabel(e),
+        ...(fixedAshbyNative ? {label:fixedAshbyLabel(e),
           submit:['submit','image'].includes(type) && ['INPUT','BUTTON'].includes(e.tagName)
             && !!e.form, required:!!e.required || e.getAttribute('aria-required')==='true',
           form_action_attr_present:!!form && form.hasAttribute('action'),

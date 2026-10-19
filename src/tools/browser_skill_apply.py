@@ -4537,7 +4537,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         fail_reason=submit_hold.PRE_SUBMIT_TEXT,
                         pre_submit_never_armed=True, pre_submit_engine='browser_skill',
                         result={'reason': submit_hold.PRE_SUBMIT},
-                        last_button='', last_url=str(step.get('url') or '')[:400])
+                        last_button='', last_url='')
                 else:
                     tracking.set_status(
                         pk, 'needs_human', gate_reason='submit_uncertain',

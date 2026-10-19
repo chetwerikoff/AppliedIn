@@ -70,22 +70,55 @@ class RedisTracking(AbstractTracking):
         raw = self.r.get(f"app:{pk}")
         return json.loads(raw) if raw else None
 
+    @staticmethod
+    def _recovered_write_allowed(current: dict, proposed: dict,
+                                 previous: str | None) -> bool:
+        """Never let an old full-row snapshot erase consumed recovery/approval."""
+        if not current.get("pre_submit_retry_used"):
+            return True
+        if proposed.get("pre_submit_retry_used") is not True:
+            return False
+        if current.get("apply_requested_at") != proposed.get("apply_requested_at"):
+            return False
+        if current.get("status") != previous:
+            return False
+        if proposed.get("status") != previous:
+            from tools.submit_hold import direct_approval
+            # The explicit click owns these transitions, not old queued workers.
+            if (not current.get("apply_requested_at")
+                    or direct_approval() != current.get("apply_requested_at")):
+                # A human-verified closure may still settle the exhausted row.
+                if proposed.get("status") not in ("skipped", "applied_manual"):
+                    return False
+        return True
+
     def _write(self, pk: str, row: dict, prev_status: str | None) -> None:
-        pipe = self.r.pipeline()
-        pipe.set(f"app:{pk}", json.dumps(row, default=str))
-        status = row.get("status")
-        # The status sets are an index of JOBS. Bookkeeping rows (watermarks, run
-        # markers) carry a status too, and letting them in meant any count taken
-        # from the sets was wrong by however many of them existed. Keeping them out
-        # here is what lets /stats count with SCARD instead of reading every row.
-        is_job = not is_internal_pk(pk)
-        if prev_status and prev_status != status:
-            pipe.srem(f"status:{prev_status}", pk)
-        if status and is_job:
-            pipe.sadd(f"status:{status}", pk)
-        if row.get("jd_hash"):
-            pipe.hset("jdhash", row["jd_hash"], pk)
-        pipe.execute()
+        key = f"app:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    current = json.loads(raw) if raw else {}
+                    if not self._recovered_write_allowed(current, row, prev_status):
+                        pipe.unwatch()
+                        return
+                    status = row.get("status")
+                    previous = current.get("status")
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    is_job = not is_internal_pk(pk)
+                    if previous and previous != status:
+                        pipe.srem(f"status:{previous}", pk)
+                    if status and is_job:
+                        pipe.sadd(f"status:{status}", pk)
+                    if row.get("jd_hash"):
+                        pipe.hset("jdhash", row["jd_hash"], pk)
+                    pipe.execute()
+                    return
+            except WatchError:
+                continue
+        raise RuntimeError("Tracking row could not be updated after WATCH contention")
 
     def put_new(self, job: JobRecord, *, status: Status = Status.FOUND) -> bool:
         # SETNX gives the same "conditional create" dedup as DynamoDB's
@@ -165,6 +198,10 @@ class RedisTracking(AbstractTracking):
                     previous = row.get("status")
                     patch = {k: getattr(v, "value", v) if k == "status" else v
                              for k, v in updates.items()}
+                    proposed = {**row, **patch}
+                    if not self._recovered_write_allowed(row, proposed, previous):
+                        pipe.unwatch()
+                        return False
                     row.update(patch)
                     status = row.get("status")
                     if status == "tailored" and previous != "tailored" and not row.get("tailored_at"):
@@ -208,7 +245,7 @@ class RedisTracking(AbstractTracking):
                         pipe.unwatch()
                         return False
                     row = json.loads(raw)
-                    if not legacy_repair_row_allowed(
+                    if row.get("pre_submit_retry_used") or not legacy_repair_row_allowed(
                             row, pk, company, job_id, old_url,
                             expected_status, expected_reader):
                         pipe.unwatch()

@@ -417,3 +417,68 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
     '/actions/rotate-and-approve','/actions/rotate-and-approve',
     '/actions/apply-profile-to-all']);
 });
+
+
+test('pre-submit inspection is the only fresh triage action, never portal reconciliation', () => {
+  const h = harness();
+  const pre = row('pre', {status:'needs_human', gate_reason:'pre_submit_uncertain',
+    fail_kind:'pre_submit_uncertain', gate_has_form_question:false,
+    gate_question:'Synthetic pre-submit failure', pre_submit_inspect_eligible:true});
+  h.state.apps = [pre];
+  assert.equal(h.fn('routeOf')(pre), 'manual_triage');
+  assert.equal(h.fn('sectionOf')(pre, new Set(['pre'])), 'triage');
+  assert.equal(h.fn('rowActionAllowed')('pre','inspect-pre-submit'), true);
+  for (const act of ['apply-now','answer','retry','reopen','queue-apply','skip','mark-applied'])
+    assert.equal(h.fn('rowActionAllowed')('pre', act), false, act);
+  const cards = h.fn('viewPipeline')();
+  assert.match(cards, /data-act="inspect-pre-submit"/);
+  assert.match(cards, /Pre-submit uncertainty/);
+  assert.doesNotMatch(cards, /Portal verification required/);
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  h.fn('openDrawer')('pre');
+  assert.match(h.node('#drawer-body').innerHTML, /data-act="inspect-pre-submit"/);
+  assert.doesNotMatch(h.node('#drawer-body').innerHTML,
+    /data-act="(?:apply-now|retry|queue-apply|answer)"/);
+});
+
+test('used recovery permits only one later direct Apply now; exhausted triage closes only', () => {
+  const h = harness(), allowed = h.fn('rowActionAllowed');
+  const recovered = row('once', {status:'tailored',gate_reason:'approval',
+    gate_has_form_question:false, pre_submit_retry_used:true, apply_requested_at:''});
+  h.state.apps = [recovered];
+  assert.equal(allowed('once','apply-now'), true);
+  for (const act of ['answer','retry','queue-apply','reopen','retailor','mark-applied',
+    'skip','run-now','queue-remove','force-apply'])
+    assert.equal(allowed('once', act), false, act);
+  recovered.apply_requested_at = 'synthetic-direct-approval';
+  assert.equal(allowed('once','apply-now'), false);
+  const exhausted = row('exhausted', {status:'needs_human',
+    gate_reason:'pre_submit_uncertain', fail_kind:'pre_submit_uncertain',
+    gate_has_form_question:false, pre_submit_retry_used:true,
+    pre_submit_close_only:true, apply_requested_at:'spent'});
+  h.state.apps = [exhausted];
+  assert.equal(h.fn('routeOf')(exhausted), 'manual_triage');
+  for (const act of ['apply-now','inspect-pre-submit','answer','retry','queue-apply'])
+    assert.equal(allowed('exhausted', act), false, act);
+  assert.equal(allowed('exhausted','skip'), true);
+  assert.equal(allowed('exhausted','mark-applied'), true);
+  const html = h.fn('viewNeeds')();
+  assert.match(html, /data-act="skip"/);
+  assert.match(html, /data-act="mark-applied"/);
+  assert.doesNotMatch(html, /data-act="apply-now"|data-act="retry"/);
+});
+
+test('pre-submit flags never override a present or unreadable independent hold', () => {
+  const h = harness(), route = h.fn('routeOf'), allowed = h.fn('rowActionAllowed');
+  for (const state of ['blocked','unknown',undefined]) {
+    const held = row('held', {status:'needs_human',
+      gate_reason:'pre_submit_uncertain', fail_kind:'pre_submit_uncertain',
+      submit_hold_state:state, pre_submit_inspect_eligible:true,
+      pre_submit_close_only:true, pre_submit_retry_used:true});
+    h.state.apps = [held];
+    assert.equal(route(held), 'portal_check');
+    for (const act of ['inspect-pre-submit','apply-now','mark-applied','skip'])
+      assert.equal(allowed('held',act), false);
+    assert.doesNotMatch(h.fn('viewNeeds')(), /data-act="inspect-pre-submit"/);
+  }
+});

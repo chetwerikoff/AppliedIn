@@ -17,8 +17,9 @@ from core.models import ApplyMode, DiscoveryMode
 class CompanyConfig(BaseModel):
     name: str
     careers_url: str = ""  # the seed: a company's career-page URL
-    # ats/board are DERIVED from careers_url by the resolver; set them only to
-    # override detection. discovery is likewise resolved (feed vs crawl).
+    # Ordinary ATS hints are resolver-derived. For a custom Greenhouse wrapper
+    # only an operator-verified, repo-deployed explicit ats + board + careers_url
+    # tuple is tenant authority; resolver guesses never grant it.
     ats: str = ""
     board: str = ""  # board URL or token, adapter-specific
     login_secret: str = ""  # Secrets Manager name for portal creds

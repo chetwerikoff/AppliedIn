@@ -686,3 +686,73 @@ def test_dynamo_found_reader_aba_cycle_defeats_stale_repair(aws, monkeypatch):
     assert store.get(pk)["jd_read_revision"] == 6
     assert store.get(pk)["jd_url"] == before["jd_url"]
     assert _indexes(store, job)[0]["found"] == [pk]
+
+
+
+def test_dynamo_initial_board_pin_and_strong_alias_only_get(aws, monkeypatch):
+    """Only the dedicated alias reader sends ConsistentRead to the base table."""
+    make_applications_table()
+    job = JobRecord(
+        company="example-co", job_id="731205", title="Platform Engineer",
+        jd_url="https://careers.example-co.test/openings/engineer?gh_jid=731205",
+        jd_text="synthetic", ats="greenhouse", greenhouse_board="example-board",
+    )
+    store = TrackingStore("applications")
+    assert store.put_new(job)
+    assert not store.put_new(job.model_copy(update={"greenhouse_board": "foreign-board"}))
+    reads = []
+    original_get = store._table.get_item
+
+    def spy(**kwargs):
+        reads.append(dict(kwargs))
+        return original_get(**kwargs)
+
+    monkeypatch.setattr(store._table, "get_item", spy)
+    pk = "example-co#731205"
+    first = store.get(pk)
+    assert first["greenhouse_board"] == "example-board"
+    assert first["jd_url"] == job.jd_url and first["ats"] == "greenhouse"
+    assert store.get_alias(pk)["greenhouse_board"] == "example-board"
+    # Commit a pin change before the next alias read; the witness cannot reuse
+    # its previous row even when the key/job URL are unchanged.
+    store.set_status(pk, Status.FOUND, greenhouse_board="foreign-board")
+    assert store.get_alias(pk)["greenhouse_board"] == "foreign-board"
+    assert reads == [
+        {"Key": {"pk": pk}},
+        {"Key": {"pk": pk}, "ConsistentRead": True},
+        {"Key": {"pk": pk}, "ConsistentRead": True},
+    ]
+
+
+def test_redis_initial_board_pin_is_in_conditional_value(monkeypatch):
+    import json
+    import fakeredis
+
+    from core.storage.local import RedisTracking
+
+    raw = fakeredis.FakeRedis(decode_responses=True)
+    original_set = raw.set
+    puts = []
+
+    def spy(key, value, **kw):
+        if key.startswith("app:"):
+            puts.append((key, json.loads(value), dict(kw)))
+            assert kw.get("nx") is True
+            assert json.loads(value)["greenhouse_board"] == "example-board"
+        return original_set(key, value, **kw)
+
+    monkeypatch.setattr(raw, "set", spy)
+    store = RedisTracking(raw)
+    job = JobRecord(
+        company="example-co", job_id="731205", title="Platform Engineer",
+        jd_url="https://careers.example-co.test/openings/engineer?gh_jid=731205",
+        jd_text="synthetic", ats="greenhouse", greenhouse_board="example-board",
+    )
+    assert store.put_new(job)
+    assert store.get(job.pk)["greenhouse_board"] == "example-board"
+    assert store.get(job.pk)["ats"] == "greenhouse"
+    assert store.status_counts().get("found") == 1
+    assert not store.put_new(job.model_copy(update={"greenhouse_board": "other-board"}))
+    assert store.get(job.pk)["greenhouse_board"] == "example-board"
+    assert all(row["pk"] == job.pk and row["job_id"] == "731205" for _, row, _ in puts)
+    assert len(puts) == 2

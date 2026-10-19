@@ -107,6 +107,47 @@ BrowserSkill daemon even while AppliedIn itself is already running.
 Use **Check setup** to verify the engine and selected profile connection. A code
 change still requires an AppliedIn restart; the daemon does not hot reload.
 
+## Greenhouse careers-page wrappers (operator verified)
+
+A custom employer-origin careers page is **not** a Greenhouse board merely
+because an iframe, page text, redirect, a similar board name or a successful API
+probe mentions Greenhouse. A redirect for one posting also does not prove a
+company-wide tenant. Independently verify that one Greenhouse board covers the
+configured careers-page scope, review the change to the **tracked,
+repo-versioned** `config/watchlist.yaml`, and deploy/restart AppliedIn so
+discovery and apply both reload the deployed configuration. Do not let discovery
+edit the watchlist or silently repair existing jobs.
+
+Synthetic example (not a real watchlist entry):
+
+```yaml
+companies:
+  - name: example-co
+    careers_url: https://careers.example-co.test/openings
+    ats: greenhouse
+    board: example-board
+    discovery: browser
+    mode: gated
+```
+
+Only postings returned by the *explicit* `discovery: browser` production
+listing are considered for Greenhouse wrapper normalization. Each must have an
+exact HTTPS employer-origin URL within the configured host and path, a sole
+numeric `?gh_jid=<digits>` query, and exactly one matching job in that
+configured board's public jobs feed. The new tracking row records the numeric
+job ID, exact wrapper URL and an immutable initial `greenhouse_board` pin.
+An unconfigured wrapper or failed/ambiguous job witness stays ordinary crawl
+discovery; its URL does not authorize an application alias.
+
+Ordinary `discovery: crawl` (including browser fallback) and sitemap results
+never promote wrappers, even if their URL carries a matching `gh_jid`. Native
+Greenhouse feeds and unrelated ATS paths are unchanged. At application entry,
+the current watchlist and stored pin must still agree. A missing/stale pin or
+changed board, host or path gates before application-browser navigation.
+Remediate by independently re-verifying the watchlist entry, redeploying and
+discovering a **new** record; do not relabel or migrate old tracking rows.
+Tenant admission is not submit or human approval: all existing guards remain.
+
 ## Operation and guarantees
 
 Every job runs in its own Agent Window. Only its own session is cleaned up;

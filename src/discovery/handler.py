@@ -42,6 +42,27 @@ def resolve_company(company: CompanyConfig, client: httpx.Client) -> CompanyConf
     if not company.needs_resolution or not company.careers_url:
         return company
     match = resolve(company.careers_url, client, name=company.name)
+    # A wrapper's embedded board/LLM label or guessed successful API probe is
+    # not a company-wide tenant assertion. Only a reviewed, persisted explicit
+    # tuple may select the wrapper's Greenhouse feed reconciliation route.
+    # Direct hosted Greenhouse URLs retain their existing native feed behavior.
+    from urllib.parse import urlsplit
+    from .resolver import AtsMatch
+
+    try:
+        native_greenhouse = urlsplit(company.careers_url).hostname in {
+            "boards.greenhouse.io", "job-boards.greenhouse.io",
+            "boards-api.greenhouse.io",
+        }
+    except ValueError:
+        native_greenhouse = False
+    incomplete_wrapper = (not native_greenhouse and (
+        match.ats == "greenhouse"
+        or company.ats == "greenhouse"
+        or (bool(company.board) and not company.ats)))
+    if incomplete_wrapper:
+        match = AtsMatch("custom", company.careers_url,
+                         discovery=DiscoveryMode.CRAWL)
     # An explicit `discovery: browser` in the watchlist SURVIVES resolution.
     # The resolver knows some browser boards, but an unfamiliar client-rendered
     # page still looks like an ordinary crawl target. An explicit choice must win

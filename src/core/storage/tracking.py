@@ -49,6 +49,8 @@ class TrackingStore(AbstractTracking):
             "apply_requested_at": job.apply_requested_at,
             "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
         }
+        if job.greenhouse_board:
+            item["greenhouse_board"] = job.greenhouse_board
         try:
             self._table.put_item(
                 Item=item,
@@ -62,6 +64,15 @@ class TrackingStore(AbstractTracking):
 
     def get(self, pk: str) -> dict | None:
         return self._table.get_item(Key={"pk": pk}).get("Item")
+
+    def get_alias(self, pk: str) -> dict | None:
+        """Read alias-critical identity from the base table after committed changes.
+
+        This is a dedicated path: ordinary gets keep their existing eventual
+        consistency. It cannot cover concurrent writes after this observation.
+        """
+        return self._table.get_item(
+            Key={"pk": pk}, ConsistentRead=True).get("Item")
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:
         names = {"#s": "status"}

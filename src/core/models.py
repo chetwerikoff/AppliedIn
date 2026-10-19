@@ -79,6 +79,9 @@ class JobRecord(BaseModel):
     jd_text: str
     location: str = ""
     ats: str = ""
+    # A new browser-verified Greenhouse wrapper pins its manually configured
+    # tenant with the row identity. Legacy/native/ordinary rows have no pin.
+    greenhouse_board: str = ""
     discovery_source: str = ""
     # Explicit, per-role submission authorization from the discovery inbox.
     apply_requested_at: str = ""

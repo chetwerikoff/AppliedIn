@@ -325,6 +325,8 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
+    if row.get("pre_submit_retry_used"):
+        return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
     if not _reader_eligible(row):
         return {"result": "already_done", "pk": pk, "status": row.get("status"),
                 "reason": "jd_read_not_eligible"}
@@ -767,6 +769,10 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     from core.apply_queue import ApplyQueue
 
     row = stores.tracking.get(pk) or {}
+    if row.get("pre_submit_retry_used"):
+        from core.apply_queue import ApplyQueue
+        ApplyQueue(stores.tracking.r).remove_all(pk, flat_queue=stores.apply_queue)
+        return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
     # Submission evidence outranks an absent request. Otherwise a stale row
     # without approval conceals the durable hold from callers expecting the
     # established uncertain-result contract.
@@ -1236,7 +1242,7 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
     return _run(_resume_job_async(pk, answer, call_id, stores))
 
 
-def run_queued(item: dict, q: Any) -> dict:
+def run_queued(item: dict, q: Any, *, direct_approval: str = "") -> dict:
     """Run ONE leased application and settle its place in the queue.
 
     Shared by the daemon's apply worker and the dashboard's per company drain, so
@@ -1247,8 +1253,16 @@ def run_queued(item: dict, q: Any) -> dict:
     from core.apply_queue import is_retryable
 
     pk = item["pk"]
+    token = submit_hold._DIRECT_APPROVAL.set(direct_approval)
     try:
-        result = _run(_apply_direct(pk, make_stores())) or {}
+        stores = make_stores()
+        row = stores.tracking.get(pk) or {}
+        if row.get("pre_submit_retry_used") and (
+                not direct_approval or row.get("apply_requested_at") != direct_approval):
+            # No flags in a daemon-produced item, including requested/queued_at,
+            # can stand in for the synchronous exact-row owner click.
+            return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
+        result = _run(_apply_direct(pk, stores)) or {}
         log.info("apply: %s", result)
         again, why = is_retryable(result)
         if again:
@@ -1276,9 +1290,13 @@ def run_queued(item: dict, q: Any) -> dict:
                 log.exception("could not settle possible submission for %s", pk)
             return {"result": "failed", "pk": pk, "reason": "uncertain",
                     "detail": "possible submission; check the employer portal before retrying"}
+        if row.get("pre_submit_retry_used"):
+            # The direct click was consumed before the attempt, even on a crash.
+            return {"result": "failed", "pk": pk, "reason": "pre_submit_uncertain"}
         q.retry(item, f"crashed: {exc}")
         return {"result": "error", "pk": pk, "reason": str(exc)}
     finally:
+        submit_hold._DIRECT_APPROVAL.reset(token)
         q.done(item)
 
 
@@ -1294,7 +1312,22 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
 
     row = stores.tracking.get(pk) or {}
     company, jd_url = row.get("company", ""), row.get("jd_url", "")
-
+    if row.get("pre_submit_retry_used"):
+        from core.apply_queue import ApplyQueue
+        from core.ids import make_pk
+        _, sep, job_id = pk.partition("#")
+        approval = submit_hold.direct_approval()
+        q = ApplyQueue(stores.tracking.r)
+        if (not approval or approval != row.get("apply_requested_at")
+                or row.get("status") != "tailored"
+                or row.get("gate_reason") != "approval"
+                or not sep or not job_id
+                or make_pk(company, job_id) != pk
+                or pk not in q.in_flight()
+                or (company or "").strip().lower() not in q.depth()["running"]
+                or not submit_hold.raw_absent(pk, tracking=stores.tracking)
+                or submit_hold.legacy_possible(row)):
+            return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
     # DUPLICATE GUARD — the one mistake this system must never make twice: a row
     # already applied (by the pipeline or by the owner's own hand) is refused
     # loudly, and its applied status is never overwritten. The tool layer checks
@@ -1338,6 +1371,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # it back through the tailor rather than submitting something you have edited
     # away; re-tailoring is cheap next to an application you cannot take back.
     if row.get("resume_tex_key") and row.get("resume_seed") != seed_fingerprint():
+        if row.get("pre_submit_retry_used"):
+            return {"result": "refused", "pk": pk, "reason": "stale_resume"}
         stores.tracking.set_status(pk, Status.FOUND, gate_reason="", fail_reason="")
         stores.queue.enqueue(stores.tailor_queue, {"pk": pk})
         emit("running", pk=pk, agent="tailor", url=jd_url,
@@ -1449,7 +1484,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     from tools.browser_runtime import configuration
     drafted = result.pop('drafted', None) or {}
     # BrowserSkill cannot turn a writer draft into future human authorization.
-    if configuration()['engine'] != 'browser_skill':
+    if result.get("_actual_engine") != 'browser_skill':
         for q, a in drafted.items():
             from core.models import AnswerScope
             stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source='writer')
@@ -1461,6 +1496,23 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         status = "uncertain"
         result["status"] = status
     if status == "uncertain":
+        current = stores.tracking.get(pk) or {}
+        if submit_hold.classify_new_pre_submit(
+                pk, current, result, tracking=stores.tracking):
+            stores.tracking.set_status(
+                pk, Status.NEEDS_HUMAN, gate_reason=submit_hold.PRE_SUBMIT,
+                fail_kind=submit_hold.PRE_SUBMIT,
+                fail_reason=submit_hold.PRE_SUBMIT_TEXT,
+                result={"reason": submit_hold.PRE_SUBMIT},
+                gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT},
+                gate_call_id=None, last_button="",
+                last_url=str((result.get("step") or {}).get("url") or "")[:400],
+                pre_submit_never_armed=True, pre_submit_engine="browser_skill")
+            emit("gate", pk=pk, agent="applier",
+                 detail=submit_hold.PRE_SUBMIT_TEXT, url=jd_url)
+            return {"result": "failed", "pk": pk,
+                    "reason": submit_hold.PRE_SUBMIT,
+                    "detail": submit_hold.PRE_SUBMIT_TEXT}
         from tools.browser_skill_apply import handoff
         context = handoff(submit_hold.REASON, result.get('step') or {})
         reason = context['text']
@@ -1564,7 +1616,7 @@ def _requeue_untouched(pk: str, stores: Any) -> None:
     browser, not for a second go-ahead.
     """
     row = stores.tracking.get(pk) or {}
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+    if row.get("pre_submit_retry_used") or submit_hold.blocked(pk, row, tracking=stores.tracking):
         return
     requested = bool(row.get("apply_requested_at"))
     stores.tracking.set_status(pk, Status.TAILORED, gate_reason="" if requested else "approval",
@@ -1638,6 +1690,8 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         return _reader_storage_error(pk, stores, None, exc)
     if row is None:
         return {"result": "missing", "pk": pk}
+    if row.get("pre_submit_retry_used"):
+        return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
     # An independent submit hold is authoritative even if an old writer
     # restored the row's status to FOUND. The public Retry response must not
     # downgrade uncertainty into an innocuous "already_done".
@@ -1924,6 +1978,8 @@ def _auto_decision(pk: str, stores: Any) -> str:
     if flags.apply_mode() != "auto" or flags.paused():
         return ""
     row = stores.tracking.get(pk) or {}
+    if row.get("pre_submit_retry_used"):
+        return ""
     if row.get("discovery_source") == "career_ops":
         return ""
     score = row.get("match_score")
@@ -2050,6 +2106,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                 emit("result", pk=pk, agent=author, detail=fr.name, output=_short(fr.response))
 
     if auto_go:
+        if (stores.tracking.get(pk) or {}).get("pre_submit_retry_used"):
+            return {"result": "refused", "pk": pk, "reason": "recovered_direct_only"}
         # DECOUPLED: don't apply inline (a slow browser session would block the
         # evaluate worker from scoring/tailoring the rest of the backlog). Hand the
         # job to the apply queue; the separate apply worker submits it under the cap.
@@ -2100,6 +2158,15 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
              screenshot=_art_url(final.get("screenshot_s3_key")))
         return {"result": "done", "pk": pk}
 
+    if submit_hold.classify_new_pre_submit(pk, final, outcome, tracking=stores.tracking):
+        stores.tracking.set_status(
+            pk, Status.NEEDS_HUMAN, gate_reason=submit_hold.PRE_SUBMIT,
+            fail_kind=submit_hold.PRE_SUBMIT,
+            fail_reason=submit_hold.PRE_SUBMIT_TEXT,
+            result={"reason": submit_hold.PRE_SUBMIT},
+            pre_submit_never_armed=True, pre_submit_engine="browser_skill",
+            gate_pending={"question": submit_hold.PRE_SUBMIT_TEXT})
+        return {"result": "failed", "pk": pk, "reason": submit_hold.PRE_SUBMIT}
     if submit_hold.blocked(pk, final, tracking=stores.tracking) or outcome.get('status') == 'uncertain':
         stores.tracking.set_status(
             pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain', fail_kind='uncertain',

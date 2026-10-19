@@ -57,9 +57,7 @@ def resolve_company(company: CompanyConfig, client: httpx.Client) -> CompanyConf
     except ValueError:
         native_greenhouse = False
     incomplete_wrapper = (not native_greenhouse and (
-        match.ats == "greenhouse"
-        or company.ats == "greenhouse"
-        or (bool(company.board) and not company.ats)))
+        match.ats == "greenhouse" or company.ats == "greenhouse"))
     if incomplete_wrapper:
         match = AtsMatch("custom", company.careers_url,
                          discovery=DiscoveryMode.CRAWL)

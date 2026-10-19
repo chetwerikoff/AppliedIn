@@ -162,9 +162,11 @@ def _browser_extract(url: str, company: str, prefs: Preferences) -> list[JobReco
 
 
 
-def _greenhouse_feed_target(url: str, board: str, jid: str) -> bool:
-    """An API-supplied hosted link may confirm, never contradict, board identity."""
+def _greenhouse_feed_target(url: str, board: str, jid: str, wrapper_url: str) -> bool:
+    """Confirm the configured hosted identity without adopting an API URL."""
     if not url:
+        return True
+    if url == wrapper_url:
         return True
     try:
         parts = urlsplit(url)
@@ -240,10 +242,12 @@ def _reconcile_browser_greenhouse(company: CompanyConfig,
     accepted = list(jobs)
     for jid, variants in proposed.items():
         witnesses = by_id.get(jid, [])
-        if (len(variants) != 1 or len(witnesses) != 1
-                or not _greenhouse_feed_target(witnesses[0].jd_url, board, jid)):
+        if len(variants) != 1 or len(witnesses) != 1:
             continue
         index, pinned = variants[0]
+        if not _greenhouse_feed_target(
+                witnesses[0].jd_url, board, jid, pinned.jd_url):
+            continue
         accepted[index] = pinned
     return accepted
 

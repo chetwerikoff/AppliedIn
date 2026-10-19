@@ -124,3 +124,23 @@ def test_other_ats_hint_is_unaffected_by_wrapper_greenhouse_fence(monkeypatch):
                             careers_url="https://careers.example-co.test/openings")
     result = handler.resolve_company(company, httpx.Client())
     assert result.ats == "ashby"
+
+
+@pytest.mark.parametrize("ats", ["ashby", "lever"])
+def test_board_only_configuration_preserves_other_ats_resolution(monkeypatch, ats):
+    from core.models import DiscoveryMode
+    from discovery import handler
+    from discovery.resolver import AtsMatch
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(handler, "resolve",
+                        lambda *a, **kw: AtsMatch(ats, "resolved-board"))
+    company = CompanyConfig(
+        name="example-co",
+        careers_url="https://careers.example-co.test/openings",
+        board="saved-token")
+
+    result = handler.resolve_company(company, httpx.Client())
+
+    assert (result.ats, result.board, result.discovery) == (
+        ats, "resolved-board", DiscoveryMode.FEED)

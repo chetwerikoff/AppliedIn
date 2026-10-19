@@ -143,6 +143,7 @@ async def test_duplicate_company_config_fails(authority):
     URL + "&extra=1",
     URL + "&gh_jid=731205",
     URL.replace("gh_jid", "%67h_jid"),
+    URL.replace("gh_jid", "%252567h_jid"),
     URL.replace("gh_jid", "GH_JID"),
     URL.replace("731205", "abc"),
     URL.replace("731205", "731%32%30%35"),

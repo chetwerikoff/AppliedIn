@@ -153,6 +153,19 @@ def test_exact_browser_listing_feed_to_fresh_persisted_alias(world):
     assert world.tracking.alias_reads == [row["pk"], row["pk"]]
 
 
+def test_employer_origin_feed_url_keeps_configured_board_alias_target(world):
+    world.feed = [board_job(url=WRAPPER)]
+
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
+    row = world.tracking.rows[f"{COMPANY}#731205"]
+    assert row["greenhouse_board"] == BOARD
+
+    proof = forms._configured_alias(row["pk"], COMPANY, WRAPPER)
+    assert isinstance(proof, forms.GreenhouseJobAlias)
+    assert proof.url == HOSTED
+    assert proof.url != world.feed[0].jd_url
+
+
 @pytest.mark.parametrize("feed", [
     [], [board_job("123")], [board_job(), board_job()],
     [board_job(url="https://job-boards.greenhouse.io/other-board/jobs/731205")],

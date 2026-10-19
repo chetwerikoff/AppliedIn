@@ -526,14 +526,17 @@ def _greenhouse_id_query_attempt(url: str) -> bool:
     if not isinstance(url, str) or '?' not in url:
         return False
     query = url.partition('?')[2].partition('#')[0]
-    for _ in range(3):
-        if re.search(r'(?i)(?:^|[&;=])gh_jid(?:=|[&;]|$)', query):
+    # Follow stacked escapes to a fixed point; nested query keys must not bypass
+    # the pre-browser tenant gate. A hostile over-depth query fails closed.
+    key_attempt = re.compile(r'(?i)(?:^|[&;=])gh_jid(?:=|[&;]|$)')
+    for _ in range(32):
+        if key_attempt.search(query):
             return True
         decoded = unquote_plus(query)
         if decoded == query:
-            break
+            return False
         query = decoded
-    return False
+    return True
 
 
 def _greenhouse_wrapper_missing_board(pk: str, company: str, url: str) -> bool:

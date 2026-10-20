@@ -165,7 +165,7 @@ def reviewed_tuple(name: str, *, path: str | Path | None = None,
                 for key in ("name", "careers_url", "ats", "board", "mode", "discovery")):
             return None
         return cfg
-    except (OSError, ValueError, TypeError, yaml.YAMLError):
+    except (OSError, ValueError, TypeError, AttributeError, yaml.YAMLError):
         return None
 
 

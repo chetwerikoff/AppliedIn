@@ -52,6 +52,10 @@ class TrackingStore(AbstractTracking):
         }
         if job.greenhouse_board:
             item["greenhouse_board"] = job.greenhouse_board
+        if job.discovery_source == "sitemap_greenhouse_suffix":
+            # Preserve feed first_published for this new data producer; ordinary
+            # feed and generic discovery persistence retain their prior shape.
+            item["posted_at"] = job.posted_at
         try:
             self._table.put_item(
                 Item=item,

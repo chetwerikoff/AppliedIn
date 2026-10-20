@@ -247,6 +247,9 @@ def test_protected_witness_type_drift_is_not_an_equal_original(
     {"apply_requested_at": "", "gate_call_id": "direct", "gate_source": "applier"},
     {"apply_requested_at": "", "status": "failed", "gate_reason": "",
      "fail_kind": ""},
+    # A tenant-denial reason without the corresponding request is not
+    # independently proved pre-browser request history.
+    {"apply_requested_at": ""},
 ])
 def test_requestless_or_browser_touched_history_is_never_pinned(world, history):
     """#6301207727 / #6301512360: no historical browser state may be pinned."""
@@ -255,3 +258,17 @@ def test_requestless_or_browser_touched_history_is_never_pinned(world, history):
     assert _once(world)["status"] == "unsafe_history"
     assert _once(world, commit=True, operator_authorized=True)["status"] == "unsafe_history"
     assert world.tracking.row == original and world.tracking.writes == 0
+
+
+def test_pristine_unrequested_row_keeps_data_only_eligibility(world):
+    """No request or browser/gate evidence remains safe to re-derive read-only."""
+    world.tracking.row.update(
+        status="found", apply_requested_at="", attempts=0,
+        gate_reason="", fail_kind="", approval_status="unanswered",
+    )
+    unchanged = deepcopy(world.tracking.row)
+    report = _once(world)
+    assert report["status"] == "dry_run_eligible"
+    assert report["would_pin"] and not report["committed"]
+    assert world.tracking.row == unchanged
+    assert world.tracking.writes == 0

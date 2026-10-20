@@ -328,6 +328,7 @@ def reserve_scan(kind: str = "feeds", company: str = "", message: str = "") -> b
 
 def _save_results(receipts: list[dict], receipt: dict):
     from discovery.career_fit import kept_on_rescan
+    from tools import posting_guard as pg
 
     stores = make_stores()
     tracked = {canonical(r["jd_url"]): r["pk"] for r in stores.tracking.all() if r.get("jd_url")}

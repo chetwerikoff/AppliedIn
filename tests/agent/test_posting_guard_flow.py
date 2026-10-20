@@ -202,3 +202,37 @@ def test_deferred_metadata_is_normalized_but_legacy_unwitnessed_retry_is_raw(
         not previously_guarded)
     if previously_guarded:
         assert not pg.valid(selected["text"], incoming["posting_guard"])
+
+@pytest.mark.parametrize("source,expected_clean", [
+    ("crawler", True), ("career_ops", False),
+])
+def test_matching_ordinary_http_witness_clears_only_non_directory_provisional_source(
+    monkeypatch, source, expected_clean,
+):
+    from tools import jd
+
+    url = "https://careers.example.test/jobs/123"
+    tracked = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    assert tracked.put_new(JobRecord(
+        company="example-co", job_id="http-1", title="Test engineer",
+        jd_url=url, jd_text=TEXT, ats="custom",
+        discovery_source=source))
+    row = tracked.get_current("example-co#http-1")
+    assert row["posting_guard"]["status"] == "unchecked"
+
+    html = "<p>Build reliable distributed systems in a product team.</p>"
+    remote = {**pg.analyze(TEXT, html_variants=[html], source_required=True),
+              "source_kind": "http_html", "source_url": url}
+    monkeypatch.setattr(jd, "fetch_jd_meta", lambda read_url, kind: (
+        remote if read_url == url else pytest.fail("Wrong posting URL")))
+
+    selected = asyncio.run(run._jd_meta(row))
+    committed = run._commit_posting_meta(
+        row["pk"], row, selected, SimpleNamespace(tracking=tracked))
+    assert committed is not None
+    assert committed["jd_text"] == selected["text"]
+    assert pg.valid(committed["jd_text"], committed["posting_guard"])
+    assert (committed["posting_guard"]["status"] == "clean") is expected_clean
+    assert pg.authorised(committed) is expected_clean
+    assert ("source_html_unavailable" in committed["posting_guard"]["reasons"]) is (
+        not expected_clean)

@@ -236,6 +236,12 @@ class _TitleSlot:
 
 
 @dataclass(frozen=True)
+class _RoleHeading:
+    """A short one-argument role reserves only its exact second segment."""
+    employer: str | None
+
+
+@dataclass(frozen=True)
 class TitleOption:
     """One independently identifiable seed role and its permitted replacements."""
     seed_line: str
@@ -246,8 +252,8 @@ class TitleOption:
     exact_non_title: bool = False
 
 
-def _structural_title_slot(line: str) -> _TitleSlot | None:
-    """Parse a balanced, single-line role call for its non-title identity.
+def _structural_title_slot(line: str) -> _TitleSlot | _RoleHeading | None:
+    """Parse balanced employment slots; identify short one-argument headings.
 
     Even a formatted/ineligible title reserves its employer/date signature.
     Other arguments may retain seed markup but cannot be substituted.
@@ -290,24 +296,34 @@ def _structural_title_slot(line: str) -> _TitleSlot | None:
         # A raw suffix is essential: normalized separators are not title edits.
         start, end = args[0]
         contents = line[start:end]
-        separators, depth = [], 0
-        for i, char in enumerate(contents):
+        separators, depth, i = [], 0, 0
+        while i < len(contents):
             if not _unescaped(contents, i):
+                i += 1
+                continue
+            char = contents[i]
+            if depth == 0 and (
+                char == "|" or contents.startswith(r"\textbar{}", i)
+            ):
+                end_sep = i + (1 if char == "|" else len(r"\textbar{}"))
+                before = i
+                while before and contents[before - 1] in " \t":
+                    before -= 1
+                after = end_sep
+                while after < len(contents) and contents[after] in " \t":
+                    after += 1
+                separators.append((before, after))
+                i = end_sep  # The literal TeX separator's braces are not segments.
                 continue
             if char == "{":
                 depth += 1
             elif char == "}":
                 depth -= 1
-            elif char == "|" and depth == 0:
-                before = i
-                while before and contents[before - 1] in " \t":
-                    before -= 1
-                after = i + 1
-                while after < len(contents) and contents[after] in " \t":
-                    after += 1
-                separators.append((before, after))
+            i += 1
         if len(separators) < 2:
-            return None
+            return _RoleHeading(
+                contents[separators[0][1]:].strip() if separators else None
+            )
         title_end = separators[0][0]
         employer = contents[separators[0][1]:separators[1][0]].strip()
         date_end = separators[2][0] if len(separators) > 2 else len(contents)
@@ -351,7 +367,11 @@ def eligible_title_options(
     anchors = used_macros(base_latex)["anchors"]
     calls = active_calls(base_latex, anchors)
     slots = [_structural_title_slot(line) for _, line in calls]
-    signatures = Counter(slot.signature for slot in slots if slot is not None)
+    signatures = Counter(slot.signature for slot in slots if isinstance(slot, _TitleSlot))
+    heading_employers = {
+        slot.employer for slot in slots
+        if isinstance(slot, _RoleHeading) and slot.employer is not None
+    }
 
     # When a known employment macro has an unsupported shape, it might be a
     # same-employer sibling. Refuse that employer's variants (or all variants
@@ -373,8 +393,9 @@ def eligible_title_options(
 
     options = []
     for slot in slots:
-        if (slot is None or signatures[slot.signature] != 1 or uncertain_all
-                or slot.employer in uncertain_employers):
+        if (not isinstance(slot, _TitleSlot) or signatures[slot.signature] != 1
+                or uncertain_all or slot.employer in uncertain_employers
+                or slot.employer in heading_employers):
             continue
         title = slot.title
         if (not title.strip() or "{" in title or "}" in title or "%" in title
@@ -428,6 +449,11 @@ def validate(
             unmatched.append(line)
     missing = []
     for line in unmatched:
+        if isinstance(_structural_title_slot(line), _RoleHeading):
+            # A non-employment heading must survive title substitution verbatim;
+            # normalized whitespace is not a witness for its raw delimiters.
+            missing.append(line)
+            continue
         witness = next(
             (candidate for candidate, count in unclaimed.items()
              if count and _norm(candidate) == _norm(line)),

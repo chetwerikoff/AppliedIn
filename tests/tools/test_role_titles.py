@@ -282,3 +282,64 @@ def test_save_one_arg_raw_suffix_disambiguates_spacing_siblings(save_attempt):
     assert result["ok"] is True
     assert state["tailored"] == changed
     assert effects["artifact"] == 2
+
+
+# The TeX spelling of the separator is itself part of the non-title signature.
+# A short one-argument role is a heading, not a competing employment role.
+TEXBAR_ROLE = r"\role{Role A  \textbar{}  example-co  \textbar{}  2022--2024}"
+TEXBAR_HEADING = r"\role{CASE STUDY 1 - Example  \textbar{}  Example subtitle}"
+TEXBAR_APPROVED = TEXBAR_ROLE.replace("Role A", "Role B", 1)
+
+
+def test_texbar_role_and_short_heading_offer_one_title_and_save_verbatim(save_attempt):
+    seed = one_arg_doc(TEXBAR_ROLE, TEXBAR_HEADING)
+    approved = {"example-co": ("Role B",)}
+    eligible = eligible_title_options(seed, approved)
+
+    assert [(option.seed_line, option.approved) for option in eligible] == [
+        (TEXBAR_ROLE, ("Role B",))
+    ]
+    tailored = one_arg_doc(TEXBAR_APPROVED, TEXBAR_HEADING)
+    result, state, effects = save_attempt(seed, tailored)
+
+    assert result["ok"] is True
+    assert state["tailored"] == tailored
+    assert effects == {"make_stores": 1, "render": 1, "artifact": 2, "tracking": 1}
+
+
+@pytest.mark.parametrize("role,heading", [
+    (TEXBAR_APPROVED.replace(r"  \textbar{}  ", r" \textbar{}  ", 1), TEXBAR_HEADING),
+    (TEXBAR_APPROVED.replace(r"  \textbar{}  ", r"  \textbar{} ", 1), TEXBAR_HEADING),
+    (TEXBAR_APPROVED.replace("example-co", "example-co-lab"), TEXBAR_HEADING),
+    (TEXBAR_APPROVED.replace("example-co", ""), TEXBAR_HEADING),
+    (TEXBAR_APPROVED.replace("2022--2024", "2023--2024"), TEXBAR_HEADING),
+    (TEXBAR_APPROVED, TEXBAR_HEADING.replace("CASE STUDY 1", "CASE STUDY 2")),
+    (TEXBAR_APPROVED, TEXBAR_HEADING.replace("Example subtitle", "Other subtitle")),
+    (TEXBAR_APPROVED, TEXBAR_HEADING.replace(r"  \textbar{}  ", r" \textbar{}  ")),
+    (TEXBAR_APPROVED, TEXBAR_HEADING.replace(r"\textbar{}", "|")),
+])
+def test_texbar_save_refuses_non_title_or_heading_mutations(save_attempt, role, heading):
+    seed = one_arg_doc(TEXBAR_ROLE, TEXBAR_HEADING)
+    result, state, effects = save_attempt(seed, one_arg_doc(role, heading))
+
+    assert result["ok"] is False
+    assert result["missing_facts"]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert state == {"base_latex": seed, "pk": "synthetic"}
+
+
+def test_short_headings_reserve_only_exact_second_segment(options):
+    seed = one_arg_doc(TEXBAR_ROLE, TEXBAR_HEADING, r"\role{CASE STUDY SECTION}")
+    eligible = eligible_title_options(seed, options)
+    assert [option.seed_line for option in eligible] == [TEXBAR_ROLE]
+
+    same_employer = TEXBAR_ROLE.replace("example-co", "Example subtitle")
+    assert eligible_title_options(
+        one_arg_doc(same_employer, TEXBAR_HEADING),
+        {"Example subtitle": ("Role B",)},
+    ) == ()
+
+
+def test_texbar_formatted_sibling_still_blocks_duplicate_signature(options):
+    formatted = r"\role{\textbf{Role A}  \textbar{}  example-co  \textbar{}  2022--2024}"
+    assert eligible_title_options(one_arg_doc(TEXBAR_ROLE, formatted), options) == ()

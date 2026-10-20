@@ -25,6 +25,8 @@ from __future__ import annotations
 import pytest
 
 from agent import run as R
+from core.storage.base import guard_observation_matches, guard_patch
+from tools import posting_guard as pg
 
 
 class _Tracking:
@@ -33,6 +35,24 @@ class _Tracking:
 
     def get(self, pk):
         return dict(self.row) if self.row.get("pk") == pk else None
+
+    def get_current(self, pk):
+        return self.get(pk)
+
+    def update_posting_guard(self, pk, observed, inspected=None, *,
+                             reviewed_generation=None, source_witness=False,
+                             settle_refusal=False):
+        current = self.get_current(pk)
+        if not guard_observation_matches(current, observed):
+            return False
+        patch = guard_patch(current, inspected,
+                            reviewed_generation=reviewed_generation,
+                            source_witness=source_witness,
+                            settle_refusal=settle_refusal)
+        if patch is None:
+            return False
+        self.row.update(patch)
+        return True
 
     def set_status(self, pk, status, **kw):
         self.row["status"] = getattr(status, "value", status)
@@ -60,9 +80,11 @@ def ran(monkeypatch):
 
 
 def _row(**kw):
+    checked = pg.analyze("We want Kubernetes and distributed systems. " * 20)
     return {"pk": "stripe#1", "company": "Stripe", "title": "SWE",
             "status": "tailored", "jd_url": "https://x", "ats": "greenhouse",
-            "jd_text": "We want Kubernetes and distributed systems. " * 20, **kw}
+            "jd_text": checked["text"], "posting_guard": checked["posting_guard"],
+            **kw}
 
 
 def test_the_note_reaches_the_tailor(ran):

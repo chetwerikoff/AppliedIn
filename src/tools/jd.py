@@ -8,6 +8,7 @@ import time
 import httpx
 
 from core.logging import get_logger
+from tools import posting_guard as pg
 
 log = get_logger(__name__)
 
@@ -51,17 +52,17 @@ def _text(html: str) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
+def _guarded(title: str, text: str, *, html_variants=(),
+             source_required: bool = False) -> dict:
+    inspected = pg.analyze(text, html_variants=html_variants,
+                           source_required=source_required)
+    cleaned_title = pg.analyze(title)["text"][:90]
+    return {"title": cleaned_title, **inspected}
+
+
 def _from_ats(url: str) -> dict | None:
-    """The posting from its board's own API, when the URL belongs to one.
-
-    The big boards render in the browser and serve an empty shell to a plain
-    fetch — reading jobs.ashbyhq.com over HTTP returns 39 characters and the word
-    "About Us". They all publish the same posting as JSON, which is complete,
-    fast and free, so ask for that instead of rendering a page to scrape it back.
-    """
+    """Match an ATS posting and inspect ALL exposed HTML before plain selection."""
     from urllib.parse import urlparse
-
-    import httpx
 
     u = urlparse(url)
     host, seg = (u.hostname or "").lower(), [p for p in u.path.split("/") if p]
@@ -70,64 +71,82 @@ def _from_ats(url: str) -> dict | None:
     org, job_id = seg[0], seg[-1]
     try:
         with httpx.Client(timeout=20, follow_redirects=True) as c:
-            if "ashbyhq.com" in host:
+            if host.endswith("ashbyhq.com"):
                 r = c.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
                 r.raise_for_status()
                 for j in r.json().get("jobs", []):
                     if job_id in str(j.get("jobUrl", "")) or job_id == str(j.get("id", "")):
-                        return {"title": str(j.get("title", ""))[:90],
-                                "text": (j.get("descriptionPlain")
-                                         or _text(j.get("descriptionHtml", "")))}
-            elif "greenhouse.io" in host:
+                        html = j.get("descriptionHtml")
+                        return _guarded(
+                            str(j.get("title", "")),
+                            str(j.get("descriptionPlain") or html or ""),
+                            html_variants=[html] if html else [],
+                            source_required=True)
+            elif host.endswith("greenhouse.io"):
                 r = c.get(f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs/{job_id}",
                           params={"content": "true"})
                 r.raise_for_status()
                 j = r.json()
-                return {"title": str(j.get("title", ""))[:90],
-                        "text": _text(j.get("content", ""))}
-            elif "lever.co" in host:
-                r = c.get(f"https://api.lever.co/v0/postings/{org}/{job_id}")
+                html = j.get("content")
+                return _guarded(str(j.get("title", "")), str(html or ""),
+                                html_variants=[html] if html else [],
+                                source_required=True)
+            elif host.endswith("lever.co"):
+                api_host = "api.eu.lever.co" if host.endswith("eu.lever.co") else "api.lever.co"
+                r = c.get(f"https://{api_host}/v0/postings/{org}/{job_id}")
                 r.raise_for_status()
                 j = r.json()
-                return {"title": str(j.get("text", ""))[:90],
-                        "text": _text(j.get("descriptionPlain") or j.get("description", ""))}
-    except Exception as exc:  # noqa: BLE001 — fall through to a plain fetch
+                html = j.get("description")
+                variants = [html] if html else []
+                # Lever sometimes exposes additional HTML fragments in lists.
+                for section in j.get("lists") or []:
+                    if isinstance(section, dict) and section.get("content"):
+                        variants.append(section["content"])
+                return _guarded(str(j.get("text", "")),
+                                str(j.get("descriptionPlain") or html or ""),
+                                html_variants=variants, source_required=True)
+    except Exception as exc:  # noqa: BLE001 — fail closed to other readers
         log.debug("board API miss for %s: %s", url, exc)
     return None
 
 
 def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
-    """{'title', 'text'} for a posting, or empty strings when it cannot be read."""
+    """Guarded title, text, posting_guard and provenance for a posting."""
     if not url:
-        return {"title": "", "text": ""}
-    if (hit := _from_ats(url)) and len(hit.get("text", "")) > 200:
-        return hit
+        return _guarded("", "", source_required=True)
+    ats = _from_ats(url)
+    if ats and len(ats["text"]) > 200:
+        return ats
     from discovery.resolver import BROWSER_HEADERS
 
-    # The disguise first, then bare. metacareers.com answers 400 to a request
-    # that carries browser-like headers and 200 to one that carries none — the
-    # imitation is what trips it — so a refusal is retried once, undisguised,
-    # before this gives up.
     html = _get(url, BROWSER_HEADERS)
     if html is None:
         html = _get(url, {})
     if html is None:
-        # Refused both ways. A bot wall in front of the page is not a missing
-        # page: the sitemap lists the job, and a person would open it. Read it
-        # the way they would before calling it unreadable.
-        return _from_chrome(url, kind) or {"title": "", "text": ""}
+        seen = _from_chrome(url, kind)
+        if seen is None:
+            return ats or _guarded("", "", source_required=True)
+        if ats:
+            merged = pg.merge(seen["text"], seen["posting_guard"], ats["posting_guard"])
+            seen.update(merged)
+        return seen
 
     raw_title = (m.group(1).strip() if (m := _TITLE_RX.search(html)) else "")
     h1 = _text(m.group(1)) if (m := _H1_RX.search(html)) else ""
     title = h1 or _SPLIT_RX.split(_text(raw_title))[0].strip()
-    text = _text(html)
-    if len(text) < 400:
-        # A page that builds itself in the browser gives a plain fetch almost
-        # nothing, and a tailor working from nothing writes a worse résumé than
-        # one that was never tailored. Read it the way a person would.
-        if (seen := _from_chrome(url, kind)) and len(seen.get("text", "")) > len(text):
-            return seen
-    return {"title": title[:90], "text": text}
+    hit = _guarded(title, html, html_variants=[html], source_required=True)
+    if len(hit["text"]) < 400:
+        seen = _from_chrome(url, kind)
+        if seen and len(seen.get("text", "")) > len(hit["text"]):
+            combined = pg.merge(seen["text"], seen["posting_guard"],
+                                hit["posting_guard"])
+            seen.update(combined)
+            hit = seen
+    if ats:
+        combined = pg.merge(hit["text"], hit["posting_guard"], ats["posting_guard"],
+                            source_witness=bool(ats["posting_guard"].get("source_verified")))
+        hit.update(combined)
+    return hit
 
 
 def _get(url: str, headers: dict) -> str | None:
@@ -151,7 +170,7 @@ def _get(url: str, headers: dict) -> str | None:
 
 
 def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
-                  with_gone: bool = False):
+                  with_gone: bool = False, with_meta: bool = False):
     """Read several browser-only postings per session. {url: description}.
 
     Meta's postings cannot be read over HTTP at all, so each needs a real browser.
@@ -173,7 +192,7 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
     if not ok:
         raise PostingReadUnavailable(why)
 
-    out: dict[str, str] = {}
+    out: dict = {}
     gone: set[str] = set()
     for i in range(0, len(urls), batch):
         chunk = urls[i:i + batch]
@@ -216,7 +235,8 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
                 continue
             if len(text) < 400:
                 continue
-            out[u] = text
+            guarded = _guarded(str(entry.get("title") or ""), text)
+            out[u] = guarded if with_meta else guarded["text"]
     return (out, gone) if with_gone else out
 
 
@@ -279,8 +299,7 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
         why = problem or "The browser reader returned no posting report. Try reading it again."
         _note_browser_problem(why)
         raise PostingReadUnavailable(why)
-    return {"title": str(report.get("title", ""))[:90],
-            "text": str(report.get("description", ""))}
+    return _guarded(str(report.get("title", "")), str(report.get("description", "")))
 
 
 def fetch_jd(url: str, kind: str = "jd") -> str:

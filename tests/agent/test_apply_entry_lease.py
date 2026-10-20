@@ -14,8 +14,9 @@ import pytest
 
 from agent import graph
 from core.apply_queue import ApplyQueue
-from core.models import Status
+from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
+from tools import posting_guard as pg
 from tools import browser_skill_apply as forms
 
 PK = "example-co#job-1"
@@ -26,7 +27,12 @@ URL = "https://example.test/jobs/job-1"
 def world(monkeypatch):
     client = fakeredis.FakeRedis(decode_responses=True)
     tracking = RedisTracking(client)
-    tracking.set_status(PK, Status.TAILORED, company="example-co", jd_url=URL)
+    checked = pg.analyze("Build safe platform tools for distributed teams. " * 20)
+    assert tracking.put_new(JobRecord(
+        company="example-co", job_id="job-1", title="Test Engineer",
+        jd_url=URL, jd_text=checked["text"],
+        posting_guard=checked["posting_guard"]))
+    tracking.set_status(PK, Status.TAILORED)
     stores = SimpleNamespace(
         tracking=tracking,
         answer_bank=SimpleNamespace(

@@ -1595,7 +1595,8 @@ class _GreenhouseSession:
             args = ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)
         elif args == ('evaluate', bsk.PAGE):
             args = ('evaluate', GREENHOUSE_PAGE)
-        result = await self.raw.call(*args, **kwargs)
+        result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
+                        else self.raw.call(*args, **kwargs))
         if args in {('evaluate', GREENHOUSE_PAGE),
                     ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)}:
             page = result.get('value') if isinstance(result, dict) else None
@@ -2011,7 +2012,7 @@ class _EntrySession:
         self.upload_attempted = self.upload_pending = True
         try:
             try:
-                result = await self.raw.call('upload', drop, '--file', args[3], timeout=130)
+                result = await _effect_call(self.raw, 'upload', drop, '--file', args[3], timeout=130)
             except (Exception, asyncio.CancelledError) as exc:
                 if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                     raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
@@ -2128,7 +2129,8 @@ class _EntrySession:
                     self.on_committing_click()
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-        result = await self.raw.call(*args, **kwargs)
+        result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
+                        else self.raw.call(*args, **kwargs))
         if args and args[0] == 'evaluate':
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
@@ -4591,6 +4593,14 @@ class ApplicationIPCController:
         if self.upload_identity != self._row_pdf():
             raise Gate('Row PDF bytes changed before the final raw click.')
 
+async def _effect_call(raw, *args, **kwargs):
+    # Only the real application Session exposes this guarded transport. Offline
+    # fixture facades retain their injected fake command spy.
+    if hasattr(raw, 'application_effect'):
+        return await raw.application_effect(*args, **kwargs)
+    return await raw.call(*args, **kwargs)
+
+
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',
                 resume_path: str = '', fixture_context=None) -> dict:
@@ -4754,6 +4764,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             raise Gate('The verified posting changed before BrowserSkill startup.')
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
+                if ctx is None:
+                    raw_session.bind_application_controller(ApplicationIPCController(
+                        pk, company, url, resume_path, facts, filled, history,
+                        step, mark_click_started))
                 session = ctx.facade(raw_session) if ctx else raw_session
                 if provenance is not None and not _alias_current(
                         provenance, fixture_context=ctx):
@@ -4761,7 +4775,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 if isinstance(provenance, ApplicationEntryProvenance):
                     if not bsk.web_url(direct_url) or not allowed(direct_url):
                         raise Gate('Application entry route or current row/config changed.')
-                    await session.call('navigate', direct_url)
+                    await _effect_call(session, 'navigate', direct_url)
                     deadline = asyncio.get_running_loop().time() + (
                         _ASHBY_WAIT_SECONDS if provenance.ats == 'ashby' else _APPLICATION_WAIT_SECONDS)
                     session = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
@@ -4774,7 +4788,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 elif isinstance(provenance, GreenhouseJobAlias):
                     if not allowed(direct_url):
                         raise Gate('Greenhouse route or current row/config changed.')
-                    await session.call('navigate', direct_url)
+                    await _effect_call(session, 'navigate', direct_url)
                     session = _GreenhouseSession(
                         session, allowed, provenance, step, submitted=lambda: submitted)
                     deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS

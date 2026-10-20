@@ -123,7 +123,8 @@ def test_redis_atomic_reader_witness_preserves_unrelated_fields_and_indexes():
 
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = "example-co#job-1"
-    tracking.set_status(pk, Status.FOUND, jd_text="", attempts=7, company="example-co",
+    assert tracking.put_new(_synthetic_job())
+    tracking.set_status(pk, Status.FOUND, attempts=7, company="example-co",
                         jd_hash="synthetic-hash")
     assert tracking.update_if_status(pk, Status.FOUND,
                                      {"status": Status.TAILORING, "jd_read_revision": 1},
@@ -162,7 +163,8 @@ def test_redis_watch_collision_retries_without_rebasing_reader_witness(monkeypat
     client = fakeredis.FakeRedis(decode_responses=True)
     tracking = RedisTracking(client)
     pk = "example-co#job-1"
-    tracking.set_status(pk, Status.FOUND, jd_text="", jd_read_revision=4,
+    assert tracking.put_new(_synthetic_job())
+    tracking.set_status(pk, Status.FOUND, jd_read_revision=4,
                         company="example-co", note="original")
     original_pipeline = client.pipeline
     injected = [False]
@@ -242,7 +244,11 @@ def _repair_seed(store, *, status="error", old_url="/jobs/1?job_id=job-1",
     }
     attrs.update(overrides)
     status_value = Status(status) if status in {x.value for x in Status} else Status.ERROR
+    # This suite deliberately models a pre-guard legacy JD. Construct it in
+    # the disposable backend, never through the protected production status API.
+    legacy_jd = attrs.pop("jd_text")
     store.set_status(pk, status_value, **attrs)
+    _write_competing_row(store, pk, {"jd_text": legacy_jd})
     if status_value.value != status:
         _write_competing_row(store, pk, {"status": status})
     return pk, deepcopy(store.get(pk)), job

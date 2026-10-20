@@ -93,7 +93,6 @@ class RedisTracking(AbstractTracking):
         # Build the full identity first: SET NX must never expose a temporary
         # placeholder that another preflight might read as a persisted job.
         from datetime import datetime
-        from core.ids import jd_hash
         from tools import posting_guard as pg
 
         # First-write trust cannot be inferred from a flattened/legacy JD.
@@ -101,7 +100,7 @@ class RedisTracking(AbstractTracking):
                    if pg.valid(job.jd_text, job.posting_guard)
                    else pg.projection(job.jd_text, job.posting_guard))
         row = {
-            "pk": job.pk, "jd_hash": jd_hash(guarded["text"]), "status": status.value,
+            "pk": job.pk, "jd_hash": job.jd_hash, "status": status.value,
             "company": job.company, "job_id": job.job_id, "title": job.title,
             "jd_url": job.jd_url, "location": job.location, "ats": job.ats, "attempts": 0,
             "discovered_at": datetime.now(UTC).isoformat(),
@@ -173,8 +172,6 @@ class RedisTracking(AbstractTracking):
         reviewed_generation: str | None = None, source_witness: bool = False,
         settle_refusal: bool = False,
     ) -> bool:
-        from core.ids import jd_hash
-
         key, hold = f"app:{pk}", f"submit_hold:{pk}"
         for _ in range(16):
             try:
@@ -201,16 +198,12 @@ class RedisTracking(AbstractTracking):
                         return False
                     prev_status = current.get("status")
                     current.update(patch)
-                    if "jd_text" in patch:
-                        current["jd_hash"] = jd_hash(patch["jd_text"])
                     pipe.multi()
                     pipe.set(key, json.dumps(current, default=str))
                     if current.get("status") != prev_status and not is_internal_pk(pk):
                         if prev_status:
                             pipe.srem(f"status:{prev_status}", pk)
                         pipe.sadd(f"status:{current['status']}", pk)
-                    if "jd_text" in patch:
-                        pipe.hset("jdhash", current["jd_hash"], pk)
                     pipe.execute()
                     return True
             except WatchError:

@@ -201,7 +201,8 @@ async def test_outcome_recording_retains_unresolved_and_clears_only_confirmed(wo
     stores.answer_bank = SimpleNamespace(all_facts=lambda company: {},
                                         put=lambda *a, **kw: pytest.fail('No BrowserSkill draft may be banked'))
     stores.secrets = None
-    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value='Engineering role. ' * 50))
+    monkeypatch.setattr(run, '_jd_meta',
+                        AsyncMock(return_value=pg.analyze('Engineering role. ' * 50)))
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: '')
     monkeypatch.setattr(run, '_note_rotation_use', lambda *a: None)

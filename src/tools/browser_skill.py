@@ -174,7 +174,12 @@ class Session:
         if self.kind != "apply" or self._application_controller is None:
             raise Unavailable("Unmediated application IPC is forbidden.")
         await self._application_controller.before_ipc(self, args, kwargs)
-        return await command(*args, "--session", self.id, **kwargs)
+        try:
+            return await command(*args, "--session", self.id, **kwargs)
+        finally:
+            # Upload bytes are checked even if BrowserSkill reports an error:
+            # an interrupted transport does not prove no file was consumed.
+            await self._application_controller.after_ipc(self, args, kwargs)
 
     async def __aenter__(self):
         from tools.browser_runtime import configuration

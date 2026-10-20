@@ -342,7 +342,6 @@ def eligible_title_options(
     return tuple(options)
 
 
-
 def validate(
     base_latex: str, tailored_latex: str,
     approved_titles: Mapping[str, Sequence[str]] | None = None,

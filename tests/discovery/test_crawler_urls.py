@@ -611,3 +611,156 @@ def test_recrawl_repair_refuses_change_between_read_and_commit(
     assert _crawl_repair(stores) == 0
     assert stores.tracking.get(pk)[field] == value
     assert stores.queue.calls == offline_pipeline.marks == offline_pipeline.emitted == []
+
+
+# Issue #138: real synthetic XML producer, never a fabricated normalized record.
+_GH_CAREERS = "https://careers.example-co.test/openings"
+_GH_SUFFIX = _GH_CAREERS + "/job/731205"
+_GH_HOSTED = "https://job-boards.greenhouse.io/example-board/jobs/731205"
+
+
+def _gh_fixture(monkeypatch, tmp_path, *, urls=None, published="2026-10-18T00:00:00Z"):
+    from core import config as core_config
+
+    (tmp_path / "watchlist.yaml").write_text("""companies:
+  - name: example-co
+    careers_url: https://careers.example-co.test/openings
+    ats: greenhouse
+    board: example-board
+    discovery: crawl
+    mode: gated
+""")
+    monkeypatch.setattr(core_config, "get_settings",
+                        lambda: SimpleNamespace(config_dir=str(tmp_path)))
+    state = SimpleNamespace(urls=urls if urls is not None else [_GH_SUFFIX],
+                            target=_GH_HOSTED, published=published, calls=[])
+    def handle(req):
+        state.calls.append(str(req.url))
+        if req.url.host == "boards-api.greenhouse.io":
+            return httpx.Response(200, json={"jobs": [{
+                "id": 731205, "title": "Staff Platform Engineer",
+                "absolute_url": state.target, "content": "Synthetic role",
+                "location": {"name": "Remote"}, "first_published": state.published,
+            }]})
+        if req.url.path == "/sitemap.xml":
+            xml = "<urlset>" + "".join(
+                f"<url><loc>{url}</loc><lastmod>2035-10-21</lastmod></url>"
+                for url in state.urls) + "</urlset>"
+            return httpx.Response(200, text=xml)
+        if req.url.path == "/openings":
+            return httpx.Response(200, text="<html>Partial employer listing</html>")
+        return httpx.Response(404)
+    company = CompanyConfig(
+        name="example-co", careers_url=_GH_CAREERS, ats="greenhouse",
+        board="example-board", discovery=DiscoveryMode.CRAWL,
+    )
+    return company, state, httpx.Client(transport=httpx.MockTransport(handle))
+
+
+def test_verified_greenhouse_suffix_from_xml_survives_partial_html_and_screens(
+    offline_pipeline, monkeypatch, tmp_path,
+):
+    company, state, client = _gh_fixture(monkeypatch, tmp_path)
+    stores = _Stores()
+    with client:
+        count = crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda html, company: [_job("/openings/job/222", "222")],
+        )
+    assert count == 2
+    assert len(stores.queue.calls) == 2
+    exact = next(j for j in stores.tracking.put_calls if j.job_id == "731205")
+    assert (exact.pk, exact.jd_url, exact.ats, exact.greenhouse_board) == (
+        "example-co#731205", _GH_SUFFIX, "greenhouse", "example-board")
+    assert (exact.title, exact.location, exact.posted_at) == (
+        "Staff Platform Engineer", "Remote", "2026-10-18T00:00:00Z")
+    assert _GH_SUFFIX in offline_pipeline.screened
+    assert _GH_SUFFIX in offline_pipeline.urls
+    assert any("sitemap.xml" in call for call in state.calls)
+    assert any("boards-api.greenhouse.io" in call for call in state.calls)
+
+
+def test_verified_suffix_first_published_not_sitemap_lastmod_is_freshness(
+    offline_pipeline, monkeypatch, tmp_path,
+):
+    company, _, client = _gh_fixture(
+        monkeypatch, tmp_path, published="2018-01-01T00:00:00Z")
+    stores = _Stores()
+    monkeypatch.setattr(crawler, "_age_limit", lambda _: 48)
+    with client:
+        assert crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda *_: []) == 0
+    assert stores.tracking.put_calls == []
+    assert stores.queue.calls == []
+
+
+@pytest.mark.parametrize("seen_hit", [False, True])
+def test_suffix_same_pk_relative_legacy_collision_has_zero_row_repairs(
+    offline_pipeline, monkeypatch, tmp_path, seen_hit,
+):
+    company, _, client = _gh_fixture(monkeypatch, tmp_path)
+    stores = _Stores()
+    row = dict(pk="example-co#731205", company="example-co", job_id="731205",
+               jd_url="/openings/legacy", status="error", jd_read_attempts=8,
+               jd_read_revision=12, apply_requested_at="2026-10-20",
+               approval_status="pending", attempts=6, note="unchanged")
+    stores.tracking.seed(row)
+    before = deepcopy(stores.tracking.get(row["pk"]))
+    if seen_hit:
+        offline_pipeline.urls.add(_GH_SUFFIX)
+    with client:
+        assert crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda *_: []) == 0
+    assert stores.tracking.get(row["pk"]) == before
+    assert stores.tracking.repair_calls == []
+    assert stores.queue.calls == []
+    assert not offline_pipeline.marks
+
+
+def test_mixed_sources_conflicting_same_pk_or_cross_pk_do_not_choose_winner(
+    offline_pipeline, monkeypatch, tmp_path,
+):
+    company, _, client = _gh_fixture(monkeypatch, tmp_path)
+    stores = _Stores()
+    with client:
+        assert crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda *_: [_job("/openings/other?gh_jid=731205", "731205")],
+        ) == 0
+    assert stores.tracking.put_calls == []
+    assert stores.queue.calls == []
+    # A different PK for the same observed employer URL is a manual identity
+    # conflict, not a license for cross-PK merge or replacement.
+    _, _, client = _gh_fixture(monkeypatch, tmp_path)
+    with client:
+        assert crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda *_: [_job(_GH_SUFFIX, "old-slug")],
+        ) == 0
+    assert stores.tracking.put_calls == []
+
+
+@pytest.mark.parametrize("candidate", [
+    "https://foreign.test/openings/job/731205",
+    "http://careers.example-co.test/openings/job/731205",
+    "https://careers.example-co.test/openings/benefits/731205",
+    "https://careers.example-co.test/openings/job/731205/extra",
+    "https://careers.example-co.test/openings/job/731205?x=1",
+    "https://careers.example-co.test/openings/job/%3731205",
+    "https://careers.example-co.test/openings/../job/731205",
+    "https://careers.example-co.test:443/openings/job/731205",
+    "https://user@careers.example-co.test/openings/job/731205",
+])
+def test_suffix_rejects_noncanonical_sitemap_identity_without_writes(
+    offline_pipeline, monkeypatch, tmp_path, candidate,
+):
+    company, _, client = _gh_fixture(monkeypatch, tmp_path, urls=[candidate])
+    stores = _Stores()
+    with client:
+        assert crawler.crawl_company(
+            company, Preferences(), stores, client=client,
+            extractor=lambda *_: []) == 0
+    assert stores.tracking.put_calls == []
+    assert stores.queue.calls == []

@@ -194,3 +194,37 @@ def test_the_country_in_the_url_becomes_a_location_hint(url, location):
     job = sitemap.job_from_url("Acme", url)
     assert job is not None
     assert job.location == location
+
+
+def test_raw_sitemap_seam_preserves_numeric_terminal_url_before_title_loss():
+    url = "https://careers.example-co.test/openings/job/731205"
+    xml = (f"<urlset><url><loc>{url}</loc>"
+           "<lastmod>2030-01-01T00:00:00Z</lastmod></url></urlset>")
+    client = _site({"https://careers.example-co.test/sitemap.xml": xml})
+    try:
+        assert sitemap.job_from_url("example-co", url) is None
+        assert sitemap.raw_sitemap_entries(
+            "https://careers.example-co.test/openings", client,
+            strict_origin=True,
+        ) == [(url, "2030-01-01T00:00:00Z")]
+        assert sitemap.sitemap_jobs(
+            "https://careers.example-co.test/openings", "example-co", client) == []
+    finally:
+        client.close()
+
+
+def test_raw_strict_sitemap_disallows_foreign_redirect_but_ordinary_seam_unchanged():
+    def redirect(req):
+        if req.url.path == "/sitemap.xml" and req.url.host == "careers.example-co.test":
+            return httpx.Response(302, headers={"Location": "https://foreign.test/sitemap.xml"})
+        if req.url.host == "foreign.test":
+            return httpx.Response(200, text=(
+                "<urlset><url><loc>https://careers.example-co.test/openings/job/731205"
+                "</loc></url></urlset>"))
+        return httpx.Response(404)
+    with httpx.Client(transport=httpx.MockTransport(redirect)) as client:
+        assert sitemap.raw_sitemap_entries(
+            "https://careers.example-co.test/openings", client,
+            strict_origin=True) == []
+        assert len(sitemap.raw_sitemap_entries(
+            "https://careers.example-co.test/openings", client)) == 1

@@ -229,6 +229,39 @@ def repair_backend(request, aws):
     return TrackingStore("applications")
 
 
+@pytest.mark.parametrize("field,value", [
+    ("jd_text", "Changed unbound synthetic JD"),
+    ("posting_guard", {"generation": "forged"}),
+    ("reviewed_guard_generation", "unapproved-generation"),
+])
+def test_generic_status_and_reader_cas_cannot_split_guard(repair_backend, field, value):
+    """Neither backend may bypass the atomic guard+JD update contract."""
+    store = repair_backend
+    job = _synthetic_job("guard-fields")
+    assert store.put_new(job)
+    before = deepcopy(store.get(job.pk))
+    with pytest.raises(ValueError, match="update_posting_guard"):
+        store.set_status(job.pk, Status.FOUND, **{field: value})
+    with pytest.raises(ValueError, match="update_posting_guard"):
+        store.update_if_status(
+            job.pk, Status.FOUND, {field: value},
+            expected_reader={"jd_text": before["jd_text"]})
+    assert store.get(job.pk) == before
+
+
+def test_redis_status_only_legacy_upsert_preserves_indexes_and_no_guard():
+    """An old status-only bookkeeping write is not permission to write JD."""
+    store = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    pk = "example-co#synthetic-marker"
+    store.set_status(pk, Status.FOUND, note="synthetic")
+    assert store.get(pk) == {"pk": pk, "status": "found", "note": "synthetic"}
+    assert store.status_counts()["found"] == 1
+    store.set_status(pk, Status.TAILORED, note="updated")
+    assert store.get(pk)["status"] == "tailored"
+    assert store.status_counts().get("found", 0) == 0
+    assert store.status_counts()["tailored"] == 1
+
+
 def _repair_seed(store, *, status="error", old_url="/jobs/1?job_id=job-1",
                  **overrides):
     job = _synthetic_job()

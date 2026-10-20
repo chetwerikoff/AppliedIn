@@ -134,7 +134,9 @@ def guard_patch(current: dict, inspected: dict | None,
     """
     from tools import posting_guard as pg
 
-    if current.get("confirmation_id") or current.get("possible_submission"):
+    if (current.get("status") in ("applied", "applied_manual")
+            or current.get("confirmation_id") or current.get("possible_submission")
+            or current.get("submit_hold")):
         return None
     if settle_refusal:
         if (current.get("status") != "submitting"

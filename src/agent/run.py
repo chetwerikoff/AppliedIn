@@ -660,7 +660,8 @@ def _guard_refusal(pk: str, stores: Any) -> dict:
     try:
         current = stores.tracking.get_current(pk)
         if not current:
-            return {"result": "gated", "pk": pk, "reason": reason}
+            return {"result": "conflict", "pk": pk,
+                    "reason": "posting_guard_state_changed"}
         if (submit_hold.blocked(pk, current, tracking=stores.tracking)
                 or current.get("possible_submission")
                 or current.get("confirmation_id")
@@ -671,11 +672,31 @@ def _guard_refusal(pk: str, stores: Any) -> dict:
             ok = stores.tracking.update_posting_guard(
                 pk, current, settle_refusal=True)
             if not ok:
+                # A failed conditional write is not evidence that the gate
+                # settled. Check for a newly created submission hold first.
+                fresh = stores.tracking.get_current(pk)
+                if (fresh and (submit_hold.blocked(pk, fresh, tracking=stores.tracking)
+                               or fresh.get("possible_submission")
+                               or fresh.get("confirmation_id")
+                               or fresh.get("gate_reason") == "submit_uncertain")):
+                    return {"result": "failed", "pk": pk, "reason": "uncertain",
+                            "detail": submit_hold.REASON}
+                if fresh and fresh.get("status") in ("applied", "applied_manual"):
+                    return {"result": "duplicate", "pk": pk,
+                            "reason": "already_applied"}
                 log.warning("posting guard refusal settlement raced for %s", pk)
+                return {"result": "conflict", "pk": pk,
+                        "reason": "posting_guard_state_changed"}
         elif current.get("status") in ("applied", "applied_manual"):
             return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+        elif (current.get("status") not in ("tailored", "needs_human")
+              or current.get("fail_kind") != reason):
+            return {"result": "conflict", "pk": pk,
+                    "reason": "posting_guard_state_changed"}
     except Exception:
         log.exception("posting guard refusal failed to persist for %s", pk)
+        return {"result": "conflict", "pk": pk,
+                "reason": "posting_guard_state_changed"}
     return {"result": "gated", "pk": pk, "reason": reason,
             "detail": "Current posting generation requires job-specific review."}
 

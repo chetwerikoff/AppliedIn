@@ -733,6 +733,60 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
         raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 
 
+
+def _guard_model_page(model_page: dict, pk: str, company: str, *,
+                      fixture_context=None) -> dict:
+    """Guard Python-assembled page descriptions before the next model decision.
+
+    The native browser observation occurs earlier and is not covered here.
+    Keep structural controls/approved choices intact; only JD-derived string
+    fields can be replaced. An invalid field is an error, never model input.
+    """
+    from tools import posting_guard as pg
+
+    safe = dict(model_page)
+    reasons: set[str] = set()
+    for field in ('text', 'description', 'title', 'summary',
+                  'job_description', 'snippet'):
+        if field not in safe:
+            continue
+        checked = pg.analyze(safe[field])
+        safe[field] = checked['text']
+        reasons.update(checked['posting_guard']['reasons'])
+    if not reasons:
+        return safe
+    if fixture_context is not None:
+        raise Gate('Posting page contained a new suspicious instruction.',
+                   reason='posting_guard_review_required')
+    try:
+        from core.stores import make_stores
+
+        tracking = make_stores().tracking
+        current = tracking.get_current(pk)
+        if (not current or current.get('pk') != pk
+                or current.get('company') != company):
+            raise Gate('Tracked posting identity changed.',
+                       reason='posting_guard_review_required')
+        incoming = pg.analyze(
+            current.get('jd_text') or '', previous={'reasons': sorted(reasons)})
+        combined = pg.merge(
+            current.get('jd_text') or '', incoming['posting_guard'],
+            current.get('posting_guard'))
+        if not tracking.update_posting_guard(pk, current, combined):
+            raise Gate('Posting safety signal could not be recorded.',
+                       reason='posting_guard_review_required')
+        newest = tracking.get_current(pk)
+        if not newest or not pg.authorised(newest):
+            raise Gate('New posting finding needs current owner review.',
+                       reason='posting_guard_review_required')
+    except Gate:
+        raise
+    except Exception as exc:
+        raise Gate('Current posting safety signal is unavailable.',
+                   reason='posting_guard_review_required') from exc
+    return safe
+
+
 def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     """A leased worker must re-read the human outcome and hold at the IPC edge."""
     ctx = _synthetic(fixture_context, pk=pk)
@@ -4445,46 +4499,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         model_page['entry'] = {k: v for k, v in page['entry'].items()
                                                if k not in {'upload_tree', 'native_candidates',
                                                             'quarantined_native_owners'}}
-                    # Browser observation already happened; do not claim to
-                    # guard that model-native first read. Every Python-assembled
-                    # JD-derived field sent to the next decision is guarded.
-                    from tools import posting_guard as pg
-
-                    page_reasons = set()
-                    for field in ('text', 'description', 'title',
-                                  'summary', 'job_description', 'snippet'):
-                        value = model_page.get(field)
-                        if isinstance(value, str):
-                            checked = pg.analyze(value)
-                            model_page[field] = checked['text']
-                            page_reasons.update(checked['posting_guard']['reasons'])
-                    if page_reasons:
-                        if ctx is not None:
-                            raise Gate('Posting page contained a new suspicious instruction.',
-                                       reason='posting_guard_review_required')
-                        from core.stores import make_stores
-                        tracking = make_stores().tracking
-                        current = tracking.get_current(pk)
-                        if not current or current.get('company') != company:
-                            raise Gate('Tracked posting identity changed.',
-                                       reason='posting_guard_review_required')
-                        new_evidence = pg.analyze(
-                            current.get('jd_text') or '',
-                            previous={'reasons': list(page_reasons)})
-                        combined = pg.merge(
-                            current.get('jd_text') or '',
-                            new_evidence['posting_guard'],
-                            current.get('posting_guard'))
-                        if not tracking.update_posting_guard(
-                                pk, current, combined):
-                            raise Gate('Posting safety signal could not be recorded.',
-                                       reason='posting_guard_review_required')
-                        # A newly discovered flag changes generation and
-                        # invalidates every old displayed owner decision.
-                        newest = tracking.get_current(pk)
-                        if not newest or not pg.authorised(newest):
-                            raise Gate('New posting finding needs current owner review.',
-                                       reason='posting_guard_review_required')
+                    model_page = _guard_model_page(
+                        model_page, pk, company, fixture_context=ctx)
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')

@@ -826,6 +826,9 @@ def test_redis_pin_watches_row_and_empty_independent_hold(monkeypatch):
 @pytest.mark.parametrize("changed", [
     {"status": "submitting"}, {"approval_status": "approved"},
     {"human_approved_answers": {"question": "synthetic"}},
+    # Browser artifacts added after the original read are protected witnesses.
+    {"fields": [{"label": "Synthetic field", "value": "synthetic"}]},
+    {"screenshot_s3_key": "synthetic/example-screen.png"},
     {"jd_read_revision": 7}, {"possible_submission": True},
     {"apply_requested_at": "2026-10-21T00:00:00Z"},
 ])
@@ -922,6 +925,13 @@ def test_dynamo_pin_consistent_read_and_row_local_partial_condition(aws, monkeyp
     assert "attribute_not_exists(#pin)" in call["ConditionExpression"]
     assert "submit_hold" in call["ExpressionAttributeNames"].values()
     assert "approval_status" in call["ExpressionAttributeNames"].values()
+    # The first observation lacked these fields: a browser artifact appearing
+    # after that observation must make the DynamoDB condition fail.
+    for artifact in ("fields", "screenshot_s3_key"):
+        aliases = [alias for alias, field in call["ExpressionAttributeNames"].items()
+                   if field == artifact]
+        assert len(aliases) == 1
+        assert f"attribute_not_exists({aliases[0]})" in call["ConditionExpression"]
     assert store.get(job.pk) == {**before, "greenhouse_board": "example-board"}
 
 
@@ -929,6 +939,8 @@ def test_dynamo_pin_consistent_read_and_row_local_partial_condition(aws, monkeyp
     {"status": "submitting"}, {"jd_read_revision": 4},
     {"approval_status": "approved"}, {"possible_submission": True},
     {"human_approved_answers": {"question": "synthetic"}},
+    {"fields": [{"label": "Synthetic field", "value": "synthetic"}]},
+    {"screenshot_s3_key": "synthetic/example-screen.png"},
     {"submit_hold": None},
 ])
 def test_dynamo_pin_rejects_row_local_intervening_witness(aws, monkeypatch, changed):
@@ -949,3 +961,30 @@ def test_dynamo_pin_rejects_row_local_intervening_witness(aws, monkeypatch, chan
         job.pk, "example-board", expected_row=before)
     assert injected[0]
     assert store.get(job.pk) == {**before, **changed}
+
+
+@pytest.mark.parametrize("status", [Status.NEEDS_HUMAN, Status.FAILED])
+def test_storage_pin_rejects_requestless_browser_gates_on_both_backends(
+    repair_backend, status,
+):
+    """Requestless _apply_direct form evidence must not authorize a tenant pin.
+
+    Both row-local DynamoDB and row+hold Redis reject it without changing
+    status/index or history; no application path or real backend runs here.
+    """
+    store = repair_backend
+    job, _before_request = _pin_seed(store)
+    store.set_status(
+        job.pk, status, apply_requested_at="", fail_kind="",
+        gate_reason="unknown_field", gate_call_id="direct",
+        gate_source="applier",
+        gate_pending={"form_question": {"pk": job.pk, "label": "Synthetic question"}},
+        fields=[{"label": "Synthetic field", "value": "synthetic"}],
+        screenshot_s3_key="synthetic/example-screen.png",
+    )
+    original = deepcopy(store.get(job.pk))
+    indexes = _indexes(store, job)
+    assert not store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=original)
+    assert store.get(job.pk) == original
+    assert _indexes(store, job) == indexes

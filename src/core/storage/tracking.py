@@ -34,7 +34,6 @@ class TrackingStore(AbstractTracking):
         The ``attribute_not_exists(pk)`` condition is the dedup guarantee: a
         second poll cycle that rediscovers the same posting is a no-op.
         """
-        from core.ids import jd_hash
         from tools import posting_guard as pg
 
         guarded = ({"text": job.jd_text, "posting_guard": job.posting_guard}
@@ -42,7 +41,7 @@ class TrackingStore(AbstractTracking):
                    else pg.projection(job.jd_text, job.posting_guard))
         item: dict[str, Any] = {
             "pk": job.pk,
-            "jd_hash": jd_hash(guarded["text"]),
+            "jd_hash": job.jd_hash,
             "status": status.value,
             "company": job.company,
             "job_id": job.job_id,
@@ -82,8 +81,6 @@ class TrackingStore(AbstractTracking):
         settle_refusal: bool = False,
     ) -> bool:
         """Read the base table consistently, then compare at UpdateItem commit."""
-        from core.ids import jd_hash
-
         current = self.get_current(pk)
         if not guard_observation_matches(current, observed):
             return False
@@ -93,8 +90,6 @@ class TrackingStore(AbstractTracking):
                             settle_refusal=settle_refusal)
         if patch is None:
             return False
-        if "jd_text" in patch:
-            patch["jd_hash"] = jd_hash(patch["jd_text"])
         names, values, conditions = {"#pk": "pk"}, {}, ["attribute_exists(#pk)"]
         for i, key in enumerate(_GUARD_COMPARE):
             field, param = f"#g{i}", f":g{i}"

@@ -123,15 +123,15 @@ class _VisibleHTML(HTMLParser):
             self.anchor[-1]["text"].append(data)
 
 
-def _text(raw: str, reasons: set[str]) -> str:
+def _text(raw: str, reasons: set[str], *, strip_trailing: bool = False) -> str:
     if _ZERO_WIDTH.search(raw):
         reasons.add("zero_width")
     if _BIDI.search(raw):
         reasons.add("bidi_control")
     raw = _ZERO_WIDTH.sub("", _BIDI.sub("", raw))
-    # Plain-text reader output can end with harmless spaces. Keep those exact
-    # spaces so the cleaned JD and its bound generation remain stable.
-    trailing_spaces = raw[len(raw.rstrip(" ")):]
+    # Legacy string readers retain harmless trailing spaces, while normalized
+    # reader interfaces opt out *during* analysis, before generation binding.
+    trailing_spaces = "" if strip_trailing else raw[len(raw.rstrip(" ")):]
     cleaned: list[str] = []
     for line in raw.splitlines():
         if _INSTRUCTION.search(line):
@@ -173,7 +173,7 @@ def _result(text: str, reasons: set[str], source_verified: bool) -> dict:
 
 
 def analyze(text: str | None, *, html_variants=(), source_required: bool = False,
-            previous: dict | None = None) -> dict:
+            previous: dict | None = None, strip_trailing: bool = False) -> dict:
     """Inspect all supplied HTML variants before relying on selected plain text.
 
     Previous positive reasons are monotonic. A provisional missing-HTML marker
@@ -206,7 +206,7 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.close()
             reasons.update(parser.reasons)
             selected = "".join(parser.parts)
-        clean = _text(selected, reasons)
+        clean = _text(selected, reasons, strip_trailing=strip_trailing)
         if source_required and not verified:
             reasons.add("source_html_unavailable")
         elif verified:

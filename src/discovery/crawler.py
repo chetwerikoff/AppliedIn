@@ -268,6 +268,11 @@ def _default_extractor(html: str, company: str) -> list[JobRecord]:
 
     from core.config import get_settings
 
+    from tools import posting_guard as pg
+
+    # Other callers may invoke the extractor directly with raw HTML.
+    if "<" in html:
+        html = pg.analyze(html)["text"]
     prompt = (
         "Extract every job posting from this careers page as a JSON array of "
         '{"job_id","title","url"} objects. job_id is a stable id from the URL if '
@@ -463,12 +468,29 @@ def _enqueue(
     already = seen.load()
     trusted_origin = _repair_origin(company.careers_url, fetched_url)
 
+    from tools import posting_guard as pg
+
+    def merge_duplicate(job):
+        try:
+            current = stores.tracking.get_current(job.pk)
+            if (current and current.get("company") == job.company
+                    and current.get("jd_url") == job.jd_url):
+                guarded = ({"text": job.jd_text, "posting_guard": job.posting_guard}
+                           if pg.valid(job.jd_text, job.posting_guard)
+                           else pg.projection(job.jd_text, job.posting_guard))
+                stores.tracking.update_posting_guard(
+                    job.pk, current, guarded,
+                    source_witness=bool(guarded["posting_guard"].get("source_verified")))
+        except Exception:
+            log.exception("could not merge newly discovered posting evidence")
+
     enqueued, new_jobs = 0, []
     for job in jobs:
         if job.jd_url in already:
             # A past-run URL ledger hit is still eligible for a same-pk
             # legacy repair. It remains excluded from *new* discoveries.
             _repair_duplicate(company, job, stores, trusted_origin)
+            merge_duplicate(job)
             continue
         if stores.tracking.put_new(job):
             stores.queue.enqueue(stores.tailor_queue, {"pk": job.pk})
@@ -480,6 +502,7 @@ def _enqueue(
             enqueued += 1
         else:
             _repair_duplicate(company, job, stores, trusted_origin)
+            merge_duplicate(job)
     if new_jobs:
         seen.mark(new_jobs)
     if enqueued:
@@ -617,8 +640,24 @@ def crawl_company(
 
     from core.events import emit
 
+    from tools import posting_guard as pg
+
+    guarded_page = pg.safe_extractor(
+        html, fetched_url or company.careers_url,
+        lambda origin, url: _trusted_posting_url(
+            url, company.careers_url, fetched_url=fetched_url) == url)
+    if guarded_page["posting_guard"]["status"] == "error":
+        log.warning("%s: source guard failed; no crawler extraction", company.name)
+        return 0
     extract = extractor or _default_extractor
-    raw_jobs = extract(html, company.name)
+    raw_jobs = extract(guarded_page["extractor_text"], company.name)
+    for job in raw_jobs:
+        inspected = pg.analyze(
+            job.jd_text or job.title, previous=guarded_page["posting_guard"],
+            source_required=True)
+        job.jd_text = inspected["text"]
+        job.title = pg.analyze(job.title)["text"]
+        job.posting_guard = inspected["posting_guard"]
     extracted = []
     for job in raw_jobs:
         normalized = _trusted_posting_url(

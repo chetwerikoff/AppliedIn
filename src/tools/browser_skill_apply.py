@@ -311,7 +311,7 @@ def handoff(message: str, step: dict) -> dict:
 _GATE_DIAGNOSTICS = frozenset({
     'owner_question', 'defect_structural', 'defect_provenance',
     'defect_tenant', 'defect_witness', 'defect_ashby_root_identity',
-    'defect_greenhouse_tenant_alias',
+    'defect_greenhouse_tenant_alias', 'posting_guard_review_required',
 })
 
 
@@ -749,6 +749,20 @@ def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     if (row.get('status') != 'needs_human'
             or row.get('gate_reason') != 'submit_uncertain' or not held):
         raise Gate('Human outcome changed or submission hold was cleared; no click is safe.')
+    # Guard source findings can arrive even after a hold was created. The
+    # pre-click read is the last available code-controlled boundary.
+    if ctx is None:
+        from tools import posting_guard as pg
+        try:
+            current = tracking.get_current(pk)
+            if not current or not pg.authorised(current):
+                raise Gate('Posting evidence changed since the job review.',
+                           reason='posting_guard_review_required')
+        except Gate:
+            raise
+        except Exception as exc:
+            raise Gate('Posting safety evidence unavailable before click.',
+                       reason='posting_guard_review_required') from exc
 
 
 def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
@@ -762,6 +776,25 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
     if (ctx.duplicate_refusal() if ctx else _duplicate_refusal(pk)):
         raise Gate('This job is already applied; no duplicate is permitted.')
     row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+    if ctx is None:
+        from tools import posting_guard as pg
+        try:
+            from core.stores import make_stores
+            current = make_stores().tracking.get_current(pk)
+            if not current or not pg.authorised(current):
+                raise Gate('Current posting generation requires explicit review.',
+                           reason='posting_guard_review_required')
+            row = current
+        except Gate:
+            raise
+        except Exception as exc:
+            raise Gate('Current posting safety witness is unavailable.',
+                       reason='posting_guard_review_required') from exc
+    elif isinstance(row.get('posting_guard'), dict) and row['posting_guard']:
+        from tools import posting_guard as pg
+        if not pg.authorised(row):
+            raise Gate('Synthetic posting safety witness is not authorized.',
+                       reason='posting_guard_review_required')
     if ctx is None:
         # A queue-owned company lease AND its exact pk are necessary for a
         # production form to open. Neither witness confers caller identity:
@@ -4412,6 +4445,46 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         model_page['entry'] = {k: v for k, v in page['entry'].items()
                                                if k not in {'upload_tree', 'native_candidates',
                                                             'quarantined_native_owners'}}
+                    # Browser observation already happened; do not claim to
+                    # guard that model-native first read. Every Python-assembled
+                    # JD-derived field sent to the next decision is guarded.
+                    from tools import posting_guard as pg
+
+                    page_reasons = set()
+                    for field in ('text', 'description', 'title',
+                                  'summary', 'job_description', 'snippet'):
+                        value = model_page.get(field)
+                        if isinstance(value, str):
+                            checked = pg.analyze(value)
+                            model_page[field] = checked['text']
+                            page_reasons.update(checked['posting_guard']['reasons'])
+                    if page_reasons:
+                        if ctx is not None:
+                            raise Gate('Posting page contained a new suspicious instruction.',
+                                       reason='posting_guard_review_required')
+                        from core.stores import make_stores
+                        tracking = make_stores().tracking
+                        current = tracking.get_current(pk)
+                        if not current or current.get('company') != company:
+                            raise Gate('Tracked posting identity changed.',
+                                       reason='posting_guard_review_required')
+                        new_evidence = pg.analyze(
+                            current.get('jd_text') or '',
+                            previous={'reasons': list(page_reasons)})
+                        combined = pg.merge(
+                            current.get('jd_text') or '',
+                            new_evidence['posting_guard'],
+                            current.get('posting_guard'))
+                        if not tracking.update_posting_guard(
+                                pk, current, combined):
+                            raise Gate('Posting safety signal could not be recorded.',
+                                       reason='posting_guard_review_required')
+                        # A newly discovered flag changes generation and
+                        # invalidates every old displayed owner decision.
+                        newest = tracking.get_current(pk)
+                        if not newest or not pg.authorised(newest):
+                            raise Gate('New posting finding needs current owner review.',
+                                       reason='posting_guard_review_required')
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')

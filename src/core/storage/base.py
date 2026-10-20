@@ -112,7 +112,9 @@ PIN_WITNESS_FIELDS = tuple(dict.fromkeys((
     "pk", "company", "job_id", "jd_url", "ats", "greenhouse_board",
     "status", "fail_kind", "gate_reason", "attempts", "note", "notes",
     "approval", "approved", "approved_at", "approval_at", "approval_status",
-    "human_approved", "browser_session", "browser_session_id",
+    "human_approved", "human_approved_answers",
+    "gate_pending", "gate_call_id", "gate_source", "last_button", "last_url",
+    "browser_session", "browser_session_id",
     "application_session", "application_session_id", "possible_submission",
     "submit_hold", "submit_hold_at", "submit_hold_reason",
     "submit_uncertain", "submission_uncertain", "browser_started_at",
@@ -120,8 +122,9 @@ PIN_WITNESS_FIELDS = tuple(dict.fromkeys((
     "application_attempted_at", "application_submitted_at",
 ) + REPAIR_READER_FIELDS + REPAIR_PROTECTED_FIELDS))
 _PIN_WITNESS_PREFIXES = (
-    "apply_", "approval_", "approved_", "browser_", "session_", "submit_",
-    "submission_", "jd_read_", "confirmation_", "reader_", "application_",
+    "apply_", "approval_", "approved_", "human_approved_", "gate_",
+    "browser_", "session_", "form_", "submit_", "submission_", "jd_read_",
+    "confirmation_", "reader_", "application_", "last_",
 )
 _PIN_ALLOWED_STATUSES = frozenset(x.value for x in Status) - {
     "submitting", "applied", "applied_manual",
@@ -188,13 +191,19 @@ def tenant_pin_row_allowed(row: dict | None, pk: str, board: str) -> bool:
     if any(row.get(key) not in (None, "", False, 0)
            for key in row if isinstance(key, str)
            and key.startswith(("browser_", "session_", "application_session",
-                               "form_started_", "apply_started_"))):
+                               "form_", "apply_started_", "last_button",
+                               "last_url"))):
         return False
     # A request followed only by the pre-browser tenant-gate denial is allowed;
-    # no other request history can be inferred safe just from a missing pin.
+    # a different human/form gate or browser-session context is not evidence of
+    # that narrow failure, even if an old fail_kind still says "defect_tenant".
     if row.get("apply_requested_at"):
-        gate = {row.get("gate_reason"), row.get("fail_kind")}
-        if not gate.intersection({"defect_greenhouse_tenant_alias", "defect_tenant"}):
+        reasons = (row.get("gate_reason"), row.get("fail_kind"))
+        tenant_reasons = {"defect_greenhouse_tenant_alias", "defect_tenant"}
+        if (not any(reason in tenant_reasons for reason in reasons)
+                or any(reason not in (*tenant_reasons, None, "") for reason in reasons)
+                or any(row.get(field) not in (None, "", False, 0)
+                       for field in ("gate_pending", "gate_call_id", "gate_source"))):
             return False
     return True
 

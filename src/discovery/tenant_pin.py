@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 import yaml
 
-from core.ids import make_pk
+from core.ids import is_internal_pk, make_pk
 from core.models import ApplyMode, DiscoveryMode, JobRecord
 from core.storage.base import tenant_pin_row_allowed
 from .adapters import ADAPTERS
@@ -214,7 +214,7 @@ def rederive_one(
     if commit and not operator_authorized:
         return {**result, "status": "authorization_required",
                 "next_action": "Only the operator may separately authorize the commit."}
-    if not isinstance(pk, str) or not pk or pk.startswith("meta#"):
+    if not isinstance(pk, str) or not pk or is_internal_pk(pk):
         return {**result, "status": "invalid_pk", "next_action": _NEXT_MANUAL}
     store = tracking if tracking is not None else make_stores().tracking
     original = deepcopy(store.get(pk))

@@ -109,6 +109,10 @@ def test_present_board_is_not_a_missing_board(world, value):
     {"browser_session_id": "synthetic-browser-session"},
     {"submission_attempted_at": "2026-10-20"},
     {"gate_reason": "submit_uncertain"},
+    {"gate_reason": "owner_question"},
+    {"last_button": "Submit"},
+    {"browser_started_at": ""},
+    {"gate_pending": {"question": "synthetic form question"}},
     {"apply_requested_at": "2026-10-21", "gate_reason": "owner_question",
      "fail_kind": "other"},
 ])

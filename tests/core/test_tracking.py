@@ -825,6 +825,7 @@ def test_redis_pin_watches_row_and_empty_independent_hold(monkeypatch):
 
 @pytest.mark.parametrize("changed", [
     {"status": "submitting"}, {"approval_status": "approved"},
+    {"human_approved_answers": {"question": "synthetic"}},
     {"jd_read_revision": 7}, {"possible_submission": True},
     {"apply_requested_at": "2026-10-21T00:00:00Z"},
 ])
@@ -927,6 +928,7 @@ def test_dynamo_pin_consistent_read_and_row_local_partial_condition(aws, monkeyp
 @pytest.mark.parametrize("changed", [
     {"status": "submitting"}, {"jd_read_revision": 4},
     {"approval_status": "approved"}, {"possible_submission": True},
+    {"human_approved_answers": {"question": "synthetic"}},
     {"submit_hold": None},
 ])
 def test_dynamo_pin_rejects_row_local_intervening_witness(aws, monkeypatch, changed):

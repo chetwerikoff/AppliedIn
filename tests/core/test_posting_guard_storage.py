@@ -7,7 +7,7 @@ import pytest
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
 from core.storage.tracking import TrackingStore
-from tests.core.conftest import make_applications_table
+from .conftest import make_applications_table
 from tools import posting_guard as pg
 
 JOB_URL = "https://jobs.ashbyhq.com/example-co/role-1"

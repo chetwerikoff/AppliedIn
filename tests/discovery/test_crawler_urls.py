@@ -10,7 +10,7 @@ import pytest
 
 from core.models import DiscoveryMode, JobRecord
 from core.storage.base import legacy_repair_row_allowed
-from discovery import chrome_crawl, crawler
+from discovery import chrome_crawl, crawler, sitemap
 from discovery.watchlist import CompanyConfig, Preferences
 
 
@@ -764,3 +764,93 @@ def test_suffix_rejects_noncanonical_sitemap_identity_without_writes(
             extractor=lambda *_: []) == 0
     assert stores.tracking.put_calls == []
     assert stores.queue.calls == []
+
+
+@pytest.mark.parametrize(("browser_id", "browser_url"), [
+    ("731205", _GH_SUFFIX),  # same PK, unproved browser ATS
+    ("731205", _GH_CAREERS + "/other?gh_jid=731205"),  # same PK, other URL
+    ("legacy-slug", _GH_SUFFIX),  # same URL, different PK
+])
+def test_partial_html_browser_fallback_cannot_replace_verified_suffix(
+    offline_pipeline, monkeypatch, tmp_path, browser_id, browser_url,
+):
+    """Irrelevant feed title must not let a later browser claim win by URL."""
+    company, _, client = _gh_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(crawler, "_default_extractor",
+                        lambda *_: [_job("/openings/job/999", "999")])
+    monkeypatch.setattr(
+        crawler, "relevant",
+        lambda jobs, prefs: [j for j in jobs if j.title.startswith("Principal")],
+    )
+    unproved = JobRecord(
+        company="example-co", job_id=browser_id, title="Principal Browser Claim",
+        jd_url=browser_url, jd_text="Synthetic browser result", ats="crawl",
+    )
+    unrelated = JobRecord(
+        company="example-co", job_id="unrelated", title="Principal Separate Role",
+        jd_url=_GH_CAREERS + "/job/unrelated-role",
+        jd_text="Synthetic browser result", ats="crawl",
+    )
+    monkeypatch.setattr(crawler, "_browser_extract",
+                        lambda *_: [unproved, unrelated])
+    stores = _Stores()
+    with client:
+        assert crawler.crawl_company(company, Preferences(), stores, client=client) == 1
+    assert [j.job_id for j in stores.tracking.put_calls] == ["unrelated"]
+    assert list(stores.tracking.persisted) == ["example-co#unrelated"]
+    assert len(stores.queue.calls) == 1
+    assert stores.tracking.repair_calls == []
+    assert offline_pipeline.marks == [[unrelated.jd_url]]
+
+
+def test_sitemap_same_pk_conflict_invalidates_earlier_screened_suffix(
+    offline_pipeline, monkeypatch, tmp_path,
+):
+    """A later ordinary sitemap collision cannot leave an old screened winner."""
+    company, _, client = _gh_fixture(
+        monkeypatch, tmp_path,
+        urls=[_GH_SUFFIX, _GH_SUFFIX + "/staff-platform-engineer"],
+    )
+    monkeypatch.setattr(crawler, "_default_extractor", lambda *_: [])
+    monkeypatch.setattr(crawler, "sitemap_jobs",
+                        lambda url, name: sitemap.sitemap_jobs(url, name, client))
+    monkeypatch.setattr(crawler, "_browser_extract", lambda *_: [])
+    stores = _Stores()
+    with client:
+        assert crawler.crawl_company(company, Preferences(), stores, client=client) == 0
+    assert stores.tracking.put_calls == stores.queue.calls == []
+    assert stores.tracking.persisted == {}
+    assert offline_pipeline.marks == offline_pipeline.emitted == []
+
+
+@pytest.mark.parametrize("browser_id", ["731205", "legacy-slug"])
+def test_empty_html_sitemap_conflict_survives_browser_fallback(
+    offline_pipeline, monkeypatch, tmp_path, browser_id,
+):
+    """The early sitemap-to-browser fallback cannot revive a disputed PK."""
+    company, _, client = _gh_fixture(
+        monkeypatch, tmp_path,
+        urls=[_GH_SUFFIX, _GH_SUFFIX + "/staff-platform-engineer"],
+    )
+    monkeypatch.setattr(crawler, "_render_page", lambda *_: "")
+    monkeypatch.setattr(crawler, "sitemap_jobs",
+                        lambda url, name: sitemap.sitemap_jobs(url, name, client))
+    unproved = JobRecord(
+        company="example-co", job_id=browser_id, title="Browser Claim",
+        jd_url=_GH_SUFFIX, jd_text="Synthetic browser result", ats="crawl",
+    )
+    unrelated = JobRecord(
+        company="example-co", job_id="unrelated", title="Separate Role",
+        jd_url=_GH_CAREERS + "/job/unrelated-role",
+        jd_text="Synthetic browser result", ats="crawl",
+    )
+    monkeypatch.setattr(crawler, "_browser_extract",
+                        lambda *_: [unproved, unrelated])
+    stores = _Stores()
+    with client:
+        assert crawler.crawl_company(company, Preferences(), stores, client=client) == 1
+    assert [j.job_id for j in stores.tracking.put_calls] == ["unrelated"]
+    assert list(stores.tracking.persisted) == ["example-co#unrelated"]
+    assert len(stores.queue.calls) == 1
+    assert stores.tracking.repair_calls == []
+    assert offline_pipeline.marks == [[unrelated.jd_url]]

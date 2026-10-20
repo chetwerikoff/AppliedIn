@@ -314,15 +314,17 @@ def _numeric_suffix_candidates(
 
 def _reconcile_suffix(
     company: CompanyConfig, ordinary: list[JobRecord],
-    verified: list[JobRecord],
+    verified: list[JobRecord], *,
+    conflicted_pks: set[str] | None = None,
 ) -> list[JobRecord]:
-    """No silent winner when HTML/sitemap disagree about a canonical PK.
+    """Reconcile all observed identities before admitting a suffix candidate.
 
-    An observed URL linked to two different PKs is also a manual conflict.
-    The seen ledger is not a universal cross-PK identity index.
+    Conflicts are kept only within this crawl invocation, so a later fallback
+    cannot re-admit a PK already disputed by HTML or the ordinary sitemap.
     """
     if not verified:
-        return ordinary
+        return (ordinary if conflicted_pks is None else
+                [job for job in ordinary if job.pk not in conflicted_pks])
     grouped: dict[str, list[JobRecord]] = {}
     for job in [*ordinary, *verified]:
         grouped.setdefault(job.pk, []).append(job)
@@ -333,6 +335,8 @@ def _reconcile_suffix(
         if len(identities) != 1:
             log.warning("%s: competing source identities at %s; manual review",
                         company.name, pk)
+            if conflicted_pks is not None:
+                conflicted_pks.add(pk)
             continue
         # The independently proven feed supplies the title, location and date.
         unique.append(next(
@@ -350,8 +354,11 @@ def _reconcile_suffix(
         for url in contested:
             log.warning("%s: observed different-PK URL identity for %s; "
                         "manual identity/disposition review", company.name, url)
+        if conflicted_pks is not None:
+            conflicted_pks.update(j.pk for j in unique if j.jd_url in contested)
         unique = [j for j in unique if j.jd_url not in contested]
-    return unique
+    return (unique if conflicted_pks is None else
+            [j for j in unique if j.pk not in conflicted_pks])
 
 
 def _render_page(url: str) -> str | None:
@@ -593,7 +600,8 @@ def _enqueue(
 
 
 def _listed_in_sitemap(company: CompanyConfig, prefs: Preferences, stores: Any, *,
-                       verified: list[JobRecord] | None = None) -> int | None:
+                       verified: list[JobRecord] | None = None,
+                       conflicted_pks: set[str] | None = None) -> int | None:
     """Screen and enqueue what the site's sitemap lists; None when it lists nothing.
 
     Tried before the browser whenever the page itself gave nothing: a sitemap is
@@ -601,8 +609,10 @@ def _listed_in_sitemap(company: CompanyConfig, prefs: Preferences, stores: Any, 
     typing searches and may still come back empty behind a bot wall."""
     from core import flags as _flags
 
-    found = _reconcile_suffix(company, sitemap_jobs(company.careers_url, company.name),
-                              verified or [])
+    found = _reconcile_suffix(
+        company, sitemap_jobs(company.careers_url, company.name),
+        verified or [], conflicted_pks=conflicted_pks,
+    )
     if not found:
         return None
     progress.record(found=len(found), stage="Matching preferences")
@@ -687,20 +697,27 @@ def crawl_company(
     # If the caller supplied an offline HTTP client, reuse that transport.
     raw_client = client if client is not None and not getattr(client, "is_closed", False) else None
     verified_suffix = _numeric_suffix_candidates(company, client=raw_client)
+    conflicted_pks: set[str] = set()
 
     if not html and extractor is None:
         if force_browser:
             log.info("%s: client-rendered careers page — reading the full listing "
                      "in the browser", company.name)
         else:
-            if (listed := _listed_in_sitemap(company, prefs, stores,
-                                               verified=verified_suffix)) is not None:
+            if (listed := _listed_in_sitemap(
+                    company, prefs, stores, verified=verified_suffix,
+                    conflicted_pks=conflicted_pks)) is not None:
                 return listed
         found = _browser_extract(company.careers_url, company.name, prefs)
-        # Only this explicit production browser branch may establish the pin.
-        # Both sitemap early-return and crawl fallback remain ordinary identities.
+        # The explicit browser mode retains #118's existing query-form behavior.
+        # On the configured crawl exception, even a fallback browser listing
+        # cannot revive a PK disputed by the ordinary sitemap.
         if force_browser:
             found = _reconcile_browser_greenhouse(company, found)
+        elif verified_suffix:
+            found = _reconcile_suffix(
+                company, found, verified_suffix, conflicted_pks=conflicted_pks,
+            )
         progress.record(found=len(found), stage="Matching preferences")
         jobs = relevant(found, prefs)
         _note_screened_out(stores, company.name, found, jobs)
@@ -742,7 +759,9 @@ def crawl_company(
             job.jd_url = normalized
             extracted.append(job)
 
-    extracted = _reconcile_suffix(company, extracted, verified_suffix)
+    extracted = _reconcile_suffix(
+        company, extracted, verified_suffix, conflicted_pks=conflicted_pks,
+    )
     progress.record(found=len(extracted), stage="Matching preferences")
     jobs = relevant(extracted, prefs)
     _note_screened_out(stores, company.name, extracted, jobs)
@@ -751,9 +770,15 @@ def crawl_company(
     # A report containing only rejected hrefs is not an empty fetch: retrying
     # it via sitemap/browser would cause work from rows already deemed unsafe.
     if extractor is None and not raw_jobs:
-        if (listed := _listed_in_sitemap(company, prefs, stores,
-                                               verified=verified_suffix)) is not None:
+        if (listed := _listed_in_sitemap(
+                company, prefs, stores, verified=verified_suffix,
+                conflicted_pks=conflicted_pks)) is not None:
             return listed
+        # The sitemap may have invalidated an already screened suffix identity.
+        # Drop that earlier result too, even when no browser fallback is needed.
+        if conflicted_pks:
+            extracted = [j for j in extracted if j.pk not in conflicted_pks]
+            jobs = [j for j in jobs if j.pk not in conflicted_pks]
     if extractor is None and not jobs and (not raw_jobs or extracted):
         log.info("%s: nothing from the plain fetch — reading the full listing "
                  "in the browser", company.name)
@@ -761,9 +786,17 @@ def crawl_company(
         # Union, not replacement: the plain fetch occasionally catches a posting
         # the browser agent scrolls past, and losing one to gain thirty is still
         # a loss for the job it dropped.
-        by_url = {j.jd_url: j for j in extracted}
-        by_url.update({j.jd_url: j for j in seen_by_browser})
-        extracted = list(by_url.values())
+        if verified_suffix:
+            # Keep both observations until reconciliation: by_url.update would
+            # hide the independently verified PK/ATS when browser URLs coincide.
+            extracted = _reconcile_suffix(
+                company, [*extracted, *seen_by_browser], verified_suffix,
+                conflicted_pks=conflicted_pks,
+            )
+        else:
+            by_url = {j.jd_url: j for j in extracted}
+            by_url.update({j.jd_url: j for j in seen_by_browser})
+            extracted = list(by_url.values())
         progress.record(found=len(extracted), stage="Matching preferences")
         jobs = relevant(extracted, prefs)
         _note_screened_out(stores, company.name, extracted, jobs)

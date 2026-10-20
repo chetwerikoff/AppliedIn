@@ -72,20 +72,28 @@ def _headers() -> dict:
 
 
 def _fetch(client: httpx.Client, url: str, *, strict_origin: str = "") -> bytes | None:
+    if strict_origin:
+        # Validate before sending; post-response checks are too late to stop
+        # requests to an untrusted redirect hop.
+        try:
+            requested = urlsplit(url)
+            if requested.scheme != "https" or requested.netloc != strict_origin:
+                return None
+        except ValueError:
+            return None
     try:
-        r = client.get(url, timeout=20, follow_redirects=True)
+        # The verified raw-sitemap path rejects *all* redirects. Ordinary
+        # sitemap discovery retains its existing redirect-following behavior.
+        r = client.get(url, timeout=20, follow_redirects=not bool(strict_origin))
     except httpx.HTTPError as exc:
         log.debug("sitemap fetch failed for %s: %s", url, exc)
         return None
     if r.status_code != 200:
         return None
     if strict_origin:
-        # This opt-in raw identity producer cannot adopt an XML document
-        # redirected to a different host. Ordinary sitemap reads are unchanged.
         try:
-            requested, final = urlsplit(url), urlsplit(str(r.url))
-            if (requested.scheme != "https" or requested.netloc != strict_origin
-                    or final.scheme != "https" or final.netloc != strict_origin):
+            final = urlsplit(str(r.url))
+            if final.scheme != "https" or final.netloc != strict_origin:
                 return None
         except ValueError:
             return None

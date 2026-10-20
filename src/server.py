@@ -742,8 +742,8 @@ def create_app() -> FastAPI:
         fields = (body or {}).get("fields") or []
         from tools import posting_guard as pg
 
-        jd_text = (body or {}).get("jd_text", "")
-        inspected = pg.analyze(jd_text, source_required=True)
+        raw_jd_text = (body or {}).get("jd_text", "")
+        inspected = pg.analyze(raw_jd_text, source_required=True)
         jd_text = inspected["text"]
         guard = inspected["posting_guard"]
         stores = make_stores(settings)
@@ -764,7 +764,10 @@ def create_app() -> FastAPI:
                     # A browser-extension snippet is text-only provenance;
                     # persist its positive findings, not its provisional
                     # missing-HTML marker on an independently verified row.
-                    findings = pg.analyze(jd_text)["posting_guard"]
+                    # Reinspection of cleaned text loses the very instructions
+                    # removed by the guard. Transfer original-source findings;
+                    # the extension has no HTML witness of its own.
+                    findings = pg.analyze(raw_jd_text)["posting_guard"]
                     combined = pg.merge(current.get("jd_text") or "", findings,
                                         current["posting_guard"])
                     if stores.tracking.update_posting_guard(pk, current, combined):

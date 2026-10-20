@@ -4600,3 +4600,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   color: var(--muted); font-size: 12px; }
 .gatecard.diag-card { padding: 15px; }
 .gatecard.diag-card .diag-note { margin: 12px 0; }
+
+/* Current, row-bound posting safety warning (escaped by the web renderer). */
+.pg-warning {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #777);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.pg-warning strong { display: block; margin-bottom: 2px; }
+.pg-warning span { display: block; overflow-wrap: anywhere; }

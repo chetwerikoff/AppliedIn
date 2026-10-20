@@ -58,10 +58,11 @@ def _save_doc(body):
 
 
 @pytest.fixture
-def _save_offline(monkeypatch):
+def _save_offline(monkeypatch, tmp_path):
     """No rendering, external stores, browser, network or owner runtime inputs."""
     from types import SimpleNamespace
     from agent.graph import save_tailored_resume
+    from agent import graph as graph_module
     from agent import run as run_module
     from core import profiles, stores as stores_module
     from tools import render
@@ -90,6 +91,9 @@ def _save_offline(monkeypatch):
         effects["render"] += 1
         return b"%PDF-synthetic"
 
+    # Tests use only an isolated temporary directory, never the private runtime file.
+    monkeypatch.setattr(graph_module, "get_settings",
+                        lambda: SimpleNamespace(local_dir=str(tmp_path)))
     monkeypatch.setattr(stores_module, "make_stores", make_stores)
     monkeypatch.setattr(render, "render_pdf", render_pdf)
     monkeypatch.setattr(profiles, "resolve_for", lambda row: object())

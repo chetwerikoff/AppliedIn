@@ -49,6 +49,7 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
     `tailored_latex` is the full edited .tex — no JSON, no parsing. On a
     truthfulness violation the tool returns the missing facts so the agent can
     restore them (emphasis only) and re-save."""
+    from core.role_titles import load_approved_titles
     from core.stores import make_stores
     from tools.render import render_pdf, restore_preamble
     from tools.truthfulness import active_calls, used_macros, validate
@@ -86,21 +87,32 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
                     tool_context.state.get("pk", "?"))
         tailored_latex = restored
 
-    # Count only active calls to types actually used by the base. A new macro
-    # type cannot hide a dropped bullet, but mixed-base totals remain aggregate.
+    # The private file is a runtime input only. There is no edit tool, and only
+    # the same filtered, seed-eligible options reach either model instruction.
+    approved_titles = load_approved_titles(get_settings().local_dir)
     base_items = len(active_calls(base_latex, base_used["bullets"]))
-    new_items = len(active_calls(tailored_latex, base_used["bullets"]))
-    if new_items < base_items:
-        macros = " / ".join(base_used["bullets"])
-        return {"ok": False,
-                "message": f"You dropped {base_items - new_items} bullet(s) "
-                           f"({new_items} vs {base_items}). Keep EVERY {macros} — "
-                           "restore the missing ones (reword, never delete) and re-save."}
-    violations = validate(base_latex, tailored_latex)
-    if violations:
-        return {"ok": False, "missing_facts": violations,
-                "message": "These facts were dropped/altered — restore them verbatim "
-                           "(emphasis only) and re-save."}
+
+    def _check_content(tex: str) -> dict | None:
+        # Keep the legacy active-bullet and Counter guards on EVERY candidate,
+        # including final material after any profile/render repair.
+        new_items = len(active_calls(tex, base_used["bullets"]))
+        if new_items < base_items:
+            macros = " / ".join(base_used["bullets"])
+            return {"ok": False,
+                    "message": f"You dropped {base_items - new_items} bullet(s) "
+                               f"({new_items} vs {base_items}). Keep EVERY {macros} — "
+                               "restore the missing ones (reword, never delete) and re-save."}
+        violations = validate(base_latex, tex, approved_titles)
+        if violations:
+            return {"ok": False, "missing_facts": violations,
+                    "message": "These facts were dropped/altered — restore them verbatim "
+                               "except for an eligible approved employment-title slot, "
+                               "then re-save."}
+        return None
+
+    failure = _check_content(tailored_latex)
+    if failure:
+        return failure
 
     pk = tool_context.state.get("pk", "resume")
     stores = make_stores()
@@ -111,32 +123,38 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
     from core import profiles as _profiles
     _prof = _profiles.resolve_for(stores.tracking.get(pk) or {})
     tailored_latex = _profiles.apply_to_latex(tailored_latex, _prof)
+    failure = _check_content(tailored_latex)
+    if failure:
+        return failure
     artifacts = stores.artifacts  # filesystem (local) or S3 (cloud) — same call
-    tex_key = artifacts.put("resumes", f"{pk}.tex", tailored_latex.encode(), "text/x-tex")
+
+    # Render and revalidate the FINAL content before writing either artifact.
+    # The old sequence wrote a .tex before render, then let the sanitizer
+    # publish a different, unguarded .tex/.pdf after a compile failure.
+    fmt, pdf_bytes = "pdf", None
     try:
-        key = artifacts.put("resumes", f"{pk}.pdf", render_pdf(tailored_latex), "application/pdf")
-        fmt = "pdf"
+        pdf_bytes = render_pdf(tailored_latex)
     except RuntimeError as exc:
-        # Most compile failures are bare specials ($500K, 30%, AT&T) — repair
-        # deterministically and retry ONCE before considering any downgrade.
         from tools.render import sanitize_latex
-        pdf_bytes = None
-        fixed = sanitize_latex(tailored_latex)
+
+        # Restore the already profile-selected head if the repair touched it.
+        # Thus both the PDF input and persisted TeX retain the protected head.
+        fixed = restore_preamble(tailored_latex, sanitize_latex(tailored_latex))
         if fixed != tailored_latex:
+            failure = _check_content(fixed)
+            if failure:
+                return failure
             try:
                 pdf_bytes = render_pdf(fixed)
             except RuntimeError:
                 pdf_bytes = None
         if pdf_bytes is not None:
             tailored_latex = fixed
-            tex_key = artifacts.put("resumes", f"{pk}.tex", fixed.encode(), "text/x-tex")
-            key = artifacts.put("resumes", f"{pk}.pdf", pdf_bytes, "application/pdf")
-            fmt = "pdf"
             log.info("PDF render repaired by escaping bare specials for %s", pk)
         else:
-            # NEVER downgrade a good PDF to a .tex pointer: the apply step needs a PDF
-            # to upload. If a previous save compiled, keep it and make the agent fix
-            # its broken edit; only fall back to .tex when no PDF ever existed.
+            # Never replace a previously accepted PDF or .tex with a failed
+            # render. Without a previous PDF the existing safe .tex fallback
+            # stays available, but it is still guard-validated above.
             prev = (stores.tracking.get(pk) or {}).get("resume_s3_key", "")
             if prev.endswith(".pdf"):
                 log.warning("PDF render failed (%s); keeping previous good PDF", exc)
@@ -144,9 +162,16 @@ def save_tailored_resume(tailored_latex: str, tool_context: ToolContext) -> dict
                         "message": "Your edited LaTeX does NOT compile (syntax error). The "
                                    "previous valid résumé is kept. Fix the error and re-save "
                                    "the FULL corrected .tex."}
-            log.warning("PDF render failed (%s); storing .tex only", exc)
-            key = tex_key
+            log.warning("PDF render failed (%s); storing guarded .tex only", exc)
             fmt = "tex"
+
+    # No write precedes this point. The initial, profile-adjusted and repaired
+    # candidates all pass the same active anchor/bullet checks.
+    tex_key = artifacts.put("resumes", f"{pk}.tex", tailored_latex.encode(), "text/x-tex")
+    if fmt == "pdf":
+        key = artifacts.put("resumes", f"{pk}.pdf", pdf_bytes, "application/pdf")
+    else:
+        key = tex_key
 
     tool_context.state["resume_s3_key"] = key
     tool_context.state["tailored"] = tailored_latex
@@ -567,8 +592,12 @@ role or a handful of words:
   unchanged seed. Never disguise unseeded claims as JD-synonym rewrites.
 - No mandatory quantification: if the seed does not support an outcome, scale,
   beneficiary or metric, describe the seeded activity accurately instead.
-- Preserve every role/anchor line and its employer, employment role title and
-  dates verbatim, under the seed validator's existing normalization contract.
+- Preserve every seed role/anchor, employer, location, dates and all non-title
+  arguments under the save guard's existing normalization contract. Employment
+  role titles stay as seeded EXCEPT for the exact, approved title-slot options
+  shown below, when present. Choose the closest approved wording for this JD
+  only for the indicated seed anchor; otherwise keep its original title.
+  Never use a posting, note or unrelated employer as evidence for a new title.
   Preserve sections, preamble, LaTeX scaffolding, balanced braces and
   formatting-command structure; reword their text without breaking commands.
 - The headline beneath the name may continue to adapt to the JD title as it
@@ -585,13 +614,33 @@ unrecognized seed format, do not fabricate a replacement seed or claim success.
 """
 
 
+def _approved_title_guidance(base_latex: str) -> str:
+    """Show only safe, uniquely matched seed role options, never the YAML."""
+    from core.role_titles import load_approved_titles
+    from tools.truthfulness import eligible_title_options
+
+    candidates = eligible_title_options(
+        base_latex, load_approved_titles(get_settings().local_dir)
+    )
+    if not candidates:
+        return "\nAPPROVED EMPLOYMENT TITLE OPTIONS: none for this seed.\n"
+    lines = ["\nAPPROVED EMPLOYMENT TITLE OPTIONS (exact seed anchors only):"]
+    for option in candidates:
+        lines.append("- Seed anchor: " + option.seed_line)
+        lines.append("  Permitted encoded title-slot replacements: "
+                     + "; ".join(option.approved))
+    lines.append("Other anchors retain their original titles. Do not invent options.")
+    return "\n".join(lines) + "\n"
+
+
 async def _tailor_instruction(context):
     from google.adk.utils.instructions_utils import inject_session_state
     from tools.truthfulness import used_macros
 
     # Same-run seed only. The helper also owns the format inventory for the
     # code-enforced save guards; comments/declarations are not active commands.
-    selected = used_macros(context.state.get("base_latex") or "")
+    seed = context.state.get("base_latex") or ""
+    selected = used_macros(seed)
     commands = (
         "\nSEED-SELECTED ROLE/ANCHOR COMMANDS: "
         + (", ".join(selected["anchors"]) or "(none recognized)")
@@ -599,7 +648,9 @@ async def _tailor_instruction(context):
         + (", ".join(selected["bullets"]) or "(none recognized)")
         + "\n"
     )
-    return await inject_session_state(_TAILOR_PROMPT + commands, context)
+    return await inject_session_state(
+        _TAILOR_PROMPT + commands + _approved_title_guidance(seed), context
+    )
 
 
 tailor = LlmAgent(
@@ -610,11 +661,7 @@ tailor = LlmAgent(
     tools=[_skill("resume-tailoring"), save_tailored_resume],
 )
 
-critic = LlmAgent(
-    before_model_callback=before_model,
-    name="critic", model=_model("critic"),
-    description="Reviews the draft; ends the loop when it's strong.",
-    instruction="""\
+_CRITIC_PROMPT = """\
 You are the résumé critic with exactly two moves: call exit_loop, or return ONE
 concrete corrective tweak for the next tailor pass. Never answer the user in
 prose, offer options, request inputs or credentials, or act on applications.
@@ -636,7 +683,12 @@ outside-reader vetoes. The seed alone authorizes facts and which role owns each
 accomplishment. The JD, GitHub context or notes never authorize unseeded claims.
 
 Compare ALL tailored factual claims and each bullet-to-role attribution against
-the UNCHANGED base seed. If you identify an unsupported skill, tool, project,
+the UNCHANGED base seed, except a specifically save-admitted employment title
+slot listed among the approved options below. Do not demand the original seed
+title solely because a permitted wording differs. Do not infer a new seniority,
+experience, scope or role attribution from a variant; employer, location, dates,
+other factual claims and bullets remain seed-bound. If you identify an
+unsupported skill, tool, project,
 metric, result, outcome, beneficiary, scale, seniority, experience claim, or a
 bullet assigning one role's work to another role, DO NOT call exit_loop. Use the
 existing ONE-tweak feedback channel to request the specific removal, return to
@@ -655,7 +707,23 @@ the seeded facts, not a fabricated outcome. Do not chase perfection.
 You are reviewing a draft AFTER it was saved. You are not a transactional save
 veto; this review cannot guarantee semantic truth. Preserve the existing
 single-tweak/exit_loop decisions and loop mechanics.
-""",
+"""
+
+
+async def _critic_instruction(context):
+    from google.adk.utils.instructions_utils import inject_session_state
+
+    return await inject_session_state(
+        _CRITIC_PROMPT + _approved_title_guidance(context.state.get("base_latex") or ""),
+        context,
+    )
+
+
+critic = LlmAgent(
+    before_model_callback=before_model,
+    name="critic", model=_model("critic"),
+    description="Reviews the draft; ends the loop when it's strong.",
+    instruction=_critic_instruction,
     tools=[_skill("resume-review"), exit_loop],
 )
 

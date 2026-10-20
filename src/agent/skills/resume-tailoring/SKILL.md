@@ -37,10 +37,14 @@ Never invent a section that is missing from the seed.
 4. Reorder seed-supported skills and adjust emphasis in any other **existing**
    section as appropriate. Do not create new sections, projects, positions,
    skills, metrics or achievements from the JD, GitHub or notes.
-5. Preserve each role/anchor line, employer, employment role title and date
-   verbatim under the existing normalization contract. Keep the preamble,
-   section scaffolding, valid commands, formatting structure and braces
-   compilable. Reword text without damaging LaTeX markup.
+5. Preserve each role/anchor, employer, location, dates and all other
+   non-title arguments under the existing normalization contract. Employment
+   role titles stay unchanged except for a uniquely matched seed anchor with
+   options explicitly listed in the assembled instruction. Choose only its
+   closest relevant approved literal wording, in the encoded LaTeX form shown;
+   no posting or note authorizes a title, and no other anchor can borrow it.
+   Keep the preamble, section scaffolding, valid commands, formatting structure
+   and braces compilable. Reword text without damaging LaTeX markup.
 
 **Truthful example (content only, not a macro template):** a seeded bullet
 about coordinating queue consumers may be rephrased with the JD's

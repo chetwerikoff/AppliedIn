@@ -10,10 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 from google.adk.agents.readonly_context import ReadonlyContext
-from google.adk.utils.instructions_utils import inject_session_state
 
 from agent.graph import critic, tailor
 from tools.truthfulness import used_macros
+
+
+@pytest.fixture(autouse=True)
+def _isolate_private_title_input(monkeypatch, tmp_path):
+    # No offline prompt test may read the operator's optional runtime YAML.
+    from agent import graph
+    monkeypatch.setattr(graph, "get_settings", lambda: SimpleNamespace(local_dir=str(tmp_path)))
 
 ROLE_SEED = r"""
 \documentclass{article}
@@ -100,7 +106,7 @@ async def test_external_only_jd_github_and_notes_are_not_licensed_as_facts(seed)
     assert "Even if they" in prompt and "tool, project, outcome" in prompt
     assert "omit it unless the SAME fact is in the" in prompt
     assert "never move an achievement to another role" in prompt
-    assert "preserve every role/anchor line" in prompt.lower()
+    assert "preserve every seed role/anchor" in prompt.lower()
     assert "headline beneath the name may continue to adapt" in prompt.lower()
     assert "no mandatory quantification" in prompt.lower()
 
@@ -124,8 +130,8 @@ async def test_critic_receives_same_seed_saved_draft_and_jd_and_requests_fact_co
     # The rubric, not a live model, must detect that the seed is the only
     # factual witness and that cross-role reattribution demands correction.
     context = _context(ROLE_SEED, tailored=swapped)
-    assert isinstance(critic.instruction, str)
-    prompt = await inject_session_state(critic.instruction, context)
+    assert callable(critic.instruction)
+    prompt = await critic.instruction(context)
     assert f"UNCHANGED SAME-RUN BASE SEED — sole factual authority:\n{ROLE_SEED}" in prompt
     assert f"TAILORED RÉSUMÉ — saved draft being reviewed:\n{swapped}" in prompt
     assert f"JOB DESCRIPTION — relevance and vocabulary hints, not new facts:\n{JD}" in prompt
@@ -153,7 +159,7 @@ async def test_critic_precedence_over_loaded_review_skill_when_seed_has_no_outco
 
     bare_seed = r"\role{example-co}{Engineer}{2023--2024}" + "\n" + r"\item Maintained queue consumers."
     ctx = _context(bare_seed, tailored=bare_seed)
-    prompt = await inject_session_state(critic.instruction, ctx)
+    prompt = await critic.instruction(ctx)
     assert "OVERRIDE conflicts in the still-loaded resume-review" in prompt
     assert '"truthfulness is not your concern"' in prompt
     assert "mandatory outcome/scale/beneficiary" in prompt

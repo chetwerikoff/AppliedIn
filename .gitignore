@@ -24,6 +24,8 @@ facts.seed.yaml
 # ADK sessions, artifacts, daemon pid/log — never commit
 .local/
 .local-*/
+# Private role-title options, including custom repo-local runtime directories
+role-titles.yaml
 
 # OS / IDE
 .DS_Store

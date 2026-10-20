@@ -113,6 +113,8 @@ PIN_WITNESS_FIELDS = tuple(dict.fromkeys((
     "status", "fail_kind", "gate_reason", "attempts", "note", "notes",
     "approval", "approved", "approved_at", "approval_at", "approval_status",
     "human_approved", "human_approved_answers",
+    # _apply_direct persists these browser-result artifacts without a prefix.
+    "fields", "screenshot_s3_key",
     "gate_pending", "gate_call_id", "gate_source", "last_button", "last_url",
     "browser_session", "browser_session_id",
     "application_session", "application_session_id", "possible_submission",
@@ -202,17 +204,23 @@ def tenant_pin_row_allowed(row: dict | None, pk: str, board: str) -> bool:
             "apply_started_", "last_button", "last_url"))
            for key in row):
         return False
-    # A request followed only by the pre-browser tenant-gate denial is allowed;
-    # a different human/form gate or browser-session context is not evidence of
-    # that narrow failure, even if an old fail_kind still says "defect_tenant".
-    if row.get("apply_requested_at"):
-        reasons = (row.get("gate_reason"), row.get("fail_kind"))
-        tenant_reasons = {"defect_greenhouse_tenant_alias", "defect_tenant"}
-        if (not any(reason in tenant_reasons for reason in reasons)
-                or any(reason not in (*tenant_reasons, None, "") for reason in reasons)
-                or any(row.get(field) not in (None, "", False, 0)
-                       for field in ("gate_pending", "gate_call_id", "gate_source"))):
-            return False
+    # Browser-result artifacts are not tagged browser_ in real tracking rows.
+    # Even empty artifacts cannot prove this row remained pre-browser.
+    if "fields" in row or "screenshot_s3_key" in row:
+        return False
+    # Validate gate history independently of request timestamps. A requestless
+    # form gate or ambiguous failed application is not a pre-browser tenant
+    # denial; the explicit request-only tenant failure remains eligible.
+    reasons = (row.get("gate_reason"), row.get("fail_kind"))
+    tenant_reasons = {"defect_greenhouse_tenant_alias", "defect_tenant"}
+    if (any(reason not in (*tenant_reasons, None, "") for reason in reasons)
+            or any(row.get(field) not in (None, "", False, 0)
+                   for field in ("gate_pending", "gate_call_id", "gate_source"))
+            or (row.get("apply_requested_at")
+                and not any(reason in tenant_reasons for reason in reasons))
+            or (row.get("status") in ("needs_human", "failed")
+                and not row.get("apply_requested_at"))):
+        return False
     return True
 
 

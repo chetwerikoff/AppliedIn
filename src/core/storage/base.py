@@ -104,11 +104,78 @@ def legacy_repair_row_allowed(
     return revision >= 0 and int(revision) == revision
 
 
+
+# Only the existing tracking row stores the guard witness and the current owner's
+# reviewed generation. Comparing every guard-sensitive field here keeps the two
+# storage adapters consistent without a new permission ledger.
+_GUARD_COMPARE = (
+    "pk", "company", "jd_url", "status", "jd_text", "posting_guard",
+    "reviewed_guard_generation", "confirmation_id", "possible_submission",
+    "submit_hold", "gate_reason",
+)
+
+
+def guard_observation_matches(current: dict | None, observed: dict) -> bool:
+    return (isinstance(current, dict) and isinstance(observed, dict)
+            and all((key in current) == (key in observed)
+                    and (key not in current or current[key] == observed[key])
+                    for key in _GUARD_COMPARE))
+
+
+def guard_patch(current: dict, inspected: dict | None,
+                *, reviewed_generation: str | None = None,
+                source_witness: bool = False) -> dict | None:
+    """Return a safe *partial* patch for a guarded compare-and-update.
+
+    The backend must atomically compare the original witness before committing.
+    Source witness means the caller has matched the original ATS posting and
+    examined all applicable HTML variants, not merely flattened scanner text.
+    """
+    from tools import posting_guard as pg
+
+    if current.get("confirmation_id") or current.get("possible_submission"):
+        return None
+    if reviewed_generation is not None:
+        meta = current.get("posting_guard")
+        if (not pg.valid(current.get("jd_text") or "", meta)
+                or reviewed_generation != meta["generation"]
+                or current.get("status") not in ("tailored", "needs_human")
+                or current.get("gate_reason") == "submit_uncertain"):
+            return None
+        return {"reviewed_guard_generation": reviewed_generation}
+    if not isinstance(inspected, dict):
+        return None
+    cleaned, meta = inspected.get("text"), inspected.get("posting_guard")
+    if not isinstance(cleaned, str) or not pg.valid(cleaned, meta):
+        return None
+    old_meta = current.get("posting_guard")
+    if not pg.valid(current.get("jd_text") or "", old_meta):
+        # A missing or corrupt older annotation cannot certify the next
+        # unverified plain read as safe. Old raw JD is never merged into text.
+        old_meta = pg.projection(current.get("jd_text") or "", old_meta)["posting_guard"]
+    merged = pg.merge(cleaned, meta, old_meta, source_witness=source_witness)
+    return {"jd_text": merged["text"], "posting_guard": merged["posting_guard"]}
+
 class AbstractTracking(ABC):
     """The application tracking store (cloud: DynamoDB `applications`)."""
 
     @abstractmethod
     def get(self, pk: str) -> dict | None: ...
+
+    def get_current(self, pk: str) -> dict | None:
+        """Authoritative base-row read for guarded submission and review."""
+        return self.get(pk)
+
+    @abstractmethod
+    def update_posting_guard(
+        self, pk: str, observed: dict, inspected: dict | None = None, *,
+        reviewed_generation: str | None = None, source_witness: bool = False,
+    ) -> bool:
+        """Atomically compare original row/guard witnesses and patch guard fields.
+
+        Never infer review from dispatch intent. A false/conflicting write cannot
+        turn stale observations into authorization.
+        """
 
     @abstractmethod
     def put_new(self, job: JobRecord, *, status: Status = Status.FOUND) -> bool:

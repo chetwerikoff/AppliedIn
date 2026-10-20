@@ -129,7 +129,7 @@ def test_enough_to_tailor_from(text):
                 "jobUrl": "https://jobs.ashbyhq.com/example-co/job-1",
                 "descriptionPlain": "Build harmless software products. " * 25,
                 "descriptionHtml": ('<div style="display:none">'
-                                    '<a href="https://evil.example/click">secret</a></div>')]}, True),
+                                    '<a href="https://evil.example/click">secret</a></div>')}]}, True),
     ("https://jobs.ashbyhq.com/example-co/job-1",
      {"jobs": [{"id": "job-1", "title": "Test Engineer",
                 "jobUrl": "https://jobs.ashbyhq.com/example-co/job-1",

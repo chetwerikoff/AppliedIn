@@ -42,7 +42,7 @@ def test_invalid_or_oversized_input_does_not_expose_partial_options(tmp_path):
     path = tmp_path / BASENAME
     path.write_text("example-co: [Role B]\nother: [Role #1]\n", encoding="utf-8")
     assert load_approved_titles(tmp_path) == {}
-    path.write_text("example-co: [" + ", ".join(["Role B"] * 7000) + "]",
+    path.write_text("example-co: [" + ", ".join(["Role B"] * 9000) + "]",
                     encoding="utf-8")
     assert load_approved_titles(tmp_path) == {}
 

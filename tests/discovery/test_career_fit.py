@@ -96,7 +96,7 @@ def test_rescan_keeps_a_domain_tier_already_paid_for(board):
     assert row["domain_reason"] == "ml platform"
     assert row["domain_at"] == "2026-10-01T00:00:00+00:00"
     assert row["search_id"] == "new"
-    assert row["description"] == "fresh"
+    assert row["description"] == "A complete posting body"
 
 
 def _row(i, **extra):

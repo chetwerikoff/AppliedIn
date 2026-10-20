@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
 from core.logging import get_logger
+from tools import posting_guard as pg
 
 log = get_logger(__name__)
 
@@ -51,86 +53,208 @@ def _text(html: str) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
-def _from_ats(url: str) -> dict | None:
-    """The posting from its board's own API, when the URL belongs to one.
+def _guarded(title: str, text: str, *, html_variants=(),
+             source_required: bool = False, normalize_terminal: bool = False,
+             source_complete: bool = True) -> dict:
+    # Source-aware ATS/HTTP metadata has always been normalized. Keep the
+    # normalization inside the analyzer so its generation binds exact bytes.
+    inspected = pg.analyze(text, html_variants=html_variants,
+                           source_required=source_required,
+                           strip_trailing=source_required or normalize_terminal,
+                           source_complete=source_complete)
+    cleaned_title = pg.analyze(title)["text"][:90]
+    return {"title": cleaned_title, **inspected}
 
-    The big boards render in the browser and serve an empty shell to a plain
-    fetch — reading jobs.ashbyhq.com over HTTP returns 39 characters and the word
-    "About Us". They all publish the same posting as JSON, which is complete,
-    fast and free, so ask for that instead of rendering a page to scrape it back.
+
+def _same_posting_url(expected: str, effective: str) -> bool:
+    """A redirect proves original HTML only for the same posting identity."""
+    try:
+        a, b = urlsplit(expected), urlsplit(effective)
+        if (a.scheme not in {"http", "https"} or b.scheme not in {"http", "https"}
+                or not a.hostname or not b.hostname or a.hostname != b.hostname
+                or a.username or b.username or a.password or b.password):
+            return False
+        same_scheme = a.scheme == b.scheme and a.port == b.port
+        upgraded = (a.scheme == "http" and b.scheme == "https"
+                    and a.port in (None, 80) and b.port in (None, 443))
+        return (same_scheme or upgraded) and (
+            (a.path.rstrip("/") or "/") == (b.path.rstrip("/") or "/")
+            and a.query == b.query)
+    except ValueError:
+        return False
+
+def matched_source_witness(row: dict, meta: dict) -> bool:
+    """Only the same posting's inspected source can clear missing-HTML evidence.
+
+    Network-directory Career Ops rows need the original ATS API HTML, not a
+    flattened posting webpage; ordinary feed/crawler HTTP pages are valid
+    witnesses when their fetched HTML belongs to the exact tracked URL.
     """
+    guard = meta.get("posting_guard")
+    kind = meta.get("source_kind")
+    return (_same_posting_url(row.get("jd_url") or "",
+                              meta.get("source_url") or "")
+            and isinstance(guard, dict) and guard.get("source_verified") is True
+            and (kind == "ats_html"
+                 or (kind == "http_html"
+                     and row.get("discovery_source") != "career_ops")))
+
+
+def _from_ats(url: str) -> dict | None:
+    """Match an exact ATS posting and inspect all exposed HTML variants."""
     from urllib.parse import urlparse
 
-    import httpx
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        if (u.scheme != "https" or u.username or u.password
+                or u.port not in (None, 443)):
+            return None
+    except ValueError:
+        return None
+    ashby = host == "jobs.ashbyhq.com"
+    greenhouse = host in {"boards.greenhouse.io", "job-boards.greenhouse.io",
+                          "job-boards.eu.greenhouse.io"}
+    lever = host in {"jobs.lever.co", "jobs.eu.lever.co"}
+    if not (ashby or greenhouse or lever):
+        return None
 
-    u = urlparse(url)
-    host, seg = (u.hostname or "").lower(), [p for p in u.path.split("/") if p]
-    if len(seg) < 2:
+    seg = [part for part in u.path.split("/") if part]
+    if ((greenhouse and (len(seg) != 3 or seg[1] != "jobs"))
+            or (not greenhouse and len(seg) != 2)):
         return None
     org, job_id = seg[0], seg[-1]
     try:
         with httpx.Client(timeout=20, follow_redirects=True) as c:
-            if "ashbyhq.com" in host:
+            if ashby:
                 r = c.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
                 r.raise_for_status()
                 for j in r.json().get("jobs", []):
-                    if job_id in str(j.get("jobUrl", "")) or job_id == str(j.get("id", "")):
-                        return {"title": str(j.get("title", ""))[:90],
-                                "text": (j.get("descriptionPlain")
-                                         or _text(j.get("descriptionHtml", "")))}
-            elif "greenhouse.io" in host:
+                    target_raw = str(j.get("jobUrl") or "")
+                    target = urlparse(target_raw)
+                    target_seg = [part for part in target.path.split("/") if part]
+                    if target_raw and (target.scheme != "https"
+                                       or target.hostname != host
+                                       or len(target_seg) != 2
+                                       or target_seg[0] != org):
+                        continue
+                    if (job_id == str(j.get("id", "")) or
+                            (target_seg and target_seg[-1] == job_id)):
+                        html = j.get("descriptionHtml")
+                        result = _guarded(
+                            str(j.get("title", "")),
+                            str(j.get("descriptionPlain") or html or ""),
+                            html_variants=[html] if html else [],
+                            source_required=True)
+                        result.update(source_kind="ats_html", source_url=url)
+                        return result
+            elif greenhouse:
                 r = c.get(f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs/{job_id}",
                           params={"content": "true"})
                 r.raise_for_status()
                 j = r.json()
-                return {"title": str(j.get("title", ""))[:90],
-                        "text": _text(j.get("content", ""))}
-            elif "lever.co" in host:
-                r = c.get(f"https://api.lever.co/v0/postings/{org}/{job_id}")
+                if not isinstance(j, dict) or (
+                        j.get("id") is not None and str(j["id"]) != job_id):
+                    return None
+                html = j.get("content")
+                result = _guarded(str(j.get("title", "")), str(html or ""),
+                                  html_variants=[html] if html else [],
+                                  source_required=True)
+                result.update(source_kind="ats_html", source_url=url)
+                return result
+            elif lever:
+                api_host = "api.eu.lever.co" if host == "jobs.eu.lever.co" else "api.lever.co"
+                r = c.get(f"https://{api_host}/v0/postings/{org}/{job_id}")
                 r.raise_for_status()
                 j = r.json()
-                return {"title": str(j.get("text", ""))[:90],
-                        "text": _text(j.get("descriptionPlain") or j.get("description", ""))}
-    except Exception as exc:  # noqa: BLE001 — fall through to a plain fetch
+                hosted = str(j.get("hostedUrl") or "")
+                hosted_parts = urlparse(hosted)
+                if ((j.get("id") is not None and str(j["id"]) != job_id)
+                        or (hosted and (
+                            hosted_parts.scheme != "https"
+                            or hosted_parts.hostname != host
+                            or hosted_parts.path.rstrip("/") != f"/{org}/{job_id}"))):
+                    return None
+                html = j.get("description")
+                variants = [html] if html else []
+                # List fragments remain diagnostic, but cannot substitute for
+                # Lever's primary description HTML as source completeness proof.
+                for section in j.get("lists") or []:
+                    if isinstance(section, dict) and section.get("content"):
+                        variants.append(section["content"])
+                result = _guarded(str(j.get("text", "")),
+                                  str(j.get("descriptionPlain") or html or ""),
+                                  html_variants=variants, source_required=True,
+                                  source_complete=bool(html))
+                result.update(source_kind="ats_html", source_url=url)
+                return result
+    except Exception as exc:  # noqa: BLE001 — fail closed to other readers
         log.debug("board API miss for %s: %s", url, exc)
     return None
 
-
 def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
-    """{'title', 'text'} for a posting, or empty strings when it cannot be read."""
+    """Guarded title, text, posting_guard and provenance for a posting."""
     if not url:
-        return {"title": "", "text": ""}
-    if (hit := _from_ats(url)) and len(hit.get("text", "")) > 200:
-        return hit
+        return _guarded("", "", source_required=True)
+    ats = _from_ats(url)
+    if ats and len(ats["text"]) > 200:
+        return ats
     from discovery.resolver import BROWSER_HEADERS
 
-    # The disguise first, then bare. metacareers.com answers 400 to a request
-    # that carries browser-like headers and 200 to one that carries none — the
-    # imitation is what trips it — so a refusal is retried once, undisguised,
-    # before this gives up.
-    html = _get(url, BROWSER_HEADERS)
-    if html is None:
-        html = _get(url, {})
-    if html is None:
-        # Refused both ways. A bot wall in front of the page is not a missing
-        # page: the sitemap lists the job, and a person would open it. Read it
-        # the way they would before calling it unreadable.
-        return _from_chrome(url, kind) or {"title": "", "text": ""}
+    html_read = _get(url, BROWSER_HEADERS)
+    if html_read is None:
+        html_read = _get(url, {})
+    if html_read is None:
+        try:
+            seen = _from_chrome(url, kind)
+        except PostingReadUnavailable:
+            # A newly flagged short ATS read must not be dropped just
+            # because the slower fallback failed to fetch a longer JD.
+            if ats:
+                return ats
+            raise
+        if seen is None:
+            return ats or _guarded("", "", source_required=True)
+        if ats:
+            merged = pg.merge(seen["text"], seen["posting_guard"], ats["posting_guard"])
+            seen.update(merged)
+        return seen
 
+    # _get supplies the effective URL after redirects. Legacy synthetic
+    # fetch stubs returning only HTML represent an exact URL response.
+    html, effective_url = (html_read if isinstance(html_read, tuple)
+                           else (html_read, url))
+    same_source = _same_posting_url(url, effective_url)
     raw_title = (m.group(1).strip() if (m := _TITLE_RX.search(html)) else "")
     h1 = _text(m.group(1)) if (m := _H1_RX.search(html)) else ""
     title = h1 or _SPLIT_RX.split(_text(raw_title))[0].strip()
-    text = _text(html)
-    if len(text) < 400:
-        # A page that builds itself in the browser gives a plain fetch almost
-        # nothing, and a tailor working from nothing writes a worse résumé than
-        # one that was never tailored. Read it the way a person would.
-        if (seen := _from_chrome(url, kind)) and len(seen.get("text", "")) > len(text):
-            return seen
-    return {"title": title[:90], "text": text}
+    hit = _guarded(title, html, html_variants=[html], source_required=True,
+                   source_complete=same_source)
+    # A redirect to a different posting is not original-HTML evidence even
+    # when that page returns HTTP 200 and its visible text looks clean.
+    hit.update(source_kind="http_html", source_url=effective_url)
+    if len(hit["text"]) < 400:
+        try:
+            seen = _from_chrome(url, kind)
+        except PostingReadUnavailable:
+            seen = None
+        if seen and len(seen.get("text", "")) > len(hit["text"]):
+            combined = pg.merge(seen["text"], seen["posting_guard"],
+                                hit["posting_guard"])
+            seen.update(combined)
+            hit = {**seen, "source_kind": "http_html", "source_url": effective_url}
+    if ats:
+        complete_ats = bool(ats["posting_guard"].get("source_verified"))
+        # Never substitute another redirected page's JD for an ATS posting.
+        selected_text = hit["text"] if same_source else ats["text"]
+        combined = pg.merge(selected_text, hit["posting_guard"],
+                            ats["posting_guard"], source_witness=complete_ats)
+        hit.update(combined)
+        if complete_ats and ats.get("source_url") == url:
+            hit.update(source_kind="ats_html", source_url=url)
+    return hit
 
-
-def _get(url: str, headers: dict) -> str | None:
+def _get(url: str, headers: dict) -> tuple[str, str] | None:
     """The page, or None when the server refused or the request failed.
 
     A non-2xx response used to be returned as if it were the posting. Meta's
@@ -147,11 +271,11 @@ def _get(url: str, headers: dict) -> str | None:
     if not 200 <= r.status_code < 300:
         log.warning("JD fetch refused for %s: HTTP %s", url, r.status_code)
         return None
-    return r.text
+    return r.text, str(r.url)
 
 
 def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
-                  with_gone: bool = False):
+                  with_gone: bool = False, with_meta: bool = False):
     """Read several browser-only postings per session. {url: description}.
 
     Meta's postings cannot be read over HTTP at all, so each needs a real browser.
@@ -173,7 +297,7 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
     if not ok:
         raise PostingReadUnavailable(why)
 
-    out: dict[str, str] = {}
+    out: dict = {}
     gone: set[str] = set()
     for i in range(0, len(urls), batch):
         chunk = urls[i:i + batch]
@@ -216,7 +340,8 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
                 continue
             if len(text) < 400:
                 continue
-            out[u] = text
+            guarded = _guarded(str(entry.get("title") or ""), text)
+            out[u] = guarded if with_meta else guarded["text"]
     return (out, gone) if with_gone else out
 
 
@@ -251,7 +376,7 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
     """Read the posting in the owner's own browser. Last resort, and slow."""
     import asyncio
 
-    from tools.browser_runtime import available, run_task
+    from tools.browser_runtime import available, configuration, run_task
 
     _check_browser_reader()
     ok, why = available()
@@ -279,8 +404,11 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
         why = problem or "The browser reader returned no posting report. Try reading it again."
         _note_browser_problem(why)
         raise PostingReadUnavailable(why)
-    return {"title": str(report.get("title", ""))[:90],
-            "text": str(report.get("description", ""))}
+    # BrowserSkill's ordinary reader is normalized; the older Claude Chrome
+    # string-return reader preserves harmless terminal spaces. Both are guarded
+    # before their distinct text contracts are returned.
+    return _guarded(str(report.get("title", "")), str(report.get("description", "")),
+                    normalize_terminal=configuration()["engine"] == "browser_skill")
 
 
 def fetch_jd(url: str, kind: str = "jd") -> str:

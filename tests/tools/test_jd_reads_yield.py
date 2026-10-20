@@ -25,13 +25,17 @@ def test_sweep_reads_are_a_yielding_kind():
 
 def test_the_sweep_passes_the_yielding_kind(monkeypatch):
     seen = {}
-    monkeypatch.setattr(jd, "fetch_jd", lambda url, kind="jd": seen.setdefault("kind", kind) or "")
+    from tools import posting_guard as pg
+    monkeypatch.setattr(jd, "fetch_jd_meta", lambda url, kind="jd":
+                        (seen.setdefault("kind", kind), pg.analyze("Synthetic job role."))[1])
     asyncio.run(_jd_text({"jd_url": "https://x/1", "jd_text": ""}))
     assert seen["kind"] == "jd_sweep"
 
 
 def test_the_apply_passes_the_non_yielding_kind(monkeypatch):
     seen = {}
-    monkeypatch.setattr(jd, "fetch_jd", lambda url, kind="jd": seen.setdefault("kind", kind) or "")
+    from tools import posting_guard as pg
+    monkeypatch.setattr(jd, "fetch_jd_meta", lambda url, kind="jd":
+                        (seen.setdefault("kind", kind), pg.analyze("Synthetic job role."))[1])
     asyncio.run(_jd_text({"jd_url": "https://x/1", "jd_text": ""}, yielding=False))
     assert seen["kind"] == "jd"

@@ -316,11 +316,17 @@ async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
         log.warning("chrome crawl of %s failed: %s", company, problem)
         return [], "", problem
 
+    from tools import posting_guard as pg
+
     jobs: list[JobRecord] = []
     for row in (report.get("jobs") or [])[:MAX_JOBS]:
         if not isinstance(row, dict):
             continue
-        title = str(row.get("title") or "").strip()
+        title = pg.analyze(str(row.get("title") or ""))["text"].strip()
+        inspected = pg.analyze(str(row.get("summary") or ""),
+                               source_required=True)
+        # Browser listing observations cannot certify missing original ATS HTML;
+        # the selected posting is read again before admission.
         # Relative links belong to the trusted careers listing. Never use a
         # model-supplied origin, and never reinterpret an absolute external ATS.
         url = _trusted_posting_url(row.get("url"), careers_url)
@@ -334,9 +340,10 @@ async def find_jobs(company: str, careers_url: str, *, prefs: object = None,
             # What the listing showed. Enough for the relevance screen, so a job
             # that will be discarded never costs a page load; the full posting is
             # read later for the ones that survive.
-            jd_text=str(row.get("summary") or "").strip(),
+            jd_text=inspected["text"],
+            posting_guard=inspected["posting_guard"],
             crawl_score=_as_score(row.get("score")),
-            crawl_why=str(row.get("why") or "").strip()[:200],
+            crawl_why=pg.analyze(str(row.get("why") or ""))["text"][:200],
             location=str(row.get("location") or "").strip(),
             # Whatever the listing said, normalised. Relative phrases ("3 days
             # ago") are as common as dates on career pages, so the parser takes

@@ -100,6 +100,25 @@ class _Tracking:
     def get(self, pk):
         return dict(self.rows[pk])
 
+    def get_current(self, pk):
+        return self.get(pk)
+
+    def update_posting_guard(self, pk, observed, inspected=None, *,
+                             reviewed_generation=None, source_witness=False,
+                             settle_refusal=False):
+        from core.storage.base import guard_observation_matches, guard_patch
+        current = self.get_current(pk)
+        if not guard_observation_matches(current, observed):
+            return False
+        patch = guard_patch(current, inspected,
+                            reviewed_generation=reviewed_generation,
+                            source_witness=source_witness,
+                            settle_refusal=settle_refusal)
+        if patch is None:
+            return False
+        self.rows[pk].update(patch)
+        return True
+
     def set_status(self, pk, status, **kw):
         self.rows[pk]["status"] = getattr(status, "value", status)
         self.rows[pk].update(kw)
@@ -192,7 +211,7 @@ def test_prefetch_closes_gone_rows(monkeypatch):
 
     assert stores.tracking.rows["meta#1"]["status"] == "job_gone"
     assert stores.tracking.rows["meta#2"]["status"] == "found"
-    assert stores.tracking.rows["meta#2"]["jd_text"] == GOOD
+    assert stores.tracking.rows["meta#2"]["jd_text"] == GOOD.strip()
 
 
 def test_prefetch_uses_persisted_eligibility_not_stale_input(monkeypatch):
@@ -228,8 +247,11 @@ def test_prefetch_loses_both_old_fill_and_gone_to_new_found_generation(monkeypat
         pk = "example-co#job-1"
         url = "https://example.test/jobs/1"
         tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
-        tracking.set_status(pk, Status.FOUND, company="example-co",
-                            jd_url=url, jd_text="Test role", attempts=0)
+        from core.models import JobRecord
+        assert tracking.put_new(JobRecord(company="example-co", job_id="job-1",
+                                          title="Test role", jd_url=url,
+                                          jd_text="Test role"))
+        tracking.set_status(pk, Status.FOUND, attempts=0)
         stores = SimpleNamespace(tracking=tracking)
         supplied = tracking.get(pk)
         monkeypatch.setattr(run, "_browser_companies", lambda: {"example-co"})
@@ -241,9 +263,9 @@ def test_prefetch_loses_both_old_fill_and_gone_to_new_found_generation(monkeypat
         async def unavailable(row, **kw):
             raise PostingReadUnavailable("synthetic reader unavailable")
 
-        monkeypatch.setattr(run, "_jd_text", unavailable)
+        monkeypatch.setattr(run, "_jd_meta", unavailable)
 
-        def delayed_batch(urls, *, with_gone):
+        def delayed_batch(urls, *, with_gone, with_meta=False):
             # Actual runner wins a full FOUND -> TAILORING -> FOUND cycle.
             assert run.run_job(pk, stores)["result"] == "deferred"
             if outcome == "fill":

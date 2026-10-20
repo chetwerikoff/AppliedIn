@@ -400,7 +400,8 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     from tools.jd import PostingReadUnavailable
 
     try:
-        jd_text = await _jd_text(row)
+        jd_meta = await _jd_meta(row)
+        jd_text = jd_meta["text"]
     except PostingReadUnavailable as exc:
         try:
             check = _reader_check(pk, row, stores)
@@ -452,8 +453,12 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         check = _reader_check(pk, row, stores)
         if check:
             return check
+        committed_guard = _commit_posting_meta(pk, row, jd_meta, stores)
+        if committed_guard is None:
+            return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
+        row = committed_guard
         committed, settled = _reader_patch(pk, row, stores, {
-            "jd_text": jd_text, "jd_read_attempts": 0,
+            "jd_read_attempts": 0,
             "jd_read_retry_at": None, "jd_read_error": "",
         })
     except Exception as exc:
@@ -461,6 +466,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     if not committed:
         return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
     row = settled
+    jd_text = row.get("jd_text") or ""
 
     # Distinguish a known infrastructure outage from a successfully returned
     # but unreadable/unsponsored page. Both content-derived terminal exits use
@@ -512,7 +518,9 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         sessions = _session_service()
         # create_session is async; a retry may find it already there.
         existing = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
-        if existing is not None and _stale_seed(existing, state["base_latex"]):
+        if existing is not None and (
+                _stale_seed(existing, state["base_latex"])
+                or _stale_posting(existing, row, jd_text)):
             # A session seeded from an earlier résumé cannot be reused against
             # a newer base. Reset and rebuild it, preserving the seed invariant.
             await _reset_session(pk)
@@ -538,7 +546,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
                     app_name=_APP, session_service=sessions)
 
     msg = types.Content(role="user", parts=[types.Part(
-        text=f"Apply to this job: {row.get('title','')} at {row.get('company','')}. "
+        text=f"Apply to this job: {__import__('tools.posting_guard', fromlist=['analyze']).analyze(row.get('title',''))['text']} at {row.get('company','')}. "
              f"URL: {row.get('jd_url','')}")])
     from .graph import ScorerInvalidOutput
 
@@ -564,32 +572,141 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     return result
 
 
-async def _jd_text(row: dict, *, yielding: bool = True) -> str:
-    """The full JD. Discovery stores only a title, so fetch the posting text from
-    its URL; fall back to whatever discovery captured.
+async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
+    """Select guarded JD while retaining original-source provenance.
 
-    `yielding` is True for the evaluate sweep, where a browser read is bulk work
-    and must wait for a live application; the apply passes False, because there
-    the read is part of the application's own flow."""
+    Directory-scan plaintext (even >400 chars) cannot become clean without
+    rereading matching ATS HTML. Legacy strings are kept as unchecked evidence
+    if the reader fails; no unfiltered fallback enters a model.
+    """
+    from tools import jd as _jd, posting_guard as pg
+
+    captured = row.get("jd_text") or ""
+    old = row.get("posting_guard")
+    if not pg.valid(captured, old):
+        old = pg.projection(captured, old)["posting_guard"]
+    local = pg.analyze(captured, previous=old,
+                       source_required="source_html_unavailable" in old.get("reasons", []))
+    local["source_kind"] = ""
+    url = row.get("jd_url") or ""
+    need_source = "source_html_unavailable" in old.get("reasons", [])
+    if not url or (len(captured) >= 400 and not need_source):
+        return local
     import asyncio
 
+    try:
+        remote = await asyncio.to_thread(
+            _jd.fetch_jd_meta, url, "jd_sweep" if yielding else "jd")
+    except _jd.PostingReadUnavailable:
+        if _unreadable(local["text"]):
+            raise
+        return local
+    if not isinstance(remote, dict):
+        return local
+    rtext, guard = remote.get("text"), remote.get("posting_guard")
+    if not isinstance(rtext, str) or not pg.valid(rtext, guard):
+        return local
+    # Directory imports require ATS HTML; ordinary feed/crawler sources can
+    # clear the provisional marker after a verified same-URL HTTP read.
+    source_witness = _jd.matched_source_witness(row, remote)
+    use_remote = bool(rtext) and (
+        len(rtext) > len(local["text"]) or (need_source and source_witness))
+    # Canonical deferred reads of an already guarded feed summary retain the
+    # normalized metadata contract. A legacy/unwitnessed source keeps harmless
+    # terminal spaces and remains unchecked until source evidence is verified.
+    # Merge rebinds the generation to the selected text and all source findings.
+    selected = (rtext.strip() if not need_source else rtext) if use_remote else local["text"]
+    combined = pg.merge(selected, guard, old, source_witness=source_witness)
+    return {**combined,
+            "source_kind": remote.get("source_kind", "") if source_witness else "",
+            "source_url": url if source_witness else ""}
+
+
+def _commit_posting_meta(pk: str, observed: dict, meta: dict,
+                         stores: Any) -> dict | None:
+    """Commit sanitized text and evidence together, never after a stale read."""
+    from tools import posting_guard as pg
+
+    current = stores.tracking.get_current(pk)
+    if (not current or current.get("pk") != pk
+            or current.get("status") != observed.get("status")
+            or current.get("jd_url") != observed.get("jd_url")
+            or _reader_witness(current) != _reader_witness(observed)
+            or not pg.valid(meta.get("text"), meta.get("posting_guard"))):
+        return None
     from tools import jd as _jd
 
-    captured = (row.get("jd_text", "") or "").strip()
-    url = row.get("jd_url", "")
-    if url and len(captured) < 400:  # looks like just a title — fetch the real thing
-        kind = "jd_sweep" if yielding else "jd"
-        try:
-            fetched = ((await asyncio.to_thread(_jd.fetch_jd, url, kind)) or "").strip()
-        except _jd.PostingReadUnavailable:
-            if _unreadable(captured):
-                raise
-            return captured
-        # Never a downgrade. This used to return whatever the fetch produced, so a
-        # refusal page replaced a perfectly good listing summary.
-        if len(fetched) > len(captured):
-            return fetched
-    return captured
+    source_witness = _jd.matched_source_witness(current, meta)
+    # The job title is also untrusted source text and appears in the initial
+    # evaluator prompt. Fold any title finding into the exact JD generation.
+    title_seen = pg.analyze(current.get("title") or "")
+    if title_seen["posting_guard"]["reasons"]:
+        meta = {**meta, **pg.merge(meta["text"],
+                                   title_seen["posting_guard"],
+                                   meta["posting_guard"],
+                                   source_witness=source_witness)}
+    if not stores.tracking.update_posting_guard(
+            pk, current, meta, source_witness=source_witness):
+        return None
+    updated = stores.tracking.get_current(pk)
+    return updated if (updated and updated.get("pk") == pk
+                       and updated.get("status") == observed.get("status")
+                       and pg.valid(updated.get("jd_text") or "",
+                                    updated.get("posting_guard"))) else None
+
+
+def _guard_refusal(pk: str, stores: Any) -> dict:
+    """Conditionally undo a *pre-browser* SUBMITTING claim without lost flags."""
+    from tools import posting_guard as pg
+
+    reason = "posting_guard_review_required"
+    try:
+        current = stores.tracking.get_current(pk)
+        if not current:
+            return {"result": "conflict", "pk": pk,
+                    "reason": "posting_guard_state_changed"}
+        if (submit_hold.blocked(pk, current, tracking=stores.tracking)
+                or current.get("possible_submission")
+                or current.get("confirmation_id")
+                or current.get("gate_reason") == "submit_uncertain"):
+            return {"result": "failed", "pk": pk, "reason": "uncertain",
+                    "detail": submit_hold.REASON}
+        if current.get("status") == "submitting":
+            ok = stores.tracking.update_posting_guard(
+                pk, current, settle_refusal=True)
+            if not ok:
+                # A failed conditional write is not evidence that the gate
+                # settled. Check for a newly created submission hold first.
+                fresh = stores.tracking.get_current(pk)
+                if (fresh and (submit_hold.blocked(pk, fresh, tracking=stores.tracking)
+                               or fresh.get("possible_submission")
+                               or fresh.get("confirmation_id")
+                               or fresh.get("gate_reason") == "submit_uncertain")):
+                    return {"result": "failed", "pk": pk, "reason": "uncertain",
+                            "detail": submit_hold.REASON}
+                if fresh and fresh.get("status") in ("applied", "applied_manual"):
+                    return {"result": "duplicate", "pk": pk,
+                            "reason": "already_applied"}
+                log.warning("posting guard refusal settlement raced for %s", pk)
+                return {"result": "conflict", "pk": pk,
+                        "reason": "posting_guard_state_changed"}
+        elif current.get("status") in ("applied", "applied_manual"):
+            return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
+        elif (current.get("status") not in ("tailored", "needs_human")
+              or current.get("fail_kind") != reason):
+            return {"result": "conflict", "pk": pk,
+                    "reason": "posting_guard_state_changed"}
+    except Exception:
+        log.exception("posting guard refusal failed to persist for %s", pk)
+        return {"result": "conflict", "pk": pk,
+                "reason": "posting_guard_state_changed"}
+    return {"result": "gated", "pk": pk, "reason": reason,
+            "detail": "Current posting generation requires job-specific review."}
+
+
+async def _jd_text(row: dict, *, yielding: bool = True) -> str:
+    """Compatibility string reader; model ingress uses _jd_meta plus commit."""
+    return (await _jd_meta(row, yielding=yielding))["text"]
 
 
 def _browser_companies() -> set[str]:
@@ -646,7 +763,8 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
         return 0
     log.info("reading %d browser-only posting(s) before the sweep", len(need))
     try:
-        got, gone = _jd.read_postings([r["jd_url"] for r in need], with_gone=True)
+        got, gone = _jd.read_postings([r["jd_url"] for r in need], with_gone=True,
+                                      with_meta=True)
     except _jd.PostingReadUnavailable as exc:
         log.warning("browser prefetch deferred: %s", exc)
         return 0
@@ -663,7 +781,17 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
                 patch = {"status": Status.JOB_GONE,
                          "fail_reason": "The posting has been removed."}
             else:
-                patch = {"jd_text": got[url], "jd_read_attempts": 0,
+                from tools import posting_guard as pg
+
+                result = got[url]
+                meta = (result if isinstance(result, dict) else
+                        pg.analyze(str(result), source_required=True,
+                                   strip_trailing=True))
+                updated = _commit_posting_meta(pk, observed, meta, stores)
+                if updated is None:
+                    continue
+                observed = updated
+                patch = {"jd_read_attempts": 0,
                          "jd_read_retry_at": None, "jd_read_error": ""}
             committed, _ = _reader_patch(pk, observed, stores, patch)
         except Exception as exc:
@@ -996,6 +1124,7 @@ def _session_state(row: dict, jd_text: str) -> dict:
         "pk": row.get("pk", ""), "company": row.get("company", ""),
         "ats": row.get("ats", ""), "jd_url": row.get("jd_url", ""),
         "jd_text": jd_text,
+        "posting_guard_generation": (row.get("posting_guard") or {}).get("generation", ""),
         "base_latex": _base_latex(), "github_context": _github_context(),
         "prefs_brief": _prefs_brief(_effective_prefs(row.get("company", ""))),
         "prefs_notes": _prefs_notes(row.get("company", "")) or "(none)",
@@ -1085,13 +1214,16 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
         stores.tracking.set_status(pk, status or Status.FOUND, tailor_note=note.strip())
         row = stores.tracking.get(pk) or row
 
-    jd_text = row.get("jd_text") or ""
-    if len(jd_text) < 400 and row.get("jd_url"):
-        from tools.jd import fetch_jd
-        try:
-            jd_text = fetch_jd(row["jd_url"]) or jd_text
-        except Exception:  # noqa: BLE001 — a dead posting must not lose the note
-            log.warning("could not re-read the posting for %s; using what we have", pk)
+    try:
+        inspected = _run(_jd_meta(row))
+        updated = _commit_posting_meta(pk, row, inspected, stores)
+        if updated is None:
+            return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
+        row = updated
+        jd_text = row.get("jd_text") or ""
+    except Exception:
+        log.exception("re-tailor could not establish a guarded posting for %s", pk)
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required"}
     if not jd_text.strip():
         return {"result": "no_jd", "pk": pk}
 
@@ -1109,7 +1241,9 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
     # have no Apply button and no way back.
     stores.tracking.set_status(pk, Status.TAILORING)
     try:
-        _run(_tailor_only(pk, state, row.get("title", ""), row.get("company", "")))
+        from tools import posting_guard as pg
+        _run(_tailor_only(pk, state, pg.analyze(row.get("title", ""))["text"],
+                          row.get("company", "")))
     except Exception as exc:  # noqa: BLE001 — the status must come back regardless
         stores.tracking.set_status(pk, status or Status.FOUND)
         log.exception("re-tailor failed for %s", pk)
@@ -1356,17 +1490,26 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     emit("running", pk=pk, agent="applier", detail="reading the posting…", url=jd_url)
 
     try:
-        jd_text = await _jd_text(row, yielding=False)
+        jd_meta = await _jd_meta(row, yielding=False)
+        jd_text = jd_meta["text"]
+        current = stores.tracking.get_current(pk)
+        if (not current or current.get("status") != Status.SUBMITTING.value):
+            return {"result": "gated", "pk": pk, "reason": "posting_guard_state_changed"}
+        guarded = _commit_posting_meta(pk, current, jd_meta, stores)
+        if guarded is None:
+            return _guard_refusal(pk, stores)
+        row = guarded
+        jd_text = row.get("jd_text") or ""
+        from tools import posting_guard as pg
+        if not pg.authorised(row, text=jd_text):
+            return _guard_refusal(pk, stores)
     except Exception as exc:  # noqa: BLE001
-        # The row was claimed as SUBMITTING a moment ago, and SUBMITTING has no
-        # Apply button — leaving it there would turn a transient read failure into
-        # a job the owner cannot retry. Hand the row back exactly as it was.
-        stores.tracking.set_status(pk, prior_status,
-                                   gate_reason=row.get("gate_reason", ""))
+        # A failed guard/read is pre-browser, but a concurrent submission hold
+        # or human/terminal update still outranks any restoration attempt.
+        log.exception("guarded JD fetch failed for pk=%s", pk)
         emit("error", pk=pk, agent="applier", url=jd_url,
-             detail=f"could not read the posting ({exc}) — not submitted, try again")
-        log.exception("JD fetch failed for pk=%s", pk)
-        return {"result": "error", "pk": pk, "reason": "jd_fetch_failed", "detail": str(exc)}
+             detail="Posting could not be safely inspected; current review required.")
+        return _guard_refusal(pk, stores)
 
     if _no_sponsorship(jd_text):  # don't submit an application that's a guaranteed no
         from core.events import emit
@@ -1427,6 +1570,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         pk=pk, jd_text=jd_text, resume_tex=resume_tex,
         github=_github_context(), resume_path=_resume_pdf_path(row),
     )
+    if result.get("reason") == "posting_guard_review_required":
+        return _guard_refusal(pk, stores)
     # A manual confirmation can arrive while the browser is filling the form.
     # A pre-submit duplicate refusal must not turn that applied row into a gate.
     if (stores.tracking.get(pk) or {}).get("status") in ("applied", "applied_manual"):
@@ -1599,6 +1744,13 @@ def _resume_pdf_path(row: dict) -> str:
 
 async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> dict:
     sessions = _session_service()
+    current = stores.tracking.get_current(pk)
+    if not current:
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required"}
+    session = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
+    if session is None or _stale_posting(session, current, current.get("jd_text") or ""):
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
+                "detail": "Posting changed; reopen and re-tailor with the current JD."}
     runner = Runner(agent=root_agent, app_name=_APP, session_service=sessions)
     # Answer the pending long-running ask_human call.
     resp = types.Content(role="user", parts=[types.Part(
@@ -1781,6 +1933,17 @@ def _stale_seed(session: Any, current_base: str) -> bool:
     return bool(current_base) and seeded != current_base
 
 
+def _stale_posting(session: Any, current: dict, jd_text: str) -> bool:
+    """Old same-seed ADK states are not evidence of a guarded posting."""
+    try:
+        state = getattr(session, "state", None) or {}
+        return (state.get("jd_text") != jd_text
+                or state.get("posting_guard_generation") !=
+                (current.get("posting_guard") or {}).get("generation", ""))
+    except Exception:
+        return True
+
+
 async def _reset_session(pk: str) -> None:
     """Delete the ADK session for a pk so run_job re-creates it fresh."""
     sessions = _session_service()
@@ -1923,7 +2086,11 @@ def _auto_decision(pk: str, stores: Any) -> str:
 
     if flags.apply_mode() != "auto" or flags.paused():
         return ""
-    row = stores.tracking.get(pk) or {}
+    from tools import posting_guard as pg
+
+    row = stores.tracking.get_current(pk) or {}
+    if not pg.authorised(row):
+        return ""
     if row.get("discovery_source") == "career_ops":
         return ""
     score = row.get("match_score")
@@ -2105,6 +2272,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain', fail_kind='uncertain',
             fail_reason=submit_hold.REASON, gate_pending={'question': submit_hold.REASON})
         return {'result': 'failed', 'pk': pk, 'reason': 'uncertain', 'detail': submit_hold.REASON}
+    if outcome.get("reason") == "posting_guard_review_required":
+        return _guard_refusal(pk, stores)
     reason = _fail_reason(outcome)
     stores.tracking.set_status(pk, Status.FAILED, fail_reason=reason,
                                fail_kind=outcome.get("reason") or "")

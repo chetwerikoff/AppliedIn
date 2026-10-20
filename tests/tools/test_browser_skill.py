@@ -19,6 +19,18 @@ from tools import claude_chrome, jd
 GOOD = 'Responsibilities and qualifications for the engineering program. ' * 20
 
 
+def _seed_clean(tracking, company, job_id, url, text=GOOD):
+    """Persist an owned, inspected synthetic JD before exercising form/lease gates."""
+    from core.models import JobRecord
+    from tools import posting_guard as pg
+
+    checked = pg.analyze(text)
+    assert tracking.put_new(JobRecord(
+        company=company, job_id=job_id, title='Test role', jd_url=url,
+        jd_text=checked['text'], posting_guard=checked['posting_guard']))
+    return checked
+
+
 def enable(tmp_path):
     (tmp_path / 'browser.local.yaml').write_text('engine: browser_skill\nbrowser: dedicated\n')
 
@@ -162,7 +174,7 @@ def test_pipeline_reader_uses_browser_skill_and_outage_remains_retryable(monkeyp
     monkeypatch.setattr(bsk, 'run_task', AsyncMock(return_value=(
         {'title': 'Program manager', 'description': GOOD}, '')))
     monkeypatch.setattr(claude_chrome, 'run_task', AsyncMock(side_effect=AssertionError('Claude')))
-    assert jd.fetch_jd('https://employer.test/job/1') == GOOD
+    assert jd.fetch_jd('https://employer.test/job/1') == GOOD.strip()
     assert runtime.is_infrastructure('BrowserSkill unavailable: profile disconnected')
     assert runtime.is_disconnected('BrowserSkill unavailable: profile disconnected')
 
@@ -253,12 +265,16 @@ def test_stale_resume_and_duplicates_are_rechecked_before_submit(monkeypatch, tm
     # Faking the row alone leaves the independent-key guard querying localhost.
     # Keep this résumé/duplicate regression offline, even without a Redis server.
     from core.apply_queue import ApplyQueue
-    tracking = SimpleNamespace(r=fakeredis.FakeRedis(decode_responses=True))
+    from tools import posting_guard as pg
+    checked = pg.analyze(GOOD)
+    row = {'pk': 'company#1', 'company': 'Company', 'status': 'submitting',
+           'resume_tex_key': 'r.tex', 'resume_seed': 'old',
+           'jd_text': checked['text'], 'posting_guard': checked['posting_guard']}
+    tracking = SimpleNamespace(r=fakeredis.FakeRedis(decode_responses=True),
+                               get_current=lambda pk: dict(row))
     monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))
     pdf = tmp_path / 'Resume.pdf'
     pdf.write_bytes(b'pdf')
-    row = {'company': 'Company', 'status': 'submitting',
-           'resume_tex_key': 'r.tex', 'resume_seed': 'old'}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
     monkeypatch.setattr('agent.run.seed_fingerprint', lambda: 'current')
     monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: None)
@@ -354,7 +370,8 @@ async def test_two_live_company_leases_cannot_splice_a_drifted_row_before_sessio
     url = 'https://example.test/jobs/job-1'
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     for company, pk in ((a, pk_a), (b, pk_b)):
-        tracking.set_status(pk, Status.SUBMITTING, company=company, jd_url=url,
+        _seed_clean(tracking, company, pk.split('#')[1], url)
+        tracking.set_status(pk, Status.SUBMITTING,
                             resume_tex_key='resumes/Test-User.tex',
                             resume_seed='synthetic-seed')
     monkeypatch.setattr('core.stores.make_stores',
@@ -421,7 +438,12 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
         def __init__(self):
             import fakeredis
             self.r = fakeredis.FakeRedis(decode_responses=True)
-            self.row = {'pk': pk, 'status': 'submitting'}
+            from tools import posting_guard as pg
+            checked = pg.analyze(GOOD)
+            self.row = {'pk': pk, 'status': 'submitting',
+                        'company': 'example-co', 'jd_url': current['url'],
+                        'jd_text': checked['text'],
+                        'posting_guard': checked['posting_guard']}
 
         def set_status(self, observed_pk, status, **attrs):
             assert observed_pk == pk
@@ -432,6 +454,9 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
             assert observed_pk == pk
             evidence.append('readback')
             return dict(self.row)
+
+        def get_current(self, observed_pk):
+            return self.get(observed_pk)
 
     tracking = Tracking()
     real_set, real_get = tracking.r.set, tracking.r.get
@@ -711,11 +736,12 @@ async def test_manual_confirmation_during_fill_keeps_the_applied_ledger(monkeypa
 
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = 'acme#1'
-    tracking.set_status(pk, Status.TAILORED, company='Acme',
-                        jd_url='https://employer.test/job/1', gate_reason='approval')
+    _seed_clean(tracking, 'Acme', '1', 'https://employer.test/job/1')
+    tracking.set_status(pk, Status.TAILORED, gate_reason='approval')
     stores = SimpleNamespace(tracking=tracking, secrets=None,
                              answer_bank=SimpleNamespace(all_facts=lambda company: {}))
-    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value=GOOD))
+    from tools import posting_guard as pg
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(return_value=pg.analyze(GOOD)))
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: '')
     monkeypatch.setattr('tools.credentials.get_login', lambda *args: None)
@@ -1390,11 +1416,13 @@ def form_gate_world(monkeypatch, tmp_path):
     from core.storage.local import MarkdownAnswerBank, RedisTracking
     pk = 'example-co#1'
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
-    tracking.set_status(pk, Status.TAILORED, company='example-co', jd_url=page()['url'])
+    _seed_clean(tracking, 'example-co', '1', page()['url'])
+    tracking.set_status(pk, Status.TAILORED)
     bank = MarkdownAnswerBank(tmp_path / 'synthetic-facts.md')
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
     monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw: stores)
-    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value=GOOD))
+    from tools import posting_guard as pg
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(return_value=pg.analyze(GOOD)))
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Resume.pdf')
     monkeypatch.setattr('tools.credentials.get_login', lambda *a: None)

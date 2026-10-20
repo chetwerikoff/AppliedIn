@@ -14,8 +14,9 @@ import daemon
 import server
 from agent import run
 from core.apply_queue import ApplyQueue
-from core.models import Status
+from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
+from tools import posting_guard as pg
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
 from tools import submit_hold
@@ -28,7 +29,12 @@ URL = 'https://example.test/job/1'
 def world(monkeypatch):
     client = fakeredis.FakeRedis(decode_responses=True)
     tracking = RedisTracking(client)
-    tracking.set_status(PK, Status.SUBMITTING, company='example-co', jd_url=URL)
+    checked = pg.analyze("Synthetic platform engineering responsibilities. " * 20)
+    assert tracking.put_new(JobRecord(
+        company='example-co', job_id='synthetic-job',
+        title='Test Engineer', jd_url=URL,
+        jd_text=checked['text'], posting_guard=checked['posting_guard']))
+    tracking.set_status(PK, Status.SUBMITTING)
     stores = SimpleNamespace(tracking=tracking, apply_queue='apply',
                              queue=SimpleNamespace(enqueue=AsyncMock()))
     monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw: stores)
@@ -195,7 +201,8 @@ async def test_outcome_recording_retains_unresolved_and_clears_only_confirmed(wo
     stores.answer_bank = SimpleNamespace(all_facts=lambda company: {},
                                         put=lambda *a, **kw: pytest.fail('No BrowserSkill draft may be banked'))
     stores.secrets = None
-    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value='Engineering role. ' * 50))
+    monkeypatch.setattr(run, '_jd_meta',
+                        AsyncMock(return_value=pg.analyze('Engineering role. ' * 50)))
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: '')
     monkeypatch.setattr(run, '_note_rotation_use', lambda *a: None)

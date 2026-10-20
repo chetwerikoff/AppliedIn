@@ -175,13 +175,15 @@ def _label_batch(jobs: list[dict]) -> list[tuple[str, str, str]]:
 
     from core.config import get_settings
 
+    from tools import posting_guard as pg
+
     listing = "\n\n".join(
         "\n".join(
             (
                 f"id: {job['id']}",
-                f"company: {_one_line(job.get('company'))}",
-                f"title: {_one_line(job.get('title'))}",
-                f"description: {_one_line(job.get('description'))}",
+                f"company: {_one_line(pg.analyze(job.get('company') or '')['text'])}",
+                f"title: {_one_line(pg.analyze(job.get('title') or '')['text'])}",
+                f"description: {_one_line(pg.analyze(job.get('description') or '')['text'])}",
             )
         )
         for job in jobs

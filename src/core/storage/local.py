@@ -24,6 +24,8 @@ from .base import (
     AbstractSecrets,
     AbstractTracking,
     legacy_repair_row_allowed,
+    guard_observation_matches,
+    guard_patch,
 )
 
 
@@ -91,6 +93,12 @@ class RedisTracking(AbstractTracking):
         # Build the full identity first: SET NX must never expose a temporary
         # placeholder that another preflight might read as a persisted job.
         from datetime import datetime
+        from tools import posting_guard as pg
+
+        # First-write trust cannot be inferred from a flattened/legacy JD.
+        guarded = ({"text": job.jd_text, "posting_guard": job.posting_guard}
+                   if pg.valid(job.jd_text, job.posting_guard)
+                   else pg.projection(job.jd_text, job.posting_guard))
         row = {
             "pk": job.pk, "jd_hash": job.jd_hash, "status": status.value,
             "company": job.company, "job_id": job.job_id, "title": job.title,
@@ -102,7 +110,7 @@ class RedisTracking(AbstractTracking):
             "posted_at": getattr(job, "posted_at", "") or "",
             "discovery_source": job.discovery_source,
             "apply_requested_at": job.apply_requested_at,
-            "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
+            "jd_text": guarded["text"], "posting_guard": guarded["posting_guard"],
         }
         if job.greenhouse_board:
             row["greenhouse_board"] = job.greenhouse_board
@@ -119,28 +127,88 @@ class RedisTracking(AbstractTracking):
         return True
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:
-        row = self.get(pk) or {"pk": pk}
-        prev = row.get("status")
-        val = status.value if hasattr(status, "value") else status
-        row["status"] = val
-        # When the résumé was written. The board groups the approval queue by this,
-        # because "tailored on Monday" is the difference between a fresh document
-        # and one written against a posting that has since changed. Stamped on the
-        # TRANSITION so a later edit to the row does not move the date.
-        if val == "tailored" and prev != "tailored" and not row.get("tailored_at"):
-            from datetime import datetime, timezone
+        """WATCH the row: a stale read must not erase a newer source finding."""
+        from datetime import datetime, timezone
 
-            row["tailored_at"] = datetime.now(timezone.utc).isoformat()
-        # And when it went out. Nothing recorded this, so "how many did I send last
-        # Tuesday" could not be answered at all: an applied row knew only when it
-        # was DISCOVERED, which for a job found in a sweep and applied to a week
-        # later is a different week.
-        if val in ("applied", "applied_manual") and not row.get("applied_at"):
-            from datetime import datetime, timezone
+        key = f"app:{pk}"
+        if set(attrs) & {"posting_guard", "reviewed_guard_generation", "jd_text"}:
+            raise ValueError("Use update_posting_guard for bound JD/guard changes")
+        val = getattr(status, "value", status)
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    # Preserve the pre-guard status-only upsert for legacy
+                    # bookkeeping rows. A missing row has no JD or guard to
+                    # certify; protected fields are rejected above.
+                    row = json.loads(raw) if raw is not None else {"pk": pk}
+                    prev = row.get("status")
+                    row["status"] = val
+                    if val == "tailored" and prev != "tailored" and not row.get("tailored_at"):
+                        row["tailored_at"] = datetime.now(timezone.utc).isoformat()
+                    if val in ("applied", "applied_manual") and not row.get("applied_at"):
+                        row["applied_at"] = datetime.now(timezone.utc).isoformat()
+                    row.update(attrs)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if prev and prev != val:
+                        pipe.srem(f"status:{prev}", pk)
+                    if val and not is_internal_pk(pk):
+                        pipe.sadd(f"status:{val}", pk)
+                    if row.get("jd_hash"):
+                        pipe.hset("jdhash", row["jd_hash"], pk)
+                    pipe.execute()
+                    return
+            except WatchError:
+                continue
+        raise RuntimeError("Concurrent tracking status update did not settle")
 
-            row["applied_at"] = datetime.now(timezone.utc).isoformat()
-        row.update(attrs)
-        self._write(pk, row, prev_status=prev)
+    def get_current(self, pk: str) -> dict | None:
+        return self.get(pk)
+
+    def update_posting_guard(
+        self, pk: str, observed: dict, inspected: dict | None = None, *,
+        reviewed_generation: str | None = None, source_witness: bool = False,
+        settle_refusal: bool = False,
+    ) -> bool:
+        key, hold = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold)
+                    raw = pipe.get(key)
+                    if not raw:
+                        pipe.unwatch()
+                        return False
+                    current = json.loads(raw)
+                    if not guard_observation_matches(current, observed):
+                        pipe.unwatch()
+                        return False
+                    # A separate durable hold takes priority over review.
+                    if (reviewed_generation is not None or settle_refusal) and pipe.get(hold) is not None:
+                        pipe.unwatch()
+                        return False
+                    patch = guard_patch(current, inspected,
+                                        reviewed_generation=reviewed_generation,
+                                        source_witness=source_witness,
+                                        settle_refusal=settle_refusal)
+                    if patch is None:
+                        pipe.unwatch()
+                        return False
+                    prev_status = current.get("status")
+                    current.update(patch)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(current, default=str))
+                    if current.get("status") != prev_status and not is_internal_pk(pk):
+                        if prev_status:
+                            pipe.srem(f"status:{prev_status}", pk)
+                        pipe.sadd(f"status:{current['status']}", pk)
+                    pipe.execute()
+                    return True
+            except WatchError:
+                continue
+        raise RuntimeError("Concurrent posting-guard update did not settle")
 
     def update_if_status(self, pk: str, expected_status: Status | str,
                          updates: dict, *, expected_reader: dict) -> bool:
@@ -149,6 +217,8 @@ class RedisTracking(AbstractTracking):
         WATCH catches intervening writes before the transaction executes; a
         same-status reader generation mismatch is a conflict, not contention.
         """
+        if set(updates) & {"jd_text", "posting_guard", "reviewed_guard_generation"}:
+            raise ValueError("Use update_posting_guard for bound JD/guard changes")
         fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
                  "jd_text", "jd_read_prepare_only")
         if set(expected_reader) - set(fixed):

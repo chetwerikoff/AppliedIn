@@ -1300,3 +1300,85 @@ async def test_ashby_approved_native_checkbox_is_not_mistaken_for_submit(monkeyp
     assert any(c['selector'] == '#native-choice' and c['checked']
                for c in (await session.page())['controls'])
     assert not decide.await_count
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_real_browser_dispatch_checks_current_posting_generation_before_any_lease(
+    monkeypatch, ats,
+):
+    """The existing entry world cannot bypass an unreviewed row by mere URL/PK."""
+    from types import SimpleNamespace
+
+    import fakeredis
+    from core.models import JobRecord, Status
+    from core.storage.local import RedisTracking
+    from tools import posting_guard as pg
+
+    actual_check = forms.check_dispatch
+    row, configs, session, decision = world(monkeypatch, ats)
+    monkeypatch.setattr(forms, 'check_dispatch', actual_check)
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    long_body = "Build useful software systems for product teams. " * 20
+    guarded = pg.analyze(long_body, source_required=True)
+    assert tracking.put_new(JobRecord(
+        company=COMPANY, job_id=JOB, title="Test Engineer",
+        jd_url=posting(ats), jd_text=guarded['text'],
+        posting_guard=guarded['posting_guard'], ats=ats))
+    tracking.set_status(PK, Status.SUBMITTING)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: False)
+    with pytest.raises(forms.Gate) as rejected:
+        actual_check(PK, 'synthetic-resume.pdf')
+    assert rejected.value.reason == 'posting_guard_review_required'
+    assert not session.calls and not decision.await_count
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_exact_owner_review_passes_guard_then_still_requires_queue_and_resume(
+    monkeypatch, ats,
+):
+    from types import SimpleNamespace
+
+    import fakeredis
+    from core.models import JobRecord, Status
+    from core.storage.local import RedisTracking
+    from tools import posting_guard as pg
+
+    actual_check = forms.check_dispatch
+    world(monkeypatch, ats)
+    monkeypatch.setattr(forms, 'check_dispatch', actual_check)
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    body = "Build useful software systems for product teams. " * 20
+    incoming = pg.analyze(body, source_required=True)
+    assert tracking.put_new(JobRecord(
+        company=COMPANY, job_id=JOB, title="Test Engineer",
+        jd_url=posting(ats), jd_text=incoming['text'],
+        posting_guard=incoming['posting_guard'], ats=ats))
+    tracking.set_status(PK, Status.TAILORED, gate_reason='approval')
+    observed = tracking.get_current(PK)
+    generation = observed['posting_guard']['generation']
+    assert tracking.update_posting_guard(PK, observed,
+                                         reviewed_generation=generation)
+    tracking.set_status(PK, Status.SUBMITTING, gate_reason='',
+                        resume_tex_key='synthetic.tex', resume_seed='synthetic-seed')
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr('agent.run.seed_fingerprint', lambda: 'synthetic-seed')
+    monkeypatch.setattr('tools.browser_apply._duplicate_refusal', lambda pk: False)
+    from core import apply_queue
+
+    class GrantedLease:
+        def __init__(self, client):
+            assert client is tracking.r
+
+        def in_flight(self):
+            return {PK}
+
+        def depth(self):
+            return {'running': [COMPANY]}
+
+    monkeypatch.setattr(apply_queue, 'ApplyQueue', GrantedLease)
+    with pytest.raises(forms.Gate) as rejected:
+        actual_check(PK, 'synthetic-resume-does-not-exist.pdf')
+    assert rejected.value.reason != 'posting_guard_review_required'
+    assert 'PDF is missing' in str(rejected.value)

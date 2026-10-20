@@ -53,9 +53,12 @@ def _text(html: str) -> str:
 
 
 def _guarded(title: str, text: str, *, html_variants=(),
-             source_required: bool = False) -> dict:
+             source_required: bool = False, normalize_terminal: bool = False) -> dict:
+    # Source-aware ATS/HTTP metadata has always been normalized. Keep the
+    # normalization inside the analyzer so its generation binds exact bytes.
     inspected = pg.analyze(text, html_variants=html_variants,
-                           source_required=source_required)
+                           source_required=source_required,
+                           strip_trailing=source_required or normalize_terminal)
     cleaned_title = pg.analyze(title)["text"][:90]
     return {"title": cleaned_title, **inspected}
 
@@ -280,7 +283,7 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
     """Read the posting in the owner's own browser. Last resort, and slow."""
     import asyncio
 
-    from tools.browser_runtime import available, run_task
+    from tools.browser_runtime import available, configuration, run_task
 
     _check_browser_reader()
     ok, why = available()
@@ -308,7 +311,11 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
         why = problem or "The browser reader returned no posting report. Try reading it again."
         _note_browser_problem(why)
         raise PostingReadUnavailable(why)
-    return _guarded(str(report.get("title", "")), str(report.get("description", "")))
+    # BrowserSkill's ordinary reader is normalized; the older Claude Chrome
+    # string-return reader preserves harmless terminal spaces. Both are guarded
+    # before their distinct text contracts are returned.
+    return _guarded(str(report.get("title", "")), str(report.get("description", "")),
+                    normalize_terminal=configuration()["engine"] == "browser_skill")
 
 
 def fetch_jd(url: str, kind: str = "jd") -> str:

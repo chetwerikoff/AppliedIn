@@ -171,3 +171,34 @@ def test_guard_refusal_failed_compare_is_not_a_falsely_settled_gate(
     outcome = run._guard_refusal(PK, stores)
     assert outcome["result"] == "conflict"
     assert stores.tracking.get_current(PK)["status"] == "submitting"
+
+
+@pytest.mark.parametrize("previously_guarded", [True, False])
+def test_deferred_metadata_is_normalized_but_legacy_unwitnessed_retry_is_raw(
+        monkeypatch, previously_guarded):
+    """Canonical feed expansion normalizes; old source-unwitnessed reads retain
+    harmless suffixes and stay unchecked. Neither may detach HTML findings.
+    """
+    from tools import jd
+
+    full = "Build safe distributed systems and collaborate across teams. " * 15
+    incoming = pg.analyze(
+        full, html_variants=[
+            '<p>Build safe systems.</p><a hidden href="https://evil.example/">secret</a>'
+        ], source_required=True)
+    assert incoming["text"] == full
+    monkeypatch.setattr(jd, "fetch_jd_meta", lambda url, kind: incoming)
+
+    row = {"jd_url": URL, "jd_text": "Short feed summary" if previously_guarded else ""}
+    if previously_guarded:
+        row["posting_guard"] = pg.analyze(row["jd_text"])["posting_guard"]
+
+    selected = asyncio.run(run._jd_meta(row))
+    assert selected["text"] == (full.strip() if previously_guarded else full)
+    assert "hidden_link" in selected["posting_guard"]["reasons"]
+    assert selected["posting_guard"]["status"] == "flagged"
+    assert pg.valid(selected["text"], selected["posting_guard"])
+    assert ("source_html_unavailable" in selected["posting_guard"]["reasons"]) is (
+        not previously_guarded)
+    if previously_guarded:
+        assert not pg.valid(selected["text"], incoming["posting_guard"])

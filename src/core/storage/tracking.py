@@ -79,6 +79,7 @@ class TrackingStore(AbstractTracking):
     def update_posting_guard(
         self, pk: str, observed: dict, inspected: dict | None = None, *,
         reviewed_generation: str | None = None, source_witness: bool = False,
+        settle_refusal: bool = False,
     ) -> bool:
         """Read the base table consistently, then compare at UpdateItem commit."""
         from core.ids import jd_hash
@@ -88,7 +89,8 @@ class TrackingStore(AbstractTracking):
             return False
         patch = guard_patch(current, inspected,
                             reviewed_generation=reviewed_generation,
-                            source_witness=source_witness)
+                            source_witness=source_witness,
+                            settle_refusal=settle_refusal)
         if patch is None:
             return False
         if "jd_text" in patch:

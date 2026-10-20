@@ -417,3 +417,23 @@ test('stale rotation and profile bulk controls cannot mutate held jobs',async()=
     '/actions/rotate-and-approve','/actions/rotate-and-approve',
     '/actions/apply-profile-to-all']);
 });
+
+test('posting-safety warning survives read-only portal hold and remains escaped',()=>{
+  const h=harness();
+  const guarded=row('held-pg',{status:'tailored',submit_hold_state:'blocked',
+    posting_guard:{status:'flagged',generation:'untrusted-guard',
+      messages:['<svg onload=evil()>','Hidden HTML removed']}});
+  h.state.apps=[guarded];
+  assert.equal(h.fn('rowActionAllowed')(guarded.pk,'apply-now'),false);
+  const html=h.fn('laneCard')(guarded);
+  assert.match(html,/Posting safety: flagged/);
+  assert.match(html,/&lt;svg/);
+  assert.doesNotMatch(html,/<svg/);
+  assert.doesNotMatch(html,/data-act="apply-now"/);
+  vm.runInContext('loadAgentLog=()=>{};',h.context);
+  h.fn('openDrawer')(guarded.pk);
+  const drawer=h.node('#drawer-body').innerHTML;
+  assert.match(drawer,/Posting safety: flagged/);
+  assert.match(drawer,/&lt;svg/);
+  assert.doesNotMatch(drawer,/data-act="apply-now"/);
+});

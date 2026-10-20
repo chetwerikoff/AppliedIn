@@ -2256,6 +2256,27 @@ def create_app() -> FastAPI:
             )
         ))
 
+    def _posting_generation_visible(tracking, pk: str, displayed: object) -> bool:
+        """Preflight every selected generation before granting any role.
+
+        A stale second role must not leave the first role durably approved when
+        the batch is refused. Each actual grant still uses the existing CAS.
+        """
+        from tools import posting_guard as pg
+
+        try:
+            current = tracking.get_current(pk)
+            if not current or current.get("pk") != pk:
+                return False
+            if not pg.requires_review(current):
+                return True
+            guard = current.get("posting_guard")
+            return (isinstance(displayed, str) and bool(displayed)
+                    and pg.valid(current.get("jd_text") or "", guard)
+                    and displayed == guard["generation"])
+        except Exception:
+            return False
+
     def _review_posting_generation(tracking, pk: str, displayed: object) -> bool:
         """Only a version actually displayed on a job-specific action can grant."""
         from tools import posting_guard as pg
@@ -2300,7 +2321,7 @@ def create_app() -> FastAPI:
                 }
         versions = body.get("guard_generations") or {}
         if not isinstance(versions, dict) or any(
-                not _review_posting_generation(stores.tracking, pk, versions.get(pk))
+                not _posting_generation_visible(stores.tracking, pk, versions.get(pk))
                 for pk in pks):
             return {"ok": False, "error": "Posting guard changed. Refresh and review the selected job generation."}
         if company.lower() in q.depth()["running"] or not q.start_flush(company):
@@ -2309,6 +2330,12 @@ def create_app() -> FastAPI:
                 "error": f"{company} already has an application run. Wait for it to finish, then apply this selection.",
             }
         try:
+            # Acquire the company run before durable review grants. A busy run
+            # cannot leave otherwise valid roles approved without dispatch.
+            if any(not _review_posting_generation(
+                    stores.tracking, pk, versions.get(pk)) for pk in pks):
+                q.stop_flush(company)
+                return {"ok": False, "error": "Posting guard changed. Refresh and review the selected job generation."}
             for pk in pks:
                 q.put(pk, company)
             background.add_task(_flush_loop, company, q, True, set(pks))

@@ -1469,15 +1469,12 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         if not pg.authorised(row, text=jd_text):
             return _guard_refusal(pk, stores)
     except Exception as exc:  # noqa: BLE001
-        # The row was claimed as SUBMITTING a moment ago, and SUBMITTING has no
-        # Apply button — leaving it there would turn a transient read failure into
-        # a job the owner cannot retry. Hand the row back exactly as it was.
-        stores.tracking.set_status(pk, prior_status,
-                                   gate_reason=row.get("gate_reason", ""))
+        # A failed guard/read is pre-browser, but a concurrent submission hold
+        # or human/terminal update still outranks any restoration attempt.
+        log.exception("guarded JD fetch failed for pk=%s", pk)
         emit("error", pk=pk, agent="applier", url=jd_url,
-             detail=f"could not read the posting ({exc}) — not submitted, try again")
-        log.exception("JD fetch failed for pk=%s", pk)
-        return {"result": "error", "pk": pk, "reason": "jd_fetch_failed", "detail": str(exc)}
+             detail="Posting could not be safely inspected; current review required.")
+        return _guard_refusal(pk, stores)
 
     if _no_sponsorship(jd_text):  # don't submit an application that's a guaranteed no
         from core.events import emit

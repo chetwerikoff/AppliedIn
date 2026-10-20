@@ -236,3 +236,45 @@ def test_matching_ordinary_http_witness_clears_only_non_directory_provisional_so
     assert pg.authorised(committed) is expected_clean
     assert ("source_html_unavailable" in committed["posting_guard"]["reasons"]) is (
         not expected_clean)
+
+def test_short_flagged_ats_survives_browser_failure_and_revokes_clean_apply(
+    stores, monkeypatch,
+):
+    from tools import browser_apply, jd
+
+    existing = stores.tracking.get_current(PK)
+    cached = ("Build reliable services with a focused engineering product team. " * 5).strip()
+    assert 200 < len(cached) < 400
+    clean = pg.analyze(cached, html_variants=["<p>Build reliable services.</p>"],
+                       source_required=True)
+    assert stores.tracking.update_posting_guard(
+        PK, existing, clean, source_witness=True)
+    stores.tracking.set_status(PK, Status.TAILORED, gate_reason="")
+    before = stores.tracking.get_current(PK)
+    assert pg.authorised(before)
+
+    short = pg.analyze("Build API tools. " * 9, html_variants=[
+        '<p>Build API tools.</p><a hidden href="https://evil.example/">secret</a>'],
+        source_required=True)
+    assert len(short["text"]) <= 200
+    assert short["posting_guard"]["status"] == "flagged"
+    monkeypatch.setattr(jd, "_from_ats", lambda _: {
+        **short, "source_kind": "ats_html", "source_url": URL})
+    monkeypatch.setattr(jd, "_get", lambda *args: None)
+    def unreadable(*args):
+        raise jd.PostingReadUnavailable("synthetic browser unavailable")
+    monkeypatch.setattr(jd, "_from_chrome", unreadable)
+    browser = AsyncMock()
+    monkeypatch.setattr(browser_apply, "apply", browser)
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
+    outcome = asyncio.run(run._apply_direct(PK, stores))
+
+    assert outcome["result"] == "gated"
+    assert outcome["reason"] == "posting_guard_review_required"
+    updated = stores.tracking.get_current(PK)
+    assert updated["jd_text"] == cached
+    assert updated["status"] == "tailored"
+    assert updated["posting_guard"]["generation"] != before["posting_guard"]["generation"]
+    assert "hidden_link" in updated["posting_guard"]["reasons"]
+    assert not pg.authorised(updated)
+    browser.assert_not_awaited()

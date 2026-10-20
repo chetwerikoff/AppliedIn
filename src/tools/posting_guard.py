@@ -201,7 +201,8 @@ def _result(text: str, reasons: set[str], source_verified: bool) -> dict:
 
 
 def analyze(text: str | None, *, html_variants=(), source_required: bool = False,
-            previous: dict | None = None, strip_trailing: bool = False) -> dict:
+            previous: dict | None = None, strip_trailing: bool = False,
+            source_complete: bool = True) -> dict:
     """Inspect all supplied HTML variants before relying on selected plain text.
 
     Previous positive reasons are monotonic. A provisional missing-HTML marker
@@ -215,8 +216,9 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
         if isinstance(old, dict):
             reasons.update(code for code in old.get("reasons", []) if code in _MESSAGES)
         variants = tuple(html_variants or ())
-        verified = bool(variants) and all(isinstance(v, str) and bool(v.strip())
-                                         for v in variants)
+        verified = (source_complete and bool(variants)
+                    and all(isinstance(v, str) and bool(v.strip())
+                            for v in variants))
         visible = ""
         for source in variants:
             if not isinstance(source, str):
@@ -225,8 +227,12 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(source)
             parser.close()
             reasons.update(parser.reasons)
-            if len("".join(parser.parts)) > len(visible):
-                visible = "".join(parser.parts)
+            html_text = "".join(parser.parts)
+            # A nonselected HTML variant can expose model-directed instructions
+            # and suspicious Unicode absent from the preferred plain JD.
+            _text(html_text, reasons)
+            if len(html_text) > len(visible):
+                visible = html_text
         selected = text or visible
         if re.search(r"<(?:[a-z][\w-]*)\b[^>]*>", selected, re.I):
             parser = _VisibleHTML()

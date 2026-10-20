@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -53,15 +54,34 @@ def _text(html: str) -> str:
 
 
 def _guarded(title: str, text: str, *, html_variants=(),
-             source_required: bool = False, normalize_terminal: bool = False) -> dict:
+             source_required: bool = False, normalize_terminal: bool = False,
+             source_complete: bool = True) -> dict:
     # Source-aware ATS/HTTP metadata has always been normalized. Keep the
     # normalization inside the analyzer so its generation binds exact bytes.
     inspected = pg.analyze(text, html_variants=html_variants,
                            source_required=source_required,
-                           strip_trailing=source_required or normalize_terminal)
+                           strip_trailing=source_required or normalize_terminal,
+                           source_complete=source_complete)
     cleaned_title = pg.analyze(title)["text"][:90]
     return {"title": cleaned_title, **inspected}
 
+
+def _same_posting_url(expected: str, effective: str) -> bool:
+    """A redirect proves original HTML only for the same posting identity."""
+    try:
+        a, b = urlsplit(expected), urlsplit(effective)
+        if (a.scheme not in {"http", "https"} or b.scheme not in {"http", "https"}
+                or not a.hostname or not b.hostname or a.hostname != b.hostname
+                or a.username or b.username or a.password or b.password):
+            return False
+        same_scheme = a.scheme == b.scheme and a.port == b.port
+        upgraded = (a.scheme == "http" and b.scheme == "https"
+                    and a.port in (None, 80) and b.port in (None, 443))
+        return (same_scheme or upgraded) and (
+            (a.path.rstrip("/") or "/") == (b.path.rstrip("/") or "/")
+            and a.query == b.query)
+    except ValueError:
+        return False
 
 def matched_source_witness(row: dict, meta: dict) -> bool:
     """Only the same posting's inspected source can clear missing-HTML evidence.
@@ -72,8 +92,8 @@ def matched_source_witness(row: dict, meta: dict) -> bool:
     """
     guard = meta.get("posting_guard")
     kind = meta.get("source_kind")
-    return (meta.get("source_url") == row.get("jd_url")
-            and bool(row.get("jd_url"))
+    return (_same_posting_url(row.get("jd_url") or "",
+                              meta.get("source_url") or "")
             and isinstance(guard, dict) and guard.get("source_verified") is True
             and (kind == "ats_html"
                  or (kind == "http_html"
@@ -81,24 +101,45 @@ def matched_source_witness(row: dict, meta: dict) -> bool:
 
 
 def _from_ats(url: str) -> dict | None:
-    """Match an ATS posting and inspect ALL exposed HTML before plain selection."""
+    """Match an exact ATS posting and inspect all exposed HTML variants."""
     from urllib.parse import urlparse
 
-    u = urlparse(url)
-    host, seg = (u.hostname or "").lower(), [p for p in u.path.split("/") if p]
-    if len(seg) < 2:
+    try:
+        u = urlparse(url)
+        host = (u.hostname or "").lower()
+        if (u.scheme != "https" or u.username or u.password
+                or u.port not in (None, 443)):
+            return None
+    except ValueError:
+        return None
+    ashby = host == "jobs.ashbyhq.com"
+    greenhouse = host in {"boards.greenhouse.io", "job-boards.greenhouse.io",
+                          "job-boards.eu.greenhouse.io"}
+    lever = host in {"jobs.lever.co", "jobs.eu.lever.co"}
+    if not (ashby or greenhouse or lever):
+        return None
+
+    seg = [part for part in u.path.split("/") if part]
+    if ((greenhouse and (len(seg) != 3 or seg[1] != "jobs"))
+            or (not greenhouse and len(seg) != 2)):
         return None
     org, job_id = seg[0], seg[-1]
     try:
         with httpx.Client(timeout=20, follow_redirects=True) as c:
-            if host.endswith("ashbyhq.com"):
+            if ashby:
                 r = c.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
                 r.raise_for_status()
                 for j in r.json().get("jobs", []):
-                    target = urlparse(str(j.get("jobUrl") or ""))
-                    path_id = target.path.rstrip("/").rsplit("/", 1)[-1]
+                    target_raw = str(j.get("jobUrl") or "")
+                    target = urlparse(target_raw)
+                    target_seg = [part for part in target.path.split("/") if part]
+                    if target_raw and (target.scheme != "https"
+                                       or target.hostname != host
+                                       or len(target_seg) != 2
+                                       or target_seg[0] != org):
+                        continue
                     if (job_id == str(j.get("id", "")) or
-                            (target.hostname == host and path_id == job_id)):
+                            (target_seg and target_seg[-1] == job_id)):
                         html = j.get("descriptionHtml")
                         result = _guarded(
                             str(j.get("title", "")),
@@ -107,37 +148,49 @@ def _from_ats(url: str) -> dict | None:
                             source_required=True)
                         result.update(source_kind="ats_html", source_url=url)
                         return result
-            elif host.endswith("greenhouse.io"):
+            elif greenhouse:
                 r = c.get(f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs/{job_id}",
                           params={"content": "true"})
                 r.raise_for_status()
                 j = r.json()
+                if not isinstance(j, dict) or (
+                        j.get("id") is not None and str(j["id"]) != job_id):
+                    return None
                 html = j.get("content")
                 result = _guarded(str(j.get("title", "")), str(html or ""),
                                   html_variants=[html] if html else [],
                                   source_required=True)
                 result.update(source_kind="ats_html", source_url=url)
                 return result
-            elif host.endswith("lever.co"):
-                api_host = "api.eu.lever.co" if host.endswith("eu.lever.co") else "api.lever.co"
+            elif lever:
+                api_host = "api.eu.lever.co" if host == "jobs.eu.lever.co" else "api.lever.co"
                 r = c.get(f"https://{api_host}/v0/postings/{org}/{job_id}")
                 r.raise_for_status()
                 j = r.json()
+                hosted = str(j.get("hostedUrl") or "")
+                hosted_parts = urlparse(hosted)
+                if ((j.get("id") is not None and str(j["id"]) != job_id)
+                        or (hosted and (
+                            hosted_parts.scheme != "https"
+                            or hosted_parts.hostname != host
+                            or hosted_parts.path.rstrip("/") != f"/{org}/{job_id}"))):
+                    return None
                 html = j.get("description")
                 variants = [html] if html else []
-                # Lever sometimes exposes additional HTML fragments in lists.
+                # List fragments remain diagnostic, but cannot substitute for
+                # Lever's primary description HTML as source completeness proof.
                 for section in j.get("lists") or []:
                     if isinstance(section, dict) and section.get("content"):
                         variants.append(section["content"])
                 result = _guarded(str(j.get("text", "")),
                                   str(j.get("descriptionPlain") or html or ""),
-                                  html_variants=variants, source_required=True)
+                                  html_variants=variants, source_required=True,
+                                  source_complete=bool(html))
                 result.update(source_kind="ats_html", source_url=url)
                 return result
     except Exception as exc:  # noqa: BLE001 — fail closed to other readers
         log.debug("board API miss for %s: %s", url, exc)
     return None
-
 
 def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
     """Guarded title, text, posting_guard and provenance for a posting."""
@@ -148,11 +201,18 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
         return ats
     from discovery.resolver import BROWSER_HEADERS
 
-    html = _get(url, BROWSER_HEADERS)
-    if html is None:
-        html = _get(url, {})
-    if html is None:
-        seen = _from_chrome(url, kind)
+    html_read = _get(url, BROWSER_HEADERS)
+    if html_read is None:
+        html_read = _get(url, {})
+    if html_read is None:
+        try:
+            seen = _from_chrome(url, kind)
+        except PostingReadUnavailable:
+            # A newly flagged short ATS read must not be dropped just
+            # because the slower fallback failed to fetch a longer JD.
+            if ats:
+                return ats
+            raise
         if seen is None:
             return ats or _guarded("", "", source_required=True)
         if ats:
@@ -160,31 +220,41 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
             seen.update(merged)
         return seen
 
+    # _get supplies the effective URL after redirects. Legacy synthetic
+    # fetch stubs returning only HTML represent an exact URL response.
+    html, effective_url = (html_read if isinstance(html_read, tuple)
+                           else (html_read, url))
+    same_source = _same_posting_url(url, effective_url)
     raw_title = (m.group(1).strip() if (m := _TITLE_RX.search(html)) else "")
     h1 = _text(m.group(1)) if (m := _H1_RX.search(html)) else ""
     title = h1 or _SPLIT_RX.split(_text(raw_title))[0].strip()
-    hit = _guarded(title, html, html_variants=[html], source_required=True)
-    # Unlike a browser/plain fallback, this was inspected directly as HTTP
-    # source HTML for the requested posting.
-    hit.update(source_kind="http_html", source_url=url)
+    hit = _guarded(title, html, html_variants=[html], source_required=True,
+                   source_complete=same_source)
+    # A redirect to a different posting is not original-HTML evidence even
+    # when that page returns HTTP 200 and its visible text looks clean.
+    hit.update(source_kind="http_html", source_url=effective_url)
     if len(hit["text"]) < 400:
-        seen = _from_chrome(url, kind)
+        try:
+            seen = _from_chrome(url, kind)
+        except PostingReadUnavailable:
+            seen = None
         if seen and len(seen.get("text", "")) > len(hit["text"]):
             combined = pg.merge(seen["text"], seen["posting_guard"],
                                 hit["posting_guard"])
             seen.update(combined)
-            hit = {**seen, "source_kind": "http_html", "source_url": url}
+            hit = {**seen, "source_kind": "http_html", "source_url": effective_url}
     if ats:
         complete_ats = bool(ats["posting_guard"].get("source_verified"))
-        combined = pg.merge(hit["text"], hit["posting_guard"], ats["posting_guard"],
-                            source_witness=complete_ats)
+        # Never substitute another redirected page's JD for an ATS posting.
+        selected_text = hit["text"] if same_source else ats["text"]
+        combined = pg.merge(selected_text, hit["posting_guard"],
+                            ats["posting_guard"], source_witness=complete_ats)
         hit.update(combined)
         if complete_ats and ats.get("source_url") == url:
             hit.update(source_kind="ats_html", source_url=url)
     return hit
 
-
-def _get(url: str, headers: dict) -> str | None:
+def _get(url: str, headers: dict) -> tuple[str, str] | None:
     """The page, or None when the server refused or the request failed.
 
     A non-2xx response used to be returned as if it were the posting. Meta's
@@ -201,7 +271,7 @@ def _get(url: str, headers: dict) -> str | None:
     if not 200 <= r.status_code < 300:
         log.warning("JD fetch refused for %s: HTTP %s", url, r.status_code)
         return None
-    return r.text
+    return r.text, str(r.url)
 
 
 def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",

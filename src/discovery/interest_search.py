@@ -257,7 +257,8 @@ def _verify_lead(row: dict) -> dict | None:
                                if isinstance(part, dict) and part.get("content"))
                 guarded = _guarded(str(title), str(job.get("descriptionPlain") or
                                                     job.get("description") or ""),
-                                   html_variants=sources, source_required=True)
+                                   html_variants=sources, source_required=True,
+                                   source_complete=bool(job.get("description")))
             else:
                 return row
         if title and len(guarded["text"]) >= 400:

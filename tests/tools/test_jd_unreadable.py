@@ -223,3 +223,98 @@ def test_single_browser_reader_whitespace_policy_binds_its_guard(
     assert not pg.valid(meta["text"] + " ", meta["posting_guard"])
     assert jd.fetch_jd(url) == expected
     assert calls == ["description", "description"]
+
+def test_lever_list_fragment_never_certifies_missing_primary_description(monkeypatch):
+    url = "https://jobs.lever.co/example-co/job-1"
+    payload = {
+        "id": "job-1", "text": "Test Engineer",
+        "descriptionPlain": "Build reliable software and useful products. " * 25,
+        "lists": [{"content": "<p>Work with a product team.</p>"}],
+    }
+    monkeypatch.setattr(httpx, "Client", _patched(
+        lambda req: httpx.Response(200, json=payload)))
+    from tools import posting_guard as pg, jd
+
+    missing = fetch_jd_meta(url)
+    assert missing["posting_guard"]["status"] == "unchecked"
+    assert missing["posting_guard"]["source_verified"] is False
+    assert "source_html_unavailable" in missing["posting_guard"]["reasons"]
+    assert not jd.matched_source_witness({"jd_url": url}, missing)
+
+    payload["lists"][0]["content"] = (
+        '<p>Useful work.</p><a hidden href="https://evil.example/">Covert link</a>')
+    flagged = fetch_jd_meta(url)
+    assert flagged["posting_guard"]["status"] == "flagged"
+    assert flagged["posting_guard"]["source_verified"] is False
+    assert {"source_html_unavailable", "hidden_link"} <= set(
+        flagged["posting_guard"]["reasons"])
+    assert pg.valid(flagged["text"], flagged["posting_guard"])
+
+    payload["description"] = "<p>Build reliable software.</p>"
+    complete = fetch_jd_meta(url)
+    assert complete["posting_guard"]["source_verified"] is True
+    assert "source_html_unavailable" not in complete["posting_guard"]["reasons"]
+    assert "hidden_link" in complete["posting_guard"]["reasons"]
+
+
+def test_ats_lookalike_hostname_and_wrong_board_identity_cannot_certify(monkeypatch):
+    from tools import jd
+
+    monkeypatch.setattr(jd, "_get", lambda *args: None)
+    monkeypatch.setattr(jd, "_from_chrome", lambda *args: None)
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: pytest.fail(
+        "A lookalike host must not invoke an official ATS API"))
+    lookalike = "https://fakeashbyhq.com/example-co/job-1"
+    got = fetch_jd_meta(lookalike)
+    assert got["posting_guard"]["status"] == "unchecked"
+    assert got["posting_guard"]["source_verified"] is False
+
+    payload = {"jobs": [{
+        "id": "job-1", "title": "Test Engineer",
+        "jobUrl": "https://jobs.ashbyhq.com/foreign-co/job-1",
+        "descriptionPlain": "Build harmless tools. " * 30,
+        "descriptionHtml": "<p>Build harmless tools.</p>",
+    }]}
+    monkeypatch.setattr(httpx, "Client", _patched(
+        lambda req: httpx.Response(200, json=payload)))
+    real = "https://jobs.ashbyhq.com/example-co/job-1"
+    wrong = fetch_jd_meta(real)
+    assert wrong["posting_guard"]["status"] == "unchecked"
+    assert wrong["posting_guard"]["source_verified"] is False
+
+
+@pytest.mark.parametrize(("redirect", "witness"), [
+    ("https://careers.example.test/jobs/other", False),
+    ("https://other.example.test/jobs/123", False),
+    ("https://careers.example.test/jobs/123/", True),
+])
+def test_http_source_witness_checks_effective_redirect_identity(
+    monkeypatch, redirect, witness,
+):
+    from tools import jd, posting_guard as pg
+
+    url = "https://careers.example.test/jobs/123"
+    html = "<html><body><h1>Engineer</h1><p>" + (
+        "Build secure and useful product infrastructure. " * 20) + "</p></body></html>"
+    visited = []
+
+    def handler(request):
+        visited.append(str(request.url))
+        if str(request.url) == url:
+            return httpx.Response(302, headers={"Location": redirect})
+        assert str(request.url) == redirect
+        return httpx.Response(200, text=html)
+
+    monkeypatch.setattr(httpx, "Client", _patched(handler))
+    monkeypatch.setattr(jd, "_from_ats", lambda _: None)
+    monkeypatch.setattr(jd, "_from_chrome", lambda *args: pytest.fail(
+        "A long HTTP fixture must not enter a browser"))
+    observed = fetch_jd_meta(url)
+    assert visited == [url, redirect]
+    assert observed["source_url"] == redirect
+    assert observed["posting_guard"]["source_verified"] is witness
+    assert observed["posting_guard"]["status"] == (
+        "clean" if witness else "unchecked")
+    assert jd.matched_source_witness(
+        {"jd_url": url, "discovery_source": "crawler"}, observed) is witness
+    assert pg.valid(observed["text"], observed["posting_guard"])

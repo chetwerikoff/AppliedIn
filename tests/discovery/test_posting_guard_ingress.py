@@ -97,3 +97,60 @@ def test_directory_scanner_is_unchecked_even_if_untrusted_payload_forges_clean()
     }, "example-co", "ashby", directory_event=True)
     assert row["posting_guard"]["status"] == "unchecked"
     assert "source_html_unavailable" in row["posting_guard"]["reasons"]
+
+@pytest.mark.parametrize(("fragment", "status", "reason"), [
+    ("<p>Support technical teams.</p>", "unchecked", None),
+    ('<a hidden href="https://evil.example/">Covert</a>', "flagged", "hidden_link"),
+])
+def test_lever_partial_primary_html_stays_unreviewed_through_first_write_and_entry(
+    monkeypatch, fragment, status, reason,
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    import fakeredis
+
+    from core.models import JobRecord, Status
+    from core.storage.local import RedisTracking
+    from tools import browser_apply, posting_guard as pg
+
+    url = "https://jobs.lever.co/example-co/job-1"
+    _client(monkeypatch, {
+        "id": "job-1", "text": "Test Engineer", "descriptionPlain": LONG,
+        "lists": [{"content": fragment}],
+    })
+    verified = _verify_lead({"url": url, "title": "Search snippet"})
+    assert verified["verification"] == "verified"  # ATS hit, not HTML safety
+    assert verified["posting_guard"]["status"] == status
+    assert verified["posting_guard"]["source_verified"] is False
+    assert "source_html_unavailable" in verified["posting_guard"]["reasons"]
+    if reason:
+        assert reason in verified["posting_guard"]["reasons"]
+
+    board = normalize(verified, "example-co", "web_search")
+    assert board["posting_guard"]["status"] == status
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    assert tracking.put_new(JobRecord(
+        company="example-co", job_id="job-1", jd_url=url,
+        title=board["title"], jd_text=board["description"],
+        posting_guard=board["posting_guard"], discovery_source="career_ops",
+        ats="lever",
+    ))
+    pk = "example-co#job-1"
+    row = tracking.get_current(pk)
+    assert pg.valid(row["jd_text"], row["posting_guard"])
+    assert row["posting_guard"]["status"] == status
+    assert not pg.authorised(row)
+
+    # A stale queued claim cannot mint approval; browser runtime is never entered.
+    tracking.set_status(pk, Status.SUBMITTING)
+    monkeypatch.setattr("core.stores.make_stores",
+                        lambda: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr("tools.browser_runtime.available", lambda: (True, ""))
+    async def forbidden_browser(*args, **kwargs):
+        pytest.fail("An unchecked/flagged Lever source must not enter the browser")
+    monkeypatch.setattr("tools.browser_runtime.apply", forbidden_browser)
+    outcome = asyncio.run(browser_apply.apply(
+        url, "example-co", {}, "synthetic", pk=pk, jd_text=row["jd_text"]))
+    assert outcome["status"] == "gate"
+    assert outcome["reason"] == "posting_guard_review_required"

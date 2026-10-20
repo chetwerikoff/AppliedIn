@@ -216,8 +216,8 @@ def tenant_pin_row_allowed(row: dict | None, pk: str, board: str) -> bool:
     if (any(reason not in (*tenant_reasons, None, "") for reason in reasons)
             or any(row.get(field) not in (None, "", False, 0)
                    for field in ("gate_pending", "gate_call_id", "gate_source"))
-            or (row.get("apply_requested_at")
-                and not any(reason in tenant_reasons for reason in reasons))
+            or (bool(row.get("apply_requested_at"))
+                != any(reason in tenant_reasons for reason in reasons))
             or (row.get("status") in ("needs_human", "failed")
                 and not row.get("apply_requested_at"))):
         return False

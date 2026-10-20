@@ -4877,40 +4877,25 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise Gate('Unproven application navigation may commit; inspect it yourself.')
                     elif verb == 'submit':
                         target = control(page, action, 'decision-submit')
-                        structural = bool(_formless_root(page))
-                        if not ((_structural_submit(page, target, provenance) if structural else
-                                 is_submission(target) and native_submit(target))):
-                            raise Gate('A proven exact structural submit control is required before clicking.'
-                                       if structural else 'A proven native submit control is required before clicking.')
-                        verify_dispatch()
-                        if provenance is not None:
-                            page, target = await _fresh_native_receiver(
-                                session, page, action, target, provenance,
-                                fixture_context=ctx)
-                        elif getattr(session, '_closed_admissions', None):
-                            # Direct routes still need current C3 parity for admitted widgets.
-                            page, _ = await _observe_controls(session, page)
-                            target = control(page, action, 'submit-reobserve')
-                        check_form_destination(page, target, *trusted_origins,
-                                               provenance=provenance)
-                        check_form(page, filled, uploaded, Path(resume_path).name, history)
-                        verify_history(history, page)
+                        if not (is_submission(target) or native_submit(target)):
+                            raise Gate('Submit requires a current application-commit control.')
                         before = page
-                        # The independent hold precedes IPC; only a possible click
-                        # sets the process-local exception classification.
-                        step['last_button'] = target['label']
-                        hold_dispatch(step)
-                        check_commit()
-                        if structural:
-                            # Immutable identity includes the independently verified values
-                            # and root-evidence file lists, not just the structural edges.
-                            session.submit_authorized = _page_identity(page)
-                            session.on_committing_click = mark_click_started
-                        elif not (isinstance(session, _EntrySession)
-                                  and isinstance(provenance, ApplicationEntryProvenance)
-                                  and provenance.ats == 'ashby'):
-                            submitted = True
-                        await session.call('click', target['selector'])
+                        step['last_button'] = target.get('label', '')
+                        if ctx is not None:
+                            # The offline facade has a fake raw producer, so its
+                            # authoritative verdict is invoked directly here.
+                            offline_guard = ApplicationIPCController(
+                                pk, company, url, resume_path, facts, filled, history,
+                                step, mark_click_started, fixture_context=ctx)
+                            offline_guard.upload_completed = uploaded
+                            offline_guard.upload_identity = offline_guard._row_pdf()
+                            await offline_guard.authorize_final_submit(session, page, target)
+                            mark_click_started()
+                            await session.call('click', target['selector'])
+                        else:
+                            # The real raw producer independently reads, validates,
+                            # holds and authorizes this exact click. No early hold.
+                            await _effect_call(session, 'click', target['selector'])
                         for _ in range(30):
                             await asyncio.sleep(1)
                             after = await session.page()
@@ -4927,33 +4912,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'step': context['step']}
                     else:
                         target = control(page, action, 'decision-action')
-                        if verb == 'click' and _NEXT.match(target['label']):
-                            if not native_submit(target):
-                                raise Gate('A JS-backed Continue has no proven native destination.')
+                        if verb == 'click':
+                            # A pre-private approved-host Apply/Continue may be
+                            # reversible; possible commits use the same final
+                            # producer guard as Submit. Never pre-authorize a
+                            # browser effect from the displayed button text.
                             verify_dispatch()
-                            if provenance is not None:
-                                page, target = await _fresh_native_receiver(
-                                    session, page, action, target, provenance,
-                                    fixture_context=ctx)
-                            elif getattr(session, '_closed_admissions', None):
-                                page, _ = await _observe_controls(session, page)
-                                target = control(page, action, 'click-reobserve')
-                            check_form_destination(page, target, *trusted_origins,
-                                                   provenance=provenance)
-                            check_form(page, filled, uploaded, Path(resume_path).name, history)
-                            verify_history(history, page)
+                            if ctx is not None:
+                                raise Gate('An offline synthetic click needs the code-owned IPC verdict.')
                             before = page
-                            step['last_button'] = target['label']
-                            hold_dispatch(step)
-                        elif verb == 'click':
-                            raise Gate('Unproven JS-backed or one-click navigation requires a human gate.')
                         elif verb in {'fill', 'select', 'choose', 'combobox', 'upload'}:
                             verify_dispatch()
                         result = await execute(
                             session, page, action, facts=facts, filled=filled,
                             resume_path=resume_path, company=company, jd_text=jd_text,
                             resume_tex=resume_tex, github=github, pk=pk,
-                            allow_click=verb == 'click' and bool(_NEXT.match(target['label'])),
+                            allow_click=verb == 'click',
                             job_url=url, on_committing_click=mark_click_started,
                             provenance=provenance,
                             **({'fixture_context': ctx} if ctx else {}))

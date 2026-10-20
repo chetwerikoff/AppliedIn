@@ -217,6 +217,8 @@ class RedisTracking(AbstractTracking):
         WATCH catches intervening writes before the transaction executes; a
         same-status reader generation mismatch is a conflict, not contention.
         """
+        if set(updates) & {"jd_text", "posting_guard", "reviewed_guard_generation"}:
+            raise ValueError("Use update_posting_guard for bound JD/guard changes")
         fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
                  "jd_text", "jd_read_prepare_only")
         if set(expected_reader) - set(fixed):

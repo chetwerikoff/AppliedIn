@@ -75,7 +75,10 @@ def _from_ats(url: str) -> dict | None:
                 r = c.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
                 r.raise_for_status()
                 for j in r.json().get("jobs", []):
-                    if job_id in str(j.get("jobUrl", "")) or job_id == str(j.get("id", "")):
+                    target = urlparse(str(j.get("jobUrl") or ""))
+                    path_id = target.path.rstrip("/").rsplit("/", 1)[-1]
+                    if (job_id == str(j.get("id", "")) or
+                            (target.hostname == host and path_id == job_id)):
                         html = j.get("descriptionHtml")
                         result = _guarded(
                             str(j.get("title", "")),

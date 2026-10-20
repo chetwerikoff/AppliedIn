@@ -613,7 +613,11 @@ async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
                       and bool(guard.get("source_verified")))
     use_remote = bool(rtext) and (
         len(rtext) > len(local["text"]) or (need_source and source_witness))
-    selected = rtext if use_remote else local["text"]
+    # Canonical deferred reads of an already guarded feed summary retain the
+    # normalized metadata contract. A legacy/unwitnessed source keeps harmless
+    # terminal spaces and remains unchecked until source evidence is verified.
+    # Merge rebinds the generation to the selected text and all source findings.
+    selected = (rtext.strip() if not need_source else rtext) if use_remote else local["text"]
     combined = pg.merge(selected, guard, old, source_witness=source_witness)
     return {**combined, "source_kind": "ats_html" if source_witness else "",
             "source_url": url if source_witness else ""}
@@ -782,7 +786,8 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
 
                 result = got[url]
                 meta = (result if isinstance(result, dict) else
-                        pg.analyze(str(result), source_required=True))
+                        pg.analyze(str(result), source_required=True,
+                                   strip_trailing=True))
                 updated = _commit_posting_meta(pk, observed, meta, stores)
                 if updated is None:
                     continue

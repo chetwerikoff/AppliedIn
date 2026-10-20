@@ -35,7 +35,7 @@ def test_old_same_seed_session_rejected_on_missing_or_old_guard_generation(store
     row = stores.tracking.get_current(PK)
     state = {"jd_text": row["jd_text"],
              "posting_guard_generation": row["posting_guard"]["generation"]}
-    assert not run._stale_posting(SimpleNamespace(state=state), row, TEXT)
+    assert not run._stale_posting(SimpleNamespace(state=state), row, row["jd_text"])
     for legacy in (
         {"jd_text": TEXT},
         {"jd_text": TEXT, "posting_guard_generation": "old"},

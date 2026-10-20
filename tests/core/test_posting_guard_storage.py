@@ -33,7 +33,7 @@ def new_job(*, guard=None):
 def test_first_write_directory_unchecked_even_for_long_plain_description(tracking):
     assert tracking.put_new(new_job())
     saved = tracking.get_current("example-co#role-1")
-    assert saved["jd_text"] == BODY
+    assert saved["jd_text"] == pg.analyze(BODY)["text"]
     assert saved["posting_guard"]["status"] == "unchecked"
     assert "source_html_unavailable" in saved["posting_guard"]["reasons"]
     assert not pg.authorised(saved)

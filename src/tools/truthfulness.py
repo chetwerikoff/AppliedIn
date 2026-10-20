@@ -244,11 +244,11 @@ class TitleOption:
     end: int
 
 
-def _title_slot(line: str) -> _TitleSlot | None:
-    """Parse only a balanced, single-line, exact supported role call.
+def _structural_title_slot(line: str) -> _TitleSlot | None:
+    """Parse a balanced, single-line role call for its non-title identity.
 
-    The title argument must have no nested TeX groups; other arguments may
-    retain their seed markup but are never available for substitution.
+    Even a formatted/ineligible title reserves its employer/date signature.
+    Other arguments may retain seed markup but cannot be substituted.
     """
     call = _COMMAND.match(line)
     if not call:
@@ -284,9 +284,6 @@ def _title_slot(line: str) -> _TitleSlot | None:
         return None
     start, end = args[title_arg]
     title = line[start:end]
-    if (not title.strip() or "{" in title or "}" in title or "%" in title
-            or "\\" in title.replace(r"\&", "")):
-        return None
     employer_start, employer_end = args[employer_arg]
     employer = line[employer_start:employer_end].strip()
     return _TitleSlot(
@@ -306,15 +303,36 @@ def eligible_title_options(
     """Return only approved values attached to exact, unique *seed* anchors.
 
     Two jobs at one employer may each independently use company-scoped titles
-    when their non-title seed signatures distinguish them. Same-employer
-    duplicates whose signatures differ only in title fail closed.
+    when their non-title seed signatures distinguish them. A formatted title
+    is not eligible, but its active anchor still counts against uniqueness.
     """
     anchors = used_macros(base_latex)["anchors"]
-    slots = [_title_slot(line) for _, line in active_calls(base_latex, anchors)]
-    signatures = Counter(s.signature for s in slots if s is not None)
+    calls = active_calls(base_latex, anchors)
+    slots = [_structural_title_slot(line) for _, line in calls]
+    signatures = Counter(slot.signature for slot in slots if slot is not None)
+
+    # When a known employment macro has an unsupported shape, it might be a
+    # same-employer sibling. Refuse that employer's variants (or all variants
+    # if even the employer cannot be read) rather than guessing uniqueness.
+    uncertain_employers = set()
+    uncertain_all = False
+    for (macro, line), slot in zip(calls, slots):
+        if slot is not None or macro not in _TITLE_LAYOUTS:
+            continue
+        prefix = re.match(r"\\[A-Za-z]+\s*\{([^{}]*)\}", line)
+        if prefix:
+            uncertain_employers.add(prefix.group(1).strip())
+        else:
+            uncertain_all = True
+
     options = []
     for slot in slots:
-        if slot is None or signatures[slot.signature] != 1:
+        if (slot is None or signatures[slot.signature] != 1 or uncertain_all
+                or slot.employer in uncertain_employers):
+            continue
+        title = slot.title
+        if (not title.strip() or "{" in title or "}" in title or "%" in title
+                or "\\" in title.replace(r"\&", "")):
             continue
         approved = tuple(approved_titles.get(slot.employer, ()))
         if approved:
@@ -322,6 +340,7 @@ def eligible_title_options(
                 slot.line, slot.title, approved, slot.start, slot.end,
             ))
     return tuple(options)
+
 
 
 def validate(
@@ -337,7 +356,9 @@ def validate(
     parsed witness, and admitting a title edit cannot add another anchor.
     """
     anchors = used_macros(base_latex)["anchors"]
-    new_calls = active_calls(tailored_latex, anchors)
+    # Keep the seed-selected legacy missing-facts guard, but inspect every
+    # supported candidate anchor so an admitted title cannot hide a new type.
+    new_calls = active_calls(tailored_latex, MACROS["anchors"])
     remaining = Counter(_norm(line) for _, line in new_calls)
     missing = []
     for _, line in active_calls(base_latex, anchors):

@@ -4,6 +4,8 @@ All content is synthetic. Tests call the actual normalizer/Counter guard, not
 a new parser or a mocked copy of the validation rule.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.role_titles import BASENAME, load_approved_titles
@@ -128,3 +130,84 @@ def test_supported_four_argument_heading_requires_same_non_title_fields(options)
 def test_inert_seed_role_is_not_an_eligible_witness(options):
     seed = doc(r"% \role{example-co}{Role A}{2022}", NEIGHBOR)
     assert eligible_title_options(seed, options) == ()
+
+
+@pytest.fixture
+def save_attempt(monkeypatch, tmp_path, options):
+    """Exercise the real save seam without owner data or external effects."""
+    from agent import graph
+    from core import profiles, stores
+    from tools import render
+
+    effects = {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+
+    class FakeArtifacts:
+        def put(self, *args, **kwargs):
+            effects["artifact"] += 1
+            return "synthetic-replacement"
+
+    class FakeTracking:
+        def get(self, pk):
+            return {"status": "tailored", "resume_s3_key": "existing.pdf"}
+
+        def set_status(self, *args, **kwargs):
+            effects["tracking"] += 1
+
+    def make_stores():
+        effects["make_stores"] += 1
+        return SimpleNamespace(artifacts=FakeArtifacts(), tracking=FakeTracking())
+
+    def render_pdf(latex):
+        effects["render"] += 1
+        return b"%PDF-synthetic"
+
+    # The options fixture writes only a temporary, synthetic YAML file.
+    monkeypatch.setattr(graph, "get_settings",
+                        lambda: SimpleNamespace(local_dir=str(tmp_path)))
+    monkeypatch.setattr(stores, "make_stores", make_stores)
+    monkeypatch.setattr(render, "render_pdf", render_pdf)
+    monkeypatch.setattr(profiles, "resolve_for", lambda row: object())
+    monkeypatch.setattr(profiles, "apply_to_latex", lambda latex, profile: latex)
+
+    def attempt(seed, changed):
+        ctx = SimpleNamespace(state={"base_latex": seed, "pk": "synthetic"})
+        result = graph.save_tailored_resume(changed, ctx)
+        return result, ctx.state, dict(effects)
+
+    return attempt
+
+
+@pytest.mark.parametrize("seed_anchor,extra_anchor", [
+    (r"\role{example-co}{Role A}{2022}",
+     r"\resumeSubheadingSingle{Synthetic Project}{2024}"),
+    (r"\role{example-co}{Role A}{2022}",
+     r"\resumeSubheading{other-co}{Remote}{Invented Role}{2025}"),
+    (r"\resumeSubheading{example-co}{Remote}{Role A}{2022}",
+     r"\role{other-co}{Invented Role}{2025}"),
+])
+def test_save_rejects_new_supported_anchor_type_during_title_variant(
+    save_attempt, seed_anchor, extra_anchor,
+):
+    seed = doc(seed_anchor)
+    changed = doc(seed_anchor.replace("Role A", "Role B"), extra_anchor)
+    result, state, effects = save_attempt(seed, changed)
+
+    assert result["ok"] is False
+    assert result["missing_facts"]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert state == {"base_latex": seed, "pk": "synthetic"}
+
+
+def test_save_rejects_formatted_same_employer_sibling_with_duplicate_signature(
+    save_attempt,
+):
+    plain = r"\role{example-co}{Role A}{2022}"
+    formatted = r"\role{example-co}{\textbf{Role Z}}{2022}"
+    seed = doc(plain, formatted)
+    changed = doc(plain.replace("Role A", "Role B"), formatted)
+    result, state, effects = save_attempt(seed, changed)
+
+    assert result["ok"] is False
+    assert result["missing_facts"] == [plain]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert state == {"base_latex": seed, "pk": "synthetic"}

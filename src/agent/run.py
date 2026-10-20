@@ -731,7 +731,8 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
         return 0
     log.info("reading %d browser-only posting(s) before the sweep", len(need))
     try:
-        got, gone = _jd.read_postings([r["jd_url"] for r in need], with_gone=True)
+        got, gone = _jd.read_postings([r["jd_url"] for r in need], with_gone=True,
+                                      with_meta=True)
     except _jd.PostingReadUnavailable as exc:
         log.warning("browser prefetch deferred: %s", exc)
         return 0
@@ -748,7 +749,16 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
                 patch = {"status": Status.JOB_GONE,
                          "fail_reason": "The posting has been removed."}
             else:
-                patch = {"jd_text": got[url], "jd_read_attempts": 0,
+                from tools import posting_guard as pg
+
+                result = got[url]
+                meta = (result if isinstance(result, dict) else
+                        pg.analyze(str(result), source_required=True))
+                updated = _commit_posting_meta(pk, observed, meta, stores)
+                if updated is None:
+                    continue
+                observed = updated
+                patch = {"jd_read_attempts": 0,
                          "jd_read_retry_at": None, "jd_read_error": ""}
             committed, _ = _reader_patch(pk, observed, stores, patch)
         except Exception as exc:

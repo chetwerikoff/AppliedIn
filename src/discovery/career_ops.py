@@ -175,14 +175,32 @@ def canonical(url: str) -> str:
     return urlunsplit(("https", host, p.path.rstrip("/"), urlencode(query), ""))
 
 
-def normalize(raw: dict, company: str, provider: str) -> dict | None:
+def normalize(raw: dict, company: str, provider: str, *,
+              directory_event: bool = False) -> dict | None:
     url, title = str(raw.get("url") or ""), str(raw.get("title") or "").strip()
     if urlsplit(url).scheme != "https" or not urlsplit(url).hostname or not title:
         return None
     url = canonical(url)
     from discovery.adapters.ashby import _iso
 
+    from tools import posting_guard as pg
+
     identity = hashlib.sha256(url.encode()).hexdigest()[:24]
+    description = (
+        "" if provider == "oraclecloud"
+        or (provider == "web_search" and raw.get("verification") != "verified")
+        else str(raw.get("description") or "")[:100000]
+    )
+    incoming = raw.get("posting_guard")
+    if pg.valid(description, incoming):
+        guarded = {"text": description, "posting_guard": incoming}
+    else:
+        guarded = pg.analyze(description, source_required=directory_event)
+        if not directory_event:
+            # No original HTML in a feed, index hit or Cosign snippet is a
+            # source-inspection witness, even when the text exceeds 400 chars.
+            guarded = pg.projection(guarded["text"], guarded["posting_guard"])
+    title = pg.analyze(title)["text"]
     return {
         "id": identity,
         "job_id": str(
@@ -196,10 +214,8 @@ def normalize(raw: dict, company: str, provider: str) -> dict | None:
         "url": url,
         "location": str(raw.get("location") or ""),
         "provider": provider,
-        "description": ""
-        if provider == "oraclecloud"
-        or (provider == "web_search" and raw.get("verification") != "verified")
-        else str(raw.get("description") or "")[:100000],
+        "description": guarded["text"],
+        "posting_guard": guarded["posting_guard"],
         "posted_at": _iso(raw.get("postedAt")),
         "first_seen": now(),
         "last_seen": now(),
@@ -324,12 +340,21 @@ def _save_results(receipts: list[dict], receipt: dict):
         with _LOCK:
             data = _read()
             for raw in result.get("jobs", []):
-                row = normalize(raw, result["company"], result["provider"])
+                row = normalize(raw, result["company"], result["provider"],
+                                directory_event=(receipt.get("kind") == "network"
+                                                 and result.get("kind") == "company"))
                 if row is None:
                     continue
                 receipt["found"] += 1
                 old = data["jobs"].get(row["id"])
                 if old:
+                    from tools import posting_guard as pg
+
+                    merged = pg.merge(
+                        row["description"], row["posting_guard"],
+                        old.get("posting_guard"),
+                        source_witness=bool(row["posting_guard"].get("source_verified")))
+                    row.update(description=merged["text"], posting_guard=merged["posting_guard"])
                     row.update(
                         {
                             k: old[k]
@@ -350,6 +375,19 @@ def _save_results(receipts: list[dict], receipt: dict):
                     receipt["added"] += 1
                 if row["url"] in tracked:
                     row.update(state="pipeline", pk=tracked[row["url"]])
+                    # New source findings on an already queued job invalidate
+                    # any old review without another enqueue or status reopen.
+                    try:
+                        current = stores.tracking.get_current(row["pk"])
+                        if (current and current.get("jd_url") == row["url"]
+                                and current.get("company") == row["company"]):
+                            stores.tracking.update_posting_guard(
+                                row["pk"], current,
+                                {"text": row["description"],
+                                 "posting_guard": row["posting_guard"]},
+                                source_witness=bool(row["posting_guard"].get("source_verified")))
+                    except Exception:
+                        log.exception("could not persist rescan guard evidence")
                 elif row["url"] in handled:
                     row["state"] = "handled"
                 data["jobs"][row["id"]] = row
@@ -535,6 +573,7 @@ def prepare(ids: list[str], stores=None, *, apply_requested: bool = False) -> di
                 title=row["title"],
                 jd_url=url,
                 jd_text=row["description"],
+                posting_guard=row.get("posting_guard") or {},
                 location=row["location"],
                 # Cosign is an index, not an ATS; the posting URL names the real one.
                 ats=detect_ats(url) if row["provider"] == "cosign" else row["provider"],
@@ -610,6 +649,7 @@ def auto_prepare(stores, since: str, companies: set[str]) -> int:
                 title=r["title"],
                 jd_url=r["url"],
                 jd_text=r["description"],
+                posting_guard=r.get("posting_guard") or {},
                 location=r["location"],
             )
             for r in candidates

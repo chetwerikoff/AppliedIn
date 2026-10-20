@@ -4264,6 +4264,333 @@ def _fields_report(history: list, filled: dict) -> list[dict]:
             for r in history if r.get('selector') in filled]
 
 
+
+def _preparation_origin(href: str, tracked_url: str) -> bool:
+    """Code-owned origin policy for reversible preparation, never tenant proof."""
+    if not isinstance(href, str) or not isinstance(tracked_url, str):
+        return False
+    try:
+        part = urlsplit(href)
+        if (part.scheme != 'https' or not part.hostname
+                or part.netloc != part.hostname or part.fragment
+                or any(ord(c) < 33 or c == '\\' for c in href)
+                or any(segment in {'.', '..'} for segment in part.path.split('/'))):
+            return False
+        if navigation_allowed(href, tracked_url):
+            return True
+        return part.hostname in {
+            'jobs.ashbyhq.com', 'jobs.lever.co', 'job-boards.greenhouse.io'
+        } and bool(part.path.strip('/'))
+    except (TypeError, ValueError):
+        return False
+
+
+
+# The actual BrowserSkill Session(kind='apply') delegates every effectful command
+# to this controller at the CLI producer. An unmediated Session.call() is read-only.
+# No action receipt or agent assertion can authorize the irreversible click.
+class ApplicationIPCController:
+    """One application-owned verdict, separately protecting reversible writes."""
+
+    def __init__(self, pk: str, company: str, url: str, resume_path: str,
+                 facts: dict, filled: dict, history: list, step: dict,
+                 mark_click_started, *, fixture_context=None):
+        import hashlib
+        self.pk, self.company, self.url = pk, company, url
+        self.resume_path = str(Path(resume_path).resolve()) if resume_path else ''
+        self.facts, self.filled, self.history = facts, filled, history
+        self.step, self.mark_click_started = step, mark_click_started
+        self.fixture_context = fixture_context
+        self.upload_completed = False
+        self.upload_identity = None
+        self.upload_pending = False
+        self.committed = False
+        self.expected_digest = None
+        if self.resume_path and Path(self.resume_path).is_file():
+            self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
+
+    def _ctx(self):
+        return {'fixture_context': self.fixture_context} if self.fixture_context else {}
+
+    def _row(self):
+        return _row(self.pk, fixture_context=self.fixture_context)
+
+    def _fresh_preparation(self, url: str) -> None:
+        if not _preparation_origin(url, self.url):
+            raise Gate('The page is not the tracked employer or an approved HTTPS ATS host.')
+        row = self._row()
+        if (not self.pk or row.get('pk') != self.pk
+                or row.get('company') != self.company
+                or row.get('jd_url') != self.url
+                or row.get('status') != 'submitting' or row.get('possible_submission')):
+            raise Gate('Tracked job/dispatch changed; no further private preparation is safe.')
+        if self.fixture_context is None:
+            from core.stores import make_stores
+            from tools import submit_hold
+            if submit_hold.is_held(self.pk, tracking=make_stores().tracking):
+                raise Gate('A previous possible submission is held; no repeat is safe.')
+
+    async def _page(self, session):
+        from tools.browser_skill_dom import ENTRY_PAGE, GREENHOUSE_PAGE, PAGE
+        # These are fixed application readers, not page/model-generated code.
+        host = urlsplit(self.url).hostname
+        script = (GREENHOUSE_PAGE if host == 'job-boards.greenhouse.io'
+                  else ENTRY_PAGE if host in {'jobs.ashbyhq.com', 'jobs.lever.co'}
+                  else PAGE)
+        result = await session.call('evaluate', script)
+        page = result.get('value') if isinstance(result, dict) else None
+        if not isinstance(page, dict) or not isinstance(page.get('url'), str):
+            raise Gate('Fresh application page observation is unavailable.')
+        return page
+
+    def _approved(self, page, target, value):
+        key = _key(page, target)
+        fact_key = _fact_key(self.facts, key)
+        if (fact_key is None or not value
+                or str(self.facts[fact_key]).strip() != value):
+            raise Gate('The written field lacks its exact current approved answer.')
+        exact_approval(self.pk, key, value, target=_bound_target(page, target),
+                       url=page['url'], **self._ctx())
+        guarded_value(target, value)
+
+    def _row_pdf(self):
+        import hashlib
+        if (not self.resume_path or not self.expected_digest
+                or not Path(self.resume_path).is_file()):
+            raise Gate('The row-tailored staged PDF is missing.')
+        path = Path(self.resume_path)
+        stat = path.stat()
+        if (not path.is_file() or stat.st_size == 0
+                or hashlib.sha256(path.read_bytes()).hexdigest() != self.expected_digest):
+            raise Gate('The staged row-tailored PDF bytes were replaced.')
+        row = self._row()
+        if self.fixture_context is None:
+            from agent.run import _resume_pdf_path, seed_fingerprint
+            original = _resume_pdf_path(row)
+            if (not original or not Path(original).is_file()
+                    or hashlib.sha256(Path(original).read_bytes()).hexdigest()
+                        != self.expected_digest
+                    or row.get('resume_seed') != seed_fingerprint()):
+                raise Gate('The current row PDF or base résumé seed changed; re-tailor.')
+        else:
+            if row.get('resume_seed') != self.fixture_context.seed_fingerprint():
+                raise Gate('The synthetic row PDF seed changed; re-tailor.')
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
+                stat.st_ctime_ns, self.expected_digest)
+
+    def _choice(self, page: dict, selector: str):
+        # Never infer option authority from a CSS class or an ATS/widget name.
+        for owner in page.get('controls', []):
+            if owner.get('type') != 'combobox':
+                continue
+            for option in (owner.get('combobox') or {}).get('options') or []:
+                if option.get('selector') != selector:
+                    continue
+                answer_key = _fact_key(self.facts, _key(page, owner))
+                answer = str(self.facts.get(answer_key) or '').strip()
+                if (not answer or not _same(answer, option.get('label', ''))
+                        or option.get('submit') or option.get('navigates')
+                        or option.get('safe') is not True):
+                    raise Gate('This rendered ARIA option is not the safe approved choice.')
+                self._approved(page, owner, answer)
+                return True
+        return False
+
+    @staticmethod
+    def _private_content(page: dict) -> bool:
+        # A pre-existing private autofill is private even without a writer receipt.
+        for field in page.get('controls', []):
+            if field.get('files'):
+                return True
+            if field.get('type') in {'text', 'email', 'tel', 'textarea', 'combobox',
+                                     'select', 'radio', 'checkbox'}:
+                if field.get('has_value') or field.get('checked'):
+                    return True
+                combo = field.get('combobox') or {}
+                if combo.get('selected_value') or combo.get('displayed_text'):
+                    return True
+        return False
+
+    async def before_ipc(self, session, args: tuple, kwargs: dict) -> None:
+        if not args or not isinstance(args[0], str) or self.committed:
+            raise Gate('Application IPC already committed or has no classified action.')
+        op = args[0]
+        if op == 'navigate':
+            if len(args) != 2 or kwargs:
+                raise Gate('Unknown application navigation IPC arguments.')
+            self._fresh_preparation(self.url)
+            if not _preparation_origin(args[1], self.url):
+                raise Gate('Unknown or unapproved cross-origin application navigation.')
+            return
+        if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'}:
+            raise Gate('Raw application executable or effectful IPC is forbidden.')
+        page = await self._page(session)
+        self._fresh_preparation(page['url'])
+        selector = args[1] if len(args) > 1 else None
+        targets = [item for item in page.get('controls', [])
+                   if item.get('selector') == selector and not item.get('disabled')]
+        if op == 'upload':
+            if (len(args) != 4 or args[2] != '--file'
+                    or str(Path(args[3]).resolve()) != self.resume_path
+                    or kwargs != {'timeout': 130}
+                    or len(targets) != 1 or targets[0].get('type') != 'file'
+                    or not re.search(r'resume|résumé|cv', label(targets[0]), re.I)):
+                raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
+            self.upload_identity = self._row_pdf()
+            self.upload_pending = True
+            return
+        if op in {'fill', 'select'}:
+            if (len(targets) != 1 or len(args) != 4 or args[2] != '--value'
+                    or not isinstance(args[3], str) or kwargs):
+                raise Gate('A unique approved form value receiver is required.')
+            target = targets[0]
+            if op == 'fill' and target.get('type') not in {
+                    'text', 'email', 'tel', 'textarea', 'combobox'}:
+                raise Gate('A non-text receiver cannot be filled.')
+            if op == 'select':
+                if target.get('tag') != 'select':
+                    raise Gate('A native select is required.')
+                matches = [o for o in target.get('options') or [] if o.get('value') == args[3]]
+                if len(matches) != 1:
+                    raise Gate('The selected form-own option is ambiguous.')
+                self._approved(page, target, matches[0]['label'])
+            else:
+                self._approved(page, target, args[3])
+            return
+        if op in {'press', 'focus'}:
+            # Enter/press can submit the form and is not an approved-answer
+            # writer. The generic accessible click path replaces key macros.
+            raise Gate('Keyboard or focus IPC lacks a safe application effect classification.')
+        if len(args) != 2 or kwargs:
+            raise Gate('Unknown application click IPC arguments.')
+        if not targets:
+            if self._choice(page, selector):
+                return
+            raise Gate('The clicked application control or option is not current.')
+        if len(targets) != 1:
+            raise Gate('Ambiguous application click; no IPC.')
+        target = targets[0]
+        if target.get('type') in {'radio', 'checkbox'}:
+            key = _key(page, target)
+            approved = _approved_native_choice(page, target, self.pk,
+                                               fixture_context=self.fixture_context)
+            if not approved or approved[1].get('selector') != selector:
+                raise Gate('The clicked radio/checkbox is not the exact approved answer.')
+            return
+        if target.get('type') == 'combobox':
+            key = _key(page, target)
+            answer_key = _fact_key(self.facts, key)
+            if answer_key is None:
+                raise Gate('Opening the picker requires an existing approved answer.')
+            self._approved(page, target, str(self.facts[answer_key]).strip())
+            return
+        text = target.get('label') or ''
+        known_submit = (native_submit(target) or target.get('submit') is True
+                        or bool(re.search(r'\bsubmit(?: application)?\b|send application|'
+                                          r'finish application|complete application', text, re.I)))
+        if known_submit or self._private_content(page):
+            await self.authorize_final_submit(session, page, target)
+            self.committed = True
+            self.mark_click_started()
+            return
+        # Owner-approved pre-private JS Apply/Continue may navigate on the
+        # current allowed origin, but a known native/explicit Submit never can.
+        if (not _NAVIGATION.match(text) or
+                (target.get('href') and not _preparation_origin(target['href'], self.url))
+                or target.get('formaction')):
+            raise Gate('Unclassified application click could commit; no IPC.')
+        return
+
+    async def after_ipc(self, session, args: tuple, kwargs: dict) -> None:
+        if args and args[0] == 'upload' and self.upload_pending:
+            self.upload_pending = False
+            # Same path/filename is not byte provenance; recheck inode, times
+            # and digest after CLI consumption, even on an interrupted command.
+            if self.upload_identity != self._row_pdf():
+                self.upload_completed = False
+                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.')
+            self.upload_completed = True
+
+    async def authorize_final_submit(self, session, page: dict, target: dict) -> None:
+        """The ONE full authoritative pre-Submit decision at raw click IPC."""
+        if self.committed:
+            raise Gate('A possibly committing application click cannot be repeated.')
+        from tools import posting_guard as pg
+        check_dispatch(self.pk, self.resume_path, **self._ctx())
+        row = self._row()
+        if (row.get('pk') != self.pk or row.get('company') != self.company
+                or row.get('jd_url') != self.url):
+            raise Gate('Current tracked job identity changed; no Submit.')
+        # Tenant/pin equality is checked only here, not at application entry.
+        if (row.get('ats') in {*_APPLICATION_ENTRY, 'greenhouse'}
+                or greenhouse_alias_candidate(self.url)):
+            fresh_alias = _configured_alias(self.pk, self.company, self.url,
+                                            fixture_context=self.fixture_context)
+            if not fresh_alias or not _alias_current(fresh_alias,
+                                                      fixture_context=self.fixture_context):
+                raise Gate('The current job/ATS tenant or board cannot be verified for Submit.',
+                           reason='defect_tenant')
+            if not navigation_allowed(page['url'], provenance=fresh_alias):
+                raise Gate('Final form is on a different job/ATS tenant; no Submit.')
+        elif not navigation_allowed(page['url'], self.url):
+            raise Gate('Final form is outside the tracked employer job origin.')
+        from core.ids import make_pk
+        if (not isinstance(row.get('job_id'), str) or
+                make_pk(self.company, row['job_id']) != self.pk):
+            raise Gate('Current canonical job ID changed before Submit.')
+        host, path = urlsplit(page['url']).hostname, urlsplit(page['url']).path
+        observed_id = ''
+        if host == 'jobs.ashbyhq.com':
+            match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
+            observed_id = match.group(1) if match else ''
+        elif host == 'job-boards.greenhouse.io':
+            match = re.search(r'/jobs/([0-9]+)(?:/|$)', path)
+            observed_id = match.group(1) if match else ''
+        elif host == 'jobs.lever.co':
+            match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
+            observed_id = match.group(1) if match else ''
+        if observed_id:
+            if observed_id != row['job_id']:
+                raise Gate('Final page exposes a contradictory job ID; no Submit.')
+        else:
+            # Deliberately non-unique owner-approved title fallback.
+            if (not isinstance(page.get('title'), str)
+                    or not isinstance(row.get('title'), str)
+                    or page['title'].strip() != row['title'].strip()):
+                raise Gate('Wrong or missing exact final job title/identity; inspect before Submit.')
+        if not self.upload_completed or self.upload_identity != self._row_pdf():
+            raise Gate('This row’s protected tailored PDF has not been verified.')
+        check_form(page, self.filled, True, Path(self.resume_path).name, self.history)
+        check_approvals(self.pk, self.history, page, **self._ctx())
+        # No independent or stale permission token: recheck this same invocation
+        # against a durable possible-submit hold, then validate own state.
+        self.step['last_button'] = target.get('label', '')
+        hold_possible_submission(self.pk, self.step, **self._ctx())
+        check_before_committing_click(self.pk, **self._ctx())
+        latest = self._row()
+        if (latest.get('pk') != self.pk or latest.get('company') != self.company
+                or latest.get('job_id') != row.get('job_id')
+                or latest.get('resume_seed') != row.get('resume_seed')
+                or latest.get('human_approved_answers') != row.get('human_approved_answers')
+                or latest.get('status') != 'needs_human'
+                or latest.get('gate_reason') != 'submit_uncertain'):
+            raise Gate('Current row, approval, seed or own post-hold status drifted; no Submit.')
+        if self.fixture_context is None:
+            from core.stores import make_stores
+            from core.apply_queue import ApplyQueue
+            from tools.browser_apply import _duplicate_refusal
+            tracking = make_stores().tracking
+            queue = ApplyQueue(tracking.r)
+            if (_duplicate_refusal(self.pk) or self.pk not in queue.in_flight()
+                    or self.company.strip().lower() not in queue.depth()['running']
+                    or not pg.authorised(tracking.get_current(self.pk) or {})):
+                raise Gate('Duplicate, company lease or reviewed posting generation changed.')
+        else:
+            if not self.fixture_context.is_held(self.pk):
+                raise Gate('Own submission hold vanished before IPC.')
+        if self.upload_identity != self._row_pdf():
+            raise Gate('Row PDF bytes changed before the final raw click.')
+
 async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = '',
                 jd_text: str = '', resume_tex: str = '', github: str = '',
                 resume_path: str = '', fixture_context=None) -> dict:

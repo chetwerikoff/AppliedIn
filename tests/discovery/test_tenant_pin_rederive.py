@@ -223,3 +223,35 @@ def test_protected_witness_type_drift_is_not_an_equal_original(
     assert not world.tracking.add_missing_greenhouse_pin(
         PK, "example-board", expected_row=original)
     assert world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("history", [
+    # A requestless _apply_direct browser-form gate is still browser history.
+    {"apply_requested_at": "", "status": "needs_human",
+     "gate_reason": "unknown_field", "fail_kind": "",
+     "gate_call_id": "direct", "gate_source": "applier",
+     "gate_pending": {"form_question": {"pk": PK, "label": "Synthetic question"}},
+     "fields": [{"label": "Synthetic field", "value": "synthetic"}],
+     "screenshot_s3_key": "synthetic/example-screen.png"},
+    {"apply_requested_at": "", "status": "failed",
+     "gate_reason": "unknown_field", "fail_kind": ""},
+    # A matching pre-browser tenant denial does not cancel an earlier browser
+    # artifact, even if the later request, approval and attempts are unchanged.
+    {"fields": [{"label": "Synthetic field", "value": "synthetic"}]},
+    {"screenshot_s3_key": "synthetic/example-screen.png"},
+    {"fields": []},  # Presence is not proof of an untouched browser.
+    {"screenshot_s3_key": ""},
+    # Neither a non-tenant reason nor a form gate depends on a request timestamp.
+    {"apply_requested_at": "", "gate_reason": "unknown_field", "fail_kind": ""},
+    {"apply_requested_at": "", "gate_pending": {"question": "Synthetic form gate"}},
+    {"apply_requested_at": "", "gate_call_id": "direct", "gate_source": "applier"},
+    {"apply_requested_at": "", "status": "failed", "gate_reason": "",
+     "fail_kind": ""},
+])
+def test_requestless_or_browser_touched_history_is_never_pinned(world, history):
+    """#6301207727 / #6301512360: no historical browser state may be pinned."""
+    world.tracking.row.update(deepcopy(history))
+    original = deepcopy(world.tracking.row)
+    assert _once(world)["status"] == "unsafe_history"
+    assert _once(world, commit=True, operator_authorized=True)["status"] == "unsafe_history"
+    assert world.tracking.row == original and world.tracking.writes == 0

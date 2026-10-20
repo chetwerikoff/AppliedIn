@@ -201,3 +201,25 @@ def test_provider_identity_and_url_drift_fail_without_writes(world):
     assert world.tracking.writes == 0
 
 
+@pytest.mark.parametrize("field,prior,changed", [
+    ("attempts", 0, False),
+    ("approved", False, 0),
+    ("jd_read_revision", 1, True),
+])
+def test_protected_witness_type_drift_is_not_an_equal_original(
+    world, field, prior, changed,
+):
+    """JSON boolean/number drift must not pass the exact original-row CAS.
+
+    Python considers True == 1 and False == 0, but these are distinct
+    persisted witness values, including for request/approval/reader history.
+    """
+    original = _row(**{field: prior})
+    world.tracking.row = deepcopy(original)
+    world.tracking.row[field] = changed
+    assert prior == changed
+    assert type(prior) is not type(changed)
+    assert not tenant_pin_same_witness(world.tracking.row, original)
+    assert not world.tracking.add_missing_greenhouse_pin(
+        PK, "example-board", expected_row=original)
+    assert world.tracking.writes == 0

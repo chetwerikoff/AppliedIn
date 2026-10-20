@@ -355,8 +355,10 @@ def _save_results(receipts: list[dict], receipt: dict):
                 if old:
                     from tools import posting_guard as pg
 
+                    # This is a board rescan, not an authoritative full-JD
+                    # re-read: retain existing detail text and bind new findings.
                     merged = pg.merge(
-                        row["description"], row["posting_guard"],
+                        old.get("description") or "", row["posting_guard"],
                         old.get("posting_guard"),
                         source_witness=bool(row["posting_guard"].get("source_verified")))
                     row.update(description=merged["text"], posting_guard=merged["posting_guard"])
@@ -386,11 +388,12 @@ def _save_results(receipts: list[dict], receipt: dict):
                         current = stores.tracking.get_current(row["pk"])
                         if (current and current.get("jd_url") == row["url"]
                                 and current.get("company") == row["company"]):
+                            witness = bool(row["posting_guard"].get("source_verified"))
+                            evidence = pg.merge(
+                                current.get("jd_text") or "", row["posting_guard"],
+                                current.get("posting_guard"), source_witness=witness)
                             stores.tracking.update_posting_guard(
-                                row["pk"], current,
-                                {"text": row["description"],
-                                 "posting_guard": row["posting_guard"]},
-                                source_witness=bool(row["posting_guard"].get("source_verified")))
+                                row["pk"], current, evidence, source_witness=witness)
                     except Exception:
                         log.exception("could not persist rescan guard evidence")
                 elif row["url"] in handled:

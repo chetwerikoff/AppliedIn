@@ -63,6 +63,23 @@ def _guarded(title: str, text: str, *, html_variants=(),
     return {"title": cleaned_title, **inspected}
 
 
+def matched_source_witness(row: dict, meta: dict) -> bool:
+    """Only the same posting's inspected source can clear missing-HTML evidence.
+
+    Network-directory Career Ops rows need the original ATS API HTML, not a
+    flattened posting webpage; ordinary feed/crawler HTTP pages are valid
+    witnesses when their fetched HTML belongs to the exact tracked URL.
+    """
+    guard = meta.get("posting_guard")
+    kind = meta.get("source_kind")
+    return (meta.get("source_url") == row.get("jd_url")
+            and bool(row.get("jd_url"))
+            and isinstance(guard, dict) and guard.get("source_verified") is True
+            and (kind == "ats_html"
+                 or (kind == "http_html"
+                     and row.get("discovery_source") != "career_ops")))
+
+
 def _from_ats(url: str) -> dict | None:
     """Match an ATS posting and inspect ALL exposed HTML before plain selection."""
     from urllib.parse import urlparse
@@ -147,17 +164,23 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
     h1 = _text(m.group(1)) if (m := _H1_RX.search(html)) else ""
     title = h1 or _SPLIT_RX.split(_text(raw_title))[0].strip()
     hit = _guarded(title, html, html_variants=[html], source_required=True)
+    # Unlike a browser/plain fallback, this was inspected directly as HTTP
+    # source HTML for the requested posting.
+    hit.update(source_kind="http_html", source_url=url)
     if len(hit["text"]) < 400:
         seen = _from_chrome(url, kind)
         if seen and len(seen.get("text", "")) > len(hit["text"]):
             combined = pg.merge(seen["text"], seen["posting_guard"],
                                 hit["posting_guard"])
             seen.update(combined)
-            hit = seen
+            hit = {**seen, "source_kind": "http_html", "source_url": url}
     if ats:
+        complete_ats = bool(ats["posting_guard"].get("source_verified"))
         combined = pg.merge(hit["text"], hit["posting_guard"], ats["posting_guard"],
-                            source_witness=bool(ats["posting_guard"].get("source_verified")))
+                            source_witness=complete_ats)
         hit.update(combined)
+        if complete_ats and ats.get("source_url") == url:
+            hit.update(source_kind="ats_html", source_url=url)
     return hit
 
 

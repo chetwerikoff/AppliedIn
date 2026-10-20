@@ -606,11 +606,9 @@ async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
     rtext, guard = remote.get("text"), remote.get("posting_guard")
     if not isinstance(rtext, str) or not pg.valid(rtext, guard):
         return local
-    # Only the original ATS source from the exact posting supplies the
-    # network-directory promotion witness. An ordinary HTTP rendering does not.
-    source_witness = (remote.get("source_kind") == "ats_html"
-                      and remote.get("source_url") == url
-                      and bool(guard.get("source_verified")))
+    # Directory imports require ATS HTML; ordinary feed/crawler sources can
+    # clear the provisional marker after a verified same-URL HTTP read.
+    source_witness = _jd.matched_source_witness(row, remote)
     use_remote = bool(rtext) and (
         len(rtext) > len(local["text"]) or (need_source and source_witness))
     # Canonical deferred reads of an already guarded feed summary retain the
@@ -619,7 +617,8 @@ async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
     # Merge rebinds the generation to the selected text and all source findings.
     selected = (rtext.strip() if not need_source else rtext) if use_remote else local["text"]
     combined = pg.merge(selected, guard, old, source_witness=source_witness)
-    return {**combined, "source_kind": "ats_html" if source_witness else "",
+    return {**combined,
+            "source_kind": remote.get("source_kind", "") if source_witness else "",
             "source_url": url if source_witness else ""}
 
 
@@ -635,9 +634,9 @@ def _commit_posting_meta(pk: str, observed: dict, meta: dict,
             or _reader_witness(current) != _reader_witness(observed)
             or not pg.valid(meta.get("text"), meta.get("posting_guard"))):
         return None
-    source_witness = (meta.get("source_kind") == "ats_html"
-                      and meta.get("source_url") == current.get("jd_url")
-                      and bool(meta["posting_guard"].get("source_verified")))
+    from tools import jd as _jd
+
+    source_witness = _jd.matched_source_witness(current, meta)
     # The job title is also untrusted source text and appears in the initial
     # evaluator prompt. Fold any title finding into the exact JD generation.
     title_seen = pg.analyze(current.get("title") or "")

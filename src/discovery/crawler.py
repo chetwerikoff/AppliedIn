@@ -478,9 +478,14 @@ def _enqueue(
                 guarded = ({"text": job.jd_text, "posting_guard": job.posting_guard}
                            if pg.valid(job.jd_text, job.posting_guard)
                            else pg.projection(job.jd_text, job.posting_guard))
+                # A listing rescan supplies additional *evidence*, not a verified
+                # replacement JD. Preserve the authoritative full text.
+                witness = bool(guarded["posting_guard"].get("source_verified"))
+                evidence = pg.merge(
+                    current.get("jd_text") or "", guarded["posting_guard"],
+                    current.get("posting_guard"), source_witness=witness)
                 stores.tracking.update_posting_guard(
-                    job.pk, current, guarded,
-                    source_witness=bool(guarded["posting_guard"].get("source_verified")))
+                    job.pk, current, evidence, source_witness=witness)
         except Exception:
             log.exception("could not merge newly discovered posting evidence")
 

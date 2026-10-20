@@ -426,6 +426,23 @@ github: {prefs.github or '""'}
 """
 
 
+def _commit_manual_posting(pk: str, stores, inspected: dict) -> bool:
+    """Bind a manual role's sanitized JD and evidence before changing status."""
+    from tools import jd, posting_guard as pg
+
+    current = stores.tracking.get_current(pk)
+    if not current or current.get("status") not in {
+        "found", "skipped", "error", "failed", "tailored", "needs_human",
+    }:
+        return False
+    text, guard = inspected.get("text"), inspected.get("posting_guard")
+    if not isinstance(text, str) or not pg.valid(text, guard):
+        return False
+    return bool(stores.tracking.update_posting_guard(
+        pk, current, {"text": text, "posting_guard": guard},
+        source_witness=jd.matched_source_witness(current, inspected)))
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="AppliedIn")
     from discovery.career_ops_api import router as career_ops_router
@@ -1664,7 +1681,12 @@ def create_app() -> FastAPI:
         if not stores.tracking.put_new(job):
             if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
-            stores.tracking.set_status(pk, Status.FOUND, jd_text=text, title=title,
+            from tools import posting_guard as pg
+
+            if not _commit_manual_posting(pk, stores, pg.analyze(text)):
+                return {"ok": False, "error": "posting_guard_conflict",
+                        "note": "The posting changed or is protected; refresh before tailoring."}
+            stores.tracking.set_status(pk, Status.FOUND, title=title,
                                        skip_reason="", fail_kind="", fail_reason="")
 
         def _run() -> None:
@@ -1720,7 +1742,8 @@ def create_app() -> FastAPI:
         if not is_new:  # already tracked — re-tailor it from scratch
             if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
                 return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
-            stores.tracking.set_status(pk, Status.FOUND, skip_reason="", fail_kind="")
+            # Do not reset a live/terminal row before its guarded compare.
+            # The background reader commits the bound JD first.
 
         def _run() -> None:
             import logging
@@ -1737,8 +1760,13 @@ def create_app() -> FastAPI:
                 meta = fetch_jd_meta(url)
                 if meta.get("title"):
                     title = meta["title"]
-                    stores.tracking.set_status(pk, Status.FOUND, title=title,
-                                               jd_text=meta.get("text") or title)
+                if not _commit_manual_posting(pk, stores, meta):
+                    logging.getLogger("server").warning(
+                        "apply-role posting guard changed or could not be committed for %s", pk)
+                    return
+                stores.tracking.set_status(
+                    pk, Status.FOUND, title=title, skip_reason="",
+                    fail_kind="", fail_reason="")
                 emit("running", agent="workflow", company=company, pk=pk,
                      detail=f"▶ single-role: scoring + tailoring {title} @ {company}…")
                 run_job(pk, stores)

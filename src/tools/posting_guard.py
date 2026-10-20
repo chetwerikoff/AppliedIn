@@ -44,20 +44,46 @@ _BLOCK = frozenset(
 _DROP = frozenset("script style noscript template iframe object svg head".split())
 
 
-def _style_hidden(raw: str) -> tuple[bool, bool]:
-    props = {k.strip().lower(): v.strip().lower().replace(" ", "")
-             for k, sep, v in (part.partition(":") for part in raw.split(";")) if sep}
-    hidden = (props.get("display") == "none"
-              or props.get("visibility") in {"hidden", "collapse"}
-              or props.get("opacity") == "0")
-    fg = props.get("color", "")
-    bg = props.get("background-color", props.get("background", ""))
-    white = {"white", "#fff", "#ffffff", "rgb(255,255,255)"}
-    colors = {"white", "#fff", "#ffffff", "black", "#000", "#000000"}
-    same = bool(fg and bg and (fg == bg or (fg in white and bg in white)
-                               or (fg in colors and bg in colors and fg == bg)))
-    return hidden or same, same
+def _style_hidden(raw: str, inherited_fg: str = "", inherited_bg: str = ""
+                  ) -> tuple[bool, bool, str, str]:
+    # Inline !important is a priority marker, not part of the CSS value.
+    # Respect it when the same property is declared more than once.
+    props: dict[str, tuple[str, bool]] = {}
+    for part in raw.split(";"):
+        key, sep, value = part.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip().lower(), value.strip().lower()
+        important = bool(re.search(r"\s*!important\s*$", value))
+        value = re.sub(r"\s+", "", re.sub(r"\s*!important\s*$", "", value))
+        if key not in props or important or not props[key][1]:
+            props[key] = (value, important)
 
+    def prop(name: str, fallback: str = "") -> str:
+        return props[name][0] if name in props else fallback
+
+    hidden = (prop("display") == "none"
+              or prop("visibility") in {"hidden", "collapse"}
+              or prop("opacity") in {"0", "0.0", "0%"})
+    fg = prop("color", inherited_fg)
+    bg = prop("background-color", prop("background", inherited_bg))
+    if fg in {"inherit", "unset"}:
+        fg = inherited_fg
+    if bg in {"transparent", "inherit", "unset"}:
+        bg = inherited_bg
+
+    def color(value: str) -> str:
+        white = {"white", "#fff", "#ffffff", "rgb(255,255,255)"}
+        black = {"black", "#000", "#000000", "rgb(0,0,0)"}
+        if value in white:
+            return "#ffffff"
+        if value in black:
+            return "#000000"
+        # Deterministic inline literals only; no computed stylesheet claims.
+        return value if re.fullmatch(r"#[0-9a-f]{3,6}|[a-z]+", value) else ""
+
+    same = bool(color(fg) and color(fg) == color(bg))
+    return hidden or same, same, fg, bg
 
 class _VisibleHTML(HTMLParser):
     """Retain visible text and the *associated* anchor label and href only."""
@@ -66,14 +92,16 @@ class _VisibleHTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.links: list[tuple[str, str]] = []
-        self.stack: list[tuple[str, bool]] = []
+        self.stack: list[tuple[str, bool, str, str]] = []
         self.anchor: list[dict] = []
         self.reasons: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs = dict(attrs)
         parent_hidden = bool(self.stack and self.stack[-1][1])
-        local, same = _style_hidden(attrs.get("style") or "")
+        parent_fg, parent_bg = self.stack[-1][2:] if self.stack else ("", "")
+        local, same, fg, bg = _style_hidden(
+            attrs.get("style") or "", parent_fg, parent_bg)
         invisible = (parent_hidden or tag in _DROP or local or "hidden" in attrs
                      or (attrs.get("aria-hidden") or "").lower() == "true")
         if same:
@@ -91,7 +119,7 @@ class _VisibleHTML(HTMLParser):
         if tag in _BLOCK and not invisible:
             self.parts.append("\n")
         # Raw event handlers and arbitrary attribute values never enter parts.
-        self.stack.append((tag, invisible))
+        self.stack.append((tag, invisible, fg, bg))
         if tag in {"br", "img", "input", "hr", "meta", "link", "source", "wbr"}:
             self.handle_endtag(tag)
 

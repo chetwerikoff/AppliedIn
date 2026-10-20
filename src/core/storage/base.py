@@ -124,7 +124,8 @@ def guard_observation_matches(current: dict | None, observed: dict) -> bool:
 
 def guard_patch(current: dict, inspected: dict | None,
                 *, reviewed_generation: str | None = None,
-                source_witness: bool = False) -> dict | None:
+                source_witness: bool = False,
+                settle_refusal: bool = False) -> dict | None:
     """Return a safe *partial* patch for a guarded compare-and-update.
 
     The backend must atomically compare the original witness before committing.
@@ -135,6 +136,18 @@ def guard_patch(current: dict, inspected: dict | None,
 
     if current.get("confirmation_id") or current.get("possible_submission"):
         return None
+    if settle_refusal:
+        if (current.get("status") != "submitting"
+                or current.get("submit_hold") or current.get("possible_submission")
+                or current.get("confirmation_id")
+                or current.get("gate_reason") == "submit_uncertain"):
+            return None
+        return {
+            "status": "tailored", "gate_reason": "approval",
+            "fail_kind": "posting_guard_review_required",
+            "fail_reason": "Posting review is required for the current guard generation.",
+            "gate_pending": {"question": "Review the current posting safety signal before applying."},
+        }
     if reviewed_generation is not None:
         meta = current.get("posting_guard")
         if (not pg.valid(current.get("jd_text") or "", meta)
@@ -170,6 +183,7 @@ class AbstractTracking(ABC):
     def update_posting_guard(
         self, pk: str, observed: dict, inspected: dict | None = None, *,
         reviewed_generation: str | None = None, source_witness: bool = False,
+        settle_refusal: bool = False,
     ) -> bool:
         """Atomically compare original row/guard witnesses and patch guard fields.
 

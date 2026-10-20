@@ -15,7 +15,7 @@ from botocore.exceptions import ClientError
 from ..models import JobRecord, Status
 from .base import (
     AbstractTracking, REPAIR_PROTECTED_FIELDS, REPAIR_READER_FIELDS,
-    legacy_repair_row_allowed,
+    legacy_repair_row_allowed, guard_observation_matches, guard_patch, _GUARD_COMPARE,
 )
 from ..ids import is_internal_pk
 
@@ -34,9 +34,15 @@ class TrackingStore(AbstractTracking):
         The ``attribute_not_exists(pk)`` condition is the dedup guarantee: a
         second poll cycle that rediscovers the same posting is a no-op.
         """
+        from core.ids import jd_hash
+        from tools import posting_guard as pg
+
+        guarded = ({"text": job.jd_text, "posting_guard": job.posting_guard}
+                   if pg.valid(job.jd_text, job.posting_guard)
+                   else pg.projection(job.jd_text, job.posting_guard))
         item: dict[str, Any] = {
             "pk": job.pk,
-            "jd_hash": job.jd_hash,
+            "jd_hash": jd_hash(guarded["text"]),
             "status": status.value,
             "company": job.company,
             "job_id": job.job_id,
@@ -47,7 +53,8 @@ class TrackingStore(AbstractTracking):
             "attempts": 0,
             "discovery_source": job.discovery_source,
             "apply_requested_at": job.apply_requested_at,
-            "jd_text": job.jd_text if job.discovery_source == "career_ops" else "",
+            "jd_text": guarded["text"],
+            "posting_guard": guarded["posting_guard"],
         }
         if job.greenhouse_board:
             item["greenhouse_board"] = job.greenhouse_board
@@ -65,6 +72,55 @@ class TrackingStore(AbstractTracking):
     def get(self, pk: str) -> dict | None:
         return self._table.get_item(Key={"pk": pk}).get("Item")
 
+    def get_current(self, pk: str) -> dict | None:
+        return self._table.get_item(
+            Key={"pk": pk}, ConsistentRead=True).get("Item")
+
+    def update_posting_guard(
+        self, pk: str, observed: dict, inspected: dict | None = None, *,
+        reviewed_generation: str | None = None, source_witness: bool = False,
+    ) -> bool:
+        """Read the base table consistently, then compare at UpdateItem commit."""
+        from core.ids import jd_hash
+
+        current = self.get_current(pk)
+        if not guard_observation_matches(current, observed):
+            return False
+        patch = guard_patch(current, inspected,
+                            reviewed_generation=reviewed_generation,
+                            source_witness=source_witness)
+        if patch is None:
+            return False
+        if "jd_text" in patch:
+            patch["jd_hash"] = jd_hash(patch["jd_text"])
+        names, values, conditions = {"#pk": "pk"}, {}, ["attribute_exists(#pk)"]
+        for i, key in enumerate(_GUARD_COMPARE):
+            field, param = f"#g{i}", f":g{i}"
+            names[field] = key
+            if key in observed:
+                values[param] = observed[key]
+                conditions.append(f"{field} = {param}")
+            else:
+                conditions.append(f"attribute_not_exists({field})")
+        sets = []
+        for i, (key, value) in enumerate(patch.items()):
+            field, param = f"#u{i}", f":u{i}"
+            names[field] = key
+            values[param] = value
+            sets.append(f"{field} = {param}")
+        try:
+            self._table.update_item(
+                Key={"pk": pk}, UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
     def get_alias(self, pk: str) -> dict | None:
         """Read alias-critical identity from the base table after committed changes.
 
@@ -75,6 +131,8 @@ class TrackingStore(AbstractTracking):
             Key={"pk": pk}, ConsistentRead=True).get("Item")
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:
+        if set(attrs) & {"jd_text", "posting_guard", "reviewed_guard_generation"}:
+            raise ValueError("Use update_posting_guard for bound JD/guard changes")
         names = {"#s": "status"}
         values = {":s": status.value}
         sets = ["#s = :s"]

@@ -7,7 +7,9 @@ active role line or reduce the number of recognized base-used bullets.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 import re
+from typing import Mapping, Sequence
 
 # The save boundary and fact validator deliberately share this small inventory.
 MACROS = {
@@ -214,10 +216,123 @@ def _norm(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip().lower()
 
 
-def validate(base_latex: str, tailored_latex: str) -> list[str]:
-    """Return lost/altered active structural lines, preserving multiplicity."""
+# Do not infer a title slot from an unfamiliar arity or a project/short-form
+# heading. This is intentionally not a general TeX parser.
+_TITLE_LAYOUTS = {
+    r"\role": (3, 0, 1),
+    r"\resumeSubheading": (4, 0, 2),
+}
+
+
+@dataclass(frozen=True)
+class _TitleSlot:
+    line: str
+    employer: str
+    title: str
+    start: int
+    end: int
+    signature: str
+
+
+@dataclass(frozen=True)
+class TitleOption:
+    """One independently identifiable seed role and its permitted replacements."""
+    seed_line: str
+    seed_title: str
+    approved: tuple[str, ...]
+    start: int
+    end: int
+
+
+def _title_slot(line: str) -> _TitleSlot | None:
+    """Parse only a balanced, single-line, exact supported role call.
+
+    The title argument must have no nested TeX groups; other arguments may
+    retain their seed markup but are never available for substitution.
+    """
+    call = _COMMAND.match(line)
+    if not call:
+        return None
+    macro = "\\" + call.group(1)
+    layout = _TITLE_LAYOUTS.get(macro)
+    if layout is None:
+        return None
+    arity, employer_arg, title_arg = layout
+    # A second structural call anywhere on the line makes slot ownership
+    # ambiguous, even if a generic TeX parser could pick one interpretation.
+    for nested in _COMMAND.finditer(line, call.end()):
+        if "\\" + nested.group(1) in MACROS["anchors"]:
+            return None
+
+    pos, args = call.end(), []
+    for _ in range(arity):
+        while pos < len(line) and line[pos].isspace():
+            pos += 1
+        if pos >= len(line) or line[pos] != "{":
+            return None
+        start, depth, pos = pos + 1, 1, pos + 1
+        while pos < len(line) and depth:
+            if line[pos] == "{" and _unescaped(line, pos):
+                depth += 1
+            elif line[pos] == "}" and _unescaped(line, pos):
+                depth -= 1
+            pos += 1
+        if depth:
+            return None
+        args.append((start, pos - 1))
+    if line[pos:].strip():
+        return None
+    start, end = args[title_arg]
+    title = line[start:end]
+    if not title.strip() or "{" in title or "}" in title or "%" in title:
+        return None
+    employer_start, employer_end = args[employer_arg]
+    employer = line[employer_start:employer_end].strip()
+    return _TitleSlot(
+        line=line, employer=employer, title=title, start=start, end=end,
+        signature=_norm(line[:start] + "<title-slot>" + line[end:]),
+    )
+
+
+def eligible_title_options(
+    base_latex: str, approved_titles: Mapping[str, Sequence[str]],
+) -> tuple[TitleOption, ...]:
+    """Return only approved values attached to exact, unique *seed* anchors.
+
+    Two jobs at one employer may each independently use company-scoped titles
+    when their non-title seed signatures distinguish them. Same-employer
+    duplicates whose signatures differ only in title fail closed.
+    """
     anchors = used_macros(base_latex)["anchors"]
-    remaining = Counter(_norm(line) for _, line in active_calls(tailored_latex, anchors))
+    slots = [_title_slot(line) for _, line in active_calls(base_latex, anchors)]
+    signatures = Counter(s.signature for s in slots if s is not None)
+    options = []
+    for slot in slots:
+        if slot is None or signatures[slot.signature] != 1:
+            continue
+        approved = tuple(approved_titles.get(slot.employer, ()))
+        if approved:
+            options.append(TitleOption(
+                slot.line, slot.title, approved, slot.start, slot.end,
+            ))
+    return tuple(options)
+
+
+def validate(
+    base_latex: str, tailored_latex: str,
+    approved_titles: Mapping[str, Sequence[str]] | None = None,
+) -> list[str]:
+    """Return lost/altered active structural lines, preserving multiplicity.
+
+    The normal Counter guard is unchanged without configured exceptions.
+    With exceptions, each missing seed line must consume its OWN unused active
+    target witness equal to that exact seed line except for one approved,
+    properly encoded title argument. No anchor may borrow a different role's
+    parsed witness, and admitting a title edit cannot add another anchor.
+    """
+    anchors = used_macros(base_latex)["anchors"]
+    new_calls = active_calls(tailored_latex, anchors)
+    remaining = Counter(_norm(line) for _, line in new_calls)
     missing = []
     for _, line in active_calls(base_latex, anchors):
         normalized = _norm(line)
@@ -225,4 +340,35 @@ def validate(base_latex: str, tailored_latex: str) -> list[str]:
             remaining[normalized] -= 1
         else:
             missing.append(line)
-    return missing
+    if not missing or not approved_titles:
+        return missing
+
+    options = {
+        _norm(option.seed_line): option
+        for option in eligible_title_options(base_latex, approved_titles)
+    }
+    unresolved = []
+    admitted = 0
+    for line in missing:
+        option = options.get(_norm(line))
+        matched = False
+        if option:
+            for title in option.approved:
+                expected = _norm(line[:option.start] + title + line[option.end:])
+                if remaining[expected]:
+                    remaining[expected] -= 1
+                    admitted += 1
+                    matched = True
+                    break
+        if not matched:
+            unresolved.append(line)
+
+    if admitted and any(remaining.values()):
+        # The legacy guard permits extra anchors in an unchanged résumé; do
+        # not expand that legacy allowance into a variant's active-call count.
+        for _, line in new_calls:
+            normalized = _norm(line)
+            if remaining[normalized]:
+                unresolved.append("Unexpected active role/heading: " + line)
+                remaining[normalized] -= 1
+    return unresolved

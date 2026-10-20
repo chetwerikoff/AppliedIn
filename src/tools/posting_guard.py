@@ -82,6 +82,8 @@ class _VisibleHTML(HTMLParser):
             self.reasons.add("hidden_html")
         if invisible and tag == "a":
             self.reasons.add("hidden_link")
+            if attrs.get("href"):
+                self.reasons.add("hidden_url")
         if tag == "a":
             href = attrs.get("href") or ""
             self.anchor.append({"href": href, "title": attrs.get("title") or "",
@@ -240,8 +242,8 @@ def valid(text: str, guard: dict | None) -> bool:
     return (guard.get("revision") == REVISION
             and isinstance(text, str)
             and isinstance(codes, list)
-            and codes == sorted(set(codes))
             and all(isinstance(c, str) and c in _MESSAGES for c in codes)
+            and codes == sorted(set(codes))
             and status in {"clean", "flagged", "unchecked", "error"}
             and type(verified) is bool
             and _result(text, set(codes), verified)["posting_guard"]["status"] == status

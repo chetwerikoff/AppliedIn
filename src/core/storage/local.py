@@ -24,6 +24,8 @@ from .base import (
     AbstractSecrets,
     AbstractTracking,
     legacy_repair_row_allowed,
+    tenant_pin_row_allowed,
+    tenant_pin_same_witness,
 )
 
 
@@ -119,28 +121,42 @@ class RedisTracking(AbstractTracking):
         return True
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:
-        row = self.get(pk) or {"pk": pk}
-        prev = row.get("status")
+        """Merge onto the row read under WATCH, not a stale earlier snapshot.
+
+        A later status writer must not erase a board pin committed after its
+        original read. Status indexes and transition stamps share the atomic
+        row transaction.
+        """
+        from datetime import datetime, timezone
+
+        key = f"app:{pk}"
         val = status.value if hasattr(status, "value") else status
-        row["status"] = val
-        # When the résumé was written. The board groups the approval queue by this,
-        # because "tailored on Monday" is the difference between a fresh document
-        # and one written against a posting that has since changed. Stamped on the
-        # TRANSITION so a later edit to the row does not move the date.
-        if val == "tailored" and prev != "tailored" and not row.get("tailored_at"):
-            from datetime import datetime, timezone
-
-            row["tailored_at"] = datetime.now(timezone.utc).isoformat()
-        # And when it went out. Nothing recorded this, so "how many did I send last
-        # Tuesday" could not be answered at all: an applied row knew only when it
-        # was DISCOVERED, which for a job found in a sweep and applied to a week
-        # later is a different week.
-        if val in ("applied", "applied_manual") and not row.get("applied_at"):
-            from datetime import datetime, timezone
-
-            row["applied_at"] = datetime.now(timezone.utc).isoformat()
-        row.update(attrs)
-        self._write(pk, row, prev_status=prev)
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key)
+                    raw = pipe.get(key)
+                    row = json.loads(raw) if raw else {"pk": pk}
+                    prev = row.get("status")
+                    row["status"] = val
+                    if val == "tailored" and prev != "tailored" and not row.get("tailored_at"):
+                        row["tailored_at"] = datetime.now(timezone.utc).isoformat()
+                    if val in ("applied", "applied_manual") and not row.get("applied_at"):
+                        row["applied_at"] = datetime.now(timezone.utc).isoformat()
+                    row.update(attrs)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if prev and prev != row.get("status"):
+                        pipe.srem(f"status:{prev}", pk)
+                    if row.get("status") and not is_internal_pk(pk):
+                        pipe.sadd(f"status:{row['status']}", pk)
+                    if row.get("jd_hash"):
+                        pipe.hset("jdhash", row["jd_hash"], pk)
+                    pipe.execute()
+                    return
+            except WatchError:
+                continue
+        raise RuntimeError("Tracking status update exhausted Redis WATCH contention")
 
     def update_if_status(self, pk: str, expected_status: Status | str,
                          updates: dict, *, expected_reader: dict) -> bool:
@@ -241,6 +257,38 @@ class RedisTracking(AbstractTracking):
                 # Retry against current data, never a new expected witness.
                 continue
         raise RuntimeError("Legacy URL repair exhausted Redis WATCH contention")
+
+    def add_missing_greenhouse_pin(
+        self, pk: str, board: str, *, expected_row: dict,
+    ) -> bool:
+        """One exact original witness, row+independent hold WATCH, no row reset."""
+        if not tenant_pin_row_allowed(expected_row, pk, board):
+            return False
+        key, hold_key = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold_key)
+                    raw = pipe.get(key)
+                    hold = pipe.get(hold_key)
+                    if raw is None or hold is not None:
+                        pipe.unwatch()
+                        return False
+                    current = json.loads(raw)
+                    if (not tenant_pin_same_witness(current, expected_row)
+                            or not tenant_pin_row_allowed(current, pk, board)):
+                        pipe.unwatch()
+                        return False
+                    current["greenhouse_board"] = board
+                    pipe.multi()
+                    # Preserve status, every history field and all index keys.
+                    pipe.set(key, json.dumps(current, default=str))
+                    pipe.execute()
+                    return True
+            except WatchError:
+                # Never rebase the original protected witness after contention.
+                continue
+        raise RuntimeError("Greenhouse pin exhausted Redis WATCH contention")
 
     def application_notes(self) -> dict:
         return {pk: json.loads(value) for pk, value in self.r.hgetall("application:notes").items()}

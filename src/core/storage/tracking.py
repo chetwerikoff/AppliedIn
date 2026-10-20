@@ -15,7 +15,8 @@ from botocore.exceptions import ClientError
 from ..models import JobRecord, Status
 from .base import (
     AbstractTracking, REPAIR_PROTECTED_FIELDS, REPAIR_READER_FIELDS,
-    legacy_repair_row_allowed,
+    legacy_repair_row_allowed, tenant_pin_row_allowed,
+    tenant_pin_witness_fields, tenant_pin_same_witness,
 )
 from ..ids import is_internal_pk
 
@@ -212,6 +213,47 @@ class TrackingStore(AbstractTracking):
             self._table.update_item(
                 Key={"pk": pk},
                 UpdateExpression=updates,
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def add_missing_greenhouse_pin(
+        self, pk: str, board: str, *, expected_row: dict,
+    ) -> bool:
+        """Strong row observation followed by a row-local, no-upsert pin patch.
+
+        The independent Redis hold key does not exist in this backend. Only
+        original application-row attributes are conditionable in DynamoDB.
+        """
+        if not tenant_pin_row_allowed(expected_row, pk, board):
+            return False
+        row = self._table.get_item(
+            Key={"pk": pk}, ConsistentRead=True).get("Item")
+        if (not tenant_pin_same_witness(row, expected_row)
+                or not tenant_pin_row_allowed(row, pk, board)):
+            return False
+        fields = tenant_pin_witness_fields(expected_row)
+        names = {"#pk": "pk", "#pin": "greenhouse_board"}
+        values = {":board": board}
+        conditions = ["attribute_exists(#pk)", "attribute_not_exists(#pin)"]
+        for i, field in enumerate(fields):
+            name, value = f"#w{i}", f":w{i}"
+            names[name] = field
+            if field in expected_row:
+                conditions.append(f"{name} = {value}")
+                values[value] = expected_row[field]
+            else:
+                conditions.append(f"attribute_not_exists({name})")
+        try:
+            self._table.update_item(
+                Key={"pk": pk},
+                UpdateExpression="SET #pin = :board",
                 ConditionExpression=" AND ".join(conditions),
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,

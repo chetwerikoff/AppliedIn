@@ -139,10 +139,10 @@ class RedisTracking(AbstractTracking):
                 with self.r.pipeline() as pipe:
                     pipe.watch(key)
                     raw = pipe.get(key)
-                    if raw is None:
-                        pipe.unwatch()
-                        return
-                    row = json.loads(raw)
+                    # Preserve the pre-guard status-only upsert for legacy
+                    # bookkeeping rows. A missing row has no JD or guard to
+                    # certify; protected fields are rejected above.
+                    row = json.loads(raw) if raw is not None else {"pk": pk}
                     prev = row.get("status")
                     row["status"] = val
                     if val == "tailored" and prev != "tailored" and not row.get("tailored_at"):

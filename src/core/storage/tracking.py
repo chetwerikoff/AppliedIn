@@ -159,6 +159,8 @@ class TrackingStore(AbstractTracking):
         Only ConditionalCheckFailedException means a benign conflict. All other
         Dynamo errors retain their original cause for the caller to diagnose.
         """
+        if set(updates) & {"jd_text", "posting_guard", "reviewed_guard_generation"}:
+            raise ValueError("Use update_posting_guard for bound JD/guard changes")
         fixed = ("jd_read_attempts", "jd_read_retry_at", "jd_read_revision",
                  "jd_text", "jd_read_prepare_only")
         if set(expected_reader) - set(fixed):

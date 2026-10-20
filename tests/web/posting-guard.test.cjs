@@ -119,3 +119,63 @@ test('company review sends exactly the selected per-role guard generations',asyn
   assert.equal(JSON.stringify(payload.guard_generations),
     JSON.stringify({[a.pk]:'generation-2',[b.pk]:'generation-3'}));
 });
+
+test('company Apply with no displayed generations omits the version map entirely',async()=>{
+  const h=harness();
+  const a=syntheticRow({posting_guard:undefined});
+  const b=syntheticRow({pk:'example-co#job-2',
+    posting_guard:{status:'flagged',generation:''}});
+  const c=syntheticRow({pk:'example-co#job-3',
+    posting_guard:{status:'unchecked',generation:'   '}});
+  h.state.apps=[a,b,c];
+  h.context.sent=[];
+  vm.runInContext('post=async(path,body)=>{ globalThis.sent.push({path,body});'
+    +'return {ok:false,error:"Current posting review is required"}; };'
+    +'toast=()=>{};loadQueue=()=>{};loadApps=()=>{};',h.context);
+  await h.fn('reviewAction')('apply','example-co',[a.pk,b.pk,c.pk]);
+  assert.equal(h.context.sent.length,1);
+  assert.equal(h.context.sent[0].path,'/actions/apply-selection');
+  assert.equal(JSON.stringify(h.context.sent[0].body),
+    JSON.stringify({company:'example-co',pks:[a.pk,b.pk,c.pk]}));
+  assert.equal(Object.hasOwn(h.context.sent[0].body,'guard_generations'),false);
+});
+
+test('mixed company Apply preserves exact real versions but omits missing ones',async()=>{
+  const h=harness();
+  const current=syntheticRow({posting_guard:{status:'flagged',
+    generation:'synthetic-current-generation'}});
+  const missing=syntheticRow({pk:'example-co#job-2',
+    posting_guard:{status:'unchecked'}});
+  const invalid=syntheticRow({pk:'example-co#job-3',
+    posting_guard:{status:'error',generation:42}});
+  h.state.apps=[current,missing,invalid];
+  h.context.sent=[];
+  vm.runInContext('post=async(path,body)=>{ globalThis.sent.push({path,body});'
+    +'return {ok:false,error:"Current posting review is required"}; };'
+    +'toast=()=>{};loadQueue=()=>{};loadApps=()=>{};',h.context);
+  await h.fn('reviewAction')('apply','example-co',[current.pk,missing.pk,invalid.pk]);
+  assert.equal(h.context.sent.length,1);
+  const versions=h.context.sent[0].body.guard_generations;
+  assert.equal(JSON.stringify(versions),
+    JSON.stringify({[current.pk]:'synthetic-current-generation'}));
+  assert.equal(Object.hasOwn(versions,missing.pk),false);
+  assert.equal(Object.hasOwn(versions,invalid.pk),false);
+});
+
+test('single Apply now never sends a fabricated blank displayed generation',async()=>{
+  for(const absent of [undefined,null,'','   ',42]) {
+    const h=harness();
+    const row=syntheticRow({posting_guard:absent===undefined
+      ? undefined : {status:'flagged',generation:absent}});
+    h.state.apps=[row];
+    h.context.sent=[];
+    vm.runInContext('post=async(path,body)=>{globalThis.sent.push({path,body});'
+      +'return {ok:false,error:"Current posting review is required"};};'
+      +'markBusy=()=>{};toast=()=>{};loadQueue=()=>{};loadApps=()=>{};',h.context);
+    h.fn('paneAction')('apply-now',row.pk,{dataset:{act:'apply-now',pk:row.pk}});
+    assert.equal(h.context.sent.length,1);
+    assert.equal(h.context.sent[0].path,'/actions/apply-now/example-co%23job-1');
+    assert.equal(JSON.stringify(h.context.sent[0].body),'{}');
+    await Promise.resolve();
+  }
+});

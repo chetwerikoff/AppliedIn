@@ -77,6 +77,8 @@ class JobRecord(BaseModel):
     title: str
     jd_url: str
     jd_text: str
+    # Source-aware JD safety witness; serialized alongside its exact cleaned text.
+    posting_guard: dict = {}
     location: str = ""
     ats: str = ""
     # A new browser-verified Greenhouse wrapper pins its manually configured

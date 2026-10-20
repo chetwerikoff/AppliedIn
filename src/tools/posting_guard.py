@@ -129,6 +129,9 @@ def _text(raw: str, reasons: set[str]) -> str:
     if _BIDI.search(raw):
         reasons.add("bidi_control")
     raw = _ZERO_WIDTH.sub("", _BIDI.sub("", raw))
+    # Plain-text reader output can end with harmless spaces. Keep those exact
+    # spaces so the cleaned JD and its bound generation remain stable.
+    trailing_spaces = raw[len(raw.rstrip(" ")):]
     cleaned: list[str] = []
     for line in raw.splitlines():
         if _INSTRUCTION.search(line):
@@ -143,7 +146,8 @@ def _text(raw: str, reasons: set[str]) -> str:
         line = " ".join(line.split())
         if line:
             cleaned.append(line)
-    return "\n".join(cleaned)[:100000]
+    normalized = "\n".join(cleaned)
+    return (normalized + trailing_spaces if normalized else "")[:100000]
 
 
 def _version(text: str, status: str, reasons: list[str], source_verified: bool) -> str:

@@ -87,7 +87,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ""
     from tools import submit_hold
 
     if pk:
-        from core.ids import make_pk
         from tools import posting_guard as pg
 
         stores = make_stores()
@@ -97,8 +96,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ""
             if submit_hold.blocked(pk, row or {}, tracking=stores.tracking):
                 return {'status': 'uncertain', 'reason': 'uncertain', 'detail': submit_hold.REASON}
             if (not isinstance(row, dict) or not row.get("company")
+                    or row.get("pk") != pk
                     or row.get("company") != company or row.get("jd_url") != url
-                    or make_pk(company, row.get("job_id") or "") != pk
                     or row.get("status") != "submitting"
                     or row.get("confirmation_id") or row.get("possible_submission")
                     or not pg.authorised(row, text=jd_text)):

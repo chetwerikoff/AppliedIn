@@ -1174,6 +1174,19 @@ function aliasById(id) {
   return null;
 }
 
+// Missing evidence must never be presented as an owner-reviewed generation.
+function displayedGuardGeneration(r) {
+  const generation = r?.posting_guard?.generation;
+  return typeof generation === "string" && generation.trim() ? generation : null;
+}
+function displayedGuardGenerations(rows) {
+  const entries = rows.flatMap((r) => {
+    const generation = displayedGuardGeneration(r);
+    return generation === null ? [] : [[r.pk, generation]];
+  });
+  return entries.length ? {guard_generations: Object.fromEntries(entries)} : {};
+}
+
 function postingGuardHtml(r) {
   const g = r && r.posting_guard;
   if (!g || !g.status || g.status === "clean") return "";
@@ -1728,10 +1741,7 @@ async function reviewAction(action, company, explicitPks = null, day = null) {
   try {
     const result = await post(action === "apply" ? "/actions/apply-selection" : "/actions/review-decision", {
       company, pks: picks.map((r) => r.pk),
-      ...(action === "apply" ? {
-        guard_generations: Object.fromEntries(picks.map((r) =>
-          [r.pk, r.posting_guard?.generation || ""])),
-      } : {action}),
+      ...(action === "apply" ? displayedGuardGenerations(picks) : {action}),
     });
     if (action === "apply") {
       if (!result?.ok) {
@@ -4461,9 +4471,9 @@ function paneAction(act, pk, el) {
   } else if (act === "apply-now") {
     markBusy(pk, "starting…");
     const displayed = state.apps.find((r) => r.pk === pk);
-    post(`/actions/apply-now/${encodeURIComponent(pk)}`, {
-      posting_guard_generation: displayed?.posting_guard?.generation || "",
-    }).then((r) => {
+    const generation = displayedGuardGeneration(displayed);
+    post(`/actions/apply-now/${encodeURIComponent(pk)}`,
+      generation === null ? {} : {posting_guard_generation: generation}).then((r) => {
       toast(!r || !r.ok ? (r && r.error) || "Could not start it."
         : r.retailoring ? "Your base résumé changed since this was tailored — re-tailoring it first (about two minutes), then applying."
         : "Applying to this one now.");

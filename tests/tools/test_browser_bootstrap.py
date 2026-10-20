@@ -2576,9 +2576,15 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
 
     # Only the outside runtime/store are fake: actual browser_apply.apply ->
     # browser_runtime.apply -> browser_skill_apply.apply and its exact guards run.
+    # Seed a current *bound* JD for the production wrapper, not a legacy
+    # metadata-free row that the posting boundary must reject.
+    from tools import posting_guard as pg
+    guarded = pg.analyze("Synthetic responsibilities for this test role. " * 16)
+    row.update(jd_text=guarded["text"], posting_guard=guarded["posting_guard"])
     monkeypatch.setattr(
         "core.stores.make_stores",
-        lambda: SimpleNamespace(tracking=SimpleNamespace(get=lambda _pk: row)),
+        lambda: SimpleNamespace(tracking=SimpleNamespace(
+            get=lambda _pk: row, get_current=lambda _pk: row)),
     )
     monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: False)
     monkeypatch.setattr(browser_runtime, "available", lambda: (True, ""))
@@ -2611,7 +2617,7 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
     monkeypatch.setattr(bsk, "decision", stop_before_write)
     result = await browser_apply.apply(
         GH_WRAP, "example-co", facts, "synthetic", pk=GH_PK,
-        resume_path="Resume.pdf",
+        jd_text=guarded["text"], resume_path="Resume.pdf",
     )
     assert result["status"] == "gate", result
     assert "Synthetic stop before any write" in result["question"]

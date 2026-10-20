@@ -271,13 +271,35 @@ async def test_existing_downstream_event_uses_apply_question_without_step(monkey
 
     class Tracking:
         def __init__(self):
-            self.row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
-                        'jd_url': URL}
+            from tools import posting_guard as pg
+            checked = pg.analyze("Synthetic engineering job. " * 40)
+            self.row = {**{'pk': PK, 'status': 'tailored', 'company': 'example-co',
+                        'jd_url': URL}, "jd_text": checked["text"],
+                        "posting_guard": checked["posting_guard"]}
             self.writes = []
 
         def get(self, pk):
             assert pk == PK
             return dict(self.row)
+
+        def get_current(self, pk):
+            return self.get(pk)
+
+        def update_posting_guard(self, pk, observed, inspected=None, *,
+                                 reviewed_generation=None, source_witness=False,
+                                 settle_refusal=False):
+            from core.storage.base import guard_observation_matches, guard_patch
+            current = self.get_current(pk)
+            if not guard_observation_matches(current, observed):
+                return False
+            patch = guard_patch(current, inspected,
+                                reviewed_generation=reviewed_generation,
+                                source_witness=source_witness,
+                                settle_refusal=settle_refusal)
+            if patch is None:
+                return False
+            self.row.update(patch)
+            return True
 
         def set_status(self, pk, status, **kwargs):
             assert pk == PK
@@ -295,7 +317,9 @@ async def test_existing_downstream_event_uses_apply_question_without_step(monkey
         return deepcopy(result)
 
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **k: False)
-    monkeypatch.setattr(run, '_jd_text', AsyncMock(return_value='Synthetic engineering job. ' * 40))
+    from tools import posting_guard as pg
+    monkeypatch.setattr(run, "_jd_meta",
+                        AsyncMock(return_value=pg.analyze("Synthetic engineering job. " * 40)))
     monkeypatch.setattr(run, '_no_sponsorship', lambda *a, **k: False)
     monkeypatch.setattr(run, 'get_settings', lambda: SimpleNamespace(browser_model='synthetic'))
     monkeypatch.setattr(run, '_github_context', lambda: '')

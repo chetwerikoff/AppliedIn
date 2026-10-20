@@ -17,8 +17,8 @@ NEIGHBOR = r"\role{example-co-lab}{Role X}{2017--2018}"
 PRE = r"\documentclass{article}" + "\n" + r"\begin{document}" + "\n"
 
 
-def doc(*lines):
-    return PRE + "\n".join((*lines, r"\resumeItem{Synthetic work.}")) + "\n" + r"\end{document}"
+def doc(*lines, preamble=PRE):
+    return preamble + "\n".join((*lines, r"\resumeItem{Synthetic work.}")) + "\n" + r"\end{document}"
 
 
 @pytest.fixture
@@ -133,12 +133,13 @@ def test_inert_seed_role_is_not_an_eligible_witness(options):
 
 
 @pytest.fixture
-def save_attempt(monkeypatch, tmp_path, options):
+def save_attempt(monkeypatch, tmp_path):
     """Exercise the real save seam without owner data or external effects."""
-    from agent import graph
+    from agent import graph, run
     from core import profiles, stores
     from tools import render
 
+    (tmp_path / BASENAME).write_text("example-co: [Role B]\n", encoding="utf-8")
     effects = {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
 
     class FakeArtifacts:
@@ -166,6 +167,7 @@ def save_attempt(monkeypatch, tmp_path, options):
                         lambda: SimpleNamespace(local_dir=str(tmp_path)))
     monkeypatch.setattr(stores, "make_stores", make_stores)
     monkeypatch.setattr(render, "render_pdf", render_pdf)
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
     monkeypatch.setattr(profiles, "resolve_for", lambda row: object())
     monkeypatch.setattr(profiles, "apply_to_latex", lambda latex, profile: latex)
 
@@ -211,3 +213,72 @@ def test_save_rejects_formatted_same_employer_sibling_with_duplicate_signature(
     assert result["missing_facts"] == [plain]
     assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
     assert state == {"base_latex": seed, "pk": "synthetic"}
+
+
+# A one-argument role macro keeps the employer, dates and any additional
+# segments inside one braced argument. Only the first segment may vary.
+ONE_ARG = r"\role{Role A | example-co | 2022--2024}"
+ONE_ARG_EXTRA = r"\role{Role A | example-co | 2022--2024 | Role A}"
+ONE_ARG_PRE = (
+    r"\documentclass{article}" + "\n"
+    + r"\newcommand{\role}[1]{#1}" + "\n"
+    + r"\begin{document}" + "\n"
+)
+
+
+def one_arg_doc(*lines):
+    return doc(*lines, preamble=ONE_ARG_PRE)
+
+
+@pytest.mark.parametrize("anchor", [ONE_ARG, ONE_ARG_EXTRA])
+def test_save_one_arg_role_changes_only_first_segment(save_attempt, anchor):
+    seed = one_arg_doc(anchor)
+    changed = one_arg_doc(anchor.replace("Role A", "Role B", 1))
+    result, state, effects = save_attempt(seed, changed)
+
+    assert result["ok"] is True
+    assert result["format"] == "pdf"
+    assert state["tailored"] == changed
+    assert effects == {"make_stores": 1, "render": 1, "artifact": 2, "tracking": 1}
+
+
+@pytest.mark.parametrize("anchor,changed", [
+    (ONE_ARG, r"\role{Role B |  | 2022--2024}"),
+    (ONE_ARG, r"\role{Role B | example-co | 2023--2024}"),
+    (ONE_ARG, r"\role{Role B  | example-co | 2022--2024}"),
+    (ONE_ARG_EXTRA, r"\role{Role B | example-co | 2022--2024 | Role B}"),
+    (ONE_ARG_EXTRA, r"\role{Role B | example-co | 2022--2024  | Role A}"),
+])
+def test_save_one_arg_role_rejects_any_non_title_difference(
+    save_attempt, anchor, changed,
+):
+    seed = one_arg_doc(anchor)
+    result, state, effects = save_attempt(seed, one_arg_doc(changed))
+
+    assert result["ok"] is False
+    assert result["missing_facts"]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert state == {"base_latex": seed, "pk": "synthetic"}
+
+
+def test_save_one_arg_formatted_duplicate_signature_blocks_variant(save_attempt):
+    formatted = r"\role{\textbf{Role A} | example-co | 2022--2024}"
+    seed = one_arg_doc(ONE_ARG, formatted)
+    changed = one_arg_doc(ONE_ARG.replace("Role A", "Role B", 1), formatted)
+    result, state, effects = save_attempt(seed, changed)
+
+    assert result["ok"] is False
+    assert result["missing_facts"] == [ONE_ARG]
+    assert effects == {"make_stores": 0, "render": 0, "artifact": 0, "tracking": 0}
+    assert state == {"base_latex": seed, "pk": "synthetic"}
+
+
+def test_save_one_arg_raw_suffix_disambiguates_spacing_siblings(save_attempt):
+    spaced = r"\role{Role A  | example-co | 2022--2024}"
+    seed = one_arg_doc(ONE_ARG, spaced)
+    changed = one_arg_doc(ONE_ARG.replace("Role A", "Role B", 1), spaced)
+    result, state, effects = save_attempt(seed, changed)
+
+    assert result["ok"] is True
+    assert state["tailored"] == changed
+    assert effects["artifact"] == 2

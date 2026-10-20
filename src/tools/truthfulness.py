@@ -232,6 +232,7 @@ class _TitleSlot:
     start: int
     end: int
     signature: tuple[str, ...]
+    exact_non_title: bool = False
 
 
 @dataclass(frozen=True)
@@ -242,6 +243,7 @@ class TitleOption:
     approved: tuple[str, ...]
     start: int
     end: int
+    exact_non_title: bool = False
 
 
 def _structural_title_slot(line: str) -> _TitleSlot | None:
@@ -265,10 +267,12 @@ def _structural_title_slot(line: str) -> _TitleSlot | None:
             return None
 
     pos, args = call.end(), []
-    for _ in range(arity):
+    while True:
         while pos < len(line) and line[pos].isspace():
             pos += 1
-        if pos >= len(line) or line[pos] != "{":
+        if pos == len(line):
+            break
+        if line[pos] != "{" or len(args) >= 4:
             return None
         start, depth, pos = pos + 1, 1, pos + 1
         while pos < len(line) and depth:
@@ -280,7 +284,45 @@ def _structural_title_slot(line: str) -> _TitleSlot | None:
         if depth:
             return None
         args.append((start, pos - 1))
-    if line[pos:].strip():
+
+    if macro == r"\role" and len(args) == 1:
+        # This macro stores title, employer and dates inside ONE braced value.
+        # A raw suffix is essential: normalized separators are not title edits.
+        start, end = args[0]
+        contents = line[start:end]
+        separators, depth = [], 0
+        for i, char in enumerate(contents):
+            if not _unescaped(contents, i):
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            elif char == "|" and depth == 0:
+                before = i
+                while before and contents[before - 1] in " \t":
+                    before -= 1
+                after = i + 1
+                while after < len(contents) and contents[after] in " \t":
+                    after += 1
+                separators.append((before, after))
+        if len(separators) < 2:
+            return None
+        title_end = separators[0][0]
+        employer = contents[separators[0][1]:separators[1][0]].strip()
+        date_end = separators[2][0] if len(separators) > 2 else len(contents)
+        dates = contents[separators[1][1]:date_end]
+        if not contents[:title_end].strip() or not employer or not dates.strip():
+            return None
+        return _TitleSlot(
+            line=line, employer=employer, title=contents[:title_end],
+            start=start, end=start + title_end,
+            # Include every delimiter and trailing segment without normalization.
+            signature=(macro.casefold(), contents[title_end:]),
+            exact_non_title=True,
+        )
+
+    if len(args) != arity:
         return None
     start, end = args[title_arg]
     title = line[start:end]
@@ -321,7 +363,11 @@ def eligible_title_options(
             continue
         prefix = re.match(r"\\[A-Za-z]+\s*\{([^{}]*)\}", line)
         if prefix:
-            uncertain_employers.add(prefix.group(1).strip())
+            if macro == r"\role" and "|" in prefix.group(1):
+                # A malformed segmented call cannot safely identify its employer.
+                uncertain_all = True
+            else:
+                uncertain_employers.add(prefix.group(1).strip())
         else:
             uncertain_all = True
 
@@ -338,6 +384,7 @@ def eligible_title_options(
         if approved:
             options.append(TitleOption(
                 slot.line, slot.title, approved, slot.start, slot.end,
+                exact_non_title=slot.exact_non_title,
             ))
     return tuple(options)
 
@@ -369,32 +416,59 @@ def validate(
     if not missing or not approved_titles:
         return missing
 
+    # Preserve normalized legacy matching above, but account for distinct raw
+    # siblings before granting exceptions. Otherwise two differently spaced
+    # segments can consume one another's title-only witness.
+    unclaimed = Counter(line for _, line in new_calls)
+    unmatched = []
+    for _, line in active_calls(base_latex, anchors):
+        if unclaimed[line]:
+            unclaimed[line] -= 1
+        else:
+            unmatched.append(line)
+    missing = []
+    for line in unmatched:
+        witness = next(
+            (candidate for candidate, count in unclaimed.items()
+             if count and _norm(candidate) == _norm(line)),
+            None,
+        )
+        if witness is None:
+            missing.append(line)
+        else:
+            unclaimed[witness] -= 1
+
     options = {
-        _norm(option.seed_line): option
+        option.seed_line: option
         for option in eligible_title_options(base_latex, approved_titles)
     }
     unresolved = []
     admitted = 0
     for line in missing:
-        option = options.get(_norm(line))
+        option = options.get(line)
         matched = False
         if option:
             for title in option.approved:
-                expected = _norm(line[:option.start] + title + line[option.end:])
-                if remaining[expected]:
-                    remaining[expected] -= 1
+                expected = line[:option.start] + title + line[option.end:]
+                witness = next(
+                    (candidate for candidate, count in unclaimed.items()
+                     if count and (candidate == expected if option.exact_non_title
+                                   else _norm(candidate) == _norm(expected))),
+                    None,
+                )
+                if witness is not None:
+                    unclaimed[witness] -= 1
                     admitted += 1
                     matched = True
                     break
         if not matched:
             unresolved.append(line)
 
-    if admitted and any(remaining.values()):
+    if admitted and any(unclaimed.values()):
         # The legacy guard permits extra anchors in an unchanged résumé; do
         # not expand that legacy allowance into a variant's active-call count.
         for _, line in new_calls:
-            normalized = _norm(line)
-            if remaining[normalized]:
+            if unclaimed[line]:
                 unresolved.append("Unexpected active role/heading: " + line)
-                remaining[normalized] -= 1
+                unclaimed[line] -= 1
     return unresolved

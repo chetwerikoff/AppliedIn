@@ -546,7 +546,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
                     app_name=_APP, session_service=sessions)
 
     msg = types.Content(role="user", parts=[types.Part(
-        text=f"Apply to this job: {row.get('title','')} at {row.get('company','')}. "
+        text=f"Apply to this job: {__import__('tools.posting_guard', fromlist=['analyze']).analyze(row.get('title',''))['text']} at {row.get('company','')}. "
              f"URL: {row.get('jd_url','')}")])
     from .graph import ScorerInvalidOutput
 
@@ -634,6 +634,14 @@ def _commit_posting_meta(pk: str, observed: dict, meta: dict,
     source_witness = (meta.get("source_kind") == "ats_html"
                       and meta.get("source_url") == current.get("jd_url")
                       and bool(meta["posting_guard"].get("source_verified")))
+    # The job title is also untrusted source text and appears in the initial
+    # evaluator prompt. Fold any title finding into the exact JD generation.
+    title_seen = pg.analyze(current.get("title") or "")
+    if title_seen["posting_guard"]["reasons"]:
+        meta = {**meta, **pg.merge(meta["text"],
+                                   title_seen["posting_guard"],
+                                   meta["posting_guard"],
+                                   source_witness=source_witness)}
     if not stores.tracking.update_posting_guard(
             pk, current, meta, source_witness=source_witness):
         return None
@@ -1208,7 +1216,9 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
     # have no Apply button and no way back.
     stores.tracking.set_status(pk, Status.TAILORING)
     try:
-        _run(_tailor_only(pk, state, row.get("title", ""), row.get("company", "")))
+        from tools import posting_guard as pg
+        _run(_tailor_only(pk, state, pg.analyze(row.get("title", ""))["text"],
+                          row.get("company", "")))
     except Exception as exc:  # noqa: BLE001 — the status must come back regardless
         stores.tracking.set_status(pk, status or Status.FOUND)
         log.exception("re-tailor failed for %s", pk)

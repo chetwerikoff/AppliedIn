@@ -74,10 +74,13 @@ def test_unapproved_other_employer_tex_and_non_title_edits_cannot_pass(options, 
 def test_repeated_or_ambiguous_same_employer_signatures_fail_closed(options):
     repeated = doc(A, A)
     ambiguous = doc(A, A.replace("Role A", "Role C"))
+    spacing_only = doc(A, r"\role{example-co} {Role Z} {2022--2024}")
     for seed, tailored in [
         (repeated, doc(A.replace("Role A", "Role B"), A)),
         (ambiguous, doc(A.replace("Role A", "Role B"),
                         A.replace("Role A", "Role C"))),
+        (spacing_only, doc(A.replace("Role A", "Role B"),
+                           r"\role{example-co} {Role Z} {2022--2024}")),
     ]:
         assert not eligible_title_options(seed, options)
         assert validate(seed, tailored, options)

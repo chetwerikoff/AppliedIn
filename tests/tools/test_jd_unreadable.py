@@ -41,7 +41,11 @@ _RealClient = httpx.Client
 @pytest.fixture(autouse=True)
 def _no_browser(monkeypatch):
     from tools import jd as _jd
+    # Most tests must not start a browser reader. Return its real adapter so
+    # synthetic reader tests can restore it after stubbing the runtime.
+    single_reader = _jd._from_chrome
     monkeypatch.setattr(_jd, "_from_chrome", lambda url, kind="jd": None)
+    return single_reader
 
 
 def _transport(handler):
@@ -181,7 +185,7 @@ def test_lever_plain_html_divergence_and_missing_html(monkeypatch):
     ("chrome", True), ("browser_skill", False),
 ])
 def test_single_browser_reader_whitespace_policy_binds_its_guard(
-        monkeypatch, engine, preserve_trailing):
+        monkeypatch, engine, preserve_trailing, _no_browser):
     """Legacy Chrome retains harmless source suffixes; BrowserSkill normalizes.
 
     Both must remove hostile lines *before* computing the matching generation.
@@ -196,15 +200,26 @@ def test_single_browser_reader_whitespace_policy_binds_its_guard(
     monkeypatch.setattr(browser_runtime, "configuration", lambda: {"engine": engine})
     monkeypatch.setattr(browser_runtime, "available", lambda: (True, ""))
 
+    calls = []
+
     async def reader(*args, **kwargs):
+        calls.append(kwargs["report_key"])
         return {"title": "Test Engineer", "description": raw}, ""
 
     monkeypatch.setattr(browser_runtime, "run_task", reader)
+    # The autouse fixture suppresses browser reads in other tests. Here the
+    # real JD adapter must run against the offline fake, not its empty stub.
+    monkeypatch.setattr(jd, "_from_chrome", _no_browser)
     url = "https://example.test/jobs/123"
     meta = jd.fetch_jd_meta(url)
     expected = safe if preserve_trailing else safe.strip()
     assert meta["text"] == expected
+    assert len(meta["text"].strip()) > 400  # Real requirements survive the hostile line.
     assert meta["posting_guard"]["status"] == "flagged"
-    assert "model_instruction" in meta["posting_guard"]["reasons"]
+    assert meta["posting_guard"]["reasons"] == ["model_instruction"]
+    assert meta["posting_guard"] == pg.analyze(
+        raw, strip_trailing=not preserve_trailing)["posting_guard"]
     assert pg.valid(meta["text"], meta["posting_guard"])
+    assert not pg.valid(meta["text"] + " ", meta["posting_guard"])
     assert jd.fetch_jd(url) == expected
+    assert calls == ["description", "description"]

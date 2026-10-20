@@ -171,6 +171,7 @@ class RedisTracking(AbstractTracking):
     def update_posting_guard(
         self, pk: str, observed: dict, inspected: dict | None = None, *,
         reviewed_generation: str | None = None, source_witness: bool = False,
+        settle_refusal: bool = False,
     ) -> bool:
         from core.ids import jd_hash
 
@@ -188,20 +189,26 @@ class RedisTracking(AbstractTracking):
                         pipe.unwatch()
                         return False
                     # A separate durable hold takes priority over review.
-                    if reviewed_generation is not None and pipe.get(hold) is not None:
+                    if (reviewed_generation is not None or settle_refusal) and pipe.get(hold) is not None:
                         pipe.unwatch()
                         return False
                     patch = guard_patch(current, inspected,
                                         reviewed_generation=reviewed_generation,
-                                        source_witness=source_witness)
+                                        source_witness=source_witness,
+                                        settle_refusal=settle_refusal)
                     if patch is None:
                         pipe.unwatch()
                         return False
+                    prev_status = current.get("status")
                     current.update(patch)
                     if "jd_text" in patch:
                         current["jd_hash"] = jd_hash(patch["jd_text"])
                     pipe.multi()
                     pipe.set(key, json.dumps(current, default=str))
+                    if current.get("status") != prev_status and not is_internal_pk(pk):
+                        if prev_status:
+                            pipe.srem(f"status:{prev_status}", pk)
+                        pipe.sadd(f"status:{current['status']}", pk)
                     if "jd_text" in patch:
                         pipe.hset("jdhash", current["jd_hash"], pk)
                     pipe.execute()

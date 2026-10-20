@@ -192,13 +192,18 @@ def normalize(raw: dict, company: str, provider: str, *,
         else str(raw.get("description") or "")[:100000]
     )
     incoming = raw.get("posting_guard")
-    if pg.valid(description, incoming):
+    # Directory provider results are flattened before crossing the pinned
+    # Node scanner. Even a forged or accidentally copied "clean" annotation
+    # cannot recreate the missing original HTML witness.
+    locally_verified = (provider == "web_search"
+                        and raw.get("verification") == "verified"
+                        and pg.valid(description, incoming))
+    if locally_verified and not directory_event:
         guarded = {"text": description, "posting_guard": incoming}
     else:
         guarded = pg.analyze(description, source_required=directory_event)
         if not directory_event:
-            # No original HTML in a feed, index hit or Cosign snippet is a
-            # source-inspection witness, even when the text exceeds 400 chars.
+            # Other board/index/snippet data has no original-source witness.
             guarded = pg.projection(guarded["text"], guarded["posting_guard"])
     title = pg.analyze(title)["text"]
     return {

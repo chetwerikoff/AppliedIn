@@ -188,11 +188,13 @@ def tenant_pin_row_allowed(row: dict | None, pk: str, board: str) -> bool:
     if any(row.get(field) not in (None, "", False, 0)
            for field in _PIN_SUBMISSION_FIELDS):
         return False
-    if any(row.get(key) not in (None, "", False, 0)
-           for key in row if isinstance(key, str)
-           and key.startswith(("browser_", "session_", "application_session",
-                               "form_", "apply_started_", "last_button",
-                               "last_url"))):
+    # Session/interaction attributes are evidence that execution reached a
+    # browser. Even an empty/malformed value cannot certify that no session
+    # occurred; fail closed instead of inferring a safe pre-browser history.
+    if any(isinstance(key, str) and key.startswith((
+            "browser_", "session_", "application_session", "form_",
+            "apply_started_", "last_button", "last_url"))
+           for key in row):
         return False
     # A request followed only by the pre-browser tenant-gate denial is allowed;
     # a different human/form gate or browser-session context is not evidence of

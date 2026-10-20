@@ -117,9 +117,7 @@ def board():
 @router.get("/job/{identity}")
 def job_detail(identity: str):
     """Read saved information only; opening a drawer never starts an agent."""
-    import html
-
-    from tools.jd import _text
+    from tools import posting_guard as pg
 
     with career_ops._LOCK:
         job = dict(career_ops._read()["jobs"].get(identity) or {})
@@ -132,11 +130,14 @@ def job_detail(identity: str):
         stores = career_ops.make_stores()
         tracked = stores.tracking.get(job["pk"]) or {}
         resume_url = _to_ui(tracked, stores.artifacts)["resume_url"]
-    description = tracked.get("jd_text") or job.get("description") or ""
-    description = html.unescape(_text(description))
+    raw = tracked.get("jd_text") or job.get("description") or ""
+    source = tracked if tracked.get("jd_text") else job
+    guarded = pg.projection(raw, source.get("posting_guard"))
     return {
         "id": identity,
-        "description": description,
+        "description": guarded["text"],
+        "posting_guard": {**guarded["posting_guard"],
+                          "messages": pg.reason_messages(guarded["posting_guard"])},
         "resume_url": resume_url,
         "match_score": tracked.get("match_score"),
         "status": tracked.get("status", ""),

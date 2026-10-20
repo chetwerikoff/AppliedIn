@@ -311,7 +311,7 @@ def handoff(message: str, step: dict) -> dict:
 _GATE_DIAGNOSTICS = frozenset({
     'owner_question', 'defect_structural', 'defect_provenance',
     'defect_tenant', 'defect_witness', 'defect_ashby_root_identity',
-    'defect_greenhouse_tenant_alias',
+    'defect_greenhouse_tenant_alias', 'posting_guard_review_required',
 })
 
 
@@ -733,6 +733,60 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
         raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 
 
+
+def _guard_model_page(model_page: dict, pk: str, company: str, *,
+                      fixture_context=None) -> dict:
+    """Guard Python-assembled page descriptions before the next model decision.
+
+    The native browser observation occurs earlier and is not covered here.
+    Keep structural controls/approved choices intact; only JD-derived string
+    fields can be replaced. An invalid field is an error, never model input.
+    """
+    from tools import posting_guard as pg
+
+    safe = dict(model_page)
+    reasons: set[str] = set()
+    for field in ('text', 'description', 'title', 'summary',
+                  'job_description', 'snippet'):
+        if field not in safe:
+            continue
+        checked = pg.analyze(safe[field])
+        safe[field] = checked['text']
+        reasons.update(checked['posting_guard']['reasons'])
+    if not reasons:
+        return safe
+    if fixture_context is not None:
+        raise Gate('Posting page contained a new suspicious instruction.',
+                   reason='posting_guard_review_required')
+    try:
+        from core.stores import make_stores
+
+        tracking = make_stores().tracking
+        current = tracking.get_current(pk)
+        if (not current or current.get('pk') != pk
+                or current.get('company') != company):
+            raise Gate('Tracked posting identity changed.',
+                       reason='posting_guard_review_required')
+        incoming = pg.analyze(
+            current.get('jd_text') or '', previous={'reasons': sorted(reasons)})
+        combined = pg.merge(
+            current.get('jd_text') or '', incoming['posting_guard'],
+            current.get('posting_guard'))
+        if not tracking.update_posting_guard(pk, current, combined):
+            raise Gate('Posting safety signal could not be recorded.',
+                       reason='posting_guard_review_required')
+        newest = tracking.get_current(pk)
+        if not newest or not pg.authorised(newest):
+            raise Gate('New posting finding needs current owner review.',
+                       reason='posting_guard_review_required')
+    except Gate:
+        raise
+    except Exception as exc:
+        raise Gate('Current posting safety signal is unavailable.',
+                   reason='posting_guard_review_required') from exc
+    return safe
+
+
 def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     """A leased worker must re-read the human outcome and hold at the IPC edge."""
     ctx = _synthetic(fixture_context, pk=pk)
@@ -749,6 +803,20 @@ def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     if (row.get('status') != 'needs_human'
             or row.get('gate_reason') != 'submit_uncertain' or not held):
         raise Gate('Human outcome changed or submission hold was cleared; no click is safe.')
+    # Guard source findings can arrive even after a hold was created. The
+    # pre-click read is the last available code-controlled boundary.
+    if ctx is None:
+        from tools import posting_guard as pg
+        try:
+            current = tracking.get_current(pk)
+            if not current or not pg.authorised(current):
+                raise Gate('Posting evidence changed since the job review.',
+                           reason='posting_guard_review_required')
+        except Gate:
+            raise
+        except Exception as exc:
+            raise Gate('Posting safety evidence unavailable before click.',
+                       reason='posting_guard_review_required') from exc
 
 
 def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
@@ -762,6 +830,25 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
     if (ctx.duplicate_refusal() if ctx else _duplicate_refusal(pk)):
         raise Gate('This job is already applied; no duplicate is permitted.')
     row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+    if ctx is None:
+        from tools import posting_guard as pg
+        try:
+            from core.stores import make_stores
+            current = make_stores().tracking.get_current(pk)
+            if not current or not pg.authorised(current):
+                raise Gate('Current posting generation requires explicit review.',
+                           reason='posting_guard_review_required')
+            row = current
+        except Gate:
+            raise
+        except Exception as exc:
+            raise Gate('Current posting safety witness is unavailable.',
+                       reason='posting_guard_review_required') from exc
+    elif isinstance(row.get('posting_guard'), dict) and row['posting_guard']:
+        from tools import posting_guard as pg
+        if not pg.authorised(row):
+            raise Gate('Synthetic posting safety witness is not authorized.',
+                       reason='posting_guard_review_required')
     if ctx is None:
         # A queue-owned company lease AND its exact pk are necessary for a
         # production form to open. Neither witness confers caller identity:
@@ -4412,6 +4499,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         model_page['entry'] = {k: v for k, v in page['entry'].items()
                                                if k not in {'upload_tree', 'native_candidates',
                                                             'quarantined_native_owners'}}
+                    model_page = _guard_model_page(
+                        model_page, pk, company, fixture_context=ctx)
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')

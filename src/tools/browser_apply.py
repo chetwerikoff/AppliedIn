@@ -87,9 +87,27 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ""
     from tools import submit_hold
 
     if pk:
+        from tools import posting_guard as pg
+
         stores = make_stores()
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
-            return {'status': 'uncertain', 'reason': 'uncertain', 'detail': submit_hold.REASON}
+        try:
+            row = stores.tracking.get_current(pk)
+            # The independently stored hold outranks an ordinary review gate.
+            if submit_hold.blocked(pk, row or {}, tracking=stores.tracking):
+                return {'status': 'uncertain', 'reason': 'uncertain', 'detail': submit_hold.REASON}
+            if (not isinstance(row, dict) or not row.get("company")
+                    or row.get("pk") != pk
+                    or row.get("company") != company or row.get("jd_url") != url
+                    or row.get("status") != "submitting"
+                    or row.get("confirmation_id") or row.get("possible_submission")
+                    or not pg.authorised(row, text=jd_text)):
+                return {"status": "gate", "reason": "posting_guard_review_required",
+                        "detail": "The current posting safety review or JD binding is missing; "
+                                  "refresh this job and review its current generation."}
+        except Exception:
+            log.exception("posting guard current-row preflight failed; browser not entered")
+            return {"status": "gate", "reason": "posting_guard_review_required",
+                    "detail": "The current posting safety state could not be verified."}
     facts = dict(facts)
     full = (facts.get("Full name") or facts.get("Name") or "").strip()
     if full:
@@ -162,7 +180,9 @@ def _map_fields(fields: list, facts: dict, company: str, jd_text: str) -> dict:
     # posting and read as a candidate who had not looked at the role. The JD is
     # only ever used to CHOOSE between the owner's own answers; values are still
     # substituted in code, so nothing here can invent one.
-    role = (jd_text or "").strip()
+    from tools import posting_guard as pg
+
+    role = pg.analyze(jd_text or "")["text"].strip()
     context = (f"THE ROLE — {company}:\n{role[:1500]}\n\n" if role
                else f"THE ROLE: a posting at {company}.\n\n")
     prompt = (

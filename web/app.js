@@ -1174,6 +1174,30 @@ function aliasById(id) {
   return null;
 }
 
+// Missing evidence must never be presented as an owner-reviewed generation.
+function displayedGuardGeneration(r) {
+  const generation = r?.posting_guard?.generation;
+  return typeof generation === "string" && generation.trim() ? generation : null;
+}
+function displayedGuardGenerations(rows) {
+  const entries = rows.flatMap((r) => {
+    const generation = displayedGuardGeneration(r);
+    return generation === null ? [] : [[r.pk, generation]];
+  });
+  return entries.length ? {guard_generations: Object.fromEntries(entries)} : {};
+}
+
+function postingGuardHtml(r) {
+  const g = r && r.posting_guard;
+  if (!g || !g.status || g.status === "clean") return "";
+  const reasons = (Array.isArray(g.messages) && g.messages.length
+    ? g.messages : g.reasons || []).slice(0, 6);
+  const detail = reasons.length ? reasons.map((reason) => esc(reason)).join(" · ")
+    : "Original posting requires a current safety review.";
+  return `<div class="pg-warning" role="note"><strong>Posting safety: ${esc(g.status)}</strong>
+    <span>${detail}</span></div>`;
+}
+
 function laneCard(r) {
   let retry = "";
   if (isReadOnly(r)) {
@@ -1217,6 +1241,7 @@ function laneCard(r) {
     ${locHtml(r.location)}
     ${profHtml(r.profile_id, r.company)}
     ${live}
+    ${postingGuardHtml(r)}
     <div class="kc-foot">${scoreHtml(r.match_score)}${tagHtml(r.status)}${rt}${aged}${retry}</div>
   </div>`;
 }
@@ -1715,7 +1740,8 @@ async function reviewAction(action, company, explicitPks = null, day = null) {
   paintReviewControls();
   try {
     const result = await post(action === "apply" ? "/actions/apply-selection" : "/actions/review-decision", {
-      company, pks: picks.map((r) => r.pk), ...(action === "apply" ? {} : {action}),
+      company, pks: picks.map((r) => r.pk),
+      ...(action === "apply" ? displayedGuardGenerations(picks) : {action}),
     });
     if (action === "apply") {
       if (!result?.ok) {
@@ -4444,7 +4470,10 @@ function paneAction(act, pk, el) {
     });
   } else if (act === "apply-now") {
     markBusy(pk, "starting…");
-    post(`/actions/apply-now/${encodeURIComponent(pk)}`).then((r) => {
+    const displayed = state.apps.find((r) => r.pk === pk);
+    const generation = displayedGuardGeneration(displayed);
+    post(`/actions/apply-now/${encodeURIComponent(pk)}`,
+      generation === null ? {} : {posting_guard_generation: generation}).then((r) => {
       toast(!r || !r.ok ? (r && r.error) || "Could not start it."
         : r.retailoring ? "Your base résumé changed since this was tailored — re-tailoring it first (about two minutes), then applying."
         : "Applying to this one now.");
@@ -4760,6 +4789,7 @@ function openDrawer(pk) {
     ${guarded ? routeNotice(r) : trackerEditor(r)}
     ${gate}
     ${failBlock}
+    ${postingGuardHtml(r)}
     ${r.jd_read_error ? `<div class="section drawer-fail"><div class="section-t">Posting read paused</div><div class="fail-text">${esc(r.jd_read_error)}</div><p>Kept in Found. Run preparation again when the reader is available.</p></div>` : ""}
     ${jdBlock}
     ${closed}

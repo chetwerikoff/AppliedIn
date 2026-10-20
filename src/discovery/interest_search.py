@@ -195,7 +195,7 @@ def _verify_lead(row: dict) -> dict | None:
     """
     import httpx
 
-    from tools.jd import _text
+    from tools.jd import _guarded
 
     parsed = urlsplit(row["url"])
     host, parts = parsed.hostname, parsed.path.strip("/").split("/")
@@ -217,7 +217,11 @@ def _verify_lead(row: dict) -> dict | None:
                     return None
                 response.raise_for_status()
                 job = response.json()
-                text, title = _text(job.get("content", "")), job.get("title", "")
+                title = job.get("title", "")
+                source = job.get("content")
+                guarded = _guarded(str(title), str(source or ""),
+                                   html_variants=[source] if source else [],
+                                   source_required=True)
             elif host == "jobs.ashbyhq.com":
                 response = client.get(f"https://api.ashbyhq.com/posting-api/job-board/{org}")
                 response.raise_for_status()
@@ -235,7 +239,11 @@ def _verify_lead(row: dict) -> dict | None:
                 )
                 if job is None:
                     return None
-                text, title = job.get("descriptionPlain", ""), job.get("title", "")
+                title = job.get("title", "")
+                source = job.get("descriptionHtml")
+                guarded = _guarded(str(title), str(job.get("descriptionPlain") or source or ""),
+                                   html_variants=[source] if source else [],
+                                   source_required=True)
             elif host in ("jobs.lever.co", "jobs.eu.lever.co"):
                 api = "api.eu.lever.co" if host == "jobs.eu.lever.co" else "api.lever.co"
                 response = client.get(f"https://{api}/v0/postings/{org}/{job_id}")
@@ -243,11 +251,20 @@ def _verify_lead(row: dict) -> dict | None:
                     return None
                 response.raise_for_status()
                 job = response.json()
-                text, title = job.get("descriptionPlain", ""), job.get("text", "")
+                title = job.get("text", "")
+                sources = [job["description"]] if job.get("description") else []
+                sources.extend(part["content"] for part in job.get("lists") or []
+                               if isinstance(part, dict) and part.get("content"))
+                guarded = _guarded(str(title), str(job.get("descriptionPlain") or
+                                                    job.get("description") or ""),
+                                   html_variants=sources, source_required=True,
+                                   source_complete=bool(job.get("description")))
             else:
                 return row
-        if title and len(text) >= 400:
-            return {**row, "title": title, "description": text, "verification": "verified"}
+        if title and len(guarded["text"]) >= 400:
+            return {**row, "title": guarded["title"], "description": guarded["text"],
+                    "posting_guard": guarded["posting_guard"],
+                    "verification": "verified"}
     except (httpx.HTTPError, ValueError, TypeError):
         pass
     return row

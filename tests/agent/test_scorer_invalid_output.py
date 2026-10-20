@@ -21,11 +21,13 @@ from pydantic import Field
 from agent import graph as G
 from agent import run as R
 from core.models import Status
+from core.storage.base import guard_observation_matches, guard_patch
+from tools import posting_guard as pg
 from tools.schema import MatchScore
 
 
 JD = ("example-co seeks a synthetic platform engineer to maintain test services, "
-      "design APIs, validate integration behavior, and document release gates. " * 2)
+      "design APIs, validate integration behavior, and document release gates. " * 2).strip()
 SEED = r"Test User: synthetic engineer; \section{Experience} API engineering."
 SYNTHETIC_STATE = {
     "pk": "example-co#synthetic-1", "company": "example-co",
@@ -64,6 +66,24 @@ class _StrictTracking:
 
     def get(self, pk):
         return dict(self.row)
+
+    def get_current(self, pk):
+        return self.get(pk)
+
+    def update_posting_guard(self, pk, observed, inspected=None, *,
+                             reviewed_generation=None, source_witness=False,
+                             settle_refusal=False):
+        current = self.get_current(pk)
+        if current.get("pk") != pk or not guard_observation_matches(current, observed):
+            return False
+        patch = guard_patch(current, inspected,
+                            reviewed_generation=reviewed_generation,
+                            source_witness=source_witness,
+                            settle_refusal=settle_refusal)
+        if patch is None:
+            return False
+        self.row.update(patch)
+        return True
 
     def set_status(self, pk, status, **kwargs):
         assert isinstance(status, Status), f"tracking received non-enum: {status!r}"
@@ -129,6 +149,7 @@ def harness(monkeypatch, request):
     pk = SYNTHETIC_STATE["pk"]
     row = {"pk": pk, "company": "example-co", "title": "Synthetic Platform Engineer",
            "jd_url": "https://example.com/jobs/synthetic", "jd_text": JD,
+           "posting_guard": pg.analyze(JD)["posting_guard"],
            "status": "found", "match_score": 9,
            "resume_s3_key": "resumes/historical.pdf"}
     tracking = _StrictTracking(row)
@@ -149,9 +170,10 @@ def harness(monkeypatch, request):
     monkeypatch.setattr(G._steering, "instructions", lambda: "Synthetic steering: no invented claims")
 
     async def _jd(_):
-        return JD
+        # The runner consumes metadata, never an untracked plain-string fetch.
+        return pg.analyze(JD)
 
-    monkeypatch.setattr(R, "_jd_text", _jd)
+    monkeypatch.setattr(R, "_jd_meta", _jd)
     saved = []
     monkeypatch.setattr(R, "_save_output", lambda pk, row, jd, stores: saved.append(dict(row)))
     # A previous session can contain 9. Neither the runner nor the scorer may

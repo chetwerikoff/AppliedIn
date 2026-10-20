@@ -508,7 +508,7 @@ def test_teamtailor_untrimmed_foreign_rss_link_never_reaches_normalizer(
 def test_feed_jd_retained_and_deferred_reads_use_only_canonical_url(
         ats, kind, monkeypatch):
     from agent.run import _jd_text
-    from tools import jd
+    from tools import jd, posting_guard as pg
 
     path = "/jobs/backend-123" if ats == "teamtailor" else "/o/backend-123"
     foreign = ("https://careers.example-co.test" if ats == "teamtailor"
@@ -537,11 +537,15 @@ def test_feed_jd_retained_and_deferred_reads_use_only_canonical_url(
 
     def reader(url, reader_kind):
         calls.append((url, reader_kind))
-        return fetched
+        return pg.analyze(fetched)
 
-    monkeypatch.setattr(jd, "fetch_jd", reader)
+    monkeypatch.setattr(jd, "fetch_jd_meta", reader)
+    # The normal feed fixture has already selected its owned plain JD;
+    # this test checks canonical deferred reads, not legacy provenance repair.
+    prior = pg.analyze(record.jd_text)
     result = asyncio.run(_jd_text({"jd_url": record.jd_url,
-                                   "jd_text": record.jd_text}))
+                                   "jd_text": prior["text"],
+                                   "posting_guard": prior["posting_guard"]}))
     if kind == "long":
         assert len(record.jd_text) >= 400
         assert result == record.jd_text

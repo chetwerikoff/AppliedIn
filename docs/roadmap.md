@@ -54,6 +54,17 @@ Depends on Phase 1 item 1 merged and Phase 2 item 1 merged.
 4. Multi-step forms: after real attempts, add support for the form patterns that gated
    (for example Workday steps), each with a synthetic local fixture test.
 
+## Posting safety — Issue #136 (implementation PR, verification pending)
+
+The T3 posting guard sanitizes untrusted ATS, crawler and browser JD text in
+code, retains source-evidence reasons per tracked JD generation, and requires a
+currently displayed job-specific review before admitting flagged/unchecked/error
+material to a browser apply. A Career Ops directory description without matched
+original ATS HTML is **unchecked**, regardless of length. Synthetic-only offline
+regressions are part of the implementation PR; **CI, merge, and owner/operator
+live smoke are not asserted here**. Never use a live application as a smoke test.
+No approval, queueing or submission belongs to a fixture.
+
 ## Deferred
 
 - A second browser engine (Grok Bot). Not before Phase 3 shows the BrowserSkill path works.

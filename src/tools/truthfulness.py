@@ -231,7 +231,7 @@ class _TitleSlot:
     title: str
     start: int
     end: int
-    signature: str
+    signature: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -284,13 +284,19 @@ def _title_slot(line: str) -> _TitleSlot | None:
         return None
     start, end = args[title_arg]
     title = line[start:end]
-    if not title.strip() or "{" in title or "}" in title or "%" in title:
+    if (not title.strip() or "{" in title or "}" in title or "%" in title
+            or "\\" in title.replace(r"\&", "")):
         return None
     employer_start, employer_end = args[employer_arg]
     employer = line[employer_start:employer_end].strip()
     return _TitleSlot(
         line=line, employer=employer, title=title, start=start, end=end,
-        signature=_norm(line[:start] + "<title-slot>" + line[end:]),
+        # Identify roles by parsed NON-TITLE argument values, not the spacing
+        # between brace groups. Formatting alone cannot make two positions
+        # with the same employer/dates uniquely identifiable.
+        signature=(macro.casefold(), *(
+            _norm(line[a:b]) for i, (a, b) in enumerate(args) if i != title_arg
+        )),
     )
 
 

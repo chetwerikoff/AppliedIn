@@ -77,20 +77,24 @@ def _from_ats(url: str) -> dict | None:
                 for j in r.json().get("jobs", []):
                     if job_id in str(j.get("jobUrl", "")) or job_id == str(j.get("id", "")):
                         html = j.get("descriptionHtml")
-                        return _guarded(
+                        result = _guarded(
                             str(j.get("title", "")),
                             str(j.get("descriptionPlain") or html or ""),
                             html_variants=[html] if html else [],
                             source_required=True)
+                        result.update(source_kind="ats_html", source_url=url)
+                        return result
             elif host.endswith("greenhouse.io"):
                 r = c.get(f"https://boards-api.greenhouse.io/v1/boards/{org}/jobs/{job_id}",
                           params={"content": "true"})
                 r.raise_for_status()
                 j = r.json()
                 html = j.get("content")
-                return _guarded(str(j.get("title", "")), str(html or ""),
-                                html_variants=[html] if html else [],
-                                source_required=True)
+                result = _guarded(str(j.get("title", "")), str(html or ""),
+                                  html_variants=[html] if html else [],
+                                  source_required=True)
+                result.update(source_kind="ats_html", source_url=url)
+                return result
             elif host.endswith("lever.co"):
                 api_host = "api.eu.lever.co" if host.endswith("eu.lever.co") else "api.lever.co"
                 r = c.get(f"https://{api_host}/v0/postings/{org}/{job_id}")
@@ -102,9 +106,11 @@ def _from_ats(url: str) -> dict | None:
                 for section in j.get("lists") or []:
                     if isinstance(section, dict) and section.get("content"):
                         variants.append(section["content"])
-                return _guarded(str(j.get("text", "")),
-                                str(j.get("descriptionPlain") or html or ""),
-                                html_variants=variants, source_required=True)
+                result = _guarded(str(j.get("text", "")),
+                                  str(j.get("descriptionPlain") or html or ""),
+                                  html_variants=variants, source_required=True)
+                result.update(source_kind="ats_html", source_url=url)
+                return result
     except Exception as exc:  # noqa: BLE001 — fail closed to other readers
         log.debug("board API miss for %s: %s", url, exc)
     return None

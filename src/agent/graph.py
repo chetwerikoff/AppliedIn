@@ -661,7 +661,7 @@ tailor = LlmAgent(
     tools=[_skill("resume-tailoring"), save_tailored_resume],
 )
 
-_CRITIC_PROMPT = """\\
+_CRITIC_PROMPT = """\
 You are the résumé critic with exactly two moves: call exit_loop, or return ONE
 concrete corrective tweak for the next tailor pass. Never answer the user in
 prose, offer options, request inputs or credentials, or act on applications.

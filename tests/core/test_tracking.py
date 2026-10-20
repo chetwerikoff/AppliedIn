@@ -760,3 +760,190 @@ def test_redis_initial_board_pin_is_in_conditional_value(monkeypatch):
     assert all(row["pk"] == job.pk and row["job_id"] == "731205" for _, row, _ in puts)
     assert len(puts) == 2
     assert [row["greenhouse_board"] for _, row, _ in puts] == ["example-board", "other-board"]
+
+
+# Issue #138: missing Greenhouse board pin only, with original row witnesses.
+def _pin_seed(store):
+    job = JobRecord(
+        company="example-co", job_id="731205", title="Staff Platform Engineer",
+        jd_url="https://careers.example-co.test/openings/engineer?gh_jid=731205",
+        jd_text="synthetic", ats="greenhouse",
+    )
+    assert store.put_new(job)
+    store.set_status(
+        job.pk, Status.ERROR, attempts=4,
+        apply_requested_at="2026-10-20T01:00:00Z",
+        fail_kind="defect_greenhouse_tenant_alias",
+        gate_reason="defect_greenhouse_tenant_alias",
+        approval_status="pending", approved_at=None, jd_read_revision=3,
+        note="Synthetic request stopped before any browser",
+    )
+    return job, deepcopy(store.get(job.pk))
+
+
+def test_missing_pin_is_the_only_storage_change_on_both_backends(repair_backend):
+    store = repair_backend
+    job, before = _pin_seed(store)
+    before_indexes = _indexes(store, job)
+    assert store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert store.get(job.pk) == {**before, "greenhouse_board": "example-board"}
+    assert _indexes(store, job) == before_indexes
+    assert not store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert _indexes(store, job) == before_indexes
+
+
+def test_redis_pin_watches_row_and_empty_independent_hold(monkeypatch):
+    raw = fakeredis.FakeRedis(decode_responses=True)
+    store = RedisTracking(raw)
+    job, before = _pin_seed(store)
+    raw.set(f"submit_hold:{job.pk}", "")
+    assert not store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert store.get(job.pk) == before
+    raw.delete(f"submit_hold:{job.pk}")
+    watched = []
+    original_pipeline = raw.pipeline
+
+    def spy_pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        original_watch = pipe.watch
+
+        def watched_keys(*keys):
+            watched.extend(keys)
+            return original_watch(*keys)
+        pipe.watch = watched_keys
+        return pipe
+
+    monkeypatch.setattr(raw, "pipeline", spy_pipeline)
+    assert store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert f"app:{job.pk}" in watched
+    assert f"submit_hold:{job.pk}" in watched
+
+
+@pytest.mark.parametrize("changed", [
+    {"status": "submitting"}, {"approval_status": "approved"},
+    {"jd_read_revision": 7}, {"possible_submission": True},
+    {"apply_requested_at": "2026-10-21T00:00:00Z"},
+])
+def test_redis_pin_original_witness_rejects_race(monkeypatch, changed):
+    raw = fakeredis.FakeRedis(decode_responses=True)
+    store = RedisTracking(raw)
+    job, before = _pin_seed(store)
+    pipeline = raw.pipeline
+    injected = [False]
+
+    def concurrent_pipeline(*args, **kwargs):
+        pipe = pipeline(*args, **kwargs)
+        original_execute = pipe.execute
+
+        def execute(*args, **kwargs):
+            if not injected[0]:
+                injected[0] = True
+                row = store.get(job.pk)
+                row.update(changed)
+                raw.set(f"app:{job.pk}", json.dumps(row))
+            return original_execute(*args, **kwargs)
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(raw, "pipeline", concurrent_pipeline)
+    assert not store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert injected[0]
+    assert store.get(job.pk) == {**before, **changed}
+
+
+def test_redis_status_pre_read_then_late_write_preserves_new_pin(monkeypatch):
+    """An earlier set_status read cannot overwrite a committed pin."""
+    raw = fakeredis.FakeRedis(decode_responses=True)
+    store = RedisTracking(raw)
+    job, before = _pin_seed(store)
+    original_pipeline = raw.pipeline
+    injected = [False]
+
+    def racing_pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        original_get = pipe.get
+
+        def get(key):
+            old_value = original_get(key)
+            if key == f"app:{job.pk}" and not injected[0]:
+                injected[0] = True
+                # The proof commits AFTER set_status has read under WATCH,
+                # but BEFORE that writer executes its full-row transaction.
+                assert store.add_missing_greenhouse_pin(
+                    job.pk, "example-board", expected_row=before)
+            return old_value
+        pipe.get = get
+        return pipe
+
+    monkeypatch.setattr(raw, "pipeline", racing_pipeline)
+    store.set_status(job.pk, Status.TAILORED, note="status writer updated")
+    after = store.get(job.pk)
+    assert injected[0]
+    assert after["greenhouse_board"] == "example-board"
+    assert after["status"] == "tailored"
+    assert after["note"] == "status writer updated"
+    assert after["apply_requested_at"] == before["apply_requested_at"]
+    assert store.status_counts()["tailored"] == 1
+    assert store.status_counts().get("error", 0) == 0
+    assert store.find_by_jd_hash(job.jd_hash) == job.pk
+
+
+def test_dynamo_pin_consistent_read_and_row_local_partial_condition(aws, monkeypatch):
+    make_applications_table()
+    store = TrackingStore("applications")
+    job, before = _pin_seed(store)
+    reads, writes = [], []
+    read = store._table.get_item
+    update = store._table.update_item
+
+    def spy_read(**kwargs):
+        reads.append(dict(kwargs))
+        return read(**kwargs)
+
+    def spy_update(**kwargs):
+        writes.append(dict(kwargs))
+        return update(**kwargs)
+
+    monkeypatch.setattr(store._table, "get_item", spy_read)
+    monkeypatch.setattr(store._table, "update_item", spy_update)
+    assert store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert reads == [{"Key": {"pk": job.pk}, "ConsistentRead": True}]
+    assert len(writes) == 1
+    call = writes[0]
+    assert call["UpdateExpression"] == "SET #pin = :board"
+    assert "attribute_exists(#pk)" in call["ConditionExpression"]
+    assert "attribute_not_exists(#pin)" in call["ConditionExpression"]
+    assert "submit_hold" in call["ExpressionAttributeNames"].values()
+    assert "approval_status" in call["ExpressionAttributeNames"].values()
+    assert store.get(job.pk) == {**before, "greenhouse_board": "example-board"}
+
+
+@pytest.mark.parametrize("changed", [
+    {"status": "submitting"}, {"jd_read_revision": 4},
+    {"approval_status": "approved"}, {"possible_submission": True},
+    {"submit_hold": None},
+])
+def test_dynamo_pin_rejects_row_local_intervening_witness(aws, monkeypatch, changed):
+    make_applications_table()
+    store = TrackingStore("applications")
+    job, before = _pin_seed(store)
+    original_update = store._table.update_item
+    injected = [False]
+
+    def compete(**kwargs):
+        if not injected[0]:
+            injected[0] = True
+            store._table.put_item(Item={**store.get(job.pk), **changed})
+        return original_update(**kwargs)
+
+    monkeypatch.setattr(store._table, "update_item", compete)
+    assert not store.add_missing_greenhouse_pin(
+        job.pk, "example-board", expected_row=before)
+    assert injected[0]
+    assert store.get(job.pk) == {**before, **changed}

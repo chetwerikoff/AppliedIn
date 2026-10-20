@@ -130,23 +130,103 @@ companies:
     mode: gated
 ```
 
-Only postings returned by the *explicit* `discovery: browser` production
-listing are considered for Greenhouse wrapper normalization. Each must have an
-exact HTTPS employer-origin URL within the configured host and path, a sole
-numeric `?gh_jid=<digits>` query, and exactly one matching job in that
-configured board's public jobs feed. The new tracking row records the numeric
-job ID, exact wrapper URL and an immutable initial `greenhouse_board` pin.
-An unconfigured wrapper or failed/ambiguous job witness stays ordinary crawl
-discovery; its URL does not authorize an application alias.
+Under #118, only postings returned by the *explicit* `discovery: browser`
+listing are considered for **new query-form** Greenhouse wrapper normalization.
+The browser path still requires an exact HTTPS employer URL containing only
+`?gh_jid=<digits>` and exactly one matching configured-board feed job.
+Its initial tracking row preserves the employer URL and stores the board pin.
+Unconfigured browser wrappers, ordinary query-form sitemap results and custom
+crawl/browser fallback are **not** promoted. Native feeds are unchanged.
 
-Ordinary `discovery: crawl` (including browser fallback) and sitemap results
-never promote wrappers, even if their URL carries a matching `gh_jid`. Native
-Greenhouse feeds and unrelated ATS paths are unchanged. At application entry,
-the current watchlist and stored pin must still agree. A missing/stale pin or
-changed board, host or path gates before application-browser navigation.
-Remediate by independently re-verifying the watchlist entry, redeploying and
-discovering a **new** record; do not relabel or migrate old tracking rows.
-Tenant admission is not submit or human approval: all existing guards remain.
+Issue #138 adds only two independently reviewed **data** exceptions to #118:
+an operator-only, one-exact-PK old query-form proof/pin, and a uniquely
+configured `greenhouse` / `discovery: crawl` numeric-terminal
+employer-sitemap posting. Neither changes application-entry code or makes a
+numeric-terminal posting eligible for the existing application route.
+
+
+### Issue #138: strictly verified data-only tenant pin and sitemap evidence
+
+A one-shot `discovery.tenant_pin.rederive_one(pk)` reads exactly one
+**original** tracking PK through the existing store factory and reads the
+deployed watchlist via its loader. It defaults to a **write-free dry-run** and
+reports the proof, conflict or next permitted action. An optional commit
+requires a separately approved operator invocation (`commit=True,
+operator_authorized=True`) **after** reviewed deployment and an idle-only
+restart; fleet work does not execute it on live data. It never scans or rekeys
+historic rows, clears history, requeues, approves or opens a browser.
+
+Before even considering a pin, independently review a **single** deployed
+company-wide ATS/board/HTTPS careers-scope mapping (not a resolver guess,
+redirect, iframe or successful board probe) and prove the **same original job
+ID** in exactly one *current* board feed row. For Greenhouse the feed must
+supply a **nonempty exact canonical hosted** `absolute_url` with
+`https://boards.greenhouse.io/<board>/jobs/<numeric-id>` or
+`https://job-boards.greenhouse.io/<board>/jobs/<numeric-id>`.
+A missing URL, employer-wrapper URL, different board, alternate host, port,
+query, encoded path or conflicting ID cannot establish that job witness.
+
+An old canonical-PK `ats=greenhouse` row with an exact employer-origin
+`?gh_jid=<digits>` URL can gain **only a genuinely absent**
+`greenhouse_board` at the same PK, conditionally against the original
+row and safety witnesses. Present, empty or conflicting pins are never
+overwritten. A stable `apply_requested_at` with attempts and the
+**pre-browser** tenant-gate denial is not itself disqualifying: the request,
+approval fields, attempts, reader revisions, status and history stay
+byte-identical. Any possible submit, submitted/submitting/manual-applied state,
+hold, browser session or changed witness is a no-mutation manual review.
+Canonical Ashby/Lever UUID, ATS and strict hosted URL identities are only
+verified against their **own** exact current board jobs, with **zero writes**
+and no vendor pin schema.
+
+Redis atomically watches both the original `app:<pk>` row and the
+independent `submit_hold:<pk>` key (even a present empty hold blocks);
+its status writer merges against the current row so a later stale status
+update cannot erase a pin. DynamoDB separately observes the application row
+strongly consistently and uses a no-upsert, conditionally partial
+`UpdateItem` on row-local identity, status and protected witnesses.
+DynamoDB does **not** promise atomicity with Redis's independent hold key.
+
+The uniquely deployed gated Greenhouse/crawl exception reuses existing bounded
+sitemap XML discovery to keep a raw URL before title extraction loses a numeric
+terminal path such as `/openings/job/731205`. Only an exact HTTPS
+careers-host/path, posting marker and final decimal job ID are accepted. The
+verified hosted feed supplies the actual title, location and
+`first_published`; sitemap `lastmod` never makes an old job
+fresh. Normal company preferences, relevance, title screening, age filtering,
+conditional `put_new`, seen and enqueue still apply. This pass also
+runs alongside nonempty partial HTTP listings. Same-canonical-PK collisions
+never overwrite or repair a prior row, **including an old relative href**:
+both seen-ledger and conditional-create conflicts skip duplicate URL repair.
+Competing observed identities are reported for manual review. The URL seen
+ledger is not a cross-PK identity index; no universal different-PK uniqueness
+or automatic historical merge is claimed.
+
+**Operator dry-run and adoption interpretation:** (a) a dry-run changes no
+data; a separately authorized **committed** Greenhouse pin is immediately
+relevant to existing **query-form** tenant admission on the already deployed
+application code, (b) a pin is tenant evidence, **never** human approval:
+existing approval, duplicate, hold, provenance, navigation and submit guards,
+and application-entry **code**, remain unchanged, and (c) changing the
+Databricks watchlist to a **nonempty independently verified board** changes
+still-unpinned rows' diagnostic reason from
+`defect_greenhouse_tenant_alias` to `defect_tenant` — **not**
+to successful tenant admission. Numeric-terminal suffix URLs are not asserted
+application-route eligible by #138.
+
+If Databricks company-wide board ownership is not independently proved from an
+official public employer-to-board link or equivalent source, leave its tracked
+watchlist tuple unchanged. The permitted next action is for the operator to
+verify that company-wide binding publicly, review the single-entry YAML diff,
+deploy the reviewed tuple and only then perform a fresh dry-run; a board
+probe, redirect or guessed slug is not enough. For any unsafe old row or
+observed different-PK conflict, the next action is manual identity/disposition
+review, not a repair. After a later merge the operator records the adopted
+`main` SHA and performs an idle-only daemon restart; run
+`uv sync --locked` only if dependency manifests changed. Any live
+row re-derivation and any requeue require separate operator authorization.
+Tests and smoke use only synthetic offline data, never a real feed, record,
+browser, application, Redis instance or submission.
 
 ## Operation and guarantees
 

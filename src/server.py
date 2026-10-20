@@ -264,6 +264,11 @@ def _to_ui(row: dict, artifacts) -> dict:
         v = artifacts.version(k)
         return f"/artifact/{quote(k, safe='/')}" + (f"?v={v}" if v else "")
 
+    from tools import posting_guard as pg
+
+    projected = pg.projection(row.get("jd_text") or "", row.get("posting_guard"))
+    visible_guard = dict(projected["posting_guard"])
+    visible_guard["messages"] = pg.reason_messages(visible_guard)
     events = row.get("events") or []
     return {
         "pk": row.get("pk"),
@@ -302,7 +307,8 @@ def _to_ui(row: dict, artifacts) -> dict:
         "jd_url": row.get("jd_url"),
         # The posting itself, so the owner can read what the résumé was tailored
         # against without leaving the board and losing their place.
-        "jd_text": (row.get("jd_text") or "")[:20000],
+        "jd_text": projected["text"][:20000],
+        "posting_guard": visible_guard,
         "location": row.get("location", ""),
         "profile_id": row.get("profile_id", ""),
         "screenshot_url": link("screenshot_s3_key"),
@@ -734,8 +740,40 @@ def create_app() -> FastAPI:
         url = (body or {}).get("url", "")
         company = (body or {}).get("company", "")
         fields = (body or {}).get("fields") or []
+        from tools import posting_guard as pg
+
         jd_text = (body or {}).get("jd_text", "")
+        inspected = pg.analyze(jd_text)
+        jd_text = inspected["text"]
+        guard = inspected["posting_guard"]
         stores = make_stores(settings)
+        # Extension-only calls have no durable row. A supplied pk does not
+        # associate itself: the owner must have seen this exact tracked
+        # generation, company and posting URL.
+        pk = (body or {}).get("pk")
+        expected = (body or {}).get("posting_guard_generation")
+        if isinstance(pk, str) and pk and isinstance(expected, str) and expected:
+            try:
+                current = stores.tracking.get_current(pk)
+                if (current and current.get("pk") == pk
+                        and current.get("company") == company
+                        and current.get("jd_url") == url
+                        and pg.valid(current.get("jd_text") or "",
+                                     current.get("posting_guard"))
+                        and current["posting_guard"]["generation"] == expected):
+                    combined = pg.merge(current.get("jd_text") or "", guard,
+                                        current["posting_guard"])
+                    if stores.tracking.update_posting_guard(pk, current, combined):
+                        persisted = stores.tracking.get_current(pk)
+                        if persisted and pg.valid(persisted.get("jd_text") or "",
+                                                 persisted.get("posting_guard")):
+                            guard = persisted["posting_guard"]
+                    else:
+                        guard = pg.projection(jd_text, None)["posting_guard"]
+            except Exception:
+                # A missing current row or storage fault is never represented
+                # to the popup as a successful durable safety annotation.
+                guard = pg.projection(jd_text, None)["posting_guard"]
         facts = stores.answer_bank.all_facts(company) or {}
 
         try:
@@ -793,6 +831,7 @@ def create_app() -> FastAPI:
                     continue
             values[label] = value
         return {"ok": True, "values": values, "essays": essays, "missing": missing,
+                "posting_guard": {**guard, "messages": pg.reason_messages(guard)},
                 "unanswered": [str(f.get("label")) for f in fields
                                if f.get("required") and str(f.get("label")) not in values]}
 
@@ -2213,6 +2252,26 @@ def create_app() -> FastAPI:
             )
         ))
 
+    def _review_posting_generation(tracking, pk: str, displayed: object) -> bool:
+        """Only a version actually displayed on a job-specific action can grant."""
+        from tools import posting_guard as pg
+
+        try:
+            current = tracking.get_current(pk)
+            if not current or current.get("pk") != pk:
+                return False
+            if pg.requires_review(current):
+                guard = current.get("posting_guard")
+                if (not isinstance(displayed, str) or not displayed
+                        or not pg.valid(current.get("jd_text") or "", guard)
+                        or displayed != guard["generation"]):
+                    return False
+                return tracking.update_posting_guard(
+                    pk, current, reviewed_generation=displayed)
+            return True
+        except Exception:
+            return False
+
     @app.post("/actions/apply-selection")
     def apply_selection(body: dict, background: BackgroundTasks):
         """Authorize and run exactly the selected roles, never the older queue."""
@@ -2235,6 +2294,11 @@ def create_app() -> FastAPI:
                     "ok": False,
                     "error": "A selected role is no longer available for review. Refresh and select again.",
                 }
+        versions = body.get("guard_generations") or {}
+        if not isinstance(versions, dict) or any(
+                not _review_posting_generation(stores.tracking, pk, versions.get(pk))
+                for pk in pks):
+            return {"ok": False, "error": "Posting guard changed. Refresh and review the selected job generation."}
         if company.lower() in q.depth()["running"] or not q.start_flush(company):
             return {
                 "ok": False,
@@ -2541,7 +2605,7 @@ def create_app() -> FastAPI:
     RETAILOR_DEADLINE_S = 15 * 60
 
     @app.post("/actions/apply-now/{pk}")
-    def apply_now(pk: str, background: BackgroundTasks):
+    def apply_now(pk: str, background: BackgroundTasks, body: dict | None = None):
         """Run ONE queued job immediately, ahead of its turn.
 
         Every tailored job is queued now, so a card's button no longer means "add
@@ -2566,6 +2630,9 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         if row.get("status") in ("applied", "applied_manual"):
             return {"ok": False, "error": f"Already {row['status']} — not reapplying."}
+        version = (body or {}).get("posting_guard_generation")
+        if not _review_posting_generation(stores.tracking, pk, version):
+            return {"ok": False, "error": "Refresh this card and review the current posting safety generation."}
         company = row.get("company") or ""
         if pk in q.in_flight():
             return {"ok": False, "error": "This one is already being filled."}

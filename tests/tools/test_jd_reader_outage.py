@@ -70,12 +70,14 @@ def test_batch_retains_successes_and_stops_on_shared_outage(monkeypatch):
 def test_unavailable_reader_keeps_job_found_with_real_reason_and_never_tailors(monkeypatch):
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = "example-co#job-1"
-    tracking.set_status(pk, Status.FOUND, company="example-co",
-                        jd_url="https://example.test/jobs/1", jd_text="Test role")
+    from core.models import JobRecord
+    assert tracking.put_new(JobRecord(company="example-co", job_id="job-1",
+                                      title="Test role", jd_url="https://example.test/jobs/1",
+                                      jd_text="Test role"))
     stores = SimpleNamespace(tracking=tracking)
     def unavailable(*args, **kwargs):
         raise jd.PostingReadUnavailable(LIMIT)
-    monkeypatch.setattr(jd, 'fetch_jd', unavailable)
+    monkeypatch.setattr(jd, 'fetch_jd_meta', unavailable)
     monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
     monkeypatch.setattr(run, '_session_service', lambda: pytest.fail('No tailoring without a posting'))
     result = run.run_job(pk, stores, prepare_only=True)
@@ -92,7 +94,7 @@ def test_unavailable_reader_keeps_job_found_with_real_reason_and_never_tailors(m
 def test_existing_usable_description_survives_reader_outage(monkeypatch):
     def unavailable(*args, **kwargs):
         raise jd.PostingReadUnavailable(LIMIT)
-    monkeypatch.setattr(jd, 'fetch_jd', unavailable)
+    monkeypatch.setattr(jd, 'fetch_jd_meta', unavailable)
     text = 'Build infrastructure. ' * 10
     assert asyncio.run(run._jd_text({'jd_url':'https://x/1', 'jd_text':text})).strip() == text.strip()
 
@@ -107,13 +109,32 @@ def test_missing_cli_and_empty_batch_do_not_break_with_gone_contract(monkeypatch
 def _synthetic_tracking():
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = "example-co#job-1"
-    tracking.set_status(pk, Status.FOUND, company="example-co",
-                        jd_url="https://example.test/jobs/1",
-                        title="Test role", jd_text="Test role", attempts=7)
+    from core.models import JobRecord
+    assert tracking.put_new(JobRecord(company="example-co", job_id="job-1",
+                                      title="Test role", jd_url="https://example.test/jobs/1",
+                                      jd_text="Test role"))
+    tracking.set_status(pk, Status.FOUND, attempts=7)
     return tracking, pk
 
 
+def _guarded_meta(monkeypatch, reader):
+    """Adapt an offline reader double to the current {text, guard} contract."""
+    from inspect import isawaitable
+    from tools import posting_guard as pg
+
+    async def wrapped(row, **kw):
+        value = reader(row, **kw)
+        if isawaitable(value):
+            value = await value
+        return pg.analyze(value)
+
+    monkeypatch.setattr(run, "_jd_meta", wrapped)
+
+
 def _quiet(monkeypatch):
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda *a, **kw: (_ for _ in ()).throw(
+                            jd.PostingReadUnavailable("synthetic offline reader")))
     monkeypatch.setattr("core.events.emit", lambda *a, **kw: None)
     monkeypatch.setattr(run, "_session_service",
                         lambda: pytest.fail("No ADK session is permitted here"))
@@ -132,10 +153,13 @@ def test_persisted_budget_deadlines_and_real_ui_projection(monkeypatch):
         calls.append(row["pk"])
         raise jd.PostingReadUnavailable("synthetic reader outage")
 
-    monkeypatch.setattr(run, "_jd_text", unavailable)
+    _guarded_meta(monkeypatch, unavailable)
     tracking, pk = _synthetic_tracking()
     other = "example-co#other"
-    tracking.set_status(other, Status.FOUND, note="untouched", jd_text="other",
+    from core.models import JobRecord
+    assert tracking.put_new(JobRecord(company="example-co", job_id="other",
+                                      title="Test other", jd_url="", jd_text="other"))
+    tracking.set_status(other, Status.FOUND, note="untouched",
                         jd_read_attempts=2, attempts=19)
     other_before = tracking.get(other)
     stores = SimpleNamespace(tracking=tracking)
@@ -207,7 +231,7 @@ def test_read_derived_terminal_results_never_overwrite_newer_outcome(
             return "This employer does not sponsor visas. " + GOOD
         return GOOD
 
-    monkeypatch.setattr(run, "_jd_text", delayed)
+    _guarded_meta(monkeypatch, delayed)
     result = run.run_job(pk, stores, prepare_only=True)
     assert result["result"] == "conflict"
     assert tracking.get(pk) == terminal_row[0]
@@ -233,7 +257,7 @@ def test_same_status_fresh_protection_during_read_blocks_preparation(monkeypatch
             tracking.set_status(pk, Status.TAILORING, confirmation_id="synthetic")
         return GOOD
 
-    monkeypatch.setattr(run, "_jd_text", read)
+    _guarded_meta(monkeypatch, read)
     result = run.run_job(pk, stores, prepare_only=True)
     assert result["result"] == "refused"
     assert result["reason"] == "submission_protected"
@@ -251,7 +275,7 @@ def test_second_guard_after_successful_metadata_patch(monkeypatch, kind):
     async def read(row, **kw):
         return text
 
-    monkeypatch.setattr(run, "_jd_text", read)
+    _guarded_meta(monkeypatch, read)
     predicate = run._unreadable if kind == "unreadable" else run._no_sponsorship
     snapshot = []
 
@@ -388,7 +412,7 @@ def test_storage_fault_after_manual_interleaving_stays_inside_daemon(monkeypatch
     monkeypatch.setattr(daemon, "make_stores", lambda: stores)
     from core import flags
     monkeypatch.setattr(flags, "paused", lambda: False)
-    monkeypatch.setattr(run, "_jd_text", lambda *a, **kw: _synthetic_good())
+    _guarded_meta(monkeypatch, lambda *a, **kw: _synthetic_good())
     original = tracking.update_if_status
     status_errors = []
     before = []
@@ -500,7 +524,7 @@ def test_recovered_reader_uses_review_agent_for_ordinary_posting(monkeypatch):
     async def recovered(row, **kwargs):
         return GOOD
 
-    monkeypatch.setattr(run, "_jd_text", recovered)
+    _guarded_meta(monkeypatch, recovered)
 
     class FakeRunner:
         def __init__(self, agent, **kw):
@@ -598,7 +622,7 @@ def test_process_backlog_contains_reader_storage_fault_after_manual_decision(
     monkeypatch.setattr(flags, "stop_epoch", lambda: 0)
     monkeypatch.setattr(daemon, "_pass_cancelled", lambda *a, **kw: False)
     monkeypatch.setattr(run, "_browser_companies", lambda: set())
-    monkeypatch.setattr(run, "_jd_text", lambda *a, **kw: _synthetic_good())
+    _guarded_meta(monkeypatch, lambda *a, **kw: _synthetic_good())
     from types import SimpleNamespace as SN
 
     class Progress:
@@ -801,7 +825,7 @@ def test_jd_attention_retry_invalidates_old_pdf_without_new_save(monkeypatch):
                 yield None  # No current-run PDF save or other ADK output.
 
     monkeypatch.setattr(run, "_session_service", lambda: EmptySession())
-    monkeypatch.setattr(run, "_jd_text", recovered)
+    _guarded_meta(monkeypatch, recovered)
     monkeypatch.setattr(run, "Runner", EmptyReviewRunner)
     result = run.retry_job(pk, stores)
     row = tracking.get(pk)
@@ -872,7 +896,7 @@ def test_actual_skip_then_retry_remains_review_only(
         return {"result": "prepared", "pk": current_pk}
 
     monkeypatch.setattr(run, "_session_service", lambda: NoNetworkSession())
-    monkeypatch.setattr(run, "_jd_text", recovered)
+    _guarded_meta(monkeypatch, recovered)
     monkeypatch.setattr(run, "Runner", GraphCapture)
     monkeypatch.setattr(run, "_drive_async", prepared)
     result = run.retry_job(pk, stores)
@@ -1035,7 +1059,7 @@ def test_retry_session_setup_failure_settles_after_successful_jd_read(monkeypatc
             raise RuntimeError("synthetic ADK session backend unavailable")
 
     monkeypatch.setattr(run, "_reset_session", reset_ok)
-    monkeypatch.setattr(run, "_jd_text", recovered)
+    _guarded_meta(monkeypatch, recovered)
     monkeypatch.setattr(run, "_session_service", lambda: BrokenSession())
     result = run.retry_job(pk, stores)
     row = tracking.get(pk)

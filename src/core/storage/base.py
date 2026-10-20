@@ -158,7 +158,13 @@ def tenant_pin_same_witness(row: dict, original: dict) -> bool:
     fields.update(tenant_pin_witness_fields(row))
     return all(
         (field in row) == (field in original)
-        and (field not in row or row[field] == original[field])
+        # Redis JSON treats booleans and numbers as different persisted data,
+        # although Python equates False == 0 and True == 1. A changed
+        # protected witness must lose rather than authorize a pin.
+        and (field not in row or (
+            type(row[field]) is type(original[field])
+            and row[field] == original[field]
+        ))
         for field in fields
     )
 

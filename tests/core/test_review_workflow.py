@@ -7,7 +7,8 @@ from fastapi import BackgroundTasks
 
 import server
 from core.apply_queue import ApplyQueue
-from core.models import Status
+from core.models import JobRecord, Status
+from tools import posting_guard as pg
 from core.storage.local import RedisTracking
 
 
@@ -22,7 +23,14 @@ def review(monkeypatch):
         ("beta#1", "Beta", Status.TAILORED),
         ("acme#sent", "Acme", Status.APPLIED),
     ]:
-        tracking.set_status(pk, status, company=company)
+        ident = pk.split("#", 1)[1]
+        guarded = pg.analyze(f"Build reliable synthetic systems for {company} role {ident}.")
+        assert guarded["posting_guard"]["status"] == "clean"
+        assert tracking.put_new(JobRecord(
+            company=company, job_id=ident, title="Test role",
+            jd_url=f"https://example.test/jobs/{ident}",
+            jd_text=guarded["text"], posting_guard=guarded["posting_guard"]))
+        tracking.set_status(pk, status)
     monkeypatch.setattr(server, "make_stores", lambda *a: SimpleNamespace(tracking=tracking))
     endpoints = {route.path: route.endpoint for route in server.create_app().routes
                  if hasattr(route, "endpoint")}
@@ -42,8 +50,12 @@ def test_apply_selected_does_not_drain_older_or_newly_arriving_jobs(review, monk
         queue.done(item)
 
     monkeypatch.setattr("agent.run.run_queued", run)
+    selected = ["acme#1", "acme#2"]
+    displayed = {pk: tracking.get_current(pk)["posting_guard"]["generation"]
+                 for pk in selected}
     result = endpoints["/actions/apply-selection"](
-        {"company": "Acme", "pks": ["acme#1", "acme#2"]}, background)
+        {"company": "Acme", "pks": selected,
+         "guard_generations": displayed}, background)
     assert result["ok"]
     task = background.tasks[0]
     task.func(*task.args, **task.kwargs)
@@ -64,12 +76,15 @@ def test_invalid_or_changed_selection_never_partially_authorizes_jobs(review, bo
 
 
 def test_stop_before_background_dispatch_prevents_even_the_first_application(review, monkeypatch):
-    _, q, endpoints = review
+    tracking, q, endpoints = review
     monkeypatch.setattr("agent.run.run_queued",
                         lambda *_: pytest.fail("Stopped work must not start"))
     background = BackgroundTasks()
     assert endpoints["/actions/apply-selection"](
-        {"company": "Acme", "pks": ["acme#1"]}, background)["ok"]
+        {"company": "Acme", "pks": ["acme#1"],
+         "guard_generations": {
+             "acme#1": tracking.get_current("acme#1")["posting_guard"]["generation"],
+         }}, background)["ok"]
     q.stop_flush("Acme")
     task = background.tasks[0]
     assert task.func(*task.args, **task.kwargs) == 0

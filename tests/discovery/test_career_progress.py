@@ -40,9 +40,13 @@ def test_progress_survives_refresh_without_exposing_resume_or_raw_model_output(b
         pk,
         Status.NEEDS_HUMAN,
         gate_pending={"question": "Which office do you prefer?"},
-        jd_text="private full description",
         fields=["private answers"],
     )
+    # Model a historical raw-JD row without weakening protected writes.
+    before = stores.tracking.get(pk)
+    stores.tracking._write(
+        pk, {**before, "jd_text": "private full description"},
+        prev_status=before["status"])
     monkeypatch.setattr(
         "core.events.recent",
         lambda _: [

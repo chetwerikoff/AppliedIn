@@ -196,9 +196,10 @@ def test_quote_outside_scorer_visible_jd_never_caps(
     else:
         # The runner reads a new JD, but the reused scorer session still has
         # an old jd_text; this Issue explicitly does not refresh it.
+        from tools import posting_guard as pg
         async def current_jd(_row):
-            return JD
-        monkeypatch.setattr(R, "_jd_text", current_jd)
+            return pg.analyze(JD)
+        monkeypatch.setattr(R, "_jd_meta", current_jd)
         phrase = GOOD_QUOTE
     h.fake.scripted = [_response(_payload(kind="location", quote=phrase))]
     _run(h)
@@ -213,9 +214,10 @@ def test_authorization_claim_never_adds_code_cap(
 ):
     h = harness
     _fresh_scorer_state(monkeypatch, GENERIC_AUTH_JD)
+    from tools import posting_guard as pg
     async def generic_jd(_row):
-        return GENERIC_AUTH_JD
-    monkeypatch.setattr(R, "_jd_text", generic_jd)
+        return pg.analyze(GENERIC_AUTH_JD)
+    monkeypatch.setattr(R, "_jd_meta", generic_jd)
     assert not R._no_sponsorship(GENERIC_AUTH_JD)
     h.fake.scripted = [_response(_payload(
         score=score, kind="authorization", quote=AUTH_QUOTE
@@ -258,10 +260,11 @@ def test_explicit_sponsorship_refusal_stops_before_scorer(harness, monkeypatch):
     refusal_jd = JD + " example-co will not sponsor visa applicants."
     assert R._no_sponsorship(refusal_jd)
 
+    from tools import posting_guard as pg
     async def denied(_row):
-        return refusal_jd
+        return pg.analyze(refusal_jd)
 
-    monkeypatch.setattr(R, "_jd_text", denied)
+    monkeypatch.setattr(R, "_jd_meta", denied)
     result = _run(h)
     assert result["reason"] == "no_sponsorship"
     assert h.fake.requests == []  # no model invoked

@@ -455,3 +455,34 @@ def test_native_select_receives_exact_option_value_and_approved_caption(
         with pytest.raises(forms.Gate):
             forms.check_form(page, {"#location": "remote"}, True,
                              "Test User Resume.pdf", receipts)
+
+
+@pytest.mark.asyncio
+async def test_session_closure_removes_only_protected_attempt_snapshot(
+        monkeypatch, tmp_path):
+    """No row PDF or unrelated workspace artifact is removed on session stop."""
+    from pathlib import Path
+
+    original = tmp_path / "Test User Resume.pdf"
+    original.write_bytes(b"%PDF-1.4\\nsynthetic authoritative source\\n")
+    controller = forms.ApplicationIPCController(
+        "example-co#synthetic", "example-co",
+        "https://jobs.ashbyhq.com/example-co/synthetic",
+        str(original), {}, {}, [], {}, lambda: None, seal_stage=True)
+    snapshot = Path(controller.resume_path)
+    assert snapshot.is_file() and snapshot != original
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+    session.bind_application_controller(controller)
+    calls = []
+
+    async def fake_command(*args, **kwargs):
+        calls.append(args)
+        return {}
+
+    monkeypatch.setattr(bsk, "command", fake_command)
+    await session.close()
+    assert calls == [("session", "stop", "synthetic-session")]
+    assert original.is_file()
+    assert not snapshot.exists()
+    assert not snapshot.parent.exists()

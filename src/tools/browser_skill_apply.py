@@ -3683,15 +3683,47 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
 # The actual BrowserSkill Session(kind='apply') delegates every effectful command
 # to this controller at the CLI producer. An unmediated Session.call() is read-only.
 # No action receipt or agent assertion can authorize the irreversible click.
+def _protected_resume_snapshot(staged: str) -> str:
+    """Keep one per-attempt read-only copy behind a nonwritable directory.
+
+    A filename or final digest cannot establish remote upload bytes. The raw
+    upload producer additionally checks inode, timestamps and digest both
+    before and after the CLI transfer; a changed snapshot denies Submit.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    source = Path(staged)
+    if not source.is_file():
+        raise Gate('The staged row-tailored PDF is missing; no upload is safe.')
+    try:
+        directory = Path(tempfile.mkdtemp(prefix='appliedin_apply_pdf_'))
+        output = directory / source.name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(output, flags, 0o400)
+        with os.fdopen(fd, 'wb') as dst, source.open('rb') as original:
+            shutil.copyfileobj(original, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+        output.chmod(0o400)
+        directory.chmod(0o500)
+        return str(output)
+    except OSError as exc:
+        raise Gate('Cannot protect a stable per-attempt PDF upload snapshot.') from exc
+
+
 class ApplicationIPCController:
     """One application-owned verdict, separately protecting reversible writes."""
 
     def __init__(self, pk: str, company: str, url: str, resume_path: str,
                  facts: dict, filled: dict, history: list, step: dict,
-                 mark_click_started, *, fixture_context=None):
+                 mark_click_started, *, fixture_context=None, seal_stage=False):
         import hashlib
         self.pk, self.company, self.url = pk, company, url
-        self.resume_path = str(Path(resume_path).resolve()) if resume_path else ''
+        self.protected_snapshot = bool(seal_stage)
+        staged = _protected_resume_snapshot(resume_path) if seal_stage else resume_path
+        self.resume_path = str(Path(staged).resolve()) if staged else ''
         self.facts, self.filled, self.history = facts, filled, history
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
@@ -3754,6 +3786,8 @@ class ApplicationIPCController:
             raise Gate('The row-tailored staged PDF is missing.')
         path = Path(self.resume_path)
         stat = path.stat()
+        if self.protected_snapshot and (stat.st_mode & 0o222 or path.parent.stat().st_mode & 0o222):
+            raise Gate('The protected PDF upload snapshot became writable.')
         if (not path.is_file() or stat.st_size == 0
                 or hashlib.sha256(path.read_bytes()).hexdigest() != self.expected_digest):
             raise Gate('The staged row-tailored PDF bytes were replaced.')
@@ -4126,10 +4160,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
              detail='Applying through BrowserSkill in the dedicated Chrome profile')
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
-                if ctx is None:
-                    raw_session.bind_application_controller(ApplicationIPCController(
+                if ctx is None and hasattr(raw_session, 'bind_application_controller'):
+                    # The actual application Session always binds; older injected
+                    # offline fake sessions only implement the legacy call spy.
+                    controller = ApplicationIPCController(
                         pk, company, url, resume_path, facts, filled, history,
-                        step, mark_click_started))
+                        step, mark_click_started, seal_stage=True)
+                    raw_session.bind_application_controller(controller)
+                    resume_path = controller.resume_path
                 session = ctx.facade(raw_session) if ctx else raw_session
                 if isinstance(provenance, ApplicationEntryProvenance):
                     if not bsk.web_url(direct_url) or not allowed(direct_url):
@@ -4259,7 +4297,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         for _ in range(30):
                             await asyncio.sleep(1)
                             after = await session.page()
-                            if structural:
+                            if _formless_root(after):
                                 after, _ = await _observe_controls(session, after)
                             step['url'] = after['url']
                             if allowed(after['url']) and (phrase := confirmation(before, after)):

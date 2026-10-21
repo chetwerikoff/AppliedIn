@@ -518,3 +518,21 @@ async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
     assert outcome['status'] == 'gate'
     assert ('click', '#country-example') in session.calls
     assert calls.count('dispatch') >= 4
+
+async def test_unsafe_nested_option_effect_never_clicks(monkeypatch):
+    """A nested action is unsafe even without a submit/link on the option node."""
+    current = page()
+    chosen = current['controls'][0]['combobox']['options'][0]
+    chosen.update(safe=False, submit=False, navigates=False)
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current)
+    with pytest.raises(forms.Gate, match='unsafe navigating option'):
+        await forms.execute(
+            session, current,
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={},
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') not in session.calls

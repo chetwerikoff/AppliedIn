@@ -2535,7 +2535,14 @@ def _unanswered(page: dict, target: dict) -> bool:
     if target.get('type') == 'checkbox':
         return bool(target.get('required')) and not target.get('checked')
     if target.get('type') == 'radio':
-        members = _radio_group(page, target)
+        try:
+            members = _radio_group(page, target)
+        except Gate:
+            # An incomplete visible question makes the group ungrantable,
+            # not unobservable for reversible preparation. A write still
+            # requires _bound_target/_radio_group; final Submit independently
+            # checks every required choice and its approved readback.
+            members = [target]
         return any(c.get('required') for c in members) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'combobox':

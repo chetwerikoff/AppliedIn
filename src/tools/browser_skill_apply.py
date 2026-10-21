@@ -4645,63 +4645,36 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     session = None
     try:
         verify_dispatch()
+        if _greenhouse_id_query_attempt(url) and not greenhouse_alias_candidate(url):
+            # An unparseable raw query is not a real job URL or a tenant witness.
+            raise Gate('Malformed Greenhouse job identity requires human inspection.',
+                       reason='defect_tenant')
         if greenhouse_alias_candidate(url):
-            provenance = _configured_alias(
-                pk, company, url, fixture_context=ctx)
-            if provenance is None:
-                raise Gate('No unique explicit Greenhouse tenant and tracked job were proven.',
-                           reason=('defect_greenhouse_tenant_alias'
-                                   if ctx is None and _greenhouse_wrapper_missing_board(pk, company, url)
-                                   else 'defect_tenant'))
-            direct_url = provenance.url
-            trusted_origins = (url,)
-        elif _greenhouse_id_query_attempt(url):
-            # Keep the existing explicit derived-board diagnostic for a forged
-            # ?board= target; malformed gh_jid attempts still fail before Chrome.
-            derived_tenant = (
-                direct_url != url
-                and urlsplit(direct_url).hostname == 'job-boards.greenhouse.io')
-            raise Gate(
-                'Derived board tenant or job is not proven to match the tracked URL.'
-                if derived_tenant else
-                'No unique explicit Greenhouse tenant and tracked job were proven.',
-                reason='defect_tenant')
+            # An absent/stale pin is NOT an early preparation refusal. It will
+            # be checked afresh by the single final commit guard.
+            provenance = _configured_alias(pk, company, url, fixture_context=ctx)
+            direct_url = provenance.url if provenance else url
         else:
-            # A query-derived Greenhouse tenant is untrusted; reject it before
-            # reading tracking, which can be unavailable and would mask the gate.
-            if (direct_url != url
-                    and urlsplit(direct_url).hostname == 'job-boards.greenhouse.io'
-                    and not navigation_allowed(direct_url, url, provenance=provenance)):
-                raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
-            tracked = ((_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {})
+            tracked = _row(pk, fixture_context=ctx) if pk else {}
             if (tracked.get('ats') in _APPLICATION_ENTRY
                     or urlsplit(url).hostname in {h for h, _ in _APPLICATION_ENTRY.values()}):
                 provenance = _configured_alias(pk, company, url, fixture_context=ctx)
-                if not isinstance(provenance, ApplicationEntryProvenance):
-                    raise Gate('Current explicit ATS board and canonical tracked job not proven; '
-                               'inspect the persisted company configuration manually.',
-                               reason='defect_tenant')
-                direct_url = provenance.url
-                trusted_origins = (url,)
+                direct_url = provenance.url if provenance else url
             if tracked.get('ats') in _VENDOR_PATH:
                 provenance = await _probe_vendor_redirect(tracked, pk, company, url)
                 if provenance is None:
                     raise Gate('The tracked vendor job did not prove one safe same-job redirect.')
                 direct_url = provenance.target_url
-                trusted_origins = (url,)
 
         def allowed(href: str) -> bool:
-            return ((provenance is None
-                     or _alias_current(provenance, fixture_context=ctx))
-                    and navigation_allowed(href, *trusted_origins,
-                                           provenance=provenance))
+            # Host-only HTTPS preparation is reversible; it cannot mint tenant
+            # or same-job final-submit authority.
+            return _preparation_origin(href, url) or (
+                isinstance(provenance, VendorRedirectProvenance)
+                and navigation_allowed(href, provenance=provenance))
 
-        # A query-generated Greenhouse/Oracle alias cannot authorize itself.
-        # Without a code-verifiable same-job route, stop before opening Chrome.
-        # The initial check must never let the derived URL authorize itself.
-        # Only the original tracked wrapper (or verified provenance) is authority.
-        if not navigation_allowed(direct_url, url, provenance=provenance):
-            raise Gate('Derived board tenant or job is not proven to match the tracked URL.')
+        if not allowed(direct_url):
+            raise Gate('The initial application route is not an approved preparation origin.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
         facts = {k: v for k, v in facts.items()
@@ -4750,9 +4723,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 + _site_rules(url, company))
         emit('running', pk=pk, agent='browser', url=url,
              detail='Applying through BrowserSkill in the dedicated Chrome profile')
-        if (isinstance(provenance, VendorRedirectProvenance)
-                and not _alias_current(provenance, fixture_context=ctx)):
-            raise Gate('The verified posting changed before BrowserSkill startup.')
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
                 if ctx is None:
@@ -4760,9 +4730,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         pk, company, url, resume_path, facts, filled, history,
                         step, mark_click_started))
                 session = ctx.facade(raw_session) if ctx else raw_session
-                if provenance is not None and not _alias_current(
-                        provenance, fixture_context=ctx):
-                    raise Gate('The original same-job tenant mapping changed before navigation.')
                 if isinstance(provenance, ApplicationEntryProvenance):
                     if not bsk.web_url(direct_url) or not allowed(direct_url):
                         raise Gate('Application entry route or current row/config changed.')

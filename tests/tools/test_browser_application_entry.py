@@ -86,7 +86,10 @@ class Session:
         return False
 
     async def navigate(self, url):
-        pytest.fail('Entry must bypass generic navigation warm-up')
+        # When a configured ATS pin is missing, a tracked literal posting may
+        # still be read for host-only preparation. No CLI or real page is used.
+        self.calls.append(('navigate', url))
+        return await self.page()
 
     async def page(self):
         self.pages += 1
@@ -210,8 +213,24 @@ async def test_invalid_current_authority_gates_before_navigation(monkeypatch, pr
         setattr(configs[0], key, value)
     result = await attempt()
     assert result['status'] == 'gate'
-    assert 'explicit ATS board' in result['question']
-    assert session.calls == []
+    tracked_mismatch = problem in {
+        'row-pk', 'row-company', 'row-job', 'row-url', 'noncanonical-uuid'}
+    if tracked_mismatch:
+        # An incoherent canonical row must refuse before even a reversible
+        # navigation. Board/watchlist mismatch is not the same authority.
+        assert 'tracked' in result['question'].lower()
+        assert session.calls == []
+    else:
+        # ARCH 21:58: missing/foreign board configuration cannot resurrect
+        # a pre-browser tenant gate. The ONE final check still denies Submit.
+        assert ('navigate', posting('ashby')) in session.calls
+        assert not any(c[0] in {'fill', 'select', 'upload', 'click'}
+                       for c in session.calls)
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
+        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
+            await guard.authorize_final_submit(
+                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
     assert not decision.await_count
 
 

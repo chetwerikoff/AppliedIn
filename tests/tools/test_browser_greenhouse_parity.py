@@ -223,7 +223,7 @@ async def test_invalid_proxy_is_preserved_not_blanket_hidden(
         return [c for c in reader['controls']
                 if c['selector'].startswith('html:nth-of-type(')
                 and c['tag'] == 'input' and c['type'] == 'text'
-                and not c['label'] and c['in_form']]
+                and not c.get('label') and c['in_form']]
     assert len(anonymous(page)) == len(anonymous(witness)) == 2
     assert len(anonymous(ordinary['page'])) == 2
     assert all(c['required'] is True for c in anonymous(page))

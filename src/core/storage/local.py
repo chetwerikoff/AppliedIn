@@ -24,6 +24,8 @@ from .base import (
     AbstractSecrets,
     AbstractTracking,
     legacy_repair_row_allowed,
+    tenant_pin_row_allowed,
+    tenant_pin_same_witness,
     guard_observation_matches,
     guard_patch,
 )
@@ -127,7 +129,11 @@ class RedisTracking(AbstractTracking):
         return True
 
     def set_status(self, pk: str, status: Status, **attrs: Any) -> None:
-        """WATCH the row: a stale read must not erase a newer source finding."""
+        """Merge onto the WATCHed row and reject unbound posting-guard writes.
+
+        Status changes preserve concurrent tenant pins, while guard fields may
+        only change through their generation-bound compare-and-update path.
+        """
         from datetime import datetime, timezone
 
         key = f"app:{pk}"
@@ -152,17 +158,17 @@ class RedisTracking(AbstractTracking):
                     row.update(attrs)
                     pipe.multi()
                     pipe.set(key, json.dumps(row, default=str))
-                    if prev and prev != val:
+                    if prev and prev != row.get("status"):
                         pipe.srem(f"status:{prev}", pk)
-                    if val and not is_internal_pk(pk):
-                        pipe.sadd(f"status:{val}", pk)
+                    if row.get("status") and not is_internal_pk(pk):
+                        pipe.sadd(f"status:{row['status']}", pk)
                     if row.get("jd_hash"):
                         pipe.hset("jdhash", row["jd_hash"], pk)
                     pipe.execute()
                     return
             except WatchError:
                 continue
-        raise RuntimeError("Concurrent tracking status update did not settle")
+        raise RuntimeError("Tracking status update exhausted Redis WATCH contention")
 
     def get_current(self, pk: str) -> dict | None:
         return self.get(pk)
@@ -311,6 +317,38 @@ class RedisTracking(AbstractTracking):
                 # Retry against current data, never a new expected witness.
                 continue
         raise RuntimeError("Legacy URL repair exhausted Redis WATCH contention")
+
+    def add_missing_greenhouse_pin(
+        self, pk: str, board: str, *, expected_row: dict,
+    ) -> bool:
+        """One exact original witness, row+independent hold WATCH, no row reset."""
+        if not tenant_pin_row_allowed(expected_row, pk, board):
+            return False
+        key, hold_key = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold_key)
+                    raw = pipe.get(key)
+                    hold = pipe.get(hold_key)
+                    if raw is None or hold is not None:
+                        pipe.unwatch()
+                        return False
+                    current = json.loads(raw)
+                    if (not tenant_pin_same_witness(current, expected_row)
+                            or not tenant_pin_row_allowed(current, pk, board)):
+                        pipe.unwatch()
+                        return False
+                    current["greenhouse_board"] = board
+                    pipe.multi()
+                    # Preserve status, every history field and all index keys.
+                    pipe.set(key, json.dumps(current, default=str))
+                    pipe.execute()
+                    return True
+            except WatchError:
+                # Never rebase the original protected witness after contention.
+                continue
+        raise RuntimeError("Greenhouse pin exhausted Redis WATCH contention")
 
     def application_notes(self) -> dict:
         return {pk: json.loads(value) for pk, value in self.r.hgetall("application:notes").items()}

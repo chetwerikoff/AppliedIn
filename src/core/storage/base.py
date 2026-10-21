@@ -105,6 +105,124 @@ def legacy_repair_row_allowed(
 
 
 
+# A pin protects the original stored identity and every known irreversible-state
+# witness, including absence versus explicit NULL. The request/attempt counter
+# is a witness, not a blocker: a pre-browser tenant failure can be re-derived.
+PIN_WITNESS_FIELDS = tuple(dict.fromkeys((
+    "pk", "company", "job_id", "jd_url", "ats", "greenhouse_board",
+    "status", "fail_kind", "gate_reason", "attempts", "note", "notes",
+    "approval", "approved", "approved_at", "approval_at", "approval_status",
+    "human_approved", "human_approved_answers",
+    # _apply_direct persists these browser-result artifacts without a prefix.
+    "fields", "screenshot_s3_key",
+    "gate_pending", "gate_call_id", "gate_source", "last_button", "last_url",
+    "browser_session", "browser_session_id",
+    "application_session", "application_session_id", "possible_submission",
+    "submit_hold", "submit_hold_at", "submit_hold_reason",
+    "submit_uncertain", "submission_uncertain", "browser_started_at",
+    "form_started_at", "form_submitted_at", "apply_started_at",
+    "application_attempted_at", "application_submitted_at",
+) + REPAIR_READER_FIELDS + REPAIR_PROTECTED_FIELDS))
+_PIN_WITNESS_PREFIXES = (
+    "apply_", "approval_", "approved_", "human_approved_", "gate_",
+    "browser_", "session_", "form_", "submit_", "submission_", "jd_read_",
+    "confirmation_", "reader_", "application_", "last_",
+)
+_PIN_ALLOWED_STATUSES = frozenset(x.value for x in Status) - {
+    "submitting", "applied", "applied_manual",
+}
+_PIN_SUBMISSION_FIELDS = frozenset((
+    "confirmation_id", "applied_at", "possible_submission", "submit_blocked",
+    "submit_attempted_at", "submission_attempted_at", "submit_attempts",
+    "submission_attempts", "submit_outcome", "submission_outcome",
+    "submit_result", "submission_result", "submitted_at",
+    "application_submitted_at", "submit_receipt", "submission_receipt",
+    "submit_uncertain", "submission_uncertain", "form_submitted_at",
+))
+
+
+def tenant_pin_witness_fields(original: dict) -> tuple[str, ...]:
+    """Fields whose original presence and value must survive a pin commit."""
+    return tuple(dict.fromkeys(
+        PIN_WITNESS_FIELDS + tuple(
+            key for key in original if isinstance(key, str)
+            and key.startswith(_PIN_WITNESS_PREFIXES)
+        )
+    ))
+
+
+def tenant_pin_same_witness(row: dict, original: dict) -> bool:
+    if not isinstance(row, dict) or not isinstance(original, dict):
+        return False
+    fields = set(tenant_pin_witness_fields(original))
+    # A newly observed guarded field must not be silently accepted, even when
+    # its name was not in the original row.
+    fields.update(tenant_pin_witness_fields(row))
+    return all(
+        (field in row) == (field in original)
+        # Redis JSON treats booleans and numbers as different persisted data,
+        # although Python equates False == 0 and True == 1. A changed
+        # protected witness must lose rather than authorize a pin.
+        and (field not in row or (
+            type(row[field]) is type(original[field])
+            and row[field] == original[field]
+        ))
+        for field in fields
+    )
+
+
+def tenant_pin_row_allowed(row: dict | None, pk: str, board: str) -> bool:
+    """Narrow stored-row gate; the caller separately proves URL and fresh feed."""
+    import re
+
+    if (not isinstance(row, dict) or not isinstance(pk, str) or not pk
+            or not isinstance(board, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", board) is None
+            or row.get("pk") != pk or row.get("ats") != "greenhouse"
+            or not isinstance(row.get("company"), str) or not row["company"]
+            or not isinstance(row.get("job_id"), str)
+            or re.fullmatch(r"[0-9]+", row["job_id"]) is None
+            or pk != make_pk(row["company"], row["job_id"])
+            or not isinstance(row.get("jd_url"), str)
+            or "greenhouse_board" in row
+            or row.get("status") not in _PIN_ALLOWED_STATUSES):
+        return False
+    # Any row-local hold attribute is unsafe even when empty or false.
+    if any(field in row for field in (
+            "submit_hold", "submit_hold_at", "submit_hold_reason")):
+        return False
+    if row.get("gate_reason") == "submit_uncertain":
+        return False
+    if any(row.get(field) not in (None, "", False, 0)
+           for field in _PIN_SUBMISSION_FIELDS):
+        return False
+    # Session/interaction attributes are evidence that execution reached a
+    # browser. Even an empty/malformed value cannot certify that no session
+    # occurred; fail closed instead of inferring a safe pre-browser history.
+    if any(isinstance(key, str) and key.startswith((
+            "browser_", "session_", "application_session", "form_",
+            "apply_started_", "last_button", "last_url"))
+           for key in row):
+        return False
+    # Browser-result artifacts are not tagged browser_ in real tracking rows.
+    # Even empty artifacts cannot prove this row remained pre-browser.
+    if "fields" in row or "screenshot_s3_key" in row:
+        return False
+    # Validate gate history independently of request timestamps. A requestless
+    # form gate or ambiguous failed application is not a pre-browser tenant
+    # denial; the explicit request-only tenant failure remains eligible.
+    reasons = (row.get("gate_reason"), row.get("fail_kind"))
+    tenant_reasons = {"defect_greenhouse_tenant_alias", "defect_tenant"}
+    if (any(reason not in (*tenant_reasons, None, "") for reason in reasons)
+            or any(row.get(field) not in (None, "", False, 0)
+                   for field in ("gate_pending", "gate_call_id", "gate_source"))
+            or (bool(row.get("apply_requested_at"))
+                != any(reason in tenant_reasons for reason in reasons))
+            or (row.get("status") in ("needs_human", "failed")
+                and not row.get("apply_requested_at"))):
+        return False
+    return True
+
 # Only the existing tracking row stores the guard witness and the current owner's
 # reviewed generation. Comparing every guard-sensitive field here keeps the two
 # storage adapters consistent without a new permission ledger.
@@ -220,6 +338,18 @@ class AbstractTracking(ABC):
         refuse submission evidence, and advance the reader generation once.
         Missing rows and conditional conflicts return False; other errors raise.
         """
+
+    def add_missing_greenhouse_pin(
+        self, pk: str, board: str, *, expected_row: dict,
+    ) -> bool:
+        """Conditionally set only an absent board pin at the original PK.
+
+        The caller supplies the first observed row; backends compare its
+        presence-sensitive identity and protected witnesses at the commit.
+        Redis also watches its independent durable hold key. DynamoDB can
+        condition only on application-row attributes.
+        """
+        raise NotImplementedError
 
     def application_notes(self) -> dict:
         raise NotImplementedError

@@ -3051,9 +3051,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 _bootstrap_log(item, ordinal, decision, required=required)
 
         if not settlement_route or not eligible:
-            # Keep the pre-#119 behavior for every non-settleable field and
-            # route. An ungrantable native question is left to the existing
-            # model Gate; a safe missing fact/grant stays a bound question.
+            # A missing ordinary answer is not a per-step admission gate.
+            # Leave it untouched for an approved model action; the one final
+            # Submit guard checks every required value against fresh readback.
+            # Owner-only questions retain their direct escalation.
             if not _unanswered(page, item) or item.get('disabled') or (
                     kind not in {'radio', 'checkbox', 'combobox'}
                     and str(item.get('value') or '').strip()):
@@ -3094,14 +3095,15 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     continue
                 except Gate:
                     pass
-            prompt = (_choice_prompt(item, question)
-                      if kind in {'radio', 'checkbox', 'combobox'}
-                      or item.get('tag') == 'select'
-                      else f'An exact human-approved answer is needed for "{key}".')
-            record('needs-human')
-            raise Gate(prompt, form_question=question,
-                       reason=(_missing_answer_reason(item) if previous is None and not value
-                               else 'unknown_field'))
+            if _missing_answer_reason(item) == 'owner_question':
+                prompt = (_choice_prompt(item, question)
+                          if kind in {'radio', 'checkbox', 'combobox'}
+                          or item.get('tag') == 'select'
+                          else f'An exact human-approved answer is needed for "{key}".')
+                record('needs-human')
+                raise Gate(prompt, form_question=question, reason='owner_question')
+            record('left-to-model')
+            continue
 
         if not _unanswered(page, item):
             # Without a previously validated controller receipt this is not a

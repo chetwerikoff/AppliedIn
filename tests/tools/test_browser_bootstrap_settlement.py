@@ -129,7 +129,7 @@ def _fixture(route, *, kind=None, noisy=False):
             'listbox_selector': '#city-options',
             'options': [{'selector': '#city-choice', 'label': 'Test City',
                          'value': 'Test City', 'unique': True,
-                         'submit': False, 'navigates': False}],
+                         'safe': True, 'submit': False, 'navigates': False}],
             'selected_text': '', 'displayed_text': '', 'selected_value': '',
             'hidden_selector': '#city-hidden', 'hidden_value': '',
         }

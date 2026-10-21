@@ -4230,26 +4230,17 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('Only the exact staged résumé may be uploaded; inspect manually.')
         return {'action': verb, 'label': target['label'], 'uploaded': True}
     elif verb == 'click':
-        if (not allow_click or not pk
-                or not (ctx.is_held(pk) if ctx else submit_hold.is_held(pk))
-                or not _NEXT.match(target.get('label', ''))):
-            raise Gate('Unproven or JS-backed click requires human inspection.')
-        if is_submission(target) or not native_submit(target):
-            raise Gate('A JS-backed or non-native submit destination is unproven.')
-        if pk and not job_url:
-            raise Gate('The original tracked job route is missing; click denied.')
-        if provenance is not None:
-            page, target = await _fresh_native_receiver(
-                session, page, action, target, provenance, fixture_context=ctx)
-        check_form_destination(page, target, job_url or page.get('url', ''),
-                               provenance=provenance)
-        check_before_committing_click(
-            pk, **({'fixture_context': ctx} if ctx else {}))
-        if on_committing_click and not (isinstance(session, _EntrySession)
-                and isinstance(provenance, ApplicationEntryProvenance)
-                and provenance.ats == 'ashby'):
-            on_committing_click()
-        await session.call('click', target['selector'])
+        if not allow_click or not pk or not job_url:
+            raise Gate('An unclassified click cannot reach application IPC.')
+        if (target.get('href') and not _preparation_origin(target['href'], job_url)):
+            raise Gate('Click target navigates outside the approved preparation host.')
+        if target.get('formaction') and not _preparation_origin(
+                target['formaction'], job_url):
+            raise Gate('Unknown form override may submit outside the approved host.')
+        # Before private data, the raw controller may permit an ordinary JS
+        # Apply/Continue progression. Any possible commit is classified and
+        # checked by the same producer-side final guard, never by this label.
+        await _effect_call(session, 'click', target['selector'])
     else:
         raise Gate('Unsupported form action.')
     receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],

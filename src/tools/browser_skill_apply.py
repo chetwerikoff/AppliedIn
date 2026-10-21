@@ -1328,10 +1328,10 @@ def _safe_diagnostic(value) -> str:
                          value)) else 'unavailable'
 
 
-def _inventory_ok(page: dict) -> None:
-    if (page.get('inventory_verified') is not True or page.get('truncated')
+def _inventory_ok(page: dict, *, complete: bool = True) -> None:
+    if (complete and (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
-            or page.get('unsupported_frames')):
+            or page.get('unsupported_frames'))):
         causes = []
         for flag in ('opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'):
             if page.get(flag):
@@ -2229,6 +2229,31 @@ _GREENHOUSE_READINESS_PREDICATES = frozenset({
 
 
 
+async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
+                                    provenance, *, deadline: float):
+    """Losing a historic shape certificate does not make an approved write a Submit.
+
+    Continue via the same fixed raw reader; every effect still passes the
+    application IPC producer. The unchanged final guard needs full inventory.
+    """
+    try:
+        return scoped_session, await _stable_application_form(
+            scoped_session, allowed, provenance, deadline=deadline)
+    except Gate as exc:
+        reason = str(exc).lower()
+        if not any(reason.startswith(message) for message in (
+                'ambiguous application roots',
+                'application root sibling identity mismatch',
+                'truncated application inventory after bounded wait',
+                'unsupported custom control')):
+            raise
+        page = await raw_session.page()
+        if not isinstance(page, dict) or not allowed(page.get('url', '')):
+            raise Gate('Reversible preparation must remain on an approved origin.')
+        _inventory_ok(page, complete=False)
+        return raw_session, page
+
+
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
                                    initial=None) -> dict:
     """Two fresh complete PAGE+witness pairs inside one navigation budget."""
@@ -2310,7 +2335,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 async def _observe_controls(session, page: dict, *, readiness: bool = False,
                             closed_transition=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
-    _inventory_ok(page)
+    _inventory_ok(page, complete=False)
     predicate, locator = 'unavailable', 'unavailable'
 
     def require(ok, key):
@@ -2329,7 +2354,10 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
         require(isinstance(value.get('controls'), list), 'controls.list')
-        require(len(value['controls']) == len(page['controls']), 'controls.length.equal')
+        require(len(value['controls']) == len(page['controls']) or (
+            page.get('truncated') is True
+            and len(value['controls']) > len(page['controls'])),
+            'controls.length.equal')
         lookup = {}
         for original, observed in zip(page['controls'], value['controls']):
             locator = _safe_diagnostic(original.get('diagnostic_locator'))
@@ -2375,7 +2403,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         current = await session.page()
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
             raise _EntryNotReady(_entry_not_ready(current))
-        _inventory_ok(current)
+        _inventory_ok(current, complete=False)
         require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup
@@ -2889,7 +2917,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or not _preparation_current(provenance, fixture_context=fixture_context)):
         raise Gate('The configured job/tenant correspondence changed; review the form.',
                    reason='defect_provenance')
-    _inventory_ok(page)
+    _inventory_ok(page, complete=False)
     if not _preparation_destination_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     if _formless_root(page):
@@ -3485,10 +3513,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if greenhouse_alias_candidate(tracked.get('jd_url')):
             # Direct calls cannot borrow a page URL as alias provenance.
             raise Gate('This Greenhouse wrapper needs a verified alias context.')
-    if (page.get('inventory_verified') is not True or page.get('truncated')
-            or page.get('opaque_controls') or page.get('shadow_roots')
-            or page.get('unsupported_frames')):
-        raise Gate('The application form is not inspectable; human review is required.')
+    _inventory_ok(page, complete=False)
     if _formless_root(page):
         _formless_boundary(page, provenance)
         if not isinstance(session, _EntrySession) or session.formless_identity != _root_identity(page):
@@ -4303,22 +4328,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     await _effect_call(session, 'navigate', direct_url)
                     deadline = asyncio.get_running_loop().time() + (
                         _ASHBY_WAIT_SECONDS if provenance.ats == 'ashby' else _APPLICATION_WAIT_SECONDS)
-                    session = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
-                    page = await _stable_application_form(
-                        session, allowed, provenance, deadline=deadline)
-                    if provenance.ats == 'ashby':
+                    scoped = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
+                    session, page = await _entry_or_reversible_page(
+                        scoped, session, allowed, provenance, deadline=deadline)
+                    if provenance.ats == 'ashby' and isinstance(session, _EntrySession):
                         session.on_committing_click = mark_click_started
-                    if ctx:
+                    if ctx and isinstance(session, _EntrySession):
                         ctx.entry_admitted(page)
                 elif isinstance(provenance, GreenhouseJobAlias):
                     if not allowed(direct_url):
                         raise Gate('Greenhouse route or current row/config changed.')
                     await _effect_call(session, 'navigate', direct_url)
-                    session = _GreenhouseSession(
+                    scoped = _GreenhouseSession(
                         session, allowed, provenance, step, submitted=lambda: submitted)
                     deadline = asyncio.get_running_loop().time() + _APPLICATION_WAIT_SECONDS
-                    page = await _stable_application_form(
-                        session, allowed, provenance, deadline=deadline)
+                    session, page = await _entry_or_reversible_page(
+                        scoped, session, allowed, provenance, deadline=deadline)
                 else:
                     page = await session.navigate(direct_url)
                     step['url'] = page['url']

@@ -326,3 +326,74 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
     assert result['status'] == ('applied' if confirmed else 'uncertain'), result
     assert submit_hold.is_held(row['pk'], tracking=tracking)
     assert raw._application_controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['fill', 'upload'])
+@pytest.mark.parametrize('wall', ['password', 'challenge'])
+async def test_raw_preparation_never_bypasses_authentication_wall(
+        monkeypatch, tmp_path, action, wall):
+    """Generic fallback skips old shape certificates, never login/CAPTCHA safety."""
+    row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, URL, pdf, {'Email': 'test@example.test'}, {}, [], {}, lambda: None)
+    raw.bind_application_controller(controller)
+    raw.id = 'synthetic-session'
+    if wall == 'password':
+        page['controls'].append(field(selector='#password', label='Password', type='password'))
+    else:
+        page['entry'] = {'helper_challenge': True}
+    # Direct producer calls cannot borrow execute()/bootstrap's earlier checks.
+    with pytest.raises(forms.Gate, match='Sign in yourself' if wall == 'password' else 'challenge'):
+        await raw.application_effect(
+            action, '#email' if action == 'fill' else '#resume',
+            '--value' if action == 'fill' else '--file',
+            'test@example.test' if action == 'fill' else controller.resume_path,
+            **({} if action == 'fill' else {'timeout': 130}))
+    assert effects == []
+    assert not controller.upload_completed
+    assert not controller.committed
+    assert not submit_hold.is_held(PK, tracking=tracking)
+
+
+@pytest.mark.asyncio
+async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
+        monkeypatch, tmp_path):
+    """ARCH21:58 / AC14: missing row ATS metadata never waives final tenant proof."""
+    row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+    url = 'https://job-boards.greenhouse.io/other-co/jobs/1'
+    row['jd_url'] = page['url'] = url
+    for control in page['controls']:
+        control['form_action'] = url
+    row['human_approved_answers']['Email'].update(url=url, form_action=url)
+    actions = iter([dict(action='fill', selector='#email', fact='Email'),
+                    dict(action='upload', selector='#resume'),
+                    dict(action='submit', selector='#submit')])
+    async def decide(*args, **kwargs):
+        return next(actions)
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(url, COMPANY, {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert result['reason'] == 'defect_tenant'
+    assert effects == [('navigate', url), ('fill', '#email'), ('upload', '#resume')]
+    assert not raw._application_controller.committed
+    assert not submit_hold.is_held(PK, tracking=tracking)
+
+
+@pytest.mark.asyncio
+async def test_upload_preserves_raw_challenge_refusal(monkeypatch, tmp_path):
+    """A raw no-IPC CAPTCHA refusal must retain its named manual next step."""
+    row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+    async def decide(*args, **kwargs):
+        page['entry'] = {'helper_challenge': True}
+        return dict(action='upload', selector='#resume')
+    monkeypatch.setattr(bsk, 'decision', decide)
+    result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert 'Visible application challenge requires manual authentication' in result['question']
+    assert effects == [('navigate', URL)]
+    assert not raw._application_controller.upload_completed
+    assert not submit_hold.is_held(PK, tracking=tracking)

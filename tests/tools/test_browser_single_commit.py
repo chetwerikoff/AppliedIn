@@ -547,11 +547,19 @@ def test_canonical_ats_posting_authority_is_not_board_pin_authority(monkeypatch)
            "jd_url": posting, "status": "submitting"}
     monkeypatch.setattr(forms, "_row", lambda *_a, **_kw: dict(row))
     assert forms._tracked_preparation_job(pk, company, posting) is None
-    for bad_url in (posting + "?new=1", posting.replace("/example-co/", "/other-co/"),
-                    posting.replace("https:", "http:")):
+    for bad_url in (posting + "?new=1", posting.replace("https:", "http:")):
         row["jd_url"] = bad_url
         with pytest.raises(forms.Gate):
             forms._tracked_preparation_job(pk, company, bad_url)
+    # ARCH21:58 / #139 AC14: a foreign but host-allowlisted tenant is not
+    # malformed posting spelling. It prepares, then the final pin check denies.
+    from discovery.watchlist import CompanyConfig
+    monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda path: [
+        CompanyConfig(name=company, ats='ashby', board=company)])
+    foreign = posting.replace('/example-co/', '/other-co/')
+    row['jd_url'] = foreign
+    forms._tracked_preparation_job(pk, company, foreign)
+    assert forms._configured_alias(pk, company, foreign) is None
     row["jd_url"] = posting
     row["job_id"] = "different-job"
     with pytest.raises(forms.Gate, match="tracked job/dispatch identity"):

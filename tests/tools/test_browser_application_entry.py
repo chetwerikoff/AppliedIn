@@ -265,7 +265,17 @@ async def test_ambiguous_posting_spelling_gates(monkeypatch, ats, change):
     result = await forms.apply(row['jd_url'], COMPANY, {}, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert session.calls == []
+    if '/other-co/' in row['jd_url']:
+        # ARCH21:58 / AC14: a host-allowlisted foreign tenant may prepare;
+        # the configured/current tenant must still refuse at the final guard.
+        assert ('navigate', row['jd_url']) in session.calls
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, row['jd_url'], '', {}, {}, [], {}, lambda: None)
+        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
+            await guard.authorize_final_submit(session, application(ats), {'label': 'Submit'})
+        no_mutations(session)
+    else:
+        assert session.calls == []
 
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
@@ -296,8 +306,15 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
         # raw action/override census; this earlier fail-closed gate is correct.
         assert 'cross-owned or contradictory native application census' in report['question']
     else:
-        assert 'native form receiver not proven' in report['question']
-    assert report.get('form_question') is None
+        # ARCH21:58 / binding 3: the allowlisted receiver can be observed for
+        # preparation, but a different final receiver must never Submit.
+        assert report['form_question']['label'] == 'Email'
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
+        with pytest.raises(forms.Gate, match='Final submit receiver'):
+            await guard.authorize_final_submit(session, page, page['controls'][-1])
+    if ats == 'ashby':
+        assert report.get('form_question') is None
     assert not decide.await_count
     no_mutations(session)
 
@@ -456,24 +473,51 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 @pytest.mark.parametrize('redirect', [False, True])
 async def test_submit_confirmation_needs_exact_route_and_independent_new_proof(
-        monkeypatch, ats, redirect):
-    _, _, session, decide = world(monkeypatch, ats)
-    # Isolate result classification: existing pre-submit guards are tested in the
-    # original controller suite. The real exact-route provenance stays active.
-    monkeypatch.setattr(forms, '_bootstrap', AsyncMock(side_effect=lambda s, p, *a, **kw: p))
-    monkeypatch.setattr(forms, 'check_form', lambda *a: None)
-    monkeypatch.setattr(forms, 'check_approvals', lambda *a, **kw: None)
+        monkeypatch, tmp_path, ats, redirect):
+    from pathlib import Path
+    from tests.tools.test_browser_controller_support import install_controller_session
+    initial = application(ats)
+    email = initial['controls'][0]
+    resume = field('Resume', '#resume', type='file', required=False, files=[],
+                   form_selector=email['form_selector'], form_action=entry(ats))
+    initial['controls'].insert(1, resume)
+    row, _, session, decide = world(monkeypatch, ats, [initial])
+    transport, tracking, pdf = install_controller_session(monkeypatch, row, session, tmp_path)
+    row['human_approved_answers'] = {'Email': {
+        **{k: email[k] for k in ('selector', 'label', 'question', 'tag', 'type',
+                                  'form_selector', 'form_action')},
+        'url': entry(ats), 'value': 'test@example.test'}}
+    original_call = session.call
+    async def call(method, *args, **kwargs):
+        if method in {'fill', 'upload'}:
+            session.calls.append((method, *args))
+            target = next(c for c in session.current['controls'] if c['selector'] == args[0])
+            if method == 'fill':
+                target.update(value=args[2], has_value=True)
+            else:
+                target['files'] = [Path(args[2]).name]
+            return {}
+        return await original_call(method, *args)
+    session.call = call
     hold = []
-    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: hold.append(a))
-    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
-    decide.return_value = {'action': 'submit', 'selector': '#submit'}
+    real_hold = forms.hold_possible_submission
+    def held(*args, **kwargs):
+        hold.append(args)
+        real_hold(*args, **kwargs)
+    monkeypatch.setattr(forms, 'hold_possible_submission', held)
+    decide.side_effect = [dict(action='fill', selector=email['selector'], fact='Email'),
+                          dict(action='upload', selector='#resume'),
+                          dict(action='submit', selector='#submit')]
     session.after_submit = inventory(url=entry(ats) + ('/thanks' if redirect else ''))
     session.after_submit['text'] = 'Thank you for applying'
     original_sleep = asyncio.sleep
     async def fast_sleep(delay):
         await original_sleep(0)
     monkeypatch.setattr(forms.asyncio, 'sleep', fast_sleep)
-    result = await attempt(ats)
+    # #139 AC1/AC8: keep the same confirmation assertions, but exercise the
+    # bound raw producer, exact row PDF and actual durable hold before click.
+    result = await forms.apply(posting(ats), COMPANY, {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == ('uncertain' if redirect else 'applied')
     assert len(hold) == 1
     assert [c for c in session.calls if c[0] == 'click'] == [('click', '#submit')]
@@ -571,6 +615,11 @@ async def test_mapping_drift_during_final_receiver_read_forbids_ipc(monkeypatch,
         if verb == 'submit':
             await forms._fresh_native_receiver(
                 session, page, {'selector': '#submit'}, page['controls'][-1], proof)
+            # ARCH21:58 / binding 3: receiver observation is preparation;
+            # current tenant equality belongs to the ONE final guard only.
+            guard = forms.ApplicationIPCController(
+                PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
+            await guard.authorize_final_submit(session, page, page['controls'][-1])
         else:
             await forms.execute(
                 session, page, {'action': verb, 'selector': page['controls'][0]['selector'],
@@ -630,7 +679,7 @@ async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
             facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
             company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
             job_url=posting(ats), provenance=proof)
-    if drift:
+    if drift and drift != 'board':
         # The read changes no DOM/grant/receiver bytes: only independent current
         # authority is revoked. A later pre-option Gate cannot undo filter fill.
         with pytest.raises(forms.Gate):
@@ -644,6 +693,15 @@ async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
         assert receipt['committed_value'] == 'EX'
         assert ('fill', '#country', '--value', 'Example Country') in session.calls
         assert ('click', '#country-example') in session.calls
+        if drift == 'board':
+            # ARCH21:58 / AC14: pin drift cannot block approved selection.
+            # Preserve the negative guarantee at the same final guard.
+            assert drifted
+            guard = forms.ApplicationIPCController(
+                PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
+            with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
+                await guard.authorize_final_submit(session, committed, {'label': 'Submit'})
+            assert ('click', '#submit') not in session.calls
 
 
 def dom(spec, script=None):
@@ -980,8 +1038,19 @@ async def test_partial_first_read_cannot_hide_authority_drift(monkeypatch, drift
             configs[0].board = 'foreign'
     session.on_page = change
     result = await attempt('lever')
-    assert 'route or current row/config changed' in result['question']
-    assert session.pages == 1
+    if drift == 'row':
+        assert 'route or current row/config changed' in result['question']
+        assert session.pages == 1
+    else:
+        # ARCH21:58 / AC2/AC14: a same-host route or board-pin change cannot
+        # recreate an early tenant certificate. Incomplete reads remain bounded
+        # and the unchanged final guard must refuse this route/configuration.
+        assert 'unverified application inventory after bounded wait' in result['question']
+        assert session.pages > 1
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
+        with pytest.raises(forms.Gate, match='job/ATS tenant|different job/ATS tenant'):
+            await guard.authorize_final_submit(session, session.current, {'label': 'Submit'})
     assert not decide.await_count
     no_mutations(session)
 

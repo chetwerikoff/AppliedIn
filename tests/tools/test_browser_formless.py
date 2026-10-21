@@ -13,6 +13,7 @@ from tools import browser_skill_apply as forms
 from tests.tools.test_browser_application_entry import (
     COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
 )
+from tests.tools.test_browser_controller_support import install_controller_session
 
 
 def observed(**changes):
@@ -95,6 +96,40 @@ async def admitted(monkeypatch):
     return row, raw, session, page, provenance
 
 
+async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
+    """ARCH21:18 / AC2/AC9: obsolete root proof is final evidence only."""
+    row, raw, decide, provenance = root_world(monkeypatch, **changes)
+    transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    file = next(c for c in raw.current['controls']
+                if c['type'] == 'file' and c['label'] == 'Resume')
+    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
+    original_call = raw.call
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            # A native input is a valid chooser target on the generic fallback;
+            # preserve the adversarial layout after selection, not a clean DOM.
+            assert args[0] == file['selector'] and args[1] == '--file'
+            assert kwargs == {'timeout': 130}
+            raw.calls.append((method, *args))
+            name = Path(args[2]).name
+            raw.current, raw.fixed = observed(
+                **changes, attached=True, files=[name], displayName=name)
+            return {}
+        return await original_call(method, *args, **kwargs)
+    raw.call = call
+    decide.side_effect = [dict(action='upload', selector=file['selector']),
+                          dict(action='submit', selector=button['selector'])]
+    result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert cause in result['question'], result
+    assert decide.await_count == 2  # preparation reached the actual final guard
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+        ('upload', file['selector'], '--file', transport._application_controller.resume_path)]
+    assert transport._application_controller.upload_completed
+    assert not transport._application_controller.committed
+
+
 def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     page, fixed = observed()
     assert page['entry'] == fixed['entry']
@@ -138,7 +173,10 @@ async def test_normal_apply_reaches_actual_direct_human_question(monkeypatch):
     ({'extraType': 'text', 'extraAttrs': {'role': 'combobox'}}, 'unsupported autocomplete/combobox'),
     ({'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}}, 'unsupported contenteditable'),
 ])
-async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkeypatch, changes, cause):
+async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkeypatch, tmp_path, changes, cause):
+    if cause == 'ambiguous application roots':
+        await prepared_shape_refusal(monkeypatch, tmp_path, changes, cause)
+        return
     _, raw, decision, _ = root_world(monkeypatch, **changes)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -224,13 +262,23 @@ def action_sequence():
 
 
 @pytest.mark.parametrize('outcome', ['confirmed', 'unconfirmed', 'foreign', 'click-fault', 'witness-mismatch'])
-async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(monkeypatch, outcome):
+async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(monkeypatch, tmp_path, outcome):
     row, raw, decide, provenance = root_world(monkeypatch)
+    transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     facts = approve_fields(row, raw.current, raw.fixed, provenance)
     decide.side_effect = action_sequence()
     checkpoints = []
-    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: checkpoints.append('held'))
-    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: checkpoints.append('checked'))
+    # #139 AC1/AC8: exercise the real producer and its own durable hold,
+    # never an offline facade permit or a no-op authorization stub.
+    real_hold, real_check = forms.hold_possible_submission, forms.check_before_committing_click
+    def hold(*a, **kw):
+        checkpoints.append('held')
+        real_hold(*a, **kw)
+    def check(*a, **kw):
+        checkpoints.append('checked')
+        real_check(*a, **kw)
+    monkeypatch.setattr(forms, 'hold_possible_submission', hold)
+    monkeypatch.setattr(forms, 'check_before_committing_click', check)
     def clicked():
         assert checkpoints == ['held', 'checked']
         if outcome == 'click-fault':
@@ -251,7 +299,7 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
         await original_sleep(0)
     monkeypatch.setattr(forms.asyncio, 'sleep', fast_sleep)
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
-                               pk=PK, resume_path='Resume.pdf')
+                               pk=PK, resume_path=pdf)
     assert result['status'] == ('applied' if outcome == 'confirmed' else 'uncertain'), result
     task = decide.await_args_list[0].args[0]
     # Ordinary fact values remain server-side; PAGE-listed choice data is not
@@ -276,7 +324,7 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('fill', '#_systemfield_name', '--value', 'Test User'),
         ('fill', '#_systemfield_email', '--value', 'test@example-co.test'),
-        ('upload', '#dropzone', '--file', 'Resume.pdf'),
+        ('upload', '#dropzone', '--file', transport._application_controller.resume_path),
         ('click', '#structural-submit')]
     assert checkpoints == ['held', 'checked']
 
@@ -321,16 +369,41 @@ async def test_every_pane_ipc_is_denied_at_producer(monkeypatch, verb):
     no_mutations(raw)
 
 
-async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch):
-    _, raw, session, _, _ = await admitted(monkeypatch)
+async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_path):
+    row, raw, _, provenance = root_world(monkeypatch)
+    transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    await transport.__aenter__()
+    session = forms._EntrySession(transport, lambda u: u == entry('ashby'), provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
     with pytest.raises(forms.Gate, match='lacks final approval'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
+    # #139 binding 1/AC9: copied facade state is not Submit authority.
     session.submit_authorized = forms._page_identity(await session.page())
-    await session.call('click', '#structural-submit')
-    with pytest.raises(forms.Gate, match='cannot be retried'):
+    with pytest.raises(forms.Gate, match='lacks final approval'):
         await session.call('click', '#structural-submit')
-    assert [c for c in raw.calls if c[0] == 'click'] == [('click', '#structural-submit')]
+    no_mutations(raw)
+    facts = approve_fields(row, page, raw.fixed, provenance)
+    filled, history = {}, []
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), pdf, facts, filled, history,
+        {'url': entry('ashby')}, lambda: None, seal_stage=True)
+    transport.bind_application_controller(controller)
+    session.resume_path = controller.resume_path
+    try:
+        for action in action_sequence()[:-1]:
+            receipt = await forms.execute(
+                session, await session.page(), action, facts=facts, filled=filled,
+                resume_path=controller.resume_path, company=COMPANY, jd_text='',
+                resume_tex='', github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+            history.append(receipt)
+        await session.call('click', '#structural-submit')
+        with pytest.raises(forms.Gate, match='cannot be retried'):
+            await session.call('click', '#structural-submit')
+        assert [c for c in raw.calls if c[0] == 'click'] == [('click', '#structural-submit')]
+    finally:
+        controller.release_snapshot()
 
 
 @pytest.mark.parametrize('tag,typ', [('input', 'submit'), ('input', 'image'), ('button', 'submit')])
@@ -399,7 +472,10 @@ def test_exact_submit_guard_local_cause(monkeypatch, member, value):
     ({'submitAttrs': {'type': 'button'}}, 'exact structural submit changed'),
     ({'submitAttrs': {'role': 'button'}}, 'exact structural submit changed'),
 ])
-async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, spec, cause):
+async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
+    if cause in {'sibling identity mismatch', 'ambiguous application roots'}:
+        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
+        return
     _, raw, decide, _ = root_world(monkeypatch, **spec)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -577,7 +653,7 @@ async def test_upload_requires_independent_fixed_readback(monkeypatch):
                             provenance=provenance)
     assert clock.now == 8.0 and clock.steps == [0.25] * 32
     assert session.formless_identity == identity and session.upload_result is None
-    assert not session.upload_pending and not session.submit_authorized
+    assert not session.upload_pending and session.submit_authorized is False
     assert len([c for c in raw.calls if c[0] == 'upload']) == 1
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
@@ -694,12 +770,14 @@ def test_structural_presubmit_requires_only_the_staged_attachment(monkeypatch):
 
 
 @pytest.mark.parametrize('drift', ['required', 'optional', 'removed-resume', 'replaced-resume', 'extra-resume', 'root'])
-async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch, drift):
+async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch, tmp_path, drift):
     row, raw, decide, provenance = root_world(monkeypatch)
+    transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     facts = approve_fields(row, raw.current, raw.fixed, provenance)
     decide.side_effect = action_sequence()
-    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: None)
+    real_check = forms.check_before_committing_click
     def rerender(*a, **kw):
+        real_check(*a, **kw)
         for snapshot in (raw.current, raw.fixed):
             if drift == 'root':
                 snapshot['entry']['formless']['pane'] = '#changed-pane'
@@ -716,10 +794,11 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
         await original_sleep(0)
     monkeypatch.setattr(forms.asyncio, 'sleep', fast_sleep)
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
-                               pk=PK, resume_path='Resume.pdf')
+                               pk=PK, resume_path=pdf)
     assert not any(c[0] == 'click' for c in raw.calls), result
     assert result['status'] == 'gate', result
-    assert ('root identity drift' if drift == 'root' else 'changed before submit') in result['question']
+    # #139 AC8: the same raw final guard checks post-hold form/root drift.
+    assert 'changed before submit' in result['question']
     # This is a post-admission drift, not a zero-total-IPC admission refusal.
     assert [c for c in raw.calls if c[0] == 'fill'], result
     assert len([c for c in raw.calls if c[0] == 'upload']) == 1
@@ -955,13 +1034,9 @@ def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_dup
     assert {'#_systemfield_resume', '#second-resume'} <= {c['selector'] for c in controls}
 
 
-async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch):
-    _, raw, decide, _ = root_world(monkeypatch, secondFormlessComplete=True)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    assert 'ambiguous application roots' in result['question']
-    assert not decide.await_count
-    no_mutations(raw)
+async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch, tmp_path):
+    await prepared_shape_refusal(monkeypatch, tmp_path, {'secondFormlessComplete': True},
+                                 'ambiguous application roots')
 
 
 @pytest.mark.parametrize('changes', [
@@ -981,14 +1056,10 @@ async def test_benign_ashby_restructuring_preserves_normal_human_question(
     no_mutations(raw)
 
 @pytest.mark.parametrize('kind', ['onclick', 'summary'])
-async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch, kind):
-    _, raw, decide, _ = root_world(
-        monkeypatch, inertSibling=True, inertDescendant=kind)
-    result = await attempt()
-    assert result['status'] == 'gate', (kind, result)
-    assert 'sibling identity mismatch' in result['question']
-    assert not decide.await_count
-    no_mutations(raw)
+async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch, tmp_path, kind):
+    await prepared_shape_refusal(monkeypatch, tmp_path,
+                                 dict(inertSibling=True, inertDescendant=kind),
+                                 'sibling identity mismatch')
 
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(

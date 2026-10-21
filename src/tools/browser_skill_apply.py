@@ -1107,6 +1107,11 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                            provenance: Provenance | None = None) -> None:
     """Preflight every receiver on this form before even uploading a document."""
     if _formless_root(page) and not target.get('in_form'):
+        if _formless_root(page).get('error'):
+            if _preparation_destination_allowed(page.get('url', ''), *origins,
+                                                provenance=provenance):
+                return  # Raw IPC still enforces the exact value/PDF and origin.
+            raise Gate('The preparation receiver is outside the tracked origin.')
         members = _formless_boundary(page, provenance)
         if target.get('selector') not in {c['selector'] for c in members} | {_formless_root(page)['submit']}:
             raise Gate('autofill or unsupported structural receiver forbidden.')
@@ -1654,14 +1659,16 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     owners = {c.get('native_owner') for c in evidence if c.get('native_owner')}
     for owner in owners:
         siblings = [c for c in page['controls'] if c.get('form_selector') == owner]
-        if siblings and _unrelated_search_form(siblings):
+        if (siblings and all(c.get('native_form_owner_selector') == owner for c in siblings)
+                and _unrelated_search_form(siblings)):
             ignored.update(c['selector'] for c in siblings)
     members = []
     for c in evidence:
         if c['selector'] in ignored:
             continue
         if c.get('native_owner') or c.get('declared_owner') or c.get('formaction') is not None:
-            raise Gate('receiver outside root or foreign native receiver; inspect manually.')
+            raise Gate('receiver outside root or foreign native receiver; '
+                       'native form receiver not proven; inspect manually.')
         if not c.get('inside'):
             cause = ('exact submit outside root' if c.get('submit') else
                      'receiver outside root' if c.get('type') == 'hidden' else
@@ -1939,7 +1946,7 @@ class _EntrySession:
         self.formless_identity = None
         self.native_identity = None
         self.committing = False
-        self.submit_authorized = None
+        self.submit_authorized = False  # Diagnostic only; never read as Submit authority.
         self.on_committing_click = None
         self.upload_attempted = False
         self.upload_pending = False
@@ -2084,12 +2091,8 @@ class _EntrySession:
             # native submit; classifying every click as submission would turn a
             # successful safe choice into a false uncertain-result hold.
             if (args[0] == 'click' and native_submit(matches[0])
-                    and self.on_committing_click is not None
                     and getattr(self.raw, '_application_controller', None) is None):
-                # Offline legacy facade only. The production transport decides
-                # at the single final guard, not this admission/read wrapper.
-                self.committing = True
-                self.on_committing_click()
+                raise Gate('Native submit lacks final approval from the application IPC controller.')
         if args and args[0] != 'evaluate' and self.formless_identity is not None:
             if self.committing:
                 raise Gate('A possible structural submit cannot be retried automatically.')
@@ -2120,15 +2123,7 @@ class _EntrySession:
                 return await self._upload(args, kwargs, selector)
             if args[0] == 'click':
                 if getattr(self.raw, '_application_controller', None) is None:
-                    if not self.submit_authorized:
-                        raise Gate('Structural submit lacks the offline authorization witness.')
-                    if _page_identity(current) != self.submit_authorized:
-                        self.submit_authorized = None
-                        raise Gate('Validated structural answers changed before submit.')
-                    self.committing = True
-                    if self.on_committing_click is not None:
-                        self.on_committing_click()
-                self.submit_authorized = False
+                    raise Gate('Structural submit lacks final approval from the application IPC controller.')
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
@@ -2158,6 +2153,9 @@ class _EntrySession:
                     if status not in {'H', 'R', 'W', 'X', 'Z'}:
                         raise Gate('Untrusted frame after a committing click.')
             else:
+                if not _preparation_current(self.provenance):
+                    raise Gate('Application entry route or current row/config changed; inspect manually.',
+                               reason='defect_provenance')
                 _entry_safety(page, self.allowed, self.provenance)
             if (self.native_identity is not None and not self.committing
                     and _ashby_native_identity(page) != self.native_identity):
@@ -2945,7 +2943,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if not _preparation_destination_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     if _formless_root(page):
-        if not isinstance(session, _EntrySession) or session.formless_identity is None:
+        if not isinstance(session, _EntrySession):
+            if getattr(session, '_application_controller', None) is not None:
+                return page  # Missing historic root proof cannot block preparation.
+            raise Gate('Formless preparation requires the code-owned application IPC controller.')
+        if session.formless_identity is None:
             raise Gate('formless root lacks stable independent admission.')
         page, witness = await _observe_controls(session, page)
         members = _formless_boundary(page, provenance)
@@ -3538,9 +3540,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # Direct calls cannot borrow a page URL as alias provenance.
             raise Gate('This Greenhouse wrapper needs a verified alias context.')
     _inventory_ok(page, complete=False)
-    if _formless_root(page):
+    if _formless_root(page) and isinstance(session, _EntrySession):
         _formless_boundary(page, provenance)
-        if not isinstance(session, _EntrySession) or session.formless_identity != _root_identity(page):
+        if session.formless_identity != _root_identity(page):
             raise Gate('formless root lacks stable independent admission.')
         check_form_destination(page, control(page, action, 'execute-formless'), provenance=provenance)
     target = control(page, action, 'execute-initial')
@@ -3586,8 +3588,16 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if verb == 'choose':
             # Missing safe answers still produce the original bound question.
             # Once granted, the model's fact is only a routing label.
-            approved = _approved_native_choice(
-                page, target, pk, provenance=provenance, fixture_context=ctx)
+            try:
+                approved = _approved_native_choice(
+                    page, target, pk, provenance=provenance, fixture_context=ctx)
+            except Gate as exc:
+                if exc.reason == 'owner_question' and exc.form_question is None:
+                    # Keep the independently observed question when the claim
+                    # classifier routes a real consent/attestation to its owner.
+                    raise Gate(str(exc), reason=exc.reason,
+                               form_question=form_question) from None
+                raise
             if approved is None:
                 raise Gate(gate_prompt, form_question=form_question,
                            reason=_missing_answer_reason(target) if _unanswered(page, target)
@@ -3725,9 +3735,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 session, page, action, target, provenance, fixture_context=ctx)
         check_form_destination(page, target, job_url or page.get('url', ''),
                                provenance=provenance)
-        if _formless_root(page):
-            if not isinstance(session, _EntrySession):
-                raise Gate('The structural upload producer is unavailable.')
+        if _formless_root(page) and isinstance(session, _EntrySession):
             await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
             observed, _ = await _observe_controls(session, await session.page())
             tree = _upload_tree(observed)
@@ -3748,8 +3756,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             observed = await session.page()
             if _formless_root(page):
                 observed, _ = await _observe_controls(session, observed)
-                _formless_boundary(observed, provenance)
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, Gate):
+                raise
             if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
                            "dedicated profile; inspect the attachment before retrying.") from None
@@ -4063,12 +4072,20 @@ class ApplicationIPCController:
             raise Gate('Raw application executable or effectful IPC is forbidden.')
         page = await self._page(session)
         self._fresh_preparation(page['url'])
+        observed = page.get('entry') or page.get('greenhouse') or {}
+        if (observed.get('helper_challenge') or any(
+                isinstance(frame, dict) and frame.get('status') in {
+                    'visible-recaptcha', 'visible-hcaptcha'}
+                for frame in observed.get('frames', []))):
+            raise CaptchaGate('Visible application challenge requires manual authentication.')
+        if any(c.get('type') == 'password' for c in page.get('controls', [])):
+            raise Gate('Sign in yourself in the dedicated profile before private preparation.')
         selector = args[1] if len(args) > 1 else None
         targets = [item for item in page.get('controls', [])
                    if item.get('selector') == selector and not item.get('disabled')]
         if op == 'upload':
             file_target = targets[0] if len(targets) == 1 else None
-            if _formless_root(page):
+            if _formless_root(page) and (not file_target or file_target.get('type') != 'file'):
                 # The dropzone is itself a button in PAGE controls. Match the
                 # independent structural tree, not an empty selector lookup.
                 tree = _upload_tree(page)
@@ -4192,6 +4209,8 @@ class ApplicationIPCController:
             raise Gate('Current tracked job identity changed; no Submit.')
         # Tenant/pin equality is checked only here, not at application entry.
         if (row.get('ats') in {*_APPLICATION_ENTRY, 'greenhouse'}
+                or urlsplit(page['url']).hostname in {'job-boards.greenhouse.io',
+                    *(host for host, _ in _APPLICATION_ENTRY.values())}
                 or greenhouse_alias_candidate(self.url)):
             fresh_alias = _configured_alias(self.pk, self.company, self.url,
                                             fixture_context=self.fixture_context)
@@ -4236,6 +4255,8 @@ class ApplicationIPCController:
                 raise Gate('Wrong or missing exact final job title/identity; inspect before Submit.')
         if not self.upload_completed or self.upload_identity != self._row_pdf():
             raise Gate('This row’s protected tailored PDF has not been verified.')
+        if _formless_root(page):
+            _formless_boundary(page, fresh_alias)
         check_form(page, self.filled, True, Path(self.resume_path).name, self.history)
         check_approvals(self.pk, self.history, page, **self._ctx())
         expected_page = (_page_identity(page), page.get('title'))
@@ -4552,7 +4573,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                         'fields': _fields_report(history, filled)}
                         context = handoff(
                             'Submission clicked, but no new employer confirmation was observed. '
-                            'Check the portal before retrying.', step)
+                            'Check the employer portal before retrying.', step)
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
                     else:

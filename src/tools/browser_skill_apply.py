@@ -3844,6 +3844,20 @@ class ApplicationIPCController:
         if self.resume_path and Path(self.resume_path).is_file():
             self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
 
+    def release_snapshot(self) -> None:
+        """Remove only the private per-attempt snapshot, never the source PDF."""
+        if not self.protected_snapshot:
+            return
+        path = Path(self.resume_path)
+        try:
+            path.parent.chmod(0o700)
+            path.unlink(missing_ok=True)
+            path.parent.rmdir()
+        except OSError:
+            _LOG.warning('A protected temporary PDF snapshot could not be cleaned.')
+        finally:
+            self.protected_snapshot = False
+
     def _ctx(self):
         return {'fixture_context': self.fixture_context} if self.fixture_context else {}
 
@@ -4276,7 +4290,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     controller = ApplicationIPCController(
                         pk, company, url, resume_path, facts, filled, history,
                         step, mark_click_started, seal_stage=True)
-                    raw_session.bind_application_controller(controller)
+                    try:
+                        raw_session.bind_application_controller(controller)
+                    except BaseException:
+                        controller.release_snapshot()
+                        raise
                     resume_path = controller.resume_path
                 session = ctx.facade(raw_session) if ctx else raw_session
                 if isinstance(provenance, ApplicationEntryProvenance):

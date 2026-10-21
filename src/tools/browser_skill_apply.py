@@ -3962,10 +3962,9 @@ class ApplicationIPCController:
     async def _page(self, session):
         from tools.browser_skill_dom import ENTRY_PAGE, GREENHOUSE_PAGE, PAGE
         # These are fixed application readers, not page/model-generated code.
-        host = urlsplit(self.url).hostname
-        script = (GREENHOUSE_PAGE if host == 'job-boards.greenhouse.io'
-                  else ENTRY_PAGE if host in {'jobs.ashbyhq.com', 'jobs.lever.co'}
-                  else PAGE)
+        ats = self._row().get('ats')
+        script = (GREENHOUSE_PAGE if ats == 'greenhouse'
+                  else ENTRY_PAGE if ats in _APPLICATION_ENTRY else PAGE)
         result = await session.call('evaluate', script)
         page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict) or not isinstance(page.get('url'), str):
@@ -4063,19 +4062,18 @@ class ApplicationIPCController:
                    if item.get('selector') == selector and not item.get('disabled')]
         if op == 'upload':
             file_target = targets[0] if len(targets) == 1 else None
-            if not targets and _formless_root(page):
-                # The existing structural chooser sends the verified dropzone
-                # selector, not its underlying file-input selector. Reprove
-                # their exact current relationship at the raw upload producer.
+            if _formless_root(page):
+                # The dropzone is itself a button in PAGE controls. Match the
+                # independent structural tree, not an empty selector lookup.
                 tree = _upload_tree(page)
                 original = _upload_input(page, tree)
                 drop = tree['nodes'][tree['dropzone']].get('target_selector')
-                if selector == drop and drop != original['selector']:
-                    linked = [item for item in page['controls']
-                              if item.get('selector') == original['selector']
-                              and item.get('type') == 'file']
-                    if len(linked) == 1:
-                        file_target = linked[0]
+                if selector != drop or drop == original['selector']:
+                    raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
+                linked = [item for item in page['controls']
+                          if item.get('selector') == original['selector']
+                          and item.get('type') == 'file']
+                file_target = linked[0] if len(linked) == 1 else None
             if (len(args) != 4 or args[2] != '--file'
                     or str(Path(args[3]).resolve()) != self.resume_path
                     or kwargs != {'timeout': 130}
@@ -4313,11 +4311,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     session = None
     try:
         verify_dispatch()
-        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
         if _greenhouse_id_query_attempt(url) and not greenhouse_alias_candidate(url):
-            # An unparseable raw query is not a real job URL or a tenant witness.
+            # A malformed tenant-bearing query has a precise pre-browser refusal
+            # even when it also conflicts with the persisted tracked route.
             raise Gate('Malformed Greenhouse job identity requires human inspection.',
                        reason='defect_tenant')
+        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
         if greenhouse_alias_candidate(url):
             # An absent/stale pin is NOT an early preparation refusal. It will
             # be checked afresh by the single final commit guard.

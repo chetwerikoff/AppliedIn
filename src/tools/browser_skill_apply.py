@@ -2137,10 +2137,10 @@ class _EntrySession:
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
-            if self.committing and self.native_identity is not None:
-                # After a verified potentially committing native click there
-                # are only passive confirmation reads; the form may disappear
-                # and be replaced by links. Never grant another IPC action.
+            if self.committing:
+                # After any potentially committing click (native or formless),
+                # only passive confirmation reads are allowed: the form may
+                # disappear before independent confirmation can be observed.
                 entry = page.get('entry') if isinstance(page, dict) else None
                 if (not isinstance(entry, dict)
                         or not isinstance(entry.get('frames'), list)

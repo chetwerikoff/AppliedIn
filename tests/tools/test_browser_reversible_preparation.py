@@ -218,3 +218,51 @@ async def test_legacy_shape_fallback_still_refuses_unknown_landing(monkeypatch):
             object(), ForeignSession(),
             lambda href: forms._preparation_origin(href, POSTING),
             None, deadline=0)
+
+
+
+@pytest.mark.asyncio
+async def test_native_ashby_preparation_does_not_require_old_owner_certificate(
+        monkeypatch, tmp_path):
+    """Only the final guard refuses two native Submit owners; preparation can read."""
+    from tools.claude_chrome import GreenhouseJobAlias
+
+    page = _page()
+    page.update(inventory_verified=True, entry={
+        "root": None, "native_candidates": [], "frames": [],
+        "response_error": False, "helper_challenge": False})
+    page["controls"] = [c for c in page["controls"]
+                        if c["selector"] in {"#name", "#pdf", "#submit"}]
+    first = next(c for c in page["controls"] if c["selector"] == "#submit")
+    second = dict(first, selector="#other-submit", form_selector="#another-form",
+                  native_form_owner_selector="#another-form")
+    page["controls"].append(second)
+    provenance = forms.ApplicationEntryProvenance(
+        PK, COMPANY, "ashby", JOB, POSTING, COMPANY, FORM_URL)
+    allowed = lambda href: forms._preparation_origin(href, POSTING)
+    # Neither the current native form controls nor their current safe receiver
+    # need a historic Ashby-specific raw-action/root admission.
+    forms._entry_safety(page, allowed, provenance)
+    assert forms._entry_not_ready(page) == ""
+
+    row = {
+        "pk": PK, "company": COMPANY, "job_id": JOB, "jd_url": POSTING,
+        "ats": "ashby", "title": page["title"], "status": "submitting",
+        "possible_submission": False, "resume_seed": "synthetic-seed",
+    }
+    pdf = tmp_path / "Synthetic Resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nsynthetic only\n")
+    monkeypatch.setattr(forms, "_row", lambda _pk, *args, **kwargs: row)
+    monkeypatch.setattr(forms, "_configured_alias", lambda *args, **kwargs: provenance)
+    monkeypatch.setattr(forms, "_alias_current", lambda *args, **kwargs: True)
+    monkeypatch.setattr(forms, "check_dispatch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(forms, "hold_possible_submission",
+                        lambda *args, **kwargs: pytest.fail(
+                            "Ambiguous native form reached the durable Submit hold"))
+    submitted = []
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, POSTING, str(pdf), {}, {}, [], {},
+        lambda: submitted.append(True))
+    with pytest.raises(forms.Gate, match="Competing native Submit owners"):
+        await controller.authorize_final_submit(None, page, first)
+    assert submitted == []

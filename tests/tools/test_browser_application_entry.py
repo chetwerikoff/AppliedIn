@@ -380,10 +380,16 @@ async def test_entry_incomplete_waits_but_malformed_is_immediate(monkeypatch, un
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await attempt()
     assert report['status'] == 'gate'
-    assert 'inventory' in report['question']
-    assert ('bounded wait' in report['question']) == (unsafe != 'controls')
-    assert session.pages == 1
-    assert not decide.await_count
+    if unsafe == 'truncated':
+        # ARCH 07:34: bounded inventory incompleteness is not a terminal
+        # pre-final gate. Preparation may continue through the raw reader.
+        assert 'truncated application inventory after bounded wait' not in report['question']
+        assert session.pages >= 2
+    else:
+        assert 'inventory' in report['question']
+        assert ('bounded wait' in report['question']) == (unsafe != 'controls')
+        assert session.pages == 1
+        assert not decide.await_count
     no_mutations(session)
 
 
@@ -1164,8 +1170,14 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
     assert raw.current['entry']['root'] is None
     result = await attempt()
     assert result['status'] == 'gate', (case, result)
-    assert cause in result['question']
-    assert not decide.await_count
+    if case == 'indistinguishable':
+        # ARCH 07:34: a shape-ambiguous root does not make already-approved
+        # reversible writes or choices an application Submit. The final IPC
+        # guard remains the only commit authority.
+        assert 'ambiguous application roots' not in result['question']
+    else:
+        assert cause in result['question']
+        assert not decide.await_count
     no_mutations(raw)
 
 

@@ -2759,7 +2759,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         # ARIA roles, not an implementation-library HTML tag, identify the
         # combobox. Independently witnessed listbox ownership and safe receiver
         # evidence remain mandatory, as does final form-value readback.
-        if (not isinstance(combo.get('link_id'), str) or not combo['link_id']
+        if ((combo.get('linked') is True
+                and (not isinstance(combo.get('link_id'), str)
+                     or not combo['link_id']))
                 or target.get('submit') is True or target.get('navigates') is True
                 or target.get('formaction') or target.get('href')):
             raise Gate('Only a safe, exclusively linked ARIA combobox may request a grant.')
@@ -3407,9 +3409,9 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                    form_question=form_question) from None
     guarded_value(target, answer)
     stable = _combobox_stable_identity(target)
+    # A closed ARIA picker may add aria-controls only when it opens.
+    # Selection still requires one fresh, exclusively linked rendered listbox.
     link_id = (target.get('combobox') or {}).get('link_id')
-    if not link_id:
-        raise Gate('The combobox does not have a unique linked option container.')
 
     latest, latest_witness, current = observed, witness, target
     combo = current.get('combobox') or {}
@@ -3430,7 +3432,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                        'inspect the current configured board and tracked job manually.')
         current = control(latest, action, 'combobox-open')
         if (_combobox_stable_identity(current) != stable
-                or (current.get('combobox') or {}).get('link_id') != link_id
+                or (link_id and (current.get('combobox') or {}).get('link_id') != link_id)
                 or not _preparation_destination_allowed(latest.get('url', ''),
                                           job_url or observed['url'], provenance=provenance)):
             raise Gate('The approved combobox changed while opening its picker.')
@@ -3447,13 +3449,16 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             refreshed, refreshed_witness = await _observe_controls(session, refreshed)
             current = _combobox_options_target(refreshed, action)
             if (_combobox_stable_identity(current) != stable
-                    or (current.get('combobox') or {}).get('link_id') != link_id
+                    or (link_id and (current.get('combobox') or {}).get('link_id') != link_id)
                     or not _preparation_destination_allowed(refreshed.get('url', ''),
                                               job_url or observed['url'], provenance=provenance)):
                 raise Gate('The approved combobox changed while options were loading.')
             combo = current.get('combobox') or {}
             if combo.get('linked') is True and combo.get('options'):
                 options = _combobox_options(current)
+                # Bind the first observed exclusive ARIA relationship. Once
+                # bound, a different listbox cannot inherit this approval.
+                link_id = combo['link_id']
                 latest, latest_witness = refreshed, refreshed_witness
                 break
             if attempt < 19:
@@ -3481,6 +3486,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed before combobox selection.')
     if (_combobox_stable_identity(before_target) != stable
+            or (before_target.get('combobox') or {}).get('link_id') != link_id
             or not _preparation_destination_allowed(before_page.get('url', ''),
                                       job_url or observed['url'], provenance=provenance)):
         raise Gate('The approved combobox changed before selecting its option.')

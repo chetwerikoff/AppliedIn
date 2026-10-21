@@ -347,8 +347,6 @@ _CONTROL_CALLERS = frozenset({
     'approval-history',
     'bootstrap-field',
     'native-receiver',
-    'closed-initial',
-    'closed-preflight',
     'combobox-observe',
     'combobox-open',
     'combobox-options',
@@ -363,9 +361,7 @@ _CONTROL_CALLERS = frozenset({
     'decision-initial',
     'decision-fresh',
     'decision-submit',
-    'submit-reobserve',
     'decision-action',
-    'click-reobserve',
 })
 # Selector display is diagnostic, never an authority for selecting a browser target.
 # Entire ID, class and attribute selectors are opaque even when they are short.

@@ -608,6 +608,29 @@ def _alias_current(provenance: Provenance, *,
                                   fixture_context=fixture_context) == provenance)
 
 
+def _preparation_current(provenance: Provenance, *, fixture_context=None) -> bool:
+    """Tracked caller/origin only; tenant and board pins belong to final Submit."""
+    if isinstance(provenance, VendorRedirectProvenance):
+        return _redirect_current(provenance, fixture_context=fixture_context)
+    if not isinstance(provenance, (ApplicationEntryProvenance, GreenhouseJobAlias)):
+        return False
+    row = _row(provenance.pk, fixture_context=fixture_context)
+    return (row.get('pk') == provenance.pk
+            and row.get('company') == provenance.company
+            and row.get('jd_url') == provenance.wrapper
+            and row.get('status') == 'submitting'
+            and not row.get('possible_submission'))
+
+
+def _preparation_destination_allowed(href: str, *origins: str,
+                                     provenance: Provenance | None = None) -> bool:
+    if isinstance(provenance, VendorRedirectProvenance):
+        return navigation_allowed(href, provenance=provenance)
+    source = (provenance.wrapper if provenance is not None else
+              origins[0] if origins else '')
+    return _preparation_origin(href, source)
+
+
 def exact_approval(pk: str, key: str, value: str, *,
                    target: dict | None = None, url: str = '', provenance=None,
                    fixture_context=None) -> None:
@@ -1017,8 +1040,8 @@ def check_form_destination(page: dict, target: dict, *origins: str,
         base, override = item.get('form_action'), item.get('formaction')
         if (not isinstance(base, str) or not base
                 or (override and not isinstance(override, str))
-                or not navigation_allowed(base, *origins, provenance=provenance)
-                or (override and not navigation_allowed(
+                or not _preparation_destination_allowed(base, *origins, provenance=provenance)
+                or (override and not _preparation_destination_allowed(
                     override, *origins, provenance=provenance))):
             if isinstance(provenance, ApplicationEntryProvenance):
                 raise Gate('native form receiver not proven; inspect the destination manually.')
@@ -1520,7 +1543,7 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     root = _formless_root(page)
     if (not root or not isinstance(provenance, ApplicationEntryProvenance)
             or provenance.ats != 'ashby'
-            or not navigation_allowed(page.get('url', ''), provenance=provenance)):
+            or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('formless structural recipient not proven; inspect manually.')
     if root.get('error'):
         reason = ('defect_ashby_root_identity' if root['error'] in {
@@ -2777,11 +2800,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      resume_path: str = '', company: str = '', job_url: str = '') -> dict:
     if provenance is not None and (
             provenance.pk != pk
-            or not _alias_current(provenance, fixture_context=fixture_context)):
+            or not _preparation_current(provenance, fixture_context=fixture_context)):
         raise Gate('The configured job/tenant correspondence changed; review the form.',
                    reason='defect_provenance')
     _inventory_ok(page)
-    if not navigation_allowed(page['url'], *origins, provenance=provenance):
+    if not _preparation_destination_allowed(page['url'], *origins, provenance=provenance):
         raise Gate('The current form is not on the tracked job route.')
     if _formless_root(page):
         if not isinstance(session, _EntrySession) or session.formless_identity is None:
@@ -2842,8 +2865,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         return page
     page, witness = await _observe_controls(session, page)
     if provenance is not None and (
-            not _alias_current(provenance, fixture_context=fixture_context)
-            or not navigation_allowed(page.get('url', ''), provenance=provenance)):
+            not _preparation_current(provenance, fixture_context=fixture_context)
+            or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
     if settlement_route and history:
@@ -2897,7 +2920,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     and str(item.get('value') or '').strip()):
                 continue
             try:
-                if provenance is not None and not _alias_current(
+                if provenance is not None and not _preparation_current(
                         provenance, fixture_context=fixture_context):
                     raise Gate('The trusted alias is no longer current.')
                 question = _disclosure_question(
@@ -2955,7 +2978,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             record('blocked')
             raise Gate('A required native control is disabled; inspect manually.')
         try:
-            if provenance is not None and not _alias_current(
+            if provenance is not None and not _preparation_current(
                     provenance, fixture_context=fixture_context):
                 raise Gate('The trusted same-job provenance is no longer current.')
             question = _disclosure_question(
@@ -3058,9 +3081,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 **({'fixture_context': fixture_context} if fixture_context else {}))
             committed, observed_witness = await _observe_controls(
                 session, await session.page())
-            if (not navigation_allowed(committed.get('url', ''), *origins,
+            if (not _preparation_destination_allowed(committed.get('url', ''), *origins,
                                        provenance=provenance)
-                    or (provenance is not None and not _alias_current(
+                    or (provenance is not None and not _preparation_current(
                         provenance, fixture_context=fixture_context))):
                 raise Gate('The job route changed during native commit readback.')
             # A later native picker may reset a previously committed field.
@@ -3095,10 +3118,10 @@ async def _current_approved_choices(session, page: dict, pk: str,
                for c in page['controls']):
         return []
     current, witness = await _observe_controls(session, page)
-    if (not navigation_allowed(current.get('url', ''), *origins, provenance=provenance)
+    if (not _preparation_destination_allowed(current.get('url', ''), *origins, provenance=provenance)
             or (provenance is not None
                 and (provenance.pk != pk
-                     or not _alias_current(provenance, fixture_context=fixture_context)))):
+                     or not _preparation_current(provenance, fixture_context=fixture_context)))):
         raise Gate('The same-job choice PAGE changed before model disclosure.')
     choices = []
     for item in current['controls']:
@@ -3143,12 +3166,12 @@ async def _fresh_native_receiver(session, page: dict, action: dict,
                                  original: dict, provenance: Provenance,
                                  *, fixture_context=None) -> tuple[dict, dict]:
     """An alias needs a current native receiver before *every* mutating IPC."""
-    if not _alias_current(provenance, fixture_context=fixture_context):
+    if not _preparation_current(provenance, fixture_context=fixture_context):
         raise Gate('The original same-job tenant mapping is no longer current.')
     observed, _ = await _observe_controls(session, page)
-    if not _alias_current(provenance, fixture_context=fixture_context):
+    if not _preparation_current(provenance, fixture_context=fixture_context):
         raise Gate('The original same-job tenant mapping changed during native inspection.')
-    if not navigation_allowed(observed.get('url', ''), provenance=provenance):
+    if not _preparation_destination_allowed(observed.get('url', ''), provenance=provenance):
         raise Gate('The current native receiver is not on the tracked job route.')
     current = control(observed, action, 'native-receiver')
     if _identity(current) != _identity(original):
@@ -3171,7 +3194,7 @@ def _combobox_options_target(page: dict, action: dict) -> dict:
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
     observed, witness = await _observe_controls(session, page)
-    if provenance is not None and not _alias_current(
+    if provenance is not None and not _preparation_current(
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action, 'combobox-observe')
@@ -3211,14 +3234,14 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         await session.call('click', current['selector'])
         latest = await session.page()
         latest, latest_witness = await _observe_controls(session, latest)
-        if provenance is not None and not _alias_current(
+        if provenance is not None and not _preparation_current(
             provenance, fixture_context=ctx):
             raise Gate('The verified posting changed while opening the picker; '
                        'inspect the current configured board and tracked job manually.')
         current = control(latest, action, 'combobox-open')
         if (_combobox_stable_identity(current) != stable
                 or (current.get('combobox') or {}).get('link_id') != link_id
-                or not navigation_allowed(latest.get('url', ''),
+                or not _preparation_destination_allowed(latest.get('url', ''),
                                           job_url or observed['url'], provenance=provenance)):
             raise Gate('The approved combobox changed while opening its picker.')
         _disclosure_question(latest, current, latest_witness,
@@ -3235,7 +3258,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             current = _combobox_options_target(refreshed, action)
             if (_combobox_stable_identity(current) != stable
                     or (current.get('combobox') or {}).get('link_id') != link_id
-                    or not navigation_allowed(refreshed.get('url', ''),
+                    or not _preparation_destination_allowed(refreshed.get('url', ''),
                                               job_url or observed['url'], provenance=provenance)):
                 raise Gate('The approved combobox changed while options were loading.')
             combo = current.get('combobox') or {}
@@ -3264,11 +3287,11 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     before_page = await session.page()
     before_page, before_witness = await _observe_controls(session, before_page)
     before_target = control(before_page, action, 'combobox-verify')
-    if provenance is not None and not _alias_current(
+    if provenance is not None and not _preparation_current(
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed before combobox selection.')
     if (_combobox_stable_identity(before_target) != stable
-            or not navigation_allowed(before_page.get('url', ''),
+            or not _preparation_destination_allowed(before_page.get('url', ''),
                                       job_url or observed['url'], provenance=provenance)):
         raise Gate('The approved combobox changed before selecting its option.')
     before_options = [o for o in _combobox_options(before_target)
@@ -3357,8 +3380,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if provenance is not None:
         if (pk != provenance.pk or company != provenance.company
                 or job_url != provenance.wrapper
-                or not _alias_current(provenance, fixture_context=ctx)
-                or not navigation_allowed(page.get('url', ''),
+                or not _preparation_current(provenance, fixture_context=ctx)
+                or not _preparation_destination_allowed(page.get('url', ''),
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job provenance.',
                    reason='defect_provenance')
@@ -3394,8 +3417,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_action(target, verb)
         observed, witness = await _observe_controls(session, page)
         if provenance is not None and (
-                not _alias_current(provenance, fixture_context=ctx)
-                or not navigation_allowed(observed.get('url', ''),
+                not _preparation_current(provenance, fixture_context=ctx)
+                or not _preparation_destination_allowed(observed.get('url', ''),
                                           provenance=provenance)):
             raise Gate('The same-job page or mapping changed before a field gate.')
         target = control(observed, action, 'execute-observe')
@@ -3496,8 +3519,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
         if provenance is not None and (
-                not _alias_current(provenance, fixture_context=ctx)
-                or not navigation_allowed(latest.get('url', ''),
+                not _preparation_current(provenance, fixture_context=ctx)
+                or not _preparation_destination_allowed(latest.get('url', ''),
                                           provenance=provenance)):
             raise Gate('The same-job page or mapping changed before disclosure.')
         fresh_question = _disclosure_question(

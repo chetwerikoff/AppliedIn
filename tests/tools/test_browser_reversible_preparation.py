@@ -34,7 +34,7 @@ def _field(selector, label, kind, **extra):
 
 def _page():
     picker = _field(
-        "#picker", "Work location", "combobox",
+        "#picker", "Work location", "combobox", name="work_location",
         combobox={"linked": True, "link_id": "listbox",
                   "listbox_selector": "#listbox",
                   "options": [{"selector": "#remote", "label": "Remote",
@@ -129,6 +129,9 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
             nodes["#picker"]["combobox"].update(
                 selected_text="Remote", displayed_text="Remote",
                 selected_value="remote")
+            # A visible caption alone cannot prove the form submits that
+            # choice. Reproduce a named native receiver with its exact code.
+            nodes["#picker"].update(value="remote", has_value=True)
         elif op == "select":
             nodes["#native"].update(value="hybrid", has_value=True)
         elif (op, args[1]) == ("click", "#privacy"):

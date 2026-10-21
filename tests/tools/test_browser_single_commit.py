@@ -486,3 +486,97 @@ async def test_session_closure_removes_only_protected_attempt_snapshot(
     assert original.is_file()
     assert not snapshot.exists()
     assert not snapshot.parent.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["checkbox", "combobox"])
+async def test_submission_marked_choice_uses_one_final_guard_before_ipc(
+        monkeypatch, kind):
+    """A choice role cannot disguise a known application commit."""
+    target = _control(label="Choose", kind=kind, submit=True)
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {"url": controller.url, "controls": [target]}, controller)
+    checked = []
+
+    async def refuse(_session, _page, _target):
+        checked.append(kind)
+        raise forms.Gate("synthetic final guard refused")
+
+    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
+        await session.application_effect("click", "#next")
+    assert checked == [kind]
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["upload", "select", "fill"])
+async def test_submit_marked_preparation_receivers_refuse_before_cli(
+        monkeypatch, tmp_path, operation):
+    """A known committing receiver is not ordinary form data transmission."""
+    pdf = tmp_path / "synthetic-row.pdf"
+    pdf.write_bytes(b"%PDF-1.4\\nsynthetic payload\\n")
+    controller = _controller(resume_path=str(pdf))
+    target = _control(label="Resume" if operation == "upload" else "Work location",
+                      kind="file" if operation == "upload" else
+                      "select" if operation == "select" else "text")
+    target["submit"] = True
+    if operation == "select":
+        target.update(tag="select", options=[{"value": "remote", "label": "Remote"}])
+    page = {"url": controller.url, "controls": [target]}
+    session, calls = await _setup(monkeypatch, page, controller)
+    args = (("upload", "#next", "--file", str(pdf)) if operation == "upload"
+            else ("select", "#next", "--value", "remote") if operation == "select"
+            else ("fill", "#next", "--value", "Remote"))
+    with pytest.raises(forms.Gate, match="submission-capable"):
+        await session.application_effect(
+            *args, **({"timeout": 130} if operation == "upload" else {}))
+    assert calls == []
+
+
+def test_canonical_ats_posting_authority_is_not_board_pin_authority(monkeypatch):
+    """Only literal tracked-row identity, never configured board, admits prep."""
+    from core.ids import make_pk
+
+    company = "example-co"
+    job = "12345678-1234-4234-8234-123456789abc"
+    pk = make_pk(company, job)
+    posting = f"https://jobs.ashbyhq.com/{company}/{job}"
+    row = {"pk": pk, "company": company, "ats": "ashby", "job_id": job,
+           "jd_url": posting, "status": "submitting"}
+    monkeypatch.setattr(forms, "_row", lambda *_a, **_kw: dict(row))
+    assert forms._tracked_preparation_job(pk, company, posting) is None
+    for bad_url in (posting + "?new=1", posting.replace("/example-co/", "/other-co/"),
+                    posting.replace("https:", "http:")):
+        row["jd_url"] = bad_url
+        with pytest.raises(forms.Gate):
+            forms._tracked_preparation_job(pk, company, bad_url)
+    row["jd_url"] = posting
+    row["job_id"] = "different-job"
+    with pytest.raises(forms.Gate, match="tracked job/dispatch identity"):
+        forms._tracked_preparation_job(pk, company, posting)
+
+
+@pytest.mark.asyncio
+async def test_new_confirmation_needs_exact_route_and_independent_witness(monkeypatch):
+    """A success phrase from a sibling route or contradictory fixed read is not applied."""
+    from unittest.mock import AsyncMock
+
+    provenance = forms.ApplicationEntryProvenance(
+        "synthetic", "example-co", "ashby", "synthetic",
+        "https://jobs.ashbyhq.com/example-co/synthetic",
+        "example-co", "https://jobs.ashbyhq.com/example-co/synthetic/application")
+    before = {"url": provenance.url, "text": "Application form",
+              "controls": [{"label": "Submit application"}]}
+    after = {"url": provenance.url, "text": "Thank you for applying", "controls": []}
+    reader = AsyncMock(return_value=({**after, "url": provenance.url + "/other-job"}, {}))
+    monkeypatch.setattr(forms, "_observe_controls", reader)
+    assert await forms._fresh_confirmed_outcome(
+        object(), before, after, provenance, provenance.wrapper) == ""
+    reader.assert_awaited_once()
+    reader.reset_mock()
+    foreign = {**after, "url": provenance.url + "/other-job"}
+    assert await forms._fresh_confirmed_outcome(
+        object(), before, foreign, provenance, provenance.wrapper) == ""
+    reader.assert_not_awaited()

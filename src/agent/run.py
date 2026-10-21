@@ -1626,11 +1626,18 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "done", "pk": pk, "confirmation": conf}
     if status == "gate":
         q = result.get("question") or "The applier needs your input to continue."
+        # Only the three explicitly owner-routed questions use the existing
+        # direct reply channel. An unsupported private Luna transport is a
+        # durable named gate, never a fabricated reviewer session/approval.
+        review_route = (result.get("review_route") if configuration()['engine'] == 'browser_skill'
+                        else "owner")
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
                                    gate_reason=result.get("reason") or "unknown_field",
                                    gate_pending={"question": q, 'form_question':
-                                       result.get('form_question') if configuration()['engine'] == 'browser_skill' else None},
-                                   gate_call_id="direct", gate_source="applier")
+                                       result.get('form_question') if configuration()['engine'] == 'browser_skill' else None,
+                                       "review_route": review_route or "hard_refusal"},
+                                   gate_call_id="direct" if review_route == "owner" else None,
+                                   gate_source="applier")
         emit("gate", pk=pk, agent="applier", detail=q, url=jd_url)
         log.info("gated pk=%s: %s", pk, q)
         return {"result": "gated", "pk": pk, "question": q}

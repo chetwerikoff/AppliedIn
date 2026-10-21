@@ -4058,14 +4058,28 @@ class ApplicationIPCController:
         targets = [item for item in page.get('controls', [])
                    if item.get('selector') == selector and not item.get('disabled')]
         if op == 'upload':
+            file_target = targets[0] if len(targets) == 1 else None
+            if not targets and _formless_root(page):
+                # The existing structural chooser sends the verified dropzone
+                # selector, not its underlying file-input selector. Reprove
+                # their exact current relationship at the raw upload producer.
+                tree = _upload_tree(page)
+                original = _upload_input(page, tree)
+                drop = tree['nodes'][tree['dropzone']].get('target_selector')
+                if selector == drop and drop != original['selector']:
+                    linked = [item for item in page['controls']
+                              if item.get('selector') == original['selector']
+                              and item.get('type') == 'file']
+                    if len(linked) == 1:
+                        file_target = linked[0]
             if (len(args) != 4 or args[2] != '--file'
                     or str(Path(args[3]).resolve()) != self.resume_path
                     or kwargs != {'timeout': 130}
-                    or len(targets) != 1 or targets[0].get('type') != 'file'
-                    or not re.search(r'resume|résumé|cv', label(targets[0]), re.I)):
+                    or not file_target or file_target.get('type') != 'file'
+                    or not re.search(r'resume|résumé|cv', label(file_target), re.I)):
                 raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
-            if (targets[0].get('submit') is True or targets[0].get('navigates') is True
-                    or targets[0].get('formaction')):
+            if (file_target.get('submit') is True or file_target.get('navigates') is True
+                    or file_target.get('formaction')):
                 raise Gate('A submission-capable upload receiver is not reversible preparation.')
             self.upload_identity = self._row_pdf()
             self.upload_pending = True

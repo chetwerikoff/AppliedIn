@@ -498,16 +498,99 @@ PROXY_BAD = [
 @pytest.mark.parametrize('key', ['location', 'country'])
 @pytest.mark.parametrize('mutation', PROXY_BAD)
 @pytest.mark.parametrize('phase', ['C0', 'C1'])
-def test_required_proxy_fingerprint_and_first_C1_quarantine(key, mutation, phase):
+async def test_required_proxy_mutation_denies_real_final_submit(
+        key, mutation, phase, monkeypatch, tmp_path):
+    """A malformed required proxy must never turn into a submitted answer.
+
+    The generic reader no longer issues C0/C1 quarantine certificates.
+    Exercise the production raw-click controller rather than resurrecting
+    that deleted per-step proof. Every matrix case must deny before the hold.
+    """
+    from tools import browser_skill as bsk
+
     snapshot = dom(fullPhone=True, requiredProxy=True, phases={key: phase},
                    proxyMutation={'key': key, **mutation})
     assert snapshot['page']['opaque_controls'] is True
     assert snapshot['page']['inventory_verified'] is False
-    for reader in snapshot.values():
+    for reader in (snapshot['page'], snapshot['witness']):
         graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#'+key)
         assert graph.get('mode') != 'closed-react-select'
-        assert graph.get('quarantined') is True
         assert graph['linked'] is False and graph['link_id'] == '' and graph['options'] == []
+
+    # Supply a real synthetic PDF and otherwise matching job identity, so the
+    # final guard reaches the generic form check rather than refusing for an
+    # unrelated row, missing attachment, or bad destination.
+    pdf = tmp_path / 'Test User Resume.pdf'
+    pdf_bytes = b'%PDF-1.4\nSynthetic row PDF only\n'
+    pdf.write_bytes(pdf_bytes)
+    page = copy.deepcopy(snapshot['page'])
+    file_inputs = [c for c in page['controls'] if c['selector'] == '#resume']
+    submitters = [c for c in page['controls'] if c['selector'] == '#submit']
+    assert len(file_inputs) == len(submitters) == 1
+    assert file_inputs[0]['type'] == 'file'
+    file_inputs[0]['files'] = [pdf.name]
+    assert page['url'] == URL and page['title'] == 'Synthetic'
+    assert submitters[0]['type'] == 'submit'
+    approved = {name: 'Approved ' + name for name in (*KEYS, 'country')}
+    row = {'pk': 'example-co#1', 'company': 'example-co', 'job_id': '1',
+           'jd_url': URL, 'title': 'Synthetic', 'ats': 'custom',
+           'status': 'submitting', 'human_approved_answers': {
+               name: {'value': value} for name, value in approved.items()}}
+    began_click, raw_commands, reached_form = [], [], []
+    controller = forms.ApplicationIPCController(
+        row['pk'], row['company'], URL, str(pdf), approved,
+        {'#' + name: value for name, value in approved.items()}, [],
+        {}, lambda: began_click.append(True))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+
+    def verify_row_pdf():
+        if pdf.read_bytes() != pdf_bytes:
+            raise forms.Gate('The synthetic row PDF bytes changed.')
+        return pdf.stat().st_size, controller.expected_digest
+
+    monkeypatch.setattr(controller, '_row_pdf', verify_row_pdf)
+    controller.upload_identity = verify_row_pdf()
+    controller.upload_completed = True
+
+    def verify_dispatch(pk, staged_path, **kwargs):
+        assert pk == row['pk'] and staged_path == str(pdf.resolve())
+        assert kwargs == {}
+
+    def verify_preparation(origin):
+        assert origin == URL
+
+    async def reread(_session):
+        return copy.deepcopy(page)
+
+    async def fake_command(*args, **kwargs):
+        raw_commands.append((args, kwargs))
+        return {}
+
+    original_check_form = forms.check_form
+
+    def real_form_check(*args, **kwargs):
+        reached_form.append(True)
+        return original_check_form(*args, **kwargs)
+
+    monkeypatch.setattr(forms, 'check_dispatch', verify_dispatch)
+    monkeypatch.setattr(controller, '_fresh_preparation', verify_preparation)
+    monkeypatch.setattr(controller, '_page', reread)
+    monkeypatch.setattr(forms, 'check_form', real_form_check)
+    monkeypatch.setattr(
+        forms, 'hold_possible_submission',
+        lambda *_a, **_kw: pytest.fail('Malformed proxy reached the Submit hold'))
+    monkeypatch.setattr(bsk, 'command', fake_command)
+    session = bsk.Session('apply')
+    session.id = 'synthetic-session'
+    session.bind_application_controller(controller)
+
+    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
+        await session.application_effect('click', '#submit')
+    assert reached_form == [True]  # Same production guard and form reader.
+    assert raw_commands == [] and began_click == []
+    assert controller.committed is False and controller.history == []
+    assert controller.upload_completed is True  # The PDF was not the refusal.
+    assert controller.filled == {'#' + name: value for name, value in approved.items()}
 
 
 async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):

@@ -16,7 +16,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
-from urllib.parse import parse_qsl, unquote, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlparse, urlsplit, urlunparse
 
 import httpx
 
@@ -71,14 +71,32 @@ def _headers() -> dict:
     return BROWSER_HEADERS
 
 
-def _fetch(client: httpx.Client, url: str) -> bytes | None:
+def _fetch(client: httpx.Client, url: str, *, strict_origin: str = "") -> bytes | None:
+    if strict_origin:
+        # Validate before sending; post-response checks are too late to stop
+        # requests to an untrusted redirect hop.
+        try:
+            requested = urlsplit(url)
+            if requested.scheme != "https" or requested.netloc != strict_origin:
+                return None
+        except ValueError:
+            return None
     try:
-        r = client.get(url, timeout=20, follow_redirects=True)
+        # The verified raw-sitemap path rejects *all* redirects. Ordinary
+        # sitemap discovery retains its existing redirect-following behavior.
+        r = client.get(url, timeout=20, follow_redirects=not bool(strict_origin))
     except httpx.HTTPError as exc:
         log.debug("sitemap fetch failed for %s: %s", url, exc)
         return None
     if r.status_code != 200:
         return None
+    if strict_origin:
+        try:
+            final = urlsplit(str(r.url))
+            if final.scheme != "https" or final.netloc != strict_origin:
+                return None
+        except ValueError:
+            return None
     body = r.content
     if body[:2] == b"\x1f\x8b" or url.endswith(".gz"):
         try:
@@ -88,11 +106,11 @@ def _fetch(client: httpx.Client, url: str) -> bytes | None:
     return body
 
 
-def _candidates(careers_url: str, client: httpx.Client) -> list[str]:
+def _candidates(careers_url: str, client: httpx.Client, *, strict_origin: str = "") -> list[str]:
     p = urlparse(careers_url)
     root = urlunparse((p.scheme or "https", p.netloc, "", "", "", ""))
     seen: list[str] = []
-    robots = _fetch(client, root + "/robots.txt")
+    robots = _fetch(client, root + "/robots.txt", strict_origin=strict_origin)
     if robots:
         for m in _SITEMAP_LINE_RX.finditer(robots.decode("utf-8", "replace")):
             u = m.group(1).strip()
@@ -197,13 +215,21 @@ def _location_from(url: str) -> str:
     return ""
 
 
-def sitemap_jobs(careers_url: str, company: str,
-                 client: httpx.Client | None = None) -> list[JobRecord]:
-    """Every posting the site's sitemap lists, or [] when it keeps none."""
+def raw_sitemap_entries(
+    careers_url: str, client: httpx.Client | None = None, *,
+    strict_origin: bool = False,
+) -> list[tuple[str, str]]:
+    """Return bounded raw URL/lastmod pairs before title-based job parsing.
+
+    This seam shares the original parser, sitemap/index selection, fetch caps
+    and ordering. The strict option is reserved for the reviewed Greenhouse
+    employer-origin producer; ordinary sitemap jobs keep their prior policy.
+    """
     own = client is None
     client = client or httpx.Client(headers=_headers())
+    origin = urlsplit(careers_url).netloc if strict_origin else ""
     try:
-        queue = _candidates(careers_url, client)
+        queue = _candidates(careers_url, client, strict_origin=origin)
         visited: set[str] = set()
         pages: list[tuple[str, str]] = []
         found_any = False
@@ -211,24 +237,36 @@ def sitemap_jobs(careers_url: str, company: str,
             url = queue.pop(0)
             if url in visited:
                 continue
+            if strict_origin:
+                try:
+                    parts = urlsplit(url)
+                    if parts.scheme != "https" or parts.netloc != origin:
+                        continue
+                except ValueError:
+                    continue
             visited.add(url)
-            body = _fetch(client, url)
+            body = _fetch(client, url, strict_origin=origin)
             if not body:
                 continue
             children, entries = _parse(body)
             if not children and not entries:
                 continue
             found_any = True
-            pages.extend(entries)
+            pages.extend(entries[:_MAX_URLS - len(pages)])
             children.sort(key=lambda u: ("job" not in u.lower(), u))
             queue = children + queue
             if not children and url in _defaults_for(careers_url):
                 break
-        if not found_any:
-            return []
+        return pages if found_any else []
     finally:
         if own:
             client.close()
+
+
+def sitemap_jobs(careers_url: str, company: str,
+                 client: httpx.Client | None = None) -> list[JobRecord]:
+    """Every title-bearing posting the site's sitemap lists, or []."""
+    pages = raw_sitemap_entries(careers_url, client)
     jobs: dict[str, JobRecord] = {}
     for url, lastmod in pages:
         job = job_from_url(company, url, lastmod)

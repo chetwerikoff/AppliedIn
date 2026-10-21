@@ -3138,3 +3138,41 @@ async def test_required_radio_group_with_optional_leader_has_one_gate_record(
     assert "'decision': 'needs-human'" in lines[0]
     assert not decide.await_count
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+
+
+async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeypatch):
+    """An unlabelled native group can be observed, but never granted or submitted.
+
+    The old per-step card-shape gate barred unrelated safe preparation. r06
+    instead retains the unanswered radios for the final code-owned guard.
+    """
+    page = secure_inventory(
+        field('First option', '#answer-a', tag='input', type='radio',
+              name='screening-answer', value='first', required=True),
+        field('Second option', '#answer-b', tag='input', type='radio',
+              name='screening-answer', value='second', required=True),
+    )
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    assert browser.pages > 0
+    assert not any(c[0] in {'click', 'fill', 'select', 'upload'}
+                   for c in browser.calls)
+    assert row['human_approved_answers'] == {}
+    assert filled == {} and history == []
+    with pytest.raises(forms.Gate, match='visible question'):
+        forms._bound_target(page, page['controls'][0])
+    with pytest.raises(forms.Gate, match='Required choice is empty'):
+        forms.check_form(page, filled, True)
+
+
+def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+    """Relocating shape checks cannot delegate new legal/privacy consent."""
+    page = secure_inventory(
+        field('I consent to sharing personal data with marketing partners',
+              '#marketing', tag='input', type='checkbox',
+              value='yes', required=True),
+    )
+    with pytest.raises(forms.Gate) as exc:
+        forms._bootstrap_wall(page, witness(page), SECURE_URL)
+    assert exc.value.reason == 'owner_question'
+    assert 'Direct owner review' in str(exc.value)

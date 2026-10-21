@@ -3851,8 +3851,12 @@ def _tracked_preparation_job(pk: str, company: str, url: str, *,
             or row.get('status') != 'submitting' or row.get('possible_submission')):
         raise Gate('The tracked job/dispatch identity is invalid; no navigation is safe.')
     ats = row.get('ats')
-    host = urlsplit(url).hostname
-    if ats in _APPLICATION_ENTRY or host in {entry[0] for entry in _APPLICATION_ENTRY.values()}:
+    try:
+        host = urlsplit(url).hostname
+        known_ats = isinstance(ats, str) and ats in _APPLICATION_ENTRY
+    except (TypeError, ValueError):
+        raise Gate('The tracked ATS posting is not a literal canonical job route.') from None
+    if known_ats or host in {entry[0] for entry in _APPLICATION_ENTRY.values()}:
         expected = _APPLICATION_ENTRY.get(ats)
         if expected is None:
             raise Gate('The tracked ATS posting identity changed; no navigation is safe.')

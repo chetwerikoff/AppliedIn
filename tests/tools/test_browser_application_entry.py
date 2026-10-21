@@ -231,7 +231,13 @@ async def test_invalid_current_authority_gates_before_navigation(monkeypatch, pr
         with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
             await guard.authorize_final_submit(
                 session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
-    assert not decision.await_count
+    if tracked_mismatch:
+        assert not decision.await_count
+    else:
+        # Ordinary preparation is allowed despite a broken tenant/board pin;
+        # the actual final guard above still refuses before one raw Submit.
+        assert decision.await_count == 1
+        assert result['form_question'] is None
 
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
@@ -308,14 +314,16 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     else:
         # ARCH21:58 / binding 3: the allowlisted receiver can be observed for
         # preparation, but a different final receiver must never Submit.
-        assert report['form_question']['label'] == 'Email'
+        assert report['form_question'] is None
+        assert decide.await_count == 1
         guard = forms.ApplicationIPCController(
             PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
         with pytest.raises(forms.Gate, match='Final submit receiver'):
             await guard.authorize_final_submit(session, page, page['controls'][-1])
     if ats == 'ashby':
         assert report.get('form_question') is None
-    assert not decide.await_count
+    if ats == 'ashby':
+        assert not decide.await_count
     no_mutations(session)
 
 
@@ -435,9 +443,18 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
     row, configs, session, decide = world(monkeypatch)
     if when == 'resume':
         first = await attempt()
-        assert first['form_question']
-        q = first['form_question']
-        row['human_approved_answers'] = {q['label']: {**q, 'value': 'test@example.test'}}
+        assert first['status'] == 'gate' and first['form_question'] is None
+        assert decide.await_count == 1
+        # Re-entry retains a real exact approved-control grant, without
+        # inventing the removed early per-step human question.
+        email = application('ashby')['controls'][0]
+        row['human_approved_answers'] = {'Email': {
+            'value': 'test@example.test', 'selector': email['selector'],
+            'url': entry('ashby'), 'label': email['label'],
+            'question': email['question'], 'tag': email['tag'],
+            'type': email['type'], 'form_selector': email['form_selector'],
+            'form_action': email['form_action']}}
+        decide.reset_mock()
         session.calls.clear()
     def change():
         if drift in {'board', 'ats'}:
@@ -464,7 +481,10 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
                 session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
     else:
         assert report.get('form_question') is None
-    assert not decide.await_count
+    if drift in {'board', 'ats'}:
+        assert decide.await_count == 1
+    else:
+        assert not decide.await_count
     no_mutations(session)
     if when == 'resume' and drift not in {'route', 'board', 'ats'}:
         assert session.calls == []
@@ -1174,10 +1194,14 @@ async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypat
     assert {c['selector'] for c in admitted['controls']} == {'#email', '#submit'}
     assert admitted['entry']['quarantined_native_owners'] == (
         ['#foreign-application'] if pair else [])
-    with pytest.raises(forms.Gate) as owner_gate:
-        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
-                               provenance=proof)
-    assert owner_gate.value.form_question['label'] == 'Email'
+    prepared = await forms._bootstrap(
+        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
+    assert not prepared['controls'][0]['has_value']
+    # No early question or write, but the final-form decision still rejects
+    # the missing required answer before any committing click.
+    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
+        forms.check_form(prepared, {}, uploaded=True)
     no_mutations(raw)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -1243,10 +1267,13 @@ async def test_native_hidden_machine_control_remains_separate_from_visible_recei
     fixed_machine = next(c for c in raw.fixed['controls'] if c['selector'] == '#native-machine')
     assert candidate_machine['visible'] is False
     assert fixed_machine['visible'] is False
-    with pytest.raises(forms.Gate) as owner_gate:
-        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
-                               provenance=proof)
-    assert owner_gate.value.form_question['label'] == 'Email'
+    prepared = await forms._bootstrap(
+        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    assert {c['selector'] for c in prepared['controls']} >= {
+        '#native-machine', '#email', '#submit'}
+    assert prepared['controls'][0]['selector'] != '#native-machine'
+    with pytest.raises(forms.Gate):
+        forms.check_form(prepared, {}, uploaded=True)
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1361,10 +1388,11 @@ async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positio
         deadline=asyncio.get_running_loop().time() + 10)
     assert admitted['entry']['selected_native_owner'] == '#application-form'
     assert admitted['entry']['quarantined_native_owners'] == ['#foreign-application']
-    with pytest.raises(forms.Gate) as owner_gate:
-        await forms._bootstrap(session, admitted, PK, {}, posting('ashby'),
-                               provenance=proof)
-    assert owner_gate.value.form_question['label'] == 'Email'
+    prepared = await forms._bootstrap(
+        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
+    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
+        forms.check_form(prepared, {}, uploaded=True)
     result = await attempt()
     assert result['status'] == 'gate', result
     assert not any(reason in result['question'] for reason in (

@@ -505,7 +505,8 @@ _CAPTCHA_RESPONSE_NODES = r"""
 # Inserted before either reader's graph: filtering the final list is too late,
 # because closedGraph and linked receivers read hidden values eagerly.
 _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
-  const reservedButtons = Array.from(document.querySelectorAll('button#hcaptchaSubmitBtn'));
+  const reservedButtons = Array.from(document.querySelectorAll('button'))
+    .filter(e => e.id === 'hcaptchaSubmitBtn');
   const excluded = new Set([...responseNodes, ...reservedButtons]);
 """ + _APPLICATION_ROOT + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
   // W is a passive row, not permission to act on either widget node. All raw
@@ -659,7 +660,8 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       {selector:selector(nativeRoot),action:nativeRoot.action} : null,
     ...(ashbyNative ? {native_candidates:nativeCandidates} : {}),
     formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,
-    helper_challenge:reservedButtons.some(e=>!e.matches('button#hcaptchaSubmitBtn.hidden') ||
+    helper_challenge:reservedButtons.some(e=>!(e.tagName === 'BUTTON' && e.id === 'hcaptchaSubmitBtn' &&
+          e.matches('.hidden')) ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&
         getComputedStyle(e).display!=='none'))};
   // An unreadable W name must reach the named frame Gate before generic graphs

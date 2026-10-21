@@ -1017,7 +1017,19 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 'selected_text', 'selected_value', 'hidden_value'))
             if not target.get('required') and not has_selection:
                 continue
-            if (not isinstance(combo.get('link_id'), str) or not combo.get('link_id')
+            # A closed picker may remove aria-controls after its option was
+            # selected. Its original exclusive linkage is captured by the
+            # receipt; fresh displayed and form-own values still must agree.
+            closed_receipt = any(
+                r.get('action') == 'combobox'
+                and r.get('selector') == target.get('selector')
+                and _same(r.get('committed_caption', ''), expected or '')
+                and r.get('committed_value') == combo.get('selected_value')
+                and r.get('hidden_selector') == combo.get('hidden_selector')
+                and r.get('hidden_value') == combo.get('hidden_value')
+                for r in receipts or [])
+            if (not isinstance(combo.get('link_id'), str)
+                    or (not combo.get('link_id') and not closed_receipt)
                     or expected is None or not _same(combo.get('selected_text', ''), expected)
                     or not _same(combo.get('displayed_text', ''), combo.get('selected_text', ''))
                     or not combo.get('selected_value')
@@ -1026,6 +1038,19 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 if combo.get('hidden_selector') and combo.get('hidden_value') != combo.get('selected_value'):
                     raise Gate('A hidden form value is not independently authorized.')
                 raise Gate(f'Unverified or changed combobox value: {target["label"]}')
+            if not combo.get('hidden_selector'):
+                # Without a hidden receiver, the combobox's own named input
+                # must actually submit the approved caption or option value.
+                own_value = target.get('value')
+                if (target.get('in_form') is not True
+                        or not target.get('form_selector')
+                        or not target.get('form_action')
+                        or not target.get('name')
+                        or not target.get('has_value')
+                        or not isinstance(own_value, str)
+                        or not (own_value == combo['selected_value']
+                                or _same(own_value, combo['selected_text']))):
+                    raise Gate('The combobox has no verified form-own value receiver.')
             guarded_value(target, expected)
             continue
         if target.get('in_form') and (
@@ -3555,6 +3580,18 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         if (len(linked_inputs) != 1
                 or linked_inputs[0].get('value') != combo.get('hidden_value')):
             raise Gate('A hidden form value is not independently authorized.')
+    else:
+        # ARIA display data alone is not a posted form value. A picker with
+        # no hidden receiver needs a real named form-owned input readback.
+        own_value = after.get('value')
+        if (after.get('in_form') is not True
+                or not after.get('form_selector') or not after.get('form_action')
+                or not after.get('name') or not after.get('has_value')
+                or not isinstance(own_value, str)
+                or not (own_value == option['value']
+                        or _same(own_value, option['label']))):
+            raise Gate('The combobox has no verified form-own value receiver.',
+                       form_question=form_question)
     filled[current['selector']] = option['label']
     return {'action': 'combobox', 'label': current['label'],
             'selector': current['selector'], 'question': current.get('question', ''),

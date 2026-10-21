@@ -640,8 +640,8 @@ def _assent_scope(target: dict) -> str:
                  r'legally binding|undertake)\b', text):
         return 'owner'
     if re.search(r'\b(privacy|personal data|personal information)\b', text):
-        if re.search(r'\b(marketing|advertis|third.party|unrelated|'
-                     r'share|sell|other purposes|partners)\b', text):
+        if re.search(r'\b(marketing|advertis\w*|third.party|unrelated|'
+                     r'shar(?:e|ing)|sell|other purposes|partners)\b', text):
             return 'owner'
         if (re.search(r'\b(acknowledge|understand|agree|consent)\b', text)
                 and re.search(r'\b(processing|process)\b', text)
@@ -2900,7 +2900,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 question['pk'] = pk
                 raise Gate(f'An exact human-approved answer is needed for "{key}".',
                            form_question=question,
-                           reason=('owner_question' if item.get('required')
+                           reason=(_missing_answer_reason(item) if item.get('required')
                                    and _unanswered(page, item) and not previous
                                    and not value else 'unknown_field'))
         return page

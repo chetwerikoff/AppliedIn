@@ -2902,16 +2902,16 @@ async def test_bootstrap_positive_required_unanswered_witness_is_owner_question(
     monkeypatch.setattr(forms, '_row', lambda *a, **k: {
         'pk': 'example-co#synthetic', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(session, current, 'example-co#synthetic', {},
-                               current['url'])
-    # ARCH21:26 / binding 7: ordinary missing facts are agent-first; an
-    # unavailable transport must not invent a direct-owner approval channel.
-    assert gated.value.reason == 'agent_review_unavailable'
-    question = gated.value.form_question
-    assert question['label'] == 'Location'
-    assert question['selector'] == '#field'
-    assert question['pk'] == 'example-co#synthetic'
+    prepared = await forms._bootstrap(
+        session, current, 'example-co#synthetic', {}, current['url'])
+    assert prepared is current
+    assert prepared['controls'][0]['label'] == 'Location'
+    assert prepared['controls'][0]['selector'] == '#field'
+    assert forms._missing_answer_reason(prepared['controls'][0]) == 'agent_review_unavailable'
+    # An ordinary missing answer no longer invents an owner question in
+    # preparation, but the real final-form boundary rejects it.
+    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
+        forms.check_form(prepared, {}, uploaded=True)
     session.call.assert_not_awaited()
 
 
@@ -2920,11 +2920,18 @@ async def test_bootstrap_unapproved_existing_fact_cannot_masquerade_as_new_quest
     monkeypatch.setattr(forms, '_row', lambda *a, **k: {
         'pk': 'example-co#synthetic', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(session, current, 'example-co#synthetic',
-                               {'Location': 'Synthetic Place'}, current['url'])
-    assert gated.value.reason == 'unknown_field'
-    assert gated.value.form_question['label'] == 'Location'
+    prepared = await forms._bootstrap(
+        session, current, 'example-co#synthetic',
+        {'Location': 'Synthetic Place'}, current['url'])
+    assert prepared is current and not prepared['controls'][0]['has_value']
+    # A fact bank is not approval. Without an exact per-control grant neither
+    # the writer nor the final Submit check may accept this value.
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
+        forms.exact_approval(
+            'example-co#synthetic', 'Location', 'Synthetic Place',
+            target=current['controls'][0], url=current['url'])
+    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
+        forms.check_form(prepared, {}, uploaded=True)
     session.call.assert_not_awaited()
 
 

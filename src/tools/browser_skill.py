@@ -210,12 +210,16 @@ class Session:
             raise
 
     async def close(self):
-        if self.id:
-            try:
-                await command("session", "stop", self.id, timeout=15)
-            except (Unavailable, TimeoutError, OSError):
-                log.warning("BrowserSkill session cleanup unavailable (session=%s)", self.id)
-            self.id = ""
+        try:
+            if self.id:
+                try:
+                    await command("session", "stop", self.id, timeout=15)
+                except (Unavailable, TimeoutError, OSError):
+                    log.warning("BrowserSkill session cleanup unavailable (session=%s)", self.id)
+                self.id = ""
+        finally:
+            if self.kind == "apply" and self._application_controller is not None:
+                self._application_controller.release_snapshot()
 
     async def __aexit__(self, *args):
         try:

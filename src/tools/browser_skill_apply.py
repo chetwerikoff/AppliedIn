@@ -1998,7 +1998,10 @@ class _EntrySession:
             # native submit; classifying every click as submission would turn a
             # successful safe choice into a false uncertain-result hold.
             if (args[0] == 'click' and native_submit(matches[0])
-                    and self.on_committing_click is not None):
+                    and self.on_committing_click is not None
+                    and getattr(self.raw, '_application_controller', None) is None):
+                # Offline legacy facade only. The production transport decides
+                # at the single final guard, not this admission/read wrapper.
                 self.committing = True
                 self.on_committing_click()
         if args and args[0] != 'evaluate' and self.formless_identity is not None:
@@ -2030,19 +2033,24 @@ class _EntrySession:
             if args[0] == 'upload':
                 return await self._upload(args, kwargs, selector)
             if args[0] == 'click':
-                if not self.submit_authorized:
-                    raise Gate('Structural submit lacks final approval, attachment and hold checks.')
-                if _page_identity(current) != self.submit_authorized:
-                    self.submit_authorized = None
-                    raise Gate('Validated structural answers or attachment changed before submit; inspect manually.')
+                if getattr(self.raw, '_application_controller', None) is None:
+                    if not self.submit_authorized:
+                        raise Gate('Structural submit lacks the offline authorization witness.')
+                    if _page_identity(current) != self.submit_authorized:
+                        self.submit_authorized = None
+                        raise Gate('Validated structural answers changed before submit.')
+                    self.committing = True
+                    if self.on_committing_click is not None:
+                        self.on_committing_click()
                 self.submit_authorized = False
-                self.committing = True
-                if self.on_committing_click is not None:
-                    self.on_committing_click()
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
                         else self.raw.call(*args, **kwargs))
+        if (args and args[0] == 'click'
+                and getattr(getattr(self.raw, '_application_controller', None),
+                            'committed', False)):
+            self.committing = True
         if args and args[0] == 'evaluate':
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):

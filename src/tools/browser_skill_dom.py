@@ -203,9 +203,15 @@ PAGE = r"""(() => {
       // existing generic linked-combobox checks below. Receiverless C2 is
       // excluded by closedGraph and has no legacy linkId to downgrade through.
       const list = currentListbox(e);
-      if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
+      if (!visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;
-      // Only a genuinely absent target is a provisional closed picker.
+      if (!linkId(e)) {
+        // A closed form-owned ARIA picker may mount its listbox only on open.
+        // No option is selectable until an exclusive live relationship exists.
+        return e.getAttribute('aria-expanded') === 'false' &&
+          !!nativeForm(e) && !unsafeOption(e);
+      }
+      // An absent target is provisional only while the owning role stays safe.
       if (!list) return document.getElementById(linkId(e)) === null;
       const options = Array.from(list.querySelectorAll('[role="option"]'));
       if (options.some(o => o.closest('[role="listbox"]') !== list)) return false;

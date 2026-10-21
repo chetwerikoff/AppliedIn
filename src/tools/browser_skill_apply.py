@@ -1940,9 +1940,11 @@ _upload_sleep = asyncio.sleep
 
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
-    def __init__(self, raw, allowed, provenance, step=None, *, resume_path=''):
+    def __init__(self, raw, allowed, provenance, step=None, *, resume_path='',
+                 fixture_context=None):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
+        self.fixture_context = fixture_context
         self.formless_identity = None
         self.native_identity = None
         self.committing = False
@@ -2153,7 +2155,8 @@ class _EntrySession:
                     if status not in {'H', 'R', 'W', 'X', 'Z'}:
                         raise Gate('Untrusted frame after a committing click.')
             else:
-                if not _preparation_current(self.provenance):
+                if not _preparation_current(self.provenance,
+                                            fixture_context=self.fixture_context):
                     raise Gate('Application entry route or current row/config changed; inspect manually.',
                                reason='defect_provenance')
                 _entry_safety(page, self.allowed, self.provenance)
@@ -4454,7 +4457,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     await _effect_call(session, 'navigate', direct_url)
                     deadline = asyncio.get_running_loop().time() + (
                         _ASHBY_WAIT_SECONDS if provenance.ats == 'ashby' else _APPLICATION_WAIT_SECONDS)
-                    scoped = _EntrySession(session, allowed, provenance, step, resume_path=resume_path)
+                    scoped = _EntrySession(session, allowed, provenance, step,
+                                           resume_path=resume_path, fixture_context=ctx)
                     session, page = await _entry_or_reversible_page(
                         scoped, session, allowed, provenance, deadline=deadline)
                     if provenance.ats == 'ashby' and isinstance(session, _EntrySession):

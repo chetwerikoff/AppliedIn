@@ -65,7 +65,9 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path):
     attachments[0]['files'] = [pdf.name]
     assert buttons[0]['type'] == 'submit' and buttons[0]['in_form'] is True
     assert buttons[0]['form_action'] == trusted
-    assert page['title'] == 'Synthetic'
+    # The independent PAGE reader now uses the actual visible posting heading.
+    # Preserve full literal title identity rather than a synthetic abbreviation.
+    assert page['title'] == 'Synthetic role at example-co'
 
     row = {'pk': 'example-co#1', 'company': 'example-co', 'jd_url': trusted,
            'job_id': '1', 'title': page['title'], 'ats': 'custom',

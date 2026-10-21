@@ -3906,7 +3906,19 @@ def _tracked_preparation_job(pk: str, company: str, url: str, *,
     """Validate tracked-row posting authority, not mutable ATS board/tenant pins."""
     from core.ids import make_pk
 
-    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+    # Only the daemon-minted, context-bound synthetic fixture uses an offline
+    # loopback URL without a real canonical posting ID. _synthetic() checks
+    # its exact sealed context, caller PK, company and fixture URL; untrusted
+    # kwargs cannot select this path, and no real application is authorized.
+    ctx = (_synthetic(fixture_context, pk=pk, company=company, url=url)
+           if fixture_context is not None else None)
+    row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+    if ctx is not None:
+        if (row.get('pk') != pk or row.get('company') != company
+                or row.get('status') != 'submitting'
+                or row.get('possible_submission')):
+            raise Gate('Synthetic tracked job/dispatch identity changed.')
+        return
     job_id = row.get('job_id')
     if (not isinstance(pk, str) or not pk or not isinstance(company, str)
             or not isinstance(url, str) or not isinstance(job_id, str) or not job_id
@@ -4434,8 +4446,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
 
         def allowed(href: str) -> bool:
             # Host-only HTTPS preparation is reversible; it cannot mint tenant
-            # or same-job final-submit authority.
-            return _preparation_origin(href, url) or (
+            # or same-job final-submit authority. The already-authorized daemon
+            # synthetic fixture is the only non-HTTPS exact-route exception.
+            return (ctx is not None and href == url) or _preparation_origin(href, url) or (
                 isinstance(provenance, VendorRedirectProvenance)
                 and navigation_allowed(href, provenance=provenance))
 

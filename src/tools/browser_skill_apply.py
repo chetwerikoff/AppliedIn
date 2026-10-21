@@ -2746,9 +2746,13 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         target = members[0]
     elif target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
-        if (target.get('tag') not in {'input', 'div'}
-                or not combo.get('link_id')):
-            raise Gate('Only uniquely linked input/div comboboxes may request a grant.')
+        # ARIA roles, not an implementation-library HTML tag, identify the
+        # combobox. Independently witnessed listbox ownership and safe receiver
+        # evidence remain mandatory, as does final form-value readback.
+        if (not isinstance(combo.get('link_id'), str) or not combo['link_id']
+                or target.get('submit') is True or target.get('navigates') is True
+                or target.get('formaction') or target.get('href')):
+            raise Gate('Only a safe, exclusively linked ARIA combobox may request a grant.')
         options = combo.get('options')
         if combo.get('linked') is True and options:
             # A known location field needs a bound question even when option
@@ -4186,6 +4190,11 @@ class ApplicationIPCController:
                 raise Gate('The clicked radio/checkbox is not the exact approved answer.')
             return
         if target.get('type') == 'combobox':
+            # A role override cannot hide a native Submit, form-action
+            # override or navigating anchor behind a picker-opening click.
+            if (target.get('submit') is True or target.get('navigates') is True
+                    or target.get('formaction') or target.get('href')):
+                raise Gate('A committing or navigating combobox cannot be opened.')
             key = _key(page, target)
             answer_key = _fact_key(self.facts, key)
             if answer_key is None:

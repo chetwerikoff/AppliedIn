@@ -2495,10 +2495,20 @@ def _bound_target(page: dict, target: dict) -> dict:
 
 
 def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
+    """A fresh PAGE copy is the same control, but selector twins are not."""
     key = target.get('question') or target.get('label')
     own = _radio_group(page, target) if target.get('type') == 'radio' else [target]
-    return [c for c in page['controls']
-            if all(c is not member for member in own)
+    controls = page['controls']
+    own_selectors = set()
+    for member in own:
+        selector = member.get('selector')
+        current = [c for c in controls if c.get('selector') == selector]
+        if (not isinstance(selector, str) or not selector
+                or len(current) != 1
+                or _identity(current[0]) != _identity(member)):
+            raise Gate('The observed approval control is missing, duplicated or changed.')
+        own_selectors.add(selector)
+    return [c for c in controls if c.get('selector') not in own_selectors
             and _same(key, c.get('question') or c.get('label') or '')]
 
 

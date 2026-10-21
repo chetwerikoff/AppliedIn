@@ -299,13 +299,20 @@ async def test_bootstrap_skips_invisible_selector_but_can_offer_visible_one(
     assert result['controls'][1]['visible'] is True
     session = Session(current, result)
     monkeypatch.setattr(forms, '_row', lambda pk: {'pk': pk, 'human_approved_answers': {}})
-    with pytest.raises(forms.Gate) as raised:
-        await forms._bootstrap(session, current, PK, {}, URL)
-    question = raised.value.form_question
-    assert question and question['selector'] == shown['selector']
+    prepared = await forms._bootstrap(session, current, PK, {}, URL)
+    assert prepared is current
+    fixed = {c['selector']: c for c in result['controls']}
+    # Independent witnessing must still refuse the invisible receiver; the
+    # visible control remains identifiable without an early ordinary gate.
+    with pytest.raises(forms.Gate, match='not visibly editable'):
+        forms._disclosure_question(current, hidden, fixed, URL)
+    question = forms._disclosure_question(current, shown, fixed, URL)
+    assert question['selector'] == shown['selector']
     assert question['selector'] in {
         c['selector'] for c in result['controls'] if c['visible'] is True
     }
+    with pytest.raises(forms.Gate, match='Required field is empty: Hidden field'):
+        forms.check_form(prepared, {}, uploaded=True)
     no_mutation(session)
 
 

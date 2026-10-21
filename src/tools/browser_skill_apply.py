@@ -547,44 +547,6 @@ def _greenhouse_id_query_attempt(url: str) -> bool:
     return True
 
 
-def _greenhouse_wrapper_missing_board(pk: str, company: str, url: str) -> bool:
-    """Match the exact #118 cause; an alias failure alone is not evidence."""
-    try:
-        from core.config import get_settings
-        from core.ids import make_pk
-        from discovery.watchlist import load_watchlist
-        row = _row(pk, None, True)
-        # This diagnostic is exclusively for pre-pin legacy rows. A present
-        # pin, even empty or stale after config change, fails as defect_tenant.
-        if 'greenhouse_board' in row:
-            return False
-        job_id = row.get('job_id')
-        match = re.fullmatch(r'gh_jid=([0-9]+)', urlsplit(url).query)
-        if (row.get('pk') != pk or row.get('company') != company
-                or row.get('jd_url') != url or row.get('ats') != 'greenhouse'
-                or not isinstance(job_id, str) or not match
-                or match.group(1) != job_id or make_pk(company, job_id) != pk):
-            return False
-        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
-        matches = [c for c in configs if isinstance(getattr(c, 'name', None), str)
-                   and c.name.strip().lower() == company.strip().lower()]
-        if len(matches) != 1:
-            return False
-        cfg = matches[0]
-        if getattr(cfg, 'ats', None) != 'greenhouse' or getattr(cfg, 'board', None) not in (None, ''):
-            return False
-        careers = cfg.careers_url
-        if isinstance(careers, str) and re.fullmatch(r'https://[^/?#]+', careers):
-            careers += '/'
-        source = _alias_https_parts(careers)
-        wrapper = _alias_https_parts(url, query=True)
-        return bool(source and wrapper and source[0] == wrapper[0]
-                    and (source[1] == '/' or wrapper[1] == source[1]
-                         or wrapper[1].startswith(source[1].rstrip('/') + '/')))
-    except Exception:
-        return False
-
-
 def _configured_alias(pk: str, company: str, url: str, *,
                       fixture_context=None) -> GreenhouseJobAlias | ApplicationEntryProvenance | None:
     """Reload only the explicit watchlist and the authoritative tracked row."""

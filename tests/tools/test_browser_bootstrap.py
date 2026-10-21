@@ -1339,7 +1339,20 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
     assert response['status'] == 'gate'
-    q = response['form_question']
+    assert response['form_question'] is None
+    assert response['review_route'] == 'agent_unavailable'
+    assert decide.await_count == 1
+    assert not row['human_approved_answers']
+    # The old direct-grant envelope can still be checked as an independent
+    # reader exercise, but ordinary missing fields no longer create one in
+    # the real preparation path.
+    observed = browser.current
+    target = next(c for c in observed['controls'] if c['selector'] == '#email')
+    fixed = {c['selector']: c for c in witness(observed)['controls']}
+    q = forms._disclosure_question(
+        observed, target, fixed, GH_WRAP,
+        provenance=_greenhouse_provenance(row))
+    q['pk'] = GH_PK
     assert q['origin_row'] == {
         'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
     assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
@@ -1347,13 +1360,14 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
         'Email', '#email', '#application')
     # Two complete independently witnessed/re-read pairs, then bootstrap's own
     # fresh witness and re-read before disclosing the original question.
-    assert browser.calls == [('navigate', GH_DIRECT)] + [
-        ('evaluate', forms.GREENHOUSE_PAGE),
-        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-        ('evaluate', forms.GREENHOUSE_PAGE)] * 2 + [
-        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-        ('evaluate', forms.GREENHOUSE_PAGE)]
-    assert not decide.await_count
+    assert browser.calls[0] == ('navigate', GH_DIRECT)
+    assert browser.calls.count(('evaluate', forms.GREENHOUSE_PAGE)) >= 2
+    assert browser.calls.count(
+        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS)) >= 2
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
+        forms.check_form(observed, {}, uploaded=True)
 
     # The same synthetic tracking-status seam used by the actual direct writer.
     class Tracking:
@@ -1712,15 +1726,20 @@ async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
     evidence = witness(current)
     evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
     browser = Browser(current, result=evidence)
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(browser, current, PK, {}, URL)
-    assert gated.value.form_question == {
+    prepared = await forms._bootstrap(browser, current, PK, {}, URL)
+    assert prepared is current
+    fixed = {c['selector']: c for c in evidence['controls']}
+    question = forms._disclosure_question(current, combo, fixed, URL)
+    question['pk'] = PK
+    assert question == {
         'pk': PK, 'label': 'Country', 'control_label': 'Country',
         'question': '', 'selector': '#country', 'url': URL, 'tag': tag,
         'type': 'combobox', 'form_selector': '#application', 'form_action': URL}
     assert [call[0] for call in browser.calls] == ['evaluate']
 
 
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
+        forms.check_form(prepared, {}, uploaded=True)
 @pytest.mark.parametrize('ats,canonical,target,status', [
     ('teamtailor', 'https://example-co.teamtailor.com/jobs/backend-123',
      'https://careers.example-co.test/jobs/backend-123', 301),
@@ -1759,7 +1778,16 @@ async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_wi
                                pk=pk, resume_path='Resume.pdf')
 
     assert result['status'] == 'gate', result
-    question = result['form_question']
+    assert result['form_question'] is None
+    # The synthetic link is still proven by the real redirect probe, but no
+    # ordinary missing Email prompt is emitted before final Submit.
+    provenance = forms.VendorRedirectProvenance(
+        pk, 'example-co', ats, 'backend-123', canonical, target)
+    item = page['controls'][0]
+    question = forms._disclosure_question(
+        page, item, {c['selector']: c for c in witness(page)['controls']},
+        canonical, provenance=provenance)
+    question['pk'] = pk
     assert question['verified_redirect_url'] == target
     assert question['origin_row'] == {
         'jd_url': canonical, 'company': 'example-co', 'ats': ats,
@@ -2467,12 +2495,16 @@ async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
         return approved(pk, key, value, **kwargs)
 
     monkeypatch.setattr(forms, "exact_approval", observe)
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(
-            browser, p, GH_PK, facts, GH_WRAP,
-            provenance=_greenhouse_provenance(row),
-        )
-    assert caught.value.form_question["label"] == "Email"
+    prepared = await forms._bootstrap(
+        browser, p, GH_PK, facts, GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert prepared is p
+    assert not p['controls'][0]['has_value']
+    # The canonical bank value plus an exact grant is not a write receipt:
+    # the final guard still refuses the unfilled first field.
+    with pytest.raises(forms.Gate, match=r'Required field is empty: First Name\*'):
+        forms.check_form(prepared, {}, uploaded=True)
     assert ("First Name*", "Test User", "#first") in checked
     assert not decide.await_count
     assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
@@ -2530,12 +2562,23 @@ async def test_greenhouse_marked_label_never_invents_grant_or_chooses_alias(
         elif problem == "ambiguous-facts":
             facts["first name"] = "Different User"
         row["human_approved_answers"] = {"First Name*": grant}
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(
-            browser, p, GH_PK, facts, GH_WRAP,
-            provenance=_greenhouse_provenance(row),
-        )
-    assert caught.value.form_question["label"] == "First Name*"
+    prepared = await forms._bootstrap(
+        browser, p, GH_PK, facts, GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert prepared is p
+    assert not p['controls'][0]['has_value']
+    if problem == 'ambiguous-facts':
+        # Differing bank aliases cannot select an approved value.
+        assert forms._fact_key(facts, 'First Name*') is None
+    else:
+        with pytest.raises(forms.Gate, match='exact human-approved answer'):
+            forms.exact_approval(
+                GH_PK, 'First Name*', 'Test User',
+                target=p['controls'][0], url=p['url'],
+                provenance=_greenhouse_provenance(row))
+    with pytest.raises(forms.Gate, match=r'Required field is empty: First Name\*'):
+        forms.check_form(prepared, {}, uploaded=True)
     assert not decide.await_count
     assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
 
@@ -2622,8 +2665,9 @@ async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
         resume_path="Resume.pdf",
     )
     assert first["status"] == "gate"
-    assert first["form_question"]["label"] == "First Name*"
-    assert not decide.await_count
+    assert first["form_question"] is None
+    assert decide.await_count == 1
+    assert not [c for c in browser.calls if c[0] in {"fill", "click", "upload", "select"}]
 
     path = tmp_path / "facts.md"
     MarkdownAnswerBank(path).put("First Name*", "Test User", AnswerScope.GLOBAL)

@@ -437,10 +437,19 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
         change()
     report = await attempt()
     assert report['status'] == 'gate'
-    assert report.get('form_question') is None  # identity Gate, not a fresh answer prompt
+    if drift in {'board', 'ats'}:
+        # Current tenant pins are *not* a preparation certificate. They may
+        # leave an approved field question available, but cannot pass Submit.
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
+        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
+            await guard.authorize_final_submit(
+                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
+    else:
+        assert report.get('form_question') is None
     assert not decide.await_count
     no_mutations(session)
-    if when == 'resume' and drift != 'route':
+    if when == 'resume' and drift not in {'route', 'board', 'ats'}:
         assert session.calls == []
 
 

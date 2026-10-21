@@ -1094,11 +1094,10 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                             for r in receipts):
                         raise Gate('Native selected caption differs from approved answer.')
                 guarded_value(target, observed or expected or '')
-                # A native select submits option.value but the approved answer
-                # names its independently read option caption.
-                compared = observed if target.get('tag') == 'select' else value
+                # The receipt binds the visible approved caption above; filled
+                # stores the actual option.value and must match that receiver.
                 if expected is None or (value and (
-                        value != expected if typ == 'tel' else not _same(compared, expected))):
+                        value != expected if typ == 'tel' else not _same(value, expected))):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
@@ -4065,6 +4064,9 @@ class ApplicationIPCController:
                     or len(targets) != 1 or targets[0].get('type') != 'file'
                     or not re.search(r'resume|résumé|cv', label(targets[0]), re.I)):
                 raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
+            if (targets[0].get('submit') is True or targets[0].get('navigates') is True
+                    or targets[0].get('formaction')):
+                raise Gate('A submission-capable upload receiver is not reversible preparation.')
             self.upload_identity = self._row_pdf()
             self.upload_pending = True
             return
@@ -4073,6 +4075,9 @@ class ApplicationIPCController:
                     or not isinstance(args[3], str) or kwargs):
                 raise Gate('A unique approved form value receiver is required.')
             target = targets[0]
+            if (target.get('submit') is True or target.get('navigates') is True
+                    or target.get('formaction')):
+                raise Gate('A submission-capable data receiver is not reversible preparation.')
             if op == 'fill' and target.get('type') not in {
                     'text', 'email', 'tel', 'textarea', 'combobox'}:
                 raise Gate('A non-text receiver cannot be filled.')
@@ -4099,6 +4104,14 @@ class ApplicationIPCController:
         if len(targets) != 1:
             raise Gate('Ambiguous application click; no IPC.')
         target = targets[0]
+        # Explicitly submitting/navigating choices are never ordinary selection
+        # writes. They reach the single full guard rather than bypassing it by role.
+        if (target.get('submit') is True or target.get('navigates') is True
+                or target.get('formaction')):
+            await self.authorize_final_submit(session, page, target)
+            self.committed = True
+            self.mark_click_started()
+            return
         if target.get('type') in {'radio', 'checkbox'}:
             key = _key(page, target)
             approved = _approved_native_choice(page, target, self.pk,

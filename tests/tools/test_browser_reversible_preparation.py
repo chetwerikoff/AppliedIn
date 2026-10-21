@@ -107,6 +107,15 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
     monkeypatch.setattr(forms, "_alias_current", lambda *_args, **_kw: True)
     monkeypatch.setattr(forms, "navigation_allowed",
                         lambda href, *_args, **_kw: href == FORM_URL)
+    # Exercise the real production preparation/row/seed gates using a valid
+    # canonical HTTPS tracked row. The ordinary daemon-only fixture capability
+    # must never be manufactured by SimpleNamespace in a unit test.
+    from core import stores
+    from agent import run
+    monkeypatch.setattr(stores, "make_stores", lambda: SimpleNamespace(
+        tracking=SimpleNamespace(r=SimpleNamespace(get=lambda _key: None))))
+    monkeypatch.setattr(run, "_resume_pdf_path", lambda _row: str(pdf))
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
 
     effects, committing, transmissions = [], [], []
     nodes = {c["selector"]: c for c in page["controls"]}
@@ -152,7 +161,6 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
         {"Full name": "Test User", "Work location": "Remote",
          "Work arrangement": "Hybrid"}, {}, [], {},
         lambda: committing.append("commit"),
-        fixture_context=SimpleNamespace(seed_fingerprint=lambda: "synthetic-seed"),
         seal_stage=True)
     raw = bsk.Session("apply")
     raw.id = "synthetic-session"

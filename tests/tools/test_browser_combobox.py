@@ -585,32 +585,56 @@ async def test_closed_aria_picker_without_rendered_link_never_selects(monkeypatc
 
 
 async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
+    """Reversible ARIA writes must retain a tracked canonical ATS route."""
+    job_id = '12345678-1234-4234-8234-123456789abc'
+    pk = 'example-co#' + job_id
+    posting = 'https://jobs.lever.co/example-co/' + job_id
+    form_url = posting + '/apply'
+
+    def on_form(snapshot):
+        snapshot['url'] = form_url
+        for item in snapshot['controls']:
+            item['form_action'] = form_url
+        return snapshot
+
     closed = control()
     closed['combobox'].update(linked=False, listbox_selector='', options=[])
-    opened = page()
-    committed = page(control(selected_text='Example Country', selected_value='EX',
-                            hidden_value='EX'))
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    from types import SimpleNamespace
-    token = SimpleNamespace(pk=PK, company='example-co', wrapper=URL, url=URL, ats='greenhouse')
-    monkeypatch.setattr(forms, '_alias_current', lambda *args, **kwargs: True)
+    initial = on_form(page(closed))
+    opened = on_form(page())
+    committed = on_form(page(control(
+        selected_text='Example Country', selected_value='EX', hidden_value='EX')))
+    approved = grant()
+    approved.update(url=form_url, form_action=form_url)
+    row = {
+        'pk': pk, 'company': 'example-co', 'job_id': job_id,
+        'ats': 'lever', 'jd_url': posting, 'status': 'submitting',
+        'possible_submission': False,
+        'human_approved_answers': {'What country?': approved},
+    }
+    monkeypatch.setattr(forms, '_row', lambda row_pk: row if row_pk == pk else {})
+    token = forms.ApplicationEntryProvenance(
+        pk=pk, company='example-co', ats='lever', job_id=job_id,
+        wrapper=posting, board='example-co', url=form_url)
+    navigation = forms.navigation_allowed
     checked = []
-    def route(_destination, *_origins, provenance=None):
-        checked.append(provenance)
-        return provenance is token
+
+    def route(destination, *origins, provenance=None):
+        if provenance is not None:
+            checked.append(provenance)
+        return navigation(destination, *origins, provenance=provenance)
+
     monkeypatch.setattr(forms, 'navigation_allowed', route)
-    session = DynamicSession(page(closed), opened, committed)
+    session = DynamicSession(initial, opened, committed)
     receipt = await forms.execute(
-        session, page(closed), {'action': 'combobox', 'selector': '#country',
-                                'fact': 'What country?'},
+        session, initial, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
         facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-        job_url=URL, provenance=token)
+        company='example-co', jd_text='', resume_tex='', github='', pk=pk,
+        job_url=posting, provenance=token)
     assert receipt['action'] == 'combobox'
     assert checked and all(item is token for item in checked)
     assert ('click', '#country-example') in session.calls
+
 
 async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
     from tools import browser_skill as bsk

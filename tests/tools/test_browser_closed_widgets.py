@@ -512,10 +512,31 @@ async def test_required_proxy_mutation_denies_real_final_submit(
                    proxyMutation={'key': key, **mutation})
     assert snapshot['page']['opaque_controls'] is True
     assert snapshot['page']['inventory_verified'] is False
-    for reader in (snapshot['page'], snapshot['witness']):
-        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#'+key)
-        assert graph.get('mode') != 'closed-react-select'
-        assert graph['linked'] is False and graph['link_id'] == '' and graph['options'] == []
+    # The generic reader may retain a real ARIA listbox during C1 even though
+    # the malformed required proxy makes the overall inventory untrustworthy.
+    # Rendered options are not submitted values or an authorization to click.
+    page_graph = next(c['combobox'] for c in snapshot['page']['controls']
+                      if c['selector'] == '#'+key)
+    witness_graph = next(c['combobox'] for c in snapshot['witness']['controls']
+                         if c['selector'] == '#'+key)
+    assert page_graph == witness_graph
+    for graph in (page_graph, witness_graph):
+        assert graph['selected_text'] == graph['selected_value'] == ''
+        assert graph['hidden_value'] == ''
+        if phase == 'C0':
+            assert graph['linked'] is False
+            assert graph['link_id'] == graph['listbox_selector'] == ''
+            assert graph['options'] == []
+        else:
+            assert graph['linked'] is True
+            assert graph['link_id'] == ('country-options' if key == 'country' else key+'-list')
+            assert graph['listbox_selector'] == '#'+graph['link_id']
+            assert len(graph['options']) == 1
+            option = graph['options'][0]
+            assert option['selector'] == '#'+key+'-option'
+            assert option['label'] == 'Approved '+key
+            assert option['unique'] is True and option['selected'] is False
+            assert option['safe'] is True and option['submit'] is False
 
     # Supply a real synthetic PDF and otherwise matching job identity, so the
     # final guard reaches the generic form check rather than refusing for an

@@ -121,7 +121,7 @@ def evidence(page, *, visible_label=True):
 
 class FakeLever:
     """Fixture-shaped fake: press opens options, only an option click commits."""
-    def __init__(self, *, caption='Testville, USA', options=None, drift='',
+    def __init__(self, *, caption='Testville, United States', options=None, drift='',
                  failed_commit='', press_unsupported=False, visible_label=True,
                  click_uncertain=False, receiver_shape='', owner_shape='',
                  selected_option_shape='', witness_receiver_drift=False):
@@ -218,6 +218,15 @@ class FakeLever:
             if self.witness_receiver_drift and self.buffer and not self.selected:
                 observed['controls'][0]['combobox']['location_receiver']['count'] = 0
             return {'value': observed}
+        if args == ('click', '#current-location'):
+            # Generic ARIA picker opening is reversible, not a submitting click.
+            self.started = True
+            return {}
+        if args[:3] == ('fill', '#current-location', '--value'):
+            if not self.started or len(args) != 4:
+                pytest.fail('Unapproved typing before picker open')
+            self.buffer = args[3]
+            return {}
         if args == ('focus', '#current-location'):
             self.started = True
             return {}
@@ -314,32 +323,36 @@ def test_offline_location_fixture_only_commits_on_option_click(caption):
 @pytest.mark.parametrize('verb', ['fill', 'combobox'])
 async def test_typed_choice_preserves_grant_and_final_report(grant_row, caption, verb):
     session = FakeLever(caption=caption)
+    if verb == 'fill':
+        # A role-combobox cannot borrow native text-fill authority.
+        with pytest.raises(forms.Gate, match='requested form action does not match'):
+            await run_choice(session, approved=caption, verb=verb)
+        assert not any(call[0] in {'click', 'fill', 'press'} for call in session.calls)
+        return
+    grant_row['human_approved_answers']['Current location']['value'] = caption
     grant_before = deepcopy(grant_row['human_approved_answers'])
-    receipt, filled = await run_choice(session, verb=verb)
-    assert receipt['approved_value'] == ANSWER
+    receipt, filled = await run_choice(session, approved=caption, verb=verb)
+    assert receipt['approved_value'] == caption
     assert receipt['committed_caption'] == caption
     assert receipt['committed_value'] == 'testville-verified'
     assert filled == {'#current-location': caption}
     assert grant_row['human_approved_answers'] == grant_before
     actions = [call for call in session.calls if call[0] != 'evaluate']
-    expected = [('focus', '#current-location'),
-                ('press', 'Ctrl+A', '--selector', '#current-location'),
-                ('press', 'Backspace', '--selector', '#current-location')]
-    expected += [('press', 'Space' if c == ' ' else c,
-                  '--selector', '#current-location') for c in ANSWER]
-    assert actions == expected + [('click', '#location-option')]
-    assert sum(call[0] == 'click' for call in session.calls) == 1
-    assert all(call[0] not in {'fill', 'select', 'navigate'} for call in session.calls)
+    assert actions == [
+        ('click', '#current-location'),
+        ('fill', '#current-location', '--value', caption),
+        ('click', '#location-option'),
+    ]
+    assert sum(call[0] == 'click' for call in session.calls) == 2
+    assert all(call[0] not in {'press', 'focus', 'select', 'navigate'} for call in session.calls)
     assert sum(call[0] == 'evaluate' for call in session.calls) >= 4
     final = await session.page()
     forms.check_form(final, filled, uploaded=True, receipts=[receipt])
     forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
     assert forms._fields_report([receipt], filled) == [
         {'label': 'Current location', 'value': caption}]
-    if caption.endswith('USA'):
-        assert receipt['committed_caption'] != receipt['approved_value']
-    else:
-        assert receipt['committed_caption'] == receipt['approved_value']
+    # A merely equivalent spelling is not an exact approved form answer.
+    assert receipt['committed_caption'] == receipt['approved_value']
 
 
 @pytest.mark.asyncio

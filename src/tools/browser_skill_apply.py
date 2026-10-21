@@ -3714,6 +3714,31 @@ def _fields_report(history: list, filled: dict) -> list[dict]:
 
 
 
+def _committing_get_route(href: str) -> bool:
+    """Known application-commit GET routes may not bypass the final guard.
+
+    A normal observed /application page is reversible; an executable Submit
+    route or ambiguous nested encoding is not. This is a generic effect
+    classifier, not a tenant certificate or page-text assertion.
+    """
+    try:
+        parts = bsk._discovery_parts(urlsplit(href))
+        if parts is None:
+            return True
+        path, fragment, query = parts
+        if fragment:
+            return True
+        candidates = path.split('/') + [term for pair in query for term in pair]
+        effect = re.compile(
+            r'requestsubmit|submit(?:application)?|sendapplication|'
+            r'completeapplication|confirmapplication|approveapplication|'
+            r'finaliz(?:e|ation)|(?:instant|one[-_]?click)apply|'
+            r'one[-_]?click|one[-_]?tap', re.I)
+        return any(effect.search(part) for part in candidates)
+    except (ValueError, TypeError, AttributeError):
+        return True
+
+
 def _preparation_origin(href: str, tracked_url: str) -> bool:
     """Code-owned origin policy for reversible preparation, never tenant proof."""
     if not isinstance(href, str) or not isinstance(tracked_url, str):
@@ -3902,8 +3927,9 @@ class ApplicationIPCController:
             if len(args) != 2 or kwargs:
                 raise Gate('Unknown application navigation IPC arguments.')
             self._fresh_preparation(self.url)
-            if not _preparation_origin(args[1], self.url):
-                raise Gate('Unknown or unapproved cross-origin application navigation.')
+            if (not _preparation_origin(args[1], self.url)
+                    or _committing_get_route(args[1])):
+                raise Gate('Unknown, executable or committing GET navigation is not preparation.')
             return
         if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'}:
             raise Gate('Raw application executable or effectful IPC is forbidden.')

@@ -11,9 +11,9 @@ URL = 'http://127.0.0.1/fixture/example-co/job/1'
 PK = 'example-co#1'
 OPTIONS = [
     {'selector': '#country-example', 'unique': True, 'label': 'Example Country',
-     'value': 'EX', 'selected': False},
+     'value': 'EX', 'selected': False, 'safe': True},
     {'selector': '#country-other', 'unique': True, 'label': 'Other Country',
-     'value': 'OT', 'selected': False},
+     'value': 'OT', 'selected': False, 'safe': True},
 ]
 
 def control(*, selected_text='', selected_value='', hidden_value='',
@@ -644,6 +644,24 @@ async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
     assert outcome['status'] == 'gate'
     assert ('click', '#country-example') in session.calls
     assert calls.count('dispatch') >= 4
+
+async def test_option_without_positive_safety_witness_never_clicks(monkeypatch):
+    """An omitted safety field is not a safe ARIA option, even in a fake DOM."""
+    current = page()
+    current['controls'][0]['combobox']['options'][0].pop('safe')
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current)
+    with pytest.raises(forms.Gate, match='unsafe navigating option'):
+        await forms.execute(
+            session, current,
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={},
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') not in session.calls
+
 
 async def test_unsafe_nested_option_effect_never_clicks(monkeypatch):
     """A nested action is unsafe even without a submit/link on the option node."""

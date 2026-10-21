@@ -14,26 +14,26 @@ _DIAGNOSTIC_MAX_CHARS = 8192
 
 
 _WIDGET_GRAPH = r"""
-  // Executed afresh in each reader. No page attributes or model flags retain admission.
+  // Accessible roles and relationships only: no site/library selectors, C0/C1/C2
+  // phases or page-controlled exceptions to a privileged application write.
+  const graphNodes = new WeakMap(), newGraphs = new Map();
+  const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
-  // Recognition must classify the same proxy owners in each independent reader.
-  // Action evidence still uses the witness's stricter visible() on these exact nodes.
-  const graphVisible = e => !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
-  const graphNodes = new WeakMap();
+  const attr = (e, k) => e.getAttribute(k) || '';
   const uniqueNode = e => !!e && document.querySelectorAll(selector(e)).length === 1;
   const byId = id => {
-    const hits = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
-    return hits.length === 1 ? hits[0] : null;
+    const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
+    return matches.length === 1 ? matches[0] : null;
   };
-  const attr = (e, k) => e.getAttribute(k) || '';
-  const editable = 'input:not([type="hidden"]),textarea,select,[role="combobox"],[contenteditable]';
-  const singleBranch = e => {
-    const names = attr(e, 'class').split(/\s+/);
-    return names.some(s=>s.endsWith('__single-value') || /(?:^|-)singleValue$/.test(s));
+  const unsafeOption = o => {
+    const dangerous = e => (e.tagName==='A' && !!e.href) ||
+      ((e.tagName==='BUTTON' || e.tagName==='INPUT') &&
+        ['submit','image'].includes(e.type)) || e.hasAttribute('formaction');
+    for (let n=o;n;n=n.parentElement) if (dangerous(n)) return true;
+    return Array.from(o.querySelectorAll('*')).some(dangerous);
   };
-  const placeholderBranch = e => attr(e, 'class').split(/\s+/)
-    .some(s=>s.endsWith('__placeholder') || /(?:^|-)placeholder$/.test(s));
-  // Diagnostics never reuse action selectors: even escaped IDs can hold answers.
+  const pickerCandidate = () => false, closedPopup = () => null;
+  const singleBranch = () => false, placeholderBranch = () => false;
   const diagnosticTags = new Set('DIAGNOSTIC_TAGS'.split(' '));
   const diagnosticLocator = e => {
     const parts = [];
@@ -50,331 +50,6 @@ _WIDGET_GRAPH = r"""
     }
     return 'unavailable';
   };
-  const requiredProxies = new Set();
-  const requiredProxy = (p,e,F,L,form) => {
-    const names=Array.from(p.attributes || []).map(a=>a.name).sort();
-    const shell=p.parentElement, style=getComputedStyle(p);
-    return e.tagName==='INPUT' && attr(e,'aria-required')==='true' &&
-      (names.join(',')==='aria-hidden,class,required,tabindex' ||
-        (names.join(',')==='aria-hidden,class,required,tabindex,value' &&
-         p.getAttribute('value')==='')) &&
-      p.tagName==='INPUT' && p.hasAttribute('required') && attr(p,'tabindex')==='-1' &&
-      attr(p,'aria-hidden')==='true' && p.value==='' &&
-      !!e.form && p.form===e.form && e.form===form &&
-      nativeForm(F)===form && nativeForm(L)===form &&
-      shell?.matches('div.select-shell') && shell.parentElement===F && shell.contains(e) &&
-      F.querySelectorAll('div.select-shell').length===1 &&
-      style.opacity==='0' && style.position==='absolute' && style.pointerEvents==='none';
-  };
-  const countryGraph = (e, L, F, form, phase) => {
-    // This receiverless authority belongs to the observed phone field only.
-    const chain = ['input.select__input','div.select__input-container',
-      'div.select__value-container','div.select__control','div','div.select-shell',
-      'div.select__container','div.select','div.phone-input__country',
-      'fieldset.phone-input','div','div.application--questions','form'];
-    const path = []; let n=e;
-    for (const shape of chain) {
-      if (!n || !n.matches(shape) || nativeForm(n)!==form || !uniqueNode(n)) return null;
-      path.push(n); n=n.parentElement;
-    }
-    const fieldset=path[9], branches=Array.from(fieldset.children);
-    if (e.id!=='country' || byId('country')!==e || form.id!=='application-form' || path[12]!==form ||
-        document.querySelectorAll('fieldset.phone-input').length!==1 ||
-        branches.length!==3 || branches.filter(x=>x.tagName==='LEGEND').length!==1 ||
-        branches.filter(x=>x.matches('div.phone-input__country')).length!==1 ||
-        branches.filter(x=>x.matches('div.phone-input__phone')).length!==1 ||
-        !path[8].contains(F) || L.tagName!=='LABEL' || L.id!=='country-label' ||
-        attr(L,'for')!==e.id || document.querySelectorAll('label[for="country"]').length!==1 ||
-        fieldset.querySelectorAll('input[type="hidden"]').length ||
-        e.type!=='text' || attr(e,'autocomplete')!=='off' || attr(e,'tabindex')!=='0' ||
-        attr(e,'aria-required')!=='true' || !['true','false'].includes(attr(e,'aria-invalid')) ||
-        !e.hasAttribute('aria-activedescendant') ||
-        !attr(e,'aria-describedby') || !attr(e,'aria-errormessage')) return null;
-    // Mutable error/placeholder references are current safety evidence, not identity.
-    // At C2 react-select can replace the placeholder with an ID-less single-value
-    // branch. closedGraph already proved that unique, visible C2 branch; only
-    // its exact now-absent placeholder IDREF may lag that DOM replacement.
-    for (const k of ['aria-describedby','aria-errormessage']) {
-      let resolved=0, replacedPlaceholder=false;
-      for (const id of attr(e,k).trim().split(/\s+/)) {
-        if (!id) return null;
-        const hits=document.querySelectorAll('#'+CSS.escape(id));
-        // Validation mounts this exact error lazily; duplicates are never absence.
-        if (!hits.length && id===e.id+'-error') continue;
-        if (!hits.length && k==='aria-describedby' && phase==='C2' &&
-            id==='react-select-country-placeholder') {
-          replacedPlaceholder=true;
-          continue;
-        }
-        const ref=hits.length===1 ? hits[0] : null;
-        if (!ref || nativeForm(ref)!==form || !path[8].contains(ref)) return null;
-        resolved++;
-      }
-      if (k==='aria-describedby' && !resolved && !replacedPlaceholder) return null;
-    }
-    if (phase!=='C1' && (e.hasAttribute('aria-controls') || e.hasAttribute('aria-owns') ||
-        attr(e,'aria-activedescendant') || e.value)) return null;
-    return path.map(selector);
-  };
-  const closedGraph = e => {
-    if (e.tagName !== 'INPUT' || attr(e,'role') !== 'combobox' || !graphVisible(e) ||
-        attr(e,'aria-haspopup') !== 'true' || attr(e,'aria-autocomplete') !== 'list') return null;
-    const id = attr(e,'aria-labelledby'), L = byId(id), W = e.parentElement, V = W?.parentElement;
-    const form = nativeForm(e);
-    if (!id.endsWith('-label') || !L || !graphVisible(L) || !form || !W || !V ||
-        W.querySelectorAll(editable).length !== 1 || !W.contains(e)) return null;
-    const branches = Array.from(V.children);
-    if (branches.filter(n=>n===W || n.querySelectorAll(editable).length).length !== 1) return null;
-    const display = branches.filter(n=>n!==W && graphVisible(n) &&
-      (singleBranch(n) || placeholderBranch(n)));
-    if (display.length !== 1 || display[0].querySelectorAll(editable).length) return null;
-    let F = V; while (F && !F.contains(L)) F = F.parentElement;
-    if (!F || F===form || nativeForm(F)!==form || nativeForm(L)!==form ||
-        F.querySelectorAll('[role="combobox"]').length !== 1 ||
-        ![e,L,W,V,F,form].every(uniqueNode)) return null;
-    const extras=Array.from(F.querySelectorAll(editable)).filter(n=>n!==e);
-    if (extras.length>1 || (extras.length===1 && !requiredProxy(extras[0],e,F,L,form))) return null;
-    const labels = Array.from(document.querySelectorAll('[role="combobox"]'))
-      .filter(n=>attr(n,'aria-labelledby')===id);
-    if (labels.length !== 1) return null;
-    const hidden = Array.from(F.querySelectorAll('input[type="hidden"]'));
-    if (hidden.length > 1 || hidden.some(h=>nativeForm(h)!==form || !uniqueNode(h))) return null;
-    const H = hidden[0];
-    const explicit = attr(e,'data-value-input'), name = attr(e,'data-value-name');
-    if ((explicit && (!H || byId(explicit)!==H)) || (name && (!H || H.name!==name))) return null;
-    const expanded = attr(e,'aria-expanded');
-    const token = singleBranch(display[0]);
-    const noLinks = !attr(e,'aria-controls') && !attr(e,'aria-owns') && !attr(e,'aria-activedescendant');
-    const phase = expanded==='true' ? 'C1' : expanded==='false' && noLinks ? (token ? 'C2' : 'C0') : '';
-    if (!phase) return null;
-    const country = !H && e.id==='country' ? countryGraph(e,L,F,form,phase) : null;
-    // Only the exact phone graph can admit receiverless #country. An unrelated
-    // #country with a proven receiver keeps ordinary closed-select authority.
-    if (e.id==='country' && !country && (!H || e.closest('fieldset.phone-input'))) return null;
-    if (extras.length) requiredProxies.add(extras[0]);
-    graphNodes.set(e, {label:L, display:display[0]});
-    return {mode:'closed-react-select',phase,required_proxy_mounted:!!extras.length,label_selector:selector(L),
-      field_selector:selector(F),value_container_selector:selector(V),
-      input_wrapper_selector:selector(W),hidden_selector:country ? undefined : H ? selector(H) : '',
-      hidden_value:country ? undefined : H ? H.value : '',
-      selected_value:country ? undefined : H ? H.value : '',
-      ...(country ? {receiverless_country:true,country_graph:country} : {}),
-      selected_text:token ? display[0].innerText : '',
-      displayed_text:token ? display[0].innerText : ''};
-  };
-  const newGraphs = new Map(Array.from(document.querySelectorAll('[role="combobox"]'))
-    .map(e=>[e,closedGraph(e)]));
-  // Rejected react-select owners must never downgrade to legacy linked authority.
-  const rejectedCandidate = e => {
-    if (e.tagName!=='INPUT' || attr(e,'role')!=='combobox' || newGraphs.get(e)) return false;
-    const W=e.parentElement, V=W?.parentElement;
-    if (e.form && W?.contains(e) && V && Array.from(V.children).some(n=>n!==W &&
-        graphVisible(n) && (singleBranch(n) || placeholderBranch(n)))) return true;
-    const L=byId(attr(e,'aria-labelledby'));
-    let F=e.parentElement; while (F && F.tagName!=='FORM' && !F.contains(L)) F=F.parentElement;
-    return !!L && !!F && F.tagName!=='FORM' && Array.from(F.querySelectorAll(editable)).some(n=> {
-      if (n===e || n.tagName!=='INPUT' || requiredProxies.has(n)) return false;
-      const s=getComputedStyle(n);
-      return attr(n,'aria-hidden')==='true' || (s.opacity==='0' && s.pointerEvents==='none');
-    });
-  };
-  const quarantined = new Set(Array.from(newGraphs.keys()).filter(rejectedCandidate));
-  const popupClaims = e => {
-    const lists = [];
-    for (const key of ['aria-controls','aria-owns']) {
-      const refs = attr(e,key).trim().split(/\s+/).filter(Boolean);
-      if (refs.length > 1) return null;
-      for (const ref of refs) {
-        const list = byId(ref);
-        if (!list || attr(list,'role')!=='listbox') return null;
-        lists.push(list);
-      }
-    }
-    const active = attr(e,'aria-activedescendant');
-    if (active) {
-      const option = byId(active), list = option?.closest('[role="listbox"]');
-      if (!option || attr(option,'role')!=='option' || !list || !uniqueNode(list)) return null;
-      lists.push(list);
-    }
-    return lists;
-  };
-  const closedPopup = e => {
-    if (newGraphs.get(e)?.phase!=='C1') return null;
-    const claims = popupClaims(e);
-    if (!claims?.length || claims.some(n=>n!==claims[0])) return null;
-    const list = claims[0], form = nativeForm(e);
-    if (newGraphs.get(e).receiverless_country && nativeForm(list)!==form) return null;
-    if (!visible(list) || (nativeForm(list) && nativeForm(list)!==form) ||
-        list.parentElement?.closest('[role="listbox"]') || list.querySelectorAll('[role="listbox"]').length) return null;
-    const options = Array.from(list.querySelectorAll('[role="option"]'));
-    if (!options.length || options.some(o=>o.closest('[role="listbox"]')!==list || !uniqueNode(o))) return null;
-    const others = Array.from(document.querySelectorAll('[role="combobox"]')).filter(c=>c!==e);
-    if (others.some(c=> {
-      const refs = ['aria-controls','aria-owns','aria-activedescendant']
-        .flatMap(k=>attr(c,k).trim().split(/\s+/)).filter(Boolean);
-      return refs.some(id=>id===list.id || options.some(o=>o.id===id));
-    })) return null;
-    return list;
-  };
-  const unsafeOption = o => {
-    const dangerous = n => (n.tagName==='A' && !!n.href) ||
-      ((n.tagName==='BUTTON' || n.tagName==='INPUT') && ['submit','image'].includes(n.type)) ||
-      n.hasAttribute('formaction');
-    for (let n=o;n;n=n.parentElement) if (dangerous(n)) return true;
-    return Array.from(o.querySelectorAll('*')).some(dangerous);
-  };
-  // Only a native Lever Current location input gets these read-only
-  // witnesses. The Python controller separately proves tracked-job provenance.
-  const leverLocationField = e => {
-    if (location.protocol!=='https:' || location.host!=='jobs.lever.co' ||
-        e.tagName!=='INPUT' || attr(e,'role')!=='combobox') return false;
-    const labels=Array.from(e.labels || []).map(n=>n.innerText).join(' ');
-    const refs=attr(e,'aria-labelledby').split(/\s+/).filter(Boolean)
-      .map(id=>byId(id)?.innerText || '').join(' ');
-    return clean(labels || refs || attr(e,'aria-label'))==='Current location';
-  };
-  // The generic linked-combobox rule is unchanged. This location-only proof
-  // checks BOTH ownership attributes and all global claimant types.
-  const leverLocationOwner = e => {
-    const claims=['aria-controls','aria-owns'].map(k=>attr(e,k).split(/\s+/).filter(Boolean));
-    const ids=claims.flat();
-    const id=ids.length && claims.every(group=>group.length<=1) &&
-      ids.every(value=>value===ids[0]) ? ids[0] : '';
-    const list=byId(id), form=nativeForm(e);
-    if (!id || !list || attr(list,'role')!=='listbox' || !form ||
-        (nativeForm(list) && nativeForm(list)!==form) ||
-        list.querySelector('[role="listbox"]')) return {valid:false,link_id:id};
-    const options=Array.from(list.querySelectorAll('[role="option"]'));
-    if (options.some(o=>o.closest('[role="listbox"]')!==list || !uniqueNode(o)))
-      return {valid:false,link_id:id};
-    const identifiers=new Set([id,...options.map(o=>attr(o,'id')).filter(Boolean)]);
-    const active=attr(e,'aria-activedescendant');
-    if (active && !options.some(o=>attr(o,'id')===active && byId(active)===o))
-      return {valid:false,link_id:id};
-    const claimants=Array.from(document.querySelectorAll(
-      '[aria-controls],[aria-owns],[aria-activedescendant]'));
-    if (claimants.some(n=>n!==e && ['aria-controls','aria-owns','aria-activedescendant']
-        .some(k=>attr(n,k).split(/\s+/).some(ref=>ref && identifiers.has(ref)))))
-      return {valid:false,link_id:id};
-    return {valid:true,link_id:id,listbox_selector:selector(list)};
-  };
-  const leverLocationReceiver = (e, form) => {
-    const hasId=e.hasAttribute('data-value-input'), hasName=e.hasAttribute('data-value-name');
-    const id=attr(e,'data-value-input'), name=attr(e,'data-value-name');
-    const hidden=Array.from(document.querySelectorAll('input[type="hidden"]'))
-      .filter(h=>h.form===form);
-    const ids=id ? hidden.filter(h=>h.id===id) : [];
-    const names=name ? hidden.filter(h=>h.name===name) : [];
-    const resolved=hidden.filter(h=>(id && h.id===id) || (name && h.name===name) || e.contains(h));
-    const valid=hasId || hasName
-      ? resolved.length===1 && uniqueNode(resolved[0]) &&
-        (!hasId || (id && ids.length===1 &&
-          document.querySelectorAll('#'+CSS.escape(id)).length===1)) &&
-        (!hasName || (name && names.length===1))
-      : resolved.length===0;
-    return {declared:hasId||hasName, count:resolved.length,
-      id_reference:id, name_reference:name, valid:!!form && !!valid};
-  };
-  // The popup may close after selection; the selected option still needs
-  // independent node/selector/caption/value evidence even while hidden.
-  const leverLocationSelected = (e, owner) => {
-    if (!owner.valid) return null;
-    const list=byId(owner.link_id);
-    if (!list) return null;
-    const selected=Array.from(list.querySelectorAll('[role="option"]')).filter(o=>
-      o.closest('[role="listbox"]')===list && attr(o,'aria-selected')==='true');
-    if (selected.length!==1 || !uniqueNode(selected[0]) ||
-        (nativeForm(selected[0]) && nativeForm(selected[0])!==nativeForm(e))) return null;
-    const o=selected[0];
-    return {selector:selector(o), label:clean(o.innerText), value:attr(o,'data-value') || attr(o,'value'),
-      tag:o.tagName.toLowerCase(), selected:true, safe:!unsafeOption(o)};
-  };
-  const leverLocationVisible = e => {
-    if (!e) return false;
-    const rects=Array.from(e.getClientRects());
-    if (!rects.length) return false;
-    let fixed=false;
-    for (let n=e;n;n=n.parentElement) {
-      const style=getComputedStyle(n);
-      if (!style || style.display==='none' || style.visibility!=='visible' ||
-          !(Number(style.opacity)>0)) return false;
-      if (style.position==='fixed') fixed=true;
-    }
-    return rects.some(r=>r.width>0 && r.height>0 &&
-      r.right+scrollX>0 && r.bottom+scrollY>0 &&
-      (!fixed || (r.right>0 && r.bottom>0)));
-  };
-  const pickerParts = new Set();
-  // Failed ITI ownership must not fall through to legacy popup omission.
-  const pickerCandidate = e => !!e.closest('.iti,.iti__dropdown-content') ||
-    e.matches('.iti__search-input,.iti__country-list');
-  for (const wrapper of document.querySelectorAll('.iti')) {
-    const form = nativeForm(wrapper), tels = Array.from(wrapper.querySelectorAll('input[type="tel"]'));
-    if (!form || !uniqueNode(wrapper) || !visible(wrapper) || wrapper.parentElement?.closest('.iti') ||
-        wrapper.querySelectorAll('.iti').length || tels.length!==1 || !visible(tels[0]) ||
-        tels[0].parentElement!==wrapper || nativeForm(tels[0])!==form) continue;
-    const one = (root,q) => { const a=Array.from(root.querySelectorAll(q)); return a.length===1 ? a[0] : null; };
-    // A locally valid picker elsewhere is not the witnessed phone-fieldset decoration.
-    const inputWrapper=wrapper.parentElement, textWrapper=inputWrapper?.parentElement;
-    const phoneBranch=textWrapper?.parentElement, fieldset=phoneBranch?.parentElement;
-    if (document.querySelectorAll('.iti').length!==1 ||
-        document.querySelectorAll('input[type="tel"]').length!==1 ||
-        tels[0].id!=='phone' || byId('phone')!==tels[0] ||
-        !inputWrapper?.matches('div.input-wrapper') ||
-        !textWrapper?.matches('div.text-input-wrapper') ||
-        !phoneBranch?.matches('div.phone-input__phone') ||
-        !fieldset?.matches('fieldset.phone-input') || nativeForm(fieldset)!==form ||
-        form.id!=='application-form' || byId('application-form')!==form ||
-        one(form,'fieldset.phone-input')!==fieldset ||
-        one(fieldset,'.phone-input__phone')!==phoneBranch) continue;
-    const container=one(wrapper,'.iti__country-container');
-    const button=container && one(container,'.iti__selected-country');
-    const dialog=container && one(container,'.iti__dropdown-content');
-    const searchWrapper=dialog && one(dialog,'.iti__search-input-wrapper');
-    const search=searchWrapper && one(searchWrapper,'.iti__search-input');
-    const clear=searchWrapper && one(searchWrapper,'.iti__search-clear');
-    const list=dialog && one(dialog,'.iti__country-list');
-    if (!container || !button || !dialog || !searchWrapper || !search || !clear || !list ||
-        container.tagName!=='DIV' || attr(container,'role') || container.parentElement!==wrapper ||
-        container.children.length!==2 || button.parentElement!==container || dialog.parentElement!==container ||
-        button.tagName!=='BUTTON' || button.type!=='button' || attr(button,'aria-haspopup')!=='dialog' ||
-        attr(button,'aria-expanded')!=='false' || !dialog.id || byId(attr(button,'aria-controls'))!==dialog ||
-        dialog.tagName!=='DIV' || attr(dialog,'role')!=='dialog' || attr(dialog,'aria-modal')!=='true' ||
-        searchWrapper.tagName!=='DIV' || searchWrapper.parentElement!==dialog ||
-        search.tagName!=='INPUT' || search.type!=='search' || attr(search,'role')!=='combobox' ||
-        search.parentElement!==searchWrapper || attr(search,'aria-expanded')!=='true' ||
-        attr(search,'aria-autocomplete')!=='list' || attr(search,'autocomplete')!=='off' ||
-        !list.id || byId(attr(search,'aria-controls'))!==list ||
-        clear.tagName!=='BUTTON' || clear.type!=='button' || clear.parentElement!==searchWrapper ||
-        list.tagName!=='UL' || attr(list,'role')!=='listbox' || list.parentElement!==dialog) continue;
-    const options=Array.from(list.querySelectorAll('[role="option"]'));
-    const parts=[container,...container.querySelectorAll('*')];
-    const structural=new Set([container,button,dialog,searchWrapper,search,clear,list,...options]);
-    const auxiliary=n => {
-      const tag=n.tagName.toUpperCase(), newTag=['LINE','MASK','RECT'].includes(tag);
-      if (!['DIV','SPAN','SVG','PATH','G','CIRCLE','LINE','MASK','RECT'].includes(tag) ||
-          attr(n,'role') || n.matches('input,button,a,select,textarea,[contenteditable]')) return false;
-      const svg=n.closest('svg'), icon=n.closest('.iti__search-icon');
-      const iconPlacement=!!icon && icon.parentElement===searchWrapper;
-      const clearPlacement=!!svg && svg.parentElement===clear;
-      // Neither pre-existing containment shortcut grants these new SVG tags.
-      if (newTag && (!svg || (!iconPlacement && !clearPlacement))) return false;
-      if (button.contains(n) || options.some(o=>o.contains(n))) return true;
-      if (n.parentElement===dialog) return n.matches('span.iti__a11y-text,div.iti__no-results');
-      return iconPlacement || clearPlacement;
-    };
-    const claimants=Array.from(document.querySelectorAll('[aria-controls],[aria-owns],[aria-activedescendant]'));
-    if (options.length!==244 || list.children.length!==244 ||
-        options.some(n=>n.tagName!=='LI' || !n.matches('.iti__country') || n.parentElement!==list || !n.id) ||
-        parts.some(n=>nativeForm(n)!==form || !uniqueNode(n) || (n.id && byId(n.id)!==n) || n.getClientRects().length ||
-          unsafeOption(n) || (!structural.has(n) && !auxiliary(n))) ||
-        wrapper.querySelectorAll(editable).length!==2 ||
-        claimants.some(n=>['aria-controls','aria-owns','aria-activedescendant'].some(k=>
-          attr(n,k).split(/\s+/).filter(Boolean).some(id=>parts.some(p=>p.id===id) &&
-            !((n===button && k==='aria-controls' && id===dialog.id) ||
-              (n===search && k==='aria-controls' && id===list.id)))))) continue;
-    parts.forEach(n=>pickerParts.add(n));
-  }
 """.replace('DIAGNOSTIC_TAGS', _DIAGNOSTIC_TAGS).replace(
     'DIAGNOSTIC_LIMIT', str(_DIAGNOSTIC_MAX_SEGMENTS)).replace(
     'DIAGNOSTIC_CHARS', str(_DIAGNOSTIC_MAX_CHARS))
@@ -407,16 +82,13 @@ PAGE = r"""(() => {
     location.hostname==='jobs.ashbyhq.com';
   /* WIDGET_GRAPH */
   const linkId = e => {
-    const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
-      .trim().split(/\s+/).filter(Boolean);
-    if (refs.length !== 1) return '';
+    const claims = ['aria-controls','aria-owns'].flatMap(key =>
+      (e.getAttribute(key) || '').trim().split(/\s+/).filter(Boolean));
+    if (!claims.length || claims.some(id => id !== claims[0])) return '';
     const owners = Array.from(document.querySelectorAll('[role="combobox"]'))
-      .filter(c => {
-        const candidate = (c.getAttribute('aria-controls') || c.getAttribute('aria-owns') || '')
-          .trim().split(/\s+/).filter(Boolean);
-        return candidate.length === 1 && candidate[0] === refs[0];
-      });
-    return owners.length === 1 ? refs[0] : '';
+      .filter(c => ['aria-controls','aria-owns'].some(key =>
+        (c.getAttribute(key) || '').trim().split(/\s+/).includes(claims[0])));
+    return owners.length === 1 && owners[0] === e ? claims[0] : '';
   };
   const linkedListbox = e => {
     const id = linkId(e);
@@ -430,52 +102,6 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
-  const leverQuestion = e => {
-    const cardSelector = 'li.application-question.custom-question';
-    if (e.tagName !== 'INPUT' || !['radio','checkbox'].includes(e.type)) return null;
-    const card = e.closest(cardSelector);
-    if (!card) return null;
-    // A question is approval identity: prove the whole nearest card, never a subset.
-    const owner = e.form;
-    const labels = Array.from(card.querySelectorAll('div.application-label'));
-    const fields = Array.from(card.querySelectorAll('div.application-field'));
-    const texts = labels.length === 1 ? Array.from(labels[0].querySelectorAll('div.text')) : [];
-    const members = Array.from(card.querySelectorAll(
-      'input,textarea,select,button,[role="button"],[role="combobox"],'+
-      '[role="radio"],[role="checkbox"],[contenteditable="true"]'));
-    if (!owner || !owner.contains(card) || !owner.contains(e) ||
-        labels.length !== 1 || fields.length !== 1 || texts.length !== 1 ||
-        labels[0].parentElement?.tagName !== 'DIV' ||
-        labels[0].parentElement !== fields[0].parentElement ||
-        labels[0].parentElement.parentElement !== card ||
-        texts[0].parentElement !== labels[0] || !visible(texts[0]) ||
-        !clean(texts[0].innerText) || !members.length) return '';
-    // Concealed text retains innerText; unknown clipping geometry is not proof.
-    const shownOnPath = n => {
-      for (let p = n; p; p = p.parentElement) {
-        const s = getComputedStyle(p);
-        if (Number(s.opacity) === 0 || s.visibility !== 'visible' || s.display === 'none' ||
-            (s.clip && s.clip !== 'auto') || (s.clipPath && s.clipPath !== 'none')) return false;
-        if (p === card) return true;
-      }
-      return false;
-    };
-    if (!shownOnPath(texts[0]) || !Array.from(texts[0].querySelectorAll('*'))
-        .every(n => n.getClientRects().length > 0 && shownOnPath(n))) return '';
-    if (e.type === 'checkbox' ? members.length !== 1 : !clean(e.name)) return '';
-    if (!members.every(m => {
-      const caption = m.closest('label');
-      const item = caption?.parentElement;
-      const list = item?.parentElement;
-      return m.tagName === 'INPUT' && m.type === e.type &&
-        (e.type !== 'radio' || m.name === e.name) &&
-        m.closest(cardSelector) === card && m.form === owner && owner.contains(m) &&
-        caption?.tagName === 'LABEL' && item?.tagName === 'LI' &&
-        list?.tagName === 'UL' && list.hasAttribute('data-qa') &&
-        list.parentElement === fields[0];
-    })) return '';
-    return clean(texts[0].innerText);
-  };
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
@@ -485,8 +111,6 @@ PAGE = r"""(() => {
     const graph = newGraphs.get(e);
     let question = graph ? label(e) : clean(group?.querySelector(
       'legend,[data-automation-id="formLabel"]')?.innerText || group?.innerText || '');
-    const lever = group === null ? leverQuestion(e) : null;
-    if (lever !== null) question = lever;
     const type = e.getAttribute('role') ||
       ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
         (e.getAttribute('type') || e.tagName.toLowerCase()));
@@ -499,7 +123,6 @@ PAGE = r"""(() => {
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
-      ...(lever === '' ? {lever_card_unresolved:true} : {}),
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
@@ -535,14 +158,9 @@ PAGE = r"""(() => {
           .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
-        const locationOnly=leverLocationField(e);
-        const locationOwner=locationOnly ? leverLocationOwner(e) : null;
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
-          ...(locationOnly ? {listbox_visible:leverLocationVisible(list),
-            location_owner:locationOwner, location_receiver:leverLocationReceiver(e, form),
-            location_selected_option:leverLocationSelected(e, locationOwner)} : {}),
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),
@@ -584,7 +202,6 @@ PAGE = r"""(() => {
       // its own ARIA listbox (or absent provisional target) must retain the
       // existing generic linked-combobox checks below. Receiverless C2 is
       // excluded by closedGraph and has no legacy linkId to downgrade through.
-      if (e.id==='country' && e.closest('fieldset.phone-input')) return false;
       const list = currentListbox(e);
       if (!linkId(e) || !visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;

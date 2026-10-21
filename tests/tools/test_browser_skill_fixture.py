@@ -139,6 +139,29 @@ def authority(tmp_path, monkeypatch):
         fixture._SESSION_ENTRY.reset(token)
 
 
+def test_sealed_fixture_http_route_cannot_be_spoofed_or_reused(authority):
+    """Only the daemon-minted offline fixture may prepare over loopback HTTP."""
+    forms._tracked_preparation_job(
+        fixture.PK, fixture.COMPANY, fixture.URL, fixture_context=authority)
+    with pytest.raises(forms.Gate, match='Synthetic fixture authority'):
+        forms._tracked_preparation_job(
+            fixture.PK, fixture.COMPANY, fixture.URL + '?other-job=1',
+            fixture_context=authority)
+    with pytest.raises(forms.Gate, match='Synthetic fixture authority'):
+        forms._tracked_preparation_job(
+            fixture.PK, fixture.COMPANY, fixture.URL,
+            fixture_context=SimpleNamespace(row=authority.row))
+    old_status = authority.row['status']
+    authority.row['status'] = 'needs_human'
+    try:
+        with pytest.raises(forms.Gate, match='Synthetic tracked job/dispatch'):
+            forms._tracked_preparation_job(
+                fixture.PK, fixture.COMPANY, fixture.URL, fixture_context=authority)
+    finally:
+        authority.row['status'] = old_status
+
+
+
 class _ServedFormInventory(HTMLParser):
     """Project fixture form groups the same way PAGE exposes control questions."""
     def __init__(self):

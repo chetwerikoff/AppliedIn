@@ -141,12 +141,17 @@ discovery; its URL does not authorize an application alias.
 
 Ordinary `discovery: crawl` (including browser fallback) and sitemap results
 never promote wrappers, even if their URL carries a matching `gh_jid`. Native
-Greenhouse feeds and unrelated ATS paths are unchanged. At application entry,
-the current watchlist and stored pin must still agree. A missing/stale pin or
-changed board, host or path gates before application-browser navigation.
-Remediate by independently re-verifying the watchlist entry, redeploying and
-discovering a **new** record; do not relabel or migrate old tracking rows.
-Tenant admission is not submit or human approval: all existing guards remain.
+Greenhouse feeds and unrelated ATS paths are unchanged. At application preparation, the code-owned approved HTTPS employer/ATS host
+restriction allows `jobs.ashbyhq.com`, `jobs.lever.co` and host-only
+`job-boards.greenhouse.io` without requiring an already-current board pin,
+legacy wrapper certificate or tenant equality before reversible work.
+That permission does **not** authorize Submit: the one final code-owned raw-click
+guard re-reads the current tracked row, configured/pinned tenant, final job and
+origin, approvals, duplicate/hold state, posting generation and seed-bound PDF.
+A missing, stale or foreign board/pin refuses that irreversible click, even
+if approved fields, accessible options and the correct PDF were prepared.
+Re-verify the board and row through the existing operator mechanism; do not
+rewrite legacy tracking rows or infer tenant membership from page hints.
 
 ## Operation and guarantees
 

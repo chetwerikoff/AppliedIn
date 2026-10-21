@@ -3514,8 +3514,9 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                    provenance=provenance,
                    **({'fixture_context': ctx} if ctx else {}))
     guarded_value(current, answer)
-    if option.get('submit') or option.get('navigates'):
-        raise Gate('A submission-capable or navigating option cannot be clicked.')
+    if (option.get('submit') or option.get('navigates')
+            or option.get('safe') is False):
+        raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
     await _effect_call(session, 'click', option['selector'])
     committed = await session.page()
     committed, committed_witness = await _observe_controls(session, committed)

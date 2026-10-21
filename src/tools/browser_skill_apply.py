@@ -4372,6 +4372,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         from tools.browser_apply import _site_rules
         from tools.claude_chrome import _stage_resume
     submitted = False
+    producer_guard = None
 
     def verify_dispatch():
         if ctx is not None:
@@ -4475,16 +4476,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
                 if ctx is None and hasattr(raw_session, 'bind_application_controller'):
-                    # The actual application Session always binds; older injected
-                    # offline fake sessions only implement the legacy call spy.
+                    # The production Session must retain the exact bound guard.
+                    # A caller with a no-op binder has no committing authority.
                     controller = ApplicationIPCController(
                         pk, company, url, resume_path, facts, filled, history,
                         step, mark_click_started, seal_stage=True)
                     try:
                         raw_session.bind_application_controller(controller)
+                        if getattr(raw_session, '_application_controller', None) is not controller:
+                            raise Gate('Application producer did not retain its raw IPC guard; no click is safe.')
                     except BaseException:
                         controller.release_snapshot()
                         raise
+                    producer_guard = controller
                     resume_path = controller.resume_path
                 session = ctx.facade(raw_session) if ctx else raw_session
                 if isinstance(provenance, ApplicationEntryProvenance):
@@ -4596,6 +4600,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
+                        if (ctx is None and (producer_guard is None or
+                                getattr(raw_session, '_application_controller', None) is not producer_guard)):
+                            raise Gate('Application Submit lacks a bound raw IPC guard; no click is safe.')
                         before = page
                         step['last_button'] = target.get('label', '')
                         if ctx is not None:
@@ -4631,13 +4638,18 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     else:
                         target = control(page, action, 'decision-action')
                         if verb == 'click':
-                            # A pre-private approved-host Apply/Continue may be
-                            # reversible; possible commits use the same final
-                            # producer guard as Submit. Never pre-authorize a
-                            # browser effect from the displayed button text.
+                            # Reversible pre-private preparation need not borrow
+                            # Submit authority. Once this click might commit,
+                            # no unmediated Session may fall through to raw IPC.
                             verify_dispatch()
                             if ctx is not None:
                                 raise Gate('An offline synthetic click needs the code-owned IPC verdict.')
+                            if (producer_guard is None or
+                                    getattr(raw_session, '_application_controller', None) is not producer_guard):
+                                if (is_submission(target) or target.get('submit') is True
+                                        or target.get('navigates') is True
+                                        or target.get('formaction') or _private_content(page)):
+                                    raise Gate('Application click lacks a bound raw IPC guard; no click is safe.')
                             before = page
                         elif verb in {'fill', 'select', 'choose', 'combobox', 'upload'}:
                             verify_dispatch()

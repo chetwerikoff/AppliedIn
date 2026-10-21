@@ -238,7 +238,7 @@ async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypat
 
     changed_machine_value = page(control(
         selected_text='Example Country', selected_value='OT', hidden_value='OT'))
-    with pytest.raises(forms.Gate, match='committed combobox value changed'):
+    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
         forms.check_approvals(PK, [receipt], changed_machine_value)
 
 
@@ -462,7 +462,7 @@ def test_typed_visible_combobox_drift_gates_pre_submit():
     with pytest.raises(forms.Gate, match='combobox'):
         forms.check_form(current, {'#country': 'Example Country'},
                          uploaded=True, receipts=[receipt])
-    with pytest.raises(forms.Gate, match='committed combobox value changed'):
+    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
         forms.check_approvals(PK, [receipt], current)
 
 

@@ -188,6 +188,11 @@ probably never saw them: check whether the company should be `discovery: browser
 
 These are enforced in code, not requested in prompts, because a rule that lives
 only in a prompt is a rule nobody is enforcing. Do not move them into a prompt.
+For BrowserSkill applications, the one fresh, code-owned final pre-Submit decision
+at the raw application IPC producer enforces the six outcomes below. Approved
+field entry, accessible choices and the exact seed-valid row PDF upload remain
+reversible preparation with per-action protections; no model or reviewer can
+replace or override the final decision.
 
 - **Never declare a protected characteristic.** `guard_value()` in
   `claude_chrome.py` intercepts every value the model writes. Disability, veteran

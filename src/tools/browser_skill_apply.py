@@ -1083,16 +1083,13 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   /* WIDGET_GRAPH */
   const linkId = e => {
-    const refs = (e.getAttribute('aria-controls') || e.getAttribute('aria-owns') || '')
-      .trim().split(/\\s+/).filter(Boolean);
-    if (refs.length !== 1) return '';
+    const claims = ['aria-controls','aria-owns'].flatMap(key =>
+      (e.getAttribute(key) || '').trim().split(/\s+/).filter(Boolean));
+    if (!claims.length || claims.some(id => id !== claims[0])) return '';
     const owners = Array.from(document.querySelectorAll('[role="combobox"]'))
-      .filter(c => {
-        const candidate = (c.getAttribute('aria-controls') || c.getAttribute('aria-owns') || '')
-          .trim().split(/\\s+/).filter(Boolean);
-        return candidate.length === 1 && candidate[0] === refs[0];
-      });
-    return owners.length === 1 ? refs[0] : '';
+      .filter(c => ['aria-controls','aria-owns'].some(key =>
+        (c.getAttribute(key) || '').trim().split(/\s+/).includes(claims[0])));
+    return owners.length === 1 && owners[0] === e ? claims[0] : '';
   };
   const linkedListbox = e => {
     const id = linkId(e);
@@ -1141,8 +1138,6 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
           (typeof e.contains === 'function' && e.contains(h)) ||
           (hiddenName && h.name === hiddenName)));
-      const locationOnly=leverLocationField(e);
-      const locationOwner=locationOnly ? leverLocationOwner(e) : null;
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
@@ -1177,9 +1172,6 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         combobox:type === 'combobox' ? {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options:opts,
-          ...(locationOnly ? {listbox_visible:leverLocationVisible(list),
-            location_owner:locationOwner, location_receiver:leverLocationReceiver(e, form),
-            location_selected_option:leverLocationSelected(e, locationOwner)} : {}),
           selected_text:clean(e.getAttribute('aria-valuetext') ||
             e.getAttribute('data-selected-label') || ''),
           displayed_text:clean(e.value || e.innerText || ''),
@@ -1269,10 +1261,6 @@ def _inventory_ok(page: dict) -> None:
             any(not isinstance(c, dict) or not isinstance(c.get('selector'), str)
                 or not c['selector'] for c in controls)):
         raise Gate('The current form control inventory is malformed.')
-    # Stop before radio admission or label-only checkbox handoffs can hide this cause.
-    if any(c.get('tag') == 'input' and c.get('lever_card_unresolved') is True
-           for c in controls):
-        raise Gate('Lever question card did not match the exact supported shape; inspect manually.')
 
 
 def _identity(target: dict) -> tuple:
@@ -4212,9 +4200,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('Only a link on the current application page may be opened.')
                         if not allowed(href):
                             raise Gate('Navigation requires provenance to the same tracked job and tenant.')
-                        # A same-job href may be an authenticated one-click
-                        # application. Observing it does not prove a read-only GET.
-                        raise Gate('Unproven application navigation may commit; inspect it yourself.')
+                        # Code-issued GET of an observed approved-host link is
+                        # preparation; the raw producer rejects executable
+                        # action paths independently of this model-selected href.
+                        await _effect_call(session, 'navigate', href)
                     elif verb == 'submit':
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):

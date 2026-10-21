@@ -634,11 +634,13 @@ def _preparation_destination_allowed(href: str, *origins: str,
 def _assent_scope(target: dict) -> str:
     """One claim/scope classifier, independent of ATS or widget implementation."""
     text = label(target).lower()
-    if _SENSITIVE.search(text) or _SANCTIONS_RX.search(text) or _FACT_ASSERTION.search(text):
+    if _SENSITIVE.search(text) or _SANCTIONS_RX.search(text):
         return 'fact'
     if re.search(r'\b(certify|attest|swear|under penalty|legal declaration|'
-                 r'legally binding|undertake)\b', text):
+                 r'legally binding|undertake|arbitrat\w*|waiv(?:e|er))\b', text):
         return 'owner'
+    if _FACT_ASSERTION.search(text):
+        return 'fact'
     if re.search(r'\b(privacy|personal data|personal information)\b', text):
         if re.search(r'\b(marketing|advertis\w*|third.party|unrelated|'
                      r'shar(?:e|ing)|sell|other purposes|partners)\b', text):
@@ -1022,10 +1024,21 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
         value = target.get('value', '')
         if typ in {'radio', 'checkbox'}:
             if target.get('checked'):
-                guarded_value(target, target.get('label', value))
-                if expected is None or not (_same(expected, value)
-                                            or _same(expected, target.get('label', ''))):
+                scope = _assent_scope(target) if typ == 'checkbox' else 'fact'
+                # A delegated application-processing acknowledgement must
+                # round-trip both checked state and its real form-submitted
+                # receiver. A generic "yes" is never remote byte/value proof.
+                if scope == 'standard_privacy':
+                    if (not _same(expected or '', 'yes')
+                            or not target.get('in_form')
+                            or not target.get('form_selector')
+                            or not target.get('form_action')
+                            or not isinstance(value, str) or not value):
+                        raise Gate('Standard privacy acknowledgement lacks checked/form-own value.')
+                elif (expected is None or not (_same(expected, value)
+                          or _same(expected, target.get('label', '')))):
                     raise Gate(f'Unverified preselected answer: {target["label"]}')
+                guarded_value(target, target.get('label', value))
             elif expected is not None:
                 raise Gate('A previously verified checkbox/radio choice has changed.')
             elif target.get('required') and typ == 'checkbox':
@@ -1050,8 +1063,19 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             if target.get('has_value'):
                 observed = value
                 if target.get('tag') == 'select':
-                    observed = next((o['label'] for o in target.get('options', [])
-                                     if o['value'] == value), value)
+                    options = [o for o in target.get('options', [])
+                               if o.get('value') == value and o.get('label')]
+                    if len(options) != 1 or not expected:
+                        raise Gate('Native selection lacks a unique displayed/form-own value.')
+                    observed = options[0]['label']
+                    # Exactly the observed form-own option can carry the
+                    # already-approved caption, not a guessed opaque ID.
+                    if receipts is not None and not any(
+                            r.get('selector') == target.get('selector')
+                            and r.get('action') == 'select'
+                            and _same(r.get('approved_value', ''), observed)
+                            for r in receipts):
+                        raise Gate('Native selected caption differs from approved answer.')
                 guarded_value(target, observed or expected or '')
                 if expected is None or (value and (value != expected if typ == 'tel' else not _same(value, expected))):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')

@@ -143,8 +143,13 @@ async def test_commit_candidate_calls_same_final_guard_before_cli(
     target = _control(private=private, label="Submit application" if explicit_submit else "Continue",
                       kind="submit" if explicit_submit else "button",
                       submit=explicit_submit)
+    controls = [target]
+    if private:
+        controls.append({"selector": "#name", "label": "Full name",
+                         "type": "text", "has_value": True, "value": "Test User",
+                         "disabled": False})
     page = {"url": "https://jobs.ashbyhq.com/example-co/synthetic",
-            "controls": [target]}
+            "controls": controls}
     controller = _controller()
 
     async def refuse(_session, _page, _target):

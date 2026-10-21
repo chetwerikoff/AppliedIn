@@ -3205,7 +3205,12 @@ def _synthetic_aria_role_combobox_page(tag='button'):
 
 
 @pytest.mark.parametrize('tag', ['button', 'span'])
-def test_safe_aria_combobox_roles_are_tag_independent(tag):
+def test_safe_aria_combobox_roles_are_tag_independent(tag, monkeypatch):
+    # Never query the owner's tracking store in offline synthetic proof.
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'possible_submission': False,
+        'human_approved_answers': {},
+    })
     # A documented ARIA role/linkage is evidence; a React-specific input/div
     # taxonomy is not. The independent transport witness must still agree.
     page = _synthetic_aria_role_combobox_page(tag)

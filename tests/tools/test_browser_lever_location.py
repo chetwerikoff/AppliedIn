@@ -16,7 +16,7 @@ from tools.lever_location import equivalent_location, parse_location, press_keys
 JOB_ID = '00000000-0000-0000-0000-000000000001'
 POSTING = f'https://jobs.lever.co/example-co/{JOB_ID}'
 URL = POSTING + '/apply'
-PK = 'example-co#synthetic-job'
+PK = 'example-co#' + JOB_ID
 ANSWER = 'Testville, United States'
 PROVENANCE = forms.ApplicationEntryProvenance(
     pk=PK, company='example-co', ats='lever', job_id=JOB_ID,
@@ -246,7 +246,8 @@ class FakeLever:
 @pytest.fixture
 def grant_row(monkeypatch):
     row = {
-        'pk': PK, 'status': 'submitting', 'possible_submission': False,
+        'pk': PK, 'company': 'example-co', 'job_id': JOB_ID, 'ats': 'lever',
+        'jd_url': POSTING, 'status': 'submitting', 'possible_submission': False,
         'human_approved_answers': {
             'Current location': {
                 'value': ANSWER, 'selector': '#current-location', 'url': URL,

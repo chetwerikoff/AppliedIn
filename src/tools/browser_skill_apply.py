@@ -502,6 +502,18 @@ def confirmation(before: dict, after: dict) -> str:
     return match.group(0)
 
 
+async def _fresh_confirmed_outcome(session, before: dict, after: dict,
+                                   provenance, job_url: str) -> str:
+    """Count only new confirmation corroborated by a fixed tracked-route read."""
+    href = after.get('url', '')
+    route_ok = (navigation_allowed(href, provenance=provenance)
+                if provenance is not None else navigation_allowed(href, job_url))
+    if not route_ok or not confirmation(before, after):
+        return ''
+    current, _ = await _observe_controls(session, after)
+    return confirmation(before, current) if current.get('url') == href else ''
+
+
 def _row(pk: str, fixture_context=None, alias_read: bool = False) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     if ctx is not None:
@@ -1082,7 +1094,11 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                             for r in receipts):
                         raise Gate('Native selected caption differs from approved answer.')
                 guarded_value(target, observed or expected or '')
-                if expected is None or (value and (value != expected if typ == 'tel' else not _same(value, expected))):
+                # A native select submits option.value but the approved answer
+                # names its independently read option caption.
+                compared = observed if target.get('tag') == 'select' else value
+                if expected is None or (value and (
+                        value != expected if typ == 'tel' else not _same(compared, expected))):
                     raise Gate(f'Unverified or changed form value: {target["label"]}')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
@@ -2247,7 +2263,12 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 'truncated application inventory after bounded wait',
                 'unsupported custom control')):
             raise
-        page = await raw_session.page()
+        if hasattr(raw_session, 'page'):
+            page = await raw_session.page()
+        else:
+            # Offline command spies still expose the existing fixed reader.
+            result = await raw_session.call('evaluate', ENTRY_PAGE)
+            page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict) or not allowed(page.get('url', '')):
             raise Gate('Reversible preparation must remain on an approved origin.')
         _inventory_ok(page, complete=False)
@@ -3351,7 +3372,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
-        await session.call('click', current['selector'])
+        await _effect_call(session, 'click', current['selector'])
         latest = await session.page()
         latest, latest_witness = await _observe_controls(session, latest)
         if provenance is not None and not _preparation_current(
@@ -3371,7 +3392,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                            provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
             guarded_value(current, answer)
-            await session.call('fill', current['selector'], '--value', answer)
+            await _effect_call(session, 'fill', current['selector'], '--value', answer)
         for attempt in range(20):
             refreshed = await session.page()
             refreshed, refreshed_witness = await _observe_controls(session, refreshed)
@@ -3446,7 +3467,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     guarded_value(current, answer)
     if option.get('submit') or option.get('navigates'):
         raise Gate('A submission-capable or navigating option cannot be clicked.')
-    await session.call('click', option['selector'])
+    await _effect_call(session, 'click', option['selector'])
     committed = await session.page()
     committed, committed_witness = await _observe_controls(session, committed)
     entries = [c for c in committed.get('controls', [])
@@ -3659,11 +3680,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                        **({'fixture_context': ctx} if ctx else {}))
         if verb == 'fill':
             guarded_value(current, write_value)
-            await session.call('fill', current['selector'], '--value', write_value)
+            await _effect_call(session, 'fill', current['selector'], '--value', write_value)
         elif verb == 'select':
             write_value = choose_value(current, str(facts[key]).strip(),
                                        str(action.get('value', '')))
-            await session.call('select', current['selector'], '--value', write_value)
+            await _effect_call(session, 'select', current['selector'], '--value', write_value)
         else:
             if current['type'] == 'checkbox':
                 if not _same(value, 'yes'):
@@ -3675,7 +3696,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
             _guard_native_choice_answer(current, value)
-            await session.call('click', current['selector'])
+            await _effect_call(session, 'click', current['selector'])
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page())
             actual = control(readback, action, 'execute-readback')
@@ -3704,7 +3725,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if _formless_root(page):
             if not isinstance(session, _EntrySession):
                 raise Gate('The structural upload producer is unavailable.')
-            await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
+            await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
             observed, _ = await _observe_controls(session, await session.page())
             tree = _upload_tree(observed)
             _upload_input(observed, tree)
@@ -3720,7 +3741,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             filled.update(rebound)
             return {'action': verb, 'label': target['label'], 'uploaded': True}
         try:
-            await session.call('upload', target['selector'], '--file', resume_path, timeout=130)
+            await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
             if _formless_root(page):
                 observed, _ = await _observe_controls(session, observed)
@@ -3817,6 +3838,35 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
 # The actual BrowserSkill Session(kind='apply') delegates every effectful command
 # to this controller at the CLI producer. An unmediated Session.call() is read-only.
 # No action receipt or agent assertion can authorize the irreversible click.
+def _tracked_preparation_job(pk: str, company: str, url: str, *,
+                             fixture_context=None) -> None:
+    """Validate tracked-row posting authority, not mutable ATS board/tenant pins."""
+    from core.ids import make_pk
+
+    row = _row(pk, fixture_context=fixture_context)
+    job_id = row.get('job_id')
+    if (not isinstance(pk, str) or not pk or not isinstance(company, str)
+            or not isinstance(url, str) or not isinstance(job_id, str) or not job_id
+            or row.get('pk') != pk or row.get('company') != company
+            or row.get('jd_url') != url or make_pk(company, job_id) != pk
+            or row.get('status') != 'submitting' or row.get('possible_submission')):
+        raise Gate('The tracked job/dispatch identity is invalid; no navigation is safe.')
+    ats = row.get('ats')
+    host = urlsplit(url).hostname
+    if ats in _APPLICATION_ENTRY or host in {entry[0] for entry in _APPLICATION_ENTRY.values()}:
+        expected = _APPLICATION_ENTRY.get(ats)
+        if expected is None:
+            raise Gate('The tracked ATS posting identity changed; no navigation is safe.')
+        board_host, _suffix = expected
+        match = re.fullmatch(
+            rf'https://{re.escape(board_host)}/({_BOARD_TOKEN.pattern})/({_JOB_UUID.pattern})',
+            url)
+        if not match or match.group(2) != job_id:
+            raise Gate('The tracked ATS posting is not a literal canonical job route.')
+    if not _preparation_origin(url, url):
+        raise Gate('The tracked posting is not a safe HTTPS preparation origin.')
+
+
 def _protected_resume_snapshot(staged: str) -> str:
     """Keep one per-attempt read-only copy behind a nonwritable directory.
 
@@ -3892,6 +3942,8 @@ class ApplicationIPCController:
     def _fresh_preparation(self, url: str) -> None:
         if not _preparation_origin(url, self.url):
             raise Gate('The page is not the tracked employer or an approved HTTPS ATS host.')
+        _tracked_preparation_job(self.pk, self.company, self.url,
+                                 fixture_context=self.fixture_context)
         row = self._row()
         if (not self.pk or row.get('pk') != self.pk
                 or row.get('company') != self.company
@@ -4062,7 +4114,8 @@ class ApplicationIPCController:
             self._approved(page, target, str(self.facts[answer_key]).strip())
             return
         text = target.get('label') or ''
-        known_submit = (native_submit(target) or target.get('submit') is True
+        known_submit = (native_submit(target) or target.get('type') in {'submit', 'image'}
+                        or target.get('submit') is True
                         or bool(re.search(r'\bsubmit(?: application)?\b|send application|'
                                           r'finish application|complete application', text, re.I)))
         if known_submit or self._private_content(page):
@@ -4229,6 +4282,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     session = None
     try:
         verify_dispatch()
+        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
         if _greenhouse_id_query_attempt(url) and not greenhouse_alias_candidate(url):
             # An unparseable raw query is not a real job URL or a tenant witness.
             raise Gate('Malformed Greenhouse job identity requires human inspection.',
@@ -4453,7 +4507,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             if _formless_root(after):
                                 after, _ = await _observe_controls(session, after)
                             step['url'] = after['url']
-                            if allowed(after['url']) and (phrase := confirmation(before, after)):
+                            if (phrase := await _fresh_confirmed_outcome(
+                                    session, before, after, provenance, url)):
                                 return {'status': 'applied', 'confirmation': phrase,
                                         'fields': _fields_report(history, filled)}
                         context = handoff(
@@ -4490,7 +4545,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     step['url'] = page['url']
                     if not allowed(page['url']):
                         raise Gate('Click redirected to an unrelated job or tenant.')
-                    if submitted and allowed(page['url']) and (phrase := confirmation(before, page)):
+                    if submitted and (phrase := await _fresh_confirmed_outcome(
+                            session, before, page, provenance, url)):
                         return {'status': 'applied', 'confirmation': phrase,
                                 'fields': _fields_report(history, filled)}
                 raise Gate('The form needs review after reaching the browser step limit.')

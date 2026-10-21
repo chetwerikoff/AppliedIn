@@ -243,10 +243,22 @@ async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeyp
     checkbox, = choices(session.current)
     assert checkbox['question'] == '' and 'lever_card_unresolved' not in checkbox
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: {})
-    with pytest.raises(forms.Gate) as exc:
-        await forms._bootstrap(session, session.current, 'example-co#synthetic', {}, URL)
-    assert exc.value.form_question['control_label'] == 'Send synthetic updates'
-    assert exc.value.form_question['question'] == ''
+    prepared = await forms._bootstrap(
+        session, session.current, 'example-co#synthetic', {}, URL)
+    assert prepared is session.current
+    fixed = {c['selector']: c for c in session.fixed['controls']}
+    # The real accessible witness can still identify this control, but no
+    # ordinary missing checkbox generates a premature owner gate.
+    question = forms._disclosure_question(prepared, checkbox, fixed, URL)
+    assert question['control_label'] == 'Send synthetic updates'
+    assert question['question'] == ''
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
+        forms.exact_approval(
+            'example-co#synthetic', question['label'], 'yes',
+            target=checkbox, url=URL)
+    assert all(call[0] == 'evaluate' for call in session.calls)
+    with pytest.raises(forms.Gate):
+        forms.check_form(prepared, {}, uploaded=True)
 
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])

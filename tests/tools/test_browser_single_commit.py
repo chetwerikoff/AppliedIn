@@ -5,6 +5,7 @@ queue, owner file, real résumé, application or submit is used.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import pytest
@@ -196,6 +197,43 @@ async def test_row_pdf_upload_detects_staged_byte_change_even_after_cli(monkeypa
                                          str(path), timeout=130)
     assert len(calls) == 1
     assert controller.upload_completed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["error", "cancelled"])
+async def test_interrupted_upload_never_creates_completion_from_unchanged_bytes(
+        monkeypatch, tmp_path, outcome):
+    """An unchanged staged digest is not proof of a completed CLI attachment."""
+    path = tmp_path / "Test User synthetic.pdf"
+    path.write_bytes(b"%PDF-1.4\nsynthetic row-only upload\n")
+    controller = _controller(resume_path=str(path))
+    page = {"url": controller.url, "controls": [
+        {"selector": "#resume", "type": "file", "tag": "input",
+         "label": "Resume", "disabled": False, "files": []},
+    ]}
+    controller._row_pdf = lambda: ("synthetic row PDF bytes", controller.expected_digest)
+    session, calls = await _setup(monkeypatch, page, controller)
+    # A prior success receipt must not survive an interrupted replacement.
+    controller.upload_completed = True
+
+    async def interrupted(*argv, **kwargs):
+        calls.append((argv, kwargs))
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+        raise bsk.Unavailable("synthetic interrupted file upload")
+
+    monkeypatch.setattr(bsk, "command", interrupted)
+    error_type = asyncio.CancelledError if outcome == "cancelled" else bsk.Unavailable
+    with pytest.raises(error_type):
+        await session.application_effect(
+            "upload", "#resume", "--file", str(path), timeout=130)
+    assert len(calls) == 1
+    assert controller.upload_pending is False
+    assert controller.upload_completed is False
+    with pytest.raises(forms.Gate, match="already attempted"):
+        await session.application_effect(
+            "upload", "#resume", "--file", str(path), timeout=130)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("url,approved", [

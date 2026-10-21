@@ -174,12 +174,16 @@ class Session:
         if self.kind != "apply" or self._application_controller is None:
             raise Unavailable("Unmediated application IPC is forbidden.")
         await self._application_controller.before_ipc(self, args, kwargs)
+        succeeded = False
         try:
-            return await command(*args, "--session", self.id, **kwargs)
+            result = await command(*args, "--session", self.id, **kwargs)
+            succeeded = True
+            return result
         finally:
-            # Upload bytes are checked even if BrowserSkill reports an error:
-            # an interrupted transport does not prove no file was consumed.
-            await self._application_controller.after_ipc(self, args, kwargs)
+            # Stable local PDF bytes alone cannot prove an interrupted upload
+            # completed. The final guard cannot accept a failed CLI transfer.
+            await self._application_controller.after_ipc(
+                self, args, kwargs, succeeded=succeeded)
 
     async def __aenter__(self):
         from tools.browser_runtime import configuration

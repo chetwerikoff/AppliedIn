@@ -3929,6 +3929,7 @@ class ApplicationIPCController:
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
         self.upload_completed = False
+        self.upload_attempted = False
         self.upload_identity = None
         self.upload_pending = False
         self.committed = False
@@ -4060,6 +4061,8 @@ class ApplicationIPCController:
         if not args or not isinstance(args[0], str) or self.committed:
             raise Gate('Application IPC already committed or has no classified action.')
         op = args[0]
+        if self.upload_pending:
+            raise Gate('An in-flight PDF upload has not settled; no mutation is safe.')
         if op == 'navigate':
             if len(args) != 2 or kwargs:
                 raise Gate('Unknown application navigation IPC arguments.')
@@ -4084,6 +4087,8 @@ class ApplicationIPCController:
         targets = [item for item in page.get('controls', [])
                    if item.get('selector') == selector and not item.get('disabled')]
         if op == 'upload':
+            if self.upload_attempted:
+                raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
             file_target = targets[0] if len(targets) == 1 else None
             if _formless_root(page) and (not file_target or file_target.get('type') != 'file'):
                 # The dropzone is itself a button in PAGE controls. Match the
@@ -4107,6 +4112,8 @@ class ApplicationIPCController:
                     or file_target.get('formaction')):
                 raise Gate('A submission-capable upload receiver is not reversible preparation.')
             self.upload_identity = self._row_pdf()
+            self.upload_attempted = True
+            self.upload_completed = False
             self.upload_pending = True
             return
         if op in {'fill', 'select'}:
@@ -4183,7 +4190,8 @@ class ApplicationIPCController:
             raise Gate('Unclassified application click could commit; no IPC.')
         return
 
-    async def after_ipc(self, session, args: tuple, kwargs: dict) -> None:
+    async def after_ipc(self, session, args: tuple, kwargs: dict, *,
+                        succeeded: bool) -> None:
         if args and args[0] == 'upload' and self.upload_pending:
             self.upload_pending = False
             # Same path/filename is not byte provenance; recheck inode, times
@@ -4191,12 +4199,16 @@ class ApplicationIPCController:
             if self.upload_identity != self._row_pdf():
                 self.upload_completed = False
                 raise Gate('The staged PDF changed during upload IPC; inspect the attachment.')
-            self.upload_completed = True
+            # A failed or cancelled transport cannot prove a file attachment,
+            # regardless of unchanged local bytes and prior upload history.
+            self.upload_completed = succeeded
 
     async def authorize_final_submit(self, session, page: dict, target: dict) -> None:
         """The ONE full authoritative pre-Submit decision at raw click IPC."""
         if self.committed:
             raise Gate('A possibly committing application click cannot be repeated.')
+        if self.upload_pending:
+            raise Gate('A PDF upload is still in flight; no Submit is safe.')
         from copy import deepcopy
         from tools import posting_guard as pg
         check_dispatch(self.pk, self.resume_path, **self._ctx())

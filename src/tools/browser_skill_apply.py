@@ -658,23 +658,17 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
             if receipt.get('action') == 'combobox':
-                if isinstance(receipt, _LeverLocationReceipt):
-                    if receipt.get('pk') != pk:
-                        raise Gate('Lever location approval is bound to a different tracked job.')
-                    _check_lever_location_commit(page, target, receipt)
                 combo = target.get('combobox') or {}
-                if _closed_mode(target) or 'closed_admission' in receipt:
-                    _check_closed_commit(target, receipt.get('approved_value'), receipt)
-                if not isinstance(receipt, _LeverLocationReceipt) and not _receiverless_country(target) and (not _same(combo.get('selected_text', ''),
-                            receipt.get('committed_caption', ''))
+                if (not _same(combo.get('selected_text', ''),
+                              receipt.get('committed_caption', ''))
                         or not _same(combo.get('displayed_text', ''),
-                                    combo.get('selected_text', ''))
+                                     combo.get('selected_text', ''))
                         or not _same(receipt.get('approved_value', ''),
-                                    receipt.get('committed_caption', ''))
+                                     receipt.get('committed_caption', ''))
                         or combo.get('selected_value') != receipt.get('committed_value')
                         or combo.get('hidden_selector') != receipt.get('hidden_selector')
                         or combo.get('hidden_value') != receipt.get('hidden_value')):
-                    raise Gate('The committed combobox value changed before submission.')
+                    raise Gate('The committed accessible choice or form value changed.')
             if receipt.get('action') == 'choose':
                 answer = receipt.get('approved_value', '')
                 if target.get('type') == 'checkbox':
@@ -906,17 +900,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
-    # A selected location must remain proved even if a page disables, relabels
-    # or replaces it; the ordinary field loop skips disabled controls.
-    for receipt in receipts or []:
-        if isinstance(receipt, _LeverLocationReceipt):
-            matching = [c for c in controls
-                        if c.get('selector') == receipt.get('selector')]
-            if len(matching) != 1:
-                raise Gate('The committed Lever location control disappeared.')
-            _check_lever_location_commit(page, matching[0], receipt)
     for target in controls:
-        _required_proxy_validity(target, submitting=True)
         typ = target.get('type', '')
         if typ == 'hidden':
             if target.get('in_form') is True:
@@ -954,26 +938,10 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
         expected = filled.get(target['selector'])
         if typ == 'combobox':
-            if _lever_location_attempt(page, target):
-                location_receipts = [r for r in receipts or []
-                                     if r.get('selector') == target['selector']
-                                     and r.get('action') == 'combobox']
-                if len(location_receipts) != 1:
-                    raise Gate('Lever location needs a witnessed selection receipt.')
-                _check_lever_location_commit(page, target, location_receipts[0])
             combo = target.get('combobox') or {}
             has_selection = any(str(combo.get(key) or '').strip() for key in (
                 'selected_text', 'selected_value', 'hidden_value'))
             if not target.get('required') and not has_selection:
-                continue
-            if _closed_mode(target):
-                current_receipts = [r for r in receipts or []
-                                    if r.get('action') == 'combobox'
-                                    and r.get('selector') == target['selector']]
-                if len(current_receipts) != 1:
-                    raise Gate('The closed combobox needs its witnessed admission/commit receipt.')
-                _check_closed_commit(target, expected, current_receipts[0])
-                guarded_value(target, expected)
                 continue
             if (not isinstance(combo.get('link_id'), str) or not combo.get('link_id')
                     or expected is None or not _same(combo.get('selected_text', ''), expected)
@@ -1278,18 +1246,6 @@ def _safe_diagnostic(value) -> str:
                          value)) else 'unavailable'
 
 
-def _required_proxy_validity(target, *, submitting=False) -> None:
-    combo = target.get('combobox') or {}
-    if combo.get('required_proxy_mounted') is True:
-        if combo.get('phase') == 'C2':
-            raise Gate('closed_select.required_proxy_mounted; control=' +
-                       _safe_diagnostic(target.get('diagnostic_locator')))
-        if submitting:
-            raise Gate('closed_select.required_proxy_uncommitted; control=' +
-                       _safe_diagnostic(target.get('diagnostic_locator')))
-
-
-
 def _inventory_ok(page: dict) -> None:
     if (page.get('inventory_verified') is not True or page.get('truncated')
             or page.get('opaque_controls') or page.get('shadow_roots')
@@ -1338,61 +1294,6 @@ def _page_identity(page: dict) -> tuple:
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
 _APPLICATION_WAIT_SECONDS = 15.0
-
-def _closed_mode(target: dict) -> bool:
-    return (target.get('combobox') or {}).get('mode') == 'closed-react-select'
-
-
-_COUNTRY_GATE = 'receiverless country commitment not independently verified; review with the human before submit.'
-
-
-def _receiverless_country(target: dict) -> bool:
-    combo = target.get('combobox') or {}
-    return (_closed_mode(target) and target.get('selector') == '#country'
-            and target.get('form_selector') == '#application-form'
-            and combo.get('receiverless_country') is True
-            and isinstance(combo.get('country_graph'), list)
-            and len(combo['country_graph']) == 13
-            and not any(k in combo for k in ('hidden_selector', 'hidden_value', 'selected_value')))
-
-
-def _closed_key(target: dict) -> tuple:
-    combo = target.get('combobox') or {}
-    return _combobox_stable_identity(target) + tuple(combo.get(k) for k in (
-        'label_selector', 'field_selector', 'value_container_selector',
-        'input_wrapper_selector', 'hidden_selector')) + (
-            tuple(combo.get('country_graph', [])), combo.get('receiverless_country'))
-
-
-def _observe_closed_admissions(session, page: dict, *, transition=None) -> None:
-    # A fresh expanded/committed graph is a candidate, never initial authority.
-    admissions = getattr(session, '_closed_admissions', None)
-    if admissions is None:
-        admissions = session._closed_admissions = {}
-    if set(admissions) - {c['selector'] for c in page['controls']}:
-        raise Gate('An admitted closed combobox disappeared from the current form.')
-    for target in page['controls']:
-        sel = target['selector']
-        prior = admissions.get(sel)
-        if not _closed_mode(target):
-            if prior:
-                raise Gate('An admitted closed combobox cannot downgrade to legacy mode.')
-            continue
-        combo = target['combobox']
-        _required_proxy_validity(target)
-        key = (page['url'], _closed_key(target))
-        phase = combo.get('phase')
-        if prior is None:
-            if phase != 'C0':
-                raise Gate('Closed combobox lacks initial C0 admission.')
-            admissions[sel] = {'key': key, 'phase': 'C0', 'phases': ('C0',)}
-        elif prior['key'] != key or (phase != prior['phase'] and not (
-                transition == (sel, phase)
-                and (prior['phase'], phase) in {('C0', 'C1'), ('C1', 'C2')})):
-            raise Gate('The closed combobox graph or ordered phase changed.')
-
-
-
 
 def _application_marker(siblings: list[dict]) -> bool:
     return any(
@@ -2294,7 +2195,6 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                     if qualifying:
                         seen = True
                         if identity == previous and loop.time() < deadline:
-                            _observe_closed_admissions(session, page)
                             if _formless_root(page):
                                 session.formless_identity = _root_identity(page)
                             elif (isinstance(session, _EntrySession)
@@ -2371,31 +2271,12 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 require(isinstance(combo, dict), 'combobox.object')
                 source = original.get('combobox')
                 require(isinstance(source, dict), 'combobox.PAGE.object')
-                # Enumerate code-owned keys only; never serialize page-supplied keys.
-                keys = ('mode', 'phase', 'quarantined', 'required_proxy_mounted',
-                        'label_selector', 'field_selector', 'value_container_selector',
-                        'input_wrapper_selector', 'receiverless_country', 'country_graph',
-                        'link_id', 'linked', 'listbox_selector', 'options', 'selected_text',
-                        'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value')
+                keys = ('link_id', 'linked', 'listbox_selector', 'options',
+                        'selected_text', 'displayed_text', 'selected_value',
+                        'hidden_selector', 'hidden_value')
                 for key in keys:
                     require(source.get(key) == combo.get(key), 'combobox.' + key + '.equal')
-                # listbox_visible is new Lever-only evidence: a generic combobox
-                # with opacity:0 must retain its original PAGE/witness contract.
-                location_keys = ('listbox_visible', 'location_owner',
-                                 'location_receiver', 'location_selected_option')
-                if _lever_location_attempt(page, original):
-                    for key in location_keys:
-                        require(source.get(key) == combo.get(key),
-                                'combobox.' + key + '.equal')
-                    require(source == combo, 'combobox.equal')
-                else:
-                    require({k: v for k, v in source.items() if k not in location_keys}
-                            == {k: v for k, v in combo.items() if k not in location_keys},
-                            'combobox.equal')
-                if not _closed_mode(original):
-                    if isinstance(session, _GreenhouseSession) and readiness:
-                        require(isinstance(combo.get('link_id'), str), 'combobox.link_id.string')
-                    require(bool(combo.get('link_id')), 'combobox.link_id.required_nonempty')
+                require(source == combo, 'combobox.equal')
                 require((combo.get('linked') is True
                          and isinstance(combo.get('listbox_selector'), str)
                          and isinstance(combo.get('options'), list)) or
@@ -2410,12 +2291,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current)
         require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
-        if not readiness:
-            # Graph equality is recognition only. These fresh witness-only flags
-            # preserve strict label/value visibility at every phase and pre-submit read.
-            for target in current['controls']:
-                _require_graph_visibility(target, lookup[target['selector']])
-            _observe_closed_admissions(session, current, transition=closed_transition)
+        # Generic independent witness parity is required for each action.
         return current, lookup
     except Gate:
         raise
@@ -2432,10 +2308,6 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 raise
             if readiness and isinstance(exc, ValueError):
                 raise _EntryNotReady('unstable application form inventory') from None
-            # Preserve the entry-scoped country failure route, without remapping
-            # unrelated ordinary-form witness failures back to a country cause.
-            if any(_receiverless_country(c) for c in page.get('controls', [])):
-                raise Gate(_COUNTRY_GATE) from None
         # Neither raw exception text nor compared values belong in diagnostics.
         error = type(exc).__name__
         error = error if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', error) else 'Exception'
@@ -2683,8 +2555,7 @@ def _combobox_options(target: dict) -> list:
             or (combo.get('hidden_selector') and (
                 not isinstance(combo.get('hidden_selector'), str)
                 or not isinstance(combo.get('hidden_value'), str)))):
-        raise Gate(_COUNTRY_GATE if _receiverless_country(target) else
-                   'The combobox option linkage is incomplete or ambiguous.')
+        raise Gate('The combobox option linkage is incomplete or ambiguous.')
     return options
 
 def _native_options(target: dict) -> list:
@@ -2702,13 +2573,6 @@ def _native_options(target: dict) -> list:
 
 def _same_key(value: str) -> str:
     return ' '.join(value.casefold().split())
-
-
-def _require_graph_visibility(target, witness):
-    if _closed_mode(target) and any(witness.get(k) is not True for k in (
-            'graph_label_strict_visible', 'graph_display_strict_visible')):
-        raise Gate('This control is not visibly editable.',
-                       reason='defect_witness')
 
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
@@ -2730,14 +2594,13 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     elif target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
         if (target.get('tag') not in {'input', 'div'}
-                or (not _closed_mode(target) and not combo.get('link_id'))):
+                or not combo.get('link_id')):
             raise Gate('Only uniquely linked input/div comboboxes may request a grant.')
         options = combo.get('options')
         if combo.get('linked') is True and options:
             # A known location field needs a bound question even when option
             # captions are duplicated or malformed; validation follows in code.
-            if not (lever_location and _lever_location_field(page, target, provenance)):
-                _combobox_options(target)
+            _combobox_options(target)
         elif (combo.get('linked') is not True and combo.get('linked') is not False
               or options not in (None, [])
               or (combo.get('linked') is True and not combo.get('listbox_selector'))):
@@ -2752,7 +2615,6 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         raise Gate('Complete native labels and questions are required.')
     for member in members:
         dom = witness.get(member['selector'])
-        _require_graph_visibility(member, dom or {})
         if (not dom or dom.get('visible') is not True
                 or dom.get('readonly') is True or dom.get('disabled') is True
                 or dom.get('inert') is True or member.get('disabled')
@@ -2985,8 +2847,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not (settlement_route and history) and not getattr(session, '_closed_admissions', {}) and not any(
-            _closed_mode(c) or c.get('type') in {'radio', 'checkbox', 'password'}
+    if not candidate and not (settlement_route and history) and not any(
+            c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
@@ -3318,478 +3180,6 @@ def _combobox_options_target(page: dict, action: dict) -> dict:
     return control(page, action, 'combobox-options')
 
 
-def _lever_location_attempt(page: dict, target: dict) -> bool:
-    """Recognize only the native Lever Current location entry, never a model hint."""
-    url = urlsplit(page.get('url', ''))
-    return (url.scheme == 'https' and url.netloc == 'jobs.lever.co'
-            and url.path.endswith('/apply') and not url.query and not url.fragment
-            and target.get('tag') == 'input'
-            and target.get('label') == 'Current location'
-            and target.get('type') in {'combobox', 'text', 'search'})
-
-
-def _lever_location_field(page: dict, target: dict, provenance) -> bool:
-    entry = page.get('entry') or {}
-    root = entry.get('root') if isinstance(entry, dict) else None
-    return (_lever_location_attempt(page, target)
-            and target.get('type') == 'combobox'
-            and isinstance(provenance, ApplicationEntryProvenance)
-            and provenance.ats == 'lever' and page.get('url') == provenance.url
-            and provenance.url.endswith('/apply')
-            and target.get('in_form') is True
-            and target.get('disabled') is False
-            and target.get('formaction', '') == ''
-            and isinstance(target.get('form_selector'), str)
-            and bool(target['form_selector'])
-            and target.get('native_form_owner_selector') == target['form_selector']
-            and root == {'selector': target['form_selector'],
-                         'action': target.get('form_action')}
-            and len([c for c in page.get('controls', [])
-                     if c.get('tag') == 'input'
-                     and c.get('label') == 'Current location']) == 1)
-
-
-class _LeverLocationReceipt(dict):
-    """In-process execution witness: a model-supplied dict cannot mint this."""
-    def __init__(self, values):
-        super().__init__(values)
-        self._witnessed = tuple(sorted(self.items()))
-
-
-def _check_lever_location_commit(page: dict, target: dict, receipt: dict) -> None:
-    """Retain selection identity and original grant separately at Submit."""
-    combo = target.get('combobox') or {}
-    entry = page.get('entry') or {}
-    root = entry.get('root') if isinstance(entry, dict) else None
-    selector = receipt.get('selector')
-    chosen = receipt.get('committed_caption')
-    value = receipt.get('committed_value')
-    hidden = receipt.get('hidden_selector', '')
-    owner = combo.get('location_owner')
-    receiver = combo.get('location_receiver')
-    selected_option = combo.get('location_selected_option')
-    if (not isinstance(receipt, _LeverLocationReceipt)
-            or receipt._witnessed != tuple(sorted(receipt.items()))
-            or receipt.get('action') != 'combobox'
-            or not _lever_location_attempt(page, target)
-            or target.get('type') != 'combobox' or target.get('disabled')
-            or _closed_mode(target) or combo.get('quarantined')
-            or page.get('url') != receipt.get('url')
-            or target.get('selector') != selector
-            or target.get('label') != receipt.get('label')
-            or target.get('question', '') != receipt.get('question', '')
-            or target.get('form_selector') != receipt.get('location_form_selector')
-            or target.get('form_action') != receipt.get('location_form_action')
-            or target.get('native_form_owner_selector') != target.get('form_selector')
-            or target.get('formaction', '') != ''
-            or root != {'selector': target.get('form_selector'),
-                        'action': target.get('form_action')}
-            or not isinstance(chosen, str) or not chosen
-            or not isinstance(value, str) or not value
-            or not equivalent_location(receipt.get('approved_value'), chosen)
-            or combo.get('linked') is not True
-            or not isinstance(owner, dict) or owner.get('valid') is not True
-            or owner.get('link_id') != combo.get('link_id')
-            or owner.get('listbox_selector') != combo.get('listbox_selector')
-            or not isinstance(receiver, dict) or receiver.get('valid') is not True
-            or tuple(sorted(receiver.items())) != receipt.get('location_receiver_proof')
-            or (receiver.get('declared') is True and (
-                receiver.get('count') != 1 or not hidden))
-            or (receiver.get('declared') is False and (
-                receiver.get('count') != 0 or bool(hidden)))
-            or receiver.get('declared') not in (True, False)
-            or not isinstance(selected_option, dict)
-            or selected_option.get('selector') != receipt.get('location_option_selector')
-            or selected_option.get('label') != chosen
-            or selected_option.get('value') != value
-            or selected_option.get('tag') not in {'li', 'div', 'span'}
-            or selected_option.get('selected') is not True
-            or selected_option.get('safe') is not True
-            or combo.get('link_id') != receipt.get('location_link_id')
-            or combo.get('listbox_selector') != receipt.get('location_listbox_selector')
-            or target.get('value') != chosen or target.get('has_value') is not True
-            or combo.get('selected_text') != chosen
-            or combo.get('displayed_text') != chosen
-            or combo.get('selected_value') != value
-            or combo.get('hidden_selector', '') != hidden
-            or combo.get('hidden_value', '') != receipt.get('hidden_value', '')):
-        raise Gate('Lever location commitment changed or lost independent selection proof.')
-    if hidden:
-        receivers = [c for c in page.get('controls', [])
-                     if c.get('selector') == hidden and c.get('type') == 'hidden'
-                     and c.get('in_form') is True
-                     and c.get('form_selector') == target.get('form_selector')
-                     and c.get('form_action') == target.get('form_action')]
-        if (len(receivers) != 1 or receivers[0].get('value') != value
-                or combo.get('hidden_value') != value
-                or receipt.get('hidden_value_before') == value):
-            raise Gate('Lever location hidden receiver is not independently committed.')
-    elif receipt.get('hidden_value_before') or receipt.get('hidden_value'):
-        raise Gate('Lever location receiver identity changed.')
-
-
-async def _execute_lever_location(session, observed: dict, witness: dict,
-                                  target: dict, action: dict, *, facts: dict,
-                                  filled: dict, pk: str, job_url: str, ctx,
-                                  provenance) -> dict:
-    """Bounded key input; unsafe or uncertain Lever widgets remain human gates."""
-    if not isinstance(provenance, ApplicationEntryProvenance) or provenance.ats != 'lever':
-        raise Gate('Current location lacks tracked Lever application provenance.')
-    if (not _lever_location_field(observed, target, provenance)
-            or not _alias_current(provenance, fixture_context=ctx)
-            or not navigation_allowed(observed['url'], provenance=provenance)):
-        raise Gate('Current location is not a proven native Lever application control.')
-    corroborated = witness.get(target['selector'], {})
-    if (corroborated.get('visible_text') != 'Current location'
-            or corroborated.get('visible') is not True
-            or corroborated.get('readonly') is not False
-            or corroborated.get('inert') is not False):
-        raise Gate('Current location lacks an independently visible native label.')
-    question = _disclosure_question(
-        observed, target, witness, job_url or observed['url'],
-        provenance=provenance, lever_location=True)
-    question['pk'] = pk
-
-    def location_gate(message):
-        return Gate(message, form_question=question)
-
-    key = action.get('fact', '')
-    answer = str(facts.get(key) or '').strip() if key in facts else ''
-    if (not answer or key != _fact_key(facts, question['label'])
-            or parse_location(answer) is None or press_keys(answer) is None):
-        raise location_gate('Current location requires an approved, supported City, Country answer.')
-    try:
-        exact_approval(pk, question['label'], answer, target=target, url=observed['url'],
-                       provenance=provenance,
-                       **({'fixture_context': ctx} if ctx else {}))
-    except Gate:
-        raise location_gate('The original Current location answer lacks an exact human grant.') from None
-    guarded_value(target, answer)
-    initial = _combobox_stable_identity(target)
-    link_id = (target.get('combobox') or {}).get('link_id')
-    if (not isinstance(link_id, str) or not link_id
-            or _closed_mode(target) or (target.get('combobox') or {}).get('quarantined')):
-        raise location_gate('Current location has no authorized ARIA listbox relationship.')
-    if ((target.get('combobox') or {}).get('selected_text')
-            or (target.get('combobox') or {}).get('selected_value')):
-        raise location_gate('A previous location selection needs human review.')
-
-    async def current_state(*, require_owner=False):
-        try:
-            current_page, current_witness = await _observe_controls(session, await session.page())
-            current = _combobox_options_target(current_page, action)
-            dom = current_witness.get(current['selector'], {})
-            if (not _lever_location_field(current_page, current, provenance)
-                    or _combobox_stable_identity(current) != initial
-                    or (current.get('combobox') or {}).get('link_id') != link_id
-                    or dom.get('visible_text') != 'Current location'
-                    or dom.get('visible') is not True or dom.get('readonly') is not False
-                    or dom.get('inert') is not False
-                    or not _alias_current(provenance, fixture_context=ctx)
-                    or not navigation_allowed(current_page['url'], provenance=provenance)):
-                raise location_gate('The witnessed Current location control changed.')
-            fresh_question = _disclosure_question(
-                current_page, current, current_witness, job_url or current_page['url'],
-                provenance=provenance, lever_location=True)
-            fresh_question['pk'] = pk
-            if fresh_question != question:
-                raise location_gate('Current location grant identity changed.')
-            exact_approval(pk, question['label'], answer, target=current,
-                           url=current_page['url'], provenance=provenance,
-                           **({'fixture_context': ctx} if ctx else {}))
-            check_form_destination(current_page, current, job_url or observed['url'],
-                                   provenance=provenance)
-            combo = current.get('combobox') or {}
-            receiver = combo.get('location_receiver')
-            hidden = combo.get('hidden_selector', '')
-            # A declared id/name receiver must resolve uniquely within this
-            # native form even while the chosen machine value is still blank.
-            if (not isinstance(receiver, dict) or receiver.get('valid') is not True
-                    or (receiver.get('declared') is True and (
-                        receiver.get('count') != 1 or not hidden))
-                    or (receiver.get('declared') is False and (
-                        receiver.get('count') != 0 or bool(hidden)))
-                    or receiver.get('declared') not in (True, False)):
-                raise location_gate('The Lever location receiver is missing or ambiguous.')
-            if require_owner:
-                owner = combo.get('location_owner')
-                if (not isinstance(owner, dict) or owner.get('valid') is not True
-                        or owner.get('link_id') != combo.get('link_id')
-                        or owner.get('listbox_selector') != combo.get('listbox_selector')):
-                    raise location_gate('The Lever location listbox has unproven exclusive ownership.')
-            return current_page, current
-        except CaptchaGate:
-            raise
-        except (Exception, asyncio.CancelledError) as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise location_gate('The current Lever location witness or grant is unavailable.') from None
-
-    # No fill IPC: BrowserSkill press dispatches actual focused keyboard events.
-    await current_state()
-    try:
-        selector = target['selector']
-        await session.call('focus', selector)
-        await session.call('press', 'Ctrl+A', '--selector', selector)
-        await session.call('press', 'Backspace', '--selector', selector)
-        for character in press_keys(answer):
-            await session.call('press', character, '--selector', selector)
-    except (Exception, asyncio.CancelledError) as exc:
-        if isinstance(exc, asyncio.CancelledError):
-            raise
-        # A partially typed answer is not a committed selection and cannot retry.
-        raise location_gate('BrowserSkill key dispatch is unsupported or interrupted; inspect manually.') from None
-
-    def unique_candidate(current):
-        combo = current.get('combobox') or {}
-        if (combo.get('linked') is not True
-                or combo.get('listbox_visible') is not True
-                or not combo.get('listbox_selector')
-                or not isinstance(combo.get('options'), list)):
-            raise location_gate('Current location suggestions are not independently linked and visible.')
-        try:
-            options = _combobox_options(current)
-        except Gate:
-            raise location_gate('Current location options are absent, stale or ambiguous.') from None
-        # Validate every visible candidate: a malformed or unsafe list is not authority.
-        if any(o.get('safe') is not True or o.get('submit') or o.get('navigates')
-               or o.get('tag') not in {'li', 'div', 'span'}
-               or o.get('selected') is not False
-               or not isinstance(o.get('value'), str) or not o['value']
-               or parse_location(o.get('label')) is None for o in options):
-            raise location_gate('Current location options include an unverified or unsafe candidate.')
-        matches = [o for o in options if equivalent_location(answer, o['label'])]
-        if len(matches) != 1:
-            raise location_gate('No single verified Current location suggestion matches the approved fact.')
-        return matches[0]
-
-    typed_page, typed_target = await current_state(require_owner=True)
-    candidate = unique_candidate(typed_target)
-    # A new independent PAGE/fixed pair immediately precedes the only option click.
-    before_page, before = await current_state(require_owner=True)
-    selected_option = unique_candidate(before)
-    if (candidate != selected_option
-            or (typed_target.get('combobox') or {}).get('location_receiver')
-                != (before.get('combobox') or {}).get('location_receiver')
-            or (typed_target.get('combobox') or {}).get('location_owner')
-                != (before.get('combobox') or {}).get('location_owner')
-            or (typed_target.get('combobox') or {}).get('listbox_selector')
-                != (before.get('combobox') or {}).get('listbox_selector')):
-        raise location_gate('The Current location suggestion changed before click.')
-    combo_before = before['combobox']
-    hidden_selector = combo_before.get('hidden_selector', '')
-    hidden_before = combo_before.get('hidden_value', '')
-    if hidden_selector:
-        linked = [c for c in before_page['controls']
-                  if c.get('selector') == hidden_selector and c.get('type') == 'hidden'
-                  and c.get('in_form') is True
-                  and c.get('form_selector') == before.get('form_selector')
-                  and c.get('form_action') == before.get('form_action')]
-        if (len(linked) != 1 or linked[0].get('value') != hidden_before
-                or hidden_before == selected_option['value']):
-            raise location_gate('Current location hidden receiver was already set or unowned.')
-    # The only option IPC is a non-submitting, non-navigating witnessed selector.
-    try:
-        await session.call('click', selected_option['selector'])
-    except (Exception, asyncio.CancelledError) as exc:
-        if isinstance(exc, asyncio.CancelledError):
-            raise
-        # IPC can fail after a click was delivered; never attempt a second click.
-        raise location_gate('Lever location option-click outcome is uncertain; inspect manually.') from None
-    committed_page, committed = await current_state(require_owner=True)
-    combo = committed.get('combobox') or {}
-    literal = selected_option['label']
-    if (combo.get('selected_text') != literal
-            or combo.get('displayed_text') != literal
-            or combo.get('selected_value') != selected_option['value']
-            or not combo.get('selected_value')
-            or combo.get('hidden_selector', '') != hidden_selector):
-        raise location_gate('The location click did not independently commit its selected caption.')
-    if hidden_selector:
-        linked = [c for c in committed_page['controls']
-                  if c.get('selector') == hidden_selector and c.get('type') == 'hidden'
-                  and c.get('in_form') is True
-                  and c.get('form_selector') == committed.get('form_selector')
-                  and c.get('form_action') == committed.get('form_action')]
-        if (len(linked) != 1 or combo.get('hidden_value') != selected_option['value']
-                or linked[0].get('value') != selected_option['value']
-                or hidden_before == combo.get('hidden_value')):
-            raise location_gate('The chosen location lacks an authorized hidden receiver.')
-    guarded_value(committed, literal)
-    receipt = _LeverLocationReceipt({
-        'action': 'combobox', 'pk': pk, 'label': committed['label'],
-        'selector': committed['selector'], 'question': committed.get('question', ''),
-        'url': committed_page['url'], 'fact': question['label'],
-        'approved_value': answer, 'committed_caption': literal,
-        'committed_value': selected_option['value'],
-        'hidden_selector': hidden_selector, 'hidden_value_before': hidden_before,
-        'hidden_value': combo.get('hidden_value', ''),
-        'location_form_selector': committed['form_selector'],
-        'location_form_action': committed['form_action'],
-        'location_link_id': combo['link_id'],
-        'location_listbox_selector': combo['listbox_selector'],
-        'location_option_selector': selected_option['selector'],
-        'location_receiver_proof': tuple(sorted(combo['location_receiver'].items())),
-    })
-    try:
-        _check_lever_location_commit(committed_page, committed, receipt)
-    except Gate:
-        raise location_gate('The selected Lever location lost its option or receiver proof.') from None
-    filled[committed['selector']] = literal
-    return receipt
-
-
-async def _execute_closed_combobox(session, page, action, *, facts, filled, pk,
-                                   job_url, ctx, provenance):
-    target = control(page, action, 'closed-initial')
-    stable = _closed_key(target)
-    selector = target['selector']
-    admission = session._closed_admissions.get(selector)
-    observed_key = _key(page, target)
-    fact_key = action.get('fact')
-    answer = facts.get(fact_key) if fact_key == _fact_key(facts, observed_key) else None
-    country = _receiverless_country(target)
-    if not admission or admission['phase'] != 'C0':
-        raise Gate('closed_select.precondition.initial_C0')
-    if not isinstance(answer, str) or not answer:
-        raise Gate('closed_select.precondition.exact_answer')
-    if not country and not target['combobox'].get('hidden_selector'):
-        raise Gate('closed_select.precondition.native_receiver')
-
-    async def preflight(transition=None):
-        fresh = await session.page()
-        fresh, witness = await _observe_controls(session, fresh, closed_transition=transition)
-        current = control(fresh, action, 'closed-preflight')
-        if (_closed_key(current) != stable or not _closed_mode(current)
-                or not navigation_allowed(fresh.get('url', ''), job_url or page['url'],
-                                          provenance=provenance)
-                or (provenance is not None and not _alias_current(provenance, fixture_context=ctx))):
-            raise Gate('The closed combobox identity or destination changed.')
-        question = _disclosure_question(fresh, current, witness, job_url or page['url'],
-                                        provenance=provenance)
-        if fact_key != _fact_key(facts, question['label']):
-            raise Gate('The exact closed question is not approved.')
-        exact_approval(pk, question['label'], answer, target=current, url=fresh['url'],
-                       provenance=provenance,
-                       **({'fixture_context': ctx} if ctx else {}))
-        guarded_value(current, answer)
-        check_form_destination(fresh, current, job_url or page['url'], provenance=provenance)
-        return fresh, current
-
-    async def wait_phase(expected):
-        # Only this authorized click may await its next phase. Prior same-key
-        # DOM is transient; all other controls, grants and receivers stay guarded.
-        try:
-            async with asyncio.timeout(5):
-                for _ in range(20):
-                    fresh, current = await preflight((selector, expected))
-                    if current['combobox']['phase'] == expected:
-                        if admission['phase'] != expected:
-                            admission['phases'] += (expected,)
-                        admission['phase'] = expected
-                        return fresh, current
-                    await asyncio.sleep(0.25)
-        except TimeoutError:
-            pass
-        raise Gate('The closed picker did not reach its expected phase within the bounded wait.')
-
-    fresh, current = await preflight()
-    before = current['combobox'].get('hidden_value')
-    await session.call('click', selector)
-    # Component opening is observed, never simulated by page-evaluate mutation.
-    fresh, current = await wait_phase('C1')
-    options = _combobox_options(current)
-    popup = tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector'))
-    candidates = [o for o in options if _same(o['label'], answer)]
-    if len(candidates) != 1:
-        raise Gate(_COUNTRY_GATE if country else 'The closed picker has no unique approved option.')
-    candidate = candidates[0]
-    fresh, current = await preflight()
-    if tuple(current['combobox'].get(k) for k in ('link_id', 'listbox_selector')) != popup:
-        raise Gate(_COUNTRY_GATE if country else 'The expanded closed-picker relationship changed before choice.')
-    matches = [o for o in _combobox_options(current) if o['selector']==candidate['selector']]
-    if len(matches) != 1:
-        raise Gate(_COUNTRY_GATE if country else 'The current closed option disappeared.')
-    option = matches[0]
-    # Literal caption AND observed transport value are separate action boundaries.
-    if option['label'] != answer:
-        raise Gate(_COUNTRY_GATE if country else 'The current option caption/code is not the exact approved answer.')
-    codes = option.get('value_attributes')
-    if not isinstance(codes, list) or any(code != answer for code in codes):
-        raise Gate(_COUNTRY_GATE if country else 'Every present option value attribute must exactly match the approved answer.')
-    if option.get('submit') or option.get('navigates'):
-        raise Gate(_COUNTRY_GATE if country else 'A submission-capable or navigating option cannot be clicked.')
-    if not country and current['combobox']['hidden_value'] != before:
-        raise Gate('The hidden receiver changed before the authorized option click.')
-    await session.call('click', option['selector'])
-    fresh, current = await wait_phase('C2')
-    receipt = _ClosedReceipt({
-        'action':'combobox', 'selector':selector, 'label':current['label'],
-        'question':current.get('question', ''), 'url':fresh['url'],
-        'fact':observed_key, 'approved_value':answer,
-        # Attribute-less react-select options commit the witnessed exact caption;
-        # the independently current receiver/token must still prove that value.
-        'committed_caption':option['label'],
-        **({'option_selector': option['selector'], 'option_codes': tuple(codes)} if country else {
-            'committed_value':codes[0] if codes else option['label'],
-            'hidden_selector':current['combobox']['hidden_selector'],
-            'hidden_value_before':before, 'hidden_value':current['combobox']['hidden_value'],
-        }),
-        'closed_admission':stable,
-    })
-    if country:
-        receipt._country_admission = admission
-    _check_closed_commit(current, answer, receipt)
-    filled[selector] = answer
-    return receipt
-
-
-class _ClosedReceipt(dict):
-    """JSON-visible history with a code-only witness, never rehydrated from model text."""
-    def __init__(self, values):
-        super().__init__(values)
-        self._witnessed = tuple(sorted(values.items()))
-
-
-def _check_closed_commit(target, approved, receipt):
-    combo = target.get('combobox') or {}
-    _required_proxy_validity(target, submitting=True)
-    if target.get('selector') == '#country' and (
-            combo.get('receiverless_country') or getattr(receipt, '_country_admission', None)):
-        admission = getattr(receipt, '_country_admission', None)
-        if (not _receiverless_country(target) or combo.get('phase') != 'C2'
-                or not isinstance(receipt, _ClosedReceipt)
-                or receipt._witnessed != tuple(sorted(receipt.items()))
-                or not isinstance(approved, str) or not approved
-                or not admission or admission.get('phases') != ('C0', 'C1', 'C2')
-                or admission.get('phase') != 'C2'
-                or admission.get('key') != (receipt.get('url'), _closed_key(target))
-                or receipt.get('closed_admission') != _closed_key(target)
-                or not receipt.get('option_selector')
-                or not isinstance(receipt.get('option_codes'), tuple)
-                or any(code != approved for code in receipt['option_codes'])
-                or any(combo.get(k) != approved for k in ('selected_text', 'displayed_text'))
-                or any(receipt.get(k) != approved for k in ('approved_value', 'committed_caption'))
-                or any(k in receipt for k in ('hidden_selector', 'hidden_value',
-                                             'hidden_value_before', 'committed_value'))):
-            raise Gate(_COUNTRY_GATE)
-        return
-    if (not _closed_mode(target) or combo.get('phase') != 'C2'
-            or not isinstance(receipt, _ClosedReceipt)
-            or receipt._witnessed != tuple(sorted(receipt.items()))
-            or not isinstance(approved, str) or not approved
-            or receipt.get('closed_admission') != _closed_key(target)
-            or not combo.get('hidden_selector')
-            or receipt.get('hidden_selector') != combo['hidden_selector']
-            or not isinstance(receipt.get('hidden_value_before'), str)
-            or receipt.get('hidden_value_before') == approved
-            or any(combo.get(k) != approved for k in (
-                'selected_text', 'displayed_text', 'selected_value', 'hidden_value'))
-            or any(receipt.get(k) != approved for k in (
-                'approved_value', 'committed_caption', 'committed_value', 'hidden_value'))):
-        raise Gate('The closed combobox commit lacks exact current independent readback.')
-
-
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
     observed, witness = await _observe_controls(session, page)
@@ -3797,14 +3187,6 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
         raise Gate('The verified posting changed during combobox observation.')
     target = control(observed, action, 'combobox-observe')
-    if _lever_location_attempt(observed, target):
-        return await _execute_lever_location(
-            session, observed, witness, target, action, facts=facts,
-            filled=filled, pk=pk, job_url=job_url, ctx=ctx, provenance=provenance)
-    if _closed_mode(target) or target['selector'] in getattr(session, '_closed_admissions', {}):
-        return await _execute_closed_combobox(
-            session, observed, action, facts=facts, filled=filled, pk=pk,
-            job_url=job_url, ctx=ctx, provenance=provenance)
     form_question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     form_question['pk'] = pk
@@ -4013,7 +3395,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     question = label(target)
     if _LOGIN.search(question) or target.get('type') == 'password':
         raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
-    if verb == 'combobox' or (verb == 'fill' and _lever_location_attempt(page, target)):
+    if verb == 'combobox':
         return await _execute_combobox(session, page, action, facts=facts,
                                        filled=filled, pk=pk, job_url=job_url,
                                        ctx=ctx, provenance=provenance)

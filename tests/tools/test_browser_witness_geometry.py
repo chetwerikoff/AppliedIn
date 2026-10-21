@@ -300,7 +300,9 @@ async def test_bootstrap_skips_invisible_selector_but_can_offer_visible_one(
     session = Session(current, result)
     monkeypatch.setattr(forms, '_row', lambda pk: {'pk': pk, 'human_approved_answers': {}})
     prepared = await forms._bootstrap(session, current, PK, {}, URL)
-    assert prepared is current
+    # A refreshed, independently witnessed page is a new snapshot, not the
+    # original Python object. Its contents, not object identity, must match.
+    assert prepared == current
     fixed = {c['selector']: c for c in result['controls']}
     # Independent witnessing must still refuse the invisible receiver; the
     # visible control remains identifiable without an early ordinary gate.

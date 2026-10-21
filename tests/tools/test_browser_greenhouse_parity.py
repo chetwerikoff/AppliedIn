@@ -185,7 +185,15 @@ async def test_generic_accessible_visibility_and_submit_boundary(
             # No label can be inferred from a broken aria-labelledby ID.
             assert independent['visible_text'] == ''
         else:
-            assert independent['visible'] is True
+            # A display sibling shares an ancestor with the input. Hiding
+            # that common ancestor is observable; hiding the display itself
+            # does not make an approved value appear or disappear.
+            ancestor_hidden = name in {
+                'ancestor-opacity', 'ancestor-display',
+                'ancestor-collapse', 'visible-descendant'}
+            affected = site == 'display' or (
+                site == 'rejected-display' and key == 'location')
+            assert independent['visible'] is not (affected and ancestor_hidden)
 
     # Unproven form inventory must never become a Commit simply because its
     # former opacity/geometry graph certificate was removed.

@@ -3191,6 +3191,37 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     assert 'Direct owner review' in str(blocked.value)
 
 
+
+@pytest.mark.parametrize('verb,caption', [
+    ('submit', 'Submit application'), ('click', 'Continue'),
+])
+async def test_unbound_application_session_cannot_issue_committing_click(
+        monkeypatch, verb, caption):
+    """A fake/nonbinding Session cannot bypass the one raw Submit guard.
+
+    The synthetic HTTPS row, current form and already attached test PDF are
+    otherwise admissible. A complete form is not authority for raw click IPC.
+    """
+    page = secure_inventory(field(
+        'Resume', '#resume', type='file', required=False,
+        files=['Test User Resume.pdf'], has_value=True))
+    page['controls'][-1]['label'] = caption
+    browser, decide, row = world(monkeypatch, page)
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               ats='custom', title=page['title'])
+    decide.return_value = {'action': verb, 'selector': '#submit'}
+
+    report = await forms.apply(
+        SECURE_URL, 'example-co', {}, 'synthetic',
+        pk=PK, resume_path='Test User Resume.pdf')
+    assert report['status'] == 'gate'
+    assert 'bound raw IPC guard' in report['question']
+    assert 'no click is safe' in report['question']
+    assert decide.await_count == 1
+    assert not any(call[0] == 'click' for call in browser.calls)
+    assert row['status'] == 'submitting' and row['possible_submission'] is False
+
+
 def _synthetic_aria_role_combobox_page(tag='button'):
     combo = dict(
         linked=True, link_id='work-mode-list', listbox_selector='#work-mode-list',

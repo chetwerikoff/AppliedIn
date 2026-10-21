@@ -206,9 +206,11 @@ PAGE = r"""(() => {
       if (!visible(e) || (list && list.closest('form') && list.closest('form') !==
           (e.form || e.closest('form')))) return false;
       if (!linkId(e)) {
-        // A closed form-owned ARIA picker may mount its listbox only on open.
-        // No option is selectable until an exclusive live relationship exists.
-        return e.getAttribute('aria-expanded') === 'false' &&
+        // Only genuinely absent ARIA ownership is provisional. A present
+        // duplicate, contradictory or unbound claim is NOT a closed picker.
+        const declared = ['aria-controls', 'aria-owns'].some(key =>
+          (e.getAttribute(key) || '').trim().length > 0);
+        return !declared && e.getAttribute('aria-expanded') === 'false' &&
           !!nativeForm(e) && !unsafeOption(e);
       }
       // An absent target is provisional only while the owning role stays safe.

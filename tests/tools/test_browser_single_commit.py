@@ -580,3 +580,27 @@ async def test_new_confirmation_needs_exact_route_and_independent_witness(monkey
     assert await forms._fresh_confirmed_outcome(
         object(), before, foreign, provenance, provenance.wrapper) == ""
     reader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_formless_upload_producer_binds_dropzone_to_exact_file_input(
+        monkeypatch, tmp_path):
+    """The structural chooser IPC names a dropzone, never an arbitrary file target."""
+    from tests.tools.test_browser_formless import observed
+
+    page, _ = observed()
+    pdf = tmp_path / "Resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\\nsynthetic row document\\n")
+    controller = _controller(resume_path=str(pdf))
+    identity = ("row", "seed", controller.expected_digest)
+    monkeypatch.setattr(controller, "_row_pdf", lambda: identity)
+    session, calls = await _setup(monkeypatch, page, controller)
+
+    with pytest.raises(forms.Gate, match="exact protected PDF file input"):
+        await session.application_effect(
+            "upload", "#untrusted-drop", "--file", str(pdf), timeout=130)
+    assert calls == []
+    await session.application_effect(
+        "upload", "#dropzone", "--file", str(pdf), timeout=130)
+    assert [entry[0][:2] for entry in calls] == [("upload", "#dropzone")]
+    assert controller.upload_completed is True

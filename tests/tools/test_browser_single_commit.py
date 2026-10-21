@@ -310,7 +310,7 @@ def test_beyond_standard_privacy_has_no_implicit_grant(monkeypatch):
 @pytest.mark.parametrize("question,expected", [
     ("Expected salary", "owner_question"),
     ("I certify my application is accurate", "owner_question"),
-    ("I consent to unrelated third-party marketing", "owner_question"),
+    ("I consent to processing personal data for recruitment and unrelated third-party marketing", "owner_question"),
     ("Work location preference", "agent_review_unavailable"),
 ])
 def test_unresolved_fact_routing_is_owner_only_for_three_exceptions(question, expected):
@@ -368,3 +368,32 @@ async def test_one_final_guard_rejects_independent_contradictory_job_id(
                   + "/application", "title": "Synthetic Role"}
     with pytest.raises(forms.Gate, match="contradictory job ID"):
         await controller.authorize_final_submit(None, final_page, {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("href", [
+    "https://jobs.ashbyhq.com/example-co/submitApplication",
+    "https://jobs.ashbyhq.com/example-co/one-click",
+    "https://jobs.ashbyhq.com/example-co/job?source=submitApplication",
+    "https://jobs.ashbyhq.com/example-co/job?source=%2573ubmitApplication",
+    "https://job-boards.greenhouse.io/example-co/jobs/123/finalize",
+])
+async def test_raw_application_get_commit_bypass_refuses_before_cli(monkeypatch, href):
+    """r06 raw executable-navigation finding: no guessed reversible GET."""
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {"url": controller.url, "controls": []}, controller)
+    with pytest.raises(forms.Gate, match="committing GET navigation"):
+        await session.application_effect("navigate", href)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_code_issued_form_get_stays_reversible(monkeypatch):
+    """A normal /application GET is not a Submit just because of its path name."""
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {"url": controller.url, "controls": []}, controller)
+    await session.application_effect(
+        "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
+    assert [c[0][0] for c in calls] == ["navigate"]

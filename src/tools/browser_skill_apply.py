@@ -1029,11 +1029,16 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 # round-trip both checked state and its real form-submitted
                 # receiver. A generic "yes" is never remote byte/value proof.
                 if scope == 'standard_privacy':
-                    if (not _same(expected or '', 'yes')
+                    if (not isinstance(value, str) or not value
+                            or not _same(expected or '', value)
                             or not target.get('in_form')
                             or not target.get('form_selector')
                             or not target.get('form_action')
-                            or not isinstance(value, str) or not value):
+                            or receipts is None
+                            or not any(r.get('selector') == target.get('selector')
+                                       and r.get('action') == 'choose'
+                                       and _same(r.get('approved_value', ''), 'yes')
+                                       for r in receipts)):
                         raise Gate('Standard privacy acknowledgement lacks checked/form-own value.')
                 elif (expected is None or not (_same(expected, value)
                           or _same(expected, target.get('label', '')))):

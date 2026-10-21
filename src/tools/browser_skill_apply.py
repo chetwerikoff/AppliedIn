@@ -626,12 +626,12 @@ def _preparation_current(provenance: Provenance, *, fixture_context=None) -> boo
         return _redirect_current(provenance, fixture_context=fixture_context)
     if not isinstance(provenance, (ApplicationEntryProvenance, GreenhouseJobAlias)):
         return False
-    row = _row(provenance.pk, fixture_context=fixture_context)
-    return (row.get('pk') == provenance.pk
-            and row.get('company') == provenance.company
-            and row.get('jd_url') == provenance.wrapper
-            and row.get('status') == 'submitting'
-            and not row.get('possible_submission'))
+    try:
+        _tracked_preparation_job(provenance.pk, provenance.company, provenance.wrapper,
+                                 fixture_context=fixture_context)
+    except Gate:
+        return False
+    return True
 
 
 def _preparation_destination_allowed(href: str, *origins: str,
@@ -640,7 +640,10 @@ def _preparation_destination_allowed(href: str, *origins: str,
         return navigation_allowed(href, provenance=provenance)
     source = (provenance.wrapper if provenance is not None else
               origins[0] if origins else '')
-    return _preparation_origin(href, source)
+    # Existing same-route readers also serve offline HTTP loopback fixtures.
+    # The application IPC producer independently requires a safe HTTPS origin;
+    # observation compatibility cannot authorize a private write or submission.
+    return navigation_allowed(href, source) or _preparation_origin(href, source)
 
 
 def _assent_scope(target: dict) -> str:
@@ -1374,7 +1377,8 @@ def _identity(target: dict) -> tuple:
         'form_selector', 'form_action', 'formaction', 'form_action_attr_present',
         'form_action_raw', 'formaction_attr_present', 'formaction_raw',
         'options', 'combobox', 'disabled',
-        'required', 'has_value', 'value', 'checked', 'name'))
+        'required', 'has_value', 'value', 'checked', 'name', 'files',
+        'submit', 'navigates', 'href', 'native_form_owner_selector'))
 
 def _page_identity(page: dict) -> tuple:
     entry = page.get('entry')
@@ -3800,9 +3804,8 @@ def _committing_get_route(href: str) -> bool:
         if parts is None:
             return True
         path, fragment, query = parts
-        if fragment:
-            return True
-        candidates = path.split('/') + [term for pair in query for term in pair]
+        candidates = (path.split('/') + fragment.split('/')
+                      + [term for pair in query for term in pair])
         effect = re.compile(
             r'requestsubmit|submit(?:application)?|sendapplication|'
             r'completeapplication|confirmapplication|approveapplication|'
@@ -3820,12 +3823,14 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
     try:
         part = urlsplit(href)
         if (part.scheme != 'https' or not part.hostname
-                or part.netloc != part.hostname or part.fragment
+                or part.netloc != part.hostname
                 or any(ord(c) < 33 or c == '\\' for c in href)
                 or any(segment in {'.', '..'} for segment in part.path.split('/'))):
             return False
         if navigation_allowed(href, tracked_url):
             return True
+        if part.fragment:
+            return False
         return part.hostname in {
             'jobs.ashbyhq.com', 'jobs.lever.co', 'job-boards.greenhouse.io'
         } and bool(part.path.strip('/'))
@@ -3842,7 +3847,7 @@ def _tracked_preparation_job(pk: str, company: str, url: str, *,
     """Validate tracked-row posting authority, not mutable ATS board/tenant pins."""
     from core.ids import make_pk
 
-    row = _row(pk, fixture_context=fixture_context)
+    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
     job_id = row.get('job_id')
     if (not isinstance(pk, str) or not pk or not isinstance(company, str)
             or not isinstance(url, str) or not isinstance(job_id, str) or not job_id
@@ -3940,7 +3945,8 @@ class ApplicationIPCController:
         return {'fixture_context': self.fixture_context} if self.fixture_context else {}
 
     def _row(self):
-        return _row(self.pk, fixture_context=self.fixture_context)
+        return (_row(self.pk, fixture_context=self.fixture_context)
+                if self.fixture_context else _row(self.pk))
 
     def _fresh_preparation(self, url: str) -> None:
         if not _preparation_origin(url, self.url):
@@ -4174,9 +4180,13 @@ class ApplicationIPCController:
         """The ONE full authoritative pre-Submit decision at raw click IPC."""
         if self.committed:
             raise Gate('A possibly committing application click cannot be repeated.')
+        from copy import deepcopy
         from tools import posting_guard as pg
         check_dispatch(self.pk, self.resume_path, **self._ctx())
-        row = self._row()
+        # Store adapters and offline fixtures may reuse nested approval objects.
+        # Hold-time mutation must not rewrite the pre-hold comparison evidence.
+        row = deepcopy(self._row())
+        fresh_alias = None
         if (row.get('pk') != self.pk or row.get('company') != self.company
                 or row.get('jd_url') != self.url):
             raise Gate('Current tracked job identity changed; no Submit.')
@@ -4193,6 +4203,13 @@ class ApplicationIPCController:
                 raise Gate('Final form is on a different job/ATS tenant; no Submit.')
         elif not navigation_allowed(page['url'], self.url):
             raise Gate('Final form is outside the tracked employer job origin.')
+        if target.get('in_form'):
+            if not target.get('form_action'):
+                raise Gate('Final submit receiver is missing; inspect the form before Submit.')
+            for receiver in (target.get('form_action'), target.get('formaction')):
+                if receiver and not navigation_allowed(
+                        receiver, self.url, provenance=fresh_alias):
+                    raise Gate('Final submit receiver is outside the tracked job/ATS tenant; no Submit.')
         from core.ids import make_pk
         if (not isinstance(row.get('job_id'), str) or
                 make_pk(self.company, row['job_id']) != self.pk):
@@ -4221,19 +4238,30 @@ class ApplicationIPCController:
             raise Gate('This row’s protected tailored PDF has not been verified.')
         check_form(page, self.filled, True, Path(self.resume_path).name, self.history)
         check_approvals(self.pk, self.history, page, **self._ctx())
+        expected_page = (_page_identity(page), page.get('title'))
         # No independent or stale permission token: recheck this same invocation
         # against a durable possible-submit hold, then validate own state.
         self.step['last_button'] = target.get('label', '')
         hold_possible_submission(self.pk, self.step, **self._ctx())
         check_before_committing_click(self.pk, **self._ctx())
+        current_page = await self._page(session)
+        if (_page_identity(current_page), current_page.get('title')) != expected_page:
+            raise Gate('Final application form or submit receiver changed before submit; inspect it.')
         latest = self._row()
         if (latest.get('pk') != self.pk or latest.get('company') != self.company
                 or latest.get('job_id') != row.get('job_id')
+                or latest.get('jd_url') != row.get('jd_url')
+                or latest.get('ats') != row.get('ats')
                 or latest.get('resume_seed') != row.get('resume_seed')
                 or latest.get('human_approved_answers') != row.get('human_approved_answers')
+                or latest.get('possible_submission')
                 or latest.get('status') != 'needs_human'
                 or latest.get('gate_reason') != 'submit_uncertain'):
             raise Gate('Current row, approval, seed or own post-hold status drifted; no Submit.')
+        if fresh_alias is not None and not _alias_current(
+                fresh_alias, fixture_context=self.fixture_context):
+            raise Gate('The job/ATS tenant or board changed after the hold; no Submit.',
+                       reason='defect_tenant')
         if self.fixture_context is None:
             from core.stores import make_stores
             from core.apply_queue import ApplyQueue
@@ -4279,25 +4307,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         else:
             check_dispatch(pk, resume_path)
 
-    def verify_history(history, page):
-        if ctx is not None:
-            check_approvals(pk, history, page, fixture_context=ctx,
-                            provenance=provenance)
-        else:
-            check_approvals(pk, history, page, provenance=provenance)
-
-    def hold_dispatch(step):
-        if ctx is not None:
-            hold_possible_submission(pk, step, fixture_context=ctx)
-        else:
-            hold_possible_submission(pk, step)
-
-    def check_commit():
-        if ctx is not None:
-            check_before_committing_click(pk, fixture_context=ctx)
-        else:
-            check_before_committing_click(pk)
-
     def mark_click_started():
         nonlocal submitted
         submitted = True
@@ -4323,7 +4332,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             provenance = _configured_alias(pk, company, url, fixture_context=ctx)
             direct_url = provenance.url if provenance else url
         else:
-            tracked = _row(pk, fixture_context=ctx) if pk else {}
+            tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
             if (tracked.get('ats') in _APPLICATION_ENTRY
                     or urlsplit(url).hostname in {h for h, _ in _APPLICATION_ENTRY.values()}):
                 provenance = _configured_alias(pk, company, url, fixture_context=ctx)

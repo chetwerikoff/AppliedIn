@@ -5,6 +5,7 @@ independent complete observations before the direct human question is reachable.
 """
 from copy import deepcopy
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -55,7 +56,9 @@ class RootSession:
         if method == 'upload':
             selector, _, path = args
             assert selector == '#dropzone' and kwargs == {'timeout': 130}
-            after = observed(attached=True, files=[path])
+            # Browser File.name is a basename even when the protected snapshot
+            # supplied to BrowserSkill has an absolute per-attempt path.
+            after = observed(attached=True, files=[Path(path).name], displayName=Path(path).name)
             for old, new in zip((self.current, self.fixed), after):
                 lookup = {c['selector']: c for c in old['controls'] + old['entry']['root_evidence']}
                 for c in new['controls'] + new['entry']['root_evidence']:

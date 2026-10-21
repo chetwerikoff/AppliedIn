@@ -105,9 +105,10 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
     monkeypatch.setattr(forms, "check_dispatch", lambda *_args, **_kw: None)
     monkeypatch.setattr(forms, "_configured_alias", lambda *_args, **_kw: object())
     monkeypatch.setattr(forms, "_alias_current", lambda *_args, **_kw: True)
-    monkeypatch.setattr(forms, "navigation_allowed", lambda *_args, **_kw: True)
+    monkeypatch.setattr(forms, "navigation_allowed",
+                        lambda href, *_args, **_kw: href == FORM_URL)
 
-    effects, committing = [], []
+    effects, committing, transmissions = [], [], []
     nodes = {c["selector"]: c for c in page["controls"]}
 
     async def fake_command(*args, **_kw):
@@ -115,6 +116,13 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
         if op == "evaluate":
             return {"value": page}
         effects.append((op, args[1]))
+        # Simulate employer-side autosave and upload transmission without
+        # making any network request. Transmitted preparation is not Submit.
+        if op == "upload":
+            transmissions.append(("upload-endpoint", args[1]))
+        elif op in {"fill", "select"} or (op == "click" and args[1] in {
+                "#remote", "#privacy", "#radio-no"}):
+            transmissions.append(("autosave", args[1]))
         if op == "fill":
             nodes["#name"].update(value="Test User", has_value=True)
         elif (op, args[1]) == ("click", "#remote"):
@@ -164,6 +172,10 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
                            ("click", "#privacy"), ("click", "#radio-no"),
                            ("upload", "#pdf")]
         assert controller.upload_completed
+        assert transmissions == [
+            ("autosave", "#name"), ("autosave", "#remote"),
+            ("autosave", "#native"), ("autosave", "#privacy"),
+            ("autosave", "#radio-no"), ("upload-endpoint", "#pdf")]
         # Controller receipts are normally populated by execute(), not by raw
         # producer IPC. Supply the synthetic readbacks to reach the *unchanged*
         # production final verdict rather than manufacturing a second guard.

@@ -381,8 +381,21 @@ def test_cleared_optional_phone_cannot_evade_presubmit():
     page = dom()['page']
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
     phone.update(value='+12025550123', has_value=False, required=False)
-    with pytest.raises(forms.Gate, match='phone value'):
+    # A partially inspectable page must fail closed before individual values.
+    assert page['inventory_verified'] is False and page['opaque_controls']
+    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
         forms.check_form(page, {'#phone': '+12025550123'}, True)
+
+    # Independently prove the phone-specific negative with a complete current
+    # native form. Opaque unrelated widgets cannot mask this checked value.
+    complete = {
+        'url': URL, 'controls': [copy.deepcopy(phone)],
+        'inventory_verified': True, 'truncated': False,
+        'opaque_controls': False, 'shadow_roots': False,
+        'unsupported_frames': [],
+    }
+    with pytest.raises(forms.Gate, match='phone value'):
+        forms.check_form(complete, {'#phone': '+12025550123'}, True)
 
 
 @pytest.mark.parametrize('delayed', ['C1', 'C2', 'both'])

@@ -276,9 +276,16 @@ async def test_required_unapproved_bootstrap_precedes_all_widget_ipc(grants):
     for snapshot in (session.snapshot['page'], session.snapshot['witness']):
         field = next(c for c in snapshot['controls'] if c['selector'] == '#additional')
         field.update(required=True, label='Unapproved final question', question='Unapproved final question')
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(session, await session.page(), 'example-co#1', grants, URL)
+    prepared = await forms._bootstrap(
+        session, await session.page(), 'example-co#1', grants, URL)
+    unapproved = [c for c in prepared['controls'] if c['selector'] == '#additional']
+    assert len(unapproved) == 1
+    assert unapproved[0]['required'] is True and not unapproved[0]['has_value']
+    # Reversible picker work may proceed; the missing required field never
+    # authorizes any write or final Submit from the observed inventory.
     assert session.calls == []
+    with pytest.raises(forms.Gate):
+        forms.check_form(prepared, {}, uploaded=True)
 
 
 async def test_committed_new_mode_still_gets_independent_presubmit_witness(grants):

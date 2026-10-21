@@ -458,6 +458,72 @@ async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
     assert not any(call[0] == 'click' and call[1] != '#country'
                    for call in session.calls)
 
+async def test_closed_aria_picker_binds_exclusive_listbox_after_open(monkeypatch):
+    """A closed ARIA combobox has no aria-controls until its options mount."""
+    closed = control()
+    closed['combobox'].update(linked=False, link_id='',
+                              listbox_selector='', options=[])
+    opened = page()
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_value='EX'))
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+
+    class LazyLinkSession(DynamicSession):
+        def current(self):
+            # The actual linked listbox first appears after the picker click.
+            return (self.initial, self.opened, self.opened, self.committed)[self.stage]
+
+    session = LazyLinkSession(page(closed), opened, committed)
+    filled = {}
+    receipt = await forms.execute(
+        session, page(closed),
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    mutations = [call for call in session.calls if call[0] != 'evaluate']
+    assert mutations == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', 'Example Country'),
+        ('click', '#country-example'),
+    ]
+    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
+    assert filled == {'#country': 'Example Country'}
+    forms.check_form(committed, filled, True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], committed)
+
+
+async def test_closed_aria_picker_without_rendered_link_never_selects(monkeypatch):
+    """Opening alone cannot confer a listbox/option identity or approval."""
+    closed = control()
+    closed['combobox'].update(linked=False, link_id='',
+                              listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+
+    class NeverLinked(DynamicSession):
+        def current(self):
+            return self.initial
+
+    session = NeverLinked(page(closed), page(), page())
+    with pytest.raises(forms.Gate, match='did not expose current selectable options'):
+        await forms.execute(
+            session, page(closed),
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={},
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert not any(call == ('click', '#country-example') for call in session.calls)
+
+
 async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
     closed = control()
     closed['combobox'].update(linked=False, listbox_selector='', options=[])

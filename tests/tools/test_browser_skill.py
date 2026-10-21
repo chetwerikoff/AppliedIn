@@ -2599,6 +2599,14 @@ def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
 async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(change, monkeypatch):
     monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
     monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: True)
+    # New preparation checks read the canonical tracked row. Keep this
+    # frame-mutation test entirely offline while proving a valid same-job
+    # dispatch rather than reaching the operator's Redis.
+    tracked = {'pk': _GH_ALIAS.pk, 'company': _GH_ALIAS.company,
+               'job_id': _GH_ALIAS.job_id, 'jd_url': _GH_ALIAS.wrapper,
+               'status': 'submitting', 'ats': 'greenhouse'}
+    monkeypatch.setattr(forms, '_row',
+                        lambda pk, *args, **kwargs: tracked if pk == _GH_ALIAS.pk else {})
     initial = _gh_dom()
     class Raw:
         def __init__(self):

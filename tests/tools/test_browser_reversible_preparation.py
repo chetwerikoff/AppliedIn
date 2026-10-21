@@ -232,26 +232,33 @@ async def test_legacy_shape_fallback_still_refuses_unknown_landing(monkeypatch):
 @pytest.mark.asyncio
 async def test_native_ashby_preparation_does_not_require_old_owner_certificate(
         monkeypatch, tmp_path):
-    """Only the final guard refuses two native Submit owners; preparation can read."""
-    from tools.claude_chrome import GreenhouseJobAlias
+    """A second Submit owner appearing after safe preparation fails at Submit."""
+    from tests.tools.test_browser_application_entry import synthetic_ashby_entry_shape
 
     page = _page()
     page.update(inventory_verified=True, entry={
-        "root": None, "native_candidates": [], "frames": [],
+        "root": {"selector": "#app", "action": FORM_URL},
+        "native_candidates": [], "frames": [],
         "response_error": False, "helper_challenge": False})
     page["controls"] = [c for c in page["controls"]
                         if c["selector"] in {"#name", "#pdf", "#submit"}]
+    for item in page["controls"]:
+        item.update(native_form_owner_selector="#app", visible=True, readonly=False)
+    synthetic_ashby_entry_shape(page)
+    provenance = forms.ApplicationEntryProvenance(
+        PK, COMPANY, "ashby", JOB, POSTING, COMPANY, FORM_URL)
+    allowed = lambda href: forms._preparation_origin(href, POSTING)
+    # The raw-action owner is proved independently before reversible entry.
+    forms._entry_safety(page, allowed, provenance)
+    assert page["entry"]["selected_native_owner"] == "#app"
+    assert forms._entry_not_ready(page) == ""
+
+    # A foreign native Submit can appear between preparation and final click.
+    # It is not an authorized replacement for the tracked original.
     first = next(c for c in page["controls"] if c["selector"] == "#submit")
     second = dict(first, selector="#other-submit", form_selector="#another-form",
                   native_form_owner_selector="#another-form")
     page["controls"].append(second)
-    provenance = forms.ApplicationEntryProvenance(
-        PK, COMPANY, "ashby", JOB, POSTING, COMPANY, FORM_URL)
-    allowed = lambda href: forms._preparation_origin(href, POSTING)
-    # Neither the current native form controls nor their current safe receiver
-    # need a historic Ashby-specific raw-action/root admission.
-    forms._entry_safety(page, allowed, provenance)
-    assert forms._entry_not_ready(page) == ""
 
     row = {
         "pk": PK, "company": COMPANY, "job_id": JOB, "jd_url": POSTING,

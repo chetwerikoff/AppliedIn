@@ -4648,7 +4648,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     getattr(raw_session, '_application_controller', None) is not producer_guard):
                                 if (is_submission(target) or target.get('submit') is True
                                         or target.get('navigates') is True
-                                        or target.get('formaction') or _private_content(page)):
+                                        or target.get('formaction') or
+                                        ApplicationIPCController._private_content(page)):
                                     raise Gate('Application click lacks a bound raw IPC guard; no click is safe.')
                             before = page
                         elif verb in {'fill', 'select', 'choose', 'combobox', 'upload'}:

@@ -136,6 +136,114 @@ async def attempt(current, *, facts=None):
                              pk=PK, resume_path='Resume.pdf')
 
 
+# The historic bootstrap tests used an HTTP-loopback URL and a partial row.
+# Those are now rejected at application entry, before _bootstrap is reached.
+# Give just the migrated cases a safe synthetic HTTPS row so they prove the
+# current preparation, approved-writer and final raw-Submit behaviors.
+SECURE_URL = 'https://example-co.test/job/1'
+
+
+def secure_inventory(*controls):
+    page = inventory(*(deepcopy(c) for c in controls), submit(), url=SECURE_URL)
+    page['title'] = 'Synthetic Role'
+    for control in page['controls']:
+        assert control['form_action'] == URL
+        control['form_action'] = SECURE_URL
+    return page
+
+
+async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, grants=None):
+    row = {
+        'pk': PK, 'company': 'example-co', 'job_id': '1',
+        'jd_url': SECURE_URL, 'title': page['title'], 'ats': 'custom',
+        'status': 'submitting', 'possible_submission': False,
+        'human_approved_answers': grants or {},
+    }
+    monkeypatch.setattr(forms, '_row', lambda pk: row if pk == PK else
+                        pytest.fail('Unexpected synthetic row lookup'))
+    browser = Browser(page)
+    filled, history = {}, []
+    observed = await forms._bootstrap(
+        browser, page, PK, facts or {}, SECURE_URL,
+        filled=filled, history=history, job_url=SECURE_URL,
+        company='example-co')
+    assert observed is page
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+    assert row['status'] == 'submitting' and not row['possible_submission']
+    return browser, row, filled, history
+
+
+async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history, *,
+                              reason):
+    """Reach the one production final-click decision with synthetic valid PDF.
+
+    Only the form/value evidence is deliberately defective: job, origin, file
+    bytes and read-back attachment are consistent. The real application IPC
+    producer must not call the fake raw transport or create a submission hold.
+    """
+    pdf = tmp_path / 'Resume.pdf'
+    data = b'%PDF-1.4\nsynthetic example-co test-only file\n'
+    pdf.write_bytes(data)
+    attached = field('Resume', '#resume', required=False, type='file',
+                     files=[pdf.name], has_value=True)
+    attached['form_action'] = SECURE_URL
+    assert len([c for c in page['controls'] if c['selector'] == '#submit']) == 1
+    assert not any(c['selector'] == '#resume' for c in page['controls'])
+    page['controls'].insert(-1, attached)
+    submitted, raw_calls, reached_form = [], [], []
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', SECURE_URL, str(pdf), {}, filled, history, {},
+        lambda: submitted.append(True))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+
+    def pdf_identity():
+        assert pdf.read_bytes() == data
+        return len(data), controller.expected_digest
+
+    controller.upload_identity = pdf_identity()
+    controller.upload_completed = True
+    monkeypatch.setattr(controller, '_row_pdf', pdf_identity)
+
+    def preparation(origin):
+        assert origin == SECURE_URL
+        forms._tracked_preparation_job(PK, 'example-co', SECURE_URL)
+
+    def dispatch(pk, path, **kwargs):
+        assert (pk, path) == (PK, str(pdf.resolve()))
+        assert not kwargs
+
+    original_form_check = forms.check_form
+
+    def checked_form(*args, **kwargs):
+        reached_form.append(True)
+        return original_form_check(*args, **kwargs)
+
+    async def read_page(_session):
+        return deepcopy(page)
+
+    async def command(*args, **kwargs):
+        raw_calls.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(controller, '_fresh_preparation', preparation)
+    monkeypatch.setattr(controller, '_page', read_page)
+    monkeypatch.setattr(forms, 'check_dispatch', dispatch)
+    monkeypatch.setattr(forms, 'check_form', checked_form)
+    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *_a, **_kw:
+                        pytest.fail('Unapproved form reached the submission hold'))
+    monkeypatch.setattr(bsk, 'command', command)
+    raw_session = bsk.Session('apply')
+    raw_session.id = 'synthetic-offline'
+    raw_session.bind_application_controller(controller)
+    with pytest.raises(forms.Gate, match=reason):
+        await raw_session.application_effect('click', '#submit')
+    assert reached_form == [True]
+    assert raw_calls == [] and submitted == []
+    assert controller.committed is False
+    assert row['status'] == 'submitting' and row['possible_submission'] is False
+
+
 async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monkeypatch):
     url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
@@ -157,34 +265,55 @@ async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monke
     ({}, '#email'),
     ({'type': 'tel'}, '#email'),
 ])
-async def test_first_required_field_gates_before_model_or_write(monkeypatch, extra, selected):
-    c = field(**extra)
-    p = inventory(c, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['status'] == 'gate'
-    q = report['form_question']
-    assert (q['pk'], q['label'], q['selector'], q['form_selector'],
-            q['form_action'], q['tag'], q['type']) == (
-                PK, 'Email', selected, '#application', URL, 'input', c['type'])
-    assert not decide.await_count
-    assert [x[0] for x in browser.calls] == ['navigate', 'evaluate']
+async def test_first_required_field_gates_before_model_or_write(
+        monkeypatch, tmp_path, extra, selected):
+    p = secure_inventory(field(**extra))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert p['controls'][0]['selector'] == selected
+    assert p['controls'][0]['type'] == ('tel' if extra else 'email')
+    assert p['controls'][0]['required'] is True and not p['controls'][0]['has_value']
+    assert [x[0] for x in browser.calls] == ['evaluate']
+    # An unanswered ordinary control is not a bootstrap human gate. The
+    # irreversible boundary must identify Email before any Submit IPC.
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: Email')
 
 
-async def test_dom_order_and_exact_current_grant_only(monkeypatch):
-    c1, c2 = field('First name', '#first'), field('Email', '#email')
-    p = inventory(c1, c2, submit())
-    browser, decide, row = world(monkeypatch, p)
-    assert (await attempt(p))['form_question']['label'] == 'First name'
-    row['human_approved_answers'] = {
-        'First name': {'value': 'Test User', 'selector': '#first', 'url': URL,
-                       'label': 'First name', 'question': '', 'tag': 'input',
-                       'type': 'text', 'form_selector': '#application',
-                       'form_action': URL}}
-    assert (await attempt(p, facts={'First name': 'Test User'}))[
-        'form_question']['label'] == 'Email'
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+async def test_dom_order_and_exact_current_grant_only(monkeypatch, tmp_path):
+    p = secure_inventory(field('First name', '#first'), field('Email', '#email'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert [c['selector'] for c in p['controls'][:2]] == ['#first', '#email']
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: First name')
+
+    # A complete exact grant authorizes the existing writer, not an eager
+    # bootstrap certificate. Only after that real synthetic fill/readback can
+    # the final decision advance deterministically to the next missing field.
+    p = secure_inventory(field('First name', '#first'), field('Email', '#email'))
+    first = p['controls'][0]
+    grant = {**{k: first[k] for k in (
+        'selector', 'label', 'question', 'tag', 'type',
+        'form_selector', 'form_action')},
+        'url': SECURE_URL, 'value': 'Test User'}
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'First name': 'Test User'},
+        grants={'First name': grant})
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, p, {'action': 'fill', 'selector': '#first', 'fact': 'First name'},
+        facts={'First name': 'Test User'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=SECURE_URL)
+    browser.allow_mutations = False
+    history.append(receipt)
+    assert receipt['fact'] == 'First name' and filled == {'#first': 'Test User'}
+    assert p['controls'][0]['has_value'] and p['controls'][0]['value'] == 'Test User'
+    assert p['controls'][1]['has_value'] is False
+    assert [x[0] for x in browser.calls if x[0] != 'evaluate'] == ['fill']
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: Email')
 
 
 @pytest.mark.parametrize('prior,bank', [
@@ -198,14 +327,31 @@ async def test_dom_order_and_exact_current_grant_only(monkeypatch):
       'label': 'Email', 'question': ''}, {'Email': 'test@example.test'}),
 ])
 async def test_bank_or_incomplete_or_changed_value_is_not_disclosure(
-        monkeypatch, prior, bank):
-    p = inventory(field(), submit())
-    browser, decide, row = world(monkeypatch, p,
-                                 grants={'Email': prior} if prior else {})
-    report = await attempt(p, facts=bank)
-    assert report['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+        monkeypatch, tmp_path, prior, bank):
+    p = secure_inventory(field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts=bank, grants={'Email': prior} if prior else {})
+    assert not filled and not history
+    assert p['controls'][0]['has_value'] is False
+    # The fact bank and a partial/stale grant cannot authorize the production
+    # writer. An explicit model-selected write is refused without effect.
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts=bank, filled=filled, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+
+    # Even page-autofill of the unapproved bank/prior value cannot make the
+    # final Submit guard accept it as a fresh approved write/readback.
+    displayed = bank.get('Email') or prior.get('value')
+    if displayed:
+        p['controls'][0].update(value=displayed, has_value=True)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason=('Unverified or changed form value: Email'
+                if displayed else 'Required field is empty: Email'))
 
 
 @pytest.mark.parametrize('problem', [
@@ -262,22 +408,25 @@ async def test_login_and_material_choice_wall_precedes_text_gate(monkeypatch, ex
     assert all(x[0] != 'fill' for x in browser.calls)
 
 
-async def test_required_radio_group_gates_before_later_text(monkeypatch):
+async def test_required_radio_group_gates_before_later_text(monkeypatch, tmp_path):
     radio = field('Evenings', '#evenings', tag='input', type='radio',
                   name='schedule', question='Schedule preference',
                   value='evenings', has_value=True)
     other = field('Mornings', '#mornings', tag='input', type='radio',
                   name='schedule', question='Schedule preference',
                   value='mornings', has_value=True)
-    p = inventory(radio, other, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question']['label'] == 'Schedule preference'
-    assert report['form_question']['radio_members'] == [
-        {'selector': '#evenings', 'caption': 'Evenings', 'value': 'evenings'},
-        {'selector': '#mornings', 'caption': 'Mornings', 'value': 'mornings'}]
-    assert 'Evenings\nMornings' in report['question']
-    assert not decide.await_count
+    p = secure_inventory(radio, other, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert [c['selector'] for c in forms._radio_group(p, p['controls'][0])] == [
+        '#evenings', '#mornings']
+    assert not any(c['checked'] for c in p['controls'][:2])
+    assert p['controls'][2]['selector'] == '#email'
+    assert not any(x[0] in {'click', 'fill'} for x in browser.calls)
+    # The group can be observed without a C0/C1/owner gate. Its first
+    # unresolved required choice, not later Email, blocks the real final click.
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required choice is empty: Evenings')
 
 
 async def test_duplicate_form_question_never_authorizes_either_sibling(monkeypatch):

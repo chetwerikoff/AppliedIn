@@ -242,6 +242,66 @@ async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypat
         forms.check_approvals(PK, [receipt], changed_machine_value)
 
 
+async def test_popup_link_may_disappear_after_verified_form_commit(monkeypatch):
+    """A closed listbox need not retain aria-controls through final Submit."""
+    current = page()
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_value='EX'))
+    chosen = committed['controls'][0]['combobox']
+    chosen.update(linked=False, link_id='', listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current, committed)
+    filled = {}
+    receipt = await forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
+    assert ('click', '#country-example') in session.calls
+    # A bare PAGE projection may not pretend a formerly mounted listbox
+    # remained bound. Only the actual verified action receipt permits final.
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(committed, filled, True)
+    forms.check_form(committed, filled, True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], committed)
+    wrong_form_value = deepcopy(committed)
+    wrong_form_value['controls'][-1]['value'] = 'OTHER'
+    with pytest.raises(forms.Gate, match='hidden form value'):
+        forms.check_form(wrong_form_value, filled, True, receipts=[receipt])
+
+
+async def test_unbound_form_receiver_denies_display_only_combobox(monkeypatch):
+    """A visible choice with no named input or hidden receiver cannot Submit."""
+    current = page(control(hidden_selector=''))
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_selector=''))
+    committed['controls'][0]['name'] = ''  # no submitted form input name
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current, committed)
+    filled = {}
+    with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
+        await forms.execute(
+            session, current,
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled=filled,
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') in session.calls
+    assert filled == {}
+    with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
+        forms.check_form(committed, {'#country': 'Example Country'}, True,
+                         receipts=[{'action': 'combobox', 'selector': '#country',
+                                    'committed_caption': 'Example Country',
+                                    'committed_value': 'EX',
+                                    'hidden_selector': '', 'hidden_value': ''}])
+
+
 @pytest.mark.parametrize(('before', 'after'), [
     ('EX', 'EX'),  # A pre-existing value unchanged by this selection is not authority.
     ('', 'OTHER'),  # A changed value must equal the selected option's machine value.

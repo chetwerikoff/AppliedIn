@@ -3172,8 +3172,9 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
         field(question_text, '#marketing', tag='input', type='checkbox',
               value='yes', required=True),
     )
+    independent = {c['selector']: c for c in witness(page)['controls']}
     with pytest.raises(forms.Gate) as exc:
-        forms._bootstrap_wall(page, witness(page), SECURE_URL)
+        forms._bootstrap_wall(page, independent, SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert exc.value.form_question is not None
     assert exc.value.form_question['control_label'] == question_text
@@ -3181,8 +3182,8 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     assert exc.value.form_question['form_action'] == SECURE_URL
     assert question_text in str(exc.value)
     # A missing independent accessibility witness never invents a question.
-    inaccessible = witness(page)
-    inaccessible['controls'][0]['visible'] = False
+    inaccessible = deepcopy(independent)
+    inaccessible['#marketing']['visible'] = False
     with pytest.raises(forms.Gate) as blocked:
         forms._bootstrap_wall(page, inaccessible, SECURE_URL)
     assert blocked.value.reason == 'owner_question'

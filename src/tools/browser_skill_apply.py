@@ -2848,8 +2848,18 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
             # New legal and broader privacy choices still require the owner.
             if (_unanswered(page, c)
                     and _missing_answer_reason(c) == 'owner_question'):
-                raise Gate('Direct owner review is required for this choice.',
-                           reason='owner_question')
+                # On a witnessed, form-owned choice, show the *actual* current
+                # question to the owner. If that evidence is unavailable,
+                # retain a fail-closed owner gate without inventing a label.
+                try:
+                    question = _disclosure_question(
+                        page, c, witness, *origins, bootstrap=True,
+                        provenance=provenance)
+                except Gate:
+                    raise Gate('Direct owner review is required for this choice.',
+                               reason='owner_question') from None
+                raise Gate(_choice_prompt(c, question),
+                           form_question=question, reason='owner_question')
             continue
         if c.get('in_form') and (
                 _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):

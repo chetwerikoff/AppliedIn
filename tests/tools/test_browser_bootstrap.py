@@ -3176,3 +3176,61 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
         forms._bootstrap_wall(page, witness(page), SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert 'Direct owner review' in str(exc.value)
+
+
+def _synthetic_aria_role_combobox_page(tag='button'):
+    combo = dict(
+        linked=True, link_id='work-mode-list', listbox_selector='#work-mode-list',
+        options=[dict(selector='#work-mode-remote', unique=True,
+                      value='remote', label='Remote')],
+        selected_text='', displayed_text='', selected_value='',
+        hidden_selector='', hidden_value='',
+    )
+    return secure_inventory(field(
+        'Work mode', '#work-mode', tag=tag, type='combobox',
+        question='Work mode', combobox=combo, submit=False, href='',
+    ))
+
+
+@pytest.mark.parametrize('tag', ['button', 'span'])
+def test_safe_aria_combobox_roles_are_tag_independent(tag):
+    # A documented ARIA role/linkage is evidence; a React-specific input/div
+    # taxonomy is not. The independent transport witness must still agree.
+    page = _synthetic_aria_role_combobox_page(tag)
+    independent = witness(page)
+    independent['controls'][0]['combobox'] = deepcopy(
+        page['controls'][0]['combobox'])
+    proof = {c['selector']: c for c in independent['controls']}
+    question = forms._disclosure_question(
+        page, page['controls'][0], proof, SECURE_URL)
+    assert question['type'] == 'combobox'
+    assert question['tag'] == tag
+    assert question['selector'] == '#work-mode'
+    assert question['form_action'] == SECURE_URL
+    assert question['label'] == 'Work mode'
+    # Neither valid accessibility nor options grant an unapproved answer.
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
+        forms.exact_approval(
+            'example-co#1', question['label'], 'Remote',
+            target=page['controls'][0], url=SECURE_URL)
+
+
+@pytest.mark.parametrize('unsafe', [
+    {'submit': True},
+    {'navigates': True},
+    {'href': 'https://foreign.example-co.test/open'},
+    {'formaction': 'https://foreign.example-co.test/submit'},
+    {'combobox': {'linked': True, 'link_id': '',
+                  'listbox_selector': '', 'options': []}},
+])
+def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
+    page = _synthetic_aria_role_combobox_page()
+    page['controls'][0].update(unsafe)
+    proof = witness(page)
+    proof['controls'][0]['combobox'] = deepcopy(
+        page['controls'][0]['combobox'])
+    with pytest.raises(forms.Gate, match='safe, exclusively linked ARIA combobox'):
+        forms._disclosure_question(
+            page, page['controls'][0],
+            {c['selector']: c for c in proof['controls']},
+            SECURE_URL)

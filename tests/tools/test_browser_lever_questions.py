@@ -265,10 +265,8 @@ async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeyp
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: {})
     prepared = await forms._bootstrap(
         session, session.current, 'example-co#synthetic', {}, URL)
-    assert prepared is session.current
+    assert prepared == session.current
     fixed = {c['selector']: c for c in session.fixed['controls']}
-    # The real accessible witness can still identify this control, but no
-    # ordinary missing checkbox generates a premature owner gate.
     question = forms._disclosure_question(prepared, checkbox, fixed, URL)
     assert question['control_label'] == 'Send synthetic updates'
     assert question['question'] == ''
@@ -280,42 +278,65 @@ async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeyp
     with pytest.raises(forms.Gate):
         forms.check_form(prepared, {}, uploaded=True)
 
-
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 def test_native_role_override_retains_unresolved_flag_from_production_reader(reader, kind):
-    page = read({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch'}, reader)
+    # An author-supplied role="switch" on an input is not evidence of native
+    # radio/checkbox group membership or an authorised form-owned value.
+    spec = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch'}
+    page = read(spec, reader)
     inputs = [c for c in page['controls']
               if c['tag'] == 'input' and c['selector'].startswith('#'+kind+'-')]
     assert len(inputs) == (2 if kind == 'radio' else 1)
     assert all(c['type'] == 'switch' and c['question'] == ''
-               and c.get('lever_card_unresolved') is True for c in inputs)
-
+               and not c['checked'] and c['in_form'] for c in inputs)
+    witness = read(spec, forms._FIXED_CONTROL_WITNESS)
+    known = {c['selector']: c for c in witness['controls']}
+    assert all(known[c['selector']]['type'] == 'switch' for c in inputs)
+    with pytest.raises(forms.Gate, match='Only observed native or linked combobox'):
+        forms._disclosure_question(page, inputs[0], known, URL)
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, uploaded=True)
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('fresh', [False, True], ids=['initial', 'refreshed'])
 @pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
 async def test_unresolved_role_override_gates_initial_and_refreshed_observation(kind, fresh, optional):
-    malformed = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch', 'optional': optional}
+    malformed = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch',
+                 'optional': optional}
     session = Session({'kinds': [kind], 'optional': optional} if fresh else malformed)
     if fresh:
+        # Independent current-page drift must refuse the stale witness, even
+        # though the legacy per-card refusal is no longer an admission gate.
         session.fresh = read(malformed)
-    with pytest.raises(forms.Gate) as exc:
-        await forms._observe_controls(session, session.current)
-    assert str(exc.value) == REASON
-    assert exc.value.form_question is None
-    assert len(session.calls) == int(fresh)
-
+        with pytest.raises(forms.Gate, match='current DOM witness is unavailable or changed'):
+            await forms._observe_controls(session, session.current)
+    else:
+        page, fixed = await forms._observe_controls(session, session.current)
+        assert page == session.current
+        assert all(fixed[c['selector']]['type'] == 'switch'
+                   for c in page['controls'] if c.get('type') == 'switch')
+        with pytest.raises(forms.Gate):
+            forms.check_form(page, {}, uploaded=True)
+    assert all(call[0] == 'evaluate' for call in session.calls)
+    assert len(session.calls) == 1
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
 async def test_unresolved_role_override_precedes_any_bootstrap_grant(monkeypatch, kind, optional):
-    session = Session({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch', 'optional': optional})
+    session = Session({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch',
+                       'optional': optional})
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: pytest.fail('Grant bank reached'))
-    monkeypatch.setattr(forms, '_disclosure_question',
-                        lambda *a, **kw: pytest.fail('Question constructed before structural Gate'))
-    with pytest.raises(forms.Gate) as exc:
-        await forms._bootstrap(session, session.current, 'example-co#synthetic', {}, URL)
-    assert str(exc.value) == REASON
-    assert exc.value.form_question is None
+    prepared = await forms._bootstrap(
+        session, session.current, 'example-co#synthetic', {}, URL)
+    assert prepared == session.current
     assert session.calls == []
+    inputs = [c for c in prepared['controls'] if c.get('type') == 'switch']
+    assert len(inputs) == (2 if kind == 'radio' else 1)
+    witness = read({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch',
+                    'optional': optional}, forms._FIXED_CONTROL_WITNESS)
+    fixed = {c['selector']: c for c in witness['controls']}
+    with pytest.raises(forms.Gate, match='Only observed native or linked combobox'):
+        forms._disclosure_question(prepared, inputs[0], fixed, URL)
+    with pytest.raises(forms.Gate):
+        forms.check_form(prepared, {}, uploaded=True)

@@ -2831,12 +2831,14 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                            for t in _submitter_texts(c))))):
             raise Gate('Login or account form requires human inspection.')
         if c.get('type') in {'radio', 'checkbox'}:
-            if _unanswered(page, c):
-                try:
-                    _disclosure_question(page, c, witness, *origins, bootstrap=True,
-                                         provenance=provenance)
-                except Gate:
-                    raise Gate('An uninspectable required choice needs human review.') from None
+            # A missing card/group witness does not prohibit reversible
+            # preparation. Only an actual committing effect needs complete
+            # group evidence; check_form() enforces it at final Submit.
+            # New legal and broader privacy choices still require the owner.
+            if (_unanswered(page, c)
+                    and _missing_answer_reason(c) == 'owner_question'):
+                raise Gate('Direct owner review is required for this choice.',
+                           reason='owner_question')
             continue
         if c.get('in_form') and (
                 _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
@@ -3024,7 +3026,16 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         kind = initial.get('type')
         if not (_native_answer(initial) or kind in {'radio', 'checkbox', 'combobox'}):
             continue
-        required = (any(c.get('required') for c in _radio_group(page, initial))
+        # Group only for traversal here, not for permission. A visible
+        # question and identical form/member values are proved by _radio_group
+        # when writing a choice and by check_form at the final Submit seam.
+        radio_members = ([c for c in page['controls']
+                          if c.get('type') == 'radio'
+                          and c.get('form_selector') == initial.get('form_selector')
+                          and c.get('name') == initial.get('name')]
+                         if kind == 'radio' and initial.get('name')
+                         and initial.get('form_selector') else [initial])
+        required = (any(c.get('required') for c in radio_members)
                     if kind == 'radio' else bool(initial.get('required')))
         if not required:
             continue
@@ -3037,10 +3048,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         eligible = kind in _BOOTSTRAP_TYPES and (
             kind != 'select' or item.get('tag') == 'select')
         group = ((item.get('form_selector'), item.get('name'))
-                 if kind == 'radio' else item['selector'])
+                 if kind == 'radio' and item.get('form_selector')
+                 and item.get('name') else item['selector'])
         if group in seen:
             continue
-        if kind == 'radio' and _radio_group(page, item)[0] is not item:
+        if kind == 'radio' and radio_members[0] is not item:
             continue
         seen.add(group)
         if eligible:

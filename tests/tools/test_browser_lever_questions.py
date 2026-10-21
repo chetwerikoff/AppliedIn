@@ -58,26 +58,34 @@ class Session:
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 def test_exact_questions_keep_visible_required_marker_and_own_card(reader):
+    # A nearby visual card is not an accessible question relationship.
     page = read({}, reader)
     items = choices(page)
     assert len(items) == 3
-    assert [c['question'] for c in items] == [
-        'Synthetic radio question *', 'Synthetic radio question *',
-        'Synthetic checkbox question *']
-    assert [c['label'] for c in items] == ['First option', 'Second option', 'Send synthetic updates']
-    assert not any(c.get('lever_card_unresolved') for c in items)
+    assert [c['question'] for c in items] == ['', '', '']
+    assert [c['label'] for c in items] == [
+        'First option', 'Second option', 'Send synthetic updates']
+    assert all(c['required'] for c in items)
     assert all(c['native_form_owner_selector'] == '#application-form' for c in items)
-    assert all(not c['checked'] for c in items)
-    assert forms._radio_group(page, items[0]) == items[:2]
-
+    assert not any(c['checked'] for c in items)
+    with pytest.raises(forms.Gate, match='visible question'):
+        forms._radio_group(page, items[0])
+    # A semantic fieldset/legend remains a positive, library-independent path.
+    identified = read({'wrapper': 'fieldset'}, reader)
+    named = choices(identified)
+    assert [c['question'] for c in named] == ['Existing standard question'] * 3
+    assert forms._radio_group(identified, named[0]) == named[:2]
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 def test_rendered_text_span_and_required_marker_remain_the_question(reader, kind):
+    # Decorative text alone is insufficient; semantic form grouping names it.
     page = read({'kinds': [kind], 'defect': 'visible-span'}, reader)
-    assert all(c['question'] == 'Synthetic '+kind+' question *'
-               and not c.get('lever_card_unresolved') for c in choices(page))
-
+    assert all(c['question'] == '' and c['required'] for c in choices(page))
+    identified = read({'kinds': [kind], 'defect': 'visible-span',
+                       'wrapper': 'fieldset'}, reader)
+    assert all(c['question'] == 'Existing standard question'
+               and c['required'] for c in choices(identified))
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 async def test_real_fixed_witness_and_controller_expose_unselected_question(monkeypatch, kind):
@@ -90,12 +98,12 @@ async def test_real_fixed_witness_and_controller_expose_unselected_question(monk
         assert fixed['native_form_owner_selector'] == '#application-form'
         assert fixed['visible'] and not fixed['readonly'] and not fixed['disabled']
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: {})
-    with pytest.raises(forms.Gate) as exc:
-        await forms._bootstrap(session, page, 'example-co#synthetic', {}, URL)
-    assert exc.value.form_question['question'] == 'Synthetic '+kind+' question *'
+    prepared = await forms._bootstrap(session, page, 'example-co#synthetic', {}, URL)
+    assert prepared is page
     assert not any(c['checked'] for c in choices(session.current))
     assert all(call[0] == 'evaluate' for call in session.calls)
-
+    with pytest.raises(forms.Gate):
+        forms.check_form(prepared, {}, uploaded=True)
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('kind,defect', MUTATIONS)
@@ -196,23 +204,33 @@ async def test_malformed_card_reader_matrix(reader, kind, defect, monkeypatch, t
 
 @pytest.mark.parametrize('kind,defect', MUTATIONS)
 async def test_structural_gate_precedes_any_question_grant_or_choice(monkeypatch, kind, defect):
-    session = Session({'kinds': [kind], 'defect': defect})
-    # A uniquely captioned checkbox would otherwise be an approvable label-only handoff.
-    if kind == 'checkbox':
-        assert choices(session.current)[0]['label'] == 'Send synthetic updates'
-    monkeypatch.setattr(forms, '_row', lambda *a, **kw: pytest.fail('Grant bank reached'))
-    monkeypatch.setattr(forms, '_disclosure_question',
-                        lambda *a, **kw: pytest.fail('Question constructed before structural Gate'))
-    with pytest.raises(forms.Gate) as exc:
-        await forms._bootstrap(session, session.current, 'example-co#synthetic', {}, URL)
-    assert str(exc.value) == REASON
-    assert exc.value.form_question is None
-    assert session.calls == []
+    """A card-shape mutation cannot authorize a native answer or Submit.
 
+    Structural admission of a legacy card was deleted under r06; the real
+    final-submit guard for every mutation is separately exercised by
+    test_malformed_card_reader_matrix above. Safe preparation cannot acquire
+    owner authority from any of these malformed visual decorations.
+    """
+    session = Session({'kinds': [kind], 'defect': defect})
+    before = [(c['selector'], c.get('checked')) for c in choices(session.current)]
+    monkeypatch.setattr(forms, '_row', lambda *a, **kw: {})
+    try:
+        prepared = await forms._bootstrap(
+            session, session.current, 'example-co#synthetic', {}, URL)
+        assert prepared is session.current
+    except forms.Gate as exc:
+        # An actually mismatched independent witness may refuse observation.
+        # A removed per-ATS card-shape certificate is not a valid refusal.
+        assert 'current DOM witness is unavailable or changed' in str(exc)
+    assert [(c['selector'], c.get('checked')) for c in choices(session.current)] == before
+    assert all(call[0] == 'evaluate' for call in session.calls)
+    with pytest.raises(forms.Gate):
+        forms.check_form(session.current, {}, uploaded=True)
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('fresh', [False, True], ids=['initial', 'refreshed'])
 async def test_observation_boundary_checks_flag_even_without_question_identity_change(kind, fresh):
+    # A removed per-card flag cannot become answer/Submit authority.
     session = Session({'kinds': [kind]})
     changed = deepcopy(session.current)
     for c in choices(changed):
@@ -221,12 +239,14 @@ async def test_observation_boundary_checks_flag_even_without_question_identity_c
         session.fresh = changed
     else:
         session.current = changed
-    with pytest.raises(forms.Gate) as exc:
-        await forms._observe_controls(session, session.current)
-    assert str(exc.value) == REASON
-    assert exc.value.form_question is None
+    current, witness = await forms._observe_controls(session, session.current)
+    assert [(c['selector'], c.get('checked')) for c in choices(current)] == [
+        (c['selector'], False) for c in choices(changed)]
+    assert all(witness[c['selector']]['visible_text'] == c['label']
+               for c in choices(current))
     assert all(call[0] == 'evaluate' for call in session.calls)
-
+    with pytest.raises(forms.Gate):
+        forms.check_form(current, {}, uploaded=True)
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('wrapper', ['fieldset', 'form-group'])

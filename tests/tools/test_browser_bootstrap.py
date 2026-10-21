@@ -3166,16 +3166,28 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
 
 
 def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
-    """Relocating shape checks cannot delegate new legal/privacy consent."""
+    """A visible privacy choice needs the owner's exact current question."""
+    question_text = 'I consent to sharing personal data with marketing partners'
     page = secure_inventory(
-        field('I consent to sharing personal data with marketing partners',
-              '#marketing', tag='input', type='checkbox',
+        field(question_text, '#marketing', tag='input', type='checkbox',
               value='yes', required=True),
     )
     with pytest.raises(forms.Gate) as exc:
         forms._bootstrap_wall(page, witness(page), SECURE_URL)
     assert exc.value.reason == 'owner_question'
-    assert 'Direct owner review' in str(exc.value)
+    assert exc.value.form_question is not None
+    assert exc.value.form_question['control_label'] == question_text
+    assert exc.value.form_question['selector'] == '#marketing'
+    assert exc.value.form_question['form_action'] == SECURE_URL
+    assert question_text in str(exc.value)
+    # A missing independent accessibility witness never invents a question.
+    inaccessible = witness(page)
+    inaccessible['controls'][0]['visible'] = False
+    with pytest.raises(forms.Gate) as blocked:
+        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+    assert blocked.value.reason == 'owner_question'
+    assert blocked.value.form_question is None
+    assert 'Direct owner review' in str(blocked.value)
 
 
 def _synthetic_aria_role_combobox_page(tag='button'):

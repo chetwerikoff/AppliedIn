@@ -269,7 +269,7 @@ def _assent_target(question, *, value="on", in_form=True):
     ("I accept a privacy policy", "owner"),
     ("I certify all statements are correct", "owner"),
     ("I am legally authorized to work", "fact"),
-    ("I agree to arbitration", "fact"),
+    ("I agree to arbitration", "owner"),
 ])
 def test_generic_assent_scope_has_no_ats_or_widget_exception(question, expected):
     """ARCH21:26: only narrow standard privacy acknowledgement is delegated."""
@@ -397,3 +397,61 @@ async def test_code_issued_form_get_stays_reversible(monkeypatch):
     await session.application_effect(
         "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
     assert [c[0][0] for c in calls] == ["navigate"]
+
+
+@pytest.mark.parametrize("checked,form_value,approved,valid", [
+    (True, "on", "yes", True),
+    (False, "on", "yes", False),
+    (True, "", "yes", False),
+    (True, "on", "no", False),
+    (True, "other", "yes", False),
+])
+def test_final_standard_acknowledgement_checks_display_and_form_receiver(
+        checked, form_value, approved, valid):
+    """r06 accepted privacy delegation: no separate owner yes, no unchecked send."""
+    target = _assent_target(
+        "I acknowledge processing of personal data for this application")
+    target["checked"] = checked
+    target["value"] = form_value
+    target["in_form"] = True
+    pdf = {"selector": "#pdf", "tag": "input", "type": "file",
+           "label": "Resume", "files": ["Test User Resume.pdf"],
+           "has_value": True}
+    page = {"url": "https://example.test/application", "inventory_verified": True,
+            "controls": [target, pdf]}
+    filled = {"#agree": "on"}
+    receipts = [{"action": "choose", "selector": "#agree",
+                 "approved_value": approved}]
+    if valid:
+        forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+    else:
+        with pytest.raises(forms.Gate):
+            forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+
+
+@pytest.mark.parametrize("approved,actual,valid", [
+    ("Remote", "remote", True),
+    ("On-site", "remote", False),
+    ("Remote", "unexpected", False),
+])
+def test_native_select_receives_exact_option_value_and_approved_caption(
+        approved, actual, valid):
+    """ARCH01:58: native select's opaque submitted value maps to approved text."""
+    target = {"selector": "#location", "tag": "select", "type": "select",
+              "label": "Work location", "required": True, "disabled": False,
+              "value": actual, "has_value": True,
+              "options": [{"label": "Remote", "value": "remote"},
+                          {"label": "On-site", "value": "office"}]}
+    pdf = {"selector": "#pdf", "tag": "input", "type": "file",
+           "label": "Resume", "files": ["Test User Resume.pdf"]}
+    page = {"url": "https://example.test/application",
+            "inventory_verified": True, "controls": [target, pdf]}
+    receipts = [{"selector": "#location", "action": "select",
+                 "approved_value": approved}]
+    if valid:
+        forms.check_form(page, {"#location": "remote"}, True,
+                         "Test User Resume.pdf", receipts)
+    else:
+        with pytest.raises(forms.Gate):
+            forms.check_form(page, {"#location": "remote"}, True,
+                             "Test User Resume.pdf", receipts)

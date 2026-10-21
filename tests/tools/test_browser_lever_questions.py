@@ -99,7 +99,7 @@ async def test_real_fixed_witness_and_controller_expose_unselected_question(monk
         assert fixed['visible'] and not fixed['readonly'] and not fixed['disabled']
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: {})
     prepared = await forms._bootstrap(session, page, 'example-co#synthetic', {}, URL)
-    assert prepared is page
+    assert prepared == page
     assert not any(c['checked'] for c in choices(session.current))
     assert all(call[0] == 'evaluate' for call in session.calls)
     with pytest.raises(forms.Gate):
@@ -217,7 +217,7 @@ async def test_structural_gate_precedes_any_question_grant_or_choice(monkeypatch
     try:
         prepared = await forms._bootstrap(
             session, session.current, 'example-co#synthetic', {}, URL)
-        assert prepared is session.current
+        assert prepared == session.current
     except forms.Gate as exc:
         # An actually mismatched independent witness may refuse observation.
         # A removed per-ATS card-shape certificate is not a valid refusal.

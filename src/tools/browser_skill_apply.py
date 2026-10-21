@@ -636,29 +636,29 @@ def _assent_scope(target: dict) -> str:
     text = label(target).lower()
     if _SENSITIVE.search(text) or _SANCTIONS_RX.search(text) or _FACT_ASSERTION.search(text):
         return 'fact'
-    if re.search(r'\\b(certify|attest|swear|under penalty|legal declaration|'
-                 r'legally binding|undertake)\\b', text):
+    if re.search(r'\b(certify|attest|swear|under penalty|legal declaration|'
+                 r'legally binding|undertake)\b', text):
         return 'owner'
-    if re.search(r'\\b(privacy|personal data|personal information)\\b', text):
-        if re.search(r'\\b(marketing|advertis|third.party|unrelated|'
-                     r'share|sell|other purposes|partners)\\b', text):
+    if re.search(r'\b(privacy|personal data|personal information)\b', text):
+        if re.search(r'\b(marketing|advertis|third.party|unrelated|'
+                     r'share|sell|other purposes|partners)\b', text):
             return 'owner'
-        if (re.search(r'\\b(acknowledge|understand|agree|consent)\\b', text)
-                and re.search(r'\\b(processing|process)\\b', text)
-                and re.search(r'\\b(application|recruitment)\\b', text)):
+        if (re.search(r'\b(acknowledge|understand|agree|consent)\b', text)
+                and re.search(r'\b(processing|process)\b', text)
+                and re.search(r'\b(application|recruitment)\b', text)):
             return 'standard_privacy'
         return 'owner'  # An ambiguous privacy scope cannot be delegated.
     return 'fact'
 
 
 def _missing_answer_reason(target: dict) -> str:
-    if (re.search(r'\\b(salary|compensation|pay expectation)\\b', label(target), re.I)
+    if (re.search(r'\b(salary|compensation|pay expectation)\b', label(target), re.I)
             or _assent_scope(target) == 'owner'):
         return 'owner_question'
     return 'agent_review_unavailable'
 
 
-def exact_approval(pk: str, key: str, value: str, *
+def exact_approval(pk: str, key: str, value: str, *,
                    target: dict | None = None, url: str = '', provenance=None,
                    fixture_context=None) -> None:
     """Approval belongs to one observed control, not a reusable bank label."""

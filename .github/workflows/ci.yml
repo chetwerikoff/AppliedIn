@@ -7,11 +7,17 @@ on:
   push:
     branches: [main]
 
+# PR updates supersede prior PR runs; distinct push runs must never replace
+# each other, including when one is still pending.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || format('{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
-  checks:
+  pytest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -20,8 +26,23 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --locked
-      - run: uv run --frozen python -m pytest -q
+      - run: uv run --frozen python -m pytest -q -n auto --durations=25
+
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
       - run: node --test tests/web/*.test.cjs tests/web/*.test.mjs
+
+  checks:
+    needs: [pytest, node]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          test "${{ needs.pytest.result }}" = "success"
+          test "${{ needs.node.result }}" = "success"

@@ -2523,6 +2523,15 @@ def _could_receive_an_answer(candidate: dict) -> bool:
     kind = candidate.get('type')
     if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
         return False
+    # An unnamed, unlabelled, empty native text control cannot carry its own
+    # form-submitted answer or identify a separate approved question. Required
+    # validation proxies still remain in the complete final form inventory:
+    # check_form must reject an unfilled required control at the one Submit gate.
+    if (candidate.get('tag') in {'input', 'textarea'}
+            and (kind in _TEXT_TYPES or kind == 'textarea')
+            and not any(candidate.get(k) for k in (
+                'label', 'name', 'value', 'has_value', 'checked'))):
+        return False
     if kind == 'combobox':
         combo = candidate.get('combobox')
         if not isinstance(combo, dict):

@@ -613,13 +613,10 @@ async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
 
 
 def dom(spec, script=None):
-    import json
-    import subprocess
-    from pathlib import Path
-    result = subprocess.run(
-        ['node', str(Path(__file__).with_name('entry_dom_fixture.js')), json.dumps(spec),
-         script or forms.ENTRY_PAGE], capture_output=True, text=True, check=True)
-    return json.loads(result.stdout)
+    from tests.tools.reader_node_harness import reader_output
+import json
+    return json.loads(reader_output(
+        'entry_dom_fixture.js', spec, script or forms.ENTRY_PAGE))
 
 
 @pytest.mark.parametrize('reader', ['page', 'plain_fixed', 'entry', 'fixed'])

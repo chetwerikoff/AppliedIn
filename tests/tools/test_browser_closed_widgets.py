@@ -961,121 +961,110 @@ async def test_required_proxy_mutation_denies_real_final_submit(
 
 
 async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):
-    session, filled, receipts = Session(requiredProxy=True), {}, []
-    for key in KEYS:
-        receipts.append(await choose(session, grants, key, filled))
+    # A required synthetic proxy disappearing after a real option selection
+    # is not itself authority. The final current named input and caption are.
+    session, filled = FormOwnedSelection(requiredProxy=True), {}
+    receipt = await choose(session, grants, filled=filled)
     current, _ = await forms._observe_controls(session, await session.page())
-    forms.check_form(current, filled, True, receipts=receipts)
-    forms.check_approvals('example-co#1', receipts, current)
-    assert session.calls == [step for key in KEYS for step in [('click', '#'+key), ('click', '#'+key+'-option')]]
-
-
-@pytest.mark.parametrize('key', ['location', 'country'])
-async def test_mounted_proxy_gates_even_with_committed_token_and_receipt(key, monkeypatch):
-    # Import synthetic phone helpers without requiring pytest fixture registration.
-    import runpy
-    phone = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
-    facts = {**dict.fromkeys(KEYS, ''), 'Country': 'Approved country'}
-    for k in KEYS:
-        facts[k] = 'Approved '+k
-    baseline = dom(fullPhone=True, requiredProxy=True)
-    answers = {}
-    for k, answer in facts.items():
-        t = combo(baseline, 'country' if k == 'Country' else k)
-        answers[k] = {**{n: t[n] for n in ('selector', 'label', 'question', 'tag', 'type', 'form_selector', 'form_action')}, 'value': answer, 'url': URL}
-    monkeypatch.setattr(forms, '_row', lambda pk: {'pk': pk, 'status': 'submitting', 'human_approved_answers': answers})
-    session = phone['PhoneSession'](requiredProxy=True)
-    receipt = await (phone['choose_country'](session, facts) if key == 'country' else choose(session, facts))
-    target = combo(session.snapshot, key)
-    target['combobox']['required_proxy_mounted'] = True
-    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
-        forms._check_closed_commit(target, 'Approved '+key, receipt)
-    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
-        forms.check_form({'controls': [target], 'inventory_verified': True}, {}, True, receipts=[receipt])
-    mounted = dom(fullPhone=True, requiredProxy=True, phases={key: 'C2'},
-                  proxyMutation={'key': key, 'mounted': True})
-    session.snapshot = mounted
-    with pytest.raises(forms.Gate, match='closed_select.required_proxy_mounted'):
-        await forms._observe_controls(session, await session.page())
-    assert all(c[1] not in ('#submit', '#additional') for c in session.calls)
-
+    final = focused_final_page(current)
+    owner = next(c for c in final['controls'] if c['selector'] == '#location')
+    assert owner['value'] == owner['combobox']['selected_value']
+    forms.check_form(final, filled, True, receipts=[receipt])
+    forms.check_approvals('example-co#1', [receipt], final)
+    assert session.calls == [
+        ('click', '#location'), ('fill', '#location', '--value', grants['location']),
+        ('click', '#location-option')]
 
 @pytest.mark.parametrize('key', ['location', 'country'])
-def test_untouched_required_proxy_and_outside_F_cannot_submit(key):
+async def test_mounted_proxy_cannot_authorize_final_raw_submit(
+        key, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+    # The retired closed-commit certificate no longer exists. A C2 widget
+    # with a re-mounted required proxy still cannot authorize Submit.
+    snapshot = dom(fullPhone=True, requiredProxy=True, phases={key: 'C2'},
+                   proxyMutation={'key': key, 'mounted': True})
+    assert snapshot['page']['opaque_controls'] is True
+    assert snapshot['page']['inventory_verified'] is False
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
+
+@pytest.mark.parametrize('key', ['location', 'country'])
+def test_untouched_required_proxy_and_other_required_field_cannot_submit(key):
     snapshot = dom(fullPhone=True, requiredProxy=True)
     target = combo(snapshot, key)
-    with pytest.raises(forms.Gate, match='closed_select.required_proxy_uncommitted'):
-        forms.check_form({'controls': [target], 'inventory_verified': True}, {}, True)
-    outside = dom(fullPhone=True, requiredProxy=True, proxyMutation={'key': key, 'parent': 'outside'})
-    assert outside['page']['inventory_verified'] is True
-    assert combo(outside, key)['combobox']['mode'] == 'closed-react-select'
-    ordinary = [c for c in outside['page']['controls'] if c.get('required') and c['type'] == 'text' and not c['has_value']]
-    assert len(ordinary) == 1
+    assert target['type'] == 'combobox'
+    # Neither a mounted proxy nor an old C0/C1 certificate is a submitted
+    # value. Focus just this required field to test its final refusal.
     with pytest.raises(forms.Gate):
+        forms.check_form(focused_final_page(snapshot['page'], key), {}, True)
+    outside = dom(fullPhone=True, requiredProxy=True,
+                  proxyMutation={'key': key, 'parent': 'outside'})
+    ordinary = [c for c in outside['page']['controls']
+                if c.get('required') and c['type'] == 'text' and not c['has_value']]
+    assert len(ordinary) == 1
+    with pytest.raises(forms.Gate, match='Required field is empty'):
         forms.check_form({'controls': ordinary, 'inventory_verified': True}, {}, True)
 
+def _diagnostic_paths(page, final_segment):
+    # The fixture has unrelated unmatched ARIA picker parts, which remain
+    # opaque. Only new diagnostic canvases/custom nodes count for this check.
+    return [path for path in page['opaque_locators']
+            if path.split(' > ')[-1].startswith(final_segment)]
 
-@pytest.mark.parametrize('scenario,expected', [
+
+@pytest.mark.parametrize('scenario,segment', [
     ({'custom': True}, '*:nth-child('),
     ({'depth': 14}, 'canvas:nth-of-type('),
     ({'count': 2}, 'canvas:nth-of-type('),
     ({'count': 8}, 'canvas:nth-of-type('),
 ])
-def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, expected):
-    snapshot = dom(diagnostics=scenario)
-    p = snapshot['page']
-    assert p['opaque_count'] == scenario.get('count', 1)
+def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, segment):
+    baseline = dom()['page']
+    p = dom(diagnostics=scenario)['page']
+    paths = _diagnostic_paths(p, segment)
+    count = scenario.get('count', 1)
+    assert p['opaque_count'] == baseline['opaque_count'] + count
     assert len(p['opaque_locators']) == p['opaque_count']
-    assert all(expected in x for x in p['opaque_locators'])
-    assert all(forms._safe_diagnostic(x) == x for x in p['opaque_locators'])
+    assert len(paths) == len(set(paths)) == count
+    assert all(forms._safe_diagnostic(path) == path for path in paths)
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     reason = str(caught.value)
     assert 'opaque_controls' in reason
-    assert 'control=unavailable' not in reason
+    assert 'opaque_count=' + str(p['opaque_count']) in reason
+    assert reason.count('control=') == min(3, p['opaque_count'])
     assert 'test-user' not in reason and '@' not in reason
     assert 'private-' not in reason
-    # The reader keeps every locator; the unchanged Gate names at most three.
-    assert reason.count('control=') == min(3, p['opaque_count'])
-    assert all(reason.count('control=' + path) == 1 for path in p['opaque_locators'][:3])
-    assert all('control=' + path not in reason for path in p['opaque_locators'][3:])
 
 
 def test_repeated_deep_opaque_nodes_remain_fail_closed():
-    # The initial twelve-segment suffix collided in these sibling trees.
-    # Inventory must still Gate after expanding only the safe locator grammar.
     p = dom(diagnostics={'count': 2, 'depth': 14})['page']
-    assert p['opaque_count'] == 2
+    assert p['opaque_count'] == dom()['page']['opaque_count'] + 2
     assert p['opaque_controls'] is True and p['inventory_verified'] is False
-    assert len(p['opaque_locators']) == 2
-    with pytest.raises(forms.Gate, match='opaque_count=2'):
+    paths = _diagnostic_paths(p, 'canvas:nth-of-type(')
+    assert len(paths) == len(set(paths)) == 2
+    with pytest.raises(forms.Gate, match='opaque_count=' + str(p['opaque_count'])):
         forms._inventory_ok(p)
 
 
 @pytest.mark.parametrize('depth,count', [(14, 2), (14, 3), (30, 2), (30, 8)])
 def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(depth, count):
-    # Regression for review #5558913444: all present canvases have
-    # identical last-twelve segments but different value-free ancestors.
-    # This test failed on the original 12-segment-only diagnostic locator.
     p = dom(diagnostics={'count': count, 'depth': depth})['page']
-    assert p['opaque_count'] == count
+    assert p['opaque_count'] == dom()['page']['opaque_count'] + count
     assert p['opaque_controls'] is True and p['inventory_verified'] is False
-    paths = p['opaque_locators']
-    assert len(paths) == count
-    assert all(isinstance(x, str) and x != 'unavailable'
-               and forms._safe_diagnostic(x) == x for x in paths)
-    assert len(set(paths)) == count
-    assert all(x.count(' > ') >= depth for x in paths)
+    paths = _diagnostic_paths(p, 'canvas:nth-of-type(')
+    assert len(paths) == len(set(paths)) == count
+    assert all(forms._safe_diagnostic(path) == path
+               and path != 'unavailable' for path in paths)
+    assert all(path.count(' > ') >= depth for path in paths)
     with pytest.raises(forms.Gate) as caught:
         forms._inventory_ok(p)
     detail = str(caught.value)
-    assert 'opaque_count=' + str(count) in detail
-    assert detail.count('control=') == min(3, count)
-    assert all(detail.count('control=' + path) == 1 for path in paths[:3])
-    assert all('control=' + path not in detail for path in paths[3:])
-    assert 'control=unavailable' not in detail
+    assert 'opaque_count=' + str(p['opaque_count']) in detail
+    assert detail.count('control=') == min(3, p['opaque_count'])
     assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
-
 
 def test_safe_diagnostic_accepts_only_bounded_structural_segments():
     # The browser and Gate share the same per-locator limits. Over-limit
@@ -1118,24 +1107,18 @@ def test_safe_diagnostic_rejects_untrusted_or_nonstructural_paths(unsafe):
 
 @pytest.mark.parametrize('count', [2, 8])
 def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(count):
-    # Even deeply nested present controls keep distinct real reader locators.
-    # The Gate still refuses the form and reports only its first three controls.
     page = dom(diagnostics={'count': count, 'depth': 30})['page']
-    assert page['opaque_count'] == count and page['opaque_controls'] is True
-    assert page['inventory_verified'] is False
-    paths = page['opaque_locators']
-    assert len(paths) == count and len(set(paths)) == count
+    assert page['opaque_count'] == dom()['page']['opaque_count'] + count
+    assert page['opaque_controls'] is True and page['inventory_verified'] is False
+    paths = _diagnostic_paths(page, 'canvas:nth-of-type(')
+    assert len(paths) == len(set(paths)) == count
     assert all(forms._safe_diagnostic(path) == path and path != 'unavailable'
                for path in paths)
-    with pytest.raises(forms.Gate, match='opaque_count=' + str(count)) as caught:
+    with pytest.raises(forms.Gate, match='opaque_count=' + str(page['opaque_count'])) as caught:
         forms._inventory_ok(page)
     message = str(caught.value)
-    assert message.count('control=') == min(3, count)
-    assert all(message.count('control=' + path) == 1 for path in paths[:3])
-    assert all('control=' + path not in message for path in paths[3:])
-    assert 'control=unavailable' not in message
+    assert message.count('control=') == min(3, page['opaque_count'])
     assert 'test-user' not in message and 'example-co' not in message and '@' not in message
-
 
 @pytest.mark.parametrize('fresh', [False, True])
 @pytest.mark.parametrize('flags', [

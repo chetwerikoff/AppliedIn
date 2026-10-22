@@ -650,3 +650,47 @@ async def test_formless_upload_producer_binds_dropzone_to_exact_file_input(
         "upload", "#dropzone", "--file", str(pdf), timeout=130)
     assert [entry[0][:2] for entry in calls] == [("upload", "#dropzone")]
     assert controller.upload_completed is True
+
+
+@pytest.mark.parametrize(("required", "value", "has_value", "receipt", "reason"), [
+    (True, "", True, {"#answer": "Approved answer"}, "Required field is empty"),
+    (False, "Unapproved injected value", False, {}, "readback disagree"),
+    (False, "", True, {}, "readback disagree"),
+])
+def test_final_native_form_readback_disagreement_denies_submit(
+        required, value, has_value, receipt, reason):
+    """The actual form-own native value, not a has_value flag, is authoritative."""
+    page = {
+        "url": "https://example-co.test/job/1",
+        "inventory_verified": True, "truncated": False,
+        "opaque_controls": False, "shadow_roots": False,
+        "unsupported_frames": [],
+        "controls": [{
+            "selector": "#answer", "tag": "input", "type": "text",
+            "in_form": True, "form_selector": "#application",
+            "form_action": "https://example-co.test/job/1",
+            "label": "Synthetic answer", "required": required,
+            "value": value, "has_value": has_value,
+        }],
+    }
+    with pytest.raises(forms.Gate, match=reason):
+        forms.check_form(page, receipt, uploaded=True)
+
+
+def test_final_optional_native_value_requires_current_exact_readback():
+    page = {
+        "url": "https://example-co.test/job/1",
+        "inventory_verified": True, "truncated": False,
+        "opaque_controls": False, "shadow_roots": False,
+        "unsupported_frames": [],
+        "controls": [{
+            "selector": "#answer", "tag": "input", "type": "text",
+            "in_form": True, "form_selector": "#application",
+            "form_action": "https://example-co.test/job/1",
+            "label": "Synthetic answer", "required": False,
+            "value": "Approved answer", "has_value": True,
+        }],
+    }
+    forms.check_form(page, {"#answer": "Approved answer"}, uploaded=True)
+    with pytest.raises(forms.Gate, match="Unverified or changed form value"):
+        forms.check_form(page, {}, uploaded=True)

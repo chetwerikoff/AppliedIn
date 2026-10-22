@@ -64,3 +64,26 @@ async def test_radio_group_drift_refuses_real_final_submit(
         reason=reason)
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('selected,reason', [
+    (False, 'Required choice is empty: Yes'),
+    (True, 'Unverified preselected answer: Yes'),
+])
+async def test_missing_or_unapproved_radio_answer_refuses_before_shape(
+        monkeypatch, tmp_path, selected, reason):
+    # A missing visible group question is never submission authority. If the
+    # answer is absent or unapproved, report that independent failure before
+    # asking for further group proof. Both cases reach the production raw-click
+    # guard and neither creates a hold or dispatches a Submit IPC.
+    page = _selected_group()
+    page['controls'][0]['question'] = ''
+    page['controls'][0]['checked'] = selected
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    await final_submit_denied(
+        monkeypatch, tmp_path, page, row, filled, history, reason=reason)
+    assert filled == {} and history == []
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)

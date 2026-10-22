@@ -2525,7 +2525,12 @@ def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
                 or _identity(current[0]) != _identity(member)):
             raise Gate('The observed approval control is missing, duplicated or changed.')
         own_selectors.add(selector)
+    # A separate form may use the same visible label without sharing this
+    # control's approval. Exact grants include form owner and action, so only
+    # collisions within this form are ambiguous authorization candidates.
+    form = target.get('form_selector') if target.get('in_form') else None
     return [c for c in controls if c.get('selector') not in own_selectors
+            and (form is None or c.get('form_selector') == form)
             and _same(key, c.get('question') or c.get('label') or '')]
 
 
@@ -2709,14 +2714,10 @@ def _form_subject(page: dict, target: dict) -> list[dict]:
         raise Gate('This field belongs to a sign-in, account or subscription form.')
     if any(c.get('type') == 'password' for c in siblings):
         raise Gate('A password field makes this owning form unsafe for disclosure.')
-    forms = {c.get('form_selector') for c in page['controls']
-             if c.get('in_form') and c.get('form_selector')
-             and (c.get('tag') in {'input', 'textarea', 'select'} or c.get('submit'))}
-    for other in forms - {form}:
-        other_controls = [c for c in page['controls']
-                          if c.get('in_form') and c.get('form_selector') == other]
-        if not _unrelated_search_form(other_controls):
-            raise Gate('Competing native form purposes require human inspection.')
+    # A separate native form on the page is not a reason to reject safe,
+    # per-control approved preparation. This selector's own form is still
+    # checked above for login/password and by the action for its destination.
+    # The ONE final Submit guard refuses competing application Submit owners.
     return siblings
 
 def _combobox_options(target: dict) -> list:

@@ -37,6 +37,8 @@ jobs:
         with:
           node-version: "24"
       - run: node --test tests/web/*.test.cjs tests/web/*.test.mjs
+      - name: Synthetic Node failure (disposable smoke only)
+        run: exit 1
 
   checks:
     needs: [pytest, node]

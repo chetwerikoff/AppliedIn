@@ -728,3 +728,45 @@ def test_manual_or_duplicate_outcome_prevents_acquiring_a_new_hold(
                  "url": "https://example-co.test/job/1"})
     assert client.get(f"submit_hold:{pk}") is None
     assert row["status"] == status
+
+
+def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
+    """A human outcome arriving after a valid pre-hold read still wins."""
+    import fakeredis
+    from types import SimpleNamespace
+
+    pk = "example-co#synthetic"
+    row = {"pk": pk, "company": "example-co", "status": "submitting",
+           "gate_reason": "", "possible_submission": False}
+    client = fakeredis.FakeRedis(decode_responses=True)
+    calls = []
+
+    def interleaved_status(_pk, _status, **_kwargs):
+        assert _pk == pk
+        assert client.get(f"submit_hold:{pk}") is not None
+        # Human reconciliation happens between mark and the raw-click
+        # reread. It is never legitimate to restore uncertain over manual.
+        row["status"] = "applied_manual"
+        client.delete(f"submit_hold:{pk}")
+        calls.append("human reconciled")
+
+    tracking = SimpleNamespace(
+        r=client,
+        get_current=lambda _pk: dict(row),
+        get=lambda _pk: dict(row),
+        set_status=interleaved_status)
+    monkeypatch.setattr(
+        "core.stores.make_stores", lambda: SimpleNamespace(tracking=tracking))
+    monkeypatch.setattr(
+        "tools.browser_apply._duplicate_refusal", lambda _pk: False)
+    monkeypatch.setattr(
+        "tools.posting_guard.authorised", lambda _row: True)
+
+    forms.hold_possible_submission(
+        pk, {"last_button": "Submit application",
+             "url": "https://example-co.test/job/1"})
+    with pytest.raises(forms.Gate, match="Human outcome changed or submission hold"):
+        forms.check_before_committing_click(pk)
+    assert calls == ["human reconciled"]
+    assert row["status"] == "applied_manual"
+    assert client.get(f"submit_hold:{pk}") is None

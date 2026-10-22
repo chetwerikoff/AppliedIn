@@ -65,8 +65,25 @@ def _world(monkeypatch, tmp_path, *, drift=None, ats=''):
         def set_status(self, observed_pk, status, **attrs):
             assert observed_pk == pk
             row.update(status=getattr(status, 'value', status), **attrs)
+
+        def update_if_status(self, observed_pk, status, updates, *,
+                             expected_reader=None):
+            # The production store performs a conditional WATCH-backed update.
+            # Exercise the same state transition in this offline fake instead
+            # of silently replacing it with the old unconditional set_status.
+            assert observed_pk == pk
+            if row['status'] != getattr(status, 'value', status):
+                return False
+            if any(row.get(key) != value
+                   for key, value in (expected_reader or {}).items()):
+                return False
+            row.update({key: getattr(value, 'value', value)
+                        for key, value in updates.items()})
+            # Inject drift *after* this attempt's durable hold/transition, so
+            # the raw-click producer must reject it without browser IPC.
             if drift:
                 drift(row, page, self.r, configs)
+            return True
 
     tracking = Tracking()
     tracking.r.sadd(apply_queue._BUSY, COMPANY)

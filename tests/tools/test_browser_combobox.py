@@ -681,15 +681,16 @@ async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeyp
     token = forms.ApplicationEntryProvenance(
         pk=pk, company='example-co', ats='lever', job_id=job_id,
         wrapper=posting, board='example-co', url=form_url)
-    navigation = forms.navigation_allowed
+    # Host-only preparation must not demand the final ATS/board certificate.
+    # It *must* still re-read the same tracked job before each mutation.
+    preparation_current = forms._preparation_current
     checked = []
 
-    def route(destination, *origins, provenance=None):
-        if provenance is not None:
-            checked.append(provenance)
-        return navigation(destination, *origins, provenance=provenance)
+    def check_live(provenance, **kwargs):
+        checked.append(provenance)
+        return preparation_current(provenance, **kwargs)
 
-    monkeypatch.setattr(forms, 'navigation_allowed', route)
+    monkeypatch.setattr(forms, '_preparation_current', check_live)
     session = DynamicSession(initial, opened, committed)
     receipt = await forms.execute(
         session, initial, {'action': 'combobox', 'selector': '#country',
@@ -698,7 +699,7 @@ async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeyp
         company='example-co', jd_text='', resume_tex='', github='', pk=pk,
         job_url=posting, provenance=token)
     assert receipt['action'] == 'combobox'
-    assert checked and all(item is token for item in checked)
+    assert len(checked) >= 3 and all(item is token for item in checked)
     assert ('click', '#country-example') in session.calls
 
 

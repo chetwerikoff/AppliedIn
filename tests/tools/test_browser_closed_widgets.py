@@ -4,6 +4,7 @@ All browser observations below execute the two production JavaScript readers in
 Node on a synthetic graph; the Session transports only synthetic snapshots.
 """
 import copy
+from tests.tools.reader_node_harness import reader_output
 import json
 import subprocess
 from pathlib import Path
@@ -18,10 +19,8 @@ KEYS = ('location', 'school', 'degree', 'discipline')
 
 
 def dom(**scenario):
-    return json.loads(subprocess.check_output([
-        'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
-        json.dumps(scenario), PAGE, forms._FIXED_CONTROL_WITNESS,
-    ], text=True))
+    return json.loads(reader_output(
+        'closed_widget_dom.cjs', scenario, PAGE, forms._FIXED_CONTROL_WITNESS))
 
 
 def combo(snapshot, key='location'):

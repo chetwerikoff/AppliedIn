@@ -129,7 +129,8 @@ async def test_greenhouse_nonempty_zero_height_placeholder_denies_submit(
 
 
 @pytest.mark.parametrize('ambiguous', [False, True])
-async def test_greenhouse_zero_height_single_value_gates(grants, ambiguous):
+async def test_greenhouse_zero_height_single_value_gates(
+        grants, ambiguous, monkeypatch, tmp_path):
     class Selecting(Session):
         async def call(self, *args):
             result = await super().call(*args)
@@ -139,16 +140,31 @@ async def test_greenhouse_zero_height_single_value_gates(grants, ambiguous):
                     change['attrs'] = {'class': 'react-select__single-value react-select__placeholder'}
                 self.snapshot = execute(dict(phases=self.phases, visibility=[change]))
             return result
-    session = Selecting()
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await choose(session, grants)
+    session, filled = Selecting(), {}
+    receipt = await choose(session, grants, filled=filled)
+    # A zero-height/ambiguous sibling display no longer blocks reversible
+    # ARIA option preparation. That visual shape also cannot prove an approved
+    # form-owned submitted value at the ONE final Submit boundary.
     assert session.phases['location'] == 'C2'
-    assert session.calls == [('click', '#location'), ('click', '#location-option')]
-    assert evidence(session.snapshot)[1]['graph_display_strict_visible'] is False
+    assert receipt['action'] == 'combobox' and receipt['committed_value'] == grants['location']
+    assert filled['#location'] == grants['location']
+    assert session.calls == [
+        ('click', '#location'),
+        ('fill', '#location', '--value', grants['location']),
+        ('click', '#location-option'),
+    ]
+    target, independent = evidence(session.snapshot)
+    assert target['combobox'] == independent['combobox']
+    assert target['combobox']['selected_text'] == grants['location']
+    assert not target.get('name')  # No native submitted receiver from decoration.
     before = list(session.calls)
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await forms._observe_controls(session, await session.page())
-    assert session.calls == before  # Count setup IPC; none after failed readback.
+    current, witness = await forms._observe_controls(session, await session.page())
+    assert current['controls'] and witness['#location']['combobox'] == target['combobox']
+    assert session.calls == before
+    with pytest.raises(forms.Gate):
+        forms.check_form(current, filled, True, receipts=[receipt])
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
     assert not any(c[0] == 'submit' for c in session.calls)
 
 

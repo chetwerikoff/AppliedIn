@@ -344,6 +344,28 @@ def test_popup_relationship_itself_refuses_ambiguous_ownership(scenario):
     assert combo(snapshot)['combobox']['options'] == []
 
 
+@pytest.mark.parametrize('scenario', ['foreign', 'nestedList'])
+async def test_foreign_or_nested_listbox_never_authorizes_final_submit(
+        scenario, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
+    # r06 §6: a rendered ARIA option belongs to its current listbox. A
+    # foreign native form or a nested listbox is another owner, even if
+    # aria-controls and option captions otherwise match an approved answer.
+    snapshot = dom(phases={'location': 'C1'}, **{scenario: True})
+    page, fixed = snapshot['page'], snapshot['witness']
+    owner = combo(snapshot, 'location')
+    witness_owner = next(c for c in fixed['controls']
+                         if c['selector'] == owner['selector'])
+    assert owner['combobox'] == witness_owner['combobox']
+    assert owner['combobox']['linked'] is False
+    assert owner['combobox']['options'] == []
+    assert page['opaque_controls'] and not page['inventory_verified']
+    await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
+
+
 @pytest.mark.parametrize('cleared', [False, True])
 async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatch, cleared):
     session = Session()

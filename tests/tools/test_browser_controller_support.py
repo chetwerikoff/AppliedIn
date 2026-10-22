@@ -46,6 +46,22 @@ def install_controller_session(monkeypatch, row, endpoint, tmp_path, *, scope='e
             assert pk == row['pk']
             row.update(status=getattr(status, 'value', status), **attrs)
 
+        def update_if_status(self, pk, expected_status, updates, *,
+                             expected_reader=None):
+            # Model the production storage adapter's conditional post-hold
+            # transition, not a permissive unconditional status overwrite.
+            # The real final-click guard must still independently re-read
+            # status, hold, approved answers, posting and leased dispatch.
+            assert pk == row['pk']
+            if row.get('status') != getattr(expected_status, 'value', expected_status):
+                return False
+            if any(row.get(key) != value
+                   for key, value in (expected_reader or {}).items()):
+                return False
+            row.update({key: getattr(value, 'value', value)
+                        for key, value in updates.items()})
+            return True
+
     tracking = Tracking()
     tracking.r.sadd(apply_queue._BUSY, row['company'].strip().lower())
     tracking.r.sadd(apply_queue._BUSY_PKS, row['pk'])

@@ -507,7 +507,13 @@ async def _fresh_confirmed_outcome(session, before: dict, after: dict,
     if not route_ok or not confirmation(before, after):
         return ''
     current, _ = await _observe_controls(session, after)
-    return confirmation(before, current) if current.get('url') == href else ''
+    if current.get('url') != href:
+        return ''
+    # A new success phrase does not confirm the original tracked job if its
+    # tenant, board or canonical row changed while reading the response.
+    if provenance is not None and not _alias_current(provenance):
+        return ''
+    return confirmation(before, current)
 
 
 def _row(pk: str, fixture_context=None, alias_read: bool = False) -> dict:

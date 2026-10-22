@@ -36,6 +36,9 @@ async def test_generic_four_field_readers_never_grant_final_submit(
         assert_unapproved_submit_is_refused,
     )
 
+    # All C0/C1/C2 phases (including preexpanded and precommitted) are tested
+    # at the actual raw Submit seam below. Phase by itself must never demand
+    # a per-step human Gate or confer submission authority.
     # A C0/C1/C2 class/phase certificate no longer exists. The generic
     # ARIA owners must agree across the independent readers, and neither a
     # legacy "selected" caption nor a phase authorizes application Submit.
@@ -207,14 +210,6 @@ async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
     assert all(not c[1].endswith('-option') for c in session.calls)
     if scenario.get('noReceiver') or scenario.get('sharedReceiver'):
         assert session.calls == []
-
-
-@pytest.mark.parametrize('phase', ['C1', 'C2'])
-async def test_fresh_expanded_or_committed_candidate_cannot_admit(grants, phase):
-    session = Session(phases={'location': phase})
-    with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert session.calls == []
 
 
 @pytest.mark.parametrize('key', ['selected_text', 'displayed_text', 'hidden_value', 'selected_value'])

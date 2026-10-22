@@ -542,7 +542,12 @@ async def test_direct_route_commit_requires_latest_fixed_witness(monkeypatch, gr
     assert not held and session.calls == []
 
 
-async def test_never_committed_component_times_out_without_more_ipc(monkeypatch, grants):
+async def test_never_committed_component_refuses_final_submit(
+        monkeypatch, tmp_path, grants):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
     class NeverCommitted(Session):
         async def call(self, *args):
             before = self.snapshot
@@ -550,13 +555,33 @@ async def test_never_committed_component_times_out_without_more_ipc(monkeypatch,
             if args == ('click', '#location-option'):
                 self.snapshot = before
             return result
-    async def no_sleep(delay):
-        pass
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
-    session = NeverCommitted()
-    with pytest.raises(forms.Gate, match='bounded wait'):
-        await choose(session, grants)
+
+    session, filled = NeverCommitted(), {}
+    receipt = await choose(session, grants, filled=filled)
     assert session.calls == [('click', '#location'), ('click', '#location-option')]
+    assert receipt['committed_value'] == 'Approved location'
+    # The reversible click returned, but this DOM never committed a selected
+    # caption/receiver. Isolate this real field from unrelated required fields
+    # to prove the exact final-form failure, not just an incomplete page.
+    final = copy.deepcopy(session.snapshot['page'])
+    field = combo({'page': final})
+    assert not field['combobox']['selected_text']
+    keep = {'#location', '#resume', '#submit'}
+    if field['combobox'].get('hidden_selector'):
+        keep.add(field['combobox']['hidden_selector'])
+    final['controls'] = [c for c in final['controls'] if c['selector'] in keep]
+    assert {'#location', '#resume', '#submit'} <= {
+        c['selector'] for c in final['controls']}
+    final.update(inventory_verified=True, truncated=False,
+                 opaque_controls=False, shadow_roots=False,
+                 unsupported_frames=[])
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(final, filled, True, receipts=[receipt])
+    # The production raw-click seam independently refuses this minimal
+    # incomplete selection with zero Submit IPC and no irreversible hold.
+    await assert_unapproved_submit_is_refused(
+        {'page': final}, monkeypatch, tmp_path, require_incomplete=False)
+    assert not any(call[0] == 'submit' for call in session.calls)
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 async def test_required_proxies_never_count_as_submitted_answers(

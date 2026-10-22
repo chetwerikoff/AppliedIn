@@ -332,6 +332,42 @@ async def test_hidden_value_must_change_to_the_selected_machine_value(
         ('click', '#country-example')]
 
 
+async def test_picker_with_no_rendered_options_cannot_authorize_final_submit(
+        monkeypatch):
+    """An unresolved picker is reversible; no value or Submit is invented."""
+    initial = page()
+    initial['controls'][0]['combobox']['options'] = []
+    opened = deepcopy(initial)
+    committed = deepcopy(initial)
+    session = DynamicSession(initial, opened, committed)
+
+    async def no_sleep(_delay):
+        # The 20 re-observations are bounded without a real browser or timer.
+        return None
+
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    filled = {}
+    receipt = await forms.execute(
+        session, initial,
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+
+    assert receipt['action'] == 'combobox'
+    assert receipt['unresolved'] and 'committed_value' not in receipt
+    assert filled == {}
+    assert session.calls == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', 'Example Country')]
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(await session.page(), filled, True, receipts=[receipt])
+    assert not any(args[:2] == ('click', '#submit') for args in session.calls)
+
+
 def test_unlinked_or_changed_without_selection_hidden_values_gate():
     unlinked = page(control(hidden_value='EX', hidden_selector=''))
     unlinked['controls'].append({

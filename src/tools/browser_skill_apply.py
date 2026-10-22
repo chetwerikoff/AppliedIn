@@ -1468,6 +1468,9 @@ def _ashby_native_classify(page: dict, provenance: ApplicationEntryProvenance) -
     only the one final raw-click guard decides application submission.
     """
     entry, controls = page['entry'], page['controls']
+    if entry.pop('selected_native_owner', None):
+        entry['root'] = None
+    entry.pop('quarantined_native_owners', None)
     candidates = entry.get('native_candidates')
     if not isinstance(candidates, list):
         return
@@ -1525,8 +1528,6 @@ def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=
     if (type(observed.get('response_controls')) is not bool or 'root' not in observed
             or page.get('unsupported_frames')):
         raise Gate('The current form control inventory is malformed or has unsupported frames.')
-    if readiness:
-        _inventory_ok(page, complete=False)
     root = observed['root']
     if root is None and (readiness or (submitted and not frames)):
         # Only the waiter may defer a missing receiver before a click. After
@@ -1900,7 +1901,6 @@ class _EntrySession:
         self.formless_identity = None
         self.native_identity = None
         self.committing = False
-        self.submit_authorized = False  # Diagnostic only; never read as Submit authority.
         self.on_committing_click = None
         self.upload_attempted = False
         self.upload_pending = False
@@ -2274,8 +2274,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
-async def _observe_controls(session, page: dict, *, readiness: bool = False,
-                            closed_transition=None) -> tuple[dict, dict]:
+async def _observe_controls(session, page: dict, *, readiness: bool = False) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
     predicate, locator = 'unavailable', 'unavailable'

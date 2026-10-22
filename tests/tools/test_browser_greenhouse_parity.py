@@ -31,7 +31,8 @@ def observe(kind='greenhouse', **scenario):
         json.dumps(scenario), *readers], text=True))
 
 
-async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path):
+async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *,
+                                              require_incomplete=True):
     """Use the production application raw-click guard, not a test-only classifier.
 
     A loopback-only fixture is copied onto a synthetic HTTPS tracked row before
@@ -41,8 +42,15 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path):
     from tools import browser_skill as bsk
 
     page = copy.deepcopy(snapshot['page'])
-    assert page['opaque_controls'] is True
-    assert page['inventory_verified'] is False
+    if require_incomplete:
+        assert page['opaque_controls'] is True
+        assert page['inventory_verified'] is False
+    else:
+        # Generic accessible preparation can keep the inventory complete.
+        # Even an apparently settled choice has no Submit permission without
+        # its current form-own approved value and write receipts.
+        assert isinstance(page['opaque_controls'], bool)
+        assert isinstance(page['inventory_verified'], bool)
     trusted = 'https://example-co.test/job/1'
     source = page['url']
     if source != trusted:
@@ -65,6 +73,12 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path):
     attachments[0]['files'] = [pdf.name]
     assert buttons[0]['type'] == 'submit' and buttons[0]['in_form'] is True
     assert buttons[0]['form_action'] == trusted
+    # Establish the exact production form-level reason first; the actual raw
+    # Submit seam must reach this same refusal rather than an unrelated fake.
+    with pytest.raises(forms.Gate) as form_denial:
+        forms.check_form(page, {}, True, pdf.name)
+    if require_incomplete:
+        assert 'form inventory is incomplete' in str(form_denial.value)
     # Both synthetic DOM families have a fixed independent heading. Keep
     # the literal PAGE title through the HTTPS rebind; the final guard must
     # compare against that same exact observed row title, not a fuzzy alias.
@@ -110,8 +124,9 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path):
     session.id = 'synthetic-offline-session'
     session.bind_application_controller(controller)
 
-    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
+    with pytest.raises(forms.Gate) as final_denial:
         await session.application_effect('click', '#submit')
+    assert str(final_denial.value) == str(form_denial.value)
     assert raw_ipc == [] and started == []
     assert controller.committed is False
     assert row['status'] == 'submitting' and row['possible_submission'] is False
@@ -238,7 +253,10 @@ async def test_invalid_proxy_is_preserved_not_blanket_hidden(
 @pytest.mark.parametrize('change', [dict(style={'opacity': '0'}), dict(style={'visibility': 'collapse'}),
                                   dict(rects=[{**RECT, 'width': 0}]),
                                   dict(rects=[{**RECT, 'right': -20}], parentStyle={'position': 'fixed'}, scrollX=100)])
-async def test_graph_parity_never_grants_strict_invisible_evidence(grants, part, change):
+async def test_graph_parity_never_grants_strict_invisible_evidence(
+        grants, part, change, monkeypatch, tmp_path):
+    # r06 deleted graph-label/display certificates for reversible work.
+    # They cannot manufacture a current approved form value at final Submit.
     change = copy.deepcopy(change)
     offsets = {k: change.pop(k) for k in ('scrollX', 'scrollY') if k in change}
     session = Session(visibility=[dict(id=part, **change)], **offsets)
@@ -246,27 +264,34 @@ async def test_graph_parity_never_grants_strict_invisible_evidence(grants, part,
     target = next(c for c in p['controls'] if c['selector'] == '#location')
     evidence = next(c for c in w['controls'] if c['selector'] == '#location')
     assert target['combobox'] == evidence['combobox']
+    assert target['combobox'].get('selected_text', '') == ''
+    assert target['combobox'].get('selected_value', '') == ''
     if part != 'location':
         assert evidence['visible'] is True
-        key = 'graph_label_strict_visible' if part.endswith('label') else 'graph_display_strict_visible'
-        assert evidence[key] is False
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        forms._disclosure_question(p, target, {c['selector']: c for c in w['controls']}, p['url'])
-    with pytest.raises(forms.Gate):
-        await choose(session, grants)
+    assert not {'graph_label_strict_visible', 'graph_display_strict_visible'} & set(evidence)
+    assert session.calls == []
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
     assert session.calls == []
 
 
 @pytest.mark.parametrize('flag', ['graph_label_strict_visible', 'graph_display_strict_visible'])
 @pytest.mark.parametrize('value', [None, False, 1, 'true'])
-def test_missing_or_nonboolean_strict_evidence_never_discloses(flag, value):
+async def test_missing_or_nonboolean_strict_evidence_never_discloses(
+        flag, value, monkeypatch, tmp_path):
+    # Historic certificate values, even when forged into the fixed witness,
+    # do not authorize a submitted answer or any application Submit IPC.
     session = Session()
     p, w = session.snapshot['page'], session.snapshot['witness']
     target = next(c for c in p['controls'] if c['selector'] == '#location')
-    lookup = {c['selector']: c for c in w['controls']}
-    lookup['#location'][flag] = value
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        forms._disclosure_question(p, target, lookup, p['url'])
+    evidence = next(c for c in w['controls'] if c['selector'] == '#location')
+    evidence[flag] = value
+    assert flag not in target and evidence[flag] == value
+    assert target['combobox'].get('selected_value', '') == ''
+    assert session.calls == []
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
+    assert session.calls == []
 
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
@@ -274,33 +299,37 @@ def test_missing_or_nonboolean_strict_evidence_never_discloses(flag, value):
 @pytest.mark.parametrize('change', [dict(style={'opacity': '0'}), dict(style={'visibility': 'collapse'}),
                                   dict(rects=[{**RECT, 'height': 0}]),
                                   dict(rects=[{**RECT, 'right': -20}], parentStyle={'position': 'fixed'})])
-async def test_every_phase_refuses_strict_evidence_before_commit_or_submit(grants, phase, part, change):
-    class Changing(Session):
-        async def call(self, *args):
-            result = await super().call(*args)
-            if args[0] == 'click' and self.phases.get('location') == phase:
-                self.snapshot = dom(
-                    phases=self.phases, visibility=[dict(id=part, **change)], scrollX=100)
-            return result
-    session = Changing(**({'visibility': [dict(id=part, **change)], 'scrollX': 100}
-                          if phase == 'C0' else {}))
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await choose(session, grants)
-    assert len(session.calls) == {'C0': 0, 'C1': 1, 'C2': 2}[phase]
-    # A fresh pre-submit observation must refuse as well, independently of the receipt.
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await forms._observe_controls(session, await session.page())
+async def test_every_phase_refuses_strict_evidence_before_commit_or_submit(
+        grants, phase, part, change, monkeypatch, tmp_path):
+    # A legacy C2 displayed caption is not a final receipt. Earlier phases
+    # are likewise never grounds to treat an unanswered form as submitted.
+    session = Session()
+    session.phases['location'] = phase
+    session.snapshot = dom(
+        phases=session.phases, visibility=[dict(id=part, **change)], scrollX=100)
+    page, fixed = session.snapshot['page'], session.snapshot['witness']
+    field = next(c for c in page['controls'] if c['selector'] == '#location')
+    independent = next(c for c in fixed['controls'] if c['selector'] == '#location')
+    assert field['combobox'] == independent['combobox']
+    assert session.calls == []
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
+    assert session.calls == []
 
 
 @pytest.mark.parametrize('flag', ['graph_label_strict_visible', 'graph_display_strict_visible'])
-async def test_strict_flag_guard_removal_is_detected(monkeypatch, flag):
+async def test_strict_flag_guard_removal_is_detected(monkeypatch, tmp_path, flag):
+    # The current generic reader does not use removed shape flags. An injected
+    # field in the independent read still cannot replace a real committed
+    # approved form value at the one production Submit guard.
     session = Session()
-    evidence = next(c for c in session.snapshot['witness']['controls'] if c['selector'] == '#location')
+    evidence = next(c for c in session.snapshot['witness']['controls']
+                    if c['selector'] == '#location')
     evidence[flag] = False
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await forms._observe_controls(session, await session.page())
-    # Remove only the refusal in memory: the same witness is otherwise admissible.
-    monkeypatch.setattr(forms, '_require_graph_visibility', lambda *args: None)
     page, lookup = await forms._observe_controls(session, await session.page())
-    target = next(c for c in page['controls'] if c['selector'] == '#location')
-    assert forms._disclosure_question(page, target, lookup, page['url'])['selector'] == '#location'
+    assert lookup['#location'][flag] is False
+    assert flag not in next(c for c in page['controls']
+                           if c['selector'] == '#location')
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
+    assert session.calls == []

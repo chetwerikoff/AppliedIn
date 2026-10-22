@@ -555,8 +555,10 @@ async def test_declared_receiver_without_form_owned_value_refuses_final_submit(g
     final['controls'][0].update(value='', has_value=False)
     with pytest.raises(forms.Gate, match='verified form-own value receiver'):
         forms.check_form(final, filled, uploaded=True, receipts=[receipt])
+    # A closed picker opens first, then clicks the one approved option. Neither
+    # reversible IPC authorizes the application Submit with no form receiver.
     assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
     assert not any(call[0] == 'submit' for call in session.calls)
 
 

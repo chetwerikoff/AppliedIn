@@ -285,21 +285,19 @@ async def test_unbound_form_receiver_denies_display_only_combobox(monkeypatch):
         'human_approved_answers': {'What country?': grant()}})
     session = Session(current, committed)
     filled = {}
-    with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
-        await forms.execute(
-            session, current,
-            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled=filled,
-            resume_path='', company='example-co', jd_text='', resume_tex='',
-            github='', pk=PK, job_url=URL)
+    receipt = await forms.execute(
+        session, current,
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    # Selection is reversible preparation. A display-only choice must be
+    # refused at the code-owned final Submit check, not at the option click.
     assert ('click', '#country-example') in session.calls
-    assert filled == {}
+    assert filled == {'#country': 'Example Country'}
     with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
-        forms.check_form(committed, {'#country': 'Example Country'}, True,
-                         receipts=[{'action': 'combobox', 'selector': '#country',
-                                    'committed_caption': 'Example Country',
-                                    'committed_value': 'EX',
-                                    'hidden_selector': '', 'hidden_value': ''}])
+        forms.check_form(committed, filled, True, receipts=[receipt])
+    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
 
 
 @pytest.mark.parametrize(('before', 'after'), [
@@ -315,14 +313,23 @@ async def test_hidden_value_must_change_to_the_selected_machine_value(
            'human_approved_answers': {'What country?': grant()}}
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
     session = Session(current, committed)
-    with pytest.raises(forms.Gate,
-                       match='A hidden form value is not independently authorized'):
-        await forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+    filled = {}
+    receipt = await forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    # A safe option click may complete even when JavaScript leaves a stale
+    # machine value. The final check must compare the selection receipt,
+    # pre-click receiver, selected option and actual submitted hidden value.
+    assert receipt['hidden_value_before'] == before
+    assert receipt['committed_value'] == 'EX'
+    assert filled == {'#country': 'Example Country'}
+    with pytest.raises(forms.Gate, match='A hidden form value is not independently authorized'):
+        forms.check_form(committed, filled, True, receipts=[receipt])
+    assert [call for call in session.calls if call[0] == 'click'] == [
+        ('click', '#country-example')]
 
 
 def test_unlinked_or_changed_without_selection_hidden_values_gate():

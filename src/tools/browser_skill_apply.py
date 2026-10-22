@@ -1777,10 +1777,6 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     return members
 
 
-def _structural_submit(page: dict, target: dict, provenance=None) -> bool:
-    _formless_boundary(page, provenance)
-    return target.get('selector') == _formless_root(page)['submit']
-
 
 def _root_identity(page: dict):
     root = _formless_root(page)
@@ -3411,10 +3407,6 @@ def _combobox_stable_identity(target: dict) -> tuple:
         'selector', 'label', 'question', 'tag', 'type', 'in_form',
         'form_selector', 'form_action', 'formaction', 'disabled', 'required'))
 
-
-def _combobox_options_target(page: dict, action: dict) -> dict:
-    """Reuse the existing fixed combobox-options resolution in both paths."""
-    return control(page, action, 'combobox-options')
 
 
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,

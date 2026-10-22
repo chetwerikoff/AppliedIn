@@ -107,8 +107,12 @@ class Session:
                 value = await self.page()
                 if isinstance(value, dict) and 'entry' not in value:
                     controls = value.get('controls') or []
-                    owners = {c.get('form_selector') for c in controls if isinstance(c, dict)
-                              and forms._application_marker([c])}
+                    # Synthetic readers use the current native Submit
+                    # classification, never a retired per-step marker helper.
+                    owners = {c.get('form_selector') for c in controls
+                              if isinstance(c, dict) and forms.native_submit(c)
+                              and any(forms._same_key(text) in forms._APP_SUBMIT_LABELS
+                                      for text in forms._submitter_texts(c))}
                     owner = next(iter(owners)) if len(owners) == 1 else None
                     value['entry'] = dict(frames=[], responses=[], response_error=False,
                                           helper_challenge=False, root=(
@@ -176,6 +180,55 @@ async def test_direct_entry_two_fresh_forms_before_bootstrap(monkeypatch, ats):
     assert bootstrap.await_count == 1
     assert not decision.await_count
     no_mutations(session)
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+async def test_direct_entry_gate_keeps_existing_question_payload(monkeypatch, ats):
+    _, _, session, decision = world(monkeypatch, ats)
+    question = {'label': 'Synthetic question', 'type': 'text'}
+    rejection = forms.Gate('Exact synthetic owner question', form_question=question,
+                           reason='owner_question')
+    bootstrap = AsyncMock(side_effect=rejection)
+    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    report = await attempt(ats)
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'owner_question'
+    assert report['review_route'] == 'owner'
+    assert report['question'].startswith(str(rejection))
+    assert report['form_question'] is question
+    assert bootstrap.await_count == 1 and not decision.await_count
+    no_mutations(session)
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+async def test_direct_entry_unexpected_exception_stays_unknown(monkeypatch, ats):
+    _, _, session, decision = world(monkeypatch, ats)
+    bootstrap = AsyncMock(side_effect=RuntimeError('Synthetic unexpected fault'))
+    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    report = await attempt(ats)
+    assert report == {'status': 'unknown',
+                      'detail': 'BrowserSkill operation unavailable: RuntimeError'}
+    assert 'question' not in report and 'form_question' not in report
+    assert bootstrap.await_count == 1 and not decision.await_count
+    no_mutations(session)
+
+
+async def test_final_submit_gate_keeps_existing_question_without_click(
+        monkeypatch, tmp_path):
+    from tests.tools.test_browser_controller_support import install_controller_session
+    row, _, endpoint, decide = world(monkeypatch, 'lever')
+    _, _, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _session, current, *a, **k: current))
+    decide.return_value = {'action': 'submit', 'selector': '#submit'}
+    report = await forms.apply(posting('lever'), COMPANY, {}, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert report['status'] == 'gate'
+    assert report['question'].startswith(
+        'This row’s protected tailored PDF has not been verified.')
+    assert report['form_question'] is None
+    assert not any(call[0] == 'click' for call in endpoint.calls)
+    assert not row.get('possible_submission')
 
 
 @pytest.mark.parametrize('problem', [

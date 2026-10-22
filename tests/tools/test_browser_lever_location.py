@@ -382,6 +382,20 @@ async def test_typed_choice_preserves_grant_and_final_report(grant_row, caption,
 ])
 async def test_rejected_candidates_gate_same_field_before_click(grant_row, options):
     session = FakeLever(options=options)
+    if any(o['label'] == ANSWER and (not o['safe'] or o['navigates'] or o['submit'])
+           for o in options):
+        # Opening and typing are reversible; an exact-caption option with a
+        # submitting/navigating handler is NOT an approved choice click.
+        with pytest.raises(forms.Gate, match='submission-capable or unsafe navigating option'):
+            await run_choice(session)
+        assert ('click', '#current-location') in session.calls
+        assert ('fill', '#current-location', '--value', ANSWER) in session.calls
+        assert not any(c[0] == 'click' and c[1].startswith('#location-option')
+                       for c in session.calls)
+        assert ('click', '#submit') not in session.calls
+        with pytest.raises(forms.Gate):
+            forms.check_form(await session.page(), {}, uploaded=True)
+        return
     receipt, filled = await run_choice(session)
     # r06 admits reversible picker opening/search; it never equates a
     # differently captioned city, ambiguous options or an unsafe handler with

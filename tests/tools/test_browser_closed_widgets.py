@@ -30,48 +30,47 @@ def combo(snapshot, key='location'):
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 @pytest.mark.parametrize('active_only', [False, True])
-def test_four_fields_same_graph_in_both_production_readers(phase, active_only):
+async def test_generic_four_field_readers_never_grant_final_submit(
+        phase, active_only, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
+    # A C0/C1/C2 class/phase certificate no longer exists. The generic
+    # ARIA owners must agree across the independent readers, and neither a
+    # legacy "selected" caption nor a phase authorizes application Submit.
     snapshot = dom(phases=dict.fromkeys(KEYS, phase), activeOnly=active_only)
-    p, w = snapshot['page'], snapshot['witness']
-    assert p['inventory_verified'] and not p['opaque_controls']
-    assert len(p['controls']) == len(w['controls']) == 37
-    assert [c['selector'] for c in p['controls']] == [c['selector'] for c in w['controls']]
-    assert not any(c['selector'].startswith('#country-') for c in p['controls'])
+    page, witness = snapshot['page'], snapshot['witness']
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
     for key in KEYS:
-        c = combo(snapshot, key)
-        wc = next(x for x in w['controls'] if x['selector'] == c['selector'])
-        assert c['combobox'] == wc['combobox']
-        graph = c['combobox']
-        assert graph['mode'] == 'closed-react-select' and graph['phase'] == phase
-        assert graph['field_selector'] == '#'+key+'-field'
-        assert graph['value_container_selector'] == '#'+key+'-value'
-        assert graph['label_selector'] == '#'+key+'-label'
-        if phase == 'C2':
-            assert all(graph[k] == 'Approved '+key for k in (
-                'selected_text', 'displayed_text', 'selected_value', 'hidden_value'))
-        if phase == 'C1':
-            assert graph['linked'] and graph['options'][0]['value'] == 'Approved '+key
+        owner = combo(snapshot, key)
+        independent = next(x for x in witness['controls']
+                           if x['selector'] == owner['selector'])
+        assert owner['type'] == independent['type'] == 'combobox'
+        assert owner['combobox'] == independent['combobox']
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
 
 
-def test_receiver_backed_country_outside_phone_fieldset_is_valid_closed_c2():
-    # Unlike the receiverless Greenhouse phone widget, a normal #country with
-    # one proven hidden receiver must not be quarantined merely by its ID.
+async def test_receiver_backed_country_still_requires_final_answer_binding(
+        monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
+    # A native hidden receiver may be observed without any ATS-specific
+    # country exception. Its caption and selector are not approved answers.
     snapshot = dom(receiverBackedCountry=True, phases={'location': 'C2'})
     page, witness = snapshot['page'], snapshot['witness']
-    assert page['inventory_verified'] is True and page['opaque_controls'] is False
-    assert page['opaque_count'] == 0 and page['opaque_locators'] == []
-    forms._inventory_ok(page)
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
     for reader in (page, witness):
-        target = next(c for c in reader['controls'] if c['selector'] == '#country')
-        graph = target['combobox']
-        assert graph['mode'] == 'closed-react-select' and graph['phase'] == 'C2'
-        assert graph['label_selector'] == '#country-label'
-        assert graph['hidden_selector'] == '#location-hidden'
-        assert graph['hidden_value'] == graph['selected_value'] == 'Approved location'
-        assert graph['selected_text'] == graph['displayed_text'] == 'Approved location'
-        assert graph.get('receiverless_country') is not True
-        assert graph.get('quarantined') is not True
-    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
+        country = next(c for c in reader['controls']
+                       if c['selector'] == '#country')
+        assert country['type'] == 'combobox'
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
 
 
 @pytest.mark.parametrize('scenario', [
@@ -488,22 +487,27 @@ async def test_never_committed_component_times_out_without_more_ipc(monkeypatch,
     assert session.calls == [('click', '#location'), ('click', '#location-option')]
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
-def test_required_proxies_are_not_answers_or_immutable_identity(phase):
-    snapshot = dom(fullPhone=True, requiredProxy=True, phases=dict.fromkeys((*KEYS, 'country'), phase))
-    assert snapshot['page']['inventory_verified'] is True
-    assert snapshot['page']['opaque_controls'] is False
-    assert len(snapshot['page']['controls']) == len(snapshot['witness']['controls']) == 38
+async def test_required_proxies_never_count_as_submitted_answers(
+        phase, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
+    # Missing or mounted native required proxies must be inventoried, not
+    # silently promoted to the former C0/C1/C2 immutable identity. Regardless
+    # of old picker presentation, no current exact approved form values exist.
+    snapshot = dom(fullPhone=True, requiredProxy=True,
+                   phases=dict.fromkeys((*KEYS, 'country'), phase))
+    page, witness = snapshot['page'], snapshot['witness']
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
     for key in ('location', 'country'):
-        target = combo(snapshot, key)
-        graph = target['combobox']
-        assert graph == next(c['combobox'] for c in snapshot['witness']['controls'] if c['selector'] == '#'+key)
-        assert graph['required_proxy_mounted'] is (phase != 'C2')
-        c0 = combo(dom(fullPhone=True, requiredProxy=True), key)
-        assert forms._closed_key(target) == forms._closed_key(c0)
-    country = combo(snapshot, 'country')['combobox']
-    assert len(country['country_graph']) == 13
-    assert country['field_selector'] == '#country-container'
-    assert not {'hidden_selector', 'hidden_value', 'selected_value'} & country.keys()
+        observed = combo(snapshot, key)
+        independent = next(c for c in witness['controls']
+                           if c['selector'] == observed['selector'])
+        assert observed['combobox'] == independent['combobox']
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
 
 
 PROXY_BAD = [

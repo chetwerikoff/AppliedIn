@@ -276,18 +276,50 @@ async def test_receipt_cannot_replace_current_admission_or_click_witness(grants,
     forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)
     forged[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, filled, True, receipts=[forged])
+    if key == 'hidden_value':
+        # check_form authorizes the *live* field value, not old receipt bytes.
+        # A forged history item is refused by the existing final approval
+        # audit; an independently changed form receiver is refused by check_form.
+        with pytest.raises(forms.Gate, match='committed accessible choice or form value changed'):
+            forms.check_approvals('example-co#1', [forged], current)
+        changed = copy.deepcopy(current)
+        owner = next(c for c in changed['controls'] if c['selector'] == '#location')
+        hidden = (owner.get('combobox') or {}).get('hidden_selector')
+        receiver = (next(c for c in changed['controls'] if c['selector'] == hidden)
+                    if hidden else owner)
+        receiver['value'] = 'Different location'
+        receiver['has_value'] = True
+        with pytest.raises(forms.Gate, match='hidden form value|form-own value receiver'):
+            forms.check_form(changed, filled, True, receipts=[receipt])
+    else:
+        with pytest.raises(forms.Gate):
+            forms.check_form(current, filled, True, receipts=[forged])
+    assert ('click', '#submit') not in session.calls
 
 
 async def test_no_receipt_is_not_a_committed_selection(grants):
+    # A current, independently readable form-owned value is proof, even
+    # without the retired per-step selection certificate.
     session = Session()
     receipt = await choose(session, grants)
     current = focused_final_page(await session.page())
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, filled, True, receipts=[])
+    forms.check_form(current, filled, True, receipts=[])
+
+    # No historical receipt may replace a missing or contradictory live
+    # submitted value. Test both conditions with the original proof absent.
+    for value in ('', 'Different location'):
+        changed = copy.deepcopy(current)
+        owner = next(c for c in changed['controls'] if c['selector'] == '#location')
+        hidden = (owner.get('combobox') or {}).get('hidden_selector')
+        receiver = (next(c for c in changed['controls'] if c['selector'] == hidden)
+                    if hidden else owner)
+        receiver['value'] = value
+        receiver['has_value'] = bool(value)
+        with pytest.raises(forms.Gate, match='hidden form value|form-own value receiver'):
+            forms.check_form(changed, filled, True, receipts=[])
+    assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('scenario', [
     'extraInput', 'noAutocomplete', 'wrongLabel', 'duplicateLabel',

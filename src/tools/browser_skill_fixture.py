@@ -433,10 +433,10 @@ def _lever_question_form(kind: str) -> bytes:
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>Synthetic application</title></head><body><h1>Synthetic role at example-co</h1>
 <form id="application-form" class="application--form" action="{URL}" method="POST">
-<ul><li class="application-question custom-question"><div>
-<div class="application-label"><div class="text">Synthetic {kind} question <span class="required">*</span></div></div>
+<ul><li class="application-question custom-question"><fieldset>
+<legend class="application-label"><span class="text">Synthetic {kind} question <span class="required">*</span></span></legend>
 <div class="application-field"><ul data-qa="synthetic-options">{choices}</ul></div>
-</div></li></ul><button id="submit" type="submit">Submit application</button>
+</fieldset></li></ul><button id="submit" type="submit">Submit application</button>
 </form></body></html>'''.encode('utf-8')
 
 

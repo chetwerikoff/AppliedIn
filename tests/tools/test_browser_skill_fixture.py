@@ -1023,7 +1023,17 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     reports = [json.loads(line) for line in result.stdout.splitlines()
                if line.lstrip().startswith("{")]
     assert len(reports) == 10, (result.stdout, result.stderr)
-    assert all(report['submitted'] is False and report['submit']['ipc_returned'] is False
+    assert {report['scenario'] for report in reports[:-1]} == {
+        'entry', 'greenhouse', 'greenhouse_empty_placeholder',
+        'w_button_aria_label', 'ashby', 'ashby-upload',
+        'lever_custom_radio', 'lever_custom_checkbox'}
+    assert {report['variant'] for report in reports[:-1]
+            if report['scenario'] == 'ashby-upload'} == {
+                'ordinary', 'transient+unwrap'}
+    assert all(report['status'] == 'gate'
+               and report['submitted'] is False
+               and report['submit']['call_entered'] is False
+               and report['submit']['ipc_returned'] is False
                and report['submit']['post_attempts'] == 0
                for report in reports[:-1])
     # The aggregate summary has safe_gate/legs, not a submitted attribute;

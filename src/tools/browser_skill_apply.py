@@ -1036,7 +1036,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     or (combo.get('hidden_selector')
                         and combo.get('hidden_value') != combo.get('selected_value'))
                     or (options and (len(matches) != 1
-                        or matches[0].get('value') != combo.get('selected_value')))):
+                        or (matches[0].get('value') or matches[0].get('label'))
+                           != combo.get('selected_value')))):
                 if (combo.get('hidden_selector')
                         and combo.get('hidden_value') != combo.get('selected_value')):
                     raise Gate('A hidden form value is not independently authorized.')

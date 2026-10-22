@@ -461,14 +461,24 @@ async def test_missing_provenance_refuses_before_key_or_option_ipc(grant_row):
 
 @pytest.mark.asyncio
 async def test_submit_checks_reject_missing_receipt_or_changed_grant(grant_row):
-    session = FakeLever()
+    # Use the exact owner-approved caption in this scenario: the test checks
+    # current grant drift, not the separate display-name equivalence question.
+    session = FakeLever(caption=ANSWER)
     receipt, filled = await run_choice(session)
     committed = await session.page()
-    with pytest.raises(forms.Gate, match='selection receipt'):
-        forms.check_form(committed, filled, uploaded=True)
+    forms.check_form(committed, filled, uploaded=True)
+    forms.check_approvals(PK, [receipt], committed, provenance=PROVENANCE)
+    # No historical selection certificate is needed once the current
+    # approved caption and actual named form-owned value are independently read.
+    changed_receiver = location_page(
+        typed=ANSWER, selected=True, caption=ANSWER,
+        changed={'receiver.value': 'OTHER'})
+    with pytest.raises(forms.Gate, match='hidden form value'):
+        forms.check_form(changed_receiver, filled, uploaded=True)
     grant_row['human_approved_answers']['Current location']['value'] = 'Changed'
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [receipt], committed, provenance=PROVENANCE)
+    assert not any(c[:2] == ('click', '#submit') for c in session.calls)
 
 
 @pytest.mark.asyncio

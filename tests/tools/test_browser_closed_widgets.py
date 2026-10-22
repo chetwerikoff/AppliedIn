@@ -137,6 +137,41 @@ class Session:
         return {}
 
 
+class FormOwnedSelection(Session):
+    """The fake option click produces independent current form-submitted bytes.
+
+    The original CSS-only snapshot has no committed machine value. Observe the
+    actual uniquely rendered option *before* clicking, then emulate the DOM's
+    selection/change handler updating the named form input after that click.
+    Neither the action receipt nor approved caption invents a machine value.
+    """
+    observed_choice = None
+
+    async def call(self, *args):
+        selected = None
+        if args == ('click', '#location-option'):
+            owner = combo(self.snapshot)
+            matches = [o for o in owner['combobox']['options']
+                       if o.get('selector') == '#location-option']
+            assert len(matches) == 1
+            selected = copy.deepcopy(matches[0])
+            assert selected['unique'] is True and selected['safe'] is True
+            assert not selected.get('submit') and not selected.get('navigates')
+            assert selected['value']  # an observed real option value, never guessed
+        result = await super().call(*args)
+        if selected is not None:
+            self.observed_choice = (selected['label'], selected['value'])
+            for reader in self.snapshot.values():
+                owner = next(c for c in reader['controls']
+                             if c['selector'] == '#location')
+                owner.update(name='location', value=selected['value'], has_value=True)
+                owner['combobox'].update(
+                    selected_text=selected['label'],
+                    displayed_text=selected['label'],
+                    selected_value=selected['value'])
+        return result
+
+
 async def test_synthetic_reversible_picker_fill_is_not_a_selection():
     session = Session()
     await session.call('click', '#location')
@@ -225,7 +260,8 @@ async def test_four_exact_commits_and_presubmit_current_reread(grants):
     {'danger': 'ancestor'}, {'danger': 'descendant'},
 ])
 async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
-    session, filled = Session(**scenario), {}
+    session, filled = (FormOwnedSelection(**scenario) if scenario.get('caption')
+                       else Session(**scenario)), {}
     if scenario.get('danger'):
         # A potential committing option is never reversible preparation.
         with pytest.raises(forms.Gate):
@@ -237,7 +273,9 @@ async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
     if scenario.get('caption'):
         # Benign case/whitespace variations of the approved caption are
         # reversible; a later material caption change still blocks Submit.
-        assert receipt.get('committed_value')
+        assert session.observed_choice is not None
+        assert receipt['committed_value'] == session.observed_choice[1]
+        assert receipt['committed_caption'] == session.observed_choice[0]
         forms.check_form(current, filled, True, receipts=[receipt])
         changed = copy.deepcopy(current)
         next(c for c in changed['controls']
@@ -254,8 +292,29 @@ async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
 
 @pytest.mark.parametrize('key', ['selected_text', 'displayed_text', 'hidden_value', 'selected_value'])
 async def test_each_current_readback_is_literal_and_independent(grants, key):
-    session = Session()
+    if key == 'hidden_value':
+        # Unlike the CSS-only closed widget, this generic fixture has an
+        # actual named hidden form receiver and its independently read code.
+        from tests.tools import test_browser_combobox as generic
+        base = generic.page(generic.control(
+            selected_text='Example Country', selected_value='EX',
+            hidden_value='EX'))
+        filled = {'#country': 'Example Country'}
+        forms.check_form(base, filled, True)
+        mutated = copy.deepcopy(base)
+        mutated['controls'][0]['combobox']['hidden_value'] = 'Different code'
+        with pytest.raises(forms.Gate, match='hidden form value'):
+            forms.check_form(mutated, filled, True)
+        changed_receiver = copy.deepcopy(base)
+        changed_receiver['controls'][-1]['value'] = 'Different code'
+        with pytest.raises(forms.Gate, match='hidden form value'):
+            forms.check_form(changed_receiver, filled, True)
+        return
+
+    session = FormOwnedSelection()
     receipt = await choose(session, grants)
+    assert session.observed_choice == (
+        receipt['committed_caption'], receipt['committed_value'])
     base = focused_final_page(await session.page())
     filled = {'#location': 'Approved location'}
     forms.check_form(base, filled, True, receipts=[receipt])
@@ -263,6 +322,7 @@ async def test_each_current_readback_is_literal_and_independent(grants, key):
     next(c for c in mutated['controls'] if c['selector'] == '#location')['combobox'][key] = 'Different location'
     with pytest.raises(forms.Gate):
         forms.check_form(mutated, filled, True, receipts=[receipt])
+    assert not any(c[:2] == ('click', '#submit') for c in session.calls)
 
 
 def _current_form_owned_choice(current, receipt):

@@ -1067,8 +1067,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                         or not target.get('name')
                         or not target.get('has_value')
                         or not isinstance(own_value, str)
-                        or not (own_value == combo['selected_value']
-                                or _same(own_value, combo['selected_text']))):
+                        or own_value != combo['selected_value']):
                     raise Gate('The combobox has no verified form-own value receiver.')
             guarded_value(target, expected)
             continue

@@ -659,10 +659,17 @@ def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
     with pytest.raises(forms.Gate, match='no longer present'):
         forms.check_form(page(), {}, True, 'Resume.pdf')
     control = target(type='radio', label='Yes', question='Authorized to work?',
-                     checked=True, name='work_auth')
+                     checked=True, name='work_auth', value='yes', has_value=True)
     with pytest.raises(forms.Gate, match='preselected'):
         forms.check_form(page(control), {}, True)
-    forms.check_form(page(control), {'#field': 'Yes'}, True)
+    # A preapproved checked radio still needs an independently observed
+    # second member: an orphan radio cannot become an authorized group.
+    with pytest.raises(forms.Gate, match='Radio group members'):
+        forms.check_form(page(control), {'#field': 'Yes'}, True)
+    decline = target(selector='#decline', type='radio', label='No',
+                     question='Authorized to work?', name='work_auth',
+                     value='no', has_value=True)
+    forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
 
 
 def test_native_select_can_derive_the_option_without_a_model_guessed_value():

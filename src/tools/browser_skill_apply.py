@@ -1057,6 +1057,13 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             raise Gate('Unsupported custom control; human inspection is required.')
         value = target.get('value', '')
         if typ in {'radio', 'checkbox'}:
+            if typ == 'radio' and (target.get('required') or target.get('checked')):
+                # A checked bit alone cannot prove its submitted question.
+                # Bind the current visible group to its form owner and name
+                # only at the final Submit decision, not during preparation.
+                group = _radio_group(page, target)
+                if sum(bool(member.get('checked')) for member in group) > 1:
+                    raise Gate('Native radio group has conflicting checked members.')
             if target.get('checked'):
                 scope = _assent_scope(target) if typ == 'checkbox' else 'fact'
                 # A delegated application-processing acknowledgement must
@@ -1796,7 +1803,6 @@ def _upload_tree(page):
         if type(tree.get(key)) is not int or not 0 <= tree[key] < len(nodes):
             raise Gate('Original upload input/container/dropzone is ambiguous.')
     return tree
-
 
 def _upload_shape(tree, removed=()):
     # Re-key edges after the sole allowed insertion/removal, never selectors.
@@ -2696,7 +2702,6 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
     _guard_native_choice_answer(selected, answer)
     return answer, selected
-
 
 def _require_native_action(target: dict, verb: str) -> None:
     """Never dispatch fill to a select or select to a text-entry field."""

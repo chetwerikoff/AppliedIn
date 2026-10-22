@@ -238,7 +238,11 @@ restriction allows `jobs.ashbyhq.com`, `jobs.lever.co` and host-only
 legacy wrapper certificate or tenant equality before reversible work.
 This permits approved field writes, accessible-choice changes and upload of
 the exact seed-valid row PDF under their per-action protections; it does not
-authorize application submission.
+authorize application submission. A uniquely observed native form owner may be
+projected to focus preparation, but an absent or hydrating native census is not
+an independent per-step approval or final Submit certificate. Independently
+witnessed form receivers, approved values and safe destinations still govern
+each write, and ambiguity cannot authorize the irreversible click.
 
 The one final code-owned raw-click guard re-reads the current tracked row,
 configured/pinned tenant, final job and origin, approvals, duplicate/hold

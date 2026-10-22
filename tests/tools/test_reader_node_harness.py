@@ -98,6 +98,35 @@ def test_fixture_console_output_is_not_protocol_output():
                   forms._FIXED_CONTROL_WITNESS).startswith('{"page":')
 
 
+def test_real_guard_removal_and_restoration_are_not_cached():
+    # The exact native-form ownership predicate is exercised in both *real*
+    # independent scripts; no fixture fake implements a replacement guard.
+    guard = "nativeForm(ref)!==form || "
+    scripts = (production.PAGE, forms._FIXED_CONTROL_WITNESS)
+    assert all(script.count(guard) == 1 for script in scripts)
+    spec = {"fullPhone": True, "countryErrorForeignOwner": True}
+    good = reused("closed_widget_dom.cjs", spec, *scripts)
+    changed = reused(
+        "closed_widget_dom.cjs", spec,
+        *(script.replace(guard, "") for script in scripts))
+    assert json.loads(changed) != json.loads(good)
+    assert reused("closed_widget_dom.cjs", spec, *scripts) == good
+
+
+def test_closed_fixture_bytes_are_reread_between_requests(tmp_path):
+    fixture = tmp_path / "closed_widget_dom.cjs"
+    original = (harness.HERE / fixture.name).read_text()
+    fixture.write_text(original)
+    spec = {"phases": {"location": "C0"}}
+    scripts = (production.PAGE, forms._FIXED_CONTROL_WITNESS)
+    base = harness.reader_output(fixture, spec, *scripts)
+    fixture.write_text('console.log("modified-closed-fixture");\\n' + original)
+    assert harness.reader_output(fixture, spec, *scripts).startswith(
+        "modified-closed-fixture\\n")
+    fixture.write_text(original)
+    assert harness.reader_output(fixture, spec, *scripts) == base
+
+
 def test_read_current_fixture_and_relative_dependency_bytes(tmp_path):
     fixture = tmp_path / "entry_dom_fixture.js"
     dep = tmp_path / "lever_card_fixture.cjs"

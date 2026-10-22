@@ -1026,7 +1026,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     assert all(report['submitted'] is False and report['submit']['ipc_returned'] is False
                and report['submit']['post_attempts'] == 0
                for report in reports[:-1])
-    assert reports[-1]['submitted'] is False
+    # The aggregate summary has safe_gate/legs, not a submitted attribute;
+    # the nine per-session reports carry the actual Submit IPC observations.
     assert reports[-1]['safe_gate'] is False
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]

@@ -262,10 +262,9 @@ async def test_popup_link_may_disappear_after_verified_form_commit(monkeypatch):
         github='', pk=PK, job_url=URL)
     assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
     assert ('click', '#country-example') in session.calls
-    # A bare PAGE projection may not pretend a formerly mounted listbox
-    # remained bound. Only the actual verified action receipt permits final.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(committed, filled, True)
+    # The listbox may close after selecting a verified approved value.
+    # Current form-owned bytes, rather than past admission, determine Submit.
+    forms.check_form(committed, filled, True)
     forms.check_form(committed, filled, True, receipts=[receipt])
     forms.check_approvals(PK, [receipt], committed)
     wrong_form_value = deepcopy(committed)
@@ -320,14 +319,17 @@ async def test_hidden_value_must_change_to_the_selected_machine_value(
         facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
         company='example-co', jd_text='', resume_tex='', github='',
         pk=PK, job_url=URL)
-    # A safe option click may complete even when JavaScript leaves a stale
-    # machine value. The final check must compare the selection receipt,
-    # pre-click receiver, selected option and actual submitted hidden value.
+    # The prior receiver state is no longer a per-step certificate. The
+    # current selected option and named hidden value own final authorization.
     assert receipt['hidden_value_before'] == before
     assert receipt['committed_value'] == 'EX'
     assert filled == {'#country': 'Example Country'}
-    with pytest.raises(forms.Gate, match='A hidden form value is not independently authorized'):
+    if after == 'EX':
+        forms.check_form(committed, filled, True)
         forms.check_form(committed, filled, True, receipts=[receipt])
+    else:
+        with pytest.raises(forms.Gate, match='hidden form value'):
+            forms.check_form(committed, filled, True, receipts=[receipt])
     assert [call for call in session.calls if call[0] == 'click'] == [
         ('click', '#country-example')]
 

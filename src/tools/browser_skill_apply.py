@@ -977,43 +977,34 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     for target in controls:
         typ = target.get('type', '')
         if typ == 'hidden':
-            if target.get('in_form') is True:
+            if target.get('in_form') is True and (
+                    target.get('required') or target.get('has_value')
+                    or bool(target.get('value'))):
                 owners = [c for c in controls if c.get('type') == 'combobox'
                           and c.get('in_form') is True
                           and c.get('form_selector') == target.get('form_selector')
                           and (c.get('combobox') or {}).get('hidden_selector')
                           == target.get('selector')]
-                if target.get('required') or target.get('has_value'):
-                    authorized = False
-                    if len(owners) == 1:
-                        owner = owners[0]
-                        combo = owner.get('combobox') or {}
-                        linked_receipts = [r for r in receipts or []
-                                           if r.get('action') == 'combobox'
-                                           and r.get('selector') == owner.get('selector')
-                                           and r.get('hidden_selector') == target.get('selector')]
-                        if not linked_receipts:
-                            # A posted hidden receiver is not verified merely
-                            # because a visible picker displays an answer.
-                            # Name the absent authorization evidence precisely
-                            # for agent-first diagnosis; never infer its value.
-                            raise Gate('A hidden form value is not independently authorized: missing selection receipt.')
-                        if len(linked_receipts) == 1:
-                            receipt = linked_receipts[0]
-                            before = receipt.get('hidden_value_before')
-                            after = receipt.get('hidden_value')
-                            authorized = (
-                                bool(owner.get('form_selector'))
-                                and owner.get('form_action') == target.get('form_action')
-                                and isinstance(before, str) and isinstance(after, str)
-                                and before != after and bool(after)
-                                and after == receipt.get('committed_value')
-                                and after == combo.get('selected_value')
-                                and after == combo.get('hidden_value')
-                                and after == target.get('value'))
-                    if not authorized:
-                        raise Gate('A hidden form value is not independently authorized.')
+                owner = owners[0] if len(owners) == 1 else None
+                combo = (owner.get('combobox') or {}) if owner else {}
+                value = target.get('value')
+                expected = filled.get(owner.get('selector')) if owner else None
+                # Only the actual named form value and current accessible
+                # selection, never a historical receipt, can authorize Submit.
+                if (owner is None or not target.get('name')
+                        or not owner.get('form_selector')
+                        or not owner.get('form_action')
+                        or owner.get('form_action') != target.get('form_action')
+                        or expected is None
+                        or not _same(combo.get('selected_text', ''), expected)
+                        or not _same(combo.get('displayed_text', ''),
+                                     combo.get('selected_text', ''))
+                        or not isinstance(value, str) or not value
+                        or value != combo.get('selected_value')
+                        or value != combo.get('hidden_value')):
+                    raise Gate('A hidden form value is not independently authorized.')
             continue
+
         if target.get('disabled'):
             if target.get('selector') in filled:
                 raise Gate('A previously approved form control is disabled at final Submit.')
@@ -1030,27 +1021,27 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     and not target.get('has_value')
                     and not str(target.get('value') or '').strip()):
                 continue
-            # A closed picker may remove aria-controls after its option was
-            # selected. Its original exclusive linkage is captured by the
-            # receipt; fresh displayed and form-own values still must agree.
-            closed_receipt = any(
-                r.get('action') == 'combobox'
-                and r.get('selector') == target.get('selector')
-                and _same(r.get('committed_caption', ''), expected or '')
-                and r.get('committed_value') == combo.get('selected_value')
-                and r.get('hidden_selector') == combo.get('hidden_selector')
-                and r.get('hidden_value') == combo.get('hidden_value')
-                for r in receipts or [])
-            if (not isinstance(combo.get('link_id'), str)
-                    or (not combo.get('link_id') and not closed_receipt)
-                    or expected is None or not _same(combo.get('selected_text', ''), expected)
-                    or not _same(combo.get('displayed_text', ''), combo.get('selected_text', ''))
+            # Closing a listbox may remove aria-controls. At the sole final
+            # guard, only fresh displayed and submitted values establish the
+            # completed approved choice, not an earlier phase/receipt token.
+            options = (combo.get('options') or []) if combo.get('linked') else []
+            matches = ([o for o in options if isinstance(o, dict)
+                        and _same(o.get('label', ''), combo.get('selected_text', ''))]
+                       if isinstance(options, list) else [])
+            if (expected is None or not _same(combo.get('selected_text', ''), expected)
+                    or not _same(combo.get('displayed_text', ''),
+                                 combo.get('selected_text', ''))
+                    or not isinstance(combo.get('selected_value'), str)
                     or not combo.get('selected_value')
                     or (combo.get('hidden_selector')
-                        and combo.get('hidden_value') != combo.get('selected_value'))):
-                if combo.get('hidden_selector') and combo.get('hidden_value') != combo.get('selected_value'):
+                        and combo.get('hidden_value') != combo.get('selected_value'))
+                    or (options and (len(matches) != 1
+                        or matches[0].get('value') != combo.get('selected_value')))):
+                if (combo.get('hidden_selector')
+                        and combo.get('hidden_value') != combo.get('selected_value')):
                     raise Gate('A hidden form value is not independently authorized.')
                 raise Gate(f'Unverified or changed combobox value: {target["label"]}')
+
             if combo.get('hidden_selector'):
                 # A caption and a claimed hidden value cannot substitute for
                 # one actual, current hidden control owned by this same form.
@@ -1059,7 +1050,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                              and c.get('type') == 'hidden'
                              and c.get('in_form') is True
                              and c.get('form_selector') == target.get('form_selector')]
-                if (len(receivers) != 1
+                if (len(receivers) != 1 or not receivers[0].get('name')
+                        or receivers[0].get('form_action') != target.get('form_action')
                         or not isinstance(receivers[0].get('value'), str)
                         or not receivers[0]['value']
                         or receivers[0]['value'] != combo.get('hidden_value')):

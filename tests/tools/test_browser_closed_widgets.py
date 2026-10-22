@@ -265,81 +265,66 @@ async def test_each_current_readback_is_literal_and_independent(grants, key):
         forms.check_form(mutated, filled, True, receipts=[receipt])
 
 
+def _current_form_owned_choice(current, receipt):
+    """Give the synthetic post-click page an actual named submitted receiver."""
+    owner = next(c for c in current['controls'] if c['selector'] == '#location')
+    assert not (owner.get('combobox') or {}).get('hidden_selector')
+    caption = receipt['committed_caption']
+    owner.update(name='location', value=caption, has_value=True)
+    owner['combobox'].update(
+        selected_text=caption, displayed_text=caption,
+        selected_value=receipt['committed_value'])
+    return current
+
+
 @pytest.mark.parametrize('key', ['committed_value', 'committed_caption',
                                  'hidden_selector', 'hidden_value_before',
                                  'hidden_value'])
 async def test_receipt_cannot_replace_current_admission_or_click_witness(grants, key):
     session = Session()
     receipt = await choose(session, grants)
-    current = focused_final_page(await session.page())
-    if key == 'hidden_value':
-        # Only this requested negative receives a valid final form-owned
-        # selection. The four historical failure variants remain separate.
-        owner = next(c for c in current['controls'] if c['selector'] == '#location')
-        assert not owner['combobox'].get('hidden_selector')
-        owner.update(name='location', value=receipt['committed_caption'], has_value=True)
-        owner['combobox'].update(
-            selected_text=receipt['committed_caption'],
-            displayed_text=receipt['committed_caption'],
-            selected_value=receipt['committed_value'])
+    current = _current_form_owned_choice(
+        focused_final_page(await session.page()), receipt)
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)
     forged[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
-    if key == 'hidden_value':
-        # check_form authorizes the *live* field value, not old receipt bytes.
-        # A forged history item is refused by the existing final approval
-        # audit; an independently changed form receiver is refused by check_form.
-        with pytest.raises(forms.Gate, match='committed accessible choice or form value changed'):
-            forms.check_approvals('example-co#1', [forged], current)
-        changed = copy.deepcopy(current)
-        owner = next(c for c in changed['controls'] if c['selector'] == '#location')
-        hidden = (owner.get('combobox') or {}).get('hidden_selector')
-        receiver = (next(c for c in changed['controls'] if c['selector'] == hidden)
-                    if hidden else owner)
-        receiver['value'] = 'Different location'
-        receiver['has_value'] = True
-        with pytest.raises(forms.Gate, match='hidden form value|form-own value receiver'):
-            forms.check_form(changed, filled, True, receipts=[receipt])
-    else:
+    # Historical evidence must not authorize or invalidate live submitted
+    # values. The approval-history audit may reject a corrupted record.
+    forms.check_form(current, filled, True, receipts=[forged])
+    if key != 'hidden_value_before':
         with pytest.raises(forms.Gate):
-            forms.check_form(current, filled, True, receipts=[forged])
+            forms.check_approvals('example-co#1', [forged], current)
+    changed = copy.deepcopy(current)
+    owner = next(c for c in changed['controls'] if c['selector'] == '#location')
+    owner['value'] = 'Different location'
+    owner['has_value'] = True
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(changed, filled, True, receipts=[forged])
     assert ('click', '#submit') not in session.calls
 
 
 async def test_no_receipt_is_not_a_committed_selection(grants):
-    # A current, independently readable form-owned value is proof, even
-    # without the retired per-step selection certificate.
     session = Session()
     receipt = await choose(session, grants)
-    current = focused_final_page(await session.page())
-    owner = next(c for c in current['controls'] if c['selector'] == '#location')
-    # CSS-only fixture lacks a chosen-value readback and submitted name.
-    # Give the valid final case its own named form value, not a fake receipt.
-    assert not owner['combobox'].get('hidden_selector')
-    owner.update(name='location', value=receipt['committed_caption'], has_value=True)
-    owner['combobox'].update(
-        selected_text=receipt['committed_caption'],
-        displayed_text=receipt['committed_caption'],
-        selected_value=receipt['committed_value'])
+    current = _current_form_owned_choice(
+        focused_final_page(await session.page()), receipt)
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
-    # This closed combobox has lost live listbox linkage; the generic option
-    # receipt still establishes which approved option was actually clicked.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(current, filled, True, receipts=[])
-
-    # A valid historical receipt must never mask bad current submitted bytes.
+    # Fresh approved caption and this form's named submitted value suffice.
+    forms.check_form(current, filled, True, receipts=[])
     for value in ('', 'Different location'):
         changed = copy.deepcopy(current)
         owner = next(c for c in changed['controls'] if c['selector'] == '#location')
-        hidden = (owner.get('combobox') or {}).get('hidden_selector')
-        receiver = (next(c for c in changed['controls'] if c['selector'] == hidden)
-                    if hidden else owner)
-        receiver['value'] = value
-        receiver['has_value'] = bool(value)
-        with pytest.raises(forms.Gate, match='hidden form value|form-own value receiver'):
-            forms.check_form(changed, filled, True, receipts=[receipt])
+        owner['value'] = value
+        owner['has_value'] = bool(value)
+        with pytest.raises(forms.Gate, match='form-own value receiver'):
+            forms.check_form(changed, filled, True, receipts=[])
+    without_name = copy.deepcopy(current)
+    next(c for c in without_name['controls']
+         if c['selector'] == '#location')['name'] = ''
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(without_name, filled, True, receipts=[])
     assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('scenario', [
@@ -419,14 +404,20 @@ async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
 async def test_forged_plain_receipt_is_not_code_witnessed(grants):
     session = Session()
     receipt = await choose(session, grants)
-    current = focused_final_page(await session.page())
+    current = _current_form_owned_choice(
+        focused_final_page(await session.page()), receipt)
     filled = {'#location': 'Approved location'}
-    forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)
     forged['committed_value'] = 'forged'
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, filled, True, receipts=[forged])
-    assert not any(c[0] == 'submit' for c in session.calls)
+    forms.check_form(current, filled, True, receipts=[forged])
+    with pytest.raises(forms.Gate, match='committed accessible choice or form value changed'):
+        forms.check_approvals('example-co#1', [forged], current)
+    changed = copy.deepcopy(current)
+    next(c for c in changed['controls']
+         if c['selector'] == '#location')['value'] = 'Different location'
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(changed, filled, True, receipts=[receipt])
+    assert ('click', '#submit') not in session.calls
 
 async def test_required_unapproved_bootstrap_precedes_all_widget_ipc(grants):
     session = Session()

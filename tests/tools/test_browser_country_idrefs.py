@@ -17,19 +17,28 @@ PhoneSession, dom, combo, choose_country, phone_grants, served_fixture_dom = (
 def test_absent_exact_error_in_both_independent_readers(phase):
     snapshot = dom(fullPhone=True, countryErrorAbsent=True, phases={'country': phase})
     page, witness = snapshot['page'], snapshot['witness']
-    assert page['inventory_verified'] and not page['opaque_controls'] and not page['truncated']
-    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
-    graph = combo(snapshot, 'country')['combobox']
-    assert graph == next(c['combobox'] for c in witness['controls'] if c['selector'] == '#country')
-    assert graph['mode'] == 'closed-react-select' and graph['phase'] == phase
-    assert graph['receiverless_country'] and len(graph['country_graph']) == 13
-    assert {'#country', '#phone', '#location'} <= {c['selector'] for c in page['controls']}
-    assert not {'hidden_selector', 'hidden_value', 'selected_value'} & graph.keys()
+    # A dangling error IDREF is an unproved graph, not an excuse to mint
+    # final submission evidence from a country-picker caption.
+    assert not page['inventory_verified'] and page['opaque_controls'] and not page['truncated']
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    field = combo(snapshot, 'country')
+    graph = field['combobox']
+    assert graph == next(c['combobox'] for c in witness['controls']
+                         if c['selector'] == '#country')
+    assert field['type'] == 'combobox' and not field.get('name')
+    assert {'#country', '#phone', '#location'} <= {
+        c['selector'] for c in page['controls']}
+    assert graph.get('selected_value', '') == graph.get('hidden_value', '') == ''
     if phase == 'C0':
-        assert combo(snapshot, 'country')['value'] == ''
+        assert field['value'] == ''
         assert graph['options'] == []
+    # Even if a selected caption is visible at C2, no named form value may
+    # be inferred from it while the current receiver remains unproved.
     if phase == 'C2':
-        assert graph['selected_text'] == graph['displayed_text'] == 'Approved country'
+        assert not field.get('has_value')
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, True)
 
 
 @pytest.mark.parametrize('attr', ['aria-describedby', 'aria-errormessage'])
@@ -38,12 +47,17 @@ async def test_padded_idref_list_is_valid_in_both_readers(phone_grants, attr):
     session = PhoneSession(countryErrorAbsent=True, countryAttr=[
         attr, ' react-select-country-placeholder country-error '])
     page, _ = await forms._observe_controls(session, await session.page())
-    assert page['inventory_verified'] and not page['opaque_controls']
-    graph = combo({'page': page}, 'country')['combobox']
-    assert graph['receiverless_country'] and graph['phase'] == 'C0'
+    # Whitespace around IDREF tokens is not a native form receiver. The
+    # generic reader keeps its current opacity instead of a shape exemption.
+    assert page['opaque_controls'] and not page['inventory_verified']
+    country = combo({'page': page}, 'country')
+    graph = country['combobox']
     witness = next(c for c in session.snapshot['witness']['controls']
                    if c['selector'] == '#country')
     assert graph == witness['combobox']
+    assert not country.get('name') and graph.get('selected_value', '') == ''
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, True)
     assert session.calls == []
 
 
@@ -110,11 +124,21 @@ async def test_missing_error_preserves_approved_receipt_and_literal_readbacks(ph
     session, filled = PhoneSession(countryErrorAbsent=True), {}
     receipt = await choose_country(session, phone_grants[0], filled)
     page, _ = await forms._observe_controls(session, await session.page())
-    forms.check_form(page, filled, True, receipts=[receipt])
-    forms.check_approvals('example-co#1', [receipt], page)
+    # The reversible picker option was clicked with an exact grant. A missing
+    # referenced native receiver still refuses at final Submit, with no second
+    # option click and no fabricated submitted-value evidence.
+    assert receipt['action'] == 'combobox'
+    assert receipt['committed_caption'] == receipt['committed_value'] == 'Approved country'
     graph = combo({'page': page}, 'country')['combobox']
-    assert graph['selected_text'] == graph['displayed_text'] == 'Approved country'
-    assert session.calls == [('click', '#country'), ('click', '#country-option')]
+    assert graph.get('selected_value', '') == ''
+    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
+        forms.check_form(page, filled, True, receipts=[receipt])
+    with pytest.raises(forms.Gate):
+        forms.check_approvals('example-co#1', [receipt], page)
+    assert session.calls == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', 'Approved country'),
+        ('click', '#country-option')]
 
 
 @pytest.mark.parametrize('source', ['_closed_form', '_greenhouse_form'])
@@ -129,11 +153,17 @@ def test_native_fixture_bytes_are_absent_error_c0(source):
         # cannot run hydration; initial nonqualification is tested separately.
         markup = markup.replace(b'<template id="greenhouse-template">', b'').replace(b'</template>', b'')
     snapshot = served_fixture_dom(markup)
-    assert snapshot['page']['inventory_verified'] and not snapshot['page']['opaque_controls']
-    assert [c['selector'] for c in snapshot['page']['controls']] == [c['selector'] for c in snapshot['witness']['controls']]
+    assert snapshot['page']['opaque_controls'] and not snapshot['page']['inventory_verified']
+    assert [c['selector'] for c in snapshot['page']['controls']] == [
+        c['selector'] for c in snapshot['witness']['controls']]
     assert combo(snapshot, 'country')['combobox'] == next(
-        c['combobox'] for c in snapshot['witness']['controls'] if c['selector'] == '#country')
-    assert combo(snapshot, 'country')['combobox']['phase'] == 'C0'
+        c['combobox'] for c in snapshot['witness']['controls']
+        if c['selector'] == '#country')
+    country = combo(snapshot, 'country')
+    assert country['type'] == 'combobox' and not country.get('name')
+    assert country['combobox'].get('selected_value', '') == ''
+    with pytest.raises(forms.Gate):
+        forms.check_form(snapshot['page'], {}, True)
     # The four-leg harness retains Ashby separately from the native W entry.
     assert b'id="country"' not in fixture._ashby_form()
     assert fixture._FORM == fixture._entry_form()
@@ -147,18 +177,25 @@ def test_native_fixture_bytes_are_absent_error_c0(source):
 def test_each_reference_ownership_guard_is_independently_necessary(scenario, guard):
     from tools.browser_skill_dom import PAGE
     scripts = [PAGE, forms._FIXED_CONTROL_WITNESS]
-    # Remove one predicate in memory, never in the production source. Each reader
-    # must independently expose the unsafe graph only when its guard is removed.
-    for script in scripts:
-        assert script.count(guard) == 1
+    # The retired library-specific form-graph predicate is intentionally
+    # absent after r06. Neither production reader may infer approval from it.
+    assert all(guard not in script for script in scripts)
+    # Execute both real, current readers on the same foreign IDREF DOM. The
+    # cross-form/foreign reference stays unapproved at the final form guard.
     snapshot = json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
-        json.dumps({'fullPhone': True, **scenario}),
-        *(script.replace(guard, '') for script in scripts),
+        json.dumps({'fullPhone': True, **scenario}), *scripts,
     ], text=True))
-    for reader in snapshot.values():
-        target = next(c for c in reader['controls'] if c['selector'] == '#country')
-        assert target['combobox']['receiverless_country'] is True
+    page, witness = snapshot['page'], snapshot['witness']
+    assert page['opaque_controls'] and not page['inventory_verified']
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    field = next(c for c in page['controls'] if c['selector'] == '#country')
+    independent = next(c for c in witness['controls'] if c['selector'] == '#country')
+    assert field['combobox'] == independent['combobox']
+    assert field['combobox'].get('selected_value', '') == ''
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, True)
 
 
 def test_untouched_missing_error_c0_is_closed_and_observational():

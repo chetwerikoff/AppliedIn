@@ -614,7 +614,7 @@ async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
 
 def dom(spec, script=None):
     from tests.tools.reader_node_harness import reader_output
-import json
+    import json
     return json.loads(reader_output(
         'entry_dom_fixture.js', spec, script or forms.ENTRY_PAGE))
 

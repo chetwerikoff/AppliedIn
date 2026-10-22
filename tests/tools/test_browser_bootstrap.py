@@ -245,20 +245,45 @@ async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history,
 
 
 async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monkeypatch):
+    # An untrusted query cannot manufacture a Greenhouse job/board route.
     url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
 
     def unavailable_row(*args, **kwargs):
         raise OSError('tracking unavailable')
 
-    # The cross-tenant gate must not depend on tracking storage being reachable.
     monkeypatch.setattr(forms, '_row', unavailable_row)
     monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
-        'Cross-tenant direct board must be rejected before browser open'))
+        'Malformed job query must not open the application browser'))
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'Derived board tenant or job' in result['question']
+    assert 'Malformed Greenhouse job identity' in result['question']
+
+    # r06 moves real ATS tenant/board equality to the ONE final click guard.
+    # A safely reached but unrelated allowlisted tenant has no Submit IPC.
+    trusted = 'https://careers.example-co.test/job/1'
+    foreign = 'https://job-boards.greenhouse.io/other-tenant/jobs/1'
+    row = {'pk': PK, 'company': 'example-co', 'job_id': '1',
+           'jd_url': trusted, 'ats': 'greenhouse',
+           'greenhouse_board': 'example-co', 'status': 'submitting',
+           'possible_submission': False}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    # The actual final guard must deny when the configured tenant cannot be
+    # freshly verified, independently of any page-supplied origin hint.
+    monkeypatch.setattr(forms, '_configured_alias', lambda *_a, **_kw: None)
+    writes = []
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', trusted, '', {}, {}, [], {},
+        lambda: writes.append('submit-started'))
+    target = {'selector': '#submit', 'label': 'Submit application',
+              'type': 'submit', 'tag': 'button', 'submit': True,
+              'in_form': True, 'form_selector': '#app',
+              'form_action': foreign}
+    with pytest.raises(forms.Gate, match='tenant or board'):
+        await controller.authorize_final_submit(
+            None, {'url': foreign, 'controls': [target]}, target)
+    assert writes == [] and controller.committed is False
 
 
 @pytest.mark.parametrize('extra,selected', [

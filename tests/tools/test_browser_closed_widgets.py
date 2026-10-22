@@ -298,23 +298,33 @@ async def test_committed_new_mode_still_gets_independent_presubmit_witness(grant
 
 
 @pytest.mark.parametrize('boundary', ['initial', 'identity', 'phase', 'downgrade', 'missing'])
-async def test_observation_itself_refuses_unproved_continuation(boundary):
-    session = Session()
-    if boundary != 'initial':
-        await forms._observe_controls(session, await session.page())
-    if boundary == 'initial':
-        session.snapshot = dom(phases={'location': 'C1'})
-    elif boundary == 'identity':
-        session.snapshot = dom(drift='field')
-    elif boundary == 'phase':
-        session._closed_admissions['#location']['phase'] = 'C1'
-    elif boundary == 'downgrade':
-        session.snapshot = dom(phases={'location': 'C1'}, badGraph=True)
-    elif boundary == 'missing':
+async def test_unproved_closed_widget_observation_refuses_final_submit(
+        boundary, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
+    # A vanished C0/C1/C2 structural certificate no longer prevents a safe
+    # observation or reversible preparation. It cannot authorize a final
+    # application Submit: exercise the real raw-click guard, not a removed
+    # per-step _closed_admissions gate.
+    scenario = {
+        'initial': {'phases': {'location': 'C1'}},
+        'identity': {'drift': 'field'},
+        'phase': {'phases': {'location': 'C2'}, 'badGraph': True},
+        'downgrade': {'phases': {'location': 'C1'}, 'badGraph': True},
+        'missing': {},
+    }[boundary]
+    session = Session(**scenario)
+    if boundary == 'missing':
         for observation in session.snapshot.values():
-            observation['controls'] = [c for c in observation['controls'] if c['selector'] != '#location']
-    with pytest.raises(forms.Gate):
-        await forms._observe_controls(session, await session.page())
+            observation['controls'] = [
+                c for c in observation['controls']
+                if c['selector'] != '#location'
+            ]
+    assert session.calls == []
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path)
     assert session.calls == []
 
 
@@ -476,7 +486,6 @@ async def test_never_committed_component_times_out_without_more_ipc(monkeypatch,
     with pytest.raises(forms.Gate, match='bounded wait'):
         await choose(session, grants)
     assert session.calls == [('click', '#location'), ('click', '#location-option')]
-
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 def test_required_proxies_are_not_answers_or_immutable_identity(phase):

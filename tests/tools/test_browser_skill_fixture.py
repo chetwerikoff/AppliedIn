@@ -1016,8 +1016,18 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     # The offline transport supplies an incomplete inventory, not a false
     # success receipt; the controller must gate before any mutating operation.
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert '"submitted": false' in result.stdout.lower()
-    assert '"status": "gate"' in result.stdout.lower()
+    # A Python import/fixture crash is NOT a verified application refusal.
+    # Demand structured outcomes from the real daemon fixture in addition to
+    # the no-mutation subprocess trace below.
+    assert "Traceback" not in result.stderr, result.stderr
+    reports = [json.loads(line) for line in result.stdout.splitlines()
+               if line.lstrip().startswith("{")]
+    assert len(reports) == 10, (result.stdout, result.stderr)
+    assert all(report['submitted'] is False and report['submit']['ipc_returned'] is False
+               and report['submit']['post_attempts'] == 0
+               for report in reports[:-1])
+    assert reports[-1]['submitted'] is False
+    assert reports[-1]['safe_gate'] is False
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
     assert "http_handler_selected" in kinds

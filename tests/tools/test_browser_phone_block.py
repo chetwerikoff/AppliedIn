@@ -406,3 +406,48 @@ def test_genuine_country_option_linkage_failure_keeps_country_commit_cause():
     target['combobox']['options'] = []
     with pytest.raises(forms.Gate, match='receiverless country commitment'):
         forms._combobox_options(target)
+
+@pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
+async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
+        phase, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+    # The unnamed, empty, optional country-search and its closed 244-option
+    # popup have no form-submitted value. Their hidden ARIA role cannot mask
+    # the real, still-inventoried applicant inputs or authorize Submit.
+    snapshot = dom(fullPhone=True, phases={'country': phase})
+    page, fixed = snapshot['page'], snapshot['witness']
+    assert page['inventory_verified'] is True and page['opaque_controls'] is False
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in fixed['controls']]
+    selectors = {c['selector'] for c in page['controls']}
+    assert {'#phone', '#country', '#resume', '#submit'} <= selectors
+    assert not {'#country-search', '#country-button', '#country-list',
+                '#picker-option-0', '#picker-option-243'} & selectors
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
+
+
+@pytest.mark.parametrize('attribute,value', [
+    ('aria-required', 'true'),
+    ('name', 'hidden_receiver'),
+    ('type', 'submit'),
+])
+async def test_hidden_submittable_aria_controls_remain_visible_to_final_guard(
+        attribute, value, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+    # The generic inactive-role exception MUST NOT consume required, named
+    # or committing controls, even while their picker is collapsed. A hidden
+    # page is never evidence that these submitted receivers are safe.
+    snapshot = dom(fullPhone=True, pickerAttr=[
+        'country-search', attribute, value,
+    ])
+    page, fixed = snapshot['page'], snapshot['witness']
+    assert '#country-search' in {c['selector'] for c in page['controls']}
+    assert '#country-search' in {c['selector'] for c in fixed['controls']}
+    assert page['opaque_controls'] is True
+    assert page['inventory_verified'] is False
+    await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)

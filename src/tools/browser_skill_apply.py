@@ -4439,6 +4439,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             raise Gate('The initial application route is not an approved preparation origin.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
+        # Staging may yield to storage callbacks. A redirect is usable for
+        # preparation only while its original tracked employer/job is current.
+        # Tenant/board pin equality remains exclusively at final Submit.
+        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
+        if (isinstance(provenance, VendorRedirectProvenance)
+                and not _preparation_current(provenance, fixture_context=ctx)):
+            raise Gate('The tracked vendor redirect changed before BrowserSkill startup.')
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}
@@ -4487,6 +4494,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
              detail='Applying through BrowserSkill in the dedicated Chrome profile')
         async with asyncio.timeout(2700):
             async with bsk.Session('apply') as raw_session:
+                # A session can be acquired after the tracked row changes.
+                # Preserve the code-owned dispatch/origin protection before
+                # the first navigation, without reinstating early ATS pins.
+                verify_dispatch()
+                _tracked_preparation_job(pk, company, url, fixture_context=ctx)
+                if (isinstance(provenance, VendorRedirectProvenance)
+                        and not _preparation_current(provenance, fixture_context=ctx)):
+                    raise Gate('The tracked vendor redirect changed before first navigation.')
                 if ctx is None and hasattr(raw_session, 'bind_application_controller'):
                     # The production Session must retain the exact bound guard.
                     # A caller with a no-op binder has no committing authority.

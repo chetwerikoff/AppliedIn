@@ -319,7 +319,7 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     assert len(anonymous) == 1
     # An unnamed blank validation proxy has no answer identity. It must stay
     # in the final required-field census, but cannot steal this exact grant.
-    assert collisions == [hidden]
+    assert collisions == []
     assert forms._key(page, location) == "Where are you located?"
     # It independently prevents Submit if a previously incomplete inventory
     # is replaced by a complete read with this required native value empty.
@@ -332,7 +332,7 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     # hidden machine field still does not collide with the approved question.
     without_proxy = {**page, "controls": [
         c for c in page["controls"] if c is not anonymous[0]]}
-    assert forms._approval_question_collisions(without_proxy, location) == [hidden]
+    assert forms._approval_question_collisions(without_proxy, location) == []
     assert forms._key(without_proxy, location) == "Where are you located?"
 
 

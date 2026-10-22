@@ -399,9 +399,13 @@ async def test_rejected_candidates_gate_same_field_before_click(grant_row, optio
         assert ('click', '#location-option-2') in session.calls
         assert receipt['committed_caption'] == ANSWER
         assert receipt['committed_value'] == 'another-verified'
-        with pytest.raises(forms.Gate):
-            forms.check_form(await session.page(), filled, uploaded=True,
-                             receipts=[receipt])
+        # Form-owned data can look internally consistent while disagreeing
+        # with the exact option clicked. Keep both production checks: current
+        # receiver and independent action receipt/grant must agree at Submit.
+        final = await session.page()
+        forms.check_form(final, filled, uploaded=True, receipts=[receipt])
+        with pytest.raises(forms.Gate, match='committed accessible choice'):
+            forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
     else:
         assert receipt.get('unresolved') and filled == {}
         assert not any(call[0] == 'click' and call[1].startswith('#location-option')

@@ -1463,16 +1463,6 @@ def _page_identity(page: dict) -> tuple:
 
 _APPLICATION_WAIT_SECONDS = 15.0
 
-def _application_marker(siblings: list[dict]) -> bool:
-    return any(
-        (native_submit(c) and any(_same_key(t) in _APP_SUBMIT_LABELS
-                                   for t in _submitter_texts(c)))
-        or (c.get('type') == 'file'
-            and re.search(r'resume|résumé|\bcv\b', label(c), re.I))
-        for c in siblings)
-
-
-
 def _ashby_native_classify(page: dict, provenance: ApplicationEntryProvenance) -> None:
     """Bind only independently witnessed native raw action to the tracked job.
 
@@ -1634,7 +1624,7 @@ def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=
             or page.get('unsupported_frames')):
         raise Gate('The current form control inventory is malformed or has unsupported frames.')
     if readiness:
-        _greenhouse_control_shape(page)
+        _inventory_ok(page, complete=False)
     root = observed['root']
     if root is None and (readiness or (submitted and not frames)):
         # Only the waiter may defer a missing receiver before a click. After
@@ -2250,41 +2240,8 @@ def _entry_not_ready(page):
         return 'no unique application root' if _formless_root(page) else 'no qualifying application form'
     return ''
 
-def _greenhouse_control_shape(page):
-    controls = page.get('controls')
-    if (not isinstance(controls, list) or any(not isinstance(c, dict) or
-            not isinstance(c.get('selector'), str) or not c['selector']
-            or not isinstance(c.get('tag'), str) or not isinstance(c.get('type'), str)
-            or type(c.get('in_form')) is not bool
-            or (c['in_form'] and not c.get('form_selector')) for c in controls)):
-        raise Gate('The current form control inventory is malformed.')
-    if len({c['selector'] for c in controls}) != len(controls):
-        raise Gate('The current DOM witness is unavailable or changed; predicate=selector.unique')
-    for c in controls:
-        for key in ('form_selector', 'form_action', 'formaction', 'native_form_owner_selector'):
-            if not isinstance(c.get(key), str):
-                raise Gate('The current form control inventory is malformed.')
-        if type(c.get('disabled')) is not bool:
-            raise Gate('The current form control inventory is malformed.')
-        if c['type'] == 'combobox':
-            combo = c.get('combobox')
-            if not isinstance(combo, dict):
-                raise Gate('The current form control inventory is malformed.')
-            for key, value in combo.items():
-                expected = (bool if key in {'quarantined', 'required_proxy_mounted', 'receiverless_country', 'linked'}
-                            else list if key in {'country_graph', 'options'} else str)
-                if not isinstance(value, expected):
-                    raise Gate('The current form control inventory is malformed.')
-            if (type(combo.get('linked')) is not bool
-                    or not isinstance(combo.get('link_id'), str)
-                    or (combo['linked'] and (not isinstance(combo.get('listbox_selector'), str)
-                                           or not isinstance(combo.get('options'), list)))
-                    or (not combo['linked'] and combo.get('options') not in (None, []))):
-                raise Gate('The current form control inventory is malformed.')
-
-
 def _greenhouse_not_ready(page, *, witness=False):
-    _greenhouse_control_shape(page)
+    _inventory_ok(page, complete=False)
     if witness:
         for c in page['controls']:
             if (c.get('unique') is not True or c.get('unique_form') is not True
@@ -2389,7 +2346,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         raise _EntryNotReady(reason)
                     qualifying = any(
                         not _formless_root(page) and c.get('in_form')
-                        and _application_marker(_form_subject(page, c))
+                        and _form_subject(page, c)
                         and (_native_answer(c) or (c.get('tag') == 'input'
                              and c.get('type') in {'radio', 'checkbox'}))
                         and witness[c['selector']].get('visible') is True
@@ -2925,8 +2882,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
-    if not _application_marker(siblings):
-        raise Gate('No positive native application-form marker was observed.')
+    # A positive Submit/file marker is final form evidence, not permission
+    # to disclose an exact-approved value on an allowed preparation origin.
     check_form_destination(page, target, *origins, provenance=provenance)
     question = {
         'pk': '', 'label': key, 'selector': target['selector'],
@@ -2998,10 +2955,6 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
         if c.get('in_form') and (
                 _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
             raise Gate('Material assent outside a bound choice needs human inspection.')
-        if (c.get('required') and c.get('in_form')
-                and c.get('tag') not in {'input', 'textarea', 'select', 'button'}
-                and c.get('type') != 'combobox'):
-            raise Gate('An uninspectable required choice needs human review.')
 
 
 

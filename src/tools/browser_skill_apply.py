@@ -2576,12 +2576,36 @@ def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
         raise Gate('The observed field has no distinct approval question.')
-    # Hidden machine-value inputs repeat their visible control's group question,
-    # but cannot receive a separate human answer or approval grant.
-    if any(c.get('type') != 'hidden'
-           for c in _approval_question_collisions(page, target)):
-        raise Gate('More than one control uses the same approval question; review manually.')
-    return key
+    # Hidden machine-value inputs cannot receive a separate human grant.
+    conflicts = [c for c in _approval_question_collisions(page, target)
+                 if c.get('type') != 'hidden']
+    if not conflicts:
+        return key
+    # A semantic fieldset may supply the SAME legend to several different
+    # native answers (e.g. a country picker beside the actual Phone input).
+    # Only disambiguate it when exactly one visible native receiver itself
+    # bears that legend, every sibling has a distinct readable label, and
+    # no other control claims the resulting label. Two unrelated questions
+    # with the same legend and no such anchor remain ambiguous.
+    if (target.get('type') != 'radio' and target.get('in_form') is True
+            and isinstance(target.get('question'), str)
+            and target['question'].strip()):
+        siblings = [target, *conflicts]
+        labels = [c.get('label') for c in siblings]
+        if (all(isinstance(label, str) and label.strip() for label in labels)
+                and all(c.get('type') not in {'radio', 'hidden'} for c in siblings)
+                and all(c.get('question') == target['question'] for c in siblings)
+                and len({_same_key(label) for label in labels}) == len(labels)
+                and sum(_same(label, target['question']) for label in labels) == 1):
+            selected = target['label']
+            others = [c for c in page['controls']
+                      if c is not target and c not in conflicts
+                      and c.get('type') != 'hidden'
+                      and c.get('form_selector') == target.get('form_selector')]
+            if not any(_same(selected, c.get('question') or c.get('label') or '')
+                       for c in others):
+                return selected
+    raise Gate('More than one control uses the same approval question; review manually.')
 
 
 def _fact_key(facts: dict, observed_label: str) -> str | None:

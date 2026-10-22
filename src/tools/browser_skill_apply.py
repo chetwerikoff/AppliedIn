@@ -1263,11 +1263,13 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
-  const all = Array.from(document.querySelectorAll(query)).filter(e => !inactiveRolePart(e) && !requiredProxies.has(e) && !pickerParts.has(e) && (
+  const all = Array.from(document.querySelectorAll(query)).filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (
     e.getAttribute('role') !== 'option' || !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))));
   return {url: location.href, controls: all
-    .filter(e => visible(e) || e.form || e.closest('form') || e.type === 'file')
+    .filter(e => (!!e.getClientRects().length &&
+      getComputedStyle(e).visibility !== 'hidden') ||
+      e.form || e.closest('form') || e.type === 'file')
     .map(e => {
       const form = e.form || e.closest('form');
       const type = e.getAttribute('role') ||

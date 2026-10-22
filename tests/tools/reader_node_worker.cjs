@@ -32,36 +32,73 @@ function evaluate(request) {
   const filename = path.resolve(fixture);
   const source = fs.readFileSync(filename, 'utf8');
   let stdout = '', stderr = '';
-  const output = {
-    log: (...args) => { stdout += util.format(...args) + '\n'; },
-    info: (...args) => { stdout += util.format(...args) + '\n'; },
-    warn: (...args) => { stderr += util.format(...args) + '\n'; },
-    error: (...args) => { stderr += util.format(...args) + '\n'; },
+  // Reader-visible globals belong to this VM. Host callbacks are captured in
+  // bootstrap closures and removed from the global before fixture code runs.
+  // In particular, URLs and CommonJS objects must not expose host prototypes.
+  const argvJSON = JSON.stringify(['node', filename, ...argv]);
+  const bridge = {
+    argv: () => argvJSON,
+    parseURL(input, base) {
+      const url = new URL(input, base);
+      return JSON.stringify({
+        href: url.href, protocol: url.protocol, hostname: url.hostname,
+        host: url.host, origin: url.origin, pathname: url.pathname,
+        search: url.search, hash: url.hash, port: url.port,
+        username: url.username, password: url.password,
+      });
+    },
+    write(kind, args) {
+      const line = util.format(...args) + '\n';
+      if (kind === 'stderr') stderr += line;
+      else stdout += line;
+    },
+    load(requested) {
+      if (path.basename(filename) !== 'entry_dom_fixture.js' ||
+          requested !== './lever_card_fixture.cjs')
+        throw Error('Unsupported fixture-relative require: ' + String(requested));
+      const dependency = path.join(path.dirname(filename), 'lever_card_fixture.cjs');
+      const bytes = fs.readFileSync(dependency, 'utf8');
+      const module = vm.runInContext('({exports:{}})', context);
+      const wrapper = vm.runInContext(
+        '(function(module, exports, require, __filename, __dirname) {\n' +
+        bytes + '\n})', context, {filename: dependency, timeout: timeout_ms});
+      const noNestedRequire = vm.runInContext(
+        '() => { throw Error("Nested fixture requires are not supported"); }',
+        context);
+      wrapper(module, module.exports, noNestedRequire,
+              dependency, path.dirname(dependency));
+      return module.exports;
+    },
   };
-  class RequestURL extends URL {}
-  const sandbox = {
-    console: output,
-    process: {argv: ['node', filename, ...argv]},
-    URL: RequestURL,
-  };
-  const context = vm.createContext(sandbox);
-  // In Node's normal CommonJS context global is an alias of globalThis.
-  vm.runInContext('globalThis.global = globalThis', context);
-  sandbox.require = requested => {
-    if (path.basename(filename) !== 'entry_dom_fixture.js' ||
-        requested !== './lever_card_fixture.cjs')
-      throw Error('Unsupported fixture-relative require: ' + String(requested));
-    const dependency = path.join(path.dirname(filename), 'lever_card_fixture.cjs');
-    const bytes = fs.readFileSync(dependency, 'utf8');
-    const module = {exports: {}};
-    const wrapper = vm.runInContext(
-      '(function(module, exports, require, __filename, __dirname) {\n' +
-      bytes + '\n})', context, {filename: dependency, timeout: timeout_ms});
-    wrapper(module, module.exports, () => {
-      throw Error('Nested fixture requires are not supported');
-    }, dependency, path.dirname(dependency));
-    return module.exports;
-  };
+  const context = vm.createContext({__bridge: bridge});
+  vm.runInContext([
+    '(() => {',
+    '  const {argv, parseURL, write, load} = globalThis.__bridge;',
+    '  delete globalThis.__bridge;',
+    '  globalThis.global = globalThis;',
+    '  globalThis.process = {argv: JSON.parse(argv())};',
+    '  globalThis.console = {',
+    "    log: (...args) => write('stdout', args),",
+    "    info: (...args) => write('stdout', args),",
+    "    warn: (...args) => write('stderr', args),",
+    "    error: (...args) => write('stderr', args),",
+    '  };',
+    '  globalThis.URL = class URL {',
+    '    constructor(input, base) {',
+    '      let data;',
+    '      try { data = parseURL(String(input), base === undefined ? undefined : String(base)); }',
+    '      catch (error) { throw new TypeError(String(error.message || error)); }',
+    '      Object.assign(this, JSON.parse(data));',
+    '    }',
+    '    toString() { return this.href; }',
+    '    toJSON() { return this.href; }',
+    '  };',
+    '  globalThis.require = name => {',
+    '    try { return load(name); }',
+    '    catch (error) { throw new Error(String(error.message || error)); }',
+    '  };',
+    '})()',
+  ].join('\n'), context);
 
   try {
     vm.runInContext(source, context, {filename, timeout: timeout_ms});

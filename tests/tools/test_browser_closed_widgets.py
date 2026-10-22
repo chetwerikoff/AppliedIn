@@ -138,12 +138,16 @@ class Session:
 
 
 class FormOwnedSelection(Session):
-    """Simulate a real DOM change handler, not a receipt-guessed receiver.
+    """Emulate form-owned values from a real DOM option change handler.
 
-    Each uniquely observed safe option click updates the *current* form-owned
-    input. An ordinary picker fill alone still cannot select an option.
+    The base fake regenerates synthetic DOM on every picker action. Persist
+    each independently observed committed selection across those re-renders;
+    a search fill alone still cannot select an option or create a receiver.
     """
-    observed_choice = None
+    def __init__(self, **scenario):
+        super().__init__(**scenario)
+        self.selected_form_values = {}
+        self.observed_choice = None
 
     async def call(self, *args):
         selected = None
@@ -161,17 +165,21 @@ class FormOwnedSelection(Session):
             assert selected['value']  # captured machine code, not a caption guess
         result = await super().call(*args)
         if selected is not None:
+            self.selected_form_values[key] = (selected['label'], selected['value'])
             if key == 'location':
-                self.observed_choice = (selected['label'], selected['value'])
+                self.observed_choice = self.selected_form_values[key]
+        for selected_key, (caption, machine_value) in self.selected_form_values.items():
+            if self.phases.get(selected_key) != 'C2':
+                continue
             for reader in self.snapshot.values():
                 owner = next(c for c in reader['controls']
-                             if c['selector'] == '#'+key)
-                owner.update(name=key, value=selected['value'], has_value=True)
+                             if c['selector'] == '#'+selected_key)
+                owner.update(name=selected_key, value=machine_value, has_value=True)
                 owner['combobox'].update(
-                    selected_text=selected['label'],
-                    displayed_text=selected['label'],
-                    selected_value=selected['value'])
+                    selected_text=caption, displayed_text=caption,
+                    selected_value=machine_value)
         return result
+
 
 async def test_synthetic_reversible_picker_fill_is_not_a_selection():
     session = Session()

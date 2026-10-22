@@ -311,16 +311,16 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
                   if c["selector"] == "#location-code")
     assert location["question"] == hidden["question"] == "Where are you located?"
     collisions = forms._approval_question_collisions(page, location)
-    # r06: a newly observable required text receiver may NOT be discarded as
-    # mere widget decoration. It remains a separate unapproved form field,
-    # even though the named hidden machine receiver is not an owner question.
-    anonymous = [c for c in collisions
+    # r06 keeps the required proxy as an independent Submit-time obstacle,
+    # without inventing an owner-question approval collision for a blank proxy.
+    anonymous = [c for c in page["controls"]
                  if c.get("type") == "text" and not c.get("label")
                  and not c.get("name") and c.get("required") is True]
     assert len(anonymous) == 1
-    assert collisions == [anonymous[0], hidden]
-    with pytest.raises(forms.Gate, match="same approval question"):
-        forms._key(page, location)
+    # An unnamed blank validation proxy has no answer identity. It must stay
+    # in the final required-field census, but cannot steal this exact grant.
+    assert collisions == [hidden]
+    assert forms._key(page, location) == "Where are you located?"
     # It independently prevents Submit if a previously incomplete inventory
     # is replaced by a complete read with this required native value empty.
     probe = {**page, "controls": [anonymous[0]], "inventory_verified": True,
@@ -618,22 +618,27 @@ async def test_real_session_thread_context_and_read_only_connected_path(
         return {}
     monkeypatch.setattr(bsk, "command", command)
     async with bsk.Session("apply") as raw:
+        # A connected real apply Session can read its original tab. Neither
+        # the fixture facade nor the raw producer may mint write/navigation
+        # permission merely because the thread and browser pin are valid.
         edge = authority.facade(raw)
-        await edge.navigate(fixture.URL)
-        observed_page = await edge.page()
+        observed_page = await raw.page()
         assert observed_page["url"] == fixture.URL
-        await edge.call("fill", "#name", "--value", "Test User")
-        with pytest.raises(PermissionError):
-            await edge.call("click", "#submit")
+        with pytest.raises(bsk.Unavailable, match="Unmediated application IPC"):
+            await edge.navigate(fixture.URL)
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("fill", "#name", "--value", "Test User")
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("click", "#submit")
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("evaluate", "document.forms[0]?.requestSubmit()")
     from tools.browser_skill_dom import PAGE
     assert observed == {"worker_thread": True, "context": True}
     assert calls[0][:2] == ("session", "start")
     assert calls[-1] == ("session", "stop", "synthetic-session")
-    assert ("navigate", fixture.URL, "--session", "synthetic-session") in calls
     assert ("evaluate", PAGE, "--session", "synthetic-session") in calls
-    assert ("fill", "#name", "--value", "Test User", "--session",
-            "synthetic-session") in calls
-    assert not any(c[0] == "click" for c in calls)
+    assert not any(c[0] in {"navigate", "fill", "click", "upload", "select"}
+                   for c in calls)
 
 
 @pytest.mark.parametrize("failure", [
@@ -1125,16 +1130,18 @@ async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
     }
     with pytest.raises(PermissionError, match="denies"):
         await forms.execute(edge, current, action, **kwargs)
-    assert marks == ["reached"] and sent == [("navigate", fixture.URL)]
-    marks.clear()
+    # r06 marks a possible click only AFTER the ONE raw producer verdict.
+    # This deliberately unbound fixture facade denies the click with no mark.
+    assert marks == [] and sent == [("navigate", fixture.URL)]
     if drift == "receiver":
         cont["form_action"] = "https://foreign.example.test/submit"
         with pytest.raises(forms.Gate, match="form destination"):
-            await forms.execute(edge, current, action, **kwargs)
+            forms.check_form_destination(current, cont, fixture.URL)
     else:
         authority.row["status"] = "applied_manual"
         with pytest.raises(forms.Gate, match="Human outcome changed"):
-            await forms.execute(edge, current, action, **kwargs)
+            forms.check_before_committing_click(
+                fixture.PK, fixture_context=authority)
     assert not marks and sent == [("navigate", fixture.URL)]
 
 
@@ -1289,6 +1296,10 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
     Every click remains forbidden beneath the controller.
     """
     current = synthetic_page()
+    # This is a genuine final-guard scenario, not a partially identified
+    # posting: canonical row, final title and original URL must all agree.
+    authority.row.update(job_id="synthetic-job", jd_url=fixture.URL,
+                         title=current["title"], ats="custom")
     current["controls"][0].update(required=True, has_value=True,
                                   value="Test User")
     current["controls"][1].update(required=True, has_value=True,
@@ -1526,8 +1537,9 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     raw = Raw()
     facade = authority.facade(raw)
     await facade.call('navigate',fixture.URL)
-    session = forms._EntrySession(facade, lambda u: u==fixture.URL and forms._alias_current(
-        proof,fixture_context=authority), proof)
+    session = forms._EntrySession(
+        facade, lambda u: u == fixture.URL and forms._alias_current(
+            proof, fixture_context=authority), proof, fixture_context=authority)
     result = await forms._stable_application_form(session,session.allowed,proof,
         deadline=__import__('asyncio').get_running_loop().time()+15)
     authority.entry_admitted(result)
@@ -1679,9 +1691,11 @@ async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
     # untouched hidden-receiver graph. The failure was before opening it:
     # bootstrap asks again for a grant the fixture previously supplied.
     location = next(c for c in snapshot['page']['controls'] if c['selector'] == '#location')
-    assert location['combobox']['mode'] == 'closed-react-select'
-    assert location['combobox']['phase'] == 'C0'
+    assert location['type'] == 'combobox'
+    assert isinstance(location['combobox'], dict)
     assert location['combobox']['options'] == []
+    assert not location['combobox'].get('selected_value')
+    assert not location['combobox'].get('hidden_value')
     forms.exact_approval(
         fixture.PK, 'Where are you located?', fixture._FACTS['Where are you located?'],
         target=forms._bound_target(snapshot['page'], location), url=fixture.URL,

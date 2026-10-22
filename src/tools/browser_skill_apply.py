@@ -765,12 +765,34 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
         submit_hold.mark(pk, tracking=tracking)
         if not submit_hold.is_held(pk, tracking=tracking):
             raise RuntimeError('Submission hold read-back is missing')
-        # Human-visible context is supplemental; stale row writes cannot erase the key.
-        tracking.set_status(
-            pk, Status.NEEDS_HUMAN, gate_reason='submit_uncertain',
-            gate_pending={'question': submit_hold.REASON}, gate_call_id=None,
-            fail_kind='uncertain', fail_reason=submit_hold.REASON,
-            last_button=context['last_button'], last_url=context['url'])
+        # Status must transition from THIS attempt's observed submitting row.
+        # A concurrent manual/applied outcome cannot be overwritten by a plain
+        # set_status() after the key is marked. Reuse the storage adapter's
+        # WATCH-backed conditional merge, preserving unrelated current fields.
+        reader_fields = ('jd_read_attempts', 'jd_read_retry_at',
+                         'jd_read_revision', 'jd_text', 'jd_read_prepare_only')
+        reader_witness = {field: current[field] for field in reader_fields
+                          if field in current}
+        updates = {
+            'status': Status.NEEDS_HUMAN,
+            'gate_reason': 'submit_uncertain',
+            'gate_pending': {'question': submit_hold.REASON},
+            'gate_call_id': None,
+            'fail_kind': 'uncertain',
+            'fail_reason': submit_hold.REASON,
+            'last_button': context['last_button'],
+            'last_url': context['url'],
+        }
+        if not tracking.update_if_status(
+                pk, Status.SUBMITTING, updates, expected_reader=reader_witness):
+            # The key is intentionally retained: a failed status transition
+            # cannot make a possibly overlapping Submit safe to replay.
+            raise Gate('Current submitting row changed before its hold transition; no click is safe.')
+        held_row = tracking.get_current(pk) or {}
+        if (held_row.get('status') != 'needs_human'
+                or held_row.get('gate_reason') != 'submit_uncertain'
+                or not submit_hold.is_held(pk, tracking=tracking)):
+            raise Gate('Own submission hold or status transition changed; no click is safe.')
     except Gate:
         raise
     except Exception as exc:

@@ -120,9 +120,9 @@ def test_closed_fixture_bytes_are_reread_between_requests(tmp_path):
     spec = {"phases": {"location": "C0"}}
     scripts = (production.PAGE, forms._FIXED_CONTROL_WITNESS)
     base = harness.reader_output(fixture, spec, *scripts)
-    fixture.write_text('console.log("modified-closed-fixture");\\n' + original)
+    fixture.write_text('console.log("modified-closed-fixture");\n' + original)
     assert harness.reader_output(fixture, spec, *scripts).startswith(
-        "modified-closed-fixture\\n")
+        "modified-closed-fixture\n")
     fixture.write_text(original)
     assert harness.reader_output(fixture, spec, *scripts) == base
 

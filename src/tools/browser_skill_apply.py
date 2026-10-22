@@ -4439,13 +4439,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             raise Gate('The initial application route is not an approved preparation origin.')
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
-        # Staging may yield to storage callbacks. A redirect is usable for
-        # preparation only while its original tracked employer/job is current.
+        # Staging may yield to storage callbacks. Recheck the vendor-specific
+        # redirect before the generic tracked-dispatch check so a drift retains
+        # its precise pre-browser reason; neither check permits browser IPC.
         # Tenant/board pin equality remains exclusively at final Submit.
-        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
         if (isinstance(provenance, VendorRedirectProvenance)
                 and not _preparation_current(provenance, fixture_context=ctx)):
             raise Gate('The tracked vendor redirect changed before BrowserSkill startup.')
+        _tracked_preparation_job(pk, company, url, fixture_context=ctx)
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}

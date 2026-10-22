@@ -100,17 +100,57 @@ class Session:
         if args[0] == 'evaluate':
             assert args[1] == forms._FIXED_CONTROL_WITNESS
             return {'value': copy.deepcopy(self.snapshot['witness'])}
+        if args[0] == 'fill':
+            # r06 permits an exact-approved reversible picker search write.
+            # Filling does NOT select an option, populate any hidden receiver,
+            # or confer permission for a final Submit. Only the raw option
+            # click may cause a later independent committed-value readback.
+            if (len(args) != 4 or args[2] != '--value'
+                    or args[1] not in {'#' + k for k in (*KEYS, 'country')}
+                    or not isinstance(args[3], str) or not args[3]):
+                pytest.fail('Unsafe synthetic combobox fill: '+repr(args))
+            self.calls.append(args)
+            for reader in self.snapshot.values():
+                matches = [c for c in reader['controls']
+                           if c['selector'] == args[1]]
+                assert len(matches) == 1 and matches[0]['type'] == 'combobox'
+                target = matches[0]
+                target.update(value=args[3], has_value=True)
+                target['combobox']['displayed_text'] = args[3]
+                assert target['combobox'].get('selected_value', '') == ''
+            return {}
         self.calls.append(args)
         assert args[0] == 'click', 'No filter/clear/unmount/country/submit IPC is needed'
         selector = args[1][1:]
-        if selector in KEYS:
+        if selector in (*KEYS, 'country'):
             self.phases[selector] = 'C1'
-        elif selector.endswith('-option'):
+        elif selector.endswith('-option') and selector.removesuffix('-option') in (*KEYS, 'country'):
             self.phases[selector.removesuffix('-option')] = 'C2'
         else:
             pytest.fail('Forbidden synthetic IPC: '+repr(args))
-        self.snapshot = dom(phases=self.phases, **self.scenario)
+        scenario = {**self.scenario, 'phases': {
+            **self.scenario.get('phases', {}), **self.phases}}
+        self.snapshot = dom(**scenario)
         return {}
+
+
+async def test_synthetic_reversible_picker_fill_is_not_a_selection():
+    session = Session()
+    await session.call('click', '#location')
+    await session.call('fill', '#location', '--value', 'Approved location')
+    assert session.calls == [
+        ('click', '#location'),
+        ('fill', '#location', '--value', 'Approved location')]
+    for reader in session.snapshot.values():
+        target = next(c for c in reader['controls'] if c['selector'] == '#location')
+        assert target['value'] == 'Approved location' and target['has_value']
+        assert target['combobox']['displayed_text'] == 'Approved location'
+        assert target['combobox']['selected_value'] == ''
+        assert target['combobox']['hidden_value'] == ''
+    # A typed input is preparation, never final form-own selection proof.
+    with pytest.raises(forms.Gate):
+        forms.check_form(session.snapshot['page'],
+                         {'#location': 'Approved location'}, True)
 
 
 @pytest.fixture

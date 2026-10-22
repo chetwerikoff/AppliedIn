@@ -85,14 +85,24 @@ async def test_unproven_reference_still_gates_before_ipc(
     assert session.calls == []
 
 
-async def test_read_only_recognition_does_not_cache_missing_error_admission(phone_grants):
+async def test_read_only_recognition_does_not_cache_missing_error_admission(
+        phone_grants, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
     session = PhoneSession(countryErrorAbsent=True)
     await forms._observe_controls(session, await session.page())
     assert session.calls == []
+    # A later DOM with a foreign ARIA error owner loses inspectability.
+    # Reversible preparation is not required to throw a human Gate here:
+    # the real final raw-click guard must refuse with zero Submit IPC.
     session.scenario.update(countryErrorAbsent=False, countryErrorOutside=True)
     session.snapshot = dom(**session.scenario)
-    with pytest.raises(forms.Gate):
-        await choose_country(session, phone_grants[0])
+    assert session.snapshot['page']['inventory_verified'] is False
+    assert session.snapshot['page']['opaque_controls'] is True
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path)
     assert session.calls == []
 
 

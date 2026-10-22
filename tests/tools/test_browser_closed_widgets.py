@@ -162,10 +162,14 @@ class FormOwnedSelection(Session):
             selected = copy.deepcopy(matches[0])
             assert selected['unique'] is True and selected['safe'] is True
             assert not selected.get('submit') and not selected.get('navigates')
-            assert selected['value']  # captured machine code, not a caption guess
+            # Emulate a real change handler's submitted value: use the
+            # option code when present, otherwise its exact caption. The
+            # final guard still requires an independent form-owned readback.
+            machine_value = selected['value'] or selected['label']
+            assert machine_value
         result = await super().call(*args)
         if selected is not None:
-            self.selected_form_values[key] = (selected['label'], selected['value'])
+            self.selected_form_values[key] = (selected['label'], machine_value)
             if key == 'location':
                 self.observed_choice = self.selected_form_values[key]
         for selected_key, (caption, machine_value) in self.selected_form_values.items():
@@ -1011,9 +1015,17 @@ def test_untouched_required_proxy_and_other_required_field_cannot_submit(key):
                   proxyMutation={'key': key, 'parent': 'outside'})
     ordinary = [c for c in outside['page']['controls']
                 if c.get('required') and c['type'] == 'text' and not c['has_value']]
-    assert len(ordinary) == 1
-    with pytest.raises(forms.Gate, match='Required field is empty'):
-        forms.check_form({'controls': ordinary, 'inventory_verified': True}, {}, True)
+    # The generic reader retains all five required text inputs, not only
+    # the one whose proxy was moved. Each empty native receiver independently
+    # blocks final Submit; an old proxy-specific inventory exemption cannot
+    # hide the four peers.
+    assert len(ordinary) == 5
+    assert len({c['selector'] for c in ordinary}) == len(ordinary)
+    for field in ordinary:
+        assert field['tag'] == 'input' and field['in_form'] is True
+        with pytest.raises(forms.Gate, match='Required field is empty'):
+            forms.check_form(
+                {'controls': [field], 'inventory_verified': True}, {}, True)
 
 def _diagnostic_paths(page, final_segment):
     # The fixture has unrelated unmatched ARIA picker parts, which remain

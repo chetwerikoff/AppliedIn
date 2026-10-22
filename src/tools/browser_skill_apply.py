@@ -1025,7 +1025,10 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             combo = target.get('combobox') or {}
             has_selection = any(str(combo.get(key) or '').strip() for key in (
                 'selected_text', 'selected_value', 'hidden_value'))
-            if not target.get('required') and not has_selection:
+            # A previous write or nonempty receiver still needs final proof.
+            if (not target.get('required') and not has_selection and expected is None
+                    and not target.get('has_value')
+                    and not str(target.get('value') or '').strip()):
                 continue
             # A closed picker may remove aria-controls after its option was
             # selected. Its original exclusive linkage is captured by the

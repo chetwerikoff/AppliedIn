@@ -272,6 +272,13 @@ async def test_receipt_cannot_replace_current_admission_or_click_witness(grants,
     session = Session()
     receipt = await choose(session, grants)
     current = focused_final_page(await session.page())
+    owner = next(c for c in current['controls'] if c['selector'] == '#location')
+    assert not owner['combobox'].get('hidden_selector')
+    owner.update(name='location', value=receipt['committed_caption'], has_value=True)
+    owner['combobox'].update(
+        selected_text=receipt['committed_caption'],
+        displayed_text=receipt['committed_caption'],
+        selected_value=receipt['committed_value'])
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)
@@ -303,12 +310,23 @@ async def test_no_receipt_is_not_a_committed_selection(grants):
     session = Session()
     receipt = await choose(session, grants)
     current = focused_final_page(await session.page())
+    owner = next(c for c in current['controls'] if c['selector'] == '#location')
+    # CSS-only fixture lacks a chosen-value readback and submitted name.
+    # Give the valid final case its own named form value, not a fake receipt.
+    assert not owner['combobox'].get('hidden_selector')
+    owner.update(name='location', value=receipt['committed_caption'], has_value=True)
+    owner['combobox'].update(
+        selected_text=receipt['committed_caption'],
+        displayed_text=receipt['committed_caption'],
+        selected_value=receipt['committed_value'])
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
-    forms.check_form(current, filled, True, receipts=[])
+    # This closed combobox has lost live listbox linkage; the generic option
+    # receipt still establishes which approved option was actually clicked.
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(current, filled, True, receipts=[])
 
-    # No historical receipt may replace a missing or contradictory live
-    # submitted value. Test both conditions with the original proof absent.
+    # A valid historical receipt must never mask bad current submitted bytes.
     for value in ('', 'Different location'):
         changed = copy.deepcopy(current)
         owner = next(c for c in changed['controls'] if c['selector'] == '#location')
@@ -318,7 +336,7 @@ async def test_no_receipt_is_not_a_committed_selection(grants):
         receiver['value'] = value
         receiver['has_value'] = bool(value)
         with pytest.raises(forms.Gate, match='hidden form value|form-own value receiver'):
-            forms.check_form(changed, filled, True, receipts=[])
+            forms.check_form(changed, filled, True, receipts=[receipt])
     assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('scenario', [

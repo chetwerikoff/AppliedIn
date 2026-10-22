@@ -113,6 +113,82 @@ def test_real_guard_removal_and_restoration_are_not_cached():
     assert reused("closed_widget_dom.cjs", spec, *scripts) == good
 
 
+
+def test_reader_url_prototype_poison_cannot_change_next_clean_entry_request():
+    # A host-derived RequestURL.prototype used to share the real URL.prototype
+    # across VM requests; the fixture's Ashby branch exposed the contamination.
+    spec = {"url": "https://jobs.ashbyhq.com/example-co/application"}
+    expected = one_shot("entry_dom_fixture.js", spec, production.PAGE)
+    assert json.loads(reused("entry_dom_fixture.js", spec, production.PAGE)) == json.loads(expected)
+    worker_pid = harness._client().process.pid
+    poisoned_page = (
+        '(()=>{Object.defineProperty(Object.getPrototypeOf(URL.prototype),'
+        '"hostname",{configurable:true,get(){return "poisoned.example-co.test"}});'
+        'return (' + production.PAGE + ');})()'
+    )
+    reused("closed_widget_dom.cjs", {}, poisoned_page,
+           forms._FIXED_CONTROL_WITNESS)
+    assert harness._client().process.pid == worker_pid
+    assert json.loads(reused("entry_dom_fixture.js", spec, production.PAGE)) == json.loads(expected)
+
+
+def test_lever_commonjs_module_and_exports_prototypes_are_request_local(tmp_path):
+    fixture = tmp_path / "entry_dom_fixture.js"
+    dependency_file = tmp_path / "lever_card_fixture.cjs"
+    fixture.write_text((harness.HERE / fixture.name).read_text())
+    dependency = (harness.HERE / dependency_file.name).read_text()
+    spec = {"url": "https://careers.example-co.test/apply", "lever": {}}
+    dependency_file.write_text(
+        'Object.getPrototypeOf(module).__leaked = true;\n'
+        'Object.getPrototypeOf(exports).__leaked = true;\n' + dependency)
+    assert json.loads(reused(fixture, spec, production.PAGE))["controls"]
+    worker_pid = harness._client().process.pid
+
+    # The independent Node invocation begins with clean CommonJS prototypes.
+    # The resident child must agree after the deliberately poisoned dependency.
+    dependency_file.write_text(
+        'if (Object.getPrototypeOf(module).__leaked || '
+        'Object.getPrototypeOf(exports).__leaked) '
+        'throw Error("SHARED MODULE PROTOTYPE");\n' + dependency)
+    assert reused(fixture, spec, production.PAGE) == one_shot(
+        fixture, spec, production.PAGE)
+    dependency_file.write_text(dependency)
+    assert reused(fixture, spec, production.PAGE) == one_shot(
+        fixture, spec, production.PAGE)
+    assert harness._client().process.pid == worker_pid
+
+
+@pytest.mark.parametrize("reader", [
+    forms.GREENHOUSE_PAGE, forms._GREENHOUSE_FIXED_CONTROL_WITNESS,
+], ids=["GREENHOUSE_PAGE", "GREENHOUSE_FIXED_CONTROL_WITNESS"])
+def test_greenhouse_claim_token_pre_read_failure_matches_one_shot_and_recovers(reader):
+    # This is the same selected real-reader guard as the retained direct-Node
+    # negative, with the concrete synthetic claim-bearing response token.
+    guard = "if (greenhouse.response_controls) return {url:location.href, greenhouse};"
+    assert reader.count(guard) == 1
+    spec = {
+        "frames": ["R"], "visible": True, "badge": True,
+        "url": "https://job-boards.greenhouse.io/example-co/jobs/123",
+        "tokens": ["g-recaptcha-response"], "textarea": False, "claim": True,
+    }
+    good = reused("entry_dom_fixture.js", spec, reader)
+    assert json.loads(good) == json.loads(one_shot("entry_dom_fixture.js", spec, reader))
+    worker_pid = harness._client().process.pid
+    unguarded = reader.replace(guard, "")
+    command = ["node", str(harness.HERE / "entry_dom_fixture.js"),
+               json.dumps(spec), unguarded]
+    with pytest.raises(subprocess.CalledProcessError) as original:
+        subprocess.run(command, capture_output=True, text=True, check=True)
+    with pytest.raises(subprocess.CalledProcessError) as resident:
+        reused("entry_dom_fixture.js", spec, unguarded)
+    for caught in (original, resident):
+        assert caught.value.returncode != 0
+        assert "PROTECTED TOKEN VALUE READ" in caught.value.stderr
+        assert not caught.value.output  # No JSON success from a failed read.
+    assert harness._client().process.pid == worker_pid
+    assert reused("entry_dom_fixture.js", spec, reader) == good
+
+
 def test_closed_fixture_bytes_are_reread_between_requests(tmp_path):
     fixture = tmp_path / "closed_widget_dom.cjs"
     original = (harness.HERE / fixture.name).read_text()

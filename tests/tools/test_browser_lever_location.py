@@ -408,7 +408,7 @@ async def test_post_click_uncertain_commit_never_retries_or_submits(grant_row, f
     with pytest.raises(forms.Gate):
         forms.check_form(final, filled, uploaded=True, receipts=[receipt])
     assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
     assert all(call[0] != 'submit' for call in session.calls)
 
 
@@ -420,7 +420,7 @@ async def test_uncertain_option_ipc_gates_without_a_second_click(grant_row):
         await run_choice(session)
     assert err.value.form_question['selector'] == '#current-location'
     assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
     assert not any(call[0] in {'submit', 'navigate'} for call in session.calls)
 
 
@@ -587,7 +587,7 @@ async def test_only_undeclared_location_receiver_can_be_absent(grant_row):
     forms.check_form(final, filled, uploaded=True, receipts=[receipt])
     forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
     assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
 
 
 @pytest.mark.asyncio
@@ -599,7 +599,7 @@ async def test_receiver_disappearing_after_option_click_cannot_submit(grant_row,
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
     assert [c for c in session.calls if c[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
     assert not any(c[0] == 'submit' for c in session.calls)
 
 
@@ -615,7 +615,7 @@ async def test_receiver_loss_at_final_submit_gates_both_checks(grant_row, shape)
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
     assert [c for c in session.calls if c[0] == 'click'] == [
-        ('click', '#location-option')]
+        ('click', '#current-location'), ('click', '#location-option')]
 
 
 @pytest.mark.asyncio

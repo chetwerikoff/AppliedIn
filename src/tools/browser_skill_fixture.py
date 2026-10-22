@@ -946,9 +946,9 @@ class _SyntheticRun:
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
                 if args[0] == 'upload':
-                    if state.ashby_upload_transient:
-                        state.upload_before_tree = deepcopy(
-                            (state.last_page or {}).get('entry', {}).get('upload_tree'))
+                    if (state.ashby_upload_transient
+                            and not isinstance(state.upload_before_tree, dict)):
+                        raise PermissionError('No independent pre-upload structural witness.')
                     state.upload_ipc += 1
                 await raw.call(*args, **kwargs)
                 if state.greenhouse and args[0] == 'click' and args[1] in _OPTION_SELECTORS:
@@ -1257,10 +1257,17 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                           and state.post_attempts == state.post_count == 0
                           and (state.last_page or {}).get('inventory_verified') is True)
                     if state.ashby_upload_unwrap:
-                        from tools.browser_skill_apply import _upload_shape
-                        pre_spans = sum(n[1] == 'span' for n in _upload_shape(state.upload_before_tree))
-                        post_spans = sum(n[1] == 'span' for n in _upload_shape(tree, tree.get('items', [])))
-                        ok = ok and pre_spans == post_spans + 1
+                        # A missing read or failed upload must report an unsafe
+                        # leg, never crash into an unstructured Python traceback.
+                        if not isinstance(state.upload_before_tree, dict):
+                            ok = False
+                        else:
+                            from tools.browser_skill_apply import _upload_shape
+                            pre_spans = sum(n[1] == 'span'
+                                            for n in _upload_shape(state.upload_before_tree))
+                            post_spans = sum(n[1] == 'span'
+                                             for n in _upload_shape(tree, tree.get('items', [])))
+                            ok = ok and pre_spans == post_spans + 1
                     if state.ashby_upload_transient:
                         pairs = state.upload_pair_trace
                         ok = (ok and len(pairs) >= 3

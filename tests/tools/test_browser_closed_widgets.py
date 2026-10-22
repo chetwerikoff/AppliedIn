@@ -185,6 +185,27 @@ async def choose(session, facts, key='location', filled=None):
         job_url=URL, ctx=None, provenance=None)
 
 
+def focused_final_page(page, key='location'):
+    """Leave only the actual form-owned combobox and its submitted receiver.
+
+    The real final check must pass for an unchanged selection; unrelated
+    unfinished fields or intentionally opaque fixture peers cannot mask the
+    exact negative being exercised.
+    """
+    final = copy.deepcopy(page)
+    owner = next(c for c in final['controls'] if c['selector'] == '#'+key)
+    hidden = (owner.get('combobox') or {}).get('hidden_selector')
+    kept = {'#'+key}
+    if hidden:
+        kept.add(hidden)
+        assert sum(c['selector'] == hidden for c in final['controls']) == 1
+    final['controls'] = [c for c in final['controls'] if c['selector'] in kept]
+    assert len(final['controls']) == len(kept)
+    final.update(inventory_verified=True, truncated=False, opaque_controls=False,
+                 shadow_roots=False, unsupported_frames=[])
+    return final
+
+
 async def test_four_exact_commits_and_presubmit_current_reread(grants):
     session, filled, receipts = Session(), {}, []
     for key in KEYS:
@@ -216,31 +237,38 @@ async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
 async def test_each_current_readback_is_literal_and_independent(grants, key):
     session = Session()
     receipt = await choose(session, grants)
-    current = await session.page()
-    combo({'page': current})['combobox'][key] = 'approved location'
+    base = focused_final_page(await session.page())
+    filled = {'#location': 'Approved location'}
+    forms.check_form(base, filled, True, receipts=[receipt])
+    mutated = copy.deepcopy(base)
+    next(c for c in mutated['controls'] if c['selector'] == '#location')['combobox'][key] = 'Different location'
     with pytest.raises(forms.Gate):
-        forms._check_closed_commit(combo({'page': current}), 'Approved location', receipt)
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, {'#location': 'Approved location'}, True, receipts=[receipt])
+        forms.check_form(mutated, filled, True, receipts=[receipt])
 
 
-@pytest.mark.parametrize('key', ['closed_admission', 'committed_value', 'committed_caption', 'hidden_selector', 'hidden_value_before'])
+@pytest.mark.parametrize('key', ['committed_value', 'committed_caption',
+                                 'hidden_selector', 'hidden_value_before',
+                                 'hidden_value'])
 async def test_receipt_cannot_replace_current_admission_or_click_witness(grants, key):
     session = Session()
     receipt = await choose(session, grants)
-    receipt[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
+    current = focused_final_page(await session.page())
+    filled = {'#location': 'Approved location'}
+    forms.check_form(current, filled, True, receipts=[receipt])
+    forged = dict(receipt)
+    forged[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
     with pytest.raises(forms.Gate):
-        # A simulated code-generated receipt with bad evidence also fails;
-        # this isolates readback equality from plain-dict/alteration detection.
-        forms._check_closed_commit(combo(session.snapshot), 'Approved location', receipt)
+        forms.check_form(current, filled, True, receipts=[forged])
 
 
 async def test_no_receipt_is_not_a_committed_selection(grants):
     session = Session()
-    await choose(session, grants)
+    receipt = await choose(session, grants)
+    current = focused_final_page(await session.page())
+    filled = {'#location': 'Approved location'}
+    forms.check_form(current, filled, True, receipts=[receipt])
     with pytest.raises(forms.Gate):
-        forms.check_form(await session.page(), {'#location': 'Approved location'}, True)
-
+        forms.check_form(current, filled, True, receipts=[])
 
 @pytest.mark.parametrize('scenario', [
     'extraInput', 'noAutocomplete', 'wrongLabel', 'duplicateLabel',
@@ -311,9 +339,14 @@ async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
 async def test_forged_plain_receipt_is_not_code_witnessed(grants):
     session = Session()
     receipt = await choose(session, grants)
+    current = focused_final_page(await session.page())
+    filled = {'#location': 'Approved location'}
+    forms.check_form(current, filled, True, receipts=[receipt])
+    forged = dict(receipt)
+    forged['committed_value'] = 'forged'
     with pytest.raises(forms.Gate):
-        forms._check_closed_commit(combo(session.snapshot), 'Approved location', dict(receipt))
-
+        forms.check_form(current, filled, True, receipts=[forged])
+    assert not any(c[0] == 'submit' for c in session.calls)
 
 async def test_required_unapproved_bootstrap_precedes_all_widget_ipc(grants):
     session = Session()
@@ -447,9 +480,11 @@ async def test_attribute_less_option_commits_exact_caption_and_receiver(grants):
     receipt = await choose(session, grants, filled=filled)
     assert receipt['committed_caption'] == receipt['committed_value'] == grants['location']
     assert receipt['hidden_value'] == grants['location']
-    assert session.calls == [('click', '#location'), ('click', '#location-option')]
+    assert session.calls == [
+        ('click', '#location'), ('fill', '#location', '--value', 'Approved location'),
+        ('click', '#location-option')]
     final, _ = await forms._observe_controls(session, await session.page())
-    forms.check_form(final, filled, True, receipts=[receipt])
+    forms.check_form(focused_final_page(final), filled, True, receipts=[receipt])
     forms.check_approvals('example-co#1', [receipt], final)
 
 
@@ -496,7 +531,9 @@ async def test_delayed_component_phase_is_observed_without_extra_ipc(grants, del
     session = Delayed()
     receipt = await choose(session, grants)
     assert receipt['committed_value'] == 'Approved location'
-    assert session.calls == [('click', '#location'), ('click', '#location-option')]
+    assert session.calls == [
+        ('click', '#location'), ('fill', '#location', '--value', 'Approved location'),
+        ('click', '#location-option')]
 
 
 @pytest.mark.parametrize('verb', ['submit', 'click'])
@@ -1022,17 +1059,21 @@ async def test_every_admission_Gate_and_form_question_passes_witness_try(monkeyp
 @pytest.mark.parametrize('cause', ['inventory', 'approval', 'destination', 'phase timeout'])
 async def test_country_wrapper_preserves_noncommit_Gates(monkeypatch, cause):
     session = Session(fullPhone=True)
-    sentinel = forms.Gate('safe synthetic ' + cause, form_question={'synthetic': cause})
+    sentinel = forms.Gate('safe synthetic ' + cause,
+                          form_question={'synthetic': cause})
     async def refused(*args, **kwargs):
         raise sentinel
-    monkeypatch.setattr(forms, '_execute_closed_combobox', refused)
+    # There is no retired shape-specific picker wrapper. The generic
+    # independently witnessed observation must propagate genuine pre-click
+    # refusals without replacing or silently losing the form question.
+    monkeypatch.setattr(forms, '_observe_controls', refused)
     with pytest.raises(forms.Gate) as caught:
         await forms._execute_combobox(session, await session.page(),
             {'action': 'combobox', 'selector': '#country'}, facts={}, filled={},
             pk='example-co#1', job_url=URL, ctx=None, provenance=None)
     assert caught.value is sentinel
+    assert caught.value.form_question == {'synthetic': cause}
     assert session.calls == []
-
 
 @pytest.mark.parametrize('scenario', ['badGraph', 'extraInput', 'noAutocomplete', 'wrongLabel',
     'duplicateLabel', 'explicitOutside', 'invalidExpanded', 'displayQuery', 'multipleReceiver'])

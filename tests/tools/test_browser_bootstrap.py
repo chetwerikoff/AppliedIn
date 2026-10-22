@@ -3038,6 +3038,8 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
                          value='on', has_value=True)
     first = field('First name', '#first', required=False)
     page = secure_inventory(morning, evening, confirmation, first)
+    # Bind grants to the actual HTTPS-form receivers, not the pre-rebind builders.
+    morning, evening, confirmation, first = page['controls'][:4]
     key_radio, radio_grant = _choice_grant_from_page(page, morning, 'pm')
     key_checkbox, checkbox_grant = _choice_grant_from_page(page, confirmation, 'yes')
     browser, decide, row = secure_world(monkeypatch, page)
@@ -3173,6 +3175,7 @@ async def test_model_choice_selector_and_fact_cannot_substitute_grant(
     evening = field('Evening', '#evening', type='radio', name='schedule',
                     question='Schedule preference', value='pm', has_value=True)
     page = secure_inventory(morning, evening)
+    morning = page['controls'][0]  # secure_inventory rebinds this form to HTTPS.
     key, grant = _choice_grant_from_page(page, morning, 'pm')
     browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {key: grant}
@@ -3191,6 +3194,7 @@ async def test_choice_changed_after_model_advertisement_cannot_click(monkeypatch
     evening = field('Evening', '#evening', type='radio', name='schedule',
                     question='Schedule preference', value='pm', has_value=True)
     page = secure_inventory(morning, evening)
+    morning = page['controls'][0]  # secure_inventory rebinds this form to HTTPS.
     key, grant = _choice_grant_from_page(page, morning, 'pm')
     browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {key: grant}

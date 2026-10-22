@@ -694,3 +694,37 @@ def test_final_optional_native_value_requires_current_exact_readback():
     forms.check_form(page, {"#answer": "Approved answer"}, uploaded=True)
     with pytest.raises(forms.Gate, match="Unverified or changed form value"):
         forms.check_form(page, {}, uploaded=True)
+
+
+@pytest.mark.parametrize("status,gate_reason", [
+    ("applied_manual", ""),
+    ("applied", ""),
+    ("needs_human", ""),
+    ("submitting", "submit_uncertain"),
+])
+def test_manual_or_duplicate_outcome_prevents_acquiring_a_new_hold(
+        monkeypatch, status, gate_reason):
+    """The production pre-hold reread must preserve an existing human outcome."""
+    import fakeredis
+    from types import SimpleNamespace
+
+    pk = "example-co#synthetic"
+    row = {"pk": pk, "company": "example-co", "status": status,
+           "gate_reason": gate_reason, "possible_submission": False}
+    client = fakeredis.FakeRedis(decode_responses=True)
+
+    def forbid_status_overwrite(*_args, **_kwargs):
+        pytest.fail("A preexisting manual outcome must never be overwritten")
+
+    tracking = SimpleNamespace(
+        r=client, get_current=lambda read_pk: dict(row) if read_pk == pk else None,
+        set_status=forbid_status_overwrite)
+    monkeypatch.setattr(
+        "core.stores.make_stores", lambda: SimpleNamespace(tracking=tracking))
+
+    with pytest.raises(forms.Gate, match="manual, duplicate or unreviewed"):
+        forms.hold_possible_submission(
+            pk, {"last_button": "Submit application",
+                 "url": "https://example-co.test/job/1"})
+    assert client.get(f"submit_hold:{pk}") is None
+    assert row["status"] == status

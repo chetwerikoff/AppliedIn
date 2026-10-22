@@ -1043,32 +1043,28 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     raise Gate('A hidden form value is not independently authorized.')
                 raise Gate(f'Unverified or changed combobox value: {target["label"]}')
 
-            if combo.get('hidden_selector'):
-                # A caption and a claimed hidden value cannot substitute for
-                # one actual, current hidden control owned by this same form.
-                receivers = [c for c in controls
-                             if c.get('selector') == combo['hidden_selector']
-                             and c.get('type') == 'hidden'
-                             and c.get('in_form') is True
-                             and c.get('form_selector') == target.get('form_selector')]
-                if (len(receivers) != 1 or not receivers[0].get('name')
-                        or receivers[0].get('form_action') != target.get('form_action')
-                        or not isinstance(receivers[0].get('value'), str)
-                        or not receivers[0]['value']
-                        or receivers[0]['value'] != combo.get('hidden_value')):
-                    raise Gate('A hidden form value is not independently authorized.')
-            else:
-                # Without a hidden receiver, the combobox's own named input
-                # must actually submit the approved caption or option value.
-                own_value = target.get('value')
-                if (target.get('in_form') is not True
-                        or not target.get('form_selector')
-                        or not target.get('form_action')
-                        or not target.get('name')
-                        or not target.get('has_value')
-                        or not isinstance(own_value, str)
-                        or own_value != combo['selected_value']):
-                    raise Gate('The combobox has no verified form-own value receiver.')
+            # One generic form-owned value check: the submitted field may be
+            # the combobox itself or its uniquely associated hidden receiver.
+            # Neither an observed caption alone nor an old receipt is authority.
+            hidden = combo.get('hidden_selector')
+            receiver = target
+            if hidden:
+                matches = [c for c in controls if c.get('selector') == hidden
+                           and c.get('type') == 'hidden'
+                           and c.get('in_form') is True
+                           and c.get('form_selector') == target.get('form_selector')]
+                receiver = matches[0] if len(matches) == 1 else None
+            if (receiver is None or receiver.get('in_form') is not True
+                    or not target.get('form_selector') or not target.get('form_action')
+                    or receiver.get('form_selector') != target.get('form_selector')
+                    or receiver.get('form_action') != target.get('form_action')
+                    or not receiver.get('name')
+                    or (not hidden and receiver.get('has_value') is not True)
+                    or not isinstance(receiver.get('value'), str)
+                    or not receiver['value']
+                    or receiver['value'] != combo['selected_value']):
+                raise Gate('A hidden form value is not independently authorized.'
+                           if hidden else 'The combobox has no verified form-own value receiver.')
             guarded_value(target, expected)
             continue
         if target.get('in_form') and (

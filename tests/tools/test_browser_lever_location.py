@@ -139,7 +139,9 @@ class FakeLever:
 
     def _snapshot(self):
         typed = self.buffer
-        state_options = self.options if self.options is not None else [option(self.caption)]
+        state_options = (self.options if self.options is not None else
+                         [option(self.caption, value=self.caption)
+                          if self.receiver_shape == 'none' else option(self.caption)])
         changed = {}
         if self.drift and self.typed_reads >= 3 and typed and not self.selected:
             if self.drift == 'option':
@@ -194,6 +196,11 @@ class FakeLever:
                 'id_reference': '', 'name_reference': '', 'valid': True,
             }
             page['controls'].pop(1)
+            if self.selected:
+                # In this variant the named input, not a removed hidden field,
+                # submits the option's exact independently observed value.
+                combo['selected_value'] = self.caption
+                combo['location_selected_option']['value'] = self.caption
         if self.owner_shape:
             combo['location_owner'] = {'valid': False, 'link_id': 'location-options'}
         if self.selected and self.selected_option_shape == 'lost':
@@ -585,19 +592,49 @@ async def test_receiver_witness_disagreement_has_no_option_click(grant_row):
 
 @pytest.mark.asyncio
 async def test_only_undeclared_location_receiver_can_be_absent(grant_row):
-    html = _lever_location_form().decode('utf-8')
+    # The browser's named input must submit the same value as the selected
+    # option. A removed hidden token cannot leave an executable token.value
+    # dereference or a machine code that the form will never submit.
+    html = _lever_location_form(caption=ANSWER).decode('utf-8')
     html = html.replace(' data-value-input="location-token"', '')
     html = html.replace('<input id="location-token" type="hidden" name="location_token">', '')
+    html = html.replace('data-value="testville-verified"', f'data-value="{ANSWER}"')
+    html = html.replace(
+        "input.setAttribute('data-selected-value', 'testville-verified');",
+        f"input.setAttribute('data-selected-value', '{ANSWER}');")
+    html = html.replace('token.value =', 'if (token) token.value =')
     assert 'data-value-input=' not in html and 'id="location-token"' not in html
+    assert f'data-value="{ANSWER}"' in html
+    assert f"data-selected-value', '{ANSWER}'" in html
+    assert html.count('if (token) token.value =') == 2
+
     session = FakeLever(receiver_shape='none')
     receipt, filled = await run_choice(session)
-    assert receipt['hidden_selector'] == ''
-    assert receipt['hidden_value'] == ''
+    assert receipt['hidden_selector'] == '' and receipt['hidden_value'] == ''
+    assert receipt['committed_caption'] == receipt['committed_value'] == ANSWER
     final = await session.page()
-    forms.check_form(final, filled, uploaded=True, receipts=[receipt])
+    owner = next(c for c in final['controls'] if c['selector'] == '#current-location')
+    assert owner['in_form'] and owner['form_selector'] == '#application-form'
+    assert owner['name'] == 'location' and owner['has_value']
+    assert owner['value'] == owner['combobox']['selected_value'] == ANSWER
+    forms.check_form(final, filled, uploaded=True)
     forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
+
+    for field, value in (('value', ''), ('value', 'OTHER'),
+                         ('name', ''), ('has_value', False)):
+        changed = deepcopy(final)
+        target = next(c for c in changed['controls']
+                      if c['selector'] == '#current-location')
+        target[field] = value
+        with pytest.raises(forms.Gate, match='form-own value receiver'):
+            forms.check_form(changed, filled, uploaded=True)
+    changed = deepcopy(final)
+    changed['controls'][0]['combobox']['selected_value'] = 'OTHER'
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(changed, filled, uploaded=True)
     assert [call for call in session.calls if call[0] == 'click'] == [
         ('click', '#current-location'), ('click', '#location-option')]
+    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
 
 
 @pytest.mark.asyncio

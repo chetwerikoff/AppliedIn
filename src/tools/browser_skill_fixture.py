@@ -1089,14 +1089,39 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 phone = [c for c in (state.last_page or {}).get('controls', [])
                          if c.get('selector') == '#phone']
                 phone_ok = len(phone)==1 and phone[0].get('value')==_FACTS['Phone']
-                from tools.browser_skill_apply import _check_closed_commit, control, Gate
-                receipt_ok = len(state.widget_receipts) == 5
-                try:
-                    for receipt in state.widget_receipts:
-                        _check_closed_commit(control(state.last_page, receipt),
-                                             receipt['approved_value'], receipt)
-                except Gate:
-                    receipt_ok = False
+                from tools.browser_skill_apply import check_form, Gate
+                # Old C0/C2 receipts cannot authorize a selected form value.
+                # Verify the four form-owned choice receivers from the *current*
+                # page through the production final-form checker. This isolated
+                # choice check does not assert the whole incomplete form is ready.
+                choice_selectors = set(_COMBO_SELECTORS.values())
+                receiver_selectors = set(_HIDDEN_SELECTORS.values())
+                choices = [c for c in (state.last_page or {}).get('controls', [])
+                           if c.get('selector') in choice_selectors | receiver_selectors]
+                receipts = state.widget_receipts
+                receipt_ok = (
+                    len(receipts) == len(_CHOICE_SELECTORS)
+                    and {r.get('selector') for r in receipts}
+                        == set(_CHOICE_SELECTORS.values())
+                    and all(any(r.get('action') == 'combobox'
+                                and r.get('selector') == selector
+                                and r.get('approved_value') == _FACTS[key]
+                                for r in receipts)
+                            for key, selector in _CHOICE_SELECTORS.items())
+                    and len(choices) == 2 * len(_COMBO_SELECTORS)
+                    and (state.last_page or {}).get('inventory_verified') is True
+                    and (state.last_page or {}).get('opaque_controls') is False
+                )
+                if receipt_ok:
+                    try:
+                        check_form(
+                            {'controls': choices, 'inventory_verified': True,
+                             'opaque_controls': False},
+                            {selector: _FACTS[key]
+                             for key, selector in _COMBO_SELECTORS.items()},
+                            uploaded=True)
+                    except Gate:
+                        receipt_ok = False
                 ok = (result.get("status") == "gate"
                       and (state.visible_badge_anchor == 'PASS' if greenhouse else state.entry_wait == 'PASS')
                       and (not greenhouse or state.native_validity == dict.fromkeys(_CHOICE_SELECTORS.values(), True))
@@ -1106,15 +1131,11 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                       and state.committed == expected_commits
                       and phone_ok
                       and receipt_ok
-                      and state.combo_observations['Country']['outcome'] == 'committed'
-                      and (not greenhouse or (
-                          isinstance(state.country_choice_inventory, dict)
-                          and state.country_choice_inventory.get('verified') is True
-                          and state.country_choice_inventory.get('country_phase') == 'C2'
-                          and state.country_choice_inventory.get('location_phase') == 'C2'
-                          and state.country_choice_inventory.get('country_selected') == _FACTS['Country']
-                          and state.country_choice_inventory.get('location_selected')
-                              == _FACTS['Where are you located?']))
+                      # ID-less Greenhouse Country selection has no form-owned
+                      # receiver. Never report it as committed from CSS alone.
+                      and state.combo_observations['Country']['outcome'] != 'committed'
+                      and (not greenhouse or state.country_choice_inventory is None
+                           or state.country_choice_inventory.get('verified') is False)
                       and state.ipc_index == len(state._positive_ipc())
                       and state.last_page.get('inventory_verified') is True
                       and state.last_page.get('opaque_controls') is False

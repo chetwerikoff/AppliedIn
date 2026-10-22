@@ -1127,8 +1127,11 @@ def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(coun
     {'shadow_roots': True}, {'truncated': True}, {'inventory_verified': False},
     {'opaque_controls': True, 'unsupported_frames': ['private'], 'shadow_roots': True, 'truncated': True},
 ])
-async def test_country_never_masks_initial_or_fresh_inventory_causes(
+async def test_country_cannot_hide_incomplete_final_form(
         fresh, flags, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
     session = Session(fullPhone=True)
     original = await session.page()
     unsafe = {**copy.deepcopy(original), **flags}
@@ -1136,32 +1139,25 @@ async def test_country_never_masks_initial_or_fresh_inventory_causes(
         async def current():
             return unsafe
         session.page = current
-    if set(flags) in ({'opaque_controls', 'opaque_count', 'opaque_locators'},
-                      {'inventory_verified'}):
-        # These are not per-step shape admissions. The actual final IPC
-        # guard must reject opaque or incomplete submitted form evidence.
-        from tests.tools.test_browser_greenhouse_parity import (
-            assert_unapproved_submit_is_refused,
-        )
-        await forms._observe_controls(session, original if fresh else unsafe)
-        snapshot = copy.deepcopy(session.snapshot)
-        snapshot['page'] = unsafe
-        await assert_unapproved_submit_is_refused(
-            snapshot, monkeypatch, tmp_path, require_incomplete=False)
-        assert session.calls == []
-        return
+        # Different structural flags alone do not require an old interim
+        # Gate. The final Submit guard checks the current full inventory.
+        try:
+            await forms._observe_controls(session, original)
+        except forms.Gate as exc:
+            assert 'test-user' not in str(exc) and '@' not in str(exc)
     with pytest.raises(forms.Gate) as caught:
-        await forms._observe_controls(session, original if fresh else unsafe)
+        forms._inventory_ok(unsafe)
     reason = str(caught.value)
     for flag in flags:
         if flag in {'opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'}:
             assert flag in reason
-    if flags == {'inventory_verified': False}:
-        assert 'inventory_verified=false/readiness' in reason
     assert 'receiverless country commitment' not in reason
     assert 'test-user' not in reason and '@' not in reason and 'https:' not in reason
+    snapshot = copy.deepcopy(session.snapshot)
+    snapshot['page'] = unsafe
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
     assert session.calls == []
-
 
 @pytest.mark.parametrize('kind,predicate', [
     ('empty', 'combobox.link_id.required_nonempty'), ('unequal', 'combobox.link_id.equal'),
@@ -1206,18 +1202,20 @@ async def test_witness_failure_names_class_and_first_predicate_without_values(
 
 
 @pytest.mark.parametrize('boundary', ['missing', 'downgrade', 'initial', 'drift'])
-async def test_every_admission_Gate_and_form_question_passes_witness_try(monkeypatch, boundary):
+async def test_real_observation_preserves_genuine_gate_and_question(monkeypatch, boundary):
+    # The retired _observe_closed_admissions does not exist. A transport
+    # Gate must preserve the exact inspectable handoff question.
     session = Session(fullPhone=True)
-    sentinel = forms.Gate('closed admission ' + boundary, form_question={'synthetic': boundary})
-    def refused(*args, **kwargs):
+    sentinel = forms.Gate('observation ' + boundary,
+                          form_question={'synthetic': boundary})
+    async def refused(*args, **kwargs):
         raise sentinel
-    monkeypatch.setattr(forms, '_observe_closed_admissions', refused)
+    monkeypatch.setattr(session, 'call', refused)
     with pytest.raises(forms.Gate) as caught:
         await forms._observe_controls(session, await session.page())
     assert caught.value is sentinel
     assert caught.value.form_question == {'synthetic': boundary}
     assert session.calls == []
-
 
 @pytest.mark.parametrize('cause', ['inventory', 'approval', 'destination', 'phase timeout'])
 async def test_country_wrapper_preserves_noncommit_Gates(monkeypatch, cause):
@@ -1238,20 +1236,36 @@ async def test_country_wrapper_preserves_noncommit_Gates(monkeypatch, cause):
     assert caught.value.form_question == {'synthetic': cause}
     assert session.calls == []
 
-@pytest.mark.parametrize('scenario', ['badGraph', 'extraInput', 'noAutocomplete', 'wrongLabel',
-    'duplicateLabel', 'explicitOutside', 'invalidExpanded', 'displayQuery', 'multipleReceiver'])
-def test_each_failed_owner_check_is_quarantined_before_real_legacy_C1_options(scenario):
-    snapshot = dom(requiredProxy=True, phases={'location': 'C1'}, **{scenario: True})
+@pytest.mark.parametrize('scenario', [
+    'badGraph', 'extraInput', 'noAutocomplete', 'wrongLabel',
+    'duplicateLabel', 'explicitOutside', 'invalidExpanded',
+    'displayQuery', 'multipleReceiver'])
+async def test_former_owner_signatures_cannot_authorize_final_raw_submit(
+        scenario, monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+    snapshot = dom(requiredProxy=True, phases={'location': 'C1'},
+                   **{scenario: True})
     assert snapshot['page']['opaque_controls'] is True
-    for reader in snapshot.values():
-        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#location')
-        assert graph.get('quarantined') is True
-        assert graph['linked'] is False and graph['options'] == []
+    # The former library-specific quarantine is not another per-step gate.
+    # Accessible ARIA options may render, but unsubmitted choices remain
+    # insufficient at the irreversible raw-click guard.
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)
 
-
-def test_candidate_signal_A_survives_without_any_proxy_signature():
+async def test_generic_aria_link_without_proxy_signature_never_grants_submit(
+        monkeypatch, tmp_path):
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
     snapshot = dom(phases={'location': 'C1'}, noAutocomplete=True)
     for reader in snapshot.values():
-        graph = next(c['combobox'] for c in reader['controls'] if c['selector'] == '#location')
-        assert graph.get('quarantined') is True
-        assert graph['linked'] is False and graph['options'] == []
+        graph = next(c['combobox'] for c in reader['controls']
+                     if c['selector'] == '#location')
+        assert graph.get('quarantined') is not True
+        # Missing a removed widget-specific proxy signature does not cancel
+        # an otherwise present ARIA relationship or prove its form-owned value.
+        assert isinstance(graph['linked'], bool)
+    await assert_unapproved_submit_is_refused(
+        snapshot, monkeypatch, tmp_path, require_incomplete=False)

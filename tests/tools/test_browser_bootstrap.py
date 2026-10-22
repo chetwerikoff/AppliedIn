@@ -2522,7 +2522,7 @@ async def test_vendor_combobox_row_drift_after_initial_observation_has_no_questi
         pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
     assert result['form_question'] is None
-    assert 'changed during combobox observation' in result['question']
+    assert 'tracked posting changed before combobox preparation' in result['question']
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 

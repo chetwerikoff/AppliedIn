@@ -3458,10 +3458,12 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         await _effect_call(session, 'click', current['selector'])
         latest, latest_witness = await _observe_controls(session, await session.page())
         current = control(latest, action, 'combobox-open')
-        if not _preparation_destination_allowed(
+        if (not _preparation_destination_allowed(
                 latest.get('url', ''), job_url or observed['url'],
-                provenance=provenance):
-            raise Gate('The picker left the approved preparation origin.')
+                provenance=provenance)
+                or (provenance is not None and not _preparation_current(
+                    provenance, fixture_context=ctx))):
+            raise Gate('The picker origin or current tracked posting changed.')
         if current.get('tag') == 'input':
             approve(current, latest)
             await _effect_call(session, 'fill', current['selector'], '--value', answer)

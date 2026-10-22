@@ -360,7 +360,7 @@ async def test_picker_with_no_rendered_options_cannot_authorize_final_submit(
     assert receipt['action'] == 'combobox'
     assert receipt['unresolved'] and 'committed_value' not in receipt
     assert filled == {}
-    assert session.calls == [
+    assert [call for call in session.calls if call[0] != 'evaluate'] == [
         ('click', '#country'),
         ('fill', '#country', '--value', 'Example Country')]
     with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
@@ -451,13 +451,23 @@ async def test_unmatched_ambiguous_or_dangerous_option_never_clicks(monkeypatch,
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant()}})
     session = Session(current)
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+    filled = {}
+    action = {'action': 'combobox', 'selector': '#country',
+              'fact': 'What country?'}
+    kwargs = dict(facts={'What country?': 'Example Country'}, filled=filled,
+                  resume_path='', company='example-co', jd_text='',
+                  resume_tex='', github='', pk=PK, job_url=URL)
+    if len(options) == 1 and options[0]['label'] == 'Other Country':
+        # No matching caption is incomplete preparation, not a human Gate.
+        receipt = await forms.execute(session, current, action, **kwargs)
+        assert receipt['unresolved'] and filled == {}
+        with pytest.raises(forms.Gate):
+            forms.check_form(current, filled, True, receipts=[receipt])
+    else:
+        # Ambiguous, navigating or submitting options remain hard pre-click
+        # refusals; they must never become ordinary reversible preparation.
+        with pytest.raises(forms.Gate):
+            await forms.execute(session, current, action, **kwargs)
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 @pytest.mark.parametrize('field', ['label', 'value'])
@@ -518,13 +528,18 @@ def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypat
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant('Example Country')}})
     session = Session(current)
+    filled = {}
+    receipt = asyncio.run(forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL))
+    # A machine value equal to the grant cannot substitute for the displayed
+    # approved caption. No selection receipt exists, and final Submit refuses.
+    assert receipt['unresolved'] and filled == {}
     with pytest.raises(forms.Gate):
-        asyncio.run(forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL))
+        forms.check_form(current, filled, True, receipts=[receipt])
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
@@ -551,13 +566,16 @@ async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
         async def page(self):
             return deepcopy(self.current)
     session = TimeoutSession()
-    with pytest.raises(forms.Gate, match='did not expose current selectable options'):
-        await forms.execute(
-            session, page(closed), {'action': 'combobox', 'selector': '#country',
-                                    'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+    filled = {}
+    receipt = await forms.execute(
+        session, page(closed), {'action': 'combobox', 'selector': '#country',
+                                'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    assert receipt['unresolved'] and filled == {}
+    with pytest.raises(forms.Gate):
+        forms.check_form(page(closed), filled, True, receipts=[receipt])
     assert not any(call[0] == 'click' and call[1] != '#country'
                    for call in session.calls)
 
@@ -617,13 +635,16 @@ async def test_closed_aria_picker_without_rendered_link_never_selects(monkeypatc
             return self.initial
 
     session = NeverLinked(page(closed), page(), page())
-    with pytest.raises(forms.Gate, match='did not expose current selectable options'):
-        await forms.execute(
-            session, page(closed),
-            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={},
-            resume_path='', company='example-co', jd_text='', resume_tex='',
-            github='', pk=PK, job_url=URL)
+    filled = {}
+    receipt = await forms.execute(
+        session, page(closed),
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert receipt['unresolved'] and filled == {}
+    with pytest.raises(forms.Gate):
+        forms.check_form(page(closed), filled, True, receipts=[receipt])
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 

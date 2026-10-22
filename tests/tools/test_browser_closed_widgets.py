@@ -553,7 +553,11 @@ async def test_never_committed_component_refuses_final_submit(
 
     session, filled = NeverCommitted(), {}
     receipt = await choose(session, grants, filled=filled)
-    assert session.calls == [('click', '#location'), ('click', '#location-option')]
+    assert session.calls == [
+        ('click', '#location'),
+        ('fill', '#location', '--value', 'Approved location'),
+        ('click', '#location-option'),
+    ]
     assert receipt['committed_value'] == 'Approved location'
     # The reversible click returned, but this DOM never committed a selected
     # caption/receiver. Isolate this real field from unrelated required fields

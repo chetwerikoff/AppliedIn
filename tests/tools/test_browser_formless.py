@@ -680,10 +680,16 @@ async def test_description_link_is_not_a_receiver_or_an_action_grant(monkeypatch
 
 def test_only_exact_structural_submit_matches_commit_target(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
-    assert forms._structural_submit(raw.current, {'selector': '#structural-submit'}, provenance)
+    # The single final guard calls the existing structural root census; a
+    # removed legacy helper is not an additional per-step submit authority.
+    assert raw.current['entry']['formless']['submit'] == '#structural-submit'
+    forms._formless_boundary(raw.current, provenance)
     for selector in ('#dropzone', '#autofill-button', '#_systemfield_name'):
-        assert not forms._structural_submit(raw.current, {'selector': selector}, provenance)
-
+        drifted = deepcopy(raw.current)
+        drifted['entry']['formless']['submit'] = selector
+        with pytest.raises(forms.Gate, match='exact structural submit changed'):
+            forms._formless_boundary(drifted, provenance)
+    no_mutations(raw)
 
 def test_structural_receiver_membership_is_guarded_at_destination_seam(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)

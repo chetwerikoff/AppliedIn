@@ -731,7 +731,7 @@ def test_manual_or_duplicate_outcome_prevents_acquiring_a_new_hold(
 
 
 def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
-    """A human outcome arriving after a valid pre-hold read still wins."""
+    """A concurrent manual outcome wins over this attempt's conditional hold."""
     import fakeredis
     from types import SimpleNamespace
 
@@ -741,20 +741,24 @@ def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
     client = fakeredis.FakeRedis(decode_responses=True)
     calls = []
 
-    def interleaved_status(_pk, _status, **_kwargs):
-        assert _pk == pk
+    def interleaved_status(_pk, expected, updates, *, expected_reader):
+        assert _pk == pk and getattr(expected, "value", expected) == "submitting"
+        assert updates["status"].value == "needs_human"
+        assert expected_reader == {}
         assert client.get(f"submit_hold:{pk}") is not None
-        # Human reconciliation happens between mark and the raw-click
-        # reread. It is never legitimate to restore uncertain over manual.
+        # The owner reconciles the job before the WATCH-backed transition.
+        # A failed conditional update must never restore needs_human here.
         row["status"] = "applied_manual"
+        row["confirmation_id"] = "Synthetic manual confirmation"
         client.delete(f"submit_hold:{pk}")
         calls.append("human reconciled")
+        return False
 
     tracking = SimpleNamespace(
         r=client,
         get_current=lambda _pk: dict(row),
         get=lambda _pk: dict(row),
-        set_status=interleaved_status)
+        update_if_status=interleaved_status)
     monkeypatch.setattr(
         "core.stores.make_stores", lambda: SimpleNamespace(tracking=tracking))
     monkeypatch.setattr(
@@ -762,13 +766,15 @@ def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
     monkeypatch.setattr(
         "tools.posting_guard.authorised", lambda _row: True)
 
-    forms.hold_possible_submission(
-        pk, {"last_button": "Submit application",
-             "url": "https://example-co.test/job/1"})
+    with pytest.raises(forms.Gate, match="submitting row changed.*no click is safe"):
+        forms.hold_possible_submission(
+            pk, {"last_button": "Submit application",
+                 "url": "https://example-co.test/job/1"})
     with pytest.raises(forms.Gate, match="Human outcome changed or submission hold"):
         forms.check_before_committing_click(pk)
     assert calls == ["human reconciled"]
     assert row["status"] == "applied_manual"
+    assert row["confirmation_id"] == "Synthetic manual confirmation"
     assert client.get(f"submit_hold:{pk}") is None
 
 

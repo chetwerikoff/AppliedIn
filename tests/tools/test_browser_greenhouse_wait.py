@@ -99,10 +99,22 @@ async def test_each_read_retries_safe_nonqualifying_observation(fast, at, flag, 
         forms._greenhouse_safety({**result, 'greenhouse': {**result['greenhouse'], 'root': None}},
                                  scoped.allowed, ALIAS)
     monkeypatch.setattr(forms, '_alias_current', lambda *args, **kwargs: True)
-    monkeypatch.setattr(forms, '_row', lambda *args, **kwargs: {})
-    with pytest.raises(forms.Gate) as human:
-        await forms._bootstrap(scoped, result, ALIAS.pk, {}, provenance=ALIAS)
-    assert human.value.form_question['label'] == 'Additional question'
+    tracked = {'pk': ALIAS.pk, 'company': ALIAS.company, 'job_id': ALIAS.job_id,
+               'jd_url': ALIAS.wrapper, 'ats': 'greenhouse',
+               'status': 'submitting', 'possible_submission': False,
+               'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda *args, **kwargs: tracked)
+    # The absent ordinary answer does not create a historic per-step human
+    # gate. Preparation may continue; the final guard must reject the current
+    # required form value rather than infer an approval from PAGE text.
+    prepared = await forms._bootstrap(
+        scoped, result, ALIAS.pk, {}, provenance=ALIAS)
+    assert prepared['controls'][0]['label'] == 'Additional question'
+    assert prepared['controls'][0]['value'] == ''
+    assert not prepared['controls'][0]['has_value']
+    with pytest.raises(forms.Gate, match='Required field is empty: Additional question'):
+        forms.check_form(prepared, {}, uploaded=True)
+    assert all(kind in {'page', 'witness'} for kind in raw.reads)
 
 
 @pytest.mark.parametrize('at', [0, 1, 2])

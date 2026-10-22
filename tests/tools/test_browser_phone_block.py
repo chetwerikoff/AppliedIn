@@ -478,6 +478,29 @@ def test_generic_legend_question_only_disambiguates_an_exact_named_receiver():
     assert forms._key(page, phone) == 'Phone'
 
 
+@pytest.mark.parametrize('receiver_change', [
+    {'required': True},
+    {'name': 'country_search'},
+    {'value': 'Unapproved country', 'has_value': True},
+    {'combobox': {'selected_text': 'Unapproved country'}},
+])
+def test_optional_accessory_becoming_an_answer_blocks_shared_group_grant(
+        receiver_change):
+    # A decorative search is not an applicant answer. Becoming required,
+    # named, selected or valued restores the duplicate-question denial.
+    page = dom(fullPhone=True)['page']
+    country = combo({'page': page}, 'country')
+    accessory = next(c for c in page['controls']
+                     if c['selector'] == '#country-search')
+    for key, value in receiver_change.items():
+        if key == 'combobox':
+            accessory['combobox'].update(value)
+        else:
+            accessory[key] = value
+    with pytest.raises(forms.Gate, match='More than one control uses'):
+        forms._key(page, country)
+
+
 @pytest.mark.parametrize('mutation', ['no-legend-anchor', 'duplicate-label',
                                       'competing-sibling'])
 def test_shared_group_legend_without_unique_native_anchor_remains_ambiguous(mutation):

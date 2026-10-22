@@ -1798,7 +1798,6 @@ def _root_identity(page: dict):
         for c in evidence))
     return envelope, excluded, members
 
-
 def _upload_tree(page):
     tree = (page.get('entry') or {}).get('upload_tree')
     if (not isinstance(tree, dict) or tree.get('complete') is not True
@@ -2569,7 +2568,30 @@ def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
     # control's approval. Exact grants include form owner and action, so only
     # collisions within this form are ambiguous authorization candidates.
     form = target.get('form_selector') if target.get('in_form') else None
+
+    def could_receive_an_answer(candidate: dict) -> bool:
+        # A button, listbox option or hidden machine value is never a separate
+        # human-answer recipient. All still belong to the final form inventory.
+        kind = candidate.get('type')
+        if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
+            return False
+        if kind == 'combobox':
+            combo = candidate.get('combobox')
+            if not isinstance(combo, dict):
+                return True
+            # An unnamed, empty, optional accessory search cannot claim the
+            # entire fieldset legend. If it becomes an actual receiver, it
+            # remains a conflicting question and must block the grant.
+            if (not candidate.get('required') and not candidate.get('name')
+                    and not candidate.get('has_value') and not candidate.get('value')
+                    and not candidate.get('checked') and not combo.get('hidden_selector')
+                    and not any(combo.get(k) for k in (
+                        'selected_text', 'selected_value', 'hidden_value'))):
+                return False
+        return True
+
     return [c for c in controls if c.get('selector') not in own_selectors
+            and could_receive_an_answer(c)
             and (form is None or c.get('form_selector') == form)
             and _same(key, c.get('question') or c.get('label') or '')]
 
@@ -4197,7 +4219,6 @@ class ApplicationIPCController:
                 self._approved(page, owner, answer)
                 return True
         return False
-
     @staticmethod
     def _private_content(page: dict) -> bool:
         # A pre-existing private autofill is private even without a writer receipt.

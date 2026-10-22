@@ -209,7 +209,10 @@ RETRY = ['greenhouse.equal', 'controls.length.equal', 'visible_text.required_non
 FATAL = ['url.equal', 'selector.unique', 'unique.true', 'unique_form.true', 'witness.object',
          'controls.list', 'control.object', 'combobox.object', 'combobox.PAGE.object',
          'combobox.linked.shape', 'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
-         'caption-wrong-type', 'link-wrong-type']
+         'caption-wrong-type']
+# No per-step graph certificate: a malformed optional link hint may be observed
+# reversibly, but cannot supply the missing submitted value at final Submit.
+OBSERVATIONAL = ['link-wrong-type']
 
 
 RETIRED_COMBOBOX_STEP_PREDICATES = {
@@ -259,7 +262,7 @@ def drift(predicate, p, w):
     return w
 
 
-@pytest.mark.parametrize('predicate', RETRY + FATAL)
+@pytest.mark.parametrize('predicate', RETRY + FATAL + OBSERVATIONAL)
 async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate, monkeypatch):
     p = combo_page()
     if predicate == 'options.equal':
@@ -305,11 +308,29 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
                 await wait(scoped)
         # Retired shape/phase predicates are not per-step human gates. Their
         # missing form-own receiver is refused by the final Submit guard.
+    elif predicate in OBSERVATIONAL:
+        # Both independent readers can agree on an optional, receiverless
+        # combobox despite its malformed historic link hint. Its missing
+        # form-owned value must still fail the one final code-owned guard.
+        admitted = await wait(scoped)
+        assert admitted['controls'][1]['combobox']['link_id'] is None
+        question, picker = admitted['controls'][0:2]
+        question.update(value='Approved detail', has_value=True)
+        picker['combobox'].update(
+            selected_text='Approved location', displayed_text='Approved location',
+            selected_value='location-code', hidden_selector='#receiver',
+            hidden_value='location-code')
+        with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+            forms.check_form(admitted, {
+                '#answer': 'Approved detail', '#location': 'Approved location'}, True)
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
         assert 'bounded wait' not in str(exc.value)
-        assert len(raw.reads) <= 3
+        # These two structural failures require the second fresh PAGE read
+        # before the witness mismatch becomes observable; still fail closed.
+        assert len(raw.reads) <= (4 if predicate in {
+            'selector.unique', 'combobox.linked.shape'} else 3)
     assert scoped._readiness is False
 
 

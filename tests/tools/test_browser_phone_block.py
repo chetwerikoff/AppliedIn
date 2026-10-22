@@ -413,25 +413,29 @@ async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
     from tests.tools.test_browser_greenhouse_parity import (
         assert_unapproved_submit_is_refused,
     )
-    # The unnamed, empty, optional country-search and its closed 244-option
-    # popup have no form-submitted value. Their hidden ARIA role cannot mask
-    # the real, still-inventoried applicant inputs or authorize Submit.
+    # Inaccessible popup roles do not prove an excluded form receiver or an
+    # inert option. Without independent native submission evidence, retain the
+    # full opaque inventory rather than silently claiming completion. The
+    # production final-click controller must refuse every such Submit.
     snapshot = dom(fullPhone=True, phases={'country': phase})
     page, fixed = snapshot['page'], snapshot['witness']
-    assert page['inventory_verified'] is True and page['opaque_controls'] is False
+    assert page['inventory_verified'] is False and page['opaque_controls'] is True
     assert [c['selector'] for c in page['controls']] == [
         c['selector'] for c in fixed['controls']]
     selectors = {c['selector'] for c in page['controls']}
     assert {'#phone', '#country', '#resume', '#submit'} <= selectors
-    assert not {'#country-search', '#country-button', '#country-list',
-                '#picker-option-0', '#picker-option-243'} & selectors
-    # Even a benign hidden popup cannot authorize an unrelated optional
-    # autofill. Independently introduce an unapproved synthetic phone value
-    # and prove the unchanged full final guard refuses any Submit IPC.
+    assert {'#country-search', '#picker-option-0', '#picker-option-243'} <= selectors
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
     phone.update(value='Synthetic unapproved autofill', has_value=True)
-    await assert_unapproved_submit_is_refused(
-        snapshot, monkeypatch, tmp_path, require_incomplete=False)
+    await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
+    # Separately prove the exact optional value, not the unrelated opacity,
+    # would also refuse even with an otherwise complete current native form.
+    complete = {'url': page['url'], 'controls': [phone],
+                'inventory_verified': True, 'truncated': False,
+                'opaque_controls': False, 'shadow_roots': False,
+                'unsupported_frames': []}
+    with pytest.raises(forms.Gate, match='Unverified or changed form value'):
+        forms.check_form(complete, {}, True)
 
 
 @pytest.mark.parametrize('attribute,value', [

@@ -1058,6 +1058,10 @@ def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch
 
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = 'example-co#interleaved-stale-write'
+    # A legitimate new hold starts from an actually persisted, independently
+    # inspected posting. Missing posting evidence is not submission authority.
+    _seed_clean(tracking, 'example-co', 'interleaved-stale-write',
+                'https://example.test/job/1')
     tracking.set_status(pk, Status.SUBMITTING, company='example-co')
     stale_pre_hold_row = tracking.get(pk)
     monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))

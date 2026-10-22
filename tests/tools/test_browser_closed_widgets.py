@@ -115,11 +115,21 @@ class Session:
 
 @pytest.fixture
 def grants(monkeypatch):
-    answers = {key: {'value': 'Approved '+key, 'selector': '#'+key,
-                    'label': key, 'question': key, 'url': URL,
-                    'tag': 'input', 'type': 'combobox',
-                    'form_selector': '#application-form', 'form_action': URL}
-               for key in KEYS}
+    # The retired shape-specific picker assigned its own synthetic question.
+    # The current generic PAGE reader supplies the actual observed control
+    # identity; only THAT exact per-row question can authorize a write.
+    initial = dom()
+    answers = {}
+    for key in KEYS:
+        target = combo(initial, key)
+        assert target['label'] == key and target['type'] == 'combobox'
+        answers[key] = {
+            **{slot: target[slot] for slot in (
+                'selector', 'label', 'question', 'tag', 'type',
+                'form_selector', 'form_action')},
+            'url': initial['page']['url'],
+            'value': 'Approved ' + key,
+        }
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': answers})
     return {key: 'Approved '+key for key in KEYS}

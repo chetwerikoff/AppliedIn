@@ -310,9 +310,30 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     hidden = next(c for c in page["controls"]
                   if c["selector"] == "#location-code")
     assert location["question"] == hidden["question"] == "Where are you located?"
-    assert forms._approval_question_collisions(page, location) == [hidden]
-
-    assert forms._key(page, location) == "Where are you located?"
+    collisions = forms._approval_question_collisions(page, location)
+    # r06: a newly observable required text receiver may NOT be discarded as
+    # mere widget decoration. It remains a separate unapproved form field,
+    # even though the named hidden machine receiver is not an owner question.
+    anonymous = [c for c in collisions
+                 if c.get("type") == "text" and not c.get("label")
+                 and not c.get("name") and c.get("required") is True]
+    assert len(anonymous) == 1
+    assert collisions == [anonymous[0], hidden]
+    with pytest.raises(forms.Gate, match="same approval question"):
+        forms._key(page, location)
+    # It independently prevents Submit if a previously incomplete inventory
+    # is replaced by a complete read with this required native value empty.
+    probe = {**page, "controls": [anonymous[0]], "inventory_verified": True,
+             "truncated": False, "opaque_controls": False,
+             "shadow_roots": False, "unsupported_frames": []}
+    with pytest.raises(forms.Gate, match="Required field is empty"):
+        forms.check_form(probe, {}, uploaded=True)
+    # On a distinct page without the required anonymous receiver, the named
+    # hidden machine field still does not collide with the approved question.
+    without_proxy = {**page, "controls": [
+        c for c in page["controls"] if c is not anonymous[0]]}
+    assert forms._approval_question_collisions(without_proxy, location) == [hidden]
+    assert forms._key(without_proxy, location) == "Where are you located?"
 
 
 def test_served_form_does_not_add_an_unlinked_caption_hidden_value():

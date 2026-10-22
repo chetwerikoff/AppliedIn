@@ -186,8 +186,14 @@ def test_selected_country_without_placeholder_is_main_failing_regression():
         assert country['combobox']['selected_text'] == ''
         assert country['combobox']['hidden_selector'] == ''
         assert location['type'] == 'combobox'
-        assert location['combobox']['hidden_value'] == 'Synthetic Example City'
+        assert location['combobox']['hidden_selector'] == ''
+        assert location['combobox']['hidden_value'] == ''
         assert location['combobox']['selected_text'] == ''
+    # A named hidden field can hold bytes without being linked to the ARIA
+    # owner. Neither reader may attribute that unrelated value to the picker.
+    stored = _control(page, '#location-code')
+    assert stored['type'] == 'hidden' and stored['name'] == 'location_value'
+    assert stored['value'] == 'Synthetic Example City'
     # The mandatory final form read rejects the unproven widget even with a
     # synthetic approval, rather than handing a fake C2 certificate to Submit.
     with pytest.raises(forms.Gate):

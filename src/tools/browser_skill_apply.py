@@ -4022,13 +4022,17 @@ class ApplicationIPCController:
                 raise Gate('A previous possible submission is held; no repeat is safe.')
 
     async def _page(self, session):
-        from tools.browser_skill_dom import ENTRY_PAGE, GREENHOUSE_PAGE, PAGE
-        # These are fixed application readers, not page/model-generated code.
-        ats = self._row().get('ats')
-        script = (GREENHOUSE_PAGE if ats == 'greenhouse'
-                  else ENTRY_PAGE if ats in _APPLICATION_ENTRY else PAGE)
-        result = await session.call('evaluate', script)
-        page = result.get('value') if isinstance(result, dict) else None
+        if self.fixture_context is not None:
+            # The sealed offline facade exposes its own read-only page, not a
+            # raw evaluator. Re-read it after the hold just as in production.
+            page = await session.page()
+        else:
+            from tools.browser_skill_dom import ENTRY_PAGE, GREENHOUSE_PAGE, PAGE
+            ats = self._row().get('ats')
+            script = (GREENHOUSE_PAGE if ats == 'greenhouse'
+                      else ENTRY_PAGE if ats in _APPLICATION_ENTRY else PAGE)
+            result = await session.call('evaluate', script)
+            page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict) or not isinstance(page.get('url'), str):
             raise Gate('Fresh application page observation is unavailable.')
         return page
@@ -4599,6 +4603,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, history, model=model)
                     verb = action.get('action')
+                    if verb == 'click' and ctx is not None and action.get('selector'):
+                        candidate = control(page, action, 'decision-initial')
+                        if is_submission(candidate) or native_submit(candidate):
+                            # The fixture's native Continue is a real Submit
+                            # action, never the generic pre-private click path.
+                            verb = 'submit'
                     if action.get('selector'):
                         old = control(page, action, 'decision-initial')
                         page = await session.page()

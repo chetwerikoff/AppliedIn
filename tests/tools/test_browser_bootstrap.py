@@ -175,7 +175,7 @@ async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, gr
 
 
 async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history, *,
-                              reason):
+                              reason, expect_form=True):
     """Reach the one production final-click decision with synthetic valid PDF.
 
     Only the form/value evidence is deliberately defective: job, origin, file
@@ -238,7 +238,7 @@ async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history,
     raw_session.bind_application_controller(controller)
     with pytest.raises(forms.Gate, match=reason):
         await raw_session.application_effect('click', '#submit')
-    assert reached_form == [True]
+    assert reached_form == ([True] if expect_form else [])
     assert raw_calls == [] and submitted == []
     assert controller.committed is False
     assert row['status'] == 'submitting' and row['possible_submission'] is False
@@ -514,19 +514,27 @@ async def test_selected_email_on_own_login_or_subscription_form_is_not_grantable
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-async def test_selected_continuation_without_positive_marker_is_generic(monkeypatch):
-    # Architect amendment (c): even model-selected Next/Continue cannot
-    # mint a disclosure grant without a positive native application marker.
-    p = inventory(field(), submit('Next'))
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-    with pytest.raises(forms.Gate) as exc:
-        await forms.execute(browser, p,
-            {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-            facts={}, filled={}, resume_path='', company='example-co',
-            jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
-    assert exc.value.form_question is None
+async def test_selected_continuation_without_positive_marker_is_generic(
+        monkeypatch, tmp_path):
+    # r06 §§1,5,8: a real native Submit cannot be classified as reversible
+    # merely because its caption says Next; an unanswered Email must deny
+    # the SAME final raw-click decision, regardless of model invocation.
+    p = secure_inventory(field())
+    p['controls'][-1]['label'] = 'Next'
+    assert forms.native_submit(p['controls'][-1])
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert not row['human_approved_answers']
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={}, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
 def test_only_actual_direct_owner_reply_persists_complete_identity(monkeypatch):
@@ -708,41 +716,52 @@ async def test_material_native_select_options_block_all_grant_routes(
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-async def test_safe_native_select_options_remain_grantable(monkeypatch):
+async def test_safe_native_select_options_remain_grantable(monkeypatch, tmp_path):
     options = [{'value': '', 'label': 'Choose one'},
                {'value': 'remote', 'label': 'Remote'},
                {'value': 'onsite', 'label': 'On-site'}]
-    location = field('Work location', '#location', tag='select', type='select',
-                     question='Where can you work?', options=options)
-    p = inventory(location, submit())
-    browser, decide, row = world(monkeypatch, p)
-    expected = chr(10).join([
+    p = secure_inventory(field(
+        'Work location', '#location', tag='select', type='select',
+        question='Where can you work?', options=options))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'Where can you work?': 'Remote'})
+    observed, fixed = await forms._observe_controls(browser, p)
+    target = forms.control(observed, {'selector': '#location'})
+    question = forms._disclosure_question(
+        observed, target, fixed, SECURE_URL, bootstrap=True)
+    assert {key: question[key] for key in (
+        'label', 'selector', 'form_selector', 'form_action', 'url')} == {
+        'label': 'Where can you work?', 'selector': '#location',
+        'form_selector': '#application', 'form_action': SECURE_URL,
+        'url': SECURE_URL}
+    assert question['options'] == options
+    expected = '\n'.join([
         'Where can you work?', 'Work location', 'Options:',
         'Choose one', 'Remote', 'On-site'])
-    # A bank candidate still requires owner confirmation and shows every
-    # native option in DOM order before any grant or browser write.
-    report = await attempt(p, facts={'Work location': 'Remote'})
-    q = report['form_question']
-    assert q['label'] == 'Where can you work?' and q['options'] == options
-    assert report['question'].startswith(expected)
-    assert row['human_approved_answers'] == {}
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
-    # Model-selected select gates show the same exact question and options.
-    missing = await selected_gate(
-        browser, p, verb='select', selector='#location', key='Work location')
-    assert str(missing) == expected
-    # A matching bank value without a per-job grant still gates with options.
-    exc = await selected_gate(browser, p, verb='select', selector='#location',
-                              key='Work location', facts={'Work location': 'Remote'})
-    assert str(exc).endswith(expected)
-    assert exc.form_question['options'] == options
-    wrong_key = await selected_gate(
-        browser, p, verb='select', selector='#location', key='Other field',
-        facts={'Other field': 'Remote'})
-    assert str(wrong_key).endswith(expected)
-    assert 'exact human-approved fact key' in str(wrong_key)
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+    assert forms._choice_prompt(target, question) == expected
+    # r06 §§2,5: the observed, form-bound question is still actionable
+    # after agent-first triage, but neither a banked answer nor the model's
+    # own chosen key can manufacture the required exact row approval.
+    for key, facts in [
+        ('Where can you work?', {}),
+        ('Where can you work?', {'Where can you work?': 'Remote'}),
+        ('Other field', {'Other field': 'Remote'}),
+    ]:
+        with pytest.raises(forms.Gate) as denied:
+            await forms.execute(
+                browser, p, {'action': 'select', 'selector': '#location',
+                            'fact': key},
+                facts=facts, filled=filled, resume_path='',
+                company='example-co', jd_text='', resume_tex='', github='',
+                pk=PK, job_url=SECURE_URL)
+        assert denied.value.form_question['options'] == options
+        assert expected in str(denied.value)
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Work location')
 
 
 @pytest.mark.parametrize('case,attribute,value', [
@@ -770,19 +789,33 @@ def test_fixed_read_only_script_contains_effective_dom_predicates():
     assert "e.matches(':disabled')" in script
 
 
-async def test_unrelated_native_search_does_not_veto_application(monkeypatch):
+async def test_unrelated_native_search_does_not_veto_application(
+        monkeypatch, tmp_path):
     search = field('Search jobs', '#search', required=False, type='search',
                    form_selector='#site-search')
     search_submit = submit('Search', selector='#search-submit',
                            form_selector='#site-search')
-    p = inventory(search, search_submit, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    exc = await selected_gate(browser, p)
-    assert exc.form_question['label'] == 'Email'
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+    p = secure_inventory(search, search_submit, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    page, fixed = await forms._observe_controls(browser, p)
+    email = forms.control(page, {'selector': '#email'})
+    q = forms._disclosure_question(page, email, fixed, SECURE_URL, bootstrap=True)
+    assert (q['label'], q['selector'], q['form_selector'], q['form_action']) == (
+        'Email', '#email', '#application', SECURE_URL)
+    assert q['form_selector'] != search['form_selector']
+    assert forms._form_subject(page, email) == [
+        item for item in page['controls']
+        if item.get('form_selector') == '#application']
+    # The second native Search Submit has a different owner and cannot be
+    # borrowed by the application. It must not hide the Email question
+    # during preparation or authorize either form's irreversible click.
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Competing native Submit owners', expect_form=False)
+    assert not filled and not history
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 async def test_plausible_competing_native_form_stays_generic(monkeypatch):
     other = field('Candidate reference', '#other', required=False,

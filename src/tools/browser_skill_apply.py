@@ -1057,13 +1057,6 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             raise Gate('Unsupported custom control; human inspection is required.')
         value = target.get('value', '')
         if typ in {'radio', 'checkbox'}:
-            if typ == 'radio' and (target.get('required') or target.get('checked')):
-                # A checked bit alone cannot prove its submitted question.
-                # Bind the current visible group to its form owner and name
-                # only at the final Submit decision, not during preparation.
-                group = _radio_group(page, target)
-                if sum(bool(member.get('checked')) for member in group) > 1:
-                    raise Gate('Native radio group has conflicting checked members.')
             if target.get('checked'):
                 scope = _assent_scope(target) if typ == 'checkbox' else 'fact'
                 # A delegated application-processing acknowledgement must
@@ -1084,6 +1077,16 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 elif (expected is None or not (_same(expected, value)
                           or _same(expected, target.get('label', '')))):
                     raise Gate(f'Unverified preselected answer: {target["label"]}')
+                if typ == 'radio':
+                    # Unselected required radios and unapproved preselection
+                    # already fail at this same final guard. Do not let a
+                    # structural witness mask those exact missing/unapproved
+                    # answer refusals. An approved selected radio must ALSO
+                    # prove one live owning form/name/visible question, unique
+                    # members and exactly one selected member before Submit.
+                    group = _radio_group(page, target)
+                    if sum(bool(member.get('checked')) for member in group) != 1:
+                        raise Gate('Native radio group has conflicting checked members.')
                 guarded_value(target, target.get('label', value))
             elif expected is not None:
                 raise Gate('A previously verified checkbox/radio choice has changed.')

@@ -771,6 +771,8 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
             gate_pending={'question': submit_hold.REASON}, gate_call_id=None,
             fail_kind='uncertain', fail_reason=submit_hold.REASON,
             last_button=context['last_button'], last_url=context['url'])
+    except Gate:
+        raise
     except Exception as exc:
         raise Gate('Durable possible-submission hold could not be confirmed; no click is safe.') from exc
 

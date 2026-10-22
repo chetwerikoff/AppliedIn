@@ -47,6 +47,7 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.8.0",
     "moto[dynamodb,s3,sqs,secretsmanager]>=5",
     "respx>=0.21",
     "ruff>=0.6",

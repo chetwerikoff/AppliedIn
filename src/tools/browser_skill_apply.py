@@ -990,6 +990,12 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                                            if r.get('action') == 'combobox'
                                            and r.get('selector') == owner.get('selector')
                                            and r.get('hidden_selector') == target.get('selector')]
+                        if not linked_receipts:
+                            # A posted hidden receiver is not verified merely
+                            # because a visible picker displays an answer.
+                            # Name the absent authorization evidence precisely
+                            # for agent-first diagnosis; never infer its value.
+                            raise Gate('A hidden form value is not independently authorized: missing selection receipt.')
                         if len(linked_receipts) == 1:
                             receipt = linked_receipts[0]
                             before = receipt.get('hidden_value_before')

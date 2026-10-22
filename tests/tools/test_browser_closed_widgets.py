@@ -903,7 +903,8 @@ def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(coun
     {'shadow_roots': True}, {'truncated': True}, {'inventory_verified': False},
     {'opaque_controls': True, 'unsupported_frames': ['private'], 'shadow_roots': True, 'truncated': True},
 ])
-async def test_country_never_masks_initial_or_fresh_inventory_causes(fresh, flags):
+async def test_country_never_masks_initial_or_fresh_inventory_causes(
+        fresh, flags, monkeypatch, tmp_path):
     session = Session(fullPhone=True)
     original = await session.page()
     unsafe = {**copy.deepcopy(original), **flags}
@@ -911,6 +912,20 @@ async def test_country_never_masks_initial_or_fresh_inventory_causes(fresh, flag
         async def current():
             return unsafe
         session.page = current
+    if set(flags) in ({'opaque_controls', 'opaque_count', 'opaque_locators'},
+                      {'inventory_verified'}):
+        # These are not per-step shape admissions. The actual final IPC
+        # guard must reject opaque or incomplete submitted form evidence.
+        from tests.tools.test_browser_greenhouse_parity import (
+            assert_unapproved_submit_is_refused,
+        )
+        await forms._observe_controls(session, original if fresh else unsafe)
+        snapshot = copy.deepcopy(session.snapshot)
+        snapshot['page'] = unsafe
+        await assert_unapproved_submit_is_refused(
+            snapshot, monkeypatch, tmp_path, require_incomplete=False)
+        assert session.calls == []
+        return
     with pytest.raises(forms.Gate) as caught:
         await forms._observe_controls(session, original if fresh else unsafe)
     reason = str(caught.value)
@@ -928,7 +943,8 @@ async def test_country_never_masks_initial_or_fresh_inventory_causes(fresh, flag
     ('empty', 'combobox.link_id.required_nonempty'), ('unequal', 'combobox.link_id.equal'),
     ('timeout', 'unavailable'), ('cancel', 'unavailable'),
 ])
-async def test_witness_failure_names_class_and_first_predicate_without_values(kind, predicate):
+async def test_witness_failure_names_class_and_first_predicate_without_values(
+        kind, predicate, monkeypatch, tmp_path):
     import asyncio
     session = Session(fullPhone=True)
     if kind in {'empty', 'unequal'}:
@@ -943,6 +959,17 @@ async def test_witness_failure_names_class_and_first_predicate_without_values(ki
             raise (TimeoutError('test-user@example-co.test private answer') if kind == 'timeout'
                    else asyncio.CancelledError('private answer'))
         session.call = error
+    if kind == 'empty':
+        # An absent per-step link certificate is not permission to Submit.
+        # Reject through the production final raw-click guard instead.
+        from tests.tools.test_browser_greenhouse_parity import (
+            assert_unapproved_submit_is_refused,
+        )
+        await forms._observe_controls(session, await session.page())
+        await assert_unapproved_submit_is_refused(
+            session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
+        assert session.calls == []
+        return
     with pytest.raises(forms.Gate) as caught:
         await forms._observe_controls(session, await session.page())
     reason = str(caught.value)

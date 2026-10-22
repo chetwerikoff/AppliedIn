@@ -212,6 +212,14 @@ FATAL = ['url.equal', 'selector.unique', 'unique.true', 'unique_form.true', 'wit
          'caption-wrong-type', 'link-wrong-type']
 
 
+RETIRED_COMBOBOX_STEP_PREDICATES = {
+    'combobox.link_id.required_nonempty',
+    *('combobox.' + key + '.equal' for key in (
+        'mode', 'phase', 'quarantined', 'required_proxy_mounted',
+        'label_selector', 'field_selector', 'value_container_selector',
+        'input_wrapper_selector', 'receiverless_country', 'country_graph')),
+}
+
 def drift(predicate, p, w):
     c, wc = p['controls'][1], w['controls'][1]
     if predicate == 'greenhouse.equal': w['greenhouse']['badge_responses'] = 1
@@ -287,20 +295,39 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
         raw.hook = recover
         await wait(scoped)
         assert len(raw.reads) >= 8
-        # Sensitivity: delete only this readiness permission in memory. The
-        # identical production comparison must now be fatal with this predicate.
-        monkeypatch.setattr(forms, '_GREENHOUSE_READINESS_PREDICATES', set(RETRY)-{predicate})
-        raw = Raw(deepcopy(baseline), change)
-        scoped = session(raw)
-        with pytest.raises(forms.Gate, match='predicate='+predicate.replace('.', r'\.')) as exc:
-            await wait(scoped)
-        assert 'bounded wait' not in str(exc.value)
+        if predicate not in RETIRED_COMBOBOX_STEP_PREDICATES:
+            # Retained readiness witnesses still have a fatal inverse.
+            monkeypatch.setattr(
+                forms, '_GREENHOUSE_READINESS_PREDICATES', set(RETRY)-{predicate})
+            raw = Raw(deepcopy(baseline), change)
+            scoped = session(raw)
+            with pytest.raises(forms.Gate, match='predicate='+predicate.replace('.', r'\.')):
+                await wait(scoped)
+        # Retired shape/phase predicates are not per-step human gates. Their
+        # missing form-own receiver is refused by the final Submit guard.
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
         assert 'bounded wait' not in str(exc.value)
         assert len(raw.reads) <= 3
     assert scoped._readiness is False
+
+
+def test_absent_hidden_form_receiver_is_a_final_submit_negative():
+    page = combo_page()
+    question = page['controls'][0]
+    question.update(value='Approved detail', has_value=True)
+    picker = page['controls'][1]
+    picker['combobox'].update(
+        linked=True, link_id='list', selected_text='Approved location',
+        displayed_text='Approved location', selected_value='location-code',
+        hidden_selector='#receiver', hidden_value='location-code')
+    # All visible values are correct; no actual hidden input exists. A shape
+    # phase is irrelevant, but the ONE final guard may not authorize Submit.
+    with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+        forms.check_form(
+            page, {'#answer': 'Approved detail', '#location': 'Approved location'},
+            uploaded=True)
 
 
 async def test_allowlist_is_closed_and_exact():

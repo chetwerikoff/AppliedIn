@@ -988,6 +988,46 @@ async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):
         ('click', '#location-option')]
 
 @pytest.mark.parametrize('key', ['location', 'country'])
+def test_empty_unnamed_native_proxy_is_not_an_independent_approval_question(key):
+    # Requiredness alone does not make an unlabelled, unnamed, empty
+    # validation input a separately grantable answer. It stays in the final
+    # inventory: required-field validation must still fail at Submit.
+    page = dom(fullPhone=True, requiredProxy=True, proxyKeys=[key])['page']
+    target = combo({'page': page}, key)
+    proxies = [c for c in page['controls']
+               if c.get('type') == 'text' and c.get('required')
+               and not c.get('label') and not c.get('name')]
+    assert len(proxies) == 1
+    proxy = proxies[0]
+    assert proxy['in_form'] is True and not proxy['value']
+    assert forms._could_receive_an_answer(proxy) is False
+    assert forms._key(page, target) == ('Country' if key == 'country' else key)
+    with pytest.raises(forms.Gate, match='Required field is empty'):
+        forms.check_form(
+            {'controls': [proxy], 'inventory_verified': True}, {}, True)
+
+
+@pytest.mark.parametrize('field, value', [
+    ('name', 'synthetic_answer'), ('has_value', True),
+    ('value', 'Unapproved synthetic value'),
+])
+def test_native_proxy_becoming_an_answer_restores_shared_question_collision(
+        field, value):
+    # A mutated input that acquires a name or value is no longer a blank
+    # non-answer. Do not let disambiguation borrow the Phone native anchor.
+    page = dom(fullPhone=True, requiredProxy=True,
+               proxyKeys=['country'])['page']
+    country = combo({'page': page}, 'country')
+    proxy, = [c for c in page['controls']
+              if c.get('type') == 'text' and c.get('required')
+              and not c.get('label') and not c.get('name')]
+    proxy[field] = value
+    assert forms._could_receive_an_answer(proxy)
+    with pytest.raises(forms.Gate, match='More than one control uses'):
+        forms._key(page, country)
+
+
+@pytest.mark.parametrize('key', ['location', 'country'])
 async def test_mounted_proxy_cannot_authorize_final_raw_submit(
         key, monkeypatch, tmp_path):
     from tests.tools.test_browser_greenhouse_parity import (

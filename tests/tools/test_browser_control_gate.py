@@ -102,21 +102,21 @@ def test_external_callers_still_compile_with_exactly_two_arguments():
             forms.control({'controls': controls}, {'selector': 'button'})
 
 
-def test_all_eighteen_remaining_r06_control_call_sites_are_fixed_and_distinct():
+def test_all_nineteen_current_control_call_sites_are_fixed_and_distinct():
     source = inspect.getsource(forms)
     tree = ast.parse(source)
     sites = [call for call in ast.walk(tree)
              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
              and call.func.id == 'control']
-    # r06 removed four closed-widget and per-step submit-readback callers;
-    # retain an exact census so deleting any surviving control gate is caught.
-    assert len(sites) == 18
+    # The current raw/preparation/final paths have 19 distinct callers.
+    # Retain an exact census so accidental removal of a guarded call is caught.
+    assert len(sites) == 19
     assert all(len(call.args) == 3 and not call.keywords
                and isinstance(call.args[2], ast.Constant)
                and isinstance(call.args[2].value, str)
                for call in sites)
     tags = [call.args[2].value for call in sites]
-    assert len(set(tags)) == 18
+    assert len(set(tags)) == 19
     assert all(0 < len(tag) <= 32 for tag in tags)
     assert set(tags) == forms._CONTROL_CALLERS - {'external'}
 

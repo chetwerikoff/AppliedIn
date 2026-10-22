@@ -2513,6 +2513,29 @@ def _bound_target(page: dict, target: dict) -> dict:
                  'value': c['value']} for c in members]}
 
 
+def _could_receive_an_answer(candidate: dict) -> bool:
+    """Only an actual answer receiver may contend for a visible question.
+
+    An empty optional ARIA search is not an approved applicant answer. Once
+    named, required or valued, it must compete for that question at both
+    the initial collision census and the final label-disambiguation pass.
+    """
+    kind = candidate.get('type')
+    if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
+        return False
+    if kind == 'combobox':
+        combo = candidate.get('combobox')
+        if not isinstance(combo, dict):
+            return True
+        if (not candidate.get('required') and not candidate.get('name')
+                and not candidate.get('has_value') and not candidate.get('value')
+                and not candidate.get('checked') and not combo.get('hidden_selector')
+                and not any(combo.get(k) for k in (
+                    'selected_text', 'selected_value', 'hidden_value'))):
+            return False
+    return True
+
+
 def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
     """A fresh PAGE copy is the same control, but selector twins are not."""
     key = target.get('question') or target.get('label')
@@ -2532,29 +2555,8 @@ def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
     # collisions within this form are ambiguous authorization candidates.
     form = target.get('form_selector') if target.get('in_form') else None
 
-    def could_receive_an_answer(candidate: dict) -> bool:
-        # A button, listbox option or hidden machine value is never a separate
-        # human-answer recipient. All still belong to the final form inventory.
-        kind = candidate.get('type')
-        if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
-            return False
-        if kind == 'combobox':
-            combo = candidate.get('combobox')
-            if not isinstance(combo, dict):
-                return True
-            # An unnamed, empty, optional accessory search cannot claim the
-            # entire fieldset legend. If it becomes an actual receiver, it
-            # remains a conflicting question and must block the grant.
-            if (not candidate.get('required') and not candidate.get('name')
-                    and not candidate.get('has_value') and not candidate.get('value')
-                    and not candidate.get('checked') and not combo.get('hidden_selector')
-                    and not any(combo.get(k) for k in (
-                        'selected_text', 'selected_value', 'hidden_value'))):
-                return False
-        return True
-
     return [c for c in controls if c.get('selector') not in own_selectors
-            and could_receive_an_answer(c)
+            and _could_receive_an_answer(c)
             and (form is None or c.get('form_selector') == form)
             and _same(key, c.get('question') or c.get('label') or '')]
 
@@ -2587,7 +2589,7 @@ def _key(page: dict, target: dict) -> str:
             selected = target['label']
             others = [c for c in page['controls']
                       if c is not target and c not in conflicts
-                      and c.get('type') != 'hidden'
+                      and _could_receive_an_answer(c)
                       and c.get('form_selector') == target.get('form_selector')]
             if not any(_same(selected, c.get('question') or c.get('label') or '')
                        for c in others):

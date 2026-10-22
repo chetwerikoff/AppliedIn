@@ -272,13 +272,16 @@ async def test_receipt_cannot_replace_current_admission_or_click_witness(grants,
     session = Session()
     receipt = await choose(session, grants)
     current = focused_final_page(await session.page())
-    owner = next(c for c in current['controls'] if c['selector'] == '#location')
-    assert not owner['combobox'].get('hidden_selector')
-    owner.update(name='location', value=receipt['committed_caption'], has_value=True)
-    owner['combobox'].update(
-        selected_text=receipt['committed_caption'],
-        displayed_text=receipt['committed_caption'],
-        selected_value=receipt['committed_value'])
+    if key == 'hidden_value':
+        # Only this requested negative receives a valid final form-owned
+        # selection. The four historical failure variants remain separate.
+        owner = next(c for c in current['controls'] if c['selector'] == '#location')
+        assert not owner['combobox'].get('hidden_selector')
+        owner.update(name='location', value=receipt['committed_caption'], has_value=True)
+        owner['combobox'].update(
+            selected_text=receipt['committed_caption'],
+            displayed_text=receipt['committed_caption'],
+            selected_value=receipt['committed_value'])
     filled = {'#location': 'Approved location'}
     forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)

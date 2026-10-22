@@ -470,21 +470,27 @@ async def test_required_radio_group_gates_before_later_text(monkeypatch, tmp_pat
                               reason='Required choice is empty: Evenings')
 
 
-async def test_duplicate_form_question_never_authorizes_either_sibling(monkeypatch):
-    a = field('First', '#a', question='Contact details')
-    b = field('Second', '#b', question='Contact details')
-    p = inventory(a, b, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question'] is None
-    assert decide.await_count == 1
+async def test_duplicate_form_question_never_authorizes_either_sibling(
+        monkeypatch, tmp_path):
+    # Identical observed approval questions cannot become two independent
+    # write grants, even if a candidate fact bank contains the same answer.
+    p = secure_inventory(field('First', '#a', question='Contact details'),
+                         field('Second', '#b', question='Contact details'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'Contact details': 'Synthetic answer'})
     for chosen in ('#a', '#b'):
-        with pytest.raises(forms.Gate) as exc:
-            await forms.execute(browser, p, {'action': 'fill', 'selector': chosen,
-                'fact': 'Contact details'}, facts={}, filled={}, resume_path='',
-                company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-                job_url=URL)
-        assert exc.value.form_question is None
+        with pytest.raises(forms.Gate, match='More than one control uses'):
+            await forms.execute(
+                browser, p, {'action': 'fill', 'selector': chosen,
+                             'fact': 'Contact details'},
+                facts={'Contact details': 'Synthetic answer'}, filled=filled,
+                resume_path='', company='example-co', jd_text='', resume_tex='',
+                github='', pk=PK, job_url=SECURE_URL)
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: First')
 
 
 @pytest.mark.parametrize('kind', ['sign-in', 'subscribe', 'account-sibling'])
@@ -778,7 +784,6 @@ async def test_unrelated_native_search_does_not_veto_application(monkeypatch):
     assert exc.form_question['label'] == 'Email'
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
-
 async def test_plausible_competing_native_form_stays_generic(monkeypatch):
     other = field('Candidate reference', '#other', required=False,
                   form_selector='#other-form')
@@ -789,29 +794,28 @@ async def test_plausible_competing_native_form_stays_generic(monkeypatch):
     assert (await selected_gate(browser, p)).form_question is None
 
 
-@pytest.mark.parametrize('value,eligible', [
-    ('Apply now', True),
-    ('  apply   NOW  ', True),
-    ('Submit application', True),
-    ('Submit', False),
-    ('Apply now!', False),
-    ('Apply', False),
-    ('Next', False),
+@pytest.mark.parametrize('value', [
+    'Apply now', '  apply   NOW  ', 'Submit application', 'Submit',
+    'Apply now!', 'Apply', 'Next',
 ])
-async def test_input_submit_marker_uses_only_exact_closed_allowlist(
-        monkeypatch, value, eligible):
-    native = field('go', '#native-submit', required=False, tag='input',
-                   type='submit', submit=True, value=value, has_value=True)
-    p = inventory(field(), native)
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    if eligible:
-        assert report['form_question']['label'] == 'Email'
-        assert not decide.await_count
-    else:
-        assert report['form_question'] is None
-        assert decide.await_count == 1
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+async def test_native_input_submit_is_irreversible_regardless_of_value(
+        monkeypatch, tmp_path, value):
+    # r06 removes the obsolete early closed allowlist. A real native
+    # input[type=submit] can submit even if its caption says "Next";
+    # an empty Email must prevent ALL of them at the final raw-click seam.
+    p = secure_inventory(field())
+    native = p['controls'][-1]
+    native.update(tag='input', type='submit', submit=True,
+                  label='go', value=value, has_value=True)
+    assert forms.native_submit(native)
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert not filled and not history
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 
 @pytest.mark.parametrize('receiver', ['form_action', 'formaction'])
@@ -1817,7 +1821,6 @@ async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_wi
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kwargs: None)
     result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
                                pk=pk, resume_path='Resume.pdf')
-
     assert result['status'] == 'gate', result
     assert result['form_question'] is None
     # The synthetic link is still proven by the real redirect probe, but no
@@ -2078,7 +2081,6 @@ async def test_vendor_row_drift_during_dom_witness_prevents_field_gate(
     assert 'job/tenant mapping changed during native control inspection' in result['question']
     assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
 
-
 @pytest.mark.parametrize('matches_fresh_target', [True, False])
 async def test_vendor_resume_requires_grant_for_exact_fresh_probe_target(
         monkeypatch, matches_fresh_target):
@@ -2337,7 +2339,6 @@ async def test_vendor_row_drift_after_decision_gates_before_each_write(
     assert len(requests) == 1
     mutating = {'fill', 'select', 'choose', 'combobox', 'upload', 'click'}
     assert not any(call[0] in mutating for call in browser.calls)
-
 
 async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(monkeypatch):
     canonical = 'https://example-co.teamtailor.com/jobs/backend-123'

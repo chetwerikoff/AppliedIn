@@ -138,39 +138,40 @@ class Session:
 
 
 class FormOwnedSelection(Session):
-    """The fake option click produces independent current form-submitted bytes.
+    """Simulate a real DOM change handler, not a receipt-guessed receiver.
 
-    The original CSS-only snapshot has no committed machine value. Observe the
-    actual uniquely rendered option *before* clicking, then emulate the DOM's
-    selection/change handler updating the named form input after that click.
-    Neither the action receipt nor approved caption invents a machine value.
+    Each uniquely observed safe option click updates the *current* form-owned
+    input. An ordinary picker fill alone still cannot select an option.
     """
     observed_choice = None
 
     async def call(self, *args):
         selected = None
-        if args == ('click', '#location-option'):
-            owner = combo(self.snapshot)
+        key = None
+        if len(args) == 2 and args[0] == 'click' and args[1].endswith('-option'):
+            key = args[1][1:].removesuffix('-option')
+            owner = next(c for c in self.snapshot['page']['controls']
+                         if c['selector'] == '#'+key)
             matches = [o for o in owner['combobox']['options']
-                       if o.get('selector') == '#location-option']
+                       if o.get('selector') == '#'+key+'-option']
             assert len(matches) == 1
             selected = copy.deepcopy(matches[0])
             assert selected['unique'] is True and selected['safe'] is True
             assert not selected.get('submit') and not selected.get('navigates')
-            assert selected['value']  # an observed real option value, never guessed
+            assert selected['value']  # captured machine code, not a caption guess
         result = await super().call(*args)
         if selected is not None:
-            self.observed_choice = (selected['label'], selected['value'])
+            if key == 'location':
+                self.observed_choice = (selected['label'], selected['value'])
             for reader in self.snapshot.values():
                 owner = next(c for c in reader['controls']
-                             if c['selector'] == '#location')
-                owner.update(name='location', value=selected['value'], has_value=True)
+                             if c['selector'] == '#'+key)
+                owner.update(name=key, value=selected['value'], has_value=True)
                 owner['combobox'].update(
                     selected_text=selected['label'],
                     displayed_text=selected['label'],
                     selected_value=selected['value'])
         return result
-
 
 async def test_synthetic_reversible_picker_fill_is_not_a_selection():
     session = Session()
@@ -220,20 +221,20 @@ async def choose(session, facts, key='location', filled=None):
         job_url=URL, ctx=None, provenance=None)
 
 
-def focused_final_page(page, key='location'):
-    """Leave only the actual form-owned combobox and its submitted receiver.
+def focused_final_choices(page, keys=('location',)):
+    """Isolate actual form-owned choices without importing incomplete peers.
 
-    The real final check must pass for an unchanged selection; unrelated
-    unfinished fields or intentionally opaque fixture peers cannot mask the
-    exact negative being exercised.
+    This is only a negative/positive final-form fixture, never a replacement
+    for the production final Submit guard's whole-page inventory.
     """
     final = copy.deepcopy(page)
-    owner = next(c for c in final['controls'] if c['selector'] == '#'+key)
-    hidden = (owner.get('combobox') or {}).get('hidden_selector')
-    kept = {'#'+key}
-    if hidden:
-        kept.add(hidden)
-        assert sum(c['selector'] == hidden for c in final['controls']) == 1
+    kept = {'#'+key for key in keys}
+    for key in keys:
+        owner = next(c for c in final['controls'] if c['selector'] == '#'+key)
+        hidden = (owner.get('combobox') or {}).get('hidden_selector')
+        if hidden:
+            kept.add(hidden)
+            assert sum(c['selector'] == hidden for c in final['controls']) == 1
     final['controls'] = [c for c in final['controls'] if c['selector'] in kept]
     assert len(final['controls']) == len(kept)
     final.update(inventory_verified=True, truncated=False, opaque_controls=False,
@@ -241,18 +242,31 @@ def focused_final_page(page, key='location'):
     return final
 
 
+def focused_final_page(page, key='location'):
+    return focused_final_choices(page, (key,))
+
 async def test_four_exact_commits_and_presubmit_current_reread(grants):
-    session, filled, receipts = Session(), {}, []
+    # The generic option click is preparation, not proof. Four independent
+    # *current form-owned* values must agree with the approved captions.
+    session, filled, receipts = FormOwnedSelection(), {}, []
     for key in KEYS:
         receipts.append(await choose(session, grants, key, filled))
-    final, _ = await forms._observe_controls(session, await session.page())
+    current, _ = await forms._observe_controls(session, await session.page())
+    final = focused_final_choices(current, KEYS)
     forms.check_form(final, filled, True, receipts=receipts)
     forms.check_approvals('example-co#1', receipts, final)
-    assert len(session.calls) == 8
-    assert len(receipts) == 4
-    for receipt in receipts:
-        assert receipt['committed_value'] == receipt['approved_value']
-
+    assert len(session.calls) == 3 * len(KEYS)
+    assert len(receipts) == len(KEYS)
+    for key, receipt in zip(KEYS, receipts):
+        owner = next(c for c in final['controls'] if c['selector'] == '#'+key)
+        assert receipt['committed_caption'] == grants[key]
+        assert receipt['committed_value'] == owner['value']
+        assert owner['combobox']['selected_value'] == owner['value']
+    # The same click receipts with a changed *current* form value fail Submit.
+    changed = copy.deepcopy(final)
+    changed['controls'][0]['value'] = 'Other submitted value'
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(changed, filled, True, receipts=receipts)
 
 @pytest.mark.parametrize('scenario', [
     {'caption': 'approved location'}, {'caption': 'Approved  location'},
@@ -405,7 +419,7 @@ def test_each_current_popup_ownership_boundary(scenario):
 
 @pytest.mark.parametrize('anchor', ['field', 'value', 'wrapper', 'label'])
 @pytest.mark.parametrize('stage', ['pre-open', 'expanded', 'committed'])
-async def test_current_anchor_drift_gates_before_next_widget_ipc(grants, anchor, stage):
+async def test_anchor_drift_does_not_confer_submit_authority(grants, anchor, stage):
     class Drift(Session):
         reads = 0
         async def page(self):
@@ -420,11 +434,16 @@ async def test_current_anchor_drift_gates_before_next_widget_ipc(grants, anchor,
                     or (stage == 'committed' and args[1] == '#location-option')):
                 self.snapshot = dom(phases=self.phases, drift=anchor)
             return result
-    session = Drift()
-    with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert len(session.calls) == {'pre-open': 0, 'expanded': 1, 'committed': 2}[stage]
 
+    # Old shape-anchor drift is not an automatic intermediate human Gate.
+    # Nor may an old receipt mint the final form-owned submitted value.
+    session, filled = Drift(), {}
+    receipt = await choose(session, grants, filled=filled)
+    assert receipt['action'] == 'combobox'
+    assert ('click', '#submit') not in session.calls
+    with pytest.raises(forms.Gate):
+        forms.check_form(focused_final_page(await session.page()),
+                         filled, True, receipts=[receipt])
 
 @pytest.mark.parametrize('phase', ['C0', 'C2'])
 async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase):
@@ -445,7 +464,7 @@ async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase):
                          filled, True, receipts=[receipt])
 
 
-async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
+async def test_legacy_shape_loss_cannot_grant_a_final_submitted_value(grants):
     class Drift(Session):
         async def call(self, *args):
             result = await super().call(*args)
@@ -454,12 +473,13 @@ async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
             return result
     session, filled = Drift(), {}
     receipt = await choose(session, grants, filled=filled)
-    assert receipt['unresolved'] and filled == {}
-    assert not any(c[1].endswith('-option') for c in session.calls)
+    # A generic ARIA relationship can still allow reversible preparation
+    # even when the former library-specific graph mode disappears.
+    assert receipt['action'] == 'combobox'
+    assert ('click', '#submit') not in session.calls
     with pytest.raises(forms.Gate):
         forms.check_form(focused_final_page(await session.page()),
                          filled, True, receipts=[receipt])
-
 
 async def test_forged_plain_receipt_is_not_code_witnessed(grants):
     session = Session()
@@ -496,14 +516,17 @@ async def test_required_unapproved_bootstrap_precedes_all_widget_ipc(grants):
         forms.check_form(prepared, {}, uploaded=True)
 
 
-async def test_committed_new_mode_still_gets_independent_presubmit_witness(grants):
+async def test_current_witness_disagreement_is_not_a_picker_phase_gate(grants):
     session = Session()
     for key in KEYS:
         await choose(session, grants, key)
     session.snapshot['witness']['controls'][0]['combobox']['selected_text'] = 'drift'
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(session, await session.page(), 'example-co#1', grants, URL)
-
+    # Bootstrap itself does not require the old C0/C1/C2 terminal gate.
+    await forms._bootstrap(session, await session.page(), 'example-co#1', grants, URL)
+    # But a subsequent real independent DOM read must not bless this mismatch.
+    with pytest.raises(forms.Gate, match='combobox.selected_text.equal'):
+        await forms._observe_controls(session, await session.page())
+    assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('boundary', ['initial', 'identity', 'phase', 'downgrade', 'missing'])
 async def test_unproved_closed_widget_observation_refuses_final_submit(
@@ -599,25 +622,35 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
     {'data-value': 'Approved location', 'value': ''},
     {'data-value': 'OTHER'},
 ])
-async def test_every_present_option_attribute_must_be_approved(grants, attrs):
-    session = Session(optionAttrs=attrs)
-    with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert session.calls == [('click', '#location')]
-
+async def test_option_machine_attributes_never_replace_live_submitted_value(grants, attrs):
+    # An opaque machine code need not equal the approved displayed caption.
+    # The actual form-owned current value MUST equal the selected option code.
+    session, filled = FormOwnedSelection(optionAttrs=attrs), {}
+    receipt = await choose(session, grants, filled=filled)
+    assert receipt['action'] == 'combobox'
+    assert session.observed_choice is not None
+    final = focused_final_page(await session.page())
+    forms.check_form(final, filled, True, receipts=[receipt])
+    changed = copy.deepcopy(final)
+    next(c for c in changed['controls'] if c['selector'] == '#location')['value'] = (
+        'Different submitted machine code')
+    with pytest.raises(forms.Gate, match='form-own value receiver'):
+        forms.check_form(changed, filled, True, receipts=[receipt])
+    assert ('click', '#submit') not in session.calls
 
 async def test_attribute_less_option_commits_exact_caption_and_receiver(grants):
-    session, filled = Session(optionAttrs={}), {}
+    session, filled = FormOwnedSelection(optionAttrs={}), {}
     receipt = await choose(session, grants, filled=filled)
     assert receipt['committed_caption'] == receipt['committed_value'] == grants['location']
-    assert receipt['hidden_value'] == grants['location']
+    assert receipt['hidden_value'] == ''  # No invented hidden input commitment.
+    assert session.observed_choice == (grants['location'], grants['location'])
     assert session.calls == [
         ('click', '#location'), ('fill', '#location', '--value', 'Approved location'),
         ('click', '#location-option')]
     final, _ = await forms._observe_controls(session, await session.page())
-    forms.check_form(focused_final_page(final), filled, True, receipts=[receipt])
-    forms.check_approvals('example-co#1', [receipt], final)
-
+    focused = focused_final_page(final)
+    forms.check_form(focused, filled, True, receipts=[receipt])
+    forms.check_approvals('example-co#1', [receipt], focused)
 
 def test_cleared_optional_phone_cannot_evade_presubmit():
     page = dom()['page']
@@ -636,7 +669,7 @@ def test_cleared_optional_phone_cannot_evade_presubmit():
         'opaque_controls': False, 'shadow_roots': False,
         'unsupported_frames': [],
     }
-    with pytest.raises(forms.Gate, match='phone value'):
+    with pytest.raises(forms.Gate, match='current native value and its readback disagree'):
         forms.check_form(complete, {'#phone': '+12025550123'}, True)
 
 
@@ -667,43 +700,59 @@ async def test_delayed_component_phase_is_observed_without_extra_ipc(grants, del
         ('click', '#location-option')]
 
 
-@pytest.mark.parametrize('verb', ['submit', 'click'])
-async def test_direct_route_commit_requires_latest_fixed_witness(monkeypatch, grants, verb):
-    from unittest.mock import AsyncMock
+async def test_direct_raw_submit_refuses_changed_current_choice(
+        monkeypatch, tmp_path, grants):
+    """One production raw application click, no fake model-level submit gate."""
     from tools import browser_skill as bsk
-    class Direct(Session):
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            return False
-        async def navigate(self, url):
-            assert url == URL
-            return await self.page()
-    session = Direct()
-    await choose(session, grants)
-    session.calls.clear()
-    if verb == 'click':
-        for snapshot in session.snapshot.values():
-            next(c for c in snapshot['controls'] if c['selector'] == '#submit')['label'] = 'Continue'
-    async def decide(*args, **kwargs):
-        # The direct route has no alias. Drift arrives after bootstrap/model input.
-        combo({'page': session.snapshot['witness']})['combobox']['selected_text'] = 'late drift'
-        return {'action': verb, 'selector': '#submit'}
-    monkeypatch.setattr(bsk, 'Session', lambda *a, **kw: session)
-    monkeypatch.setattr(bsk, 'decision', decide)
-    monkeypatch.setattr(forms, '_bootstrap', AsyncMock(side_effect=lambda s, p, *a, **kw: p))
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
-    monkeypatch.setattr(forms, 'check_form', lambda *a, **kw: None)
-    monkeypatch.setattr(forms, 'check_approvals', lambda *a, **kw: None)
-    held = []
-    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: held.append(a))
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
-    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *a: '')
-    result = await forms.apply(URL, 'example-co', grants, 'synthetic',
-                               pk='example-co#1', resume_path='Synthetic.pdf')
-    assert result['status'] == 'gate' and 'DOM witness' in result['question']
-    assert not held and session.calls == []
 
+    session, filled = FormOwnedSelection(), {}
+    receipt = await choose(session, grants, filled=filled)
+    current = copy.deepcopy(await session.page())
+    current['controls'] = [c for c in current['controls']
+                           if c['selector'] in {'#location', '#resume', '#submit'}]
+    current.update(inventory_verified=True, truncated=False, opaque_controls=False,
+                   shadow_roots=False, unsupported_frames=[])
+    choice = next(c for c in current['controls'] if c['selector'] == '#location')
+    choice['combobox']['selected_text'] = 'Different displayed location'
+
+    pdf = tmp_path / 'Test User Resume.pdf'
+    pdf.write_bytes(b'%PDF-1.4\nSynthetic row PDF only\n')
+    next(c for c in current['controls']
+         if c['selector'] == '#resume')['files'] = [pdf.name]
+    row = {'pk': 'example-co#1', 'company': 'example-co', 'jd_url': URL,
+           'job_id': '1', 'title': 'Synthetic', 'ats': 'custom',
+           'status': 'submitting', 'possible_submission': False}
+    raw_commands, started = [], []
+    controller = forms.ApplicationIPCController(
+        row['pk'], row['company'], URL, str(pdf), grants, filled,
+        [receipt], {}, lambda: started.append(True))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    identity = (pdf.stat().st_size, controller.expected_digest)
+    monkeypatch.setattr(controller, '_row_pdf', lambda: identity)
+    controller.upload_identity = identity
+    controller.upload_completed = True
+
+    async def reread(_session):
+        return copy.deepcopy(current)
+
+    async def command(*args, **kwargs):
+        raw_commands.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(controller, '_page', reread)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'hold_possible_submission',
+                        lambda *a, **kw: pytest.fail('Unapproved choice reached Submit hold'))
+    monkeypatch.setattr(bsk, 'command', command)
+    raw = bsk.Session('apply')
+    raw.id = 'synthetic-session'
+    raw.bind_application_controller(controller)
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        await raw.application_effect('click', '#submit')
+    assert raw_commands == [] and started == []
+    assert controller.committed is False
+    assert ('click', '#submit') not in session.calls
 
 async def test_never_committed_component_refuses_final_submit(
         monkeypatch, tmp_path, grants):

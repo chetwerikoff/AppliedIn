@@ -5,7 +5,6 @@ leaving their two required proxies in its inventory despite the existing filter.
 Graph recognition is now shared; actionable label/display evidence stays strict.
 """
 import copy
-from tests.tools.reader_node_harness import reader_output
 import json
 import subprocess
 from pathlib import Path
@@ -30,8 +29,9 @@ def observe(kind='greenhouse', *, old=False, **scenario):
         readers = tuple(s.replace('!graphVisible(e)', '!visible(e)')
                         .replace('!graphVisible(L)', '!visible(L)')
                         .replace('graphVisible(n)', 'visible(n)') for s in readers)
-    return json.loads(reader_output(
-        'closed_widget_dom.cjs', scenario, *(instrument(s) for s in readers)))
+    return json.loads(subprocess.check_output([
+        'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
+        json.dumps(scenario), *(instrument(s) for s in readers)], text=True))
 
 
 RECT = dict(width=120, height=24, right=120, bottom=24)

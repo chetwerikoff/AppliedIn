@@ -19,6 +19,13 @@ KEYS = ('location', 'school', 'degree', 'discipline')
 
 
 def dom(**scenario):
+    if scenario.get('secondIti'):
+        # Cloning the full 244-option phone picker exceeds the VM request
+        # budget in CI. Preserve the original one-shot reader/witness command.
+        return json.loads(subprocess.check_output([
+            'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
+            json.dumps(scenario), PAGE, forms._FIXED_CONTROL_WITNESS,
+        ], text=True))
     return json.loads(reader_output(
         'closed_widget_dom.cjs', scenario, PAGE, forms._FIXED_CONTROL_WITNESS))
 

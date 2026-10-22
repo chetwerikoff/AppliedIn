@@ -1817,7 +1817,6 @@ async def test_alias_revoked_during_session_acquisition_prevents_navigation(
 
         async def __aexit__(self, *args):
             return False
-
     monkeypatch.setattr(bsk, 'Session', lambda kind: RevokingSession())
     outcome = await forms.apply(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
@@ -2597,7 +2596,6 @@ async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
     facts = MarkdownAnswerBank(path).all_facts("example-co")
     assert facts == {"First Name": "Test User"}
     assert "- **First Name**: Test User" in path.read_text()
-
     p = _marked_greenhouse_page()
     browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
     row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
@@ -3117,7 +3115,6 @@ async def test_bad_native_choice_grants_refuse_unbound_without_ipc(monkeypatch, 
     assert not decide.await_count
     assert not any(call[0] in {'click', 'fill', 'select', 'upload'}
                    for call in browser.calls)
-
 @pytest.mark.parametrize('selector,fact', [
     ('#morning', 'Schedule preference'),
     ('#evening', 'Unrelated question'),
@@ -3378,3 +3375,18 @@ def test_safe_aria_combobox_roles_are_tag_independent(tag, monkeypatch):
     {'submit': True},
     {'navigates': True},
     {'href': 'https://foreign.example-co.test/open'},
+    {'formaction': 'https://foreign.example-co.test/submit'},
+    {'combobox': {'linked': True, 'link_id': '',
+                  'listbox_selector': '', 'options': []}},
+])
+def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
+    page = _synthetic_aria_role_combobox_page()
+    page['controls'][0].update(unsafe)
+    proof = witness(page)
+    proof['controls'][0]['combobox'] = deepcopy(
+        page['controls'][0]['combobox'])
+    with pytest.raises(forms.Gate, match='safe, exclusively linked ARIA combobox'):
+        forms._disclosure_question(
+            page, page['controls'][0],
+            {c['selector']: c for c in proof['controls']},
+            SECURE_URL)

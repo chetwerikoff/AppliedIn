@@ -107,6 +107,11 @@ async def test_greenhouse_post_submit_rootless_confirmation(monkeypatch, tmp_pat
         nonlocal clicked
         assert args[-2:] == ('--session', 'synthetic-offline')
         op = args[:-2]
+        if op == ('evaluate', bsk.PAGE):
+            # The only unscoped read available on the raw Session stays
+            # observational, even when the Greenhouse form has disappeared.
+            browser.calls.append(op)
+            return {'value': deepcopy(after if clicked else browser.current)}
         if clicked and op == ('evaluate', forms.GREENHOUSE_PAGE):
             browser.calls.append(op)
             return {'value': deepcopy(after)}
@@ -143,10 +148,15 @@ async def test_greenhouse_post_submit_rootless_confirmation(monkeypatch, tmp_pat
     monkeypatch.setattr(forms.asyncio, 'sleep', AsyncMock())
     result = await forms.apply(GH_WRAP, 'example-co', {}, 'synthetic',
                                pk=GH_PK, resume_path=str(pdf))
-    assert raw_effects.count(('click', '#submit')) == 1, result
-    assert marker['held'] and clicked
+    assert [op[0] for op in raw_effects] == [
+        'navigate', 'upload', 'click'], (raw_effects, result)
+    assert raw_effects[0] == ('navigate', GH_DIRECT)
+    assert raw_effects[-1] == ('click', '#submit')
+    assert marker['held'] and clicked and row['status'] == 'needs_human'
     assert decide.await_count == 2
     assert not row.get('possible_submission')
+    if after_kind == 'revoked-provenance':
+        assert row['job_id'] == '654321'
     if after_kind == 'rootless-success':
         assert result['status'] == 'applied', result
         assert result['confirmation'].lower() == 'thank you for applying'

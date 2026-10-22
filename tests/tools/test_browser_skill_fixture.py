@@ -317,6 +317,11 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
                  if c.get("type") == "text" and not c.get("label")
                  and not c.get("name") and c.get("required") is True]
     assert len(anonymous) == 2
+    assert len({c["selector"] for c in anonymous}) == 2
+    assert all(c.get("in_form") is True
+               and c.get("form_selector") == location["form_selector"]
+               and not c.get("has_value") and c.get("value") == ""
+               for c in anonymous)
     assert hidden["type"] == "hidden" and hidden["name"] == "location_value"
     assert collisions == []
     assert forms._key(page, location) == "Where are you located?"

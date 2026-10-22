@@ -3422,156 +3422,129 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     observed, witness = await _observe_controls(session, page)
     if provenance is not None and not _preparation_current(
             provenance, fixture_context=ctx):
-        raise Gate('The verified posting changed during combobox observation.')
+        raise Gate('The tracked posting changed before combobox preparation.')
     target = control(observed, action, 'combobox-observe')
-    form_question = _disclosure_question(
+    question = _disclosure_question(
         observed, target, witness, job_url or observed['url'], provenance=provenance)
-    form_question['pk'] = pk
+    question['pk'] = pk
     key = action.get('fact', '')
     answer = str(facts.get(key) or '').strip() if key in facts else ''
-    if not answer or key != _fact_key(facts, form_question['label']):
+    if not answer or key != _fact_key(facts, question['label']):
         raise Gate('Choose an exact approved answer for this combobox.',
-                   form_question=form_question,
+                   form_question=question,
                    reason=_missing_answer_reason(target) if _unanswered(observed, target)
                    and not answer else 'unknown_field')
-    try:
-        exact_approval(pk, form_question['label'], answer, target=target, url=observed['url'],
-                       provenance=provenance,
+
+    def approve(current, current_page):
+        exact_approval(pk, question['label'], answer, target=current,
+                       url=current_page['url'], provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
+        guarded_value(current, answer)
+
+    def unresolved():
+        # No selection receipt or filled value is fabricated. An incomplete
+        # choice is assessed by the ONE final form/Submit decision instead.
+        return {'action': 'combobox', 'label': target['label'],
+                'selector': target['selector'], 'fact': question['label'],
+                'unresolved': 'The approved option or its receiver is not verified.'}
+
+    try:
+        approve(target, observed)
     except Gate:
         raise Gate('An exact human-approved answer is needed for this combobox.',
-                   form_question=form_question) from None
-    guarded_value(target, answer)
-    stable = _combobox_stable_identity(target)
-    # A closed ARIA picker may add aria-controls only when it opens.
-    # Selection still requires one fresh, exclusively linked rendered listbox.
-    link_id = (target.get('combobox') or {}).get('link_id')
-
+                   form_question=question) from None
     latest, latest_witness, current = observed, witness, target
     combo = current.get('combobox') or {}
-    options = (_combobox_options(current)
-               if combo.get('linked') is True and combo.get('options') else [])
+    try:
+        options = (_combobox_options(current)
+                   if combo.get('linked') is True and combo.get('options') else [])
+    except Gate:
+        options = []
     if not options:
-        # Opening/filtering a picker can asynchronously mount its options. The only
-        # typed value is the exact approved answer, and each refresh is witnessed.
-        exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
-                       provenance=provenance,
-                       **({'fixture_context': ctx} if ctx else {}))
+        # Opening the picker and typing only the already-approved answer are
+        # reversible. A missing/mutating listbox is not a human Submit gate.
         await _effect_call(session, 'click', current['selector'])
-        latest = await session.page()
-        latest, latest_witness = await _observe_controls(session, latest)
-        if provenance is not None and not _preparation_current(
-            provenance, fixture_context=ctx):
-            raise Gate('The verified posting changed while opening the picker; '
-                       'inspect the current configured board and tracked job manually.')
+        latest, latest_witness = await _observe_controls(session, await session.page())
         current = control(latest, action, 'combobox-open')
-        if (_combobox_stable_identity(current) != stable
-                or (link_id and (current.get('combobox') or {}).get('link_id') != link_id)
-                or not _preparation_destination_allowed(latest.get('url', ''),
-                                          job_url or observed['url'], provenance=provenance)):
-            raise Gate('The approved combobox changed while opening its picker.')
-        _disclosure_question(latest, current, latest_witness,
-                             job_url or latest['url'], provenance=provenance)
+        if not _preparation_destination_allowed(
+                latest.get('url', ''), job_url or observed['url'],
+                provenance=provenance):
+            raise Gate('The picker left the approved preparation origin.')
         if current.get('tag') == 'input':
-            exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
-                           provenance=provenance,
-                           **({'fixture_context': ctx} if ctx else {}))
-            guarded_value(current, answer)
+            approve(current, latest)
             await _effect_call(session, 'fill', current['selector'], '--value', answer)
         for attempt in range(20):
-            refreshed = await session.page()
-            refreshed, refreshed_witness = await _observe_controls(session, refreshed)
-            current = _combobox_options_target(refreshed, action)
-            if (_combobox_stable_identity(current) != stable
-                    or (link_id and (current.get('combobox') or {}).get('link_id') != link_id)
-                    or not _preparation_destination_allowed(refreshed.get('url', ''),
-                                              job_url or observed['url'], provenance=provenance)):
-                raise Gate('The approved combobox changed while options were loading.')
-            combo = current.get('combobox') or {}
-            if combo.get('linked') is True and combo.get('options'):
-                options = _combobox_options(current)
-                # Bind the first observed exclusive ARIA relationship. Once
-                # bound, a different listbox cannot inherit this approval.
-                link_id = combo['link_id']
-                latest, latest_witness = refreshed, refreshed_witness
-                break
+            try:
+                refreshed, refreshed_witness = await _observe_controls(
+                    session, await session.page())
+                candidate = control(refreshed, action, 'combobox-options')
+            except Gate:
+                candidate = None
+            if candidate is not None:
+                if not _preparation_destination_allowed(
+                        refreshed.get('url', ''), job_url or observed['url'],
+                        provenance=provenance):
+                    raise Gate('The picker left the approved preparation origin.')
+                combo = candidate.get('combobox') or {}
+                if combo.get('linked') is True and combo.get('options'):
+                    try:
+                        options = _combobox_options(candidate)
+                    except Gate:
+                        options = []
+                    if options:
+                        latest, latest_witness, current = (
+                            refreshed, refreshed_witness, candidate)
+                        break
             if attempt < 19:
                 await asyncio.sleep(0.25)
-        if not options:
-            raise Gate('The linked picker did not expose current selectable options.',
-                       form_question=form_question)
+    if not options:
+        return unresolved()
     matches = [option for option in options if _same(answer, option['label'])]
     if len(matches) != 1:
-        raise Gate('No unambiguous visible option matches the approved answer.',
-                   form_question=form_question)
-    option = matches[0]
-    _disclosure_question(latest, current, latest_witness,
-                         job_url or latest['url'], provenance=provenance)
-    exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
-                   provenance=provenance,
-                   **({'fixture_context': ctx} if ctx else {}))
-    guarded_value(current, answer)
-    # Refresh immediately before the option click so hidden-value authorization
-    # compares the receiver on both sides of this exact selection action.
-    before_page = await session.page()
-    before_page, before_witness = await _observe_controls(session, before_page)
-    before_target = control(before_page, action, 'combobox-verify')
-    if provenance is not None and not _preparation_current(
-            provenance, fixture_context=ctx):
-        raise Gate('The verified posting changed before combobox selection.')
-    if (_combobox_stable_identity(before_target) != stable
-            or (before_target.get('combobox') or {}).get('link_id') != link_id
-            or not _preparation_destination_allowed(before_page.get('url', ''),
-                                      job_url or observed['url'], provenance=provenance)):
-        raise Gate('The approved combobox changed before selecting its option.')
-    before_options = [o for o in _combobox_options(before_target)
-                      if o.get('selector') == option.get('selector')]
-    check_form_destination(
-        before_page, before_target, job_url or observed['url'], provenance=provenance)
-    exact_approval(pk, form_question['label'], answer, target=before_target, url=before_page['url'],
-                   provenance=provenance,
-                   **({'fixture_context': ctx} if ctx else {}))
-    if (len(before_options) != 1
-            or before_options[0].get('label') != option.get('label')
-            or before_options[0].get('value') != option.get('value')):
-        raise Gate('The approved option changed before selection.')
-    option = before_options[0]
-    latest, latest_witness, current = before_page, before_witness, before_target
-    combo_before = current.get('combobox') or {}
-    hidden_selector = combo_before.get('hidden_selector', '')
-    hidden_value_before = combo_before.get('hidden_value', '')
-    if hidden_selector:
-        linked_inputs = [c for c in latest.get('controls', [])
-                         if c.get('selector') == hidden_selector
-                         and c.get('type') == 'hidden'
-                         and c.get('in_form') is True
-                         and c.get('form_selector') == current.get('form_selector')]
-        if (len(linked_inputs) != 1
-                or not isinstance(hidden_value_before, str)
-                or linked_inputs[0].get('value') != hidden_value_before):
-            raise Gate('A hidden form value is not independently authorized.')
-    exact_approval(pk, form_question['label'], answer, target=current, url=latest['url'],
-                   provenance=provenance,
-                   **({'fixture_context': ctx} if ctx else {}))
-    guarded_value(current, answer)
-    if (option.get('submit') or option.get('navigates')
-            or option.get('safe') is not True):
+        return unresolved()
+    selected = matches[0]
+    # The latest independent observation, not an old C0/C1/C2 or widget-root
+    # identity, binds the one option that may be clicked during preparation.
+    try:
+        latest, latest_witness = await _observe_controls(
+            session, await session.page())
+        current = control(latest, action, 'combobox-verify')
+    except Gate:
+        return unresolved()
+    if (not _preparation_destination_allowed(
+            latest.get('url', ''), job_url or observed['url'],
+            provenance=provenance)
+            or (provenance is not None and not _preparation_current(
+                provenance, fixture_context=ctx))):
+        raise Gate('The tracked preparation origin changed before option click.')
+    # Reconfirm the already-approved fact at the exact option-click edge.
+    approve(current, latest)
+    try:
+        candidates = [option for option in _combobox_options(current)
+                      if option.get('selector') == selected.get('selector')
+                      and option.get('label') == selected.get('label')
+                      and option.get('value') == selected.get('value')]
+    except Gate:
+        return unresolved()
+    if len(candidates) != 1:
+        return unresolved()
+    selected = candidates[0]
+    if (selected.get('submit') or selected.get('navigates')
+            or selected.get('safe') is not True):
         raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
-    await _effect_call(session, 'click', option['selector'])
-    # This option click is reversible preparation, not Submit authorization.
-    # The receipt binds the uniquely observed approved option, not a claimed
-    # post-click commit. The ONE final guard rereads the selected caption and
-    # actual form-owned receiver, including after asynchronous DOM changes.
-    selected_value = option.get('value') or option['label']
-    filled[current['selector']] = option['label']
+    before = current.get('combobox') or {}
+    await _effect_call(session, 'click', selected['selector'])
+    # Receiver presence, current displayed caption and submitted bytes are
+    # checked at final Submit; an option click is not that authorization.
+    committed = selected.get('value') or selected['label']
+    filled[current['selector']] = selected['label']
     return {'action': 'combobox', 'label': current['label'],
             'selector': current['selector'], 'question': current.get('question', ''),
-            'url': latest['url'], 'fact': form_question['label'], 'approved_value': answer,
-            'committed_caption': option['label'],
-            'committed_value': selected_value,
-            'hidden_selector': hidden_selector,
-            'hidden_value_before': hidden_value_before,
-            'hidden_value': selected_value if hidden_selector else ''}
+            'url': latest['url'], 'fact': question['label'], 'approved_value': answer,
+            'committed_caption': selected['label'], 'committed_value': committed,
+            'hidden_selector': before.get('hidden_selector', ''),
+            'hidden_value_before': before.get('hidden_value', ''),
+            'hidden_value': committed if before.get('hidden_selector') else ''}
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,

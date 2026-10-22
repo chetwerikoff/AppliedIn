@@ -655,15 +655,27 @@ def test_direct_writer_refuses_malformed_control_provenance(monkeypatch, missing
     assert _direct_form_label(PK, row) is None
 
 
-async def test_missing_control_label_cannot_create_unwritable_owner_grant(monkeypatch):
-    # Even a unique question is insufficient if the writer cannot bind
-    # an original control_label to the current PAGE observation.
-    p = inventory(field('', '#email', question='Email address'), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['status'] == 'gate' and report['form_question'] is None
-    assert decide.await_count == 1
-    assert not any(x[0] in {'fill', 'select'} for x in browser.calls)
+async def test_missing_control_label_cannot_create_unwritable_owner_grant(
+        monkeypatch, tmp_path):
+    # A unique question is insufficient if its current writable receiver has
+    # no visible control label. r06 permits observing the page, but forbids an
+    # unbound writer and any final Submit with an unanswered required field.
+    p = secure_inventory(field('', '#email', question='Email address'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    with pytest.raises(forms.Gate, match='Complete native labels'):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email',
+                         'fact': 'Email address'},
+            facts={'Email address': 'Synthetic answer'}, filled=filled,
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty:')
+    assert not row['human_approved_answers'] and not filled and not history
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
 # Settled PR #38 findings: every test is PAGE-shaped and uses a separate
@@ -817,14 +829,28 @@ async def test_unrelated_native_search_does_not_veto_application(
     assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
                    for x in browser.calls)
 
-async def test_plausible_competing_native_form_stays_generic(monkeypatch):
+async def test_plausible_competing_native_form_stays_generic(
+        monkeypatch, tmp_path):
     other = field('Candidate reference', '#other', required=False,
                   form_selector='#other-form')
-    p = inventory(other, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-    assert (await selected_gate(browser, p)).form_question is None
+    p = secure_inventory(other, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    page, fixed = await forms._observe_controls(browser, p)
+    email = forms.control(page, {'selector': '#email'})
+    question = forms._disclosure_question(
+        page, email, fixed, SECURE_URL, bootstrap=True)
+    assert question['label'] == 'Email'
+    assert question['form_selector'] == '#application'
+    assert question['form_selector'] != other['form_selector']
+    # The separate optional native form is not an approval for Email. Neither
+    # form can commit while the real applicant field is still unanswered.
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
 @pytest.mark.parametrize('value', [
@@ -886,15 +912,15 @@ async def test_native_action_must_match_native_target_before_any_grant_or_ipc(
     assert not browser.calls  # no evaluate and especially no mutating IPC
 
 
-# The later architect amendment makes the positive native application
-# marker a structural grant prerequisite. Wording-only classifier misses from
-# the second source review are notes, not denial rules.
 @pytest.mark.parametrize('case', [
     'input-button-sign-in', 'input-button-subscribe',
     'subscribe-action', 'signin-form-id', 'safe-next',
 ])
 async def test_second_round_structural_marker_is_required_for_model_grants(
-        monkeypatch, case):
+        monkeypatch, tmp_path, case):
+    # An unproved Next label, neighboring account control, or changed native
+    # form is never Submit authority. The only current grant is the exact
+    # per-control row answer; the model's presence cannot create one.
     email = field()
     next_control = submit('Next')
     controls = [email, next_control]
@@ -909,14 +935,26 @@ async def test_second_round_structural_marker_is_required_for_model_grants(
     elif case == 'signin-form-id':
         email['form_selector'] = '#signin'
         next_control['form_selector'] = '#signin'
-    p = inventory(*controls)
-    browser, decide, _ = world(monkeypatch, p)
-    result = await attempt(p)
-    assert result['form_question'] is None
-    assert decide.await_count == 1
-    exc = await selected_gate(browser, p)
-    assert exc.form_question is None
-    assert all(c[0] not in {'fill', 'select'} for c in browser.calls)
+    p = secure_inventory(*controls)
+    if case == 'subscribe-action':
+        for ctrl in p['controls'][:2]:
+            ctrl['form_action'] = SECURE_URL + '/subscribe'
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email',
+                         'fact': 'Email'},
+            facts={}, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason=('Competing native Submit owners' if case == 'signin-form-id'
+                else 'Required field is empty: Email'),
+        expect_form=(case != 'signin-form-id'))
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 
 async def test_second_round_native_resume_file_is_positive_application_marker(
@@ -2597,7 +2635,6 @@ async def test_greenhouse_marked_label_execute_retains_grant_and_receipt_identit
     def observe(pk, key, value, **kwargs):
         checked.append((key, value))
         return original(pk, key, value, **kwargs)
-
     monkeypatch.setattr(forms, "exact_approval", observe)
     receipt = await forms.execute(
         browser, p,
@@ -2857,7 +2894,6 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
     monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: False)
     monkeypatch.setattr(browser_runtime, "available", lambda: (True, ""))
     dispatched = []
-
     async def offline_engine(url, company, enriched, model, **kwargs):
         dispatched.append(dict(enriched))
         assert enriched["First name"] == enriched["First Name"] == "Ada"

@@ -225,12 +225,31 @@ async def test_four_exact_commits_and_presubmit_current_reread(grants):
     {'danger': 'ancestor'}, {'danger': 'descendant'},
 ])
 async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
-    session = Session(**scenario)
-    with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert all(not c[1].endswith('-option') for c in session.calls)
-    if scenario.get('noReceiver') or scenario.get('sharedReceiver'):
-        assert session.calls == []
+    session, filled = Session(**scenario), {}
+    if scenario.get('danger'):
+        # A potential committing option is never reversible preparation.
+        with pytest.raises(forms.Gate):
+            await choose(session, grants, filled=filled)
+        assert not any(c[1].endswith('-option') for c in session.calls)
+        return
+    receipt = await choose(session, grants, filled=filled)
+    current = focused_final_page(await session.page())
+    if scenario.get('caption'):
+        # Benign case/whitespace variations of the approved caption are
+        # reversible; a later material caption change still blocks Submit.
+        assert receipt.get('committed_value')
+        forms.check_form(current, filled, True, receipts=[receipt])
+        changed = copy.deepcopy(current)
+        next(c for c in changed['controls']
+             if c['selector'] == '#location')['combobox']['selected_text'] = 'Different location'
+        with pytest.raises(forms.Gate):
+            forms.check_form(changed, filled, True, receipts=[receipt])
+    else:
+        # A foreign machine value or missing/non-owned receiver cannot be
+        # laundered by an approved displayed caption at the final boundary.
+        with pytest.raises(forms.Gate):
+            forms.check_form(current, filled, True, receipts=[receipt])
+    assert not any(c[0] == 'submit' for c in session.calls)
 
 
 @pytest.mark.parametrize('key', ['selected_text', 'displayed_text', 'hidden_value', 'selected_value'])
@@ -317,10 +336,15 @@ async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase):
             if args == ('click', '#location'):
                 self.snapshot = dom(phases={'location': phase})
             return result
-    session = Drift()
+    session, filled = Drift(), {}
+    receipt = await choose(session, grants, filled=filled)
+    # Missing/late-mounted picker options produce no invented selection
+    # receipt, and the final form guard refuses the incomplete control.
+    assert receipt['unresolved'] and filled == {}
+    assert not any(c[1].endswith('-option') for c in session.calls)
     with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert session.calls == [('click', '#location')]
+        forms.check_form(focused_final_page(await session.page()),
+                         filled, True, receipts=[receipt])
 
 
 async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
@@ -330,10 +354,13 @@ async def test_admitted_widget_cannot_fall_back_to_legacy_linked_branch(grants):
             if args == ('click', '#location'):
                 self.snapshot = dom(phases={'location': 'C1'}, badGraph=True)
             return result
-    session = Drift()
+    session, filled = Drift(), {}
+    receipt = await choose(session, grants, filled=filled)
+    assert receipt['unresolved'] and filled == {}
+    assert not any(c[1].endswith('-option') for c in session.calls)
     with pytest.raises(forms.Gate):
-        await choose(session, grants)
-    assert session.calls == [('click', '#location')]
+        forms.check_form(focused_final_page(await session.page()),
+                         filled, True, receipts=[receipt])
 
 
 async def test_forged_plain_receipt_is_not_code_witnessed(grants):

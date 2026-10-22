@@ -692,8 +692,6 @@ def entry_reader(script: str) -> str:
     transiently. The fixed witness observes provider identities independently.
     """
     script = script.replace(_WIDGET_GRAPH, _ENTRY_OBSERVATION + _WIDGET_GRAPH)
-    script = script.replace('const closedGraph = e => {',
-                            'const closedGraph = e => { if (excluded.has(e)) return null;')
     script = script.replace('const H = hidden[0];',
                             'const H = hidden[0]; if (responseNodes.includes(H)) '
                             '{ entry.response_error=true; return null; }')

@@ -94,19 +94,28 @@ def test_exact_phone_inventory_uses_both_production_readers(phase):
     {'outsideOption': True}, {'countryDuplicate': True}, {'countryTyped': True},
     {'countryNoToken': True}, {'countryAttr': ['aria-controls', '']},
 ])
-def test_unproven_phone_shape_remains_opaque(scenario):
+async def test_unproven_phone_shape_remains_opaque(scenario, monkeypatch, tmp_path):
+    """Generic ARIA inventory never converts an ambiguous country picker to Submit."""
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
     snapshot = dom(fullPhone=True, **scenario)
-    assert snapshot['page']['opaque_controls'] is True
-    assert snapshot['page']['inventory_verified'] is False
-    if scenario.get('flatPicker'):
-        # This separate legacy shape cannot be covered by mutating the nested graph.
-        for reader in snapshot.values():
-            sels = {c['selector'] for c in reader['controls']}
-            assert {'#country-button', '#country-search', '#picker-option-0'} <= sels
-    if any(k.startswith('picker') or k in {'visiblePicker', 'multipleTel', 'extraPicker', 'nestedPicker'} for k in scenario):
-        for reader in snapshot.values():
-            sels = {c['selector'] for c in reader['controls']}
-            assert '#country-search' in sels and any(c['type'] == 'option' for c in reader['controls'])
+    page, witness = snapshot['page'], snapshot['witness']
+    assert page['opaque_controls'] is True
+    assert page['inventory_verified'] is False
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    country = combo(snapshot, 'country')
+    independent = next(c for c in witness['controls']
+                       if c['selector'] == '#country')
+    assert country['combobox'] == independent['combobox']
+    assert country['combobox'].get('selected_text', '') == ''
+    assert country['combobox'].get('selected_value', '') == ''
+    # A listbox's own option may be suppressed from the native receiver
+    # census or separately exposed when its ARIA owner is ambiguous. Neither
+    # presentation becomes a current approved form value or Submit authority.
+    await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
 
 
 async def test_receiverless_commit_has_no_fabricated_transport(phone_grants):

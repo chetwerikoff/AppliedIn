@@ -43,7 +43,7 @@ def test_closed_real_page_and_fixed_witness_one_shot_parity(spec):
 @pytest.mark.parametrize("reader", [
     production.PAGE, production.ENTRY_PAGE, production.GREENHOUSE_PAGE,
     forms._FIXED_CONTROL_WITNESS,
-])
+], ids=["PAGE", "ENTRY_PAGE", "GREENHOUSE_PAGE", "FIXED"])
 def test_entry_fixture_relative_lever_card_real_reader_parity(reader):
     spec = {"url": "https://careers.example-co.test/apply",
             "lever": {"kinds": ["radio", "checkbox"], "defect": "visible-span"}}

@@ -421,16 +421,32 @@ async def test_no_witness_or_unsafe_receiver_never_mints_grant(
     field('Arbitration consent', '#legal', tag='input', type='radio',
           name='legal', question='Arbitration consent', required=True),
 ])
-async def test_login_and_material_choice_wall_precedes_text_gate(monkeypatch, extra_control):
-    p = inventory(field(), extra_control, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    if extra_control.get('type') == 'checkbox':
-        assert report['form_question']['label'] == 'Email'
+async def test_login_and_material_choice_wall_precedes_text_gate(
+        monkeypatch, tmp_path, extra_control):
+    # An ordinary unanswered field is now a FINAL Submit refusal, not an
+    # early structural bootstrap gate. Keep real login and owner-only legal
+    # decisions as separate pre-disclosure refusals on a safe synthetic route.
+    p = secure_inventory(field(), extra_control)
+    kind = extra_control.get('type')
+    if kind == 'checkbox':
+        browser, row, filled, history = await prepared_without_unapproved_write(
+            monkeypatch, p)
+        assert p['controls'][0]['selector'] == '#email'
+        assert p['controls'][0]['form_action'] == SECURE_URL
+        await final_submit_denied(
+            monkeypatch, tmp_path, p, row, filled, history,
+            reason='Required field is empty: Email')
+        assert all(x[0] not in {'fill', 'click', 'upload'} for x in browser.calls)
     else:
-        assert report['form_question'] is None
-    assert not decide.await_count
-    assert all(x[0] != 'fill' for x in browser.calls)
+        browser = Browser(p)
+        with pytest.raises(forms.Gate) as denial:
+            await forms._bootstrap(browser, p, PK, {}, SECURE_URL)
+        if kind == 'password':
+            assert 'Login or account' in str(denial.value)
+        else:
+            assert denial.value.reason == 'owner_question'
+            assert 'Direct owner review' in str(denial.value)
+        assert not any(x[0] in {'fill', 'click', 'upload'} for x in browser.calls)
 
 
 async def test_required_radio_group_gates_before_later_text(monkeypatch, tmp_path):
@@ -3117,7 +3133,6 @@ async def test_non_actionable_granted_checkbox_never_advertised_or_clicked(
         assert decide.await_count == 1
         assert decide.call_args.args[1]['approved_choices'] == []
     assert not any(c[0] == 'click' for c in browser.calls)
-
 async def test_optional_disabled_native_input_does_not_block_required_gate(
         monkeypatch, caplog):
     """Required-field traversal must skip non-required, disabled siblings."""

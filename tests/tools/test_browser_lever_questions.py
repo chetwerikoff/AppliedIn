@@ -1,7 +1,8 @@
-"""A wrong card question binds the wrong human answer; refuse the whole card.
+"""Generic accessible native questions, without visual-card admission gates.
 
-Execute the shipped JS against parent-edge synthetic DOM, then the real controller
-and fixed witness. No socket, browser, account, or fixture approval is involved.
+Exercise the shipped PAGE readers on parent-edge synthetic DOM and the real
+fixed witness, approval checks and final raw-click guard. No network, browser,
+owner records or live application is involved.
 """
 from copy import deepcopy
 import json
@@ -14,7 +15,6 @@ from tools import browser_skill_apply as forms
 from tools import browser_skill_dom as dom
 
 URL = 'https://careers.example-co.test/apply'
-REASON = 'Lever question card did not match the exact supported shape; inspect manually.'
 READERS = [dom.PAGE, dom.ENTRY_PAGE, dom.GREENHOUSE_PAGE]
 DEFECTS = ['two-names', 'extra-text', 'extra-role', 'two-texts', 'hidden-text',
            'empty-text', 'outside-form', 'reassociated', 'member-owner', 'no-owner',
@@ -203,13 +203,13 @@ async def test_malformed_card_reader_matrix(reader, kind, defect, monkeypatch, t
 
 
 @pytest.mark.parametrize('kind,defect', MUTATIONS)
-async def test_structural_gate_precedes_any_question_grant_or_choice(monkeypatch, kind, defect):
-    """A card-shape mutation cannot authorize a native answer or Submit.
+async def test_malformed_card_preparation_never_mints_a_choice_grant(monkeypatch, kind, defect):
+    """Visual card topology neither blocks preparation nor approves an answer.
 
-    Structural admission of a legacy card was deleted under r06; the real
-    final-submit guard for every mutation is separately exercised by
-    test_malformed_card_reader_matrix above. Safe preparation cannot acquire
-    owner authority from any of these malformed visual decorations.
+    Missing library-specific card geometry is not an early human gate.
+    A genuinely inconsistent independent witness may still refuse a read;
+    the production final raw-Submit guard above separately checks every
+    mutation for missing/unapproved form-owned answers with zero IPC.
     """
     session = Session({'kinds': [kind], 'defect': defect})
     before = [(c['selector'], c.get('checked')) for c in choices(session.current)]
@@ -229,33 +229,34 @@ async def test_structural_gate_precedes_any_question_grant_or_choice(monkeypatch
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('fresh', [False, True], ids=['initial', 'refreshed'])
-async def test_observation_boundary_checks_flag_even_without_question_identity_change(kind, fresh):
-    # A removed per-card flag cannot become answer/Submit authority.
+async def test_current_answer_readback_is_not_a_visual_card_certificate(kind, fresh):
+    # Mutating a visual wrapper never submits an answer. A newly selected
+    # unapproved native choice cannot inherit an old observed page identity.
     session = Session({'kinds': [kind]})
     changed = deepcopy(session.current)
-    for c in choices(changed):
-        c['lever_card_unresolved'] = True
+    target = choices(changed)[0]
+    target['checked'] = True
     if fresh:
         session.fresh = changed
+        with pytest.raises(forms.Gate, match='current DOM witness is unavailable or changed'):
+            await forms._observe_controls(session, session.current)
     else:
         session.current = changed
-    current, witness = await forms._observe_controls(session, session.current)
-    assert [(c['selector'], c.get('checked')) for c in choices(current)] == [
-        (c['selector'], False) for c in choices(changed)]
-    assert all(witness[c['selector']]['visible_text'] == c['label']
-               for c in choices(current))
+        current, witness = await forms._observe_controls(session, session.current)
+        assert choices(current)[0]['checked'] is True
+        assert witness[target['selector']]['visible_text'] == target['label']
+        with pytest.raises(forms.Gate):
+            forms.check_form(current, {}, uploaded=True)
     assert all(call[0] == 'evaluate' for call in session.calls)
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, {}, uploaded=True)
 
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('wrapper', ['fieldset', 'form-group'])
 @pytest.mark.parametrize('empty', [False, True])
-def test_standard_wrapper_precedence_even_when_old_question_is_empty(reader, wrapper, empty):
+def test_standard_wrapper_precedence_over_visual_card_text(reader, wrapper, empty):
     page = read({'wrapper': wrapper, 'emptyWrapper': empty, 'defect': 'two-texts'}, reader)
     for c in choices(page):
         assert c['question'] == ('' if empty else 'Existing standard question')
-        assert 'lever_card_unresolved' not in c
+        assert c['type'] in {'radio', 'checkbox'}
 
 
 async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeypatch):
@@ -278,9 +279,108 @@ async def test_outside_card_label_only_checkbox_keeps_approvable_handoff(monkeyp
     with pytest.raises(forms.Gate):
         forms.check_form(prepared, {}, uploaded=True)
 
+@pytest.mark.parametrize('case', [
+    'semantic-radio', 'semantic-checkbox', 'label-only-checkbox',
+])
+@pytest.mark.parametrize('mutation', [
+    None, 'uncheck', 'machine-value', 'caption', 'form-owner', 'approval',
+], ids=['approved', 'uncheck', 'wrong-value', 'changed-caption',
+        'changed-form', 'revoked-approval'])
+def test_current_named_choice_needs_exact_form_value_and_row_grant(
+        monkeypatch, case, mutation):
+    # An exact existing answer may survive irrelevant visual-card changes.
+    # No current checked/form-owned native receiver or current scoped grant
+    # may be inferred from a card's decoration or a model's proposed caption.
+    if case == 'semantic-radio':
+        spec = {'kinds': ['radio'], 'wrapper': 'fieldset'}
+    elif case == 'semantic-checkbox':
+        spec = {'kinds': ['checkbox'], 'wrapper': 'fieldset'}
+    else:
+        spec = {'kinds': ['checkbox'], 'outsideCard': True,
+                'defect': 'two-texts'}
+    page = read(spec)
+    native = choices(page)
+    target = native[-1] if case == 'semantic-radio' else native[0]
+    key = forms._key(page, target)
+    assert key == ('Existing standard question'
+                   if case != 'label-only-checkbox'
+                   else 'Send synthetic updates')
+    assert target['in_form'] is True and target['form_selector'] == '#application-form'
+    # Isolate the production final value/approval checks from the lack of
+    # a synthetic PDF upload or any unrelated undecidable page wrapper.
+    page.update(inventory_verified=True, truncated=False,
+                opaque_controls=False, shadow_roots=False,
+                unsupported_frames=[])
+    target['checked'] = True
+    approved = target['label'] if case == 'semantic-radio' else 'yes'
+    filled = {target['selector']: target['value']}
+    leader = native[0]
+    grant = {
+        'value': approved, 'selector': leader['selector'],
+        'url': page['url'], 'label': leader['label'],
+        'question': leader['question'], 'tag': leader['tag'],
+        'type': leader['type'], 'form_selector': leader['form_selector'],
+        'form_action': leader['form_action'],
+    }
+    if case == 'semantic-radio':
+        grant.update(
+            radio_name=leader['name'],
+            radio_members=[{'selector': member['selector'],
+                            'caption': member['label'],
+                            'value': member['value']} for member in native])
+    else:
+        grant['visible_text'] = target['label']
+    row = {'pk': 'example-co#synthetic', 'status': 'submitting',
+           'possible_submission': False,
+           'human_approved_answers': {key: grant}}
+    monkeypatch.setattr(forms, '_row', lambda pk: row)
+    receipt = {
+        'action': 'choose', 'selector': target['selector'],
+        'label': target['label'], 'question': target['question'],
+        'url': page['url'], 'fact': key, 'approved_value': approved,
+    }
+    forms.check_form(page, filled, uploaded=True, receipts=[receipt])
+    forms.check_approvals(row['pk'], [receipt], page)
+
+    if mutation is None:
+        return
+    # Mutate only current form/approval evidence *after* a positive readback.
+    if mutation == 'uncheck':
+        target['checked'] = False
+    elif mutation == 'machine-value':
+        target['value'] = 'different-remote-value'
+    elif mutation == 'caption':
+        target['label'] = 'Unapproved new caption'
+    elif mutation == 'form-owner':
+        target['form_selector'] = '#foreign-form'
+    elif mutation == 'approval':
+        row['human_approved_answers'][key]['value'] = 'Other answer'
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, filled, uploaded=True, receipts=[receipt])
+        forms.check_approvals(row['pk'], [receipt], page)
+
+
+@pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
+def test_unlabelled_radio_selection_cannot_become_approved_from_its_value(reader):
+    # A native required radio pair with no semantic group question is still
+    # visible during preparation. Even a fabricated filled-value dictionary
+    # does not establish the original approved question at final Submit.
+    page = read({'kinds': ['radio']}, reader)
+    items = choices(page)
+    assert len(items) == 2 and all(c['question'] == '' for c in items)
+    selected = items[1]
+    selected['checked'] = True
+    page.update(inventory_verified=True, truncated=False,
+                opaque_controls=False, shadow_roots=False,
+                unsupported_frames=[])
+    with pytest.raises(forms.Gate, match='visible question'):
+        forms.check_form(page, {selected['selector']: selected['value']},
+                         uploaded=True)
+
+
 @pytest.mark.parametrize('reader', READERS, ids=['PAGE', 'ENTRY_PAGE', 'GREENHOUSE_PAGE'])
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_native_role_override_retains_unresolved_flag_from_production_reader(reader, kind):
+def test_native_role_override_never_mints_choice_authority(reader, kind):
     # An author-supplied role="switch" on an input is not evidence of native
     # radio/checkbox group membership or an authorised form-owned value.
     spec = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch'}
@@ -301,7 +401,7 @@ def test_native_role_override_retains_unresolved_flag_from_production_reader(rea
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('fresh', [False, True], ids=['initial', 'refreshed'])
 @pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
-async def test_unresolved_role_override_gates_initial_and_refreshed_observation(kind, fresh, optional):
+async def test_role_override_requires_consistent_current_reader_evidence(kind, fresh, optional):
     malformed = {'kinds': [kind], 'defect': 'two-texts', 'role': 'switch',
                  'optional': optional}
     session = Session({'kinds': [kind], 'optional': optional} if fresh else malformed)
@@ -323,7 +423,7 @@ async def test_unresolved_role_override_gates_initial_and_refreshed_observation(
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 @pytest.mark.parametrize('optional', [False, True], ids=['required', 'optional'])
-async def test_unresolved_role_override_precedes_any_bootstrap_grant(monkeypatch, kind, optional):
+async def test_role_override_never_creates_a_native_choice_grant(monkeypatch, kind, optional):
     session = Session({'kinds': [kind], 'defect': 'two-texts', 'role': 'switch',
                        'optional': optional})
     monkeypatch.setattr(forms, '_row', lambda *a, **kw: pytest.fail('Grant bank reached'))

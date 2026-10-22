@@ -3010,34 +3010,6 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
     return 'current'
 
 
-def _bootstrap_receipt_current(page: dict, receipt: dict, filled: dict) -> None:
-    """An old receipt without the current native state never means satisfied."""
-    selector = receipt.get('selector')
-    # check_approvals() already requires a unique, enabled receipt selector
-    # before this extra committed-value check; do not add another control() site.
-    target = next(c for c in page['controls'] if c['selector'] == selector)
-    if selector not in filled:
-        raise Gate('The earlier approved field has no verified write receipt.')
-    action = receipt.get('action')
-    if action in {'fill', 'select'}:
-        if (target.get('has_value') is not True
-                or target.get('value') != filled[selector]):
-            raise Gate('The earlier approved native value is no longer committed.')
-        if action == 'select':
-            if target.get('tag') != 'select' or target.get('type') != 'select':
-                raise Gate('The earlier native option receiver changed.')
-            if choose_value(target, receipt.get('approved_value', ''), '') != filled[selector]:
-                raise Gate('The earlier approved native option changed.')
-    elif action == 'combobox':
-        combo = target.get('combobox') or {}
-        if (_unanswered(page, target)
-                or not _same(combo.get('selected_text', ''), filled[selector])):
-            raise Gate('The earlier combobox selection is no longer committed.')
-    elif action == 'choose':
-        if target.get('type') not in {'radio', 'checkbox'} or not target.get('checked'):
-            raise Gate('The earlier native choice is no longer committed.')
-
-
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
                      provenance: Provenance | None = None,
@@ -3118,14 +3090,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
     _bootstrap_wall(page, witness, *origins, provenance=provenance)
-    if settlement_route and history:
-        check_approvals(
-            pk, history, page, provenance=provenance,
-            **({'fixture_context': fixture_context} if fixture_context else {}))
-        for receipt in history:
-            if receipt.get('fact'):
-                _bootstrap_receipt_current(page, receipt, filled)
-
+    # Earlier reversible writes may be temporarily reset by later pickers.
+    # The complete current form and all receipts are checked only at Submit.
     seen = set()
     ordinal = 0
     # PAGE order, one logical record per required control (one per radio group).
@@ -3353,15 +3319,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     or (provenance is not None and not _preparation_current(
                         provenance, fixture_context=fixture_context))):
                 raise Gate('The job route changed during native commit readback.')
-            # A later native picker may reset a previously committed field.
-            # Revalidate all receipts before passing the refreshed PAGE to a model.
-            pending = [*history, receipt]
-            check_approvals(
-                pk, pending, committed, provenance=provenance,
-                **({'fixture_context': fixture_context} if fixture_context else {}))
-            for prior in pending:
-                if prior.get('fact'):
-                    _bootstrap_receipt_current(committed, prior, trial)
+            # No per-step receipt admission: an approved preparation action
+            # cannot authorize final submission from intermediate readback.
         except (Exception, asyncio.CancelledError) as exc:
             # A transport failure after an authorized IPC is not proof that the
             # browser did nothing. Stop without an automatic repeat.

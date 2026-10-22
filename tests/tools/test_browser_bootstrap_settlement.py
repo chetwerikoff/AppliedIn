@@ -717,10 +717,15 @@ async def test_later_picker_clears_earlier_phone_and_cumulative_readback_gates(
 
     raw.call = reactive_call
 
-    async def no_decision(*args, **kwargs):
-        pytest.fail('Cleared earlier committed phone must never reach first model decision')
+    async def review_before_final_submit(_prompt, page, history, *, model):
+        # A later approved picker may clear a prior fact. Preparation reaches
+        # the model; the real final form check still forbids Submit.
+        assert raw.target('#phone')['has_value'] is False
+        with pytest.raises(forms.Gate, match='Required field is empty: Phone'):
+            forms.check_form(page, {'#phone': PHONE}, uploaded=True, receipts=history)
+        return {'action': 'gate', 'question': 'Synthetic final form requires phone re-entry'}
 
-    monkeypatch.setattr(bsk, 'decision', no_decision)
+    monkeypatch.setattr(bsk, 'decision', review_before_final_submit)
     result = await _apply(case)
     assert result['status'] == 'gate' and result['form_question'] is None
     assert raw.writes == [('fill', '#phone'), picker_ipc]
@@ -730,7 +735,7 @@ async def test_later_picker_clears_earlier_phone_and_cumulative_readback_gates(
     else:
         assert raw.target('#city')['combobox']['selected_text'] == 'Test City'
     assert [d['decision'] for d in _decisions(caplog)] == [
-        'settled-from-bank', 'blocked']
+        'settled-from-bank', 'settled-from-bank']
 
 
 async def test_reordered_radio_after_phone_fill_still_gets_one_bound_gate(

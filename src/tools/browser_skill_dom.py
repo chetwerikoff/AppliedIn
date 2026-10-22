@@ -34,22 +34,6 @@ _WIDGET_GRAPH = r"""
   };
   const pickerCandidate = () => false, closedPopup = () => null;
   const singleBranch = () => false, placeholderBranch = () => false;
-  // A nonrendered, empty, unnamed, optional ARIA picker accessory cannot
-  // contribute a native submitted value. Preserve every actual receiver:
-  // named, required, selected, valued or potentially committing nodes are
-  // NEVER exempt. This is generic DOM evidence, not a widget/ATS signature.
-  const inactiveRolePart = e => {
-    if (visible(e) || !e.closest('form')) return false;
-    if (e.name || e.getAttribute('name') || e.required ||
-        e.getAttribute('aria-required') === 'true' ||
-        e.value || e.checked || e.files?.length ||
-        ['submit','image'].includes(e.type) || e.hasAttribute('formaction'))
-      return false;
-    const role = e.getAttribute('role');
-    return ['option','listbox','combobox'].includes(role) ||
-      (e.tagName === 'BUTTON' && e.type === 'button' &&
-        e.hasAttribute('aria-controls'));
-  };
   const diagnosticTags = new Set('DIAGNOSTIC_TAGS'.split(' '));
   const diagnosticLocator = e => {
     const parts = [];
@@ -71,22 +55,8 @@ _WIDGET_GRAPH = r"""
     'DIAGNOSTIC_CHARS', str(_DIAGNOSTIC_MAX_CHARS))
 
 PAGE = r"""(() => {
-  const visible = e => {
-    const rects = e.getClientRects();
-    if (!rects.length) return false;
-    let fixed = false;
-    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
-      const style = getComputedStyle(n);
-      if (!style || style.display === 'none' ||
-          style.visibility === 'hidden' || style.visibility === 'collapse' ||
-          !(Number(style.opacity) > 0)) return false;
-      if (style.position === 'fixed') fixed = true;
-    }
-    return Array.from(rects).some(rect =>
-      rect.width > 0 && rect.height > 0 &&
-      rect.right + scrollX > 0 && rect.bottom + scrollY > 0 &&
-      (!fixed || (rect.right > 0 && rect.bottom > 0)));
-  };
+  const visible = e => !!e.getClientRects().length &&
+    getComputedStyle(e).visibility !== 'hidden';
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const selector = e => {
     if (e.id && document.querySelectorAll('#'+CSS.escape(e.id)).length === 1)
@@ -138,7 +108,7 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
-  const controls = nodes.filter(e => !inactiveRolePart(e) && !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
+  const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
     (visible(e) || e.form || e.closest('form') || e.type === 'file')).map(e => {
@@ -259,7 +229,7 @@ PAGE = r"""(() => {
   const opaqueNodes = Array.from(document.querySelectorAll('*')).filter(e =>
     (visible(e) || e.closest('form') || e.getAttribute('aria-required') === 'true') &&
     e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&
-    !inactiveRolePart(e) && (
+    (
       (e.matches('[role="combobox"]') && !linkedComboboxes.includes(e)) ||
       (e.matches('[role="listbox"],[role="option"]') && !linkedParts.has(e)) ||
       e.matches('[contenteditable]') || e.tagName.includes('-') ||

@@ -1057,8 +1057,17 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             if _formless_root(page) and expected is not None and (
                     not target.get('has_value') or value != expected):
                 raise Gate('A previously verified structural answer is empty or changed.')
-            if target.get('required') and not target.get('has_value'):
+            # A DOM has_value flag is not proof of submitted bytes. Required
+            # receivers must contain a real nonblank value; an optional form
+            # value must not disappear from approval accounting when the
+            # reader's has_value flag contradicts its own value.
+            present = isinstance(value, str) and bool(value.strip())
+            if target.get('required') and (
+                    target.get('has_value') is not True or not present):
                 raise Gate(f'Required field is empty: {target["label"]}')
+            if ((target.get('has_value') is True and not present)
+                    or (target.get('has_value') is not True and present)):
+                raise Gate('The current native value and its readback disagree.')
             if typ == 'tel' and expected is not None and (
                 not target.get('has_value') or value != expected
             ):

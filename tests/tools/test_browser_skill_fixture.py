@@ -311,23 +311,31 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
                   if c["selector"] == "#location-code")
     assert location["question"] == hidden["question"] == "Where are you located?"
     collisions = forms._approval_question_collisions(page, location)
-    # The generic reader excludes validation-only decoration from its
-    # actionable controls. It cannot be mistaken for a second owner answer.
-    assert not [c for c in page["controls"]
-                if c.get("type") == "text" and not c.get("label")
-                and not c.get("name") and c.get("required") is True]
+    # Two real required validation proxies (location and phone country)
+    # have no own approval identity. They cannot borrow this visible question.
+    anonymous = [c for c in page["controls"]
+                 if c.get("type") == "text" and not c.get("label")
+                 and not c.get("name") and c.get("required") is True]
+    assert len(anonymous) == 2
     assert hidden["type"] == "hidden" and hidden["name"] == "location_value"
     assert collisions == []
     assert forms._key(page, location) == "Where are you located?"
-    # Excluding a decorative proxy is NOT proof that the entire form is safe
-    # to submit. The observed page is opaque and the final guard must refuse.
+    # Excluding a proxy from approval collision detection is not permission
+    # to submit: the original inventory is opaque, and each still-empty
+    # required proxy independently fails the one final form-value census.
     assert page["inventory_verified"] is False and page["opaque_controls"] is True
     with pytest.raises(forms.Gate, match="incomplete"):
         forms.check_form(page, {}, uploaded=True)
-    without_hidden = {**page, "controls": [
-        c for c in page["controls"] if c is not hidden]}
-    assert forms._approval_question_collisions(without_hidden, location) == []
-    assert forms._key(without_hidden, location) == "Where are you located?"
+    for proxy in anonymous:
+        probe = {**page, "controls": [proxy], "inventory_verified": True,
+                 "truncated": False, "opaque_controls": False,
+                 "shadow_roots": False, "unsupported_frames": []}
+        with pytest.raises(forms.Gate, match="Required field is empty"):
+            forms.check_form(probe, {}, uploaded=True)
+    without_proxies = {**page, "controls": [
+        c for c in page["controls"] if c not in anonymous]}
+    assert forms._approval_question_collisions(without_proxies, location) == []
+    assert forms._key(without_proxies, location) == "Where are you located?"
 
 
 def test_served_form_does_not_add_an_unlinked_caption_hidden_value():

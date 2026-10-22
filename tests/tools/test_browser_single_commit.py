@@ -770,3 +770,45 @@ def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
     assert calls == ["human reconciled"]
     assert row["status"] == "applied_manual"
     assert client.get(f"submit_hold:{pk}") is None
+
+
+def test_distinct_native_forms_never_share_approval_ownership(monkeypatch):
+    """Other form purposes cannot block a safe write or steal its exact grant."""
+    url = "https://example-co.test/job/1"
+
+    def control(selector, owner):
+        return {
+            "selector": selector, "label": "Email",
+            "question": "Contact details", "tag": "input",
+            "type": "email", "in_form": True, "form_selector": owner,
+            "form_action": url, "formaction": "", "disabled": False,
+            "value": "", "has_value": False, "required": True,
+        }
+
+    main = control("#main-email", "#application")
+    unrelated = control("#other-email", "#other-form")
+    page = {"url": url, "controls": [unrelated, main]}
+    assert forms._form_subject(page, main) == [main]
+    assert forms._approval_question_collisions(page, main) == []
+    assert forms._key(page, main) == "Contact details"
+
+    pk, answer = "example-co#synthetic", "test@example-co.test"
+    grant = {key: main[key] for key in (
+        "selector", "label", "question", "tag", "type",
+        "form_selector", "form_action")}
+    grant.update(url=url, value=answer)
+    row = {"pk": pk, "status": "submitting",
+           "possible_submission": False,
+           "human_approved_answers": {"Contact details": grant}}
+    monkeypatch.setattr(forms, "_row", lambda _pk: row)
+
+    forms.exact_approval(pk, "Contact details", answer, target=main, url=url)
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        forms.exact_approval(
+            pk, "Contact details", answer, target=unrelated, url=url)
+
+    # Two real competing answers in the SAME form are still ambiguous.
+    same_form = control("#second-email", "#application")
+    both = {"url": url, "controls": [main, same_form]}
+    with pytest.raises(forms.Gate, match="same approval question"):
+        forms._key(both, main)

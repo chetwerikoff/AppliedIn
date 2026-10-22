@@ -435,19 +435,23 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
     next(c for c in current['controls'] if c['selector'] == '#submit')['label'] = button
     evidence = []
     real_set, real_get = tracking.r.set, tracking.r.get
-    real_status = tracking.set_status
+    real_update = tracking.update_if_status
     def held_set(*args, **kwargs):
         evidence.append('hold_set')
         return real_set(*args, **kwargs)
     def held_get(*args, **kwargs):
         evidence.append('hold_read')
         return real_get(*args, **kwargs)
-    def set_status(*args, **kwargs):
-        evidence.append('write')
-        return real_status(*args, **kwargs)
+    def update_if_status(*args, **kwargs):
+        # The real durable hold uses a conditional WATCH-backed transition,
+        # not the old unconditional set_status API.
+        updated = real_update(*args, **kwargs)
+        if updated:
+            evidence.append('write')
+        return updated
     monkeypatch.setattr(tracking.r, 'set', held_set)
     monkeypatch.setattr(tracking.r, 'get', held_get)
-    monkeypatch.setattr(tracking, 'set_status', set_status)
+    monkeypatch.setattr(tracking, 'update_if_status', update_if_status)
     command = bsk.command
     async def fail_submit(*args, **kwargs):
         if args[0] == 'click':
@@ -475,8 +479,11 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
     assert result['step'] == {'last_button': button, 'url': current['url']}
     assert button in result['detail'] and current['url'] in result['detail']
     assert evidence.count('click') == 1
-    assert evidence.index('write') < evidence.index('click')
     hold_set = evidence.index('hold_set')
+    write = evidence.index('write')
+    # The durable hold precedes its WATCH-conditional status transition; the
+    # click can happen only after both and a fresh hold readback.
+    assert hold_set < write < evidence.index('click')
     # Preparation checks for prior holds too; require a fresh read after this set.
     assert hold_set < evidence.index('hold_read', hold_set + 1) < evidence.index('click')
     assert forms.submit_hold.is_held(PK, tracking=tracking)
@@ -1307,7 +1314,17 @@ console.log(JSON.stringify({page,witness}));
         combos = [c for c in witness['controls'] if c.get('type') == 'combobox']
         if scenario in {'shared', 'wrong-role', 'duplicate-id'}:
             assert combos and all(not c['combobox']['linked'] for c in combos)
-        elif scenario in {'other-form', 'nested'}:
+        elif scenario == 'other-form':
+            # Cross-form ARIA ID references are not owned by this application
+            # receiver. Keep the unresolved claim visible but never lend its
+            # foreign option to an approved choice or final Submit.
+            for source in (page, witness):
+                owners = [c for c in source['controls'] if c.get('type') == 'combobox']
+                assert owners and all(
+                    c['combobox']['linked'] is False
+                    and c['combobox']['link_id'] == 'choices'
+                    and c['combobox']['options'] == [] for c in owners)
+        elif scenario == 'nested':
             assert combos and combos[0]['combobox']['linked']
         elif scenario == 'orphan-option':
             assert any(c['type'] == 'option' for c in witness['controls'])
@@ -3040,63 +3057,87 @@ def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
     assert gated.value.reason == cause
 
 
-def test_greenhouse_missing_board_diagnostic_is_verified_from_row_and_config(monkeypatch, tmp_path):
+def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, tmp_path):
     from core.ids import make_pk
+
     pk = make_pk('example-co', '101')
     url = 'https://careers.example.test/jobs?gh_jid=101'
     row = {'pk': pk, 'company': 'example-co', 'job_id': '101',
            'ats': 'greenhouse', 'jd_url': url}
     config = SimpleNamespace(name='example-co', ats='greenhouse', board=None,
                              careers_url='https://careers.example.test/')
-    monkeypatch.setattr(forms, '_row', lambda *_: row)
-    monkeypatch.setattr('core.config.get_settings', lambda: SimpleNamespace(config_dir=tmp_path))
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: row)
+    monkeypatch.setattr('core.config.get_settings',
+                        lambda: SimpleNamespace(config_dir=tmp_path))
     monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
-    assert forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    # Absent board and absent persisted pin grant no *final* ATS authority.
+    assert forms._configured_alias(pk, 'example-co', url) is None
     config.board = 'verified-board'
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    row['greenhouse_board'] = 'verified-board'
+    proof = forms._configured_alias(pk, 'example-co', url)
+    assert isinstance(proof, forms.GreenhouseJobAlias)
+    assert proof.url == 'https://job-boards.greenhouse.io/verified-board/jobs/101'
+    assert forms._alias_current(proof)
     config.board = None
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    assert not forms._alias_current(proof)
     config.careers_url = 'https://different.example.test/'
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'wrong-company', url)
+    config.board = 'verified-board'
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    assert forms._configured_alias(pk, 'wrong-company', url) is None
 
 
-@pytest.mark.parametrize('narrow', [False, True])
-async def test_greenhouse_missing_board_returns_specific_or_generic_tenant_gate_without_browser(
-        monkeypatch, narrow):
+@pytest.mark.parametrize('pin', [None, 'stale-board'], ids=['absent-pin', 'stale-pin'])
+async def test_greenhouse_missing_or_stale_board_prepares_but_cannot_submit(
+        monkeypatch, tmp_path, pin):
     url = 'https://careers.example.test/jobs?gh_jid=101'
     row = dict(pk='example-co#101', company='example-co', job_id='101',
                jd_url=url, ats='greenhouse', status='submitting')
+    if pin is not None:
+        row['greenhouse_board'] = pin
+    config = SimpleNamespace(name='example-co', ats='greenhouse',
+                             board='verified-board',
+                             careers_url='https://careers.example.test/')
+    monkeypatch.setattr('core.config.get_settings',
+                        lambda: SimpleNamespace(config_dir=tmp_path))
+    monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
     current = {**page(), 'url': url}
     navigations = []
+
     class Session:
         async def __aenter__(self):
             return self
+
         async def __aexit__(self, *args):
             return False
+
         async def navigate(self, destination):
             navigations.append(destination)
             return current
+
         async def page(self):
             return current
+
         async def call(self, *args, **kwargs):
-            pytest.fail('Missing-board observation must never submit or write private data')
+            pytest.fail('Unproved final tenant must never submit or write private data')
+
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **k: None)
     monkeypatch.setattr(forms, '_row', lambda *a, **k: row)
-    monkeypatch.setattr(forms, '_configured_alias', lambda *a, **k: None)
-    old_early_gate = AsyncMock(return_value=narrow)
-    monkeypatch.setattr(forms, '_greenhouse_wrapper_missing_board', old_early_gate)
+    assert forms._configured_alias(row['pk'], 'example-co', url) is None
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
     monkeypatch.setattr('tools.browser_apply._site_rules', lambda *a: '')
     monkeypatch.setattr(bsk, 'Session', lambda *_: Session())
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
-        'action': 'gate', 'question': 'Stop after synthetic preparation observation'}))
+    decide = AsyncMock(return_value={
+        'action': 'gate', 'question': 'Stop after synthetic preparation observation'})
+    monkeypatch.setattr(bsk, 'decision', decide)
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
-                               pk='example-co#101', resume_path='Resume.pdf')
+                               pk=row['pk'], resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    # ARCH21:58 / AC14: no early board diagnostic can deny host-safe
-    # observation. Preserve the tenant refusal at the ONE final guard.
+    # ARCH21:58 / AC14: missing or stale pins do not gate approved-host
+    # reversible navigation; absence is examined by the one final guard.
     assert navigations == [url]
-    old_early_gate.assert_not_called()
+    assert decide.await_count == 1
     guard = forms.ApplicationIPCController(
         row['pk'], 'example-co', url, '', {}, {}, [], {}, lambda: None)
     with pytest.raises(forms.Gate, match='job/ATS tenant or board') as refusal:

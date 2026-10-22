@@ -750,6 +750,18 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
     context = handoff(submit_hold.REASON, step)['step']
     try:
         tracking = make_stores().tracking
+        # Re-read immediately before acquiring the possible-submit hold. A
+        # human may have recorded a manual outcome since the earlier full
+        # pre-submit checks. Never replace that outcome with an uncertain hold.
+        from tools.browser_apply import _duplicate_refusal
+        from tools import posting_guard as pg
+        current = tracking.get_current(pk) or {}
+        if (current.get('status') != 'submitting'
+                or current.get('possible_submission')
+                or submit_hold.blocked(pk, current, tracking=tracking)
+                or _duplicate_refusal(pk)
+                or not pg.authorised(current)):
+            raise Gate('A manual, duplicate or unreviewed outcome exists before the hold; no click is safe.')
         submit_hold.mark(pk, tracking=tracking)
         if not submit_hold.is_held(pk, tracking=tracking):
             raise RuntimeError('Submission hold read-back is missing')

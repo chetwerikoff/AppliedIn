@@ -5,7 +5,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, ci-142-disposable-smoke]
 
 # PR updates supersede prior PR runs; distinct push runs must never replace
 # each other, including when one is still pending.

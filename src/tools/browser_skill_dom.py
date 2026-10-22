@@ -123,9 +123,15 @@ PAGE = r"""(() => {
   const linkedListbox = e => {
     const id = linkId(e);
     const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
-    if (!id || !matches.length) return null;
-    return matches.length === 1 && matches[0].getAttribute('role') === 'listbox'
-      ? matches[0] : null;
+    if (matches.length !== 1 || matches[0].getAttribute('role') !== 'listbox')
+      return null;
+    const list = matches[0], listForm = list.closest('form');
+    // An ARIA portal outside native forms is permissible; a listbox owned
+    // by a DIFFERENT form is not. A nested listbox has another option owner
+    // and cannot borrow this combobox's current approved answer.
+    if ((listForm && listForm !== nativeForm(e)) ||
+        list.querySelector('[role="listbox"]')) return null;
+    return list;
   };
   const currentListbox = e => {
     if (pickerCandidate(e) || quarantined.has(e)) return null;

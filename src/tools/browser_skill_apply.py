@@ -2056,6 +2056,11 @@ class _EntrySession:
             raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
         before = await self._upload_pair()
         tree = _upload_tree(before)
+        if self.fixture_context is not None and getattr(
+                self.fixture_context, 'ashby_upload_transient', False):
+            # Capture the validated pre-upload pair, not the last incidental PAGE.
+            from copy import deepcopy
+            self.fixture_context.upload_before_tree = deepcopy(tree)
         original = _upload_input(before, tree)
         if original['selector'] != selector or tree.get('items') or original.get('files') != []:
             raise Gate('The original empty résumé input changed before upload.')

@@ -448,7 +448,6 @@ async def test_login_and_material_choice_wall_precedes_text_gate(
             assert 'Direct owner review' in str(denial.value)
         assert not any(x[0] in {'fill', 'click', 'upload'} for x in browser.calls)
 
-
 async def test_required_radio_group_gates_before_later_text(monkeypatch, tmp_path):
     radio = field('Evenings', '#evenings', tag='input', type='radio',
                   name='schedule', question='Schedule preference',
@@ -936,10 +935,20 @@ async def test_second_round_structural_marker_is_required_for_model_grants(
     elif case == 'signin-form-id':
         email['form_selector'] = '#signin'
         next_control['form_selector'] = '#signin'
-    p = secure_inventory(*controls)
+    # secure_inventory already creates the ONE native Submit receiver.
+    # Feeding it next_control as well would duplicate '#submit', preventing
+    # this security-negative test from reaching the actual final guard.
+    p = secure_inventory(*controls[:-1])
+    p['controls'][-1]['label'] = 'Next'
+    assert sum(c['selector'] == '#submit' for c in p['controls']) == 1
+    assert forms.native_submit(p['controls'][-1])
     if case == 'subscribe-action':
-        for ctrl in p['controls'][:2]:
+        for ctrl in p['controls']:
             ctrl['form_action'] = SECURE_URL + '/subscribe'
+    elif case == 'signin-form-id':
+        for ctrl in p['controls']:
+            ctrl['form_selector'] = '#signin'
+            ctrl['native_form_owner_selector'] = '#signin'
     browser, row, filled, history = await prepared_without_unapproved_write(
         monkeypatch, p)
     with pytest.raises(forms.Gate):
@@ -950,9 +959,7 @@ async def test_second_round_structural_marker_is_required_for_model_grants(
             jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
     await final_submit_denied(
         monkeypatch, tmp_path, p, row, filled, history,
-        reason=('Competing native Submit owners' if case == 'signin-form-id'
-                else 'Required field is empty: Email'),
-        expect_form=(case != 'signin-form-id'))
+        reason='Required field is empty: Email')
     assert not filled and not history and not row['human_approved_answers']
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)

@@ -58,16 +58,30 @@ async def test_padded_idref_list_is_valid_in_both_readers(phone_grants, attr):
       for attr in ('aria-describedby', 'aria-errormessage')
       for value in (None, '', ' ', '\t')),
 ])
-async def test_unproven_reference_still_gates_before_ipc(phone_grants, scenario):
+async def test_unproven_reference_still_gates_before_ipc(
+        phone_grants, scenario, monkeypatch, tmp_path):
+    """Ambiguous ARIA references never grant a final application Submit."""
+    from tests.tools.test_browser_greenhouse_parity import (
+        assert_unapproved_submit_is_refused,
+    )
+
     session = PhoneSession(**scenario)
-    page = await session.page()
-    assert page['opaque_controls'] and not page['inventory_verified']
-    for reader in session.snapshot.values():
-        target = next(c for c in reader['controls'] if c['selector'] == '#country')
-        assert target['combobox']['quarantined'] is True
-        assert target['combobox'].get('mode') != 'closed-react-select'
-    with pytest.raises(forms.Gate):
-        await choose_country(session, phone_grants[0])
+    snapshot = session.snapshot
+    page, fixed = snapshot['page'], snapshot['witness']
+    assert page['opaque_controls'] is True and page['inventory_verified'] is False
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in fixed['controls']]
+    current = next(c for c in page['controls'] if c['selector'] == '#country')
+    independent = next(c for c in fixed['controls']
+                       if c['selector'] == '#country')
+    assert current['combobox'] == independent['combobox']
+    assert not current['combobox'].get('selected_text', '')
+    assert not current['combobox'].get('selected_value', '')
+    assert session.calls == []
+    # r06 removed the C0/C1 quarantine certificate as an early preparation
+    # permission. The real raw-click guard still refuses every malformed
+    # reference case with zero Submit IPC and no synthetic approval.
+    await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
     assert session.calls == []
 
 

@@ -5,7 +5,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, ci-142-disposable-smoke]
+    branches: [main]
 
 # PR updates supersede prior PR runs; distinct push runs must never replace
 # each other, including when one is still pending.
@@ -37,8 +37,6 @@ jobs:
         with:
           node-version: "24"
       - run: node --test tests/web/*.test.cjs tests/web/*.test.mjs
-      - name: Synthetic Node failure (disposable smoke only)
-        run: exit 1
 
   checks:
     needs: [pytest, node]

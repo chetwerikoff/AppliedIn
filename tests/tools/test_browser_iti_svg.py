@@ -20,7 +20,7 @@ def svg_observe(kind='greenhouse', **scenario):
                (forms.GREENHOUSE_PAGE, forms._GREENHOUSE_FIXED_CONTROL_WITNESS))
     return json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
-        json.dumps(scenario), *readers], text=True))
+        json.dumps({'fullPhone': True, **scenario}), *readers], text=True))
 
 
 SVG_GRAPHICS = {

@@ -1,11 +1,11 @@
 """Static synthetic hydration construction; live all-leg smoke remains separate."""
 import json
-
-import pytest
 import re
 import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
+
+import pytest
 
 from tools import browser_skill_apply as forms
 from tools import browser_skill_fixture as fixture

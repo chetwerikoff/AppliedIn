@@ -24,7 +24,6 @@ async def test_greenhouse_post_submit_rootless_confirmation(monkeypatch, tmp_pat
     final guard, durable hold ordering and post-click reads run as production.
     """
     from types import SimpleNamespace
-    from core.models import Status
     from tools import browser_skill as bsk
     from tools import submit_hold, posting_guard
     from tools import browser_apply

@@ -23,10 +23,46 @@ def state(tmp_path, monkeypatch):
         fixture._SESSION_ENTRY.reset(token)
 
 
+def semantically_labelled_card(kind):
+    """In-memory positive control: the production fixture remains unchanged.
+
+    Native choice groups need a real accessible fieldset/legend. A visual
+    application-question div is not a current approval relationship; only
+    this test-owned alternate markup can prove the positive semantic path.
+    """
+    original = fixture._lever_question_form(kind)
+    start = b'<ul><li class="application-question custom-question"><div>\n'
+    end = b'</div></li></ul><button id="submit"'
+    name = (b'<div class="application-label"><div class="text">Synthetic ' +
+            kind.encode() + b' question <span class="required">*</span></div></div>')
+    assert original.count(start) == original.count(end) == original.count(name) == 1
+    labelled = original.replace(
+        start, b'<ul><li class="application-question custom-question"><fieldset>\n')
+    labelled = labelled.replace(
+        name, b'<legend class="application-label"><span class="text">Synthetic ' +
+        kind.encode() + b' question <span class="required">*</span></span></legend>')
+    labelled = labelled.replace(
+        end, b'</fieldset></li></ul><button id="submit"')
+    assert labelled != original and b'<fieldset>' in labelled
+    return labelled
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_original_nonsemantic_fixture_card_refuses_unapproved_submission(kind):
+    # The sealed fixture's original visual card is deliberately not given
+    # human approval authority by proximity to decorative label text.
+    page = served_fixture_dom(fixture._lever_question_form(kind))['page']
+    choices = [c for c in page['controls'] if c['type'] == kind]
+    assert len(choices) == (2 if kind == 'radio' else 1)
+    assert all(c['question'] == '' and not c['checked'] for c in choices)
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, uploaded=True)
+
+
 def observed(state, kind):
     state.custom_question = kind
     state.enable_positive_fixture()
-    snapshot = served_fixture_dom(fixture._lever_question_form(kind))
+    snapshot = served_fixture_dom(semantically_labelled_card(kind))
     state.observe_page(snapshot['page'])
     state.entry_wait = 'PASS'
     state.navigations = 1
@@ -39,7 +75,7 @@ def observed(state, kind):
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_served_custom_card_bytes_reach_real_human_question(state, kind):
+def test_semantic_custom_card_bytes_reach_real_human_question(state, kind):
     result = observed(state, kind)
     observation = fixture._lever_question_observation(state, result)
     assert observation == {

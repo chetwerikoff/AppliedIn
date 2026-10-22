@@ -182,7 +182,9 @@ def test_selected_country_without_placeholder_is_main_failing_regression():
         location = _control(source, '#location')
         # A visually selected ID-less node and a retained named machine input
         # are different kinds of evidence. Neither can authorize Country.
-        assert country['name'] == ''
+        # ID-less visual branches need not expose a name property at all.
+        # Absence is NOT an authorization to attribute a sibling receiver.
+        assert not country.get('name')
         assert country['combobox']['selected_text'] == ''
         assert country['combobox']['hidden_selector'] == ''
         assert location['type'] == 'combobox'

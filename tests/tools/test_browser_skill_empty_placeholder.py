@@ -155,7 +155,10 @@ async def test_greenhouse_zero_height_single_value_gates(
     ]
     target, independent = evidence(session.snapshot)
     assert target['combobox'] == independent['combobox']
-    assert target['combobox']['selected_text'] == grants['location']
+    # A typed accessible value and a visual single-value decoration are not
+    # proof of a committed option after this zero-height DOM transition.
+    assert target['combobox']['selected_text'] == ''
+    assert target['combobox']['selected_value'] == ''
     assert not target.get('name')  # No native submitted receiver from decoration.
     before = list(session.calls)
     current, witness = await forms._observe_controls(session, await session.page())

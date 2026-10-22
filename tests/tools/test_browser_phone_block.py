@@ -445,6 +445,36 @@ async def test_picker_exemption_requires_one_exact_phone_branch(
     # the raw final Submit guard decide, never an ITI ancestor signature.
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
 
+async def test_unnamed_required_proxy_allows_approved_country_preparation(
+        phone_grants):
+    # A required empty native validation proxy is inventoried for Submit but
+    # has no name, accessible label or form-owned answer of its own. A common
+    # Phone fieldset legend cannot block the Country field's approved selection.
+    session, filled = PhoneSession(requiredProxy=True), {}
+    original = await session.page()
+    country = combo({'page': original}, 'country')
+    phone, = [c for c in original['controls'] if c['selector'] == '#phone']
+    assert forms._key(original, country) == 'Country'
+    assert forms._key(original, phone) == 'Phone'
+    proxies = [c for c in original['controls']
+               if c.get('required') and c.get('type') == 'text'
+               and not c.get('name') and not c.get('label')]
+    assert len(proxies) == 5
+    assert all(not forms._could_receive_an_answer(c) for c in proxies)
+    receipt = await choose_country(session, phone_grants[0], filled)
+    assert receipt['fact'] == 'Country'
+    assert receipt['committed_caption'] == phone_grants[0]['Country']
+    assert session.calls == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', phone_grants[0]['Country']),
+        ('click', '#country-option')]
+    # A successful reversible choice does not mint a named form receiver.
+    # The complete final check still denies an absent live submitted value.
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(focused_country(await session.page(), receipt),
+                         filled, True, receipts=[receipt])
+
+
 @pytest.mark.parametrize('scenario', [
     {'countryCaption': 'approved country'}, {'countryCodes': {'data-value': 'CODE'}},
 ])

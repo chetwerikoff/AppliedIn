@@ -425,6 +425,11 @@ async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
     assert {'#phone', '#country', '#resume', '#submit'} <= selectors
     assert not {'#country-search', '#country-button', '#country-list',
                 '#picker-option-0', '#picker-option-243'} & selectors
+    # Even a benign hidden popup cannot authorize an unrelated optional
+    # autofill. Independently introduce an unapproved synthetic phone value
+    # and prove the unchanged full final guard refuses any Submit IPC.
+    phone = next(c for c in page['controls'] if c['selector'] == '#phone')
+    phone.update(value='Synthetic unapproved autofill', has_value=True)
     await assert_unapproved_submit_is_refused(
         snapshot, monkeypatch, tmp_path, require_incomplete=False)
 

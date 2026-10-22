@@ -456,3 +456,36 @@ async def test_hidden_submittable_aria_controls_remain_visible_to_final_guard(
     assert page['opaque_controls'] is True
     assert page['inventory_verified'] is False
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
+
+
+def test_generic_legend_question_only_disambiguates_an_exact_named_receiver():
+    # The real reader associates the same Phone fieldset legend with a
+    # separate country combobox and telephone input. A single native input
+    # bearing that legend anchors the two *distinct* visible answer labels.
+    # This never grants either answer; exact_approval still binds each raw
+    # selector, question, label, form and current per-row approved value.
+    page = dom(fullPhone=True)['page']
+    country = combo({'page': page}, 'country')
+    phone, = [c for c in page['controls'] if c['selector'] == '#phone']
+    assert country['question'] == phone['question'] == 'Phone'
+    assert country['label'] == 'Country' and phone['label'] == 'Phone'
+    assert country['form_selector'] == phone['form_selector']
+    assert forms._key(page, country) == 'Country'
+    assert forms._key(page, phone) == 'Phone'
+
+
+@pytest.mark.parametrize('mutation', ['no-legend-anchor', 'duplicate-label',
+                                      'competing-sibling'])
+def test_shared_group_legend_without_unique_native_anchor_remains_ambiguous(mutation):
+    page = dom(fullPhone=True)['page']
+    country = combo({'page': page}, 'country')
+    phone, = [c for c in page['controls'] if c['selector'] == '#phone']
+    if mutation == 'no-legend-anchor':
+        phone['label'] = 'Telephone number'
+    elif mutation == 'duplicate-label':
+        country['label'] = 'Phone'
+    else:
+        page['controls'].append({**phone, 'selector': '#second-phone',
+                                  'label': 'Phone'})
+    with pytest.raises(forms.Gate, match='More than one control uses'):
+        forms._key(page, country)

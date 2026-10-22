@@ -1073,6 +1073,52 @@ def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch
     assert forms.submit_hold.blocked(pk, tracking.get(pk), tracking=tracking)
 
 
+@pytest.mark.parametrize('when', ['preexisting', 'after-hold-mark'])
+def test_manual_outcome_is_never_replaced_by_own_possible_submit_hold(monkeypatch, when):
+    """The existing Redis WATCH transition must preserve manual reconciliation."""
+    import fakeredis
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    pk = 'example-co#manual-outcome'
+    _seed_clean(tracking, 'example-co', 'manual-outcome',
+                'https://example.test/job/1')
+    tracking.set_status(pk, Status.SUBMITTING)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=tracking))
+
+    if when == 'preexisting':
+        tracking.set_status(pk, Status.APPLIED_MANUAL,
+                            confirmation_id='Synthetic manual confirmation')
+    else:
+        original_update = tracking.update_if_status
+
+        def human_between_mark_and_status(*args, **kwargs):
+            assert forms.submit_hold.is_held(pk, tracking=tracking)
+            tracking.set_status(pk, Status.APPLIED_MANUAL,
+                                confirmation_id='Synthetic manual confirmation')
+            return original_update(*args, **kwargs)
+
+        monkeypatch.setattr(tracking, 'update_if_status',
+                            human_between_mark_and_status)
+
+    with pytest.raises(forms.Gate, match='no click is safe'):
+        forms.hold_possible_submission(
+            pk, {'last_button': 'Submit',
+                 'url': 'https://example.test/job/1'})
+
+    current = tracking.get_current(pk)
+    assert current['status'] == 'applied_manual'
+    assert current['confirmation_id'] == 'Synthetic manual confirmation'
+    if when == 'preexisting':
+        assert not forms.submit_hold.is_held(pk, tracking=tracking)
+    else:
+        # A concurrent manual outcome must survive, but never erase the
+        # independently recorded possible-submit key without reconciliation.
+        assert forms.submit_hold.is_held(pk, tracking=tracking)
+
+
 def test_jit_approval_revocation_cannot_be_hidden_by_prior_fill_receipt(monkeypatch):
     row = {'pk': 'example-co#1', 'status': 'submitting',
            'human_approved_answers': {'Name': grant('Name', 'Test User')}}

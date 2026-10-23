@@ -648,6 +648,9 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const style=getComputedStyle(e), hidden=style.visibility==='hidden' || style.display==='none';
     const shown=style.visibility==='visible' && style.display!=='none';
     const outside=!!root && !root.contains(e), box=rectOf(e);
+    // Structural fallback is Ashby hidden-R-only, not shared X/Z placement.
+    const hiddenROutside=nativeRoot ? !nativeRoot.contains(e) :
+      ashbyNative && !!structuralRoot && !structuralRoot.contains(e);
     const parent=e.parentElement;
     const h=origin==='https://newassets.hcaptcha.com' && path.endsWith('/static/hcaptcha-enclave.html') &&
       !!nativeRoot && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===nativeRoot;
@@ -682,7 +685,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     // Visible bframe precedence is independent of root proof/placement.
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
-    else if ((r && outside && hidden) || visibleR==='R') status='R';
+    else if ((r && hiddenROutside && hidden) || visibleR==='R') status='R';
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';

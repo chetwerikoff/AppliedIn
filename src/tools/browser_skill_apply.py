@@ -69,7 +69,6 @@ class VendorRedirectProvenance:
     wrapper: str
     target_url: str
 
-
 @dataclass(frozen=True)
 class ApplicationEntryProvenance:
     pk: str
@@ -80,14 +79,12 @@ class ApplicationEntryProvenance:
     board: str
     url: str
 
-
 _APPLICATION_ENTRY = {
     'ashby': ('jobs.ashbyhq.com', 'application'),
     'lever': ('jobs.lever.co', 'apply'),
 }
 _BOARD_TOKEN = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?')
 _JOB_UUID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-
 
 def _application_entry(row: dict, pk: str, company: str, url: str, configs):
     """The persisted board is an independent witness, never inferred from the URL."""
@@ -115,13 +112,11 @@ def _application_entry(row: dict, pk: str, company: str, url: str, configs):
     return ApplicationEntryProvenance(
         pk, company, ats, job_id, url, config.board, posting + '/' + suffix)
 
-
 _VENDOR_PATH = {
     'teamtailor': ('teamtailor.com', re.compile(r'^/jobs/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
     'recruitee': ('recruitee.com', re.compile(r'^/o/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')),
 }
 _DNS_LABEL = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
-
 
 def _tenant_job(row: dict, pk: str, company: str, url: str):
     """Bind eligible canonical vendor URLs to one coherent tracked identity."""
@@ -151,7 +146,6 @@ def _tenant_job(row: dict, pk: str, company: str, url: str):
         return vendor, route
     except (TypeError, ValueError, AttributeError):
         return None
-
 
 def _literal_redirect_target(canonical: str, location: str) -> bool:
     """Reject parser normalization before a vendor Location gains authority."""
@@ -190,8 +184,6 @@ def _literal_redirect_target(canonical: str, location: str) -> bool:
     except (TypeError, ValueError):
         return False
 
-
-
 def redirect_provenance(row: dict, pk: str, target_url: str):
     """Rebuild only the row-bound, syntactically exact redirect witness."""
     company, canonical, ats = row.get('company'), row.get('jd_url'), row.get('ats')
@@ -200,13 +192,11 @@ def redirect_provenance(row: dict, pk: str, target_url: str):
         return None
     return VendorRedirectProvenance(pk, company, ats, row['job_id'], canonical, target_url)
 
-
 def _redirect_current(provenance: VendorRedirectProvenance, *, fixture_context=None) -> bool:
     row = _row(provenance.pk, fixture_context=fixture_context)
     return (row.get('pk') == provenance.pk and row.get('company') == provenance.company
             and row.get('ats') == provenance.ats and row.get('job_id') == provenance.job_id
             and row.get('jd_url') == provenance.wrapper)
-
 
 async def _probe_vendor_redirect(row: dict, pk: str, company: str, url: str):
     eligible = _tenant_job(row, pk, company, url)
@@ -225,11 +215,6 @@ async def _probe_vendor_redirect(row: dict, pk: str, company: str, url: str):
         return redirect_provenance(row, pk, target)
     except (httpx.HTTPError, OSError, ValueError, UnicodeDecodeError):
         return None
-
-
-
-
-
 
 Provenance = GreenhouseJobAlias | VendorRedirectProvenance | ApplicationEntryProvenance
 
@@ -314,7 +299,6 @@ _GATE_DIAGNOSTICS = frozenset({
     'defect_greenhouse_tenant_alias', 'posting_guard_review_required',
 })
 
-
 class Gate(ValueError):
     def __init__(self, message: str, *, form_question: dict | None = None,
                  reason: str = 'unknown_field'):
@@ -322,10 +306,8 @@ class Gate(ValueError):
         self.form_question = form_question
         self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
 
-
 class CaptchaGate(Gate):
     """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
-
 
 def _synthetic(fixture_context, *, pk: str = '', company: str = '',
                url: str = ''):
@@ -336,7 +318,6 @@ def _synthetic(fixture_context, *, pk: str = '', company: str = '',
     if not fixture.authorized(fixture_context, pk=pk, company=company, url=url):
         raise Gate('Synthetic fixture authority is invalid; use the exact daemon CLI.')
     return fixture_context
-
 
 _CONTROL_ACTIONS = frozenset({
     'click', 'fill', 'select', 'choose', 'combobox', 'upload', 'submit',
@@ -374,7 +355,6 @@ _CONTROL_SEGMENT = (r'(?:' + '|'.join(_CONTROL_TAG_NAMES)
 _CONTROL_STRUCTURAL = re.compile(
     _CONTROL_SEGMENT + r'(?: *> *' + _CONTROL_SEGMENT + r')*')
 
-
 def _control_selector_display(raw) -> str:
     if not isinstance(raw, str) or not _CONTROL_STRUCTURAL.fullmatch(raw):
         return '[redacted]'
@@ -385,7 +365,6 @@ def _control_selector_display(raw) -> str:
     prefix = display[:120]
     return prefix.rsplit(' > ', 1)[0] if ' > ' in prefix else '[redacted]'
 
-
 class ControlGate(Gate):
     """A control-resolution Gate carries only code-owned safe diagnostic fields."""
 
@@ -395,7 +374,6 @@ class ControlGate(Gate):
             'The chosen control is absent, disabled or ambiguous; inspect the current page. '
             + '; '.join(f'{key}={diagnostics[key]}'
                         for key in ('action', 'selector', 'reason', 'caller')))
-
 
 def _control_gate_handoff(exc: ControlGate, step: dict) -> dict:
     # A previously clicked control label is untrusted and unrelated to this Gate.
@@ -1217,8 +1195,25 @@ def check_form_destination(page: dict, target: dict, *origins: str,
         if item is not target and item.get('in_form')
         and (not form_selector or not item.get('form_selector')
              or item.get('form_selector') == form_selector)]
+    observed = urlsplit(page.get('url', ''))
+    route = (_APPLICATION_ENTRY.get(provenance.ats)
+             if isinstance(provenance, ApplicationEntryProvenance) else None)
+    observed_job = (re.search(r'/(' + _JOB_UUID.pattern + r')(?:/|$)', observed.path, re.I)
+                    if route and observed.hostname == route[0] else None)
     for item in relevant:
         base, override = item.get('form_action'), item.get('formaction')
+        for receiver in (base, override):
+            if observed_job and isinstance(receiver, str) and receiver:
+                try:
+                    destination = urlsplit(receiver)
+                except ValueError:
+                    raise Gate('native form receiver not proven; malformed action.') from None
+                if destination.hostname == observed.hostname:
+                    receiver_job = re.search(r'/(' + _JOB_UUID.pattern + r')(?:/|$)',
+                                             destination.path, re.I)
+                    if (receiver_job and
+                            receiver_job.group(1).lower() != observed_job.group(1).lower()):
+                        raise Gate('native form receiver not proven; PAGE/action posting ID drift.')
         if (not isinstance(base, str) or not base
                 or (override and not isinstance(override, str))
                 or not _preparation_destination_allowed(base, *origins, provenance=provenance)
@@ -2061,6 +2056,11 @@ class _EntrySession:
             if args[0] not in {'fill', 'select', 'upload', 'click'}:
                 raise Gate('Unsupported effectful application entry IPC.')
             if args[0] == 'upload' and root:
+                receivers = [c for c in (current.get('entry') or {}).get('root_evidence', [])
+                             if isinstance(c, dict) and c.get('selector') == selector
+                             and c.get('type') == 'file']
+                if len(receivers) != 1:
+                    raise Gate('unsupported root target forbidden at IPC producer.')
                 return await self._upload(args, kwargs, selector)
             current, _ = await _observe_controls(self, current)
             matches = [c for c in current.get('controls', [])

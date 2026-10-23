@@ -977,7 +977,12 @@ async def test_unknown_or_timeout_upload_is_human_inspection_not_requeue(error):
     session.call.assert_awaited_once()
 
 
-async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc():
+async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc(monkeypatch):
+    # A synthetic tracked row makes this denial independent of the owner's Redis.
+    url = 'https://employer.test/job/1'
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'company': 'example-co', 'job_id': '1',
+        'jd_url': url, 'status': 'submitting'})
     for wording in ['View', 'Proceed', 'Apply now', 'Edit']:
         session = SimpleNamespace(call=AsyncMock())
         button = target(tag='button', type='button', label=wording)
@@ -985,7 +990,8 @@ async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc():
             await forms.execute(
                 session, page(button), {'action': 'click', 'selector': '#field'},
                 facts={}, filled={}, resume_path='', company='example-co',
-                jd_text='', resume_tex='', github='', pk='example-co#1')
+                jd_text='', resume_tex='', github='', pk='example-co#1',
+                job_url=url)
         session.call.assert_not_awaited()
 
 
@@ -1632,16 +1638,24 @@ async def test_discovery_keeps_reading_and_native_search_filter_writes(monkeypat
 
 @pytest.mark.parametrize('corruption', ['source', 'call_id', 'status', 'application',
     'destination', 'selector', 'ambiguous_label'])
-async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, corruption):
+async def test_direct_form_grant_refuses_wrong_origin_or_scope(monkeypatch, form_gate_world, corruption):
     run, stores, pk = form_gate_world
+    # Exercise the real granted question, not a Redis-fault Gate with no payload.
+    monkeypatch.setattr(forms, '_row', stores.tracking.get)
     current = page(target(label='Email'), application_marker=True)
     if corruption == 'ambiguous_label':
         current['controls'].append(target(selector='#field', label='Email'))
+    session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate) as gated:
-        await forms.execute(SimpleNamespace(call=AsyncMock()), current,
+        await forms.execute(session, current,
             {'action': 'fill', 'selector': '#field', 'fact': 'Email'},
             facts={}, filled={}, resume_path='', company='example-co',
-            jd_text='', resume_tex='', github='', pk=pk)
+            jd_text='', resume_tex='', github='', pk=pk, job_url=current['url'])
+    session.call.assert_not_awaited()
+    assert gated.value.form_question is not None
+    assert gated.value.form_question['label'] == 'Email'
+    assert gated.value.form_question['pk'] == pk
+    assert gated.value.form_question['url'] == current['url']
     pending = {'question': str(gated.value), 'form_question': gated.value.form_question}
     attrs = {'gate_source': 'applier', 'gate_call_id': 'direct', 'gate_pending': pending}
     status = 'needs_human'

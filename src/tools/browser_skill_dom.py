@@ -43,8 +43,7 @@ _WIDGET_GRAPH = r"""
       for (const id of (e.getAttribute(key)||'').split(/\s+/).filter(Boolean)) {
         const ref=byId(id);
         if (ref) {
-          const refOwner = nativeForm(ref);
-          if (refOwner !== form || ref.hasAttribute('formaction')) return false;
+          if (nativeForm(ref)!==form || ref.hasAttribute('formaction')) return false;
         }
       }
     }

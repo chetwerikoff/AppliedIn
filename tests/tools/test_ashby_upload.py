@@ -408,8 +408,9 @@ async def test_unavailable_paired_reader_is_a_gate_not_unknown(monkeypatch, afte
     original = raw.call
     async def unavailable(method, *args, **kwargs):
         if method == 'evaluate' and raw.uploaded == after_ipc:
-            # Let the ordinary producer check finish; break its final pre-pair.
-            if after_ipc or sum(c[0] == 'evaluate' for c in raw.calls) >= 3:
+            # Break the actual independent fixed read of the first pre-upload pair;
+            # after upload, break its first settling read. Neither can be unknown.
+            if after_ipc or args == (forms._ENTRY_FIXED_CONTROL_WITNESS,):
                 raise OSError('synthetic reader failure')
         return await original(method, *args, **kwargs)
     raw.call = unavailable

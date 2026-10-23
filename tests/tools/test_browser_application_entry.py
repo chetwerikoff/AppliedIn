@@ -5,6 +5,7 @@ prove HTTPS ATS routing, so both vendor shapes are exercised offline here.
 """
 from copy import deepcopy
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +15,27 @@ from discovery.watchlist import CompanyConfig
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
 from tests.tools.test_browser_bootstrap import field, submit, inventory, witness
+
+
+@pytest.fixture(autouse=True)
+def _arch1332_application_timing(request):
+    """Measure each of the five exact ARCH13:32 cases in full CI, including xdist."""
+    name = getattr(request.node, 'originalname', None) or request.node.name.split('[')[0]
+    params = request.node.callspec.params if hasattr(request.node, 'callspec') else {}
+    targeted = (
+        (name == 'test_current_identity_rechecked_after_read_and_on_resume'
+         and params.get('drift') == 'route')
+        or name == 'test_native_receiver_visibility_must_agree_with_page_and_fixed_witnesses'
+    )
+    if not targeted:
+        yield
+        return
+    started = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - started
+    assert elapsed <= 5.0, f'ARCH13:32 {request.node.nodeid}: {elapsed:.3f}s exceeds 5s'
+    request.node.warn(pytest.PytestWarning(
+        f'ARCH13:32 measured {request.node.nodeid} = {elapsed:.3f}s (<=5s)'))
 
 COMPANY = 'example-co'
 JOB = '12345678-1234-4234-8234-123456789abc'
@@ -1370,6 +1392,9 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
 
 
 async def test_ashby_unavailable_or_contradictory_fixed_native_witness(monkeypatch):
+    # This permanent synthetic disagreement is separate from the 20 ARCH13:32
+    # targets; the real 90s wait remains covered by fake-clock hydration tests.
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _, raw, decide, _ = native_real_world(monkeypatch, nativePair=True)
     owner = raw.fixed['entry']['native_candidates'][0]
     owner['action_attr_present'] = False

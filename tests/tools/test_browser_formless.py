@@ -5,6 +5,7 @@ independent complete observations before the direct human question is reachable.
 """
 from copy import deepcopy
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,33 @@ from tests.tools.test_browser_application_entry import (
 )
 from tests.tools.test_browser_controller_support import install_controller_session
 
+
+
+@pytest.fixture(autouse=True)
+def _arch1332_formless_timing(request):
+    """Measure the fifteen original slow permanent-negatives in exact-head CI."""
+    name = getattr(request.node, 'originalname', None) or request.node.name.split('[')[0]
+    params = request.node.callspec.params if hasattr(request.node, 'callspec') else {}
+    cause = params.get('cause')
+    targeted = (
+        (name == 'test_real_dom_root_edges_and_hidden_fields_gate_before_model'
+         and cause in {'sibling identity mismatch', 'ambiguous application roots'})
+        or (name == 'test_normal_apply_preserves_specific_danger_before_model_or_ipc'
+            and cause in {'ambiguous application roots', 'unsupported radio',
+                          'unsupported checkbox', 'unsupported autocomplete/combobox',
+                          'unsupported contenteditable'})
+        or name in {'test_complete_two_formless_roots_gate_before_model_and_ipc',
+                    'test_nested_interactive_sibling_gates_before_model_and_ipc'}
+    )
+    if not targeted:
+        yield
+        return
+    started = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - started
+    assert elapsed <= 5.0, f'ARCH13:32 {request.node.nodeid}: {elapsed:.3f}s exceeds 5s'
+    request.node.warn(pytest.PytestWarning(
+        f'ARCH13:32 measured {request.node.nodeid} = {elapsed:.3f}s (<=5s)'))
 
 def observed(**changes):
     # Let each real production reader observe the literal tracked PAGE URL,

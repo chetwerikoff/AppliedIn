@@ -48,7 +48,7 @@ def _grant(item, url, value, *, group=()):
     elif item['type'] == 'radio':
         record['radio_name'] = item['name']
         record['radio_members'] = [
-            {'selector': c['selector'], 'caption': c['label'], 'value': c['value']}
+            {'selector': c['selector'], 'caption': c['label'], 'label': c['label'], 'value': c['value']}
             for c in group
         ]
     return record

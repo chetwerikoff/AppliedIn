@@ -107,6 +107,7 @@ def test_lever_partial_primary_html_stays_unreviewed_through_first_write_and_ent
 ):
     import asyncio
     from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
     import fakeredis
 
@@ -140,17 +141,24 @@ def test_lever_partial_primary_html_stays_unreviewed_through_first_write_and_ent
     row = tracking.get_current(pk)
     assert pg.valid(row["jd_text"], row["posting_guard"])
     assert row["posting_guard"]["status"] == status
-    assert not pg.authorised(row)
+    # Missing source alone refuses; a bound removed-hidden finding is permitted.
+    assert pg.authorised(row) is (reason == "hidden_link")
 
-    # A stale queued claim cannot mint approval; browser runtime is never entered.
+    # The ordinary posting preflight must still refuse the unavailable-only
+    # case; the sanitized hidden-only case reaches only this offline stub.
     tracking.set_status(pk, Status.SUBMITTING)
     monkeypatch.setattr("core.stores.make_stores",
                         lambda: SimpleNamespace(tracking=tracking))
     monkeypatch.setattr("tools.browser_runtime.available", lambda: (True, ""))
-    async def forbidden_browser(*args, **kwargs):
-        pytest.fail("An unchecked/flagged Lever source must not enter the browser")
-    monkeypatch.setattr("tools.browser_runtime.apply", forbidden_browser)
+    browser = AsyncMock(return_value={
+        "status": "unknown", "detail": "synthetic no-op, nothing submitted"})
+    monkeypatch.setattr("tools.browser_runtime.apply", browser)
     outcome = asyncio.run(browser_apply.apply(
         url, "example-co", {}, "synthetic", pk=pk, jd_text=row["jd_text"]))
-    assert outcome["status"] == "gate"
-    assert outcome["reason"] == "posting_guard_review_required"
+    if reason == "hidden_link":
+        assert outcome["status"] == "unknown"
+        browser.assert_awaited_once()
+    else:
+        assert outcome["status"] == "gate"
+        assert outcome["reason"] == "posting_guard_review_required"
+        browser.assert_not_awaited()

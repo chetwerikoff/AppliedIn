@@ -1387,7 +1387,8 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # an approved final application or trigger a writing IPC.
         assert result['form_question'] is None
         assert 'not been submitted' in result['question']
-        assert decide.await_count == 1
+        # A definite foreign posting ID refuses before the model or any effectful IPC.
+        assert decide.await_count == (0 if case == 'contrary-job' else 1)
     no_mutations(raw)
 
 

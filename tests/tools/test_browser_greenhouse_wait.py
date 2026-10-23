@@ -332,11 +332,19 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
-        assert 'bounded wait' not in str(exc.value)
-        # These two structural failures require the second fresh PAGE read
-        # before the witness mismatch becomes observable; still fail closed.
-        assert len(raw.reads) <= (4 if predicate in {
-            'selector.unique', 'combobox.linked.shape'} else 3)
+        if predicate == 'unlisted':
+            # _page_identity raises ValueError during readiness. The r06
+            # waiter treats unavailable read-only identity evidence as bounded
+            # instability; it never authorizes an applicant IPC.
+            assert 'unstable application form inventory after bounded wait' in str(exc.value)
+            assert len(raw.reads) >= 3
+        else:
+            assert 'bounded wait' not in str(exc.value)
+            # These two structural failures require the second fresh PAGE read
+            # before the witness mismatch becomes observable; still fail closed.
+            assert len(raw.reads) <= (4 if predicate in {
+                'selector.unique', 'combobox.linked.shape'} else 3)
+        assert all(kind in {'page', 'witness'} for kind in raw.reads)
     assert scoped._readiness is False
 
 

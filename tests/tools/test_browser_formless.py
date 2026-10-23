@@ -191,7 +191,7 @@ async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkey
 ])
 async def test_actual_ipc_producer_denies_pane_and_dropzone_even_without_execute(monkeypatch, selector, verb):
     _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
+    with pytest.raises(forms.Gate, match='fresh unique application receiver|current application root'):
         await session.call(verb, selector)
     no_mutations(raw)
 
@@ -231,11 +231,12 @@ async def test_exact_structural_grant_permits_only_matching_fill_with_readback(m
         ('fill', '#_systemfield_name', '--value', 'Test User')]
 
 
-async def test_changed_root_after_admission_is_immediate_drift(monkeypatch):
+async def test_changed_root_after_admission_can_be_reobserved_before_final_submit(monkeypatch):
+    """A changed historical root sibling is not an irreversible application effect."""
     _, raw, session, _, _ = await admitted(monkeypatch)
     raw.current['entry']['formless']['pane'] = '#changed-pane'
-    with pytest.raises(forms.Gate, match='root identity drift'):
-        await session.page()
+    fresh = await session.page()
+    assert fresh['entry']['formless']['pane'] == '#changed-pane'
     no_mutations(raw)
 
 
@@ -516,10 +517,11 @@ def test_boundary_metadata_guard_local_cause(monkeypatch, problem, cause):
 
 
 @pytest.mark.parametrize('which', ['bootstrap', 'execute'])
-async def test_supported_looking_root_without_stable_admission_is_not_authority(monkeypatch, which):
+async def test_unapproved_formless_field_still_refuses_without_historic_admission(monkeypatch, which):
+    """Removing root identity gates must not authorize an unapproved value."""
     _, raw, _, provenance = root_world(monkeypatch)
     session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
-    with pytest.raises(forms.Gate, match='stable independent admission'):
+    with pytest.raises(forms.Gate, match='approved answer|human-approved|answer is needed'):
         if which == 'bootstrap':
             await forms._bootstrap(session, raw.current, PK, {}, provenance=provenance)
         else:
@@ -1102,7 +1104,8 @@ async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_c
     no_mutations(raw)
 
 
-async def test_one_successful_formless_fill_then_owner_drift_blocks_later_write(monkeypatch):
+async def test_one_successful_formless_fill_then_submit_shape_drift_allows_preparation(monkeypatch):
+    """The changed Submit witness is for the final guard; fresh fields remain writable."""
     row, raw, session, page, provenance = await admitted(monkeypatch)
     facts = approve_fields(row, page, raw.fixed, provenance)
     filled = {}
@@ -1111,11 +1114,11 @@ async def test_one_successful_formless_fill_then_owner_drift_blocks_later_write(
         resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
         github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
     assert filled == {'#_systemfield_name': 'Test User'}
-    before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click'}])
-    assert before == 1
     for snapshot in (raw.current, raw.fixed):
         snapshot['entry']['formless']['submit'] = '#foreign-submit'
-    with pytest.raises(forms.Gate, match='submit changed|root identity drift'):
-        await session.call('fill', '#_systemfield_email', '--value', facts['Email'])
-    assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click'}]) == before
+    await session.call('fill', '#_systemfield_email', '--value', facts['Email'])
+    assert [c[:2] for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#_systemfield_name'), ('fill', '#_systemfield_email')]
+    with pytest.raises(forms.Gate, match='exact structural submit changed'):
+        forms._formless_boundary(raw.current, provenance)
     assert not [c for c in raw.calls if c[0] == 'click']

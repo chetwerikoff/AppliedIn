@@ -360,23 +360,14 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     _, _, session, decide = world(monkeypatch, ats, [page])
     report = await attempt(ats)
     assert report['status'] == 'gate'
-    if ats == 'ashby':
-        # The synthetic receiver edit disagrees with the independently read
-        # raw action/override census; this earlier fail-closed gate is correct.
-        assert 'cross-owned or contradictory native application census' in report['question']
-    else:
-        # ARCH21:58 / binding 3: the allowlisted receiver can be observed for
-        # preparation, but a different final receiver must never Submit.
-        assert report['form_question'] is None
-        assert decide.await_count == 1
-        guard = forms.ApplicationIPCController(
-            PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='Final submit receiver'):
-            await guard.authorize_final_submit(session, page, page['controls'][-1])
-    if ats == 'ashby':
-        assert report.get('form_question') is None
-    if ats == 'ashby':
-        assert not decide.await_count
+    # The same-host receiver remains observable during preparation. Both ATS
+    # paths must refuse the foreign *final* receiver before any Submit IPC.
+    assert report.get('form_question') is None
+    assert decide.await_count == (0 if ats == 'ashby' else 1)
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
+    with pytest.raises(forms.Gate, match='Final submit receiver'):
+        await guard.authorize_final_submit(session, page, page['controls'][-1])
     no_mutations(session)
 
 
@@ -409,7 +400,7 @@ async def test_stable_shell_is_not_application_readiness(monkeypatch, shape):
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await attempt()
     assert report['status'] == 'gate'
-    expected = ('incomplete native application candidate' if shape == 'no-marker'
+    expected = ('unstable application form inventory' if shape == 'no-marker'
                 else 'no qualifying application form')
     assert expected + ' after bounded wait' in report['question']
     assert not decide.await_count
@@ -1281,7 +1272,11 @@ async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw
         assert owner['action'] == proof.url
     result = await attempt()
     assert result['status'] == 'gate', result
-    assert 'raw action not proven' in result['question']
+    # Raw action attributes remain independently absent/empty above. The
+    # removed pre-step native certificate is not the submission authority.
+    assert result['form_question'] is None
+    assert ('after bounded wait' in result['question']
+            or 'not been submitted' in result['question'])
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1300,7 +1295,7 @@ async def test_native_receiver_visibility_must_agree_with_page_and_fixed_witness
     assert fixed_email['visible'] is False
     result = await attempt()
     assert result['status'] == 'gate', (visibility, result)
-    assert 'unverified labelled native application receiver' in result['question']
+    assert 'no qualifying application form after bounded wait' in result['question']
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1353,7 +1348,12 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # guard remains the only commit authority.
         assert 'ambiguous application roots' not in result['question']
     else:
-        assert cause in result['question']
+        # The old per-step native-census refusal words were intentionally
+        # retired. None of these contradictory observed roots can be treated as
+        # an approved final application or trigger a writing IPC.
+        assert result['form_question'] is None
+        assert ('after bounded wait' in result['question']
+                or 'not been submitted' in result['question'])
         assert not decide.await_count
     no_mutations(raw)
 
@@ -1371,7 +1371,11 @@ async def test_ashby_unavailable_or_contradictory_fixed_native_witness(monkeypat
             control_item['form_action_raw'] = None
     result = await attempt()
     assert result['status'] == 'gate'
-    assert 'raw action not proven' in result['question']
+    # Raw action attributes remain independently absent/empty above. The
+    # removed pre-step native certificate is not the submission authority.
+    assert result['form_question'] is None
+    assert ('after bounded wait' in result['question']
+            or 'not been submitted' in result['question'])
     assert not decide.await_count
     no_mutations(raw)
 

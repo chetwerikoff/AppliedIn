@@ -1652,10 +1652,14 @@ async def test_direct_form_grant_refuses_wrong_origin_or_scope(monkeypatch, form
             facts={}, filled={}, resume_path='', company='example-co',
             jd_text='', resume_tex='', github='', pk=pk, job_url=current['url'])
     session.call.assert_not_awaited()
-    assert gated.value.form_question is not None
-    assert gated.value.form_question['label'] == 'Email'
-    assert gated.value.form_question['pk'] == pk
-    assert gated.value.form_question['url'] == current['url']
+    if corruption == 'ambiguous_label':
+        # The duplicate selector is rejected before any grantable question exists.
+        assert gated.value.form_question is None
+    else:
+        assert gated.value.form_question is not None
+        assert gated.value.form_question['label'] == 'Email'
+        assert gated.value.form_question['pk'] == pk
+        assert gated.value.form_question['url'] == current['url']
     pending = {'question': str(gated.value), 'form_question': gated.value.form_question}
     attrs = {'gate_source': 'applier', 'gate_call_id': 'direct', 'gate_pending': pending}
     status = 'needs_human'

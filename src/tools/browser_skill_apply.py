@@ -2926,6 +2926,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             item = control(page, observed, 'bootstrap-field')
             key = _key(page, item)
             value = str(facts.get(_fact_key(facts, key)) or '').strip()
+            previous = (_row(pk, fixture_context=fixture_context)
+                        if fixture_context else _row(pk)).get(
+                            'human_approved_answers', {}).get(key)
             approved = False
             if item.get('has_value') or value:
                 try:

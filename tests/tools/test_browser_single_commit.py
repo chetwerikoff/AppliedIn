@@ -942,6 +942,8 @@ async def test_verified_vendor_redirect_preserves_exact_raw_session_route(monkey
            "status": "submitting", "possible_submission": False}
     proof = forms.redirect_provenance(row, pk, target)
     assert isinstance(proof, forms.VendorRedirectProvenance)
+    # Exact typed redirect, not a broadened global preparation allowlist.
+    assert forms._preparation_origin(target, wrapper) is False
     monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: row)
     monkeypatch.setattr("tools.submit_hold.is_held", lambda *a, **kw: False)
     from core import stores

@@ -209,12 +209,14 @@ def test_hidden_enterprise_inside_existing_ashby_structural_root_still_gates(rea
     # Reparent only the synthetic iframe inside the container. The real
     # reader still resolves the same complete three-child structural root.
     script = script.replace(opener, opener + """
-  const anchor = document.querySelector('iframe');
-  const container = document.querySelector('.ashby-application-form-container');
-  const siblings = anchor.parentElement.children;
-  siblings.splice(siblings.indexOf(anchor), 1);
-  anchor.parentElement = container;
-  container.children.push(anchor);
+  {
+    const anchor = document.querySelector('iframe');
+    const container = document.querySelector('.ashby-application-form-container');
+    const siblings = anchor.parentElement.children;
+    siblings.splice(siblings.indexOf(anchor), 1);
+    anchor.parentElement = container;
+    container.children.push(anchor);
+  }
 """, 1)
     page = dom(dict(root=False, formless=True, url=entry('ashby'),
                     **_hidden_enterprise_anchor()), script)

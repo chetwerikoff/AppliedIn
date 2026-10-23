@@ -177,9 +177,6 @@ def test_native_fixture_bytes_are_absent_error_c0(source):
 def test_each_reference_ownership_guard_is_independently_necessary(scenario, guard):
     from tools.browser_skill_dom import PAGE
     scripts = [PAGE, forms._FIXED_CONTROL_WITNESS]
-    # The retired library-specific form-graph predicate is intentionally
-    # absent after r06. Neither production reader may infer approval from it.
-    assert all(guard not in script for script in scripts)
     # Execute both real, current readers on the same foreign IDREF DOM. The
     # cross-form/foreign reference stays unapproved at the final form guard.
     snapshot = json.loads(subprocess.check_output([

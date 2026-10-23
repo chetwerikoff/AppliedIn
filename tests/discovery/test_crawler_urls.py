@@ -887,8 +887,9 @@ def test_visible_link_manifest_preserves_paired_safe_href_and_blocks_hidden_targ
     inserted = stores.tracking.rows["example-co#visible-1"]
     assert {"hidden_html", "hidden_link"} <= set(inserted.posting_guard["reasons"])
     assert inserted.posting_guard["status"] == "flagged"
-    assert not pg.authorised({"jd_text": inserted.jd_text,
-                              "posting_guard": inserted.posting_guard})
+    # Hidden content was removed before exposure; its bound guard is safe to authorize.
+    assert pg.authorised({"jd_text": inserted.jd_text,
+                          "posting_guard": inserted.posting_guard})
 
 def test_already_seen_crawler_snippet_merges_flags_without_replacing_full_jd(
     monkeypatch,

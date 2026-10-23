@@ -17,6 +17,7 @@ _MESSAGES = {
     "hidden_html": "Hidden page content removed",
     "hidden_link": "Hidden posting link removed",
     "hidden_url": "Hidden URL removed",
+    "hidden_text_retained": "HTML-hidden content remains in the selected posting text",
     "same_color": "Indistinguishable foreground and background removed",
     "zero_width": "Invisible Unicode controls removed",
     "bidi_control": "Bidirectional Unicode controls removed",
@@ -26,6 +27,7 @@ _MESSAGES = {
     "guard_error": "Posting safety inspection failed",
 }
 _POSITIVE = frozenset(_MESSAGES) - {"source_html_unavailable"}
+_REMOVED_HIDDEN = frozenset({"hidden_html", "hidden_link", "hidden_url"})
 _ZERO_WIDTH = re.compile("[\u200b-\u200f\u2060\ufeff]")
 _BIDI = re.compile("[\u202a-\u202e\u2066-\u2069]")
 _URL = re.compile(r"https?://[^\s<>'\"]+", re.I)
@@ -92,18 +94,32 @@ class _VisibleHTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.links: list[tuple[str, str]] = []
-        self.stack: list[tuple[str, bool, str, str]] = []
+        self.stack: list[tuple[str, bool, str, str, int | None, bool]] = []
+        self.hidden_text: list[list[str]] = []
+        self.hidden_attrs: list[str] = []
         self.anchor: list[dict] = []
         self.reasons: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs = dict(attrs)
         parent_hidden = bool(self.stack and self.stack[-1][1])
-        parent_fg, parent_bg = self.stack[-1][2:] if self.stack else ("", "")
+        parent_fg, parent_bg = self.stack[-1][2:4] if self.stack else ("", "")
         local, same, fg, bg = _style_hidden(
             attrs.get("style") or "", parent_fg, parent_bg)
         invisible = (parent_hidden or tag in _DROP or local or "hidden" in attrs
                      or (attrs.get("aria-hidden") or "").lower() == "true")
+        # Machine-only subtrees never prove that selected JD text retained a
+        # hidden payload, even if a nested element has hidden attributes.
+        dropped = tag in _DROP or bool(self.stack and self.stack[-1][5])
+        # Group hidden descendants so split HTML text is checked as one payload.
+        hidden_group = self.stack[-1][4] if parent_hidden else None
+        if invisible and not parent_hidden and not dropped:
+            hidden_group = len(self.hidden_text)
+            self.hidden_text.append([])
+        if invisible and not dropped:
+            for key in ("href", "title", "alt", "aria-label"):
+                if attrs.get(key):
+                    self.hidden_attrs.append(attrs[key])
         if same:
             self.reasons.add("same_color")
         if invisible and not parent_hidden and tag not in _DROP:
@@ -119,7 +135,7 @@ class _VisibleHTML(HTMLParser):
         if tag in _BLOCK and not invisible:
             self.parts.append("\n")
         # Raw event handlers and arbitrary attribute values never enter parts.
-        self.stack.append((tag, invisible, fg, bg))
+        self.stack.append((tag, invisible, fg, bg, hidden_group, dropped))
         if tag in {"br", "img", "input", "hr", "meta", "link", "source", "wbr"}:
             self.handle_endtag(tag)
 
@@ -143,6 +159,9 @@ class _VisibleHTML(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self.stack and self.stack[-1][1]:
+            group = self.stack[-1][4]
+            if group is not None and not self.stack[-1][5]:
+                self.hidden_text[group].append(data)
             if _URL.search(data):
                 self.reasons.add("hidden_url")
             return
@@ -176,6 +195,34 @@ def _text(raw: str, reasons: set[str], *, strip_trailing: bool = False) -> str:
             cleaned.append(line)
     normalized = "\n".join(cleaned)
     return (normalized + trailing_spaces if normalized else "")[:100000]
+
+
+def _hidden_material_retained(text: str, hidden_text: list[str],
+                              hidden_attrs: list[str]) -> bool:
+    """Hidden text needs word windows; attributes need complete-value matches."""
+    selected = _TOKEN.findall(text.casefold())
+    windows: dict[int, set[tuple[str, ...]]] = {}
+    for fragment in hidden_text:
+        words = _TOKEN.findall(fragment.casefold())
+        if not words:
+            continue
+        width = min(4, len(words))
+        if width not in windows:
+            windows[width] = {
+                tuple(selected[i:i + width])
+                for i in range(len(selected) - width + 1)
+            }
+        if any(tuple(words[i:i + width]) in windows[width]
+               for i in range(len(words) - width + 1)):
+            return True
+    # A job-title slug can share four words with the visible title without
+    # the hidden href (or another attribute value) being present in the JD.
+    normalized = " ".join(text.casefold().split())
+    for value in hidden_attrs:
+        complete = " ".join(value.casefold().split())
+        if complete and complete in normalized:
+            return True
+    return False
 
 
 def _version(text: str, status: str, reasons: list[str], source_verified: bool) -> str:
@@ -215,6 +262,8 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
         old = previous or {}
         if isinstance(old, dict):
             reasons.update(code for code in old.get("reasons", []) if code in _MESSAGES)
+        hidden_text: list[str] = []
+        hidden_attrs: list[str] = []
         variants = tuple(html_variants or ())
         verified = (source_complete and bool(variants)
                     and all(isinstance(v, str) and bool(v.strip())
@@ -227,6 +276,8 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(source)
             parser.close()
             reasons.update(parser.reasons)
+            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
+            hidden_attrs.extend(parser.hidden_attrs)
             html_text = "".join(parser.parts)
             # A nonselected HTML variant can expose model-directed instructions
             # and suspicious Unicode absent from the preferred plain JD.
@@ -239,8 +290,14 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(selected)
             parser.close()
             reasons.update(parser.reasons)
+            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
+            hidden_attrs.extend(parser.hidden_attrs)
             selected = "".join(parser.parts)
         clean = _text(selected, reasons, strip_trailing=strip_trailing)
+        # The selected ATS plaintext may still contain content removed only
+        # from descriptionHtml. It must not inherit the hidden-only exemption.
+        if _hidden_material_retained(clean, hidden_text, hidden_attrs):
+            reasons.add("hidden_text_retained")
         if source_required and not verified:
             reasons.add("source_html_unavailable")
         elif verified:
@@ -299,18 +356,27 @@ def projection(text: str, guard: dict | None) -> dict:
     return _result(inspected["text"], reasons, False)
 
 
+def _removed_hidden_only(guard: dict) -> bool:
+    # Hidden HTML/links/URLs were dropped before the bound JD reached a model.
+    # A missing-source annotation alone is never evidence of such removal.
+    reasons = set(guard["reasons"])
+    return (bool(reasons & _REMOVED_HIDDEN)
+            and reasons <= (_REMOVED_HIDDEN | {"source_html_unavailable"}))
+
+
 def requires_review(row: dict) -> bool:
     text, guard = row.get("jd_text") or "", row.get("posting_guard")
-    return not valid(text, guard) or guard["status"] != "clean"
+    return (not valid(text, guard)
+            or (guard["status"] != "clean" and not _removed_hidden_only(guard)))
 
 
 def authorised(row: dict, *, text: str | None = None) -> bool:
-    """Only a currently bound, explicitly reviewed generation admits a risky JD."""
+    """Require a current text binding; only removed-hidden findings bypass review."""
     guard = row.get("posting_guard")
     stored = row.get("jd_text") or ""
     if not valid(stored, guard) or (text is not None and text != stored):
         return False
-    return (guard["status"] == "clean"
+    return (guard["status"] == "clean" or _removed_hidden_only(guard)
             or row.get("reviewed_guard_generation") == guard["generation"])
 
 

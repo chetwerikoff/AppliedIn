@@ -396,12 +396,14 @@ async def test_actual_vendor_apply_commits_before_first_decision_and_upload_stay
         case.facts['Schedule preference'] = 'Evening'
         case.row['human_approved_answers']['Schedule preference'] = _grant(
             morning, case.url, 'Evening', group=[morning, evening])
-    sessions, first_page, snapshots = [], [], []
+    sessions, first_page, snapshots, trusted_histories = [], [], [], []
     bootstrap = forms._bootstrap
 
     async def observed_bootstrap(session, *args, **kwargs):
         sessions.append(type(session))
-        return await bootstrap(session, *args, **kwargs)
+        result = await bootstrap(session, *args, **kwargs)
+        trusted_histories.append(deepcopy(kwargs['history']))
+        return result
 
     monkeypatch.setattr(forms, '_bootstrap', observed_bootstrap)
 
@@ -421,19 +423,23 @@ async def test_actual_vendor_apply_commits_before_first_decision_and_upload_stay
             assert {r['action'] for r in history} == (
                 {'fill', 'select', 'choose'} if route == 'lever'
                 else {'fill', 'combobox', 'choose'})
+            assert all('approved_value' not in item for item in history)
             forms.check_approvals(
-                case.pk, history, page,
+                case.pk, trusted_histories[-1], raw.state,
                 provenance=forms._configured_alias(case.pk, COMPANY, case.wrapper))
             with pytest.raises(forms.Gate, match='attachment'):
-                forms.check_form(page, raw.filled, False, 'Resume.pdf', history)
+                forms.check_form(raw.state, raw.filled, False, 'Resume.pdf',
+                                 trusted_histories[-1])
             return {'action': 'upload', 'selector': '#resume'}
         assert len(snapshots) == 2
         assert len([r for r in history if r.get('fact')]) == 3
         assert any(r['action'] == 'upload' for r in history)
+        assert all('approved_value' not in item for item in history)
         forms.check_approvals(
-            case.pk, history, page,
+            case.pk, trusted_histories[-1], raw.state,
             provenance=forms._configured_alias(case.pk, COMPANY, case.wrapper))
-        forms.check_form(page, raw.filled, True, 'Resume.pdf', history)
+        forms.check_form(raw.state, raw.filled, True, 'Resume.pdf',
+                         trusted_histories[-1])
         return {'action': 'gate', 'question': 'Synthetic stop before submit'}
 
     monkeypatch.setattr(bsk, 'decision', decide)

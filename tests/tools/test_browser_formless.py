@@ -177,10 +177,12 @@ async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkey
     if cause == 'ambiguous application roots':
         await prepared_shape_refusal(monkeypatch, tmp_path, changes, cause)
         return
-    _, raw, decision, _ = root_world(monkeypatch, **changes)
+    _, raw, decision, provenance = root_world(monkeypatch, **changes)
     result = await attempt()
     assert result['status'] == 'gate', result
-    assert cause in result['question'], result
+    # Entry may be transient; these structural defects still forbid final Submit.
+    with pytest.raises(forms.Gate, match=cause):
+        forms._formless_boundary(raw.current, provenance)
     assert not decision.await_count
     no_mutations(raw)
 
@@ -191,7 +193,7 @@ async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkey
 ])
 async def test_actual_ipc_producer_denies_pane_and_dropzone_even_without_execute(monkeypatch, selector, verb):
     _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='fresh unique application receiver|current application root'):
+    with pytest.raises(forms.Gate, match='fresh unique application receiver|current application root|forbidden at IPC producer'):
         await session.call(verb, selector)
     no_mutations(raw)
 
@@ -477,10 +479,11 @@ async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypat
     if cause in {'sibling identity mismatch', 'ambiguous application roots'}:
         await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
         return
-    _, raw, decide, _ = root_world(monkeypatch, **spec)
+    _, raw, decide, provenance = root_world(monkeypatch, **spec)
     result = await attempt()
     assert result['status'] == 'gate', result
-    assert cause in result['question'], result
+    with pytest.raises(forms.Gate, match=cause):
+        forms._formless_boundary(raw.current, provenance)
     assert not decide.await_count
     no_mutations(raw)
 
@@ -910,8 +913,8 @@ async def test_ac_z_becoming_active_is_rejected_on_later_inventory(monkeypatch):
 async def test_missing_autofill_pane_uses_the_existing_entry_wait(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch, missingPane=True)
     for snapshot in (raw.current, raw.fixed):
-        with pytest.raises(forms._EntryNotReady, match='no unique application root'):
-            forms._entry_safety(snapshot, lambda url: True, provenance)
+        forms._entry_safety(snapshot, lambda url: True, provenance)
+        assert forms._entry_not_ready(snapshot) == 'no unique application root'
     complete = observed()
     original = raw.call
     reads = 0
@@ -936,7 +939,7 @@ def test_search_only_exception_needs_the_inputs_actual_native_owner(monkeypatch)
     search = next(c for c in raw.current['controls'] if c['selector'] == '#job-search')
     search['native_form_owner_selector'] = ''
     with pytest.raises(forms.Gate, match='native form receiver not proven'):
-        forms._entry_safety(raw.current, lambda url: True, provenance)
+        forms._formless_boundary(raw.current, provenance)
 
 
 @pytest.mark.parametrize('fact', ['src', 'title', 'data', 'aria', 'display', 'rects',
@@ -973,7 +976,7 @@ eval(process.argv[2]+'console.log(JSON.stringify(z));');
 def test_missing_pane_does_not_waive_proven_wrong_sibling_edges(monkeypatch, changes):
     _, raw, _, provenance = root_world(monkeypatch, missingPane=True, **changes)
     with pytest.raises(forms.Gate, match='sibling identity mismatch'):
-        forms._entry_safety(raw.current, lambda url: True, provenance)
+        forms._formless_boundary(raw.current, provenance)
 
 
 
@@ -1067,9 +1070,13 @@ async def test_benign_ashby_restructuring_preserves_normal_human_question(
 
 @pytest.mark.parametrize('kind', ['onclick', 'summary'])
 async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch, tmp_path, kind):
-    await prepared_shape_refusal(monkeypatch, tmp_path,
-                                 dict(inertSibling=True, inertDescendant=kind),
-                                 'sibling identity mismatch')
+    _, raw, decide, provenance = root_world(
+        monkeypatch, inertSibling=True, inertDescendant=kind)
+    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+        forms._formless_boundary(raw.current, provenance)
+    result = await attempt()
+    assert result['status'] == 'gate', result
+    no_mutations(raw)
 
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(

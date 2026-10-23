@@ -1697,7 +1697,7 @@ async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_conte
                   submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
     # Even a matching-looking page.url and job_url cannot mint authority.
-    with pytest.raises(forms.Gate, match='verified alias context'):
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
         await forms.execute(
             browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
             facts={'Email': 'test@example.test'}, filled={},
@@ -2855,7 +2855,7 @@ async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
             "['First Name'].") in advertised[0][0]
     assert advertised[0][1] == []
     assert advertised[1][1][0]["fact"] == "First Name*"
-    assert advertised[1][1][0]["approved_value"] == "Test User"
+    assert "approved_value" not in advertised[1][1][0]
     assert checked and all(item == ("First Name*", "Test User", "#first")
                            for item in checked)
     assert row["human_approved_answers"] == {"First Name*": _marked_name_grant()}
@@ -3056,6 +3056,15 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
         return original_approval(pk, key, answer, **kwargs)
 
     monkeypatch.setattr(forms, 'exact_approval', capture_approval)
+    trusted_receipts = []
+    raw_execute = forms.execute
+
+    async def capture_execute(*args, **kwargs):
+        receipt = await raw_execute(*args, **kwargs)
+        trusted_receipts.append(deepcopy(receipt))
+        return receipt
+
+    monkeypatch.setattr(forms, 'execute', capture_execute)
     decisions = []
 
     async def route_decision(prompt, model_page, history, *, model):
@@ -3084,16 +3093,23 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
             radio_choice['form_action']) == (
                 '#morning', 'schedule', key_radio, '#application', SECURE_URL)
     assert radio_choice['approved_answer'] == {
-        'selector': '#evening', 'caption': evening['label'], 'value': 'pm'}
-    assert radio_choice['radio_members'] == radio_grant['radio_members']
+        'selector': '#evening', 'caption': evening['label']}
+    assert [{k: m[k] for k in ('selector', 'label')}
+            for m in radio_choice['radio_members']] == [
+                {k: m[k] for k in ('selector', 'label')}
+                for m in radio_grant['radio_members']]
+    assert all('value' not in m for m in radio_choice['radio_members'])
     assert check_choice['approved_answer'] == {
-        'selector': '#confirm', 'value': 'yes', 'checked': True}
+        'selector': '#confirm', 'checked': True}
     assert check_choice['control_label'] == confirmation['label']
     assert [c['key'] for c in decisions[1][1]['approved_choices']] == [key_checkbox]
     assert decisions[2][1]['approved_choices'] == []
     receipts = decisions[-1][2]
-    assert [(r['action'], r['fact'], r['approved_value']) for r in receipts] == [
-        ('choose', key_radio, 'pm'), ('choose', key_checkbox, 'yes')]
+    assert [(r['action'], r['fact']) for r in receipts] == [
+        ('choose', key_radio), ('choose', key_checkbox)]
+    assert all('approved_value' not in r for r in receipts)
+    assert [(r['fact'], r['approved_value']) for r in trusted_receipts] == [
+        (key_radio, 'pm'), (key_checkbox, 'yes')]
     assert [call for call in browser.calls if call[0] == 'click'] == [
         ('click', '#evening'), ('click', '#confirm')]
     assert not any(call[0] in {'upload', 'fill', 'select'}
@@ -3102,7 +3118,9 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
     assert evening['checked'] and confirmation['checked']
     assert len([v for v in witnessed if v == (key_radio, 'pm', '#morning')]) >= 3
     assert len([v for v in witnessed if v == (key_checkbox, 'yes', '#confirm')]) >= 3
-    forms.check_approvals(PK, receipts, page)
+    forms.check_approvals(PK, trusted_receipts, page)
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, receipts, page)
 
 async def test_missing_native_choice_grant_keeps_bound_first_question(monkeypatch):
     box = field('Confirm details', '#confirm', type='checkbox',

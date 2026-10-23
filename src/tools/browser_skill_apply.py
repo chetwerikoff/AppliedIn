@@ -1220,7 +1220,10 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                 or (override and not isinstance(override, str))
                 or not _preparation_destination_allowed(base, *origins, provenance=provenance)
                 or (override and not _preparation_destination_allowed(
-                    override, *origins, provenance=provenance))):
+                    override, *origins, provenance=provenance))
+                or (isinstance(provenance, ApplicationEntryProvenance) and
+                    any(receiver and not navigation_allowed(receiver, provenance=provenance)
+                        for receiver in (base, override)))):
             if isinstance(provenance, ApplicationEntryProvenance):
                 raise Gate('native form receiver not proven; inspect the destination manually.')
             raise Gate('The form destination is external or not proven to be this tracked job.')
@@ -2067,7 +2070,7 @@ class _EntrySession:
             matches = [c for c in current.get('controls', [])
                        if c.get('selector') == selector]
             if len(matches) != 1:
-                raise Gate('unsupported root target; only a fresh unique application receiver may be mutated.'
+                raise Gate('unsupported root target forbidden at IPC producer; only a fresh unique application receiver may be mutated.'
                            if root else 'Only a fresh unique application receiver may be mutated.')
             target = matches[0]
             root = _formless_root(current)
@@ -2942,8 +2945,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                                    **({'fixture_context': fixture_context} if fixture_context else {}))
                     approved = True
                 except Gate:
-                    if item.get('has_value'):
-                        raise
+                    if item.get('has_value') or previous:
+                        raise Gate('Previously approved structural root or submit changed') from None
                 if approved:
                     if item.get('has_value') and item.get('value') != value:
                         raise Gate('unapproved populated application control; inspect manually.')
@@ -4105,11 +4108,9 @@ class ApplicationIPCController:
                 raise Gate('The clicked radio/checkbox is not the exact approved answer.')
             return
         if target.get('type') == 'combobox':
-            # A role override cannot hide a native Submit, form-action
-            # override or navigating anchor behind a picker-opening click.
-            if (target.get('submit') is True or target.get('navigates') is True
-                    or target.get('formaction') or target.get('href')):
-                raise Gate('A committing or navigating combobox cannot be opened.')
+            # The preceding sole commit classification owns submit/form overrides.
+            if target.get('href'):
+                raise Gate('A navigating combobox cannot be opened.')
             key = _key(page, target)
             answer_key = _fact_key(self.facts, key)
             if answer_key is None:

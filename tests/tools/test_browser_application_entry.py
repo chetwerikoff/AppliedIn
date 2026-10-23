@@ -1599,10 +1599,14 @@ def test_page_reader_reports_native_inline_requestsubmit_as_committing():
     assert choice["type"] == "checkbox"
     assert choice["submit"] is False
     assert choice["commits_application"] is True
+    independent = dom(spec, script.replace(PAGE, forms._FIXED_CONTROL_WITNESS))
+    assert next(c for c in independent["controls"]
+                if c["selector"] == "#native-choice")["commits_application"] is True
     # Ordinary form-owned checkbox without a submitting handler remains prep.
-    normal = dom(spec, PAGE)
-    assert next(c for c in normal["controls"]
-                if c["selector"] == "#native-choice")["commits_application"] is False
+    for reader in (PAGE, forms._FIXED_CONTROL_WITNESS):
+        normal = dom(spec, reader)
+        assert next(c for c in normal["controls"]
+                    if c["selector"] == "#native-choice")["commits_application"] is False
 
 
 @pytest.mark.asyncio

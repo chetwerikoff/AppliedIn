@@ -108,6 +108,16 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
+  // Explicit inline application commits are observable; autosave is not one.
+  const commitsApplication = e => {
+    for (let n=e; n && n !== document; n=n.parentElement) {
+      const handlers=Array.from(n.attributes || []);
+      if (handlers.some(a => /^on(?:click|change|input|pointerup|mouseup|keydown|keyup|blur)$/i.test(a.name)
+          && /\b(?:requestSubmit|submit)\s*\(/i.test(a.value))) return true;
+      if (n.tagName === 'FORM') break;
+    }
+    return false;
+  };
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
@@ -129,6 +139,7 @@ PAGE = r"""(() => {
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
+      commits_application:commitsApplication(e),
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
@@ -152,6 +163,7 @@ PAGE = r"""(() => {
             submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
               o.type === 'submit' || o.type === 'image',
             navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
+            commits_application:commitsApplication(o),
             // Independent option safety is consumed only by the Lever location path.
             safe:!unsafeOption(o),
             value:o.getAttribute('data-value') || o.getAttribute('value') || '',

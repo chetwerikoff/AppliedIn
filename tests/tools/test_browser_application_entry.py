@@ -851,6 +851,45 @@ def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader,
             assert foreign['form_action_raw'] != entry(ats)
 
 
+
+async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(monkeypatch):
+    # The parent-only synthetic fixture makes every child document unreadable.
+    # The entry guard must not invent a 'no controls' conclusion for any frame.
+    private_segment = '12345678-1234-4234-8234-123456789abc'
+    page = dom(dict(
+        url=entry('ashby'), frames=['H', 'R', 'W', 'X'],
+        edit={'src': 'https://widgets.example-co.test/frame/' + private_segment
+              + '?access_token=do-not-print#fragment'}))
+    assert len(page['entry']['frames']) == 4
+    assert all(f['status'] == 'unknown' and f['form_controls'] == 'unknown'
+               for f in page['entry']['frames'])
+
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame') as error:
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+    detail = str(error.value)
+    for i in range(1, 5):
+        assert f'frame[{i}] origin=https://widgets.example-co.test' in detail
+    assert detail.count('path=/frame/[redacted]') == 4
+    assert detail.count('source_kind=url') == 4
+    assert detail.count('form_controls=unknown') == 4
+    assert detail.count('outside_root=true') == 2
+    assert detail.count('outside_root=false') == 2
+    assert detail.count('visibility=hidden display=block') == 3
+    assert 'visibility=visible display=block' in detail
+    for dimensions in ('100x30', '236x48', '1x1'):
+        assert f'box={dimensions}' in detail
+    for secret in (private_segment, 'access_token', 'do-not-print', 'fragment', '?', '#'):
+        assert secret not in detail
+
+    _, _, session, decision = world(monkeypatch, 'ashby', [page])
+    result = await attempt('ashby')
+    assert result['status'] == 'gate'
+    assert detail in result['question']
+    assert decision.await_count == 0
+    no_mutations(session)
+
+
+
 @pytest.mark.parametrize('reader', ['page', 'witness'])
 @pytest.mark.parametrize('kind', ['H', 'R', 'B', 'W', 'X'])
 def test_complete_passive_signatures_are_element_specific(reader, kind):

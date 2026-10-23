@@ -1,4 +1,5 @@
 """Static synthetic hydration construction; live all-leg smoke remains separate."""
+from tests.tools.reader_node_harness import reader_output
 import json
 import re
 import subprocess
@@ -44,10 +45,11 @@ def snapshots(hydrated):
     else:
         markup = re.sub(r'<template id="greenhouse-template">.*?</template>', '', markup, flags=re.S)
     tree = Tree(); tree.feed(markup)
-    return json.loads(subprocess.check_output([
-        'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
-        json.dumps(dict(fixtureTree=tree.root, fixtureUrl=fixture.URL)),
-        instrument(forms.GREENHOUSE_PAGE), instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS)], text=True))
+    return json.loads(reader_output(
+        'closed_widget_dom.cjs',
+        dict(fixtureTree=tree.root, fixtureUrl=fixture.URL),
+        instrument(forms.GREENHOUSE_PAGE),
+        instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS)))
 
 
 def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():

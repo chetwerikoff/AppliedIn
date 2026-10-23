@@ -4,6 +4,7 @@ Execute the shipped JS against parent-edge synthetic DOM, then the real controll
 and fixed witness. No socket, browser, account, or fixture approval is involved.
 """
 from copy import deepcopy
+from tests.tools.reader_node_harness import reader_output
 import json
 from pathlib import Path
 import subprocess
@@ -30,9 +31,8 @@ MUTATIONS = [(kind, defect) for kind in ('radio', 'checkbox') for defect in DEFE
 
 
 def read(spec, script=dom.PAGE):
-    return json.loads(subprocess.check_output([
-        'node', str(Path(__file__).with_name('entry_dom_fixture.js')),
-        json.dumps({'url': URL, 'lever': spec}), script], text=True))
+    return json.loads(reader_output(
+        'entry_dom_fixture.js', {'url': URL, 'lever': spec}, script))
 
 
 def choices(page):

@@ -3,6 +3,7 @@
 The second combobox case is intentionally adversarial: it proves the fieldset
 does not grant authority to another widget, not that this was the live second node.
 """
+from tests.tools.reader_node_harness import reader_output
 import json
 import re
 import subprocess
@@ -128,11 +129,11 @@ def selected_snapshot(mutation=''):
             'duplicate-country-placeholder', 'foreign-country-placeholder',
         }
 
-    return json.loads(subprocess.check_output([
-        'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
-        json.dumps({'fixtureTree': tree.root, 'fixtureUrl': fixture.URL}),
-        instrument(forms.GREENHOUSE_PAGE), instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-    ], text=True))
+    return json.loads(reader_output(
+        'closed_widget_dom.cjs',
+        {'fixtureTree': tree.root, 'fixtureUrl': fixture.URL},
+        instrument(forms.GREENHOUSE_PAGE),
+        instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS)))
 
 
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():

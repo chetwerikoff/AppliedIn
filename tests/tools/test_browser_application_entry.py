@@ -514,6 +514,9 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
         session.on_evaluate = after
     else:
         change()
+    if drift == 'route':
+        # Only the permanently drifted synthetic route needs a short waiter.
+        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await attempt()
     assert report['status'] == 'gate'
     if drift in {'board', 'ats'}:
@@ -1300,6 +1303,8 @@ async def test_native_receiver_visibility_must_agree_with_page_and_fixed_witness
     assert any(c['selector'] == '#email' for c in raw.current['controls'])
     fixed_email = next(c for c in raw.fixed['controls'] if c['selector'] == '#email')
     assert fixed_email['visible'] is False
+    # Both fixed readers keep this test receiver invisible; no late hydration.
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     result = await attempt()
     assert result['status'] == 'gate', (visibility, result)
     assert 'no qualifying application form after bounded wait' in result['question']

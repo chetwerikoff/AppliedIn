@@ -98,6 +98,8 @@ async def admitted(monkeypatch):
 
 async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     """ARCH21:18 / AC2/AC9: obsolete root proof is final evidence only."""
+    # Production permits late hydration up to 90s; this fake never changes shape.
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     row, raw, decide, provenance = root_world(monkeypatch, **changes)
     transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     file = next(c for c in raw.current['controls']
@@ -174,6 +176,10 @@ async def test_normal_apply_reaches_actual_direct_human_question(monkeypatch):
     ({'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}}, 'unsupported contenteditable'),
 ])
 async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkeypatch, tmp_path, changes, cause):
+    if cause in {'unsupported radio', 'unsupported checkbox',
+                 'unsupported autocomplete/combobox', 'unsupported contenteditable'}:
+        # A permanent synthetic unsupported control cannot become ready later.
+        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     if cause == 'ambiguous application roots':
         await prepared_shape_refusal(monkeypatch, tmp_path, changes, cause)
         return
@@ -1070,6 +1076,8 @@ async def test_benign_ashby_restructuring_preserves_normal_human_question(
 
 @pytest.mark.parametrize('kind', ['onclick', 'summary'])
 async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch, tmp_path, kind):
+    # The sibling violation is permanent in this synthetic page.
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _, raw, decide, provenance = root_world(
         monkeypatch, inertSibling=True, inertDescendant=kind)
     with pytest.raises(forms.Gate, match='sibling identity mismatch'):

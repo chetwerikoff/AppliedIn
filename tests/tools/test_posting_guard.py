@@ -346,3 +346,18 @@ def test_unavailable_only_and_invalid_or_stale_bindings_remain_refused():
     changed = {**row, "jd_text": guarded["text"] + " changed"}
     assert not pg.valid(changed["jd_text"], guard)
     assert not pg.authorised(changed)
+
+
+@pytest.mark.parametrize("hidden,reasons", [
+    ('<span aria-hidden="true">covert content</span>', {"hidden_html"}),
+    ('<a aria-hidden="true">covert anchor</a>', {"hidden_html", "hidden_link"}),
+    ('<span aria-hidden="true">https://hidden.example.test/payload</span>',
+     {"hidden_html", "hidden_url"}),
+])
+def test_each_removed_hidden_reason_subset_is_review_free(hidden, reasons):
+    result = pg.analyze("<p>Build useful services.</p>" + hidden)
+    guard = result["posting_guard"]
+    assert set(guard["reasons"]) == reasons
+    assert result["text"] == "Build useful services."
+    assert pg.valid(result["text"], guard)
+    assert pg.authorised({"jd_text": result["text"], "posting_guard": guard})

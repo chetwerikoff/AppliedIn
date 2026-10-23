@@ -1827,6 +1827,84 @@ def _upload_delta(before, after, filename):
     raise Gate('Unexpected structural mutation during résumé attachment; inspect manually.')
 
 
+
+# Keep unknown iframe diagnostics structural and free of URL payloads.
+# Each other path component may be a posting/account identifier or token.
+_FRAME_PATH_WORDS = frozenset({
+    'recaptcha', 'enterprise', 'anchor', 'bframe', 'api2', 'captcha',
+    'static', 'hcaptcha-enclave.html', 'embed', 'iframe', 'frame',
+    'widget', 'widgets', 'assets', 'application', 'v1', 'v2', 'v3',
+})
+
+
+def _unknown_frame_details(frames, provenance):
+    """Render value-free structural facts for every non-admitted frame."""
+    admitted = {'H', 'R', 'W', 'X'}
+    if isinstance(provenance, ApplicationEntryProvenance):
+        admitted.add('Z')
+
+    def literal(value, permitted):
+        return value if type(value) is str and value in permitted else 'unknown'
+
+    def origin(value):
+        if value == 'null':
+            return 'null'
+        if type(value) is not str or len(value) > 253:
+            return 'unknown'
+        try:
+            parsed = urlsplit(value)
+            host = parsed.hostname
+            if (parsed.scheme != 'https' or not host or parsed.netloc != host
+                    or parsed.path or parsed.query or parsed.fragment
+                    or any(not _DNS_LABEL.fullmatch(label) for label in host.split('.'))):
+                return 'unknown'
+            # Preserve the origin's host shape, but not identifier-like labels.
+            labels = [label if len(label) <= 24 and not any(c.isdigit() for c in label)
+                      else '[redacted]' for label in host.split('.')]
+            return 'https://' + '.'.join(labels)
+        except (ValueError, AttributeError):
+            return 'unknown'
+
+    def path(value):
+        if value == 'blank':
+            return 'blank'
+        if type(value) is not str or not value.startswith('/'):
+            return 'unknown'
+        segments = value.split('?', 1)[0].split('#', 1)[0].split('/')
+        if len(segments) > 33:
+            return 'unknown'
+        return '/'.join(
+            segment if segment in _FRAME_PATH_WORDS or not segment else '[redacted]'
+            for segment in segments)
+
+    def box(value):
+        if not isinstance(value, dict):
+            return 'unknown'
+        width, height = value.get('width'), value.get('height')
+        if any(type(n) not in (int, float) or not 0 <= n < float('inf')
+               for n in (width, height)):
+            return 'unknown'
+        return f'{width}x{height}'
+
+    rows = []
+    for index, frame in enumerate(frames, 1):
+        if isinstance(frame, dict) and frame.get('status') in admitted:
+            continue
+        frame = frame if isinstance(frame, dict) else {}
+        outside = ('true' if frame['outside'] else 'false') if (
+            type(frame.get('root')) is str and frame['root']
+            and type(frame.get('outside')) is bool) else 'unknown'
+        rows.append(
+            f"frame[{index}] origin={origin(frame.get('origin'))} "
+            f"path={path(frame.get('path'))} "
+            f"source_kind={literal(frame.get('source'), {'absent', 'blank', 'url'})} "
+            f"box={box(frame.get('box'))} outside_root={outside} "
+            f"visibility={literal(frame.get('visibility'), {'visible', 'hidden', 'collapse'})} "
+            f"display={literal(frame.get('display'), {'block', 'none', 'inline', 'inline-block', 'flex', 'grid', 'contents', 'table', 'table-row', 'table-cell', 'list-item', 'flow-root'})} "
+            f"form_controls={literal(frame.get('form_controls'), {'yes', 'no'})}")
+    return '; '.join(rows)
+
+
 def _entry_safety(page, allowed, provenance):
     if not isinstance(page, dict):
         raise Gate('The current form control inventory is malformed.')
@@ -1850,7 +1928,8 @@ def _entry_safety(page, allowed, provenance):
             raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
         if status not in {'H', 'R', 'W', 'X'} and not (
                 status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
-            raise Gate('unknown/untrusted application frame; inspect manually.')
+            raise Gate('unknown/untrusted application frame; inspect manually. '
+                       'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance))
     if entry.get('response_error'):
         raise Gate('untrusted captcha response control; ambiguous owner or provider.')
     if entry.get('helper_challenge'):

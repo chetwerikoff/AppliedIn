@@ -85,16 +85,17 @@ def test_success_keeps_original_control_object_and_exact_raw_selector():
     assert caught.value.diagnostics['selector'] == '[redacted]'
 
 
-def test_external_callers_still_compile_with_exactly_two_arguments():
-    # These read-only modules remain outside #105's editable roots.
+def test_external_two_argument_helper_stays_safe_without_legacy_call_sites():
+    # These modules no longer call control() directly. A source-only census
+    # cannot require retired callers to exist merely to pin API compatibility.
     for module in (bsk, fixture):
         source = Path(inspect.getsourcefile(module)).read_text()
         tree = ast.parse(source)
         sites = [call for call in ast.walk(tree)
                  if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                  and call.func.id == 'control']
-        assert any(len(call.args) == 2 and not call.keywords for call in sites)
-    # The same helper both resolves and refuses without a third argument.
+        assert sites == []
+    # The same public helper still resolves and refuses with two arguments.
     target = {'selector': 'button', 'disabled': False}
     assert forms.control({'controls': [target]}, {'selector': 'button'}) is target
     for controls in ([], [target, target], [{**target, 'disabled': True}]):
@@ -102,21 +103,23 @@ def test_external_callers_still_compile_with_exactly_two_arguments():
             forms.control({'controls': controls}, {'selector': 'button'})
 
 
-def test_all_nineteen_current_control_call_sites_are_fixed_and_distinct():
+def test_all_nineteen_current_control_call_sites_keep_named_provenance():
     source = inspect.getsource(forms)
     tree = ast.parse(source)
     sites = [call for call in ast.walk(tree)
              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
              and call.func.id == 'control']
-    # The current raw/preparation/final paths have 19 distinct callers.
-    # Retain an exact census so accidental removal of a guarded call is caught.
+    # Nineteen resolution call sites remain across raw/preparation/final.
+    # Two initial-decision branches share the same code-owned diagnostic tag.
     assert len(sites) == 19
     assert all(len(call.args) == 3 and not call.keywords
                and isinstance(call.args[2], ast.Constant)
                and isinstance(call.args[2].value, str)
                for call in sites)
     tags = [call.args[2].value for call in sites]
-    assert len(set(tags)) == 19
+    assert len(set(tags)) == 18
+    assert tags.count('decision-initial') == 2
+    assert all(tags.count(tag) == 1 for tag in set(tags) - {'decision-initial'})
     assert all(0 < len(tag) <= 32 for tag in tags)
     assert set(tags) == forms._CONTROL_CALLERS - {'external'}
 

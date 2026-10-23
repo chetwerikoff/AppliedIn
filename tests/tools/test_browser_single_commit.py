@@ -818,3 +818,154 @@ def test_distinct_native_forms_never_share_approval_ownership(monkeypatch):
     both = {"url": url, "controls": [main, same_form]}
     with pytest.raises(forms.Gate, match="same approval question"):
         forms._key(both, main)
+
+
+@pytest.mark.asyncio
+async def test_native_choice_with_inline_requestsubmit_never_bypasses_final_guard(monkeypatch):
+    """A granted native checkbox's onclick requestSubmit is a commit, not autosave."""
+    target = _control(label="I agree", kind="checkbox", submit=False)
+    target.update(tag="input", required=True, checked=False, value="on",
+                  question="I acknowledge application data processing",
+                  commits_application=True)
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {"url": controller.url, "controls": [target]}, controller)
+    final_calls, marked = [], []
+
+    async def refuse(_session, _page, _target):
+        final_calls.append("same final guard")
+        raise forms.Gate("synthetic final guard refused")
+
+    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    controller.mark_click_started = lambda: marked.append("possible submission")
+    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
+        await session.application_effect("click", "#next")
+    assert final_calls == ["same final guard"]
+    assert marked == [] and calls == []
+    assert controller.committed is False
+
+
+@pytest.mark.parametrize("files,second_file,valid", [
+    (["Tailored.pdf"], [], True),
+    (["Tailored.pdf", "Unapproved.pdf"], [], False),
+    (["Tailored.pdf"], ["Other-document.pdf"], False),
+    (["Unapproved.pdf"], [], False),
+])
+def test_native_final_form_refuses_extra_file_attachments(files, second_file, valid):
+    """Native receivers must obey the same exact single-row-PDF boundary as formless."""
+    page = {
+        "url": "https://example-co.test/jobs/123",
+        "inventory_verified": True, "truncated": False,
+        "opaque_controls": False, "unsupported_frames": [], "shadow_roots": False,
+        "controls": [
+            {"selector": "#resume", "tag": "input", "type": "file",
+             "label": "Resume", "in_form": True, "form_selector": "#application",
+             "files": files, "required": False},
+            {"selector": "#other-file", "tag": "input", "type": "file",
+             "label": "Additional attachment", "in_form": True,
+             "form_selector": "#application", "files": second_file, "required": False},
+        ],
+    }
+    if valid:
+        forms.check_form(page, {}, uploaded=True, attachment="Tailored.pdf")
+    else:
+        with pytest.raises(forms.Gate, match="résumé attachment|exact staged résumé"):
+            forms.check_form(page, {}, uploaded=True, attachment="Tailored.pdf")
+
+
+@pytest.mark.asyncio
+async def test_completion_receives_only_redacted_model_projection(monkeypatch):
+    """Assert the actual LiteLLM completion messages, not only a helper's dict."""
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    secrets = {
+        "text": "SYNTHETIC_PRIVATE_NAME_4ba2",
+        "file": "SYNTHETIC_PRIVATE_RESUME_68e1.pdf",
+        "receiver": "SYNTHETIC_PRIVATE_RECEIVER_79da",
+        "approved": "SYNTHETIC_APPROVED_VALUE_9e4f",
+    }
+    page = {"url": "https://jobs.ashbyhq.com/example-co/job",
+            "text": secrets["text"], "description": secrets["text"],
+            "inventory_verified": True, "controls": [
+                {"selector": "#name", "label": "Full name", "type": "text",
+                 "has_value": True, "value": secrets["text"], "files": []},
+                {"selector": "#resume", "label": "Resume", "type": "file",
+                 "files": [secrets["file"]]},
+                {"selector": "#picker", "label": "Work location",
+                 "type": "combobox", "combobox": {
+                     "selected_text": secrets["approved"],
+                     "displayed_text": secrets["approved"],
+                     "selected_value": secrets["receiver"],
+                     "hidden_value": secrets["receiver"],
+                     "options": [{"selector": "#remote", "label": "Remote",
+                                  "value": secrets["receiver"]}]}}
+            ]}
+    receipts = [{"action": "fill", "selector": "#name",
+                 "approved_value": secrets["approved"],
+                 "label": "Full name"}]
+    model_page, model_history = forms._model_projection(page, receipts)
+    captured = []
+
+    def fake_completion(*, model, messages, response_format):
+        captured.append(json.dumps(messages, ensure_ascii=False))
+        assert response_format == {"type": "json_object"}
+        return {"choices": [{"message": {"content": '{"action":"wait"}'}}]}
+
+    monkeypatch.setitem(sys.modules, "litellm",
+                        SimpleNamespace(completion=fake_completion))
+    monkeypatch.setattr("core.steering.messages",
+                        lambda prompt: [{"role": "user", "content": prompt}])
+    assert await bsk.decision("Use only fact keys", model_page, model_history,
+                              model="synthetic-model") == {"action": "wait"}
+    assert len(captured) == 1
+    assert all(secret not in captured[0] for secret in secrets.values())
+    # The producer has not corrupted the original values used by code validation.
+    assert page["controls"][0]["value"] == secrets["text"]
+    assert page["controls"][1]["files"] == [secrets["file"]]
+    assert receipts[0]["approved_value"] == secrets["approved"]
+
+
+@pytest.mark.asyncio
+async def test_verified_vendor_redirect_preserves_exact_raw_session_route(monkeypatch):
+    """Production-shaped apply Session allows only a row-bound typed vendor redirect."""
+    from core.ids import make_pk
+
+    company, job_id = "example-co", "job-123"
+    pk = make_pk(company, job_id)
+    wrapper = "https://example-co.teamtailor.com/jobs/job-123"
+    target = "https://careers.example-co.com/jobs/job-123"
+    foreign = "https://unapproved.example.net/jobs/job-123"
+    row = {"pk": pk, "company": company, "job_id": job_id,
+           "jd_url": wrapper, "ats": "teamtailor",
+           "status": "submitting", "possible_submission": False}
+    proof = forms.redirect_provenance(row, pk, target)
+    assert isinstance(proof, forms.VendorRedirectProvenance)
+    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: row)
+    monkeypatch.setattr("tools.submit_hold.is_held", lambda *a, **kw: False)
+    from core import stores
+    monkeypatch.setattr(stores, "make_stores", lambda: SimpleNamespace(tracking=object()))
+    effects = []
+
+    async def fake_command(*argv, **kwargs):
+        effects.append(argv)
+        return {}
+
+    from types import SimpleNamespace
+    monkeypatch.setattr(bsk, "command", fake_command)
+    controller = forms.ApplicationIPCController(
+        pk, company, wrapper, "", {}, {}, [], {}, lambda: None,
+        verified_redirect=proof)
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+    session.bind_application_controller(controller)
+    await session.application_effect("navigate", target)
+    assert len(effects) == 1 and effects[0][:2] == ("navigate", target)
+    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET"):
+        await session.application_effect("navigate", foreign)
+    assert len(effects) == 1
+    row["job_id"] = "different-job"
+    with pytest.raises(forms.Gate):
+        await session.application_effect("navigate", target)
+    assert len(effects) == 1

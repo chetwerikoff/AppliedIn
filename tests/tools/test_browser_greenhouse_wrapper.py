@@ -255,3 +255,80 @@ async def test_stale_pin_may_enter_preparation_but_cannot_submit(authority):
     # Offline sentinel aborts as soon as the preparation session is requested.
     assert len(authority.browser_starts) == 1
     await _must_final_tenant_deny(authority)
+
+
+@pytest.mark.asyncio
+async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_submit(
+        monkeypatch, authority, tmp_path):
+    """ARCH09:47: no early alias veto across the real apply -> execute -> IPC path."""
+    from unittest.mock import AsyncMock
+    from core import events
+    from tools import browser_apply, claude_chrome
+
+    # The tracked wrapper is eligible, but neither the row nor config has a pin.
+    authority.tracking.rows[PK].pop("greenhouse_board")
+    authority.write(f"""companies:
+  - name: {COMPANY}
+    careers_url: {CAREERS}
+    ats: greenhouse
+    discovery: browser
+    mode: gated
+""")
+    assert forms._configured_alias(PK, COMPANY, URL) is None
+    pdf = tmp_path / "Test User Row.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nsynthetic row-specific document\n")
+    monkeypatch.setattr(claude_chrome, "_stage_resume", lambda p, _owner: p)
+    monkeypatch.setattr(browser_apply, "_site_rules", lambda *args: "")
+    monkeypatch.setattr(events, "emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(forms.submit_hold, "is_held", lambda *a, **kw: False)
+
+    page = {
+        "url": URL, "title": "Synthetic Role", "text": "Synthetic neutral posting. " * 30,
+        "description": "", "controls": [
+            {"selector": "#apply", "label": "Apply", "question": "",
+             "tag": "button", "type": "button", "submit": False,
+             "disabled": False, "in_form": False, "href": "", "formaction": "",
+             "form_selector": "", "form_action": "", "files": [],
+             "value": "", "has_value": False},
+        ],
+        "inventory_verified": True, "truncated": False,
+        "opaque_controls": False, "shadow_roots": False, "unsupported_frames": [],
+    }
+    ipc = []
+
+    async def command(*args, **kwargs):
+        ipc.append(args)
+        if args[0] == "evaluate":
+            return {"value": deepcopy(page)}
+        assert args[0] in {"navigate", "click"}
+        return {}
+
+    async def enter(self):
+        self.id = "synthetic-session"
+        return self
+
+    async def exit(self, *_args):
+        if self._application_controller:
+            self._application_controller.release_snapshot()
+        return False
+
+    # Real application Session methods and raw IPC controller, with only
+    # Chrome process/session setup and transport substituted by offline spies.
+    monkeypatch.setattr(bsk, "Session", bsk.Session)
+    monkeypatch.setattr(bsk.Session, "__aenter__", enter)
+    monkeypatch.setattr(bsk.Session, "__aexit__", exit)
+    monkeypatch.setattr(bsk, "command", command)
+    decisions = AsyncMock(side_effect=[
+        {"action": "click", "selector": "#apply"},
+        {"action": "gate", "question": "Synthetic inspection stop"},
+    ])
+    monkeypatch.setattr(bsk, "decision", decisions)
+    result = await forms.apply(URL, COMPANY, {}, "synthetic",
+                               pk=PK, resume_path=str(pdf))
+    assert result["status"] == "gate", result
+    assert decisions.await_count == 2
+    assert [cmd[:2] for cmd in ipc if cmd[0] in {"click", "navigate"}] == [
+        ("navigate", URL), ("click", "#apply")]
+    # Reversible Apply click is not an authorized final Submit/possible hold.
+    assert authority.tracking.rows[PK].get("possible_submission") is not True
+    await _must_final_tenant_deny(authority)

@@ -202,13 +202,17 @@ COMBO_EQUALS = ['mode', 'phase', 'quarantined', 'required_proxy_mounted', 'label
                 'field_selector', 'value_container_selector', 'input_wrapper_selector',
                 'receiverless_country', 'country_graph', 'link_id', 'linked', 'listbox_selector',
                 'options', 'selected_text', 'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value']
+# r06 treats malformed or split read-only identity evidence as a bounded,
+# non-authorizing reobservation, not an immediate per-step shape certificate.
 RETRY = ['greenhouse.equal', 'controls.length.equal', 'visible_text.required_nonempty',
          'combobox.link_id.required_nonempty', 'selector.equal', 'visible_text.equal', 'options.equal',
-         'combobox.equal', 'inventory.identity.equal'] + [k+'.equal' for k in CONTROL_EQUALS] + [
+         'combobox.equal', 'inventory.identity.equal', 'selector.unique', 'combobox.object',
+         'combobox.PAGE.object', 'combobox.linked.shape'] + [
+             k+'.equal' for k in CONTROL_EQUALS] + [
              'combobox.'+k+'.equal' for k in COMBO_EQUALS]
-FATAL = ['url.equal', 'selector.unique', 'unique.true', 'unique_form.true', 'witness.object',
-         'controls.list', 'control.object', 'combobox.object', 'combobox.PAGE.object',
-         'combobox.linked.shape', 'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
+FATAL = ['url.equal', 'unique.true', 'unique_form.true', 'witness.object',
+         'controls.list', 'control.object',
+         'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
          'caption-wrong-type']
 # No per-step graph certificate: a malformed optional link hint may be observed
 # reversibly, but cannot supply the missing submitted value at final Submit.

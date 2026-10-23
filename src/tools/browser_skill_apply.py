@@ -29,6 +29,7 @@ from tools.claude_chrome import (
 from tools import submit_hold
 from tools.browser_skill_dom import (
     ENTRY_PAGE, GREENHOUSE_PAGE, entry_reader, greenhouse_reader,
+    scoped_identity_conflict, submission_like_transition,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -420,7 +421,7 @@ def native_submit(target: dict) -> bool:
     """A label and safe form.action do not prove a JS button's click effect."""
     return (target.get('submit') is True
             and target.get('tag') in {'button', 'input'}
-            and target.get('type') in {'submit', 'image'}
+            and (target.get('native_type') or target.get('type')) in {'submit', 'image'}
             and bool(target.get('native_form_owner_selector'))
             and target.get('native_form_owner_selector') == target.get('form_selector'))
 
@@ -1315,9 +1316,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       e.form || e.closest('form') || e.type === 'file')
     .map(e => {
       const form = e.form || e.closest('form');
-      const type = e.getAttribute('role') ||
-        ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
-          (e.getAttribute('type') || e.tagName.toLowerCase()));
+      const nativeType=['INPUT','BUTTON'].includes(e.tagName) ? e.type : '';
+      const type=e.getAttribute('role') || nativeType || e.getAttribute('type') || e.tagName.toLowerCase();
       const ownSelector = selector(e), formSelector = form ? selector(form) : '';
       const graph = newGraphs.get(e);
       const exactNodes = graphNodes.get(e);
@@ -1343,15 +1343,15 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           (hiddenName && h.name === hiddenName)));
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         commits_application:commitsApplication(e),
-        tag:e.tagName.toLowerCase(), type, in_form:!!form,
+        tag:e.tagName.toLowerCase(), type, native_type:nativeType,
+        submit:['submit','image'].includes(nativeType) && (e.tagName === 'INPUT' || !!e.form), in_form:!!form,
         form_selector:formSelector,
         native_form_owner_selector:e.form ? selector(e.form) : '',
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
         formaction:e.getAttribute('formaction') !== null ? (e.formAction || '') : '',
         ...(fixedAshbyNative ? {label:fixedAshbyLabel(e),
-          submit:['submit','image'].includes(type) && ['INPUT','BUTTON'].includes(e.tagName)
-            && !!e.form, required:!!e.required || e.getAttribute('aria-required')==='true',
+          submit:['submit','image'].includes(nativeType) && !!e.form, required:!!e.required || e.getAttribute('aria-required')==='true',
           form_action_attr_present:!!form && form.hasAttribute('action'),
           form_action_raw:form ? form.getAttribute('action') : null,
           formaction_attr_present:e.hasAttribute('formaction'),
@@ -1382,7 +1382,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:hidden.length === 1 ? selector(hidden[0]) : '',
           hidden_value:hidden.length === 1 ? hidden[0].value : '', ...(graph || {})} : null};
-    })};
+    }), application_identity:applicationIdentity()};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 
 _APP_SUBMIT_LABELS = frozenset({
@@ -1404,7 +1404,7 @@ def _submitter_texts(target: dict) -> tuple[str, ...]:
     if not native_submit(target):
         return ()
     texts = [target.get('label', '')]
-    if target.get('tag') == 'input' and target.get('type') == 'submit':
+    if target.get('tag') == 'input' and (target.get('native_type') or target.get('type')) == 'submit':
         texts.append(target.get('value', ''))
     return tuple(t for t in texts if isinstance(t, str) and t.strip())
 
@@ -1469,7 +1469,7 @@ def _inventory_ok(page: dict, *, complete: bool = True) -> None:
 
 def _identity(target: dict) -> tuple:
     return tuple(target.get(k) for k in (
-        'selector', 'label', 'question', 'tag', 'type', 'in_form',
+        'selector', 'label', 'question', 'tag', 'type', 'native_type', 'in_form',
         'form_selector', 'form_action', 'formaction', 'form_action_attr_present',
         'form_action_raw', 'formaction_attr_present', 'formaction_raw',
         'options', 'combobox', 'disabled',
@@ -1483,7 +1483,7 @@ def _page_identity(page: dict) -> tuple:
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
             page.get('opaque_controls'), page.get('shadow_roots'),
             page.get('unsupported_frames'), repr(entry),
-            repr(page.get('greenhouse')),
+            repr(page.get('greenhouse')), repr(page.get('application_identity')),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
 _APPLICATION_WAIT_SECONDS = 15.0
@@ -1612,50 +1612,42 @@ def _formless_root(page: dict) -> dict | None:
 
 
 def _formless_boundary(page: dict, provenance=None) -> list[dict]:
-    """Structural recipient, never a native form or a claimed HTTP endpoint."""
+    """Recipient ownership, not an ATS-specific preparation widget classifier."""
     root = _formless_root(page)
     if (not root or not isinstance(provenance, ApplicationEntryProvenance)
             or provenance.ats != 'ashby'
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('formless structural recipient not proven; inspect manually.')
     if root.get('error'):
-        reason = ('defect_ashby_root_identity' if root['error'] in {
-            'ambiguous application roots',
-            'application root sibling identity mismatch',
-        } else 'defect_structural')
-        raise Gate(root['error'] + '; inspect the application manually.', reason=reason)
+        raise Gate(root['error'] + '; inspect the application manually.',
+                   reason='defect_ashby_root_identity')
     if not root.get('root'):
         raise _EntryNotReady('no unique application root')
-    evidence = page['entry'].get('root_evidence')
+    evidence = (page.get('entry') or {}).get('root_evidence')
     if (root.get('truncated') or not isinstance(evidence, list) or not evidence
             or len(evidence) > 500):
         raise Gate('incomplete application root evidence; inspect manually.')
     selectors = [c.get('selector') for c in evidence]
-    if len(set(selectors)) != len(selectors) or any(
-            not c.get('unique') for c in evidence):
+    if len(set(selectors)) != len(selectors) or any(not c.get('unique') for c in evidence):
         raise Gate('ambiguous application root control identity; inspect manually.',
                    reason='defect_structural')
-    # A null native owner never establishes shared ownership. Only a proven
-    # unrelated native search form can be omitted from this global census.
     ignored = set()
-    owners = {c.get('native_owner') for c in evidence if c.get('native_owner')}
-    for owner in owners:
+    for owner in {c.get('native_owner') for c in evidence if c.get('native_owner')}:
         siblings = [c for c in page['controls'] if c.get('form_selector') == owner]
         if (siblings and all(c.get('native_form_owner_selector') == owner for c in siblings)
                 and _unrelated_search_form(siblings)):
             ignored.update(c['selector'] for c in siblings)
     members = []
+    lookup = {c['selector']: c for c in page['controls']}
     for c in evidence:
         if c['selector'] in ignored:
             continue
         if c.get('native_owner') or c.get('declared_owner') or c.get('formaction') is not None:
-            raise Gate('receiver outside root or foreign native receiver; '
-                       'native form receiver not proven; inspect manually.')
+            raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
         if not c.get('inside'):
-            cause = ('exact submit outside root' if c.get('submit') else
-                     'receiver outside root' if c.get('type') == 'hidden' else
-                     'candidate control outside root')
-            raise Gate(cause + '; inspect manually.')
+            raise Gate('exact submit outside root' if c.get('submit') else
+                       'receiver outside root' if c.get('type') == 'hidden' else
+                       'candidate control outside root')
         if c.get('submit'):
             if (c['selector'] != root.get('submit') or c.get('tag') != 'button'
                     or not c.get('untyped') or c.get('role') or c.get('disabled')
@@ -1664,44 +1656,28 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             continue
         if not c.get('in_container'):
             raise Gate('candidate control outside application container; inspect manually.')
-        if c.get('dropzone') and c.get('tag') == 'button':
-            continue
         typ = c.get('type')
-        if c.get('iti'):
-            cause = 'unsupported .iti phone-country picker'
-        elif c.get('contenteditable'):
-            cause = 'unsupported contenteditable widget'
-        elif c.get('role') or c.get('autocomplete') not in {'', 'off'}:
-            cause = 'unsupported autocomplete/combobox widget'
-        elif typ in {'select', 'radio', 'checkbox', 'hidden'}:
-            cause = 'unsupported ' + typ + (' receiver' if typ == 'hidden' else ' widget')
-        elif typ == 'file' and c.get('id') != '_systemfield_resume':
-            cause = 'unsupported file receiver'
-        elif not ((c.get('tag') == 'input' and typ in {'text', 'email', 'file'})
-                  or (c.get('tag') == 'textarea' and typ == 'textarea')):
-            cause = 'unsupported custom control'
-        else:
-            cause = ''
-        if cause:
-            raise Gate(cause + '; complete this control manually.')
+        if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
+                'listbox', 'option', 'button'}:
+            continue
+        if c.get('iti') or c.get('contenteditable'):
+            raise Gate('unsupported .iti phone-country picker' if c.get('iti')
+                       else 'unsupported contenteditable widget')
+        if typ == 'hidden' or (typ == 'file' and c.get('id') != '_systemfield_resume'):
+            raise Gate('unsupported hidden receiver' if typ == 'hidden'
+                       else 'unsupported file receiver')
         if (not c.get('associated') or not c.get('label') or c.get('disabled')
                 or c.get('readonly') or c.get('inert')
                 or (typ != 'file' and not c.get('visible'))):
             raise Gate('application label/control association or editability changed; inspect manually.')
-        if _MATERIAL_ASSENT.search(c['label']):
-            raise Gate('unsupported material assent; review directly with the human.')
-        members.append(c)
-    if len([c for c in members if c.get('type') == 'file']) != 1:
-        raise Gate('missing unique labelled resume receiver; inspect manually.')
-    # Cross-channel PAGE fields cannot silently disagree with the global census.
-    lookup = {c['selector']: c for c in page['controls']}
-    for c in members:
         original = lookup.get(c['selector'])
         if not original or any(original.get(k) != c.get(k) for k in (
                 'tag', 'type', 'label', 'value', 'required', 'disabled', 'files')):
             raise Gate('application field inventory differs from root evidence; inspect manually.')
+        members.append(c)
+    if len([c for c in members if c.get('type') == 'file']) != 1:
+        raise Gate('missing unique labelled resume receiver; inspect manually.')
     return members
-
 
 
 def _root_identity(page: dict):
@@ -1917,7 +1893,6 @@ class _EntrySession:
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
         self.fixture_context = fixture_context
-        self.formless_identity = None
         self.committing = False
         self.on_committing_click = None
         self.upload_attempted = False
@@ -2075,13 +2050,12 @@ class _EntrySession:
                 if selector not in {c.get('selector') for c in evidence
                                     if isinstance(c, dict)} | {root['submit']}:
                     raise Gate('The current application root does not own this receiver.')
-                if args[0] == 'click' and selector != root['submit']:
-                    raise Gate('The current application root forbids structural click at IPC producer.')
             else:
                 check_form_destination(current, target, provenance=self.provenance)
             if (args[0] == 'click' and
-                    (native_submit(target) or (root and selector == root['submit'])
-                     or target.get('commits_application')) and
+                    (native_submit(target) or target.get('submit')
+                     or (root and selector == root['submit'])
+                     or target.get('commits_application') or target.get('formaction')) and
                     getattr(self.raw, '_application_controller', None) is None):
                 raise Gate('Submission-capable click lacks final approval from the application IPC controller.')
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
@@ -2287,6 +2261,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         if isinstance(session, _GreenhouseSession):
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
+        require(value.get('application_identity') == page.get('application_identity'),
+                'application_identity.equal')
         require(isinstance(value.get('controls'), list), 'controls.list')
         require(len(value['controls']) == len(page['controls']) or (
             page.get('truncated') is True
@@ -2301,7 +2277,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
             require(observed.get('selector') == sel, 'selector.equal')
             for key in ('unique', 'unique_form'):
                 require(observed.get(key) is True, key + '.true')
-            for key in ('tag', 'type', 'in_form', 'form_selector',
+            for key in ('tag', 'type', 'native_type', 'in_form', 'form_selector',
                         'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
                         'form_action_attr_present', 'form_action_raw',
                         'formaction_attr_present', 'formaction_raw',
@@ -2371,17 +2347,22 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')
+    structural = _formless_root(page)
     if (target.get('tag') != 'input' or target.get('type') != 'radio'
             or not isinstance(name, str) or not name.strip()
-            or not isinstance(form, str) or not form.strip()
+            or (not structural and (not isinstance(form, str) or not form.strip()))
             or not isinstance(target.get('question'), str)
             or not target['question'].strip()):
         raise Gate('A native radio group needs a form, name and visible question.')
+    owned = ({c['selector'] for c in page['entry'].get('root_evidence', [])
+              if c.get('in_container') and c.get('associated')}
+             if structural else None)
     members = [c for c in page['controls']
                if c.get('type') == 'radio' and c.get('name') == name
-               and c.get('form_selector') == form]
+               and c.get('form_selector') == form
+               and (owned is None or c.get('selector') in owned)]
     if (len(members) < 2 or any(
-            c.get('tag') != 'input' or c.get('in_form') is not True
+            c.get('tag') != 'input' or (not structural and c.get('in_form') is not True)
             or c.get('question') != target['question']
             or c.get('form_action') != target.get('form_action')
             or not isinstance(c.get('selector'), str) or not c['selector']
@@ -4094,7 +4075,9 @@ class ApplicationIPCController:
         target = targets[0]
         # Explicitly submitting/navigating choices are never ordinary selection
         # writes. They reach the single full guard rather than bypassing it by role.
-        if (target.get('submit') is True or target.get('navigates') is True
+        if ((target.get('tag') in {'input', 'button'}
+             and target.get('native_type') in {'submit', 'image'})
+                or target.get('submit') is True or target.get('navigates') is True
                 or target.get('formaction') or target.get('commits_application')):
             await self.authorize_final_submit(session, page, target)
             self.committed = True
@@ -4209,6 +4192,11 @@ class ApplicationIPCController:
         elif host == 'jobs.lever.co':
             match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
             observed_id = match.group(1) if match else ''
+        conflict = scoped_identity_conflict(
+            page, target.get('form_selector') if target.get('in_form') else
+            (_formless_root(page) or {}).get('container'), row['job_id'], self.company)
+        if conflict:
+            raise Gate('Final page exposes a contradictory visible ' + conflict + '; no Submit.')
         if observed_id:
             if observed_id != row['job_id']:
                 raise Gate('Final page exposes a contradictory job ID; no Submit.')
@@ -4493,6 +4481,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         model_page['entry'] = {k: v for k, v in page['entry'].items()
                                                if k not in {'upload_tree', 'native_candidates',
                                                             'quarantined_native_owners'}}
+                    model_page.pop('application_identity', None)
                     model_page = _guard_model_page(
                         model_page, pk, company, fixture_context=ctx)
                     model_page, model_history = _model_projection(model_page, history)
@@ -4608,6 +4597,16 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         history.append(result)
                     page = await session.page()
                     step['url'] = page['url']
+                    if (verb == 'click' and not submitted and (
+                            confirmation(before, page) or submission_like_transition(before, page))):
+                        # An opaque JS Continue handler may submit. Stop and hold.
+                        mark_click_started()
+                        hold_possible_submission(pk, step,
+                            **({'fixture_context': ctx} if ctx else {}))
+                        context = handoff('Possible submission after Continue; check the employer '
+                                          'portal before retrying.', step)
+                        return {'status': 'uncertain', 'detail': context['text'],
+                                'step': context['step']}
                     if not allowed(page['url']):
                         raise Gate('Click redirected to an unrelated job or tenant.')
                     if submitted and (phrase := await _fresh_confirmed_outcome(

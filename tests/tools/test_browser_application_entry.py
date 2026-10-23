@@ -1667,3 +1667,44 @@ async def test_native_hydration_after_first_field_does_not_reuse_old_root_identi
         ("fill", "#email", "--value", "test@example-co.test"),
     ]
     assert not any(item[0] == "click" for item in raw.calls)
+
+
+@pytest.mark.asyncio
+async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
+        monkeypatch, tmp_path):
+    """Round-2: JS Continue -> new thanks page -> uncertain, never second Submit.
+
+    Real producer, code-owned entry reader and durable offline tracking adapter;
+    only CLI and employer DOM are synthetic. No live application is sent.
+    """
+    from tests.tools.test_browser_controller_support import install_controller_session
+
+    before = application('ashby')
+    owner = before['controls'][0]['form_selector']
+    continue_button = field('Continue', '#continue', required=False, tag='button',
+                            type='button', form_selector=owner,
+                            form_action=entry('ashby'), submit=False)
+    before['controls'].insert(-1, continue_button)
+    row, _, endpoint, decide = world(monkeypatch, 'ashby', [before])
+    _, tracking, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
+    # Only skip field bootstrap. The stable-entry producer and actual raw
+    # application guard remain unmocked.
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    decide.side_effect = [
+        {'action': 'click', 'selector': '#continue'},
+        {'action': 'submit', 'selector': '#submit'},
+    ]
+    after = inventory(url=entry('ashby'))
+    after.update(text='Thank you for applying', title='Application received')
+    endpoint.after_submit = after
+    result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert result['status'] == 'uncertain', result
+    assert 'check the employer portal before retrying' in result['detail'].lower()
+    assert decide.await_count == 1
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [
+        ('click', '#continue')]
+    assert tracking.r.get(f'submit_hold:{PK}') is not None
+    assert row['status'] == 'needs_human'
+    assert row.get('gate_reason') == 'submit_uncertain'

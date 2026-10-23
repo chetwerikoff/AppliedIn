@@ -35,6 +35,19 @@ _WIDGET_GRAPH = r"""
     }
     return false;
   };
+  // Explicit labels inside the application receiver, not sibling jobs or footers.
+  const applicationIdentity=()=>{
+    const roots=Array.from(document.querySelectorAll('form'));
+    const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+    if(containers.length===1 && !containers[0].closest('form')) roots.push(containers[0]);
+    const id=/^(?:job|requisition|req|posting)\s*(?:id|number|#)\s*[:#]\s*(\S.{0,159})$/i;
+    const employer=/^(?:employer|company(?:\s+name)?)\s*:\s*(\S.{0,159})$/i;
+    return roots.map(root=>{
+      const lines=String(root.innerText||'').split(/\r?\n/).map(clean);
+      const values=rx=>[...new Set(lines.map(s=>s.match(rx)?.[1]?.trim()).filter(Boolean))];
+      return {selector:selector(root),job_ids:values(id),employers:values(employer)};
+    });
+  };
   // Referenced captions from another native form cannot witness this control.
   const refsStayInForm = e => {
     const form=nativeForm(e);
@@ -142,18 +155,17 @@ PAGE = r"""(() => {
     const graph = newGraphs.get(e);
     let question = graph ? label(e) : clean(group?.querySelector(
       'legend,[data-automation-id="formLabel"]')?.innerText || group?.innerText || '');
-    const type = e.getAttribute('role') ||
-      ((e.tagName === 'INPUT' || e.tagName === 'BUTTON') ? e.type :
-        (e.getAttribute('type') || e.tagName.toLowerCase()));
-    const submit = e.tagName === 'BUTTON' ? e.type === 'submit' && !!e.form :
-      type === 'submit' || type === 'image';
+    const nativeType=['INPUT','BUTTON'].includes(e.tagName) ? e.type : '';
+    const type=e.getAttribute('role') || nativeType || e.getAttribute('type') || e.tagName.toLowerCase();
+    const submit=['submit','image'].includes(nativeType) &&
+      (e.tagName === 'INPUT' || !!e.form);
     const form = e.form || e.closest('form');
     // DOM properties resolve relative actions against document.baseURI.
     // Do not infer a receiver from the visible button label.
     const formAction = form?.action || '';
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
-      question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, submit,
+      question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
       commits_application:commitsApplication(e),
       in_form:!!form, form_selector:form ? selector(form) : '',
       native_form_owner_selector:e.form ? selector(e.form) : '',
@@ -245,7 +257,7 @@ PAGE = r"""(() => {
         const declared = ['aria-controls', 'aria-owns'].some(key =>
           (e.getAttribute(key) || '').trim().length > 0);
         return !declared && e.getAttribute('aria-expanded') === 'false' &&
-          !!nativeForm(e) && !unsafeOption(e);
+          !unsafeOption(e);
       }
       // An absent target is provisional only while the owning role stays safe.
       if (!list) return document.getElementById(linkId(e)) === null;
@@ -273,7 +285,7 @@ PAGE = r"""(() => {
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
     opaque_count:opaqueNodes.length, opaque_locators:opaqueNodes.map(diagnosticLocator),
-    inventory_verified:inventoryVerified};
+    inventory_verified:inventoryVerified, application_identity:applicationIdentity()};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 
 
@@ -320,12 +332,11 @@ _APPLICATION_ROOT = r"""
         action:f.action || '', action_attr_present:f.hasAttribute('action'),
         action_attr:f.getAttribute('action'),
         controls:members.map(e => {
-          const type=e.getAttribute('role') ||
-            (['INPUT','BUTTON'].includes(e.tagName) ? e.type :
-              (e.getAttribute('type') || e.tagName.toLowerCase()));
+          const nativeType=['INPUT','BUTTON'].includes(e.tagName) ? e.type : '';
+          const type=e.getAttribute('role') || nativeType || e.getAttribute('type') || e.tagName.toLowerCase();
           const labels=Array.from(e.labels || []);
-          return {selector:selector(e),tag:e.tagName.toLowerCase(),type,
-            submit:['submit','image'].includes(type) && ['INPUT','BUTTON'].includes(e.tagName),
+          return {selector:selector(e),tag:e.tagName.toLowerCase(),type,native_type:nativeType,
+            submit:['submit','image'].includes(nativeType),
             caption:entryLabel(e),owned:f.contains(e),native_owner:e.form ? selector(e.form) : '',
             declared_owner:e.getAttribute('form'),label_count:labels.length,
             labels_owned:labels.every(l=>f.contains(l)),
@@ -505,6 +516,7 @@ _ASHBY_ROOT = r"""
         document.getElementById(labels[0].getAttribute('for'))===e;
       return {selector:sel,unique:document.querySelectorAll(sel).length===1,
         tag:e.tagName.toLowerCase(),type:e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
+        native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
         id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
         associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
         in_container:!!container && container.contains(e),
@@ -811,3 +823,44 @@ def greenhouse_reader(script: str) -> str:
 
 
 GREENHOUSE_PAGE = greenhouse_reader(PAGE)
+
+
+def scoped_identity_conflict(page: dict, root_selector: str, job_id: str,
+                             company: str) -> str:
+    """Report only an explicitly labelled disagreement inside the bound form."""
+    if not isinstance(root_selector, str) or not root_selector:
+        return ''
+    witnesses = page.get('application_identity') or []
+    if not isinstance(witnesses, list):
+        return 'application identity'
+    matches = [w for w in witnesses if isinstance(w, dict)
+               and w.get('selector') == root_selector]
+    if len(matches) > 1:
+        return 'application identity'
+    if not matches:
+        return ''
+    observed = matches[0]
+    ids, employers = observed.get('job_ids'), observed.get('employers')
+    if not isinstance(ids, list) or not isinstance(employers, list):
+        return 'application identity'
+    if any(not isinstance(v, str) or v.casefold() != job_id.casefold() for v in ids):
+        return 'job ID'
+    normal = lambda s: ' '.join(s.replace('-', ' ').casefold().split())
+    if any(not isinstance(v, str) or normal(v) != normal(company) for v in employers):
+        return 'employer'
+    return ''
+
+
+def submission_like_transition(before: dict, after: dict) -> bool:
+    """A new completion-looking page after JS Continue warrants an existing hold."""
+    import re
+    from urllib.parse import urlsplit
+    if any(c.get('submit') or c.get('commits_application')
+           for c in after.get('controls', []) if isinstance(c, dict)):
+        return False
+    if re.search(r'/(?:thanks|thank-you|confirmation|success|submitted)(?:/|$)',
+                 urlsplit(after.get('url') or '').path, re.I) and after.get('url') != before.get('url'):
+        return True
+    return after.get('title') != before.get('title') and bool(re.search(
+        r'thank you|application (?:received|submitted|complete)',
+        after.get('title') or '', re.I))

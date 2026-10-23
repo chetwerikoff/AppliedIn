@@ -971,3 +971,124 @@ async def test_verified_vendor_redirect_preserves_exact_raw_session_route(monkey
     with pytest.raises(forms.Gate):
         await session.application_effect("navigate", target)
     assert len(effects) == 1
+
+
+@pytest.mark.parametrize('role', ['button', 'checkbox'])
+@pytest.mark.parametrize('reader', [
+    bsk.PAGE, forms._FIXED_CONTROL_WITNESS,
+    forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS,
+])
+def test_native_submit_role_does_not_mask_trusted_reader_html_type(role, reader):
+    """Synthetic DOM read: role is accessibility, input type is native effect."""
+    from tests.tools.test_browser_application_entry import dom, entry
+    marker = "  const query = 'input,textarea,select,button,a[href]"
+    assert marker in reader
+    source = reader.replace(
+        marker,
+        "  document.querySelector('#submit').setAttribute('role','" + role + "');\n" + marker,
+        1)
+    page = dom({'url': entry('ashby'), 'marker': 'value',
+                'actionAttr': 'explicit'}, source)
+    target = next(c for c in page['controls'] if c['selector'] == '#submit')
+    assert target['type'] == role
+    assert target['native_type'] == 'submit'
+    assert target['submit'] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('role', ['button', 'checkbox'])
+async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeypatch, role):
+    """A native committing input cannot become an approved reversible choice."""
+    target = _control(label='Continue', kind=role, submit=False)
+    target.update(tag='input', native_type='submit',
+                  native_form_owner_selector='#app')
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {'url': controller.url, 'controls': [target]}, controller)
+    visited = []
+
+    async def refuse(_session, _page, _target):
+        visited.append('single final guard')
+        raise forms.Gate('synthetic final guard refused')
+
+    monkeypatch.setattr(controller, 'authorize_final_submit', refuse)
+    with pytest.raises(forms.Gate, match='synthetic final guard refused'):
+        await session.application_effect('click', '#next')
+    assert visited == ['single final guard']
+    assert calls == [] and controller.committed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('identity','expected'), [
+    ({'job_ids': ['other-job'], 'employers': []}, 'contradictory visible job ID'),
+    ({'job_ids': [], 'employers': ['foreign-co']}, 'contradictory visible employer'),
+    ({'job_ids': [], 'employers': []}, 'protected tailored PDF'),
+])
+async def test_visible_application_identity_is_scoped_at_only_final_ipc(
+        monkeypatch, identity, expected):
+    """Identical title is insufficient for a labelled foreign root identity.
+
+    A foreign ID in unrelated page prose or a different form is not authority.
+    The matching-root positive reaches the normal PDF check, not the hold.
+    """
+    from core.ids import make_pk
+    company, job = 'example-co', 'synthetic-job-42'
+    pk = make_pk(company, job)
+    url = 'https://example-co.test/jobs/synthetic-job-42'
+    controller = forms.ApplicationIPCController(
+        pk, company, url, '', {}, {}, [], {}, lambda: None)
+    row = {'pk': pk, 'company': company, 'job_id': job,
+           'jd_url': url, 'ats': 'other', 'title': 'Synthetic Role'}
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **k: None)
+    monkeypatch.setattr(forms, 'navigation_allowed', lambda *a, **k: True)
+    monkeypatch.setattr(forms, 'hold_possible_submission',
+                        lambda *a, **k: pytest.fail('identity/PDF refusal must precede hold'))
+    target = _control(label='Submit application', kind='submit', submit=True)
+    target.update(selector='#submit', native_type='submit', tag='button',
+                  native_form_owner_selector='#app', form_action=url)
+    page = {
+        'url': url, 'title': 'Synthetic Role',
+        'text': 'Related postings: Employer: foreign-co; Job ID: other-job',
+        'controls': [target],
+        'application_identity': [
+            {'selector': '#other-form', 'job_ids': ['other-job'],
+             'employers': ['foreign-co']},
+            {'selector': '#app', **identity},
+        ],
+    }
+    session, calls = await _setup(monkeypatch, page, controller)
+    with pytest.raises(forms.Gate, match=expected):
+        await session.application_effect('click', '#submit')
+    assert calls == []
+    assert controller.committed is False
+
+
+@pytest.mark.parametrize(('visible','expected'), [
+    ('Job ID: other-job', 'job ID'),
+    ('Employer: foreign-co', 'employer'),
+    ('', ''),
+])
+@pytest.mark.parametrize('reader', [
+    bsk.PAGE, forms._FIXED_CONTROL_WITNESS,
+    forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS,
+])
+def test_both_raw_readers_scope_labelled_identity_to_application_root(reader, visible, expected):
+    """Real trusted JS reader and synthetic DOM; the page footer has no authority."""
+    from tests.tools.test_browser_application_entry import dom, entry
+    from tools.browser_skill_dom import scoped_identity_conflict
+    marker = "  const query = 'input,textarea,select,button,a[href]"
+    assert marker in reader
+    preparation = (
+        "  Object.defineProperty(document.querySelector('#body'), 'innerText', "
+        "{value:'Job ID: other-job; Employer: foreign-co'});\n"
+    )
+    if visible:
+        preparation += (
+            "  Object.defineProperty(document.querySelector('#application-form'), "
+            "'innerText', {value:'" + visible + "', configurable:true});\n"
+        )
+    source = reader.replace(marker, preparation + marker, 1)
+    page = dom({'url': entry('ashby'), 'actionAttr': 'explicit'}, source)
+    assert scoped_identity_conflict(page, '#application-form',
+                                    'synthetic-job-42', 'example-co') == expected

@@ -215,7 +215,10 @@ async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkey
     result = await attempt()
     assert result['status'] == 'gate', result
     # Entry may be transient; these structural defects still forbid final Submit.
-    with pytest.raises(forms.Gate, match=cause):
+    expected = ('label/control association' if cause in {
+        'unsupported select', 'unsupported radio', 'unsupported checkbox',
+        'unsupported autocomplete/combobox'} else cause)
+    with pytest.raises(forms.Gate, match=expected):
         forms._formless_boundary(raw.current, provenance)
     assert not decision.await_count
     no_mutations(raw)
@@ -465,15 +468,13 @@ def test_native_submit_needs_actual_independent_form_owner(tag, typ, owner):
     ('disabled', True, 'editability changed'),
     ('iti', True, 'unsupported .iti'),
     ('contenteditable', True, 'unsupported contenteditable'),
-    ('autocomplete', 'name', 'unsupported autocomplete'),
-    ('role', 'combobox', 'unsupported autocomplete'),
-    ('type', 'select', 'unsupported select'),
-    ('type', 'radio', 'unsupported radio'),
-    ('type', 'checkbox', 'unsupported checkbox'),
     ('type', 'hidden', 'unsupported hidden'),
     ('type', 'file', 'unsupported file'),
-    ('type', 'unknown', 'unsupported custom'),
-    ('label', 'I agree to these terms', 'unsupported material assent'),
+    ('type', 'unknown', 'application field inventory differs'),
+    ('type', 'select', 'application field inventory differs'),
+    ('type', 'radio', 'application field inventory differs'),
+    ('type', 'checkbox', 'application field inventory differs'),
+    ('label', 'I agree to these terms', 'application field inventory differs'),
 ])
 def test_boundary_guard_local_cause(monkeypatch, member, value, cause):
     # Observe first, then alter precisely one independent evidence member. Calling
@@ -1165,3 +1166,69 @@ async def test_one_successful_formless_fill_then_submit_shape_drift_allows_prepa
     with pytest.raises(forms.Gate, match='exact structural submit changed'):
         forms._formless_boundary(raw.current, provenance)
     assert not [c for c in raw.calls if c[0] == 'click']
+
+
+@pytest.mark.asyncio
+async def test_forless_witnessed_aria_picker_and_native_choices_reach_real_entry_ipc(monkeypatch):
+    """Round-2: actual stable form, recipient, witness and raw entry path.
+
+    Hydrated controls augment both independently observed real Ashby readers.
+    No mocked stable-form admission or grant bypass can authorize a Submit.
+    """
+    _, raw, _, provenance = root_world(monkeypatch)
+    variants = [
+        ('#work-picker', 'combobox', 'div', 'Work location', 'work_location', ''),
+        ('#radio-no', 'radio', 'input', 'No', 'relocation', 'no'),
+        ('#radio-yes', 'radio', 'input', 'Yes', 'relocation', 'yes'),
+        ('#consent-choice', 'checkbox', 'input', 'Contact permission', 'contact', 'yes'),
+    ]
+    for snapshot in (raw.current, raw.fixed):
+        sample = next(c for c in snapshot['controls'] if c['selector'] == '#_systemfield_name')
+        root_sample = next(c for c in snapshot['entry']['root_evidence']
+                           if c['id'] == '_systemfield_name')
+        for selector, kind, tag, caption, name, value in variants:
+            control = deepcopy(sample)
+            control.update(selector=selector, type=kind, native_type=kind if tag == 'input' else '',
+                           tag=tag, label=caption, question='Relocation' if kind == 'radio' else caption,
+                           name=name, value=value, required=True, disabled=False,
+                           checked=False, submit=False, in_form=False, form_selector='',
+                           native_form_owner_selector='', form_action='', files=[])
+            if kind in {'radio', 'checkbox'}:
+                control['visible_text'] = caption
+            if kind == 'combobox':
+                control['combobox'] = {
+                    'linked': True, 'link_id': 'work-options',
+                    'listbox_selector': '#work-options',
+                    'options': [{'selector': '#remote', 'unique': True, 'tag': 'div',
+                                 'native_type': '', 'submit': False, 'navigates': False,
+                                 'commits_application': False, 'safe': True,
+                                 'label': 'Remote', 'value': 'remote', 'selected': False}],
+                    'selected_text': '', 'displayed_text': '', 'selected_value': '',
+                    'hidden_selector': '', 'hidden_value': '',
+                }
+            root_control = deepcopy(root_sample)
+            root_control.update(selector=selector, id=selector[1:], type=kind,
+                                native_type=kind if tag == 'input' else '', tag=tag,
+                                role='combobox' if kind == 'combobox' else '',
+                                label=caption, value=value, files=[], required=True,
+                                disabled=False, readonly=False, visible=True,
+                                associated=True, inside=True, in_container=True,
+                                unique=True, native_owner='', declared_owner='',
+                                formaction=None, dropzone=False, submit=False)
+            snapshot['controls'].append(control)
+            snapshot['entry']['root_evidence'].append(root_control)
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'),
+                                  provenance, resume_path='Resume.pdf')
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    selectors = {c['selector'] for c in forms._formless_boundary(page, provenance)}
+    assert selectors.issuperset({'#work-picker', '#radio-no', '#radio-yes', '#consent-choice'})
+    radio = next(c for c in page['controls'] if c['selector'] == '#radio-no')
+    assert len(forms._radio_group(page, radio)) == 2
+    for selector in ('#work-picker', '#radio-no', '#consent-choice'):
+        await session.call('click', selector)
+    assert [c for c in raw.calls if c[0] == 'click'] == [
+        ('click', '#work-picker'), ('click', '#radio-no'),
+        ('click', '#consent-choice')]
+    assert not any(c[0] == 'submit' for c in raw.calls)

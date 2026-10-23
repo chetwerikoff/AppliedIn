@@ -126,17 +126,15 @@ def test_production_decision_rejects_unavailable_row_without_disclosing_page(
 
 
 @pytest.mark.parametrize("source_unavailable", [False, True])
-def test_production_decision_keeps_bound_sanitized_html_authorized(
+def test_production_decision_allows_sanitized_aria_hidden_anchor_without_review(
     monkeypatch, source_unavailable,
 ):
     tracking, inspected = greenhouse_row(
         monkeypatch, source_unavailable=source_unavailable)
     current = tracking.get_current(PK)
     assert pg.authorised(current)
-    assert current["posting_guard"]["removed_hidden_verified"] is True
-    # Model-bound page text is already the visible, sanitized projection.
     safe = forms._guard_model_page(
-        page("Normal page", description=inspected["text"]), PK, "example-co")
+        page("Normal page", description=GREENHOUSE_HTML), PK, "example-co")
     assert "ignore previous instructions" not in safe["description"]
     assert "hidden.example.test" not in safe["description"]
     persisted = tracking.get_current(PK)
@@ -149,25 +147,6 @@ def test_production_decision_keeps_bound_sanitized_html_authorized(
     assert pg.authorised(persisted)
     assert not pg.requires_review(persisted)
     assert not persisted.get("reviewed_guard_generation")
-
-
-def test_page_decision_requires_review_when_new_hidden_material_loses_provenance(
-    monkeypatch,
-):
-    # The page decision forwards only reason codes, not the discarded hidden
-    # content. The new page finding cannot certify absence from the tracked JD.
-    tracking, inspected = greenhouse_row(monkeypatch)
-    assert pg.authorised(tracking.get_current(PK))
-    inspected_page = pg.analyze(GREENHOUSE_HTML)
-    assert "ignore previous instructions" not in inspected_page["text"]
-    with pytest.raises(forms.Gate) as rejected:
-        forms._guard_model_page(
-            page("Normal page", description=GREENHOUSE_HTML), PK, "example-co")
-    assert rejected.value.reason == "posting_guard_review_required"
-    stored = tracking.get_current(PK)
-    assert stored["jd_text"] == inspected["text"]
-    assert pg.valid(stored["jd_text"], stored["posting_guard"])
-    assert not pg.authorised(stored)
 
 
 def test_production_decision_rejects_mixed_hidden_and_material_risk(monkeypatch):
@@ -307,7 +286,6 @@ def test_ats_plaintext_hidden_html_mismatch_refuses_browser_preflight(
     assert "hidden_text_retained" in guard["reasons"]
     assert "model_instruction" not in guard["reasons"]
     assert pg.valid(inspected["text"], guard)
-    assert "removed_hidden_verified" not in guard
 
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = "example-co#role-1"

@@ -881,7 +881,7 @@ def _model_projection(page: dict, history: list) -> tuple[dict, list]:
             if field in visible:
                 visible[field] = ''
     receipts = [{'action': item.get('action'), 'selector': item.get('selector'),
-                 'uploaded': item.get('uploaded') is True}
+                 'fact': item.get('fact'), 'uploaded': item.get('uploaded') is True}
                 for item in history[-8:] if isinstance(item, dict)]
     return visible, receipts
 
@@ -1293,6 +1293,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     return owners.length === 1 && owners[0] === e ? claims[0] : '';
   };
   const linkedListbox = e => {
+    if (!refsStayInForm(e)) return null;
     const id = linkId(e);
     const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
     if (matches.length !== 1 || matches[0].getAttribute('role') !== 'listbox')
@@ -1330,7 +1331,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           submit:(o.tagName === 'BUTTON' && o.type === 'submit' && !!o.form) ||
             o.type === 'submit' || o.type === 'image',
           navigates:(o.tagName === 'A' && !!o.href) || (!!graph && unsafeOption(o)),
-          safe:!unsafeOption(o),
+          commits_application:commitsApplication(o), safe:!unsafeOption(o),
           label:graph ? o.innerText : clean(o.innerText),
           value:o.getAttribute('data-value') || o.getAttribute('value') || '',
           ...(graph ? {value_attributes:['data-value','value']
@@ -1343,6 +1344,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           (typeof e.contains === 'function' && e.contains(h)) ||
           (hiddenName && h.name === hiddenName)));
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
+        commits_application:commitsApplication(e),
         tag:e.tagName.toLowerCase(), type, in_form:!!form,
         form_selector:formSelector,
         native_form_owner_selector:e.form ? selector(e.form) : '',
@@ -1526,11 +1528,6 @@ def _ashby_native_classify(page: dict, provenance: ApplicationEntryProvenance) -
         and isinstance(c.get('selector'), str) and c['selector'] != owner)
     page['controls'] = [c for c in controls if c.get('in_form')
                         and c.get('form_selector') == owner]
-
-
-def _ashby_native_identity(page: dict):
-    # Changing hydrated siblings is not loss of the selected native form owner.
-    return (page.get('entry') or {}).get('selected_native_owner')
 
 
 _ENTRY_FIXED_CONTROL_WITNESS = entry_reader(_FIXED_CONTROL_WITNESS)
@@ -1948,12 +1945,11 @@ class _EntrySession:
                 # The opaque upload subtree is deliberately not root identity.
                 filename = Path(self.resume_path).name
                 for witness in (page, fixed):
-                    if (witness.get('url') != settle_before['url']
-                            or _formless_root(witness) != _formless_root(settle_before)):
+                    previous_root, current_root = _formless_root(settle_before), _formless_root(witness)
+                    if (previous_root and current_root and previous_root.get('submit') != current_root.get('submit')):
+                        raise Gate('exact structural submit changed during upload.')
+                    if (witness.get('url') != settle_before['url'] or current_root != previous_root):
                         raise Gate('Original application root or submit changed during upload.')
-                    if (_upload_candidates(settle_before)
-                            != _upload_candidates(witness)):
-                        raise Gate('Application control semantics changed during upload.')
                     evidence = witness['entry']['root_evidence']
                     original = next(c for c in evidence
                                     if c.get('id') == '_systemfield_resume'
@@ -1967,6 +1963,8 @@ class _EntrySession:
                         raise Gate('The exact passive attached-file item was not proven.')
                     if tree['complete'] is True:
                         _upload_tree(witness)
+                    if _upload_candidates(settle_before) != _upload_candidates(witness):
+                        raise Gate('Application control semantics changed during upload.')
             if (fixed.get('url') != page.get('url')
                     or fixed.get('entry') != page.get('entry')):
                 if (settle_before is not None
@@ -2058,14 +2056,19 @@ class _EntrySession:
         if args and args[0] != 'evaluate':
             if self.committing:
                 raise Gate('A possibly committing application action cannot be retried.')
-            if args[0] not in {'fill', 'select', 'upload', 'click'}:
-                raise Gate('Unsupported effectful application entry IPC.')
             current = await self.page()
             selector = args[1] if len(args) > 1 else ''
+            root = _formless_root(current)
+            if root and selector in root.get('excluded', []):
+                raise Gate('Autofill pane is forbidden at IPC producer.')
+            if args[0] not in {'fill', 'select', 'upload', 'click'}:
+                raise Gate('Unsupported effectful application entry IPC.')
+            current, _ = await _observe_controls(self, current)
             matches = [c for c in current.get('controls', [])
                        if c.get('selector') == selector]
             if len(matches) != 1:
-                raise Gate('Only a fresh unique application receiver may be mutated.')
+                raise Gate('unsupported root target; only a fresh unique application receiver may be mutated.'
+                           if root else 'Only a fresh unique application receiver may be mutated.')
             target = matches[0]
             root = _formless_root(current)
             if root:
@@ -2081,7 +2084,7 @@ class _EntrySession:
                     (native_submit(target) or (root and selector == root['submit'])
                      or target.get('commits_application')) and
                     getattr(self.raw, '_application_controller', None) is None):
-                raise Gate('Submission-capable click lacks the application IPC controller.')
+                raise Gate('Submission-capable click lacks final approval from the application IPC controller.')
             if args[0] == 'upload' and root:
                 return await self._upload(args, kwargs, selector)
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
@@ -2135,7 +2138,8 @@ def _entry_not_ready(page):
             or c.get('type') in {'radio', 'checkbox', 'combobox', 'file'})
         for c in page.get('controls', []))
     if not page['entry'].get('root') and not (_formless_root(page) or {}).get('root') and not has_native_fields:
-        return 'no unique application root' if _formless_root(page) else 'no qualifying application form'
+        return ((_formless_root(page) or {}).get('error') or 'no unique application root'
+                if _formless_root(page) else 'no qualifying application form')
     return ''
 
 def _greenhouse_not_ready(page, *, witness=False):
@@ -2177,7 +2181,7 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 'ambiguous application roots',
                 'application root sibling identity mismatch',
                 'truncated application inventory after bounded wait',
-                'unsupported custom control')):
+                'unsupported custom control', 'no unique application root')):
             raise
         if hasattr(raw_session, 'page'):
             page = await raw_session.page()
@@ -2302,7 +2306,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
             for key in ('tag', 'type', 'in_form', 'form_selector',
                         'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
                         'form_action_attr_present', 'form_action_raw',
-                        'formaction_attr_present', 'formaction_raw'):
+                        'formaction_attr_present', 'formaction_raw',
+                        'commits_application'):
                 require(original.get(key) == observed.get(key), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
                 if isinstance(session, _GreenhouseSession) and readiness:

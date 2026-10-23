@@ -25,6 +25,28 @@ _WIDGET_GRAPH = r"""
     const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
     return matches.length === 1 ? matches[0] : null;
   };
+  // Explicit inline application commits are observable; autosave is not one.
+  const commitsApplication = e => {
+    for (let n=e; n && n !== document; n=n.parentElement) {
+      const handlers=Array.from(n.attributes || []);
+      if (handlers.some(a => /^on(?:click|change|input|pointerup|mouseup|keydown|keyup|blur)$/i.test(a.name)
+          && /\b(?:requestSubmit|submit)\s*\(/i.test(a.value))) return true;
+      if (n.tagName === 'FORM') break;
+    }
+    return false;
+  };
+  // Referenced captions from another native form cannot witness this control.
+  const refsStayInForm = e => {
+    const form=nativeForm(e);
+    if (!form) return true;
+    for (const key of ['aria-describedby','aria-errormessage']) {
+      for (const id of (e.getAttribute(key)||'').split(/\s+/).filter(Boolean)) {
+        const ref=byId(id);
+        if (ref && (nativeForm(ref)!==form || ref.hasAttribute('formaction'))) return false;
+      }
+    }
+    return true;
+  };
   const unsafeOption = o => {
     const dangerous = e => (e.tagName==='A' && !!e.href) ||
       ((e.tagName==='BUTTON' || e.tagName==='INPUT') &&
@@ -91,6 +113,7 @@ PAGE = r"""(() => {
     return owners.length === 1 && owners[0] === e ? claims[0] : '';
   };
   const linkedListbox = e => {
+    if (!refsStayInForm(e)) return null;
     const id = linkId(e);
     const matches = id ? document.querySelectorAll('#'+CSS.escape(id)) : [];
     if (matches.length !== 1 || matches[0].getAttribute('role') !== 'listbox')
@@ -107,16 +130,6 @@ PAGE = r"""(() => {
     if (pickerCandidate(e) || quarantined.has(e)) return null;
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
-  };
-  // Explicit inline application commits are observable; autosave is not one.
-  const commitsApplication = e => {
-    for (let n=e; n && n !== document; n=n.parentElement) {
-      const handlers=Array.from(n.attributes || []);
-      if (handlers.some(a => /^on(?:click|change|input|pointerup|mouseup|keydown|keyup|blur)$/i.test(a.name)
-          && /\b(?:requestSubmit|submit)\s*\(/i.test(a.value))) return true;
-      if (n.tagName === 'FORM') break;
-    }
-    return false;
   };
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
@@ -208,6 +221,7 @@ PAGE = r"""(() => {
   const linkedParts = new Set();
   const linkedComboboxes = Array.from(document.querySelectorAll('[role="combobox"]'))
     .filter(e => {
+      if (!refsStayInForm(e)) return false;
       if (pickerParts.has(e)) return true;
       if (pickerCandidate(e) || quarantined.has(e)) return false;
       if (newGraphs.get(e)) {

@@ -1213,7 +1213,7 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                                              destination.path, re.I)
                     if (receiver_job and
                             receiver_job.group(1).lower() != observed_job.group(1).lower()):
-                        raise Gate('native form receiver not proven; PAGE/action posting ID drift.')
+                        raise Gate('native form receiver not proven; PAGE/action posting ID drift. The application has not been submitted by this applier.')
         if (not isinstance(base, str) or not base
                 or (override and not isinstance(override, str))
                 or not _preparation_destination_allowed(base, *origins, provenance=provenance)

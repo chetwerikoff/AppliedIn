@@ -94,7 +94,7 @@ class _VisibleHTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.links: list[tuple[str, str]] = []
-        self.stack: list[tuple[str, bool, str, str, int | None]] = []
+        self.stack: list[tuple[str, bool, str, str, int | None, bool]] = []
         self.hidden_text: list[list[str]] = []
         self.hidden_attrs: list[str] = []
         self.anchor: list[dict] = []
@@ -108,12 +108,15 @@ class _VisibleHTML(HTMLParser):
             attrs.get("style") or "", parent_fg, parent_bg)
         invisible = (parent_hidden or tag in _DROP or local or "hidden" in attrs
                      or (attrs.get("aria-hidden") or "").lower() == "true")
+        # Machine-only subtrees never prove that selected JD text retained a
+        # hidden payload, even if a nested element has hidden attributes.
+        dropped = tag in _DROP or bool(self.stack and self.stack[-1][5])
         # Group hidden descendants so split HTML text is checked as one payload.
         hidden_group = self.stack[-1][4] if parent_hidden else None
-        if invisible and not parent_hidden:
+        if invisible and not parent_hidden and not dropped:
             hidden_group = len(self.hidden_text)
             self.hidden_text.append([])
-        if invisible:
+        if invisible and not dropped:
             for key in ("href", "title", "alt", "aria-label"):
                 if attrs.get(key):
                     self.hidden_attrs.append(attrs[key])
@@ -132,7 +135,7 @@ class _VisibleHTML(HTMLParser):
         if tag in _BLOCK and not invisible:
             self.parts.append("\n")
         # Raw event handlers and arbitrary attribute values never enter parts.
-        self.stack.append((tag, invisible, fg, bg, hidden_group))
+        self.stack.append((tag, invisible, fg, bg, hidden_group, dropped))
         if tag in {"br", "img", "input", "hr", "meta", "link", "source", "wbr"}:
             self.handle_endtag(tag)
 
@@ -157,7 +160,7 @@ class _VisibleHTML(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.stack and self.stack[-1][1]:
             group = self.stack[-1][4]
-            if group is not None:
+            if group is not None and not self.stack[-1][5]:
                 self.hidden_text[group].append(data)
             if _URL.search(data):
                 self.reasons.add("hidden_url")
@@ -194,11 +197,12 @@ def _text(raw: str, reasons: set[str], *, strip_trailing: bool = False) -> str:
     return (normalized + trailing_spaces if normalized else "")[:100000]
 
 
-def _hidden_material_retained(text: str, fragments: list[str]) -> bool:
-    """Conservatively detect hidden HTML text or targets retained in the JD."""
+def _hidden_material_retained(text: str, hidden_text: list[str],
+                              hidden_attrs: list[str]) -> bool:
+    """Hidden text needs word windows; attributes need complete-value matches."""
     selected = _TOKEN.findall(text.casefold())
     windows: dict[int, set[tuple[str, ...]]] = {}
-    for fragment in fragments:
+    for fragment in hidden_text:
         words = _TOKEN.findall(fragment.casefold())
         if not words:
             continue
@@ -210,6 +214,13 @@ def _hidden_material_retained(text: str, fragments: list[str]) -> bool:
             }
         if any(tuple(words[i:i + width]) in windows[width]
                for i in range(len(words) - width + 1)):
+            return True
+    # A job-title slug can share four words with the visible title without
+    # the hidden href (or another attribute value) being present in the JD.
+    normalized = " ".join(text.casefold().split())
+    for value in hidden_attrs:
+        complete = " ".join(value.casefold().split())
+        if complete and complete in normalized:
             return True
     return False
 
@@ -251,7 +262,8 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
         old = previous or {}
         if isinstance(old, dict):
             reasons.update(code for code in old.get("reasons", []) if code in _MESSAGES)
-        hidden_fragments: list[str] = []
+        hidden_text: list[str] = []
+        hidden_attrs: list[str] = []
         variants = tuple(html_variants or ())
         verified = (source_complete and bool(variants)
                     and all(isinstance(v, str) and bool(v.strip())
@@ -264,8 +276,8 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(source)
             parser.close()
             reasons.update(parser.reasons)
-            hidden_fragments.extend("".join(parts) for parts in parser.hidden_text)
-            hidden_fragments.extend(parser.hidden_attrs)
+            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
+            hidden_attrs.extend(parser.hidden_attrs)
             html_text = "".join(parser.parts)
             # A nonselected HTML variant can expose model-directed instructions
             # and suspicious Unicode absent from the preferred plain JD.
@@ -278,13 +290,13 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(selected)
             parser.close()
             reasons.update(parser.reasons)
-            hidden_fragments.extend("".join(parts) for parts in parser.hidden_text)
-            hidden_fragments.extend(parser.hidden_attrs)
+            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
+            hidden_attrs.extend(parser.hidden_attrs)
             selected = "".join(parser.parts)
         clean = _text(selected, reasons, strip_trailing=strip_trailing)
         # The selected ATS plaintext may still contain content removed only
         # from descriptionHtml. It must not inherit the hidden-only exemption.
-        if _hidden_material_retained(clean, hidden_fragments):
+        if _hidden_material_retained(clean, hidden_text, hidden_attrs):
             reasons.add("hidden_text_retained")
         if source_required and not verified:
             reasons.add("source_html_unavailable")

@@ -1422,7 +1422,7 @@ async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkey
                 control_item['form_action_raw'] = foreign_route
     before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}])
     next_verb, selector = ('fill', '#email') if at == 'before-next-fill' else ('click', '#submit')
-    with pytest.raises(forms.Gate, match='lacks tracked job binding|root identity drift'):
+    with pytest.raises(forms.Gate, match='native form receiver not proven|tracked job binding|root identity drift'):
         await session.call(next_verb, selector, '--value', 'another' if at == 'before-next-fill' else '')
     assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}]) == before == 1
     assert not [c for c in raw.calls if c[0] == 'click']
@@ -1575,3 +1575,53 @@ def test_exact_owner_review_passes_guard_then_still_requires_queue_and_resume(
         actual_check(PK, 'synthetic-resume-does-not-exist.pdf')
     assert rejected.value.reason != 'posting_guard_review_required'
     assert 'PDF is missing' in str(rejected.value)
+
+
+def test_page_reader_reports_native_inline_requestsubmit_as_committing():
+    """The actual PAGE producer, not a synthetic boolean alone, detects inline submit."""
+    from tools.browser_skill_dom import PAGE
+
+    spec = dict(url=entry('ashby'), nativeCheckbox=True)
+    script = (
+        "document.querySelector('#native-choice').setAttribute("
+        "'onclick', 'this.form.requestSubmit()');\n" + PAGE
+    )
+    observed = dom(spec, script)
+    choice = next(c for c in observed["controls"]
+                  if c["selector"] == "#native-choice")
+    assert choice["type"] == "checkbox"
+    assert choice["submit"] is False
+    assert choice["commits_application"] is True
+    # Ordinary form-owned checkbox without a submitting handler remains prep.
+    normal = dom(spec, PAGE)
+    assert next(c for c in normal["controls"]
+                if c["selector"] == "#native-choice")["commits_application"] is False
+
+
+@pytest.mark.asyncio
+async def test_native_hydration_after_first_field_does_not_reuse_old_root_identity(monkeypatch):
+    """A native Ashby re-render preserves safe reversible writes after an approved field."""
+    raw, session, filled = await native_admitted_with_one_safe_fill(monkeypatch)
+    assert filled == {"#email": "test@example-co.test"}
+    old_owner, new_owner = "#application-form", "#hydrated-application"
+    for snapshot in (raw.current, raw.fixed):
+        candidate = next(c for c in snapshot["entry"]["native_candidates"]
+                         if c["selector"] == old_owner)
+        candidate["selector"] = new_owner
+        for control_item in snapshot["controls"]:
+            if control_item.get("form_selector") == old_owner:
+                control_item["form_selector"] = new_owner
+                control_item["native_form_owner_selector"] = new_owner
+        for control_item in candidate["controls"]:
+            if control_item.get("native_owner") == old_owner:
+                control_item["native_owner"] = new_owner
+        snapshot["entry"]["selected_native_owner"] = new_owner
+    # Only the historic root identity changed. Destination stays exact and safe.
+    hydrated = await session.page()
+    assert hydrated["entry"]["selected_native_owner"] == new_owner
+    await session.call("fill", "#email", "--value", "test@example-co.test")
+    assert [item for item in raw.calls if item[0] == "fill"] == [
+        ("fill", "#email", "--value", "test@example-co.test"),
+        ("fill", "#email", "--value", "test@example-co.test"),
+    ]
+    assert not any(item[0] == "click" for item in raw.calls)

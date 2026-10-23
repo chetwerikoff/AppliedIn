@@ -861,6 +861,31 @@ def _guard_model_page(model_page: dict, pk: str, company: str, *,
     return safe
 
 
+def _model_projection(page: dict, history: list) -> tuple[dict, list]:
+    """Send selectors and answer-presence, never read-back values, to the model."""
+    private = {'value', 'files', 'approved_value', 'selected_value',
+               'hidden_value', 'selected_text', 'displayed_text',
+               'value_attributes', 'filename'}
+
+    def strip(item):
+        if isinstance(item, dict):
+            return {key: strip(value) for key, value in item.items()
+                    if key not in private}
+        if isinstance(item, list):
+            return [strip(value) for value in item]
+        return item
+
+    visible = strip(page)
+    if ApplicationIPCController._private_content(page):
+        for field in ('text', 'description', 'summary', 'job_description', 'snippet'):
+            if field in visible:
+                visible[field] = ''
+    receipts = [{'action': item.get('action'), 'selector': item.get('selector'),
+                 'uploaded': item.get('uploaded') is True}
+                for item in history[-8:] if isinstance(item, dict)]
+    return visible, receipts
+
+
 def check_before_committing_click(pk: str, *, fixture_context=None) -> None:
     """A leased worker must re-read the human outcome and hold at the IPC edge."""
     ctx = _synthetic(fixture_context, pk=pk)
@@ -975,7 +1000,9 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     and attachment in c.get('files', [])]
         if len(attached) != 1:
             raise Gate('The résumé attachment is no longer present on the current file input.')
-        if _formless_root(page) and attached[0].get('files') != [attachment]:
+        if (attached[0].get('files') != [attachment] or any(
+                c is not attached[0] and c.get('type') == 'file' and c.get('files')
+                for c in controls)):
             raise Gate('Only the exact staged résumé may remain attached; inspect manually.')
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
@@ -1172,8 +1199,9 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                                                 provenance=provenance):
                 return  # Raw IPC still enforces the exact value/PDF and origin.
             raise Gate('The preparation receiver is outside the tracked origin.')
-        members = _formless_boundary(page, provenance)
-        if target.get('selector') not in {c['selector'] for c in members} | {_formless_root(page)['submit']}:
+        evidence = (page.get('entry') or {}).get('root_evidence') or []
+        if target.get('selector') not in {c.get('selector') for c in evidence
+                                            if isinstance(c, dict)} | {_formless_root(page)['submit']}:
             raise Gate('autofill or unsupported structural receiver forbidden.')
         return
     if not target.get('in_form'):
@@ -1877,8 +1905,8 @@ def _entry_safety(page, allowed, provenance):
                     and _unrelated_search_form(siblings)):
                 continue
             check_form_destination(page, c, provenance=provenance)
-    if _formless_root(page) and isinstance(provenance, ApplicationEntryProvenance) and provenance.ats == 'ashby':
-        _formless_boundary(page, provenance)
+    # Receiver and approved-value evidence is refreshed for preparation;
+    # completeness of the structural root is a final-Submit requirement.
 
 
 _ASHBY_WAIT_SECONDS = 90.0
@@ -1899,7 +1927,6 @@ class _EntrySession:
         self.step = step
         self.fixture_context = fixture_context
         self.formless_identity = None
-        self.native_identity = None
         self.committing = False
         self.on_committing_click = None
         self.upload_attempted = False
@@ -2028,61 +2055,35 @@ class _EntrySession:
                 ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
                 ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)}):
             raise Gate('Only read-only observations are permitted during upload settling.')
-        if (args and args[0] != 'evaluate'
-                and self.native_identity is not None and self.formless_identity is None):
+        if args and args[0] != 'evaluate':
             if self.committing:
-                raise Gate('A possible native submit cannot be retried automatically.')
-            # The same independent witness is required at the actual IPC seam,
-            # including direct producer calls that bypass the model/controller.
-            current, _ = await _observe_controls(self, await self.page())
-            if _ashby_native_identity(current) != self.native_identity:
-                raise Gate('native application owner drift before IPC.')
-            selector = args[1] if len(args) > 1 else ''
-            matches = [c for c in current['controls'] if c['selector'] == selector
-                       and c.get('form_selector') ==
-                       current['entry'].get('selected_native_owner')]
-            if len(matches) != 1:
-                raise Gate('foreign or unsupported native control forbidden at IPC producer.')
-            check_form_destination(current, matches[0], provenance=self.provenance)
+                raise Gate('A possibly committing application action cannot be retried.')
             if args[0] not in {'fill', 'select', 'upload', 'click'}:
-                raise Gate('unapproved native IPC verb.')
-            # A guarded radio/checkbox choice is not a potentially committing
-            # native submit; classifying every click as submission would turn a
-            # successful safe choice into a false uncertain-result hold.
-            if (args[0] == 'click' and native_submit(matches[0])
-                    and getattr(self.raw, '_application_controller', None) is None):
-                raise Gate('Native submit lacks final approval from the application IPC controller.')
-        if args and args[0] != 'evaluate' and self.formless_identity is not None:
-            if self.committing:
-                raise Gate('A possible structural submit cannot be retried automatically.')
-            # This is the actual IPC producer, including adversarial direct calls.
+                raise Gate('Unsupported effectful application entry IPC.')
             current = await self.page()
-            try:
-                current, _ = await _observe_controls(self, current)
-            except Gate as exc:
-                # This independent pre-IPC read already checked both original
-                # routes. Report the existing strict upload-pair Gate instead
-                # of the generic witness diagnostic for entry-only disagreement.
-                if (args[0] == 'upload' and str(exc) ==
-                        'The current DOM witness is unavailable or changed; '
-                        'exception=ValueError; predicate=entry.equal; control=unavailable'):
-                    raise Gate('Upload PAGE/fixed structural witness disagreement.',
-                           reason='defect_witness') from None
-                raise
-            members = _formless_boundary(current, self.provenance)
-            root = _formless_root(current)
             selector = args[1] if len(args) > 1 else ''
-            allowed = {c['selector']: c for c in members}
-            typ = allowed.get(selector, {}).get('type')
-            if not ((args[0] == 'fill' and typ in {'text', 'email', 'textarea'})
-                    or (args[0] == 'upload' and typ == 'file')
-                    or (args[0] == 'click' and selector == root['submit'])):
-                raise Gate('autofill or unsupported root target forbidden at IPC producer.')
-            if args[0] == 'upload':
+            matches = [c for c in current.get('controls', [])
+                       if c.get('selector') == selector]
+            if len(matches) != 1:
+                raise Gate('Only a fresh unique application receiver may be mutated.')
+            target = matches[0]
+            root = _formless_root(current)
+            if root:
+                evidence = (current.get('entry') or {}).get('root_evidence') or []
+                if selector not in {c.get('selector') for c in evidence
+                                    if isinstance(c, dict)} | {root['submit']}:
+                    raise Gate('The current application root does not own this receiver.')
+                if args[0] == 'click' and selector != root['submit']:
+                    raise Gate('Unclassified structural click cannot reach application IPC.')
+            else:
+                check_form_destination(current, target, provenance=self.provenance)
+            if (args[0] == 'click' and
+                    (native_submit(target) or (root and selector == root['submit'])
+                     or target.get('commits_application')) and
+                    getattr(self.raw, '_application_controller', None) is None):
+                raise Gate('Submission-capable click lacks the application IPC controller.')
+            if args[0] == 'upload' and root:
                 return await self._upload(args, kwargs, selector)
-            if args[0] == 'click':
-                if getattr(self.raw, '_application_controller', None) is None:
-                    raise Gate('Structural submit lacks final approval from the application IPC controller.')
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
@@ -2117,12 +2118,6 @@ class _EntrySession:
                     raise Gate('Application entry route or current row/config changed; inspect manually.',
                                reason='defect_provenance')
                 _entry_safety(page, self.allowed, self.provenance)
-            if (self.native_identity is not None and not self.committing
-                    and _ashby_native_identity(page) != self.native_identity):
-                raise Gate('native application root identity drift; inspect manually.')
-            if (self.formless_identity is not None and not self.committing and not self.upload_pending
-                    and _root_identity(page) != self.formless_identity):
-                raise Gate('application root identity drift; inspect manually.')
         return result
 
 
@@ -2250,10 +2245,6 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         if identity == previous and loop.time() < deadline:
                             if _formless_root(page):
                                 session.formless_identity = _root_identity(page)
-                            elif (isinstance(session, _EntrySession)
-                                  and isinstance(provenance, ApplicationEntryProvenance)
-                                  and provenance.ats == 'ashby'):
-                                session.native_identity = _ashby_native_identity(page)
                             return page
                     last_reason = ('unstable application form inventory' if seen else
                                    'no qualifying application form')
@@ -2927,8 +2918,6 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if getattr(session, '_application_controller', None) is not None:
                 return page  # Missing historic root proof cannot block preparation.
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
-        if session.formless_identity is None:
-            raise Gate('formless root lacks stable independent admission.')
         page, witness = await _observe_controls(session, page)
         members = _formless_boundary(page, provenance)
         for observed in members:
@@ -2937,12 +2926,6 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             item = control(page, observed, 'bootstrap-field')
             key = _key(page, item)
             value = str(facts.get(_fact_key(facts, key)) or '').strip()
-            previous = (_row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)).get(
-                'human_approved_answers', {}).get(key)
-            if isinstance(previous, dict) and any(previous.get(k) != expected for k, expected in (
-                    ('form_selector', _formless_root(page)['root']),
-                    ('form_action', _formless_root(page)['submit']))):
-                raise Gate('Previously approved structural root or submit changed; inspect manually.')
             approved = False
             if item.get('has_value') or value:
                 try:
@@ -3460,19 +3443,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                           provenance=provenance)):
             raise Gate('This page lacks current same-job provenance.',
                    reason='defect_provenance')
-    elif pk and (verb in {'fill', 'select', 'choose', 'combobox', 'upload'}
-                 or (verb == 'click' and allow_click)):
-        # A non-committing, unapproved click is refused on existing local
-        # guards and must not fetch stores merely to repeat that refusal.
-        tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
-        if greenhouse_alias_candidate(tracked.get('jd_url')):
-            # Direct calls cannot borrow a page URL as alias provenance.
-            raise Gate('This Greenhouse wrapper needs a verified alias context.')
     _inventory_ok(page, complete=False)
     if _formless_root(page) and isinstance(session, _EntrySession):
-        _formless_boundary(page, provenance)
-        if session.formless_identity != _root_identity(page):
-            raise Gate('formless root lacks stable independent admission.')
         check_form_destination(page, control(page, action, 'execute-formless'), provenance=provenance)
     target = control(page, action, 'execute-initial')
     question = label(target)
@@ -3860,7 +3832,8 @@ class ApplicationIPCController:
 
     def __init__(self, pk: str, company: str, url: str, resume_path: str,
                  facts: dict, filled: dict, history: list, step: dict,
-                 mark_click_started, *, fixture_context=None, seal_stage=False):
+                 mark_click_started, *, fixture_context=None, seal_stage=False,
+                 verified_redirect=None):
         import hashlib
         self.pk, self.company, self.url = pk, company, url
         self.protected_snapshot = bool(seal_stage)
@@ -3869,6 +3842,7 @@ class ApplicationIPCController:
         self.facts, self.filled, self.history = facts, filled, history
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
+        self.verified_redirect = verified_redirect
         self.upload_completed = False
         self.upload_attempted = False
         self.upload_identity = None
@@ -3899,8 +3873,17 @@ class ApplicationIPCController:
         return (_row(self.pk, fixture_context=self.fixture_context)
                 if self.fixture_context else _row(self.pk))
 
+    def _verified_redirect_url(self, url: str) -> bool:
+        proof = self.verified_redirect
+        return (isinstance(proof, VendorRedirectProvenance)
+                and proof.pk == self.pk and proof.company == self.company
+                and proof.wrapper == self.url
+                and _redirect_current(proof, fixture_context=self.fixture_context)
+                and redirect_provenance(self._row(), self.pk, proof.target_url) == proof
+                and navigation_allowed(url, provenance=proof))
+
     def _fresh_preparation(self, url: str) -> None:
-        if not _preparation_origin(url, self.url):
+        if not (_preparation_origin(url, self.url) or self._verified_redirect_url(url)):
             raise Gate('The page is not the tracked employer or an approved HTTPS ATS host.')
         _tracked_preparation_job(self.pk, self.company, self.url,
                                  fixture_context=self.fixture_context)
@@ -3981,7 +3964,8 @@ class ApplicationIPCController:
                 answer = str(self.facts.get(answer_key) or '').strip()
                 if (not answer or not _same(answer, option.get('label', ''))
                         or option.get('submit') or option.get('navigates')
-                        or option.get('safe') is not True):
+                        or option.get('safe') is not True
+                        or option.get('commits_application')):
                     raise Gate('This rendered ARIA option is not the safe approved choice.')
                 self._approved(page, owner, answer)
                 return True
@@ -4011,7 +3995,8 @@ class ApplicationIPCController:
             if len(args) != 2 or kwargs:
                 raise Gate('Unknown application navigation IPC arguments.')
             self._fresh_preparation(self.url)
-            if (not _preparation_origin(args[1], self.url)
+            if (not (_preparation_origin(args[1], self.url)
+                     or self._verified_redirect_url(args[1]))
                     or _committing_get_route(args[1])):
                 raise Gate('Unknown, executable or committing GET navigation is not preparation.')
             return
@@ -4053,7 +4038,8 @@ class ApplicationIPCController:
                     or not re.search(r'resume|résumé|cv', label(file_target), re.I)):
                 raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
             if (file_target.get('submit') is True or file_target.get('navigates') is True
-                    or file_target.get('formaction')):
+                    or file_target.get('formaction')
+                    or file_target.get('commits_application')):
                 raise Gate('A submission-capable upload receiver is not reversible preparation.')
             self.upload_identity = self._row_pdf()
             self.upload_attempted = True
@@ -4066,7 +4052,8 @@ class ApplicationIPCController:
                 raise Gate('A unique approved form value receiver is required.')
             target = targets[0]
             if (target.get('submit') is True or target.get('navigates') is True
-                    or target.get('formaction')):
+                    or target.get('formaction')
+                    or target.get('commits_application')):
                 raise Gate('A submission-capable data receiver is not reversible preparation.')
             if op == 'fill' and target.get('type') not in {
                     'text', 'email', 'tel', 'textarea', 'combobox'}:
@@ -4097,7 +4084,7 @@ class ApplicationIPCController:
         # Explicitly submitting/navigating choices are never ordinary selection
         # writes. They reach the single full guard rather than bypassing it by role.
         if (target.get('submit') is True or target.get('navigates') is True
-                or target.get('formaction')):
+                or target.get('formaction') or target.get('commits_application')):
             await self.authorize_final_submit(session, page, target)
             self.committed = True
             self.mark_click_started()
@@ -4181,7 +4168,8 @@ class ApplicationIPCController:
                            reason='defect_tenant')
             if not navigation_allowed(page['url'], provenance=fresh_alias):
                 raise Gate('Final form is on a different job/ATS tenant; no Submit.')
-        elif not navigation_allowed(page['url'], self.url):
+        elif not (navigation_allowed(page['url'], self.url)
+                  or self._verified_redirect_url(page['url'])):
             raise Gate('Final form is outside the tracked employer job origin.')
         if target.get('in_form'):
             # Multiple native Submit owners on one page are ambiguous final
@@ -4193,8 +4181,9 @@ class ApplicationIPCController:
             if not target.get('form_action'):
                 raise Gate('Final submit receiver is missing; inspect the form before Submit.')
             for receiver in (target.get('form_action'), target.get('formaction')):
-                if receiver and not navigation_allowed(
-                        receiver, self.url, provenance=fresh_alias):
+                if receiver and not (navigation_allowed(
+                        receiver, self.url, provenance=fresh_alias)
+                        or self._verified_redirect_url(receiver)):
                     raise Gate('Final submit receiver is outside the tracked job/ATS tenant; no Submit.')
         from core.ids import make_pk
         if (not isinstance(row.get('job_id'), str) or
@@ -4413,7 +4402,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     # A caller with a no-op binder has no committing authority.
                     controller = ApplicationIPCController(
                         pk, company, url, resume_path, facts, filled, history,
-                        step, mark_click_started, seal_stage=True)
+                        step, mark_click_started, seal_stage=True,
+                        verified_redirect=(provenance if isinstance(
+                            provenance, VendorRedirectProvenance) else None))
                     try:
                         raw_session.bind_application_controller(controller)
                         if getattr(raw_session, '_application_controller', None) is not controller:
@@ -4495,8 +4486,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                                             'quarantined_native_owners'}}
                     model_page = _guard_model_page(
                         model_page, pk, company, fixture_context=ctx)
+                    model_page, model_history = _model_projection(model_page, history)
                     action = await (ctx.decision if ctx else bsk.decision)(
-                        task + progress, model_page, history, model=model)
+                        task + progress, model_page, model_history, model=model)
                     verb = action.get('action')
                     if verb == 'click' and ctx is not None and action.get('selector'):
                         candidate = control(page, action, 'decision-initial')

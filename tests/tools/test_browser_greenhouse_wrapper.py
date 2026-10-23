@@ -10,6 +10,9 @@ from core.ids import make_pk
 from discovery.watchlist import CompanyConfig
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
+
+REAL_APPLICATION_SESSION = bsk.Session  # Capture before the offline fixture patches the constructor.
+
 from tools.claude_chrome import greenhouse_alias_candidate, verified_greenhouse_alias
 
 COMPANY = "example-co"
@@ -314,9 +317,9 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
 
     # Real application Session methods and raw IPC controller, with only
     # Chrome process/session setup and transport substituted by offline spies.
-    monkeypatch.setattr(bsk, "Session", bsk.Session)
-    monkeypatch.setattr(bsk.Session, "__aenter__", enter)
-    monkeypatch.setattr(bsk.Session, "__aexit__", exit)
+    monkeypatch.setattr(bsk, "Session", REAL_APPLICATION_SESSION)
+    monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aenter__", enter)
+    monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aexit__", exit)
     monkeypatch.setattr(bsk, "command", command)
     decisions = AsyncMock(side_effect=[
         {"action": "click", "selector": "#apply"},

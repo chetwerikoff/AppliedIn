@@ -160,6 +160,120 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     assert not transport._application_controller.committed
 
 
+def _hidden_enterprise_anchor():
+    # Scrubbed 256x60 enterprise-anchor shape, with no provider child reads.
+    return dict(frames=['R'], edit={
+        'rect': {'width': 256, 'height': 60, 'right': 256, 'bottom': 60},
+        'style': {'visibility': 'hidden', 'display': 'inline'},
+    })
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_hidden_enterprise_outside_ashby_structural_root_is_existing_r(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(root=False, formless=True, url=entry('ashby'),
+                    **_hidden_enterprise_anchor()), script)
+    assert page['entry']['root'] is None  # No native form is present.
+    assert page['entry']['formless']['root'] == '#application-root'
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'R'
+    assert frame['root'] == '#application-root' and frame['outside'] is True
+    assert frame['box'] == {'width': 256, 'height': 60}
+    assert frame['visibility'] == 'hidden' and frame['display'] == 'inline'
+    assert frame['origin'] == 'https://www.recaptcha.net'
+    assert frame['path'] == '/recaptcha/enterprise/anchor'
+    assert 'form_controls' not in frame
+    forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_hidden_enterprise_without_native_or_structural_root_still_gates(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(root=False, formless=True, missingPane=True, url=entry('ashby'),
+                    **_hidden_enterprise_anchor()), script)
+    assert page['entry']['root'] is None
+    assert page['entry']['formless']['root'] == ''
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'unknown'
+    assert frame['root'] == '' and frame['outside'] is False
+    assert frame['form_controls'] == 'unknown'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_hidden_enterprise_inside_existing_ashby_structural_root_still_gates(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    opener = '(() => {\n'
+    assert script.startswith(opener)
+    # Reparent only the synthetic iframe inside the container. The real
+    # reader still resolves the same complete three-child structural root.
+    script = script.replace(opener, opener + """
+  const anchor = document.querySelector('iframe');
+  const container = document.querySelector('.ashby-application-form-container');
+  const siblings = anchor.parentElement.children;
+  siblings.splice(siblings.indexOf(anchor), 1);
+  anchor.parentElement = container;
+  container.children.push(anchor);
+""", 1)
+    page = dom(dict(root=False, formless=True, url=entry('ashby'),
+                    **_hidden_enterprise_anchor()), script)
+    assert page['entry']['formless']['root'] == '#application-root'
+    frame = page['entry']['frames'][0]
+    assert frame['root'] == '#application-root' and frame['outside'] is False
+    assert frame['status'] == 'unknown'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_non_ashby_formless_lookalike_cannot_borrow_hidden_r_fallback(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(root=False, formless=True, url=entry('lever'),
+                    **_hidden_enterprise_anchor()), script)
+    assert page['entry']['root'] is None
+    assert page['entry']['formless']['root'] == '#application-root'
+    frame = page['entry']['frames'][0]
+    assert frame['root'] == '#application-root' and frame['outside'] is True
+    assert frame['status'] == 'unknown'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda url: url == entry('lever'), None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('edit', [
+    {'src': 'https://www.recaptcha.net/recaptcha/api2/anchor'},
+    {'src': 'https://widgets.example.test/recaptcha/enterprise/anchor'},
+    {'style': {'visibility': 'visible', 'display': 'inline'}},
+])
+def test_ashby_structural_hidden_r_keeps_provider_path_and_visibility_rules(reader, edit):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    spec = _hidden_enterprise_anchor()
+    spec['edit'].update(edit)
+    page = dom(dict(root=False, formless=True, url=entry('ashby'), **spec), script)
+    assert page['entry']['formless']['root'] == '#application-root'
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_ashby_hidden_r_does_not_hide_other_frames_or_visible_challenge(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(root=False, formless=True, url=entry('ashby'), sibling=True,
+                    **_hidden_enterprise_anchor()), script)
+    assert [f['status'] for f in page['entry']['frames']] == ['R', 'unknown']
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+
+    shown = dom(dict(root=False, formless=True, url=entry('ashby'),
+                     frames=['B', 'R'], visible=True), script)
+    assert [f['status'] for f in shown['entry']['frames']] == [
+        'visible-recaptcha', 'unknown']
+    with pytest.raises(forms.CaptchaGate, match='visible reCAPTCHA Enterprise challenge'):
+        forms._entry_safety(shown, lambda url: url == entry('ashby'), None)
+
+
 def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     page, fixed = observed()
     assert page['entry'] == fixed['entry']

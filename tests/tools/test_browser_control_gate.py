@@ -86,15 +86,30 @@ def test_success_keeps_original_control_object_and_exact_raw_selector():
 
 
 def test_external_two_argument_helper_stays_safe_without_legacy_call_sites():
-    # These modules no longer call control() directly. A source-only census
-    # cannot require retired callers to exist merely to pin API compatibility.
+    # Discovery intentionally uses the two-argument public helper inside
+    # _crawl. The sealed fixture has no direct control-resolution call site.
     for module in (bsk, fixture):
         source = Path(inspect.getsourcefile(module)).read_text()
         tree = ast.parse(source)
         sites = [call for call in ast.walk(tree)
                  if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                  and call.func.id == 'control']
-        assert sites == []
+        if module is bsk:
+            crawls = [node for node in ast.walk(tree)
+                      if isinstance(node, ast.AsyncFunctionDef)
+                      and node.name == '_crawl']
+            assert len(crawls) == 1 and len(sites) == 1
+            call = sites[0]
+            assert len(call.args) == 2 and not call.keywords
+            assert [arg.id if isinstance(arg, ast.Name) else None
+                    for arg in call.args] == ['page', 'action']
+            assert any(isinstance(node, ast.Assign) and node.value is call
+                       and len(node.targets) == 1
+                       and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id == 'target'
+                       for node in ast.walk(crawls[0]))
+        else:
+            assert sites == []
     # The same public helper still resolves and refuses with two arguments.
     target = {'selector': 'button', 'disabled': False}
     assert forms.control({'controls': [target]}, {'selector': 'button'}) is target

@@ -653,7 +653,9 @@ async def test_upload_requires_independent_fixed_readback(monkeypatch):
                             provenance=provenance)
     assert clock.now == 8.0 and clock.steps == [0.25] * 32
     assert session.formless_identity == identity and session.upload_result is None
-    assert not session.upload_pending and session.submit_authorized is False
+    # The fixed reader never confirmed the staged file: a timeout has no
+    # attachment receipt, and cannot create a submitting IPC permission.
+    assert not session.upload_pending and session.upload_result is None
     assert len([c for c in raw.calls if c[0] == 'upload']) == 1
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 

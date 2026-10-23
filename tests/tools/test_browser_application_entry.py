@@ -851,6 +851,122 @@ def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader,
             assert foreign['form_action_raw'] != entry(ats)
 
 
+def _dom_with_readable_child(spec, script):
+    """Inject a synthetic child into the existing offline fixture in memory.
+
+    The ordinary fixture deliberately refuses child-document reads. Its file
+    remains unchanged; only this test process substitutes that getter.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text(encoding='utf-8')
+    guard = "  Object.defineProperty(e,'contentDocument',{get:()=>{throw Error('CHILD FRAME READ');}});"
+    getter = r"""  Object.defineProperty(e,'contentDocument',{get:()=>{
+    const child=spec.child;
+    if (!child) throw Error('CHILD FRAME READ');
+    const control={tagName:child.control==='button'?'BUTTON':'DIV',
+      shadowRoot:null,attributes:[]};
+    const found=q=>{
+      const selectors=q.split(',').map(s=>s.trim());
+      return child.control==='button' ? selectors.includes('button') :
+        child.control==='role-button' ?
+          selectors.includes('[role="button"]') || selectors.includes('[role]') : false;
+    };
+    return {URL:child.url,readyState:child.readyState,
+      querySelector:q=>found(q) ? control : null,
+      querySelectorAll:q=>q==='*' && child.control!=='none' ? [control] : []};
+  }});"""
+    assert fixture.count(guard) == 1
+    result = subprocess.run(
+        ['node', '-e', fixture.replace(guard, getter), 'fixture',
+         json.dumps(spec), script],
+        capture_output=True, text=True, check=True)
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_unknown_frame_role_button_is_a_form_control(reader):
+    # A complete, current child containing only div[role=button] is not empty.
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    url = 'https://widgets.example.test/embed/frame'
+    page = _dom_with_readable_child(
+        {'frames': ['R'], 'edit': {'src': url},
+         'child': {'url': url, 'readyState': 'complete', 'control': 'role-button'}},
+        script)
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'unknown'
+    assert frame['form_controls'] == 'yes'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        forms._entry_safety(page, lambda _url: True, None)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('child_url,control,ready_state', [
+    ('about:blank', 'none', 'complete'),
+    ('https://widgets.example.test/embed/previous', 'button', 'complete'),
+    ('https://widgets.example.test/embed/frame', 'button', 'loading'),
+])
+def test_unknown_frame_stale_or_incomplete_child_is_unknown(reader, child_url, control, ready_state):
+    # A previous empty or actionable child, or one still loading, is not
+    # evidence about this frame's current source.
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = _dom_with_readable_child(
+        {'frames': ['R'], 'edit': {'src': 'https://widgets.example.test/embed/frame'},
+         'child': {'url': child_url, 'readyState': ready_state, 'control': control}},
+        script)
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    assert page['entry']['frames'][0]['form_controls'] == 'unknown'
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('control,expected', [('button', 'yes'), ('none', 'no')])
+def test_unknown_frame_matching_complete_child_controls(reader, control, expected):
+    # A matching, complete child still provides justified yes or no evidence.
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    url = 'https://widgets.example.test/embed/frame'
+    page = _dom_with_readable_child(
+        {'frames': ['R'], 'edit': {'src': url},
+         'child': {'url': url, 'readyState': 'complete', 'control': control}},
+        script)
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    assert page['entry']['frames'][0]['form_controls'] == expected
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_relative_unknown_frame_src_is_diagnostic_only(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom({'url': entry('ashby'), 'frames': ['R'],
+                'edit': {'src': '/embed/frame?account=private-token#fragment'}}, script)
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'unknown'
+    assert frame['origin'] == 'https://jobs.ashbyhq.com'
+    assert frame['path'] == '/embed/frame'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame') as error:
+        forms._entry_safety(page, lambda u: u == entry('ashby'), None)
+    detail = str(error.value)
+    assert 'origin=https://jobs.ashbyhq.com path=/embed/frame' in detail
+    for secret in ('account', 'private-token', 'fragment', '?', '#'):
+        assert secret not in detail
+
+
+@pytest.mark.parametrize('host', [
+    'candidatealias.example.test', 'alphatoken.example.test', 'tenant123.example.test',
+])
+def test_unknown_frame_all_letter_and_numeric_hostname_redaction(host):
+    page = dom({'frames': ['R'],
+                'edit': {'src': f'https://{host}/frame/private-token?key=secret#fragment'}})
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame') as error:
+        forms._entry_safety(page, lambda _url: True, None)
+    detail = str(error.value)
+    assert 'origin=https://[redacted].[redacted].[redacted]' in detail
+    assert 'path=/frame/[redacted]' in detail
+    for secret in (*host.split('.'), 'private-token', 'key', 'secret', 'fragment', '?', '#'):
+        assert secret not in detail
+
+
 async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(monkeypatch):
     # The parent-only synthetic fixture makes every child document unreadable.
     # The entry guard must not invent a 'no controls' conclusion for any frame.
@@ -867,7 +983,7 @@ async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(
         forms._entry_safety(page, lambda url: url == entry('ashby'), None)
     detail = str(error.value)
     for i in range(1, 5):
-        assert f'frame[{i}] origin=https://widgets.example-co.test' in detail
+        assert f'frame[{i}] origin=https://[redacted].[redacted].[redacted]' in detail
     assert detail.count('path=/frame/[redacted]') == 4
     assert detail.count('source_kind=url') == 4
     assert detail.count('form_controls=unknown') == 4
@@ -877,7 +993,7 @@ async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(
     assert 'visibility=visible display=block' in detail
     for dimensions in ('100x30', '236x48', '1x1'):
         assert f'box={dimensions}' in detail
-    for secret in (private_segment, 'access_token', 'do-not-print', 'fragment', '?', '#'):
+    for secret in (private_segment, 'widgets', 'example-co', 'access_token', 'do-not-print', 'fragment', '?', '#'):
         assert secret not in detail
 
     _, _, session, decision = world(monkeypatch, 'ashby', [page])

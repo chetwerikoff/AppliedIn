@@ -637,8 +637,14 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
   };
   const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
     const raw = e.getAttribute('src');
-    let origin='', path='';
+    let origin='', path='', diagnosticOrigin='', diagnosticPath='';
+    // Absolute-only H/R/W/X/Z classifier inputs are unchanged. Resolve
+    // relative sources only for the parent-page diagnostic metadata.
     try { if (raw!==null) { const u=new URL(raw); origin=u.origin; path=u.pathname; } } catch (_) {}
+    try { if (raw!==null) {
+      const u=new URL(raw, document.baseURI);
+      diagnosticOrigin=u.origin; diagnosticPath=u.pathname;
+    }} catch (_) {}
     const style=getComputedStyle(e), hidden=style.visibility==='hidden' || style.display==='none';
     const shown=style.visibility==='visible' && style.display!=='none';
     const outside=!!root && !root.contains(e), box=rectOf(e);
@@ -680,23 +686,38 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';
-    // A child frame is often cross-origin. Inspect structural controls only
-    // when readable; never infer absence from an opaque or incomplete document.
+    // A stale complete child (including about:blank) can outlive a src
+    // change. Check full URLs internally, but export no URL payload or DOM.
     let formControls='unknown';
     if (!['H','R','W','X','Z'].includes(status)) try {
       const child=e.contentDocument;
-      if (child) {
-        if (child.querySelector('input,textarea,select,button,[role="textbox"],' +
-            '[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable]'))
+      let current=false;
+      if (child && raw!==null && !e.hasAttribute('srcdoc') &&
+          typeof child.URL==='string' && child.URL) {
+        try {
+          current=new URL(raw, document.baseURI).href===new URL(child.URL).href;
+        } catch (_) {}
+      }
+      if (current && child.readyState==='complete') {
+        if (child.querySelector('input,textarea,select,button,[role="button"],' +
+            '[role="textbox"],[role="searchbox"],[role="combobox"],' +
+            '[role="checkbox"],[role="radio"],[role="switch"],' +
+            '[role="slider"],[role="spinbutton"],[role="listbox"],' +
+            '[role="option"],[role="menuitem"],[role="menuitemcheckbox"],' +
+            '[role="menuitemradio"],[contenteditable]'))
           formControls='yes';
-        else if (child.readyState==='complete' && !child.querySelector('iframe,object,embed')) {
+        else if (!child.querySelector('iframe,object,embed,form,[role],[tabindex],' +
+            'a[href],area[href],summary,details,audio[controls],video[controls]')) {
           const descendants=child.querySelectorAll('*');
           if (descendants.length<=1024 && !Array.from(descendants).some(n =>
-              n.shadowRoot || n.tagName.includes('-'))) formControls='no';
+              n.shadowRoot || n.tagName.includes('-') ||
+              Array.from(n.attributes || []).some(a => /^on/i.test(a.name))))
+            formControls='no';
         }
       }
     } catch (_) {}
-    return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
+    return {selector:selector(e),origin:diagnosticOrigin || origin,
+      path:diagnosticPath || path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
       box,badge,bounds,status,

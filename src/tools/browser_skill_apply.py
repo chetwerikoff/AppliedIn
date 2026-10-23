@@ -1830,6 +1830,12 @@ def _upload_delta(before, after, filename):
 
 # Keep unknown iframe diagnostics structural and free of URL payloads.
 # Each other path component may be a posting/account identifier or token.
+# Exact known-safe public provider hosts, never tenant-controlled suffixes.
+_FRAME_SAFE_ORIGIN_HOSTS = frozenset({
+    'newassets.hcaptcha.com', 'www.recaptcha.net', 'www.google.com',
+    'jobs.ashbyhq.com', 'jobs.lever.co',
+})
+
 _FRAME_PATH_WORDS = frozenset({
     'recaptcha', 'enterprise', 'anchor', 'bframe', 'api2', 'captcha',
     'static', 'hcaptcha-enclave.html', 'embed', 'iframe', 'frame',
@@ -1858,10 +1864,10 @@ def _unknown_frame_details(frames, provenance):
                     or parsed.path or parsed.query or parsed.fragment
                     or any(not _DNS_LABEL.fullmatch(label) for label in host.split('.'))):
                 return 'unknown'
-            # Preserve the origin's host shape, but not identifier-like labels.
-            labels = [label if len(label) <= 24 and not any(c.isdigit() for c in label)
-                      else '[redacted]' for label in host.split('.')]
-            return 'https://' + '.'.join(labels)
+            # An all-letter label may also be a tenant, account or token.
+            if host in _FRAME_SAFE_ORIGIN_HOSTS:
+                return 'https://' + host
+            return 'https://' + '.'.join('[redacted]' for _ in host.split('.'))
         except (ValueError, AttributeError):
             return 'unknown'
 

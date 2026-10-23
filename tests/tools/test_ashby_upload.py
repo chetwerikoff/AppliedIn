@@ -99,7 +99,8 @@ async def test_exact_default_upload_and_bounded_settle(monkeypatch, unchanged):
     assert not any(c['selector'].startswith('#delete') for c in page['controls'])
     assert sum(forms.is_submission(c) for c in page['controls']) == 1
     assert len(forms._formless_boundary(page, session.provenance)) == 4
-    assert not session.submit_authorized
+    assert session.upload_attempted and session.upload_result is not None
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
     with pytest.raises(forms.Gate, match='one exact default'):
         await upload(session)
     assert len(raw.mutations) == 1
@@ -128,7 +129,8 @@ async def test_chooser_fakepath_only_exempts_verified_resume_value(monkeypatch, 
         assert current['value'] == r'C:\fakepath\Resume.pdf'
         assert current['has_value'] is True and current['files'] == ['Resume.pdf']
         assert session.formless_identity == forms._root_identity(page)
-        assert not session.submit_authorized
+        assert session.upload_attempted and session.upload_result is not None
+        assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
     assert len(raw.mutations) == 1
 
 
@@ -457,7 +459,9 @@ async def _filename_case(monkeypatch, attrs=None, count=1, accepted=False):
             await upload(session)
         assert session.formless_identity == identity
     assert len(raw.mutations) == 1
-    assert not session.submit_authorized
+    assert not session.upload_pending and session.upload_attempted
+    assert (session.upload_result is not None) is accepted
+    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
 
 async def test_ashby_filename_one_passive_svg_plus_span_passes(monkeypatch):
@@ -568,7 +572,7 @@ async def test_one_entry_split_then_opaque_agreement_then_exact_attachment(monke
     assert forms._upload_delta(before, session.upload_result, 'Resume.pdf') is True
     assert session.upload_result['entry']['upload_tree']['attached'] is True
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
-    assert not session.upload_pending and not session.submit_authorized
+    assert not session.upload_pending and session.upload_attempted
 
 
 async def test_persistent_benign_entry_split_hits_original_eight_second_deadline(
@@ -582,7 +586,7 @@ async def test_persistent_benign_entry_split_hits_original_eight_second_deadline
     assert upload_clock.now == 8.0 and upload_clock.steps == [0.25] * 32
     assert raw.post_pairs == 32 and len(raw.mutations) == 1
     assert session.formless_identity == identity and session.upload_result is None
-    assert not session.upload_pending and not session.submit_authorized
+    assert not session.upload_pending and session.upload_attempted
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
 
@@ -639,7 +643,7 @@ async def test_entry_split_never_masks_one_sided_definitive_gate(
     assert raw.post_pairs == 1 and upload_clock.steps == []
     assert len(raw.mutations) == 1
     assert session.formless_identity == identity and session.upload_result is None
-    assert not session.upload_pending and not session.submit_authorized
+    assert not session.upload_pending and session.upload_attempted
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
     if drift.endswith('root'):
         page['entry']['formless']['root'] = '#changed-application-root'
@@ -661,5 +665,5 @@ async def test_entry_split_never_masks_one_sided_definitive_gate(
     assert raw.post_pairs == 1 and upload_clock.steps == []
     assert len(raw.mutations) == 1
     assert session.formless_identity == identity and session.upload_result is None
-    assert not session.upload_pending and not session.submit_authorized
+    assert not session.upload_pending and session.upload_attempted
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)

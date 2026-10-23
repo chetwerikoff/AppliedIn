@@ -851,7 +851,6 @@ def test_shared_page_and_fixed_readers_observe_host_scoped_native_action(reader,
             assert foreign['form_action_raw'] != entry(ats)
 
 
-
 async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(monkeypatch):
     # The parent-only synthetic fixture makes every child document unreadable.
     # The entry guard must not invent a 'no controls' conclusion for any frame.
@@ -887,7 +886,6 @@ async def test_multiple_unknown_frames_report_safe_structure_before_field_entry(
     assert detail in result['question']
     assert decision.await_count == 0
     no_mutations(session)
-
 
 
 @pytest.mark.parametrize('reader', ['page', 'witness'])

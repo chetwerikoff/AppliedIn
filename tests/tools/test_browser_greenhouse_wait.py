@@ -299,13 +299,19 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
         await wait(scoped)
         assert len(raw.reads) >= 8
         if predicate not in RETIRED_COMBOBOX_STEP_PREDICATES:
-            # Retained readiness witnesses still have a fatal inverse.
-            monkeypatch.setattr(
-                forms, '_GREENHOUSE_READINESS_PREDICATES', set(RETRY)-{predicate})
-            raw = Raw(deepcopy(baseline), change)
-            scoped = session(raw)
-            with pytest.raises(forms.Gate, match='predicate='+predicate.replace('.', r'\.')):
-                await wait(scoped)
+            # The catalog was removed: a permanent PAGE/fixed disagreement
+            # must still consume only the read-only budget, never grant IPC.
+            async def persistent(index, kind, value):
+                if predicate == 'inventory.identity.equal' and kind == 'page' and index % 3 == 2:
+                    value['controls'][0]['label'] = 'Changed question'
+                elif kind == 'witness':
+                    value = drift(predicate, permanent.current, value)
+                return value
+            permanent = Raw(deepcopy(baseline), persistent)
+            with pytest.raises(forms.Gate, match='after bounded wait'):
+                await wait(session(permanent), .02)
+            assert len(permanent.reads) >= 2
+            assert all(kind in {'page', 'witness'} for kind in permanent.reads)
         # Retired shape/phase predicates are not per-step human gates. Their
         # missing form-own receiver is refused by the final Submit guard.
     elif predicate in OBSERVATIONAL:
@@ -351,9 +357,25 @@ def test_absent_hidden_form_receiver_is_a_final_submit_negative():
             uploaded=True)
 
 
-async def test_allowlist_is_closed_and_exact():
-    assert forms._GREENHOUSE_READINESS_PREDICATES == set(RETRY)
-    assert not (forms._GREENHOUSE_READINESS_PREDICATES & set(FATAL))
+@pytest.mark.parametrize('fault', [
+    'unverified', 'truncated', 'opaque', 'shadow', 'frame',
+])
+def test_final_submit_refuses_incomplete_inventory_without_legacy_readiness_catalog(fault):
+    current = combo_page()
+    if fault == 'unverified':
+        current['inventory_verified'] = False
+    elif fault == 'truncated':
+        current['truncated'] = True
+    elif fault == 'opaque':
+        current['opaque_controls'] = True
+    elif fault == 'shadow':
+        current['shadow_roots'] = True
+    else:
+        current['unsupported_frames'] = ['synthetic-frame']
+    # A qualifying observed prefix is not a certificate for the unobserved
+    # remainder. This is the real final form guard, not a mutable pre-step list.
+    with pytest.raises(forms.Gate, match='incomplete|uninspectable'):
+        forms.check_form(current, {}, uploaded=True)
 
 
 async def test_null_multiple_root_never_admits_and_times_out(fast):

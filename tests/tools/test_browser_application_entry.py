@@ -363,7 +363,8 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     # The same-host receiver remains observable during preparation. Both ATS
     # paths must refuse the foreign *final* receiver before any Submit IPC.
     assert report.get('form_question') is None
-    assert decide.await_count == (0 if ats == 'ashby' else 1)
+    # A model finish decision is a reversible review outcome, not Submit.
+    assert decide.await_count == 1
     guard = forms.ApplicationIPCController(
         PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
     with pytest.raises(forms.Gate, match='Final submit receiver'):
@@ -1275,9 +1276,8 @@ async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw
     # Raw action attributes remain independently absent/empty above. The
     # removed pre-step native certificate is not the submission authority.
     assert result['form_question'] is None
-    assert ('after bounded wait' in result['question']
-            or 'not been submitted' in result['question'])
-    assert not decide.await_count
+    assert 'not been submitted' in result['question']
+    assert decide.await_count == 1
     no_mutations(raw)
 
 
@@ -1352,9 +1352,8 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # retired. None of these contradictory observed roots can be treated as
         # an approved final application or trigger a writing IPC.
         assert result['form_question'] is None
-        assert ('after bounded wait' in result['question']
-                or 'not been submitted' in result['question'])
-        assert not decide.await_count
+        assert 'not been submitted' in result['question']
+        assert decide.await_count == 1
     no_mutations(raw)
 
 

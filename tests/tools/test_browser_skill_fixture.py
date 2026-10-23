@@ -1035,7 +1035,11 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                and report['submit']['call_entered'] is False
                and report['submit']['ipc_returned'] is False
                and report['submit']['post_attempts'] == 0
-               for report in reports[:-1])
+               for report in reports[:-1]), [
+        (report['scenario'], report.get('variant'), report['status'],
+         report['submitted'], report['applicant_ipc'], report['submit'])
+        for report in reports[:-1]
+    ]
     # The aggregate summary has safe_gate/legs, not a submitted attribute;
     # the nine per-session reports carry the actual Submit IPC observations.
     assert reports[-1]['safe_gate'] is False

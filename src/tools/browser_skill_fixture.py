@@ -828,6 +828,14 @@ class _SyntheticRun:
                     if state.navigations:
                         raise PermissionError('Fixture permits only one navigation IPC.')
                     state.navigations += 1
+                    # The production raw apply Session is intentionally read-only.
+                    # Only this daemon-minted, exact loopback fixture GET can use
+                    # the CLI directly; real application IPC remains producer-guarded.
+                    from tools.browser_skill import Session as BrowserSkillSession, command
+                    if type(raw) is BrowserSkillSession:
+                        if raw.kind != 'apply' or not raw.id or not authorized(state, url=URL):
+                            raise PermissionError('Synthetic fixture session authority expired.')
+                        return await command('navigate', URL, '--session', raw.id)
                     return await raw.call(*args)
                 if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")
@@ -946,9 +954,9 @@ class _SyntheticRun:
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
                 if args[0] == 'upload':
-                    if state.ashby_upload_transient:
-                        state.upload_before_tree = deepcopy(
-                            (state.last_page or {}).get('entry', {}).get('upload_tree'))
+                    if (state.ashby_upload_transient
+                            and not isinstance(state.upload_before_tree, dict)):
+                        raise PermissionError('No independent pre-upload structural witness.')
                     state.upload_ipc += 1
                 await raw.call(*args, **kwargs)
                 if state.greenhouse and args[0] == 'click' and args[1] in _OPTION_SELECTORS:
@@ -1089,14 +1097,39 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 phone = [c for c in (state.last_page or {}).get('controls', [])
                          if c.get('selector') == '#phone']
                 phone_ok = len(phone)==1 and phone[0].get('value')==_FACTS['Phone']
-                from tools.browser_skill_apply import _check_closed_commit, control, Gate
-                receipt_ok = len(state.widget_receipts) == 5
-                try:
-                    for receipt in state.widget_receipts:
-                        _check_closed_commit(control(state.last_page, receipt),
-                                             receipt['approved_value'], receipt)
-                except Gate:
-                    receipt_ok = False
+                from tools.browser_skill_apply import check_form, Gate
+                # Old C0/C2 receipts cannot authorize a selected form value.
+                # Verify the four form-owned choice receivers from the *current*
+                # page through the production final-form checker. This isolated
+                # choice check does not assert the whole incomplete form is ready.
+                choice_selectors = set(_COMBO_SELECTORS.values())
+                receiver_selectors = set(_HIDDEN_SELECTORS.values())
+                choices = [c for c in (state.last_page or {}).get('controls', [])
+                           if c.get('selector') in choice_selectors | receiver_selectors]
+                receipts = state.widget_receipts
+                receipt_ok = (
+                    len(receipts) == len(_CHOICE_SELECTORS)
+                    and {r.get('selector') for r in receipts}
+                        == set(_CHOICE_SELECTORS.values())
+                    and all(any(r.get('action') == 'combobox'
+                                and r.get('selector') == selector
+                                and r.get('approved_value') == _FACTS[key]
+                                for r in receipts)
+                            for key, selector in _CHOICE_SELECTORS.items())
+                    and len(choices) == 2 * len(_COMBO_SELECTORS)
+                    and (state.last_page or {}).get('inventory_verified') is True
+                    and (state.last_page or {}).get('opaque_controls') is False
+                )
+                if receipt_ok:
+                    try:
+                        check_form(
+                            {'controls': choices, 'inventory_verified': True,
+                             'opaque_controls': False},
+                            {selector: _FACTS[key]
+                             for key, selector in _COMBO_SELECTORS.items()},
+                            uploaded=True)
+                    except Gate:
+                        receipt_ok = False
                 ok = (result.get("status") == "gate"
                       and (state.visible_badge_anchor == 'PASS' if greenhouse else state.entry_wait == 'PASS')
                       and (not greenhouse or state.native_validity == dict.fromkeys(_CHOICE_SELECTORS.values(), True))
@@ -1106,15 +1139,11 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                       and state.committed == expected_commits
                       and phone_ok
                       and receipt_ok
-                      and state.combo_observations['Country']['outcome'] == 'committed'
-                      and (not greenhouse or (
-                          isinstance(state.country_choice_inventory, dict)
-                          and state.country_choice_inventory.get('verified') is True
-                          and state.country_choice_inventory.get('country_phase') == 'C2'
-                          and state.country_choice_inventory.get('location_phase') == 'C2'
-                          and state.country_choice_inventory.get('country_selected') == _FACTS['Country']
-                          and state.country_choice_inventory.get('location_selected')
-                              == _FACTS['Where are you located?']))
+                      # ID-less Greenhouse Country selection has no form-owned
+                      # receiver. Never report it as committed from CSS alone.
+                      and state.combo_observations['Country']['outcome'] != 'committed'
+                      and (not greenhouse or state.country_choice_inventory is None
+                           or state.country_choice_inventory.get('verified') is False)
                       and state.ipc_index == len(state._positive_ipc())
                       and state.last_page.get('inventory_verified') is True
                       and state.last_page.get('opaque_controls') is False
@@ -1236,10 +1265,17 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                           and state.post_attempts == state.post_count == 0
                           and (state.last_page or {}).get('inventory_verified') is True)
                     if state.ashby_upload_unwrap:
-                        from tools.browser_skill_apply import _upload_shape
-                        pre_spans = sum(n[1] == 'span' for n in _upload_shape(state.upload_before_tree))
-                        post_spans = sum(n[1] == 'span' for n in _upload_shape(tree, tree.get('items', [])))
-                        ok = ok and pre_spans == post_spans + 1
+                        # A missing read or failed upload must report an unsafe
+                        # leg, never crash into an unstructured Python traceback.
+                        if not isinstance(state.upload_before_tree, dict):
+                            ok = False
+                        else:
+                            from tools.browser_skill_apply import _upload_shape
+                            pre_spans = sum(n[1] == 'span'
+                                            for n in _upload_shape(state.upload_before_tree))
+                            post_spans = sum(n[1] == 'span'
+                                             for n in _upload_shape(tree, tree.get('items', [])))
+                            ok = ok and pre_spans == post_spans + 1
                     if state.ashby_upload_transient:
                         pairs = state.upload_pair_trace
                         ok = (ok and len(pairs) >= 3

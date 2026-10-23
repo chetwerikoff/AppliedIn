@@ -85,16 +85,32 @@ def test_success_keeps_original_control_object_and_exact_raw_selector():
     assert caught.value.diagnostics['selector'] == '[redacted]'
 
 
-def test_external_callers_still_compile_with_exactly_two_arguments():
-    # These read-only modules remain outside #105's editable roots.
+def test_external_two_argument_helper_stays_safe_without_legacy_call_sites():
+    # Discovery intentionally uses the two-argument public helper inside
+    # _crawl. The sealed fixture has no direct control-resolution call site.
     for module in (bsk, fixture):
         source = Path(inspect.getsourcefile(module)).read_text()
         tree = ast.parse(source)
         sites = [call for call in ast.walk(tree)
                  if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                  and call.func.id == 'control']
-        assert any(len(call.args) == 2 and not call.keywords for call in sites)
-    # The same helper both resolves and refuses without a third argument.
+        if module is bsk:
+            crawls = [node for node in ast.walk(tree)
+                      if isinstance(node, ast.AsyncFunctionDef)
+                      and node.name == '_crawl']
+            assert len(crawls) == 1 and len(sites) == 1
+            call = sites[0]
+            assert len(call.args) == 2 and not call.keywords
+            assert [arg.id if isinstance(arg, ast.Name) else None
+                    for arg in call.args] == ['page', 'action']
+            assert any(isinstance(node, ast.Assign) and node.value is call
+                       and len(node.targets) == 1
+                       and isinstance(node.targets[0], ast.Name)
+                       and node.targets[0].id == 'target'
+                       for node in ast.walk(crawls[0]))
+        else:
+            assert sites == []
+    # The same public helper still resolves and refuses with two arguments.
     target = {'selector': 'button', 'disabled': False}
     assert forms.control({'controls': [target]}, {'selector': 'button'}) is target
     for controls in ([], [target, target], [{**target, 'disabled': True}]):
@@ -102,19 +118,23 @@ def test_external_callers_still_compile_with_exactly_two_arguments():
             forms.control({'controls': controls}, {'selector': 'button'})
 
 
-def test_all_twenty_two_in_file_call_sites_are_fixed_and_distinct():
+def test_all_nineteen_current_control_call_sites_keep_named_provenance():
     source = inspect.getsource(forms)
     tree = ast.parse(source)
     sites = [call for call in ast.walk(tree)
              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
              and call.func.id == 'control']
-    assert len(sites) == 22
+    # Nineteen resolution call sites remain across raw/preparation/final.
+    # Two initial-decision branches share the same code-owned diagnostic tag.
+    assert len(sites) == 19
     assert all(len(call.args) == 3 and not call.keywords
                and isinstance(call.args[2], ast.Constant)
                and isinstance(call.args[2].value, str)
                for call in sites)
     tags = [call.args[2].value for call in sites]
-    assert len(set(tags)) == 22
+    assert len(set(tags)) == 18
+    assert tags.count('decision-initial') == 2
+    assert all(tags.count(tag) == 1 for tag in set(tags) - {'decision-initial'})
     assert all(0 < len(tag) <= 32 for tag in tags)
     assert set(tags) == forms._CONTROL_CALLERS - {'external'}
 
@@ -226,8 +246,14 @@ async def _synthetic_preaction_apply(monkeypatch, selector):
               'question': QUESTION_SECRET, 'fact': 'Synthetic Answer',
               'resume_path': PATH_SECRET}
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **k: None)
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'human_approved_answers': {'Synthetic Answer': {'value': ANSWER_SECRET}}})
+    # The current preparation admission checks the exact tracked job identity
+    # before reaching the control resolver. Keep this fixture synthetic but
+    # canonical so its negative proves the intended zero-IPC control Gate.
+    tracked = {'pk': PK, 'company': 'example-co', 'job_id': 'synthetic',
+               'jd_url': URL, 'status': 'submitting', 'ats': '',
+               'human_approved_answers': {
+                   'Synthetic Answer': {'value': ANSWER_SECRET}}}
+    monkeypatch.setattr(forms, '_row', lambda pk: tracked if pk == PK else {})
     monkeypatch.setattr(forms, '_bootstrap', bootstrap)
     monkeypatch.setattr(bsk, 'Session', Session)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value=action))

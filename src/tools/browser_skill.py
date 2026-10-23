@@ -159,6 +159,31 @@ class Session:
         self.kind = kind
         self.id = ""
         self.owner = None
+        self._application_controller = None
+
+    def bind_application_controller(self, controller):
+        """Bind once to the actual application controller; raw calls gain no authority."""
+        from tools.browser_skill_apply import ApplicationIPCController
+        if (self.kind != "apply" or self._application_controller is not None
+                or not isinstance(controller, ApplicationIPCController)):
+            raise Unavailable("Application IPC controller binding refused.")
+        self._application_controller = controller
+
+    async def application_effect(self, *args, **kwargs):
+        """The only application mutating transport, with fresh producer-side checks."""
+        if self.kind != "apply" or self._application_controller is None:
+            raise Unavailable("Unmediated application IPC is forbidden.")
+        await self._application_controller.before_ipc(self, args, kwargs)
+        succeeded = False
+        try:
+            result = await command(*args, "--session", self.id, **kwargs)
+            succeeded = True
+            return result
+        finally:
+            # Stable local PDF bytes alone cannot prove an interrupted upload
+            # completed. The final guard cannot accept a failed CLI transfer.
+            await self._application_controller.after_ipc(
+                self, args, kwargs, succeeded=succeeded)
 
     async def __aenter__(self):
         from tools.browser_runtime import configuration
@@ -189,12 +214,16 @@ class Session:
             raise
 
     async def close(self):
-        if self.id:
-            try:
-                await command("session", "stop", self.id, timeout=15)
-            except (Unavailable, TimeoutError, OSError):
-                log.warning("BrowserSkill session cleanup unavailable (session=%s)", self.id)
-            self.id = ""
+        try:
+            if self.id:
+                try:
+                    await command("session", "stop", self.id, timeout=15)
+                except (Unavailable, TimeoutError, OSError):
+                    log.warning("BrowserSkill session cleanup unavailable (session=%s)", self.id)
+                self.id = ""
+        finally:
+            if self.kind == "apply" and self._application_controller is not None:
+                self._application_controller.release_snapshot()
 
     async def __aexit__(self, *args):
         try:
@@ -203,6 +232,21 @@ class Session:
             _LIVE.pop(id(self.owner), None)
 
     async def call(self, *args, **kwargs):
+        if self.kind == "apply":
+            # At this privileged producer even an otherwise authenticated raw
+            # click or executable evaluation must have zero CLI effect. Only
+            # fixed code-owned observation scripts are harmless raw reads.
+            from tools.browser_skill_dom import PAGE, ENTRY_PAGE, GREENHOUSE_PAGE
+            from tools.browser_skill_apply import (
+                _FIXED_CONTROL_WITNESS, _ENTRY_FIXED_CONTROL_WITNESS,
+                _GREENHOUSE_FIXED_CONTROL_WITNESS,
+            )
+            readers = (PAGE, ENTRY_PAGE, GREENHOUSE_PAGE, _FIXED_CONTROL_WITNESS,
+                       _ENTRY_FIXED_CONTROL_WITNESS, _GREENHOUSE_FIXED_CONTROL_WITNESS)
+            if (len(args) != 2 or args[0] != "evaluate"
+                    or not isinstance(args[1], str)
+                    or not any(args[1] == reader for reader in readers)):
+                raise Unavailable("Raw application IPC refused before BrowserSkill CLI.")
         return await command(*args, "--session", self.id, **kwargs)
 
     async def page(self) -> dict:
@@ -215,7 +259,10 @@ class Session:
     async def navigate(self, url: str) -> dict:
         if not web_url(url):
             raise ValueError("Only HTTP(S) pages may be opened")
-        await self.call("navigate", url)
+        if self.kind == "apply":
+            await self.application_effect("navigate", url)
+        else:
+            await self.call("navigate", url)
         page = {}
         # A cold Workday profile may need to fetch several megabytes of scripts.
         # Wait within the caller's deadline; do not read a loading shell as a JD.

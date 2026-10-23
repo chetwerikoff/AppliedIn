@@ -136,53 +136,71 @@ def selected_snapshot(mutation=''):
         instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS)))
 
 
+def _control(source, selector):
+    matches = [c for c in source['controls'] if c.get('selector') == selector]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _unproven_final_inventory(page):
+    # Generic accessibility may observe a picker without proving its form
+    # value or every sibling widget. Only the one final Submit guard consumes
+    # this complete-inventory requirement; reversible discovery still works.
+    assert page['inventory_verified'] is False
+    assert page['opaque_controls'] is True
+    assert page['opaque_count'] > 0
+    assert len(page['opaque_locators']) == page['opaque_count']
+    with pytest.raises(forms.Gate, match='opaque'):
+        forms._inventory_ok(page)
+
+
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
     out = selected_snapshot()
     page, witness = out['page'], out['witness']
-    assert page['inventory_verified'] is True and page['opaque_controls'] is False
-    assert page['opaque_count'] == 0 and page['opaque_locators'] == []
-    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
-    for selector, text in (('#location', 'Synthetic Example City'),
-                           ('#country', 'Synthetic Country')):
-        a = next(c for c in page['controls'] if c['selector'] == selector)
-        b = next(c for c in witness['controls'] if c['selector'] == selector)
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    _unproven_final_inventory(page)
+    for selector in ('#country', '#location'):
+        a, b = _control(page, selector), _control(witness, selector)
+        assert a['type'] == b['type'] == 'combobox'
         assert a['combobox'] == b['combobox']
-        assert a['combobox']['mode'] == 'closed-react-select'
-        assert a['combobox']['phase'] == 'C2'
-        assert a['combobox']['selected_text'] == a['combobox']['displayed_text'] == text
-    country = next(c for c in page['controls'] if c['selector'] == '#country')
-    assert country['combobox']['receiverless_country'] is True
-    assert len(country['combobox']['country_graph']) == 13
-    assert not {'hidden_selector', 'hidden_value', 'selected_value'} & country['combobox'].keys()
-
+        assert a['combobox']['options'] == []
+    # The visual div is NOT a browser-owned selected caption. A missing
+    # selected-value property must not be reconstructed from React CSS/DOM.
+    country = _control(page, '#country')
+    assert not country['has_value']
+    assert not country['combobox']['selected_text']
+    assert not country['combobox']['selected_value']
+    assert not country['combobox']['hidden_value']
 
 
 def test_selected_country_without_placeholder_is_main_failing_regression():
-    # main rejects this exact C2 shape in countryGraph: its aria-describedby
-    # still mentions react-select-country-placeholder, but the selected-value
-    # DOM has replaced that node. The location picker remains a valid C2.
     out = selected_snapshot()
     page, witness = out['page'], out['witness']
-    assert page['inventory_verified'] is True
-    assert page['opaque_controls'] is False and page['opaque_count'] == 0
-    assert page['opaque_locators'] == []
-    forms._inventory_ok(page)
+    _unproven_final_inventory(page)
     for source in (page, witness):
-        country = next(c for c in source['controls'] if c['selector'] == '#country')
-        location = next(c for c in source['controls'] if c['selector'] == '#location')
-        assert country['combobox']['mode'] == 'closed-react-select'
-        assert country['combobox']['phase'] == 'C2'
-        assert country['combobox']['receiverless_country'] is True
-        assert country['combobox']['selected_text'] == fixture._FACTS['Country']
-        assert not {'selected_value', 'hidden_value', 'hidden_selector'} & country['combobox'].keys()
-        assert location['combobox']['mode'] == 'closed-react-select'
-        assert location['combobox']['phase'] == 'C2'
-    for graph in out['graphs']:
-        assert '#country' not in graph['quarantined']
-        assert next(g for selector, g in graph['graphs']
-                    if selector == '#country')['phase'] == 'C2'
-        assert next(g for selector, g in graph['graphs']
-                    if selector == '#location')['phase'] == 'C2'
+        country = _control(source, '#country')
+        location = _control(source, '#location')
+        # A visually selected ID-less node and a retained named machine input
+        # are different kinds of evidence. Neither can authorize Country.
+        # ID-less visual branches need not expose a name property at all.
+        # Absence is NOT an authorization to attribute a sibling receiver.
+        assert not country.get('name')
+        assert country['combobox']['selected_text'] == ''
+        assert country['combobox']['hidden_selector'] == ''
+        assert location['type'] == 'combobox'
+        assert location['combobox']['hidden_selector'] == ''
+        assert location['combobox']['hidden_value'] == ''
+        assert location['combobox']['selected_text'] == ''
+    # A named hidden field can hold bytes without being linked to the ARIA
+    # owner. Neither reader may attribute that unrelated value to the picker.
+    stored = _control(page, '#location-code')
+    assert stored['type'] == 'hidden' and stored['name'] == 'location_value'
+    assert stored['value'] == 'Synthetic Example City'
+    # The mandatory final form read rejects the unproven widget even with a
+    # synthetic approval, rather than handing a fake C2 certificate to Submit.
+    with pytest.raises(forms.Gate):
+        forms.check_form(page, {}, uploaded=True)
 
 
 @pytest.mark.parametrize('mutation', [
@@ -194,89 +212,80 @@ def test_selected_country_without_placeholder_is_main_failing_regression():
 ])
 def test_selected_country_placeholder_exception_is_exact_and_c2_only(mutation):
     out = selected_snapshot(mutation)
-    page = out['page']
-    assert page['inventory_verified'] is False
-    assert page['opaque_controls'] is True and page['opaque_count'] == 1
-    assert len(page['opaque_locators']) == 1
-    assert forms._safe_diagnostic(page['opaque_locators'][0]) == page['opaque_locators'][0]
-    country = next(c for c in page['controls'] if c['selector'] == '#country')
-    assert country['combobox'].get('mode') != 'closed-react-select'
-    assert country['combobox']['quarantined'] is True
-    location = next(c for c in page['controls'] if c['selector'] == '#location')
-    assert location['combobox']['phase'] == 'C2'
+    page, witness = out['page'], out['witness']
+    _unproven_final_inventory(page)
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    country = _control(page, '#country')
+    assert country['type'] == 'combobox'
+    assert not country['combobox'].get('selected_value')
+    assert not country['combobox'].get('hidden_value')
+    # Unknown, duplicated, foreign or unmounted ARIA references are not
+    # stand-in form receivers just because a sibling visual value is present.
+    assert _control(witness, '#country')['combobox'] == country['combobox']
 
 
 def test_retained_country_placeholder_c2_remains_classifiable():
     out = selected_snapshot('retained-country-placeholder')
-    assert out['page']['inventory_verified'] is True
-    assert out['page']['opaque_count'] == 0
+    page = out['page']
+    _unproven_final_inventory(page)
+    country = _control(page, '#country')
+    assert country['type'] == 'combobox'
+    assert not country['combobox'].get('selected_value')
+    assert not country['combobox'].get('selected_text')
 
 
 def test_intact_country_subtree_outside_phone_fieldset_never_downgrades_to_generic_c2():
-    # Moving only the input breaks W/V ownership and misses the old fallback.
-    # Move the entire otherwise-valid selected country widget and its label.
     out = selected_snapshot('country-subtree-outside-fieldset')
     page = out['page']
-    assert page['inventory_verified'] is False
-    assert page['opaque_controls'] is True and page['opaque_count'] == 1
-    assert len(page['opaque_locators']) == 1
-    assert forms._safe_diagnostic(page['opaque_locators'][0]) == page['opaque_locators'][0]
-    for reader in (out['page'], out['witness']):
-        country = next(c for c in reader['controls'] if c['selector'] == '#country')
-        location = next(c for c in reader['controls'] if c['selector'] == '#location')
-        assert country['combobox'].get('mode') != 'closed-react-select'
-        assert country['combobox']['quarantined'] is True
-        assert location['combobox']['phase'] == 'C2'
-    for graph in out['graphs']:
-        assert '#country' in graph['quarantined']
-        assert next(g for selector, g in graph['graphs'] if selector == '#country') is None
-    with pytest.raises(forms.Gate, match='opaque_count=1') as caught:
-        forms._inventory_ok(page)
-    assert 'control=unavailable' not in str(caught.value)
+    _unproven_final_inventory(page)
+    for source in (page, out['witness']):
+        country = _control(source, '#country')
+        assert country['type'] == 'combobox'
+        assert not country['combobox'].get('selected_value')
+        assert not country['combobox'].get('hidden_value')
+        assert _control(source, '#location')['type'] == 'combobox'
 
 
-@pytest.mark.parametrize('mutation,opaque', [
+@pytest.mark.parametrize('mutation,minimum_opaque', [
     ('valued-unknown', 1),
     ('country-outside-fieldset', 1),
     ('country-subtree-outside-fieldset', 1),
     ('second-in-phone-fieldset', 2),
 ])
-def test_selected_country_does_not_hide_unproven_widgets(mutation, opaque):
+def test_selected_country_does_not_hide_unproven_widgets(mutation, minimum_opaque):
     out = selected_snapshot(mutation)
     page = out['page']
-    assert page['opaque_controls'] is True
-    assert page['inventory_verified'] is False
-    assert page['opaque_count'] == opaque
-    assert len(page['opaque_locators']) == opaque
-    # A deep present country node must be diagnosable rather than 'unavailable'.
-    assert all(forms._safe_diagnostic(path) == path
-               for path in page['opaque_locators'])
-    if mutation == 'second-in-phone-fieldset':
-        country = next(c for c in page['controls'] if c['selector'] == '#country')
-        assert country['combobox'].get('mode') != 'closed-react-select'
-        assert country['combobox']['quarantined'] is True
-        # This is the deliberate two-opaque synthetic case: the country graph
-        # rejects the extra fieldset branch, and the unknown combobox has no link.
-        assert any(c['selector'] == '#unknown-selected' for c in page['controls'])
+    _unproven_final_inventory(page)
+    assert page['opaque_count'] >= minimum_opaque
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in out['witness']['controls']]
+    if mutation in {'valued-unknown', 'second-in-phone-fieldset'}:
+        extra = _control(page, '#unknown-selected')
+        assert extra['type'] == 'combobox'
+        assert extra['value'] == 'Synthetic unknown'
+        assert extra['combobox']['linked'] is False
+    # An off-form receiver never gains an inferred hidden value.
+    country = _control(page, '#country')
+    assert not country['combobox'].get('selected_value')
+
 
 def test_existing_greenhouse_smoke_leg_observes_selected_country_with_location():
-    # The extra inventory assertion belongs to the existing selected-state
-    # observation, not to a tenth fixture session or a real browser.
     state = fixture._SyntheticRun('Synthetic-only.pdf')
     state.greenhouse = True
     state.combo_touched.add('Country')
-    state.observe_page(selected_snapshot()['page'])
-    capture = state.country_choice_inventory
-    assert capture is not None and capture['verified'] is True
-    assert capture['opaque_count'] == 0 and capture['opaque_locators'] == []
-    assert capture['country_phase'] == capture['location_phase'] == 'C2'
-    assert capture['country_selected'] == fixture._FACTS['Country']
-    assert capture['location_selected'] == fixture._FACTS['Where are you located?']
-    # An unrelated opaque control must not be hidden by the country sub-case.
-    state = fixture._SyntheticRun('Synthetic-only.pdf')
-    state.greenhouse = True
-    state.combo_touched.add('Country')
-    state.observe_page(selected_snapshot('valued-unknown')['page'])
-    assert state.country_choice_inventory is not None
-    assert state.country_choice_inventory['verified'] is False
-    assert state.country_choice_inventory['opaque_count'] == 1
+    page = selected_snapshot()['page']
+    state.observe_page(page)
+    assert state.last_page is page
+    assert state.combo_observations['Country']['outcome'] == 'not_committed'
+    # No obsolete Greenhouse C2/receiverless-county certificate may be
+    # inferred from the selected div. This is an unverified final form.
+    assert state.country_choice_inventory is None
+    _unproven_final_inventory(state.last_page)
+    mutated = selected_snapshot('valued-unknown')['page']
+    state.observe_page(mutated)
+    assert state.combo_observations['Country']['outcome'] == 'not_committed'
+    assert state.last_page['opaque_controls'] is True
+    assert any(c.get('selector') == '#unknown-selected'
+               for c in state.last_page['controls'])
+    assert state.submit_ipc == state.post_attempts == 0

@@ -129,7 +129,13 @@ async def synthetic_controller(monkeypatch, case):
     from core import events
     from tools import browser_apply, claude_chrome
     monkeypatch.setattr(forms, "check_dispatch", lambda *a, **k: None)
-    monkeypatch.setattr(forms, "_row", lambda pk: {})
+    # The safety controller first verifies a real tracked preparation row.
+    # Exercise challenge classification *after* that invariant, not against
+    # an intentionally missing dispatch identity.
+    tracked = {"pk": PK, "company": "example-co", "job_id": "captcha",
+               "jd_url": URL, "status": "submitting",
+               "possible_submission": False, "ats": "custom"}
+    monkeypatch.setattr(forms, "_row", lambda pk: tracked if pk == PK else {})
     monkeypatch.setattr(forms, "_bootstrap", bootstrap)
     monkeypatch.setattr(bsk, "Session", Session)
     monkeypatch.setattr(bsk, "decision", AsyncMock(side_effect=AssertionError("model called")))

@@ -1,4 +1,4 @@
-"""Greenhouse tenant gates: persisted pin and current manual watchlist authority."""
+"""Issue #139 r06: Greenhouse tenant equality gates final Submit, not preparation."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -10,6 +10,9 @@ from core.ids import make_pk
 from discovery.watchlist import CompanyConfig
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
+
+REAL_APPLICATION_SESSION = bsk.Session  # Capture before the offline fixture patches the constructor.
+
 from tools.claude_chrome import greenhouse_alias_candidate, verified_greenhouse_alias
 
 COMPANY = "example-co"
@@ -73,11 +76,19 @@ async def attempt(url=URL):
                              pk=PK, resume_path="synthetic.pdf")
 
 
-def _must_gate(result, state, reason="defect_tenant"):
-    assert result["status"] == "gate", result
-    assert result["reason"] == reason, result
-    assert "No unique explicit Greenhouse tenant and tracked job were proven." in result["question"]
-    assert state.browser_starts == []
+async def _must_final_tenant_deny(state, *, url=URL):
+    """ARCH01:58: even a corrupt row/pin/config never gains Submit IPC."""
+    clicks = []
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, url, "synthetic.pdf", {}, {}, [], {},
+        lambda: clicks.append("submitted"))
+    prior_starts = len(state.browser_starts)
+    with pytest.raises(forms.Gate):
+        await controller.authorize_final_submit(
+            None, {"url": HOSTED, "title": "Synthetic role"},
+            {"label": "Submit application"})
+    assert clicks == []
+    assert len(state.browser_starts) == prior_starts
 
 
 def test_fresh_alias_uses_persisted_pin_and_rechecks(authority):
@@ -96,16 +107,16 @@ def test_fresh_alias_uses_persisted_pin_and_rechecks(authority):
     ("jd_url", CAREERS + "/other?gh_jid=731205"), ("ats", "crawl"),
     ("greenhouse_board", "other-board"), ("greenhouse_board", ""),
 ])
-async def test_bad_persisted_identity_fails_pre_browser(authority, field, bad):
+async def test_bad_persisted_identity_refuses_final_commit(authority, field, bad):
     authority.tracking.rows[PK][field] = bad
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
 @pytest.mark.parametrize("bad", [
     "", "other-board", "Example-Board", "example/board",
     "https://boards.greenhouse.io/example-board",
 ])
-async def test_removed_changed_or_malformed_config_board_fails(authority, bad):
+async def test_removed_changed_or_malformed_config_board_refuses_final_commit(authority, bad):
     authority.write(f"""companies:
   - name: {COMPANY}
     careers_url: {CAREERS}
@@ -113,7 +124,7 @@ async def test_removed_changed_or_malformed_config_board_fails(authority, bad):
     board: {bad!r}
     discovery: browser
 """)
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
 @pytest.mark.parametrize("careers", [
@@ -122,21 +133,21 @@ async def test_removed_changed_or_malformed_config_board_fails(authority, bad):
     "http://careers.example-co.test/openings",
     "https://careers.example-co.test:443/openings",
 ])
-async def test_careers_host_path_or_scheme_drift_fails(authority, careers):
+async def test_careers_host_path_or_scheme_drift_refuses_final_commit(authority, careers):
     authority.write(f"""companies:
   - name: {COMPANY}
     careers_url: {careers}
     ats: greenhouse
     board: {BOARD}
 """)
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
-async def test_duplicate_company_config_fails(authority):
+async def test_duplicate_company_config_refuses_final_commit(authority):
     authority.write(authority.path.read_text() +
                     f"\n  - name: EXAMPLE-CO\n    careers_url: {CAREERS}\n"
                     f"    ats: greenhouse\n    board: {BOARD}\n")
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
 @pytest.mark.parametrize("malformed", [
@@ -158,13 +169,15 @@ async def test_duplicate_company_config_fails(authority):
     URL + "#fragment",
 ])
 async def test_noncanonical_id_attempt_gates_not_custom_apply(authority, malformed):
-    result = await attempt(malformed)
-    assert result["status"] == "gate" and result["reason"] == "defect_tenant"
-    if "board=other-board" in malformed:
-        assert "Derived board tenant or job" in result["question"]
+    if forms._greenhouse_id_query_attempt(malformed) and not greenhouse_alias_candidate(malformed):
+        result = await attempt(malformed)
+        assert result["status"] == "gate" and result["reason"] == "defect_tenant"
+        assert "Malformed Greenhouse job identity" in result["question"]
+        assert authority.browser_starts == []
     else:
-        assert "No unique explicit Greenhouse tenant" in result["question"]
-    assert authority.browser_starts == []
+        # A syntactically parseable alias with a contradictory tracked route
+        # is denied by the one final guard, not by a stale early tenant gate.
+        await _must_final_tenant_deny(authority, url=malformed)
 
 
 def test_attempt_detector_does_not_block_unrelated_custom_urls():
@@ -190,14 +203,14 @@ def test_validator_rejects_noncanonical_employer_witness(authority, change):
            configs=[authority.config]) is None
 
 
-async def test_unproven_ordinary_crawl_row_exact_wrapper_gates(authority):
+async def test_unproven_ordinary_crawl_row_refuses_final_commit(authority):
     row = authority.tracking.rows[PK]
     row["ats"] = "crawl"
     row.pop("greenhouse_board")
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
-async def test_legacy_missing_pin_and_board_gets_distinct_reason(authority):
+async def test_legacy_missing_pin_and_board_refuses_final_commit(authority):
     authority.tracking.rows[PK].pop("greenhouse_board")
     authority.write(f"""companies:
   - name: {COMPANY}
@@ -205,12 +218,13 @@ async def test_legacy_missing_pin_and_board_gets_distinct_reason(authority):
     ats: greenhouse
     discovery: browser
 """)
-    _must_gate(await attempt(), authority, "defect_greenhouse_tenant_alias")
-    assert len(authority.tracking.reads) >= 2
+    assert forms._configured_alias(PK, COMPANY, URL) is None
+    await _must_final_tenant_deny(authority)
+    assert len(authority.tracking.reads) >= 1
 
 
 @pytest.mark.parametrize("pin", ["example-board", "", "another-board"])
-async def test_pinned_row_with_removed_board_is_defect_tenant(authority, pin):
+async def test_pinned_row_with_removed_board_refuses_final_commit(authority, pin):
     authority.tracking.rows[PK]["greenhouse_board"] = pin
     authority.write(f"""companies:
   - name: {COMPANY}
@@ -218,19 +232,106 @@ async def test_pinned_row_with_removed_board_is_defect_tenant(authority, pin):
     ats: greenhouse
     discovery: browser
 """)
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
 
 
-async def test_committed_pin_drift_before_preflight_or_later_recheck(authority):
+async def test_committed_pin_drift_before_final_commit(authority):
     proof = forms._configured_alias(PK, COMPANY, URL)
     assert isinstance(proof, forms.GreenhouseJobAlias)
     # A committed row change is visible on the next dedicated alias read.
     authority.tracking.rows[PK]["greenhouse_board"] = "other-board"
     assert not forms._alias_current(proof)
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
     assert len(authority.tracking.reads) >= 3
 
 
-async def test_consistent_row_failure_gates_not_starts(authority):
+async def test_consistent_row_failure_refuses_final_commit(authority):
     authority.tracking.failure = True
-    _must_gate(await attempt(), authority)
+    await _must_final_tenant_deny(authority)
+
+
+async def test_stale_pin_may_enter_preparation_but_cannot_submit(authority):
+    """Accepted r06 tenant relocation: no pre-browser pin denial, final refusal."""
+    authority.tracking.rows[PK]["greenhouse_board"] = "another-board"
+    result = await attempt()
+    assert result["status"] == "unknown"
+    # Offline sentinel aborts as soon as the preparation session is requested.
+    assert len(authority.browser_starts) == 1
+    await _must_final_tenant_deny(authority)
+
+
+@pytest.mark.asyncio
+async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_submit(
+        monkeypatch, authority, tmp_path):
+    """ARCH09:47: no early alias veto across the real apply -> execute -> IPC path."""
+    from unittest.mock import AsyncMock
+    from core import events
+    from tools import browser_apply, claude_chrome
+
+    # The tracked wrapper is eligible, but neither the row nor config has a pin.
+    authority.tracking.rows[PK].pop("greenhouse_board")
+    authority.write(f"""companies:
+  - name: {COMPANY}
+    careers_url: {CAREERS}
+    ats: greenhouse
+    discovery: browser
+    mode: gated
+""")
+    assert forms._configured_alias(PK, COMPANY, URL) is None
+    pdf = tmp_path / "Test User Row.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nsynthetic row-specific document\n")
+    monkeypatch.setattr(claude_chrome, "_stage_resume", lambda p, _owner: p)
+    monkeypatch.setattr(browser_apply, "_site_rules", lambda *args: "")
+    monkeypatch.setattr(events, "emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(forms.submit_hold, "is_held", lambda *a, **kw: False)
+
+    page = {
+        "url": URL, "title": "Synthetic Role", "text": "Synthetic neutral posting. " * 30,
+        "description": "", "controls": [
+            {"selector": "#apply", "label": "Apply", "question": "",
+             "tag": "button", "type": "button", "submit": False,
+             "disabled": False, "in_form": False, "href": "", "formaction": "",
+             "form_selector": "", "form_action": "", "files": [],
+             "value": "", "has_value": False},
+        ],
+        "inventory_verified": True, "truncated": False,
+        "opaque_controls": False, "shadow_roots": False, "unsupported_frames": [],
+    }
+    ipc = []
+
+    async def command(*args, **kwargs):
+        ipc.append(args)
+        if args[0] == "evaluate":
+            return {"value": deepcopy(page)}
+        assert args[0] in {"navigate", "click"}
+        return {}
+
+    async def enter(self):
+        self.id = "synthetic-session"
+        return self
+
+    async def exit(self, *_args):
+        if self._application_controller:
+            self._application_controller.release_snapshot()
+        return False
+
+    # Real application Session methods and raw IPC controller, with only
+    # Chrome process/session setup and transport substituted by offline spies.
+    monkeypatch.setattr(bsk, "Session", REAL_APPLICATION_SESSION)
+    monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aenter__", enter)
+    monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aexit__", exit)
+    monkeypatch.setattr(bsk, "command", command)
+    decisions = AsyncMock(side_effect=[
+        {"action": "click", "selector": "#apply"},
+        {"action": "gate", "question": "Synthetic inspection stop"},
+    ])
+    monkeypatch.setattr(bsk, "decision", decisions)
+    result = await forms.apply(URL, COMPANY, {}, "synthetic",
+                               pk=PK, resume_path=str(pdf))
+    assert result["status"] == "gate", result
+    assert decisions.await_count == 2
+    assert [cmd[:2] for cmd in ipc if cmd[0] in {"click", "navigate"}] == [
+        ("navigate", URL), ("click", "#apply")]
+    # Reversible Apply click is not an authorized final Submit/possible hold.
+    assert authority.tracking.rows[PK].get("possible_submission") is not True
+    await _must_final_tenant_deny(authority)

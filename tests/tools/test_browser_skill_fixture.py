@@ -139,6 +139,29 @@ def authority(tmp_path, monkeypatch):
         fixture._SESSION_ENTRY.reset(token)
 
 
+def test_sealed_fixture_http_route_cannot_be_spoofed_or_reused(authority):
+    """Only the daemon-minted offline fixture may prepare over loopback HTTP."""
+    forms._tracked_preparation_job(
+        fixture.PK, fixture.COMPANY, fixture.URL, fixture_context=authority)
+    with pytest.raises(forms.Gate, match='Synthetic fixture authority'):
+        forms._tracked_preparation_job(
+            fixture.PK, fixture.COMPANY, fixture.URL + '?other-job=1',
+            fixture_context=authority)
+    with pytest.raises(forms.Gate, match='Synthetic fixture authority'):
+        forms._tracked_preparation_job(
+            fixture.PK, fixture.COMPANY, fixture.URL,
+            fixture_context=SimpleNamespace(row=authority.row))
+    old_status = authority.row['status']
+    authority.row['status'] = 'needs_human'
+    try:
+        with pytest.raises(forms.Gate, match='Synthetic tracked job/dispatch'):
+            forms._tracked_preparation_job(
+                fixture.PK, fixture.COMPANY, fixture.URL, fixture_context=authority)
+    finally:
+        authority.row['status'] = old_status
+
+
+
 class _ServedFormInventory(HTMLParser):
     """Project fixture form groups the same way PAGE exposes control questions."""
     def __init__(self):
@@ -287,9 +310,37 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     hidden = next(c for c in page["controls"]
                   if c["selector"] == "#location-code")
     assert location["question"] == hidden["question"] == "Where are you located?"
-    assert forms._approval_question_collisions(page, location) == [hidden]
-
+    collisions = forms._approval_question_collisions(page, location)
+    # Two real required validation proxies (location and phone country)
+    # have no own approval identity. They cannot borrow this visible question.
+    anonymous = [c for c in page["controls"]
+                 if c.get("type") == "text" and not c.get("label")
+                 and not c.get("name") and c.get("required") is True]
+    assert len(anonymous) == 2
+    assert len({c["selector"] for c in anonymous}) == 2
+    assert all(c.get("in_form") is True
+               and c.get("form_selector") == location["form_selector"]
+               and not c.get("has_value") and c.get("value") == ""
+               for c in anonymous)
+    assert hidden["type"] == "hidden" and hidden["name"] == "location_value"
+    assert collisions == []
     assert forms._key(page, location) == "Where are you located?"
+    # Excluding a proxy from approval collision detection is not permission
+    # to submit: the original inventory is opaque, and each still-empty
+    # required proxy independently fails the one final form-value census.
+    assert page["inventory_verified"] is False and page["opaque_controls"] is True
+    with pytest.raises(forms.Gate, match="incomplete"):
+        forms.check_form(page, {}, uploaded=True)
+    for proxy in anonymous:
+        probe = {**page, "controls": [proxy], "inventory_verified": True,
+                 "truncated": False, "opaque_controls": False,
+                 "shadow_roots": False, "unsupported_frames": []}
+        with pytest.raises(forms.Gate, match="Required field is empty"):
+            forms.check_form(probe, {}, uploaded=True)
+    without_proxies = {**page, "controls": [
+        c for c in page["controls"] if c not in anonymous]}
+    assert forms._approval_question_collisions(without_proxies, location) == []
+    assert forms._key(without_proxies, location) == "Where are you located?"
 
 
 def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
@@ -574,22 +625,27 @@ async def test_real_session_thread_context_and_read_only_connected_path(
         return {}
     monkeypatch.setattr(bsk, "command", command)
     async with bsk.Session("apply") as raw:
+        # A connected real apply Session can read its original tab. Neither
+        # the fixture facade nor the raw producer may mint write/navigation
+        # permission merely because the thread and browser pin are valid.
         edge = authority.facade(raw)
-        await edge.navigate(fixture.URL)
-        observed_page = await edge.page()
+        observed_page = await raw.page()
         assert observed_page["url"] == fixture.URL
-        await edge.call("fill", "#name", "--value", "Test User")
-        with pytest.raises(PermissionError):
-            await edge.call("click", "#submit")
+        with pytest.raises(bsk.Unavailable, match="Unmediated application IPC"):
+            await edge.navigate(fixture.URL)
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("fill", "#name", "--value", "Test User")
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("click", "#submit")
+        with pytest.raises(bsk.Unavailable, match="Raw application IPC refused"):
+            await raw.call("evaluate", "document.forms[0]?.requestSubmit()")
     from tools.browser_skill_dom import PAGE
     assert observed == {"worker_thread": True, "context": True}
     assert calls[0][:2] == ("session", "start")
     assert calls[-1] == ("session", "stop", "synthetic-session")
-    assert ("navigate", fixture.URL, "--session", "synthetic-session") in calls
     assert ("evaluate", PAGE, "--session", "synthetic-session") in calls
-    assert ("fill", "#name", "--value", "Test User", "--session",
-            "synthetic-session") in calls
-    assert not any(c[0] == "click" for c in calls)
+    assert not any(c[0] in {"navigate", "fill", "click", "upload", "select"}
+                   for c in calls)
 
 
 @pytest.mark.parametrize("failure", [
@@ -960,8 +1016,33 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     # The offline transport supplies an incomplete inventory, not a false
     # success receipt; the controller must gate before any mutating operation.
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert '"submitted": false' in result.stdout.lower()
-    assert '"status": "gate"' in result.stdout.lower()
+    # A Python import/fixture crash is NOT a verified application refusal.
+    # Demand structured outcomes from the real daemon fixture in addition to
+    # the no-mutation subprocess trace below.
+    assert "Traceback" not in result.stderr, result.stderr
+    reports = [json.loads(line) for line in result.stdout.splitlines()
+               if line.lstrip().startswith("{")]
+    assert len(reports) == 10, (result.stdout, result.stderr)
+    assert {report['scenario'] for report in reports[:-1]} == {
+        'entry', 'greenhouse', 'greenhouse_empty_placeholder',
+        'w_button_aria_label', 'ashby', 'ashby-upload',
+        'lever_custom_radio', 'lever_custom_checkbox'}
+    assert {report['variant'] for report in reports[:-1]
+            if report['scenario'] == 'ashby-upload'} == {
+                'ordinary', 'transient+unwrap'}
+    assert all(report['status'] == 'gate'
+               and report['submitted'] is False
+               and report['submit']['call_entered'] is False
+               and report['submit']['ipc_returned'] is False
+               and report['submit']['post_attempts'] == 0
+               for report in reports[:-1]), [
+        (report['scenario'], report.get('variant'), report['status'],
+         report['submitted'], report['applicant_ipc'], report['submit'])
+        for report in reports[:-1]
+    ]
+    # The aggregate summary has safe_gate/legs, not a submitted attribute;
+    # the nine per-session reports carry the actual Submit IPC observations.
+    assert reports[-1]['safe_gate'] is False
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
     assert "http_handler_selected" in kinds
@@ -971,12 +1052,12 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                    and (e["dotenv"], e["cost"]) != ("1", "True")
                    for e in events)
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
-    # The incomplete fake page opens seven BSK subprocess sessions before gating;
-    # the separate all-leg test still pins nine dispatches across eight legs,
-    # with both Ashby upload sub-cases sharing the original dispatch shape.
-    assert actions.count('session_start') == actions.count('session_stop') == 7
-    assert actions.count('navigate') == 7
-    assert actions.count('evaluate_page') == 7
+    # One BSK session per independently checked scenario/variant report.
+    # The final aggregate has no session; the two Ashby upload variants do.
+    expected_sessions = len(reports[:-1])
+    assert actions.count('session_start') == actions.count('session_stop') == expected_sessions
+    assert actions.count('navigate') == expected_sessions
+    assert actions.count('evaluate_page') == expected_sessions
     assert actions.count("fill_name") == 0
     assert not any(a in {"click", "upload", "select", "choose"} for a in actions)
     assert any(e["kind"] == "sanitized_bsk_child" for e in events)
@@ -1081,16 +1162,18 @@ async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
     }
     with pytest.raises(PermissionError, match="denies"):
         await forms.execute(edge, current, action, **kwargs)
-    assert marks == ["reached"] and sent == [("navigate", fixture.URL)]
-    marks.clear()
+    # r06 marks a possible click only AFTER the ONE raw producer verdict.
+    # This deliberately unbound fixture facade denies the click with no mark.
+    assert marks == [] and sent == [("navigate", fixture.URL)]
     if drift == "receiver":
         cont["form_action"] = "https://foreign.example.test/submit"
         with pytest.raises(forms.Gate, match="form destination"):
-            await forms.execute(edge, current, action, **kwargs)
+            forms.check_form_destination(current, cont, fixture.URL)
     else:
         authority.row["status"] = "applied_manual"
         with pytest.raises(forms.Gate, match="Human outcome changed"):
-            await forms.execute(edge, current, action, **kwargs)
+            forms.check_before_committing_click(
+                fixture.PK, fixture_context=authority)
     assert not marks and sent == [("navigate", fixture.URL)]
 
 
@@ -1245,6 +1328,10 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
     Every click remains forbidden beneath the controller.
     """
     current = synthetic_page()
+    # This is a genuine final-guard scenario, not a partially identified
+    # posting: canonical row, final title and original URL must all agree.
+    authority.row.update(job_id="synthetic-job", jd_url=fixture.URL,
+                         title=current["title"], ats="custom")
     current["controls"][0].update(required=True, has_value=True,
                                   value="Test User")
     current["controls"][1].update(required=True, has_value=True,
@@ -1482,8 +1569,9 @@ async def test_typed_fixture_entry_never_delegates_generic_navigation(authority,
     raw = Raw()
     facade = authority.facade(raw)
     await facade.call('navigate',fixture.URL)
-    session = forms._EntrySession(facade, lambda u: u==fixture.URL and forms._alias_current(
-        proof,fixture_context=authority), proof)
+    session = forms._EntrySession(
+        facade, lambda u: u == fixture.URL and forms._alias_current(
+            proof, fixture_context=authority), proof, fixture_context=authority)
     result = await forms._stable_application_form(session,session.allowed,proof,
         deadline=__import__('asyncio').get_running_loop().time()+15)
     authority.entry_admitted(result)
@@ -1635,9 +1723,11 @@ async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
     # untouched hidden-receiver graph. The failure was before opening it:
     # bootstrap asks again for a grant the fixture previously supplied.
     location = next(c for c in snapshot['page']['controls'] if c['selector'] == '#location')
-    assert location['combobox']['mode'] == 'closed-react-select'
-    assert location['combobox']['phase'] == 'C0'
+    assert location['type'] == 'combobox'
+    assert isinstance(location['combobox'], dict)
     assert location['combobox']['options'] == []
+    assert not location['combobox'].get('selected_value')
+    assert not location['combobox'].get('hidden_value')
     forms.exact_approval(
         fixture.PK, 'Where are you located?', fixture._FACTS['Where are you located?'],
         target=forms._bound_target(snapshot['page'], location), url=fixture.URL,

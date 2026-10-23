@@ -48,7 +48,7 @@ def _grant(item, url, value, *, group=()):
     elif item['type'] == 'radio':
         record['radio_name'] = item['name']
         record['radio_members'] = [
-            {'selector': c['selector'], 'caption': c['label'], 'value': c['value']}
+            {'selector': c['selector'], 'caption': c['label'], 'label': c['label'], 'value': c['value']}
             for c in group
         ]
     return record
@@ -129,7 +129,7 @@ def _fixture(route, *, kind=None, noisy=False):
             'listbox_selector': '#city-options',
             'options': [{'selector': '#city-choice', 'label': 'Test City',
                          'value': 'Test City', 'unique': True,
-                         'submit': False, 'navigates': False}],
+                         'safe': True, 'submit': False, 'navigates': False}],
             'selected_text': '', 'displayed_text': '', 'selected_value': '',
             'hidden_selector': '#city-hidden', 'hidden_value': '',
         }
@@ -326,18 +326,39 @@ async def _apply(case, facts=None, *, resume_path='Resume.pdf'):
                              case.facts if facts is None else facts,
                              'synthetic', pk=case.pk, resume_path=resume_path)
 
-async def test_greenhouse_positive_fixture_requires_persisted_pin(monkeypatch):
+async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeypatch):
+    """A missing board pin is not an early gate, but can never authorize Submit."""
     case, raw = _world(monkeypatch, 'greenhouse')
     case.row.pop('greenhouse_board')
-    monkeypatch.setattr(
-        bsk, 'Session', lambda *args: pytest.fail('unpinned row opened browser'))
+    visited = []
 
-    result = await _apply(case)
+    async def navigate(url):
+        visited.append(url)
+        return deepcopy(raw.state)
 
-    assert result['status'] == 'gate'
-    assert result['reason'] == 'defect_tenant'
-    assert raw.calls == []
+    async def stop_after_navigation(_session, page, *_args, **_kwargs):
+        assert page['url'] == case.url
+        raise forms.Gate('Synthetic stop after allowed host-only preparation.')
+
+    raw.navigate = navigate
+    monkeypatch.setattr(forms, '_bootstrap', stop_after_navigation)
+    outcome = await _apply(case)
+    assert outcome['status'] == 'gate'
+    assert 'Synthetic stop after allowed host-only preparation' in outcome['question']
+    assert visited == [case.wrapper]
+    assert forms._preparation_origin(case.url, case.wrapper)
     assert raw.writes == []
+
+    # This is the original production final-click decision. Even after
+    # permitted entry the missing persisted board must deny with zero Submit.
+    controller = forms.ApplicationIPCController(
+        case.pk, COMPANY, case.wrapper, '', case.facts, {}, [], {}, lambda: None)
+    submitter = next(c for c in case.page['controls'] if c['selector'] == '#submit')
+    with pytest.raises(forms.Gate, match='tenant or board') as denied:
+        await controller.authorize_final_submit(raw, case.page, submitter)
+    assert denied.value.reason == 'defect_tenant'
+    assert raw.writes == []
+    assert not any(c[0] == 'click' and c[1] == '#submit' for c in raw.calls)
 
 
 def _decisions(caplog):
@@ -375,12 +396,14 @@ async def test_actual_vendor_apply_commits_before_first_decision_and_upload_stay
         case.facts['Schedule preference'] = 'Evening'
         case.row['human_approved_answers']['Schedule preference'] = _grant(
             morning, case.url, 'Evening', group=[morning, evening])
-    sessions, first_page, snapshots = [], [], []
+    sessions, first_page, snapshots, trusted_histories = [], [], [], []
     bootstrap = forms._bootstrap
 
     async def observed_bootstrap(session, *args, **kwargs):
         sessions.append(type(session))
-        return await bootstrap(session, *args, **kwargs)
+        result = await bootstrap(session, *args, **kwargs)
+        trusted_histories.append(deepcopy(kwargs['history']))
+        return result
 
     monkeypatch.setattr(forms, '_bootstrap', observed_bootstrap)
 
@@ -400,19 +423,23 @@ async def test_actual_vendor_apply_commits_before_first_decision_and_upload_stay
             assert {r['action'] for r in history} == (
                 {'fill', 'select', 'choose'} if route == 'lever'
                 else {'fill', 'combobox', 'choose'})
+            assert all('approved_value' not in item for item in history)
             forms.check_approvals(
-                case.pk, history, page,
+                case.pk, trusted_histories[-1], raw.state,
                 provenance=forms._configured_alias(case.pk, COMPANY, case.wrapper))
             with pytest.raises(forms.Gate, match='attachment'):
-                forms.check_form(page, raw.filled, False, 'Resume.pdf', history)
+                forms.check_form(raw.state, raw.filled, False, 'Resume.pdf',
+                                 trusted_histories[-1])
             return {'action': 'upload', 'selector': '#resume'}
         assert len(snapshots) == 2
         assert len([r for r in history if r.get('fact')]) == 3
         assert any(r['action'] == 'upload' for r in history)
+        assert all('approved_value' not in item for item in history)
         forms.check_approvals(
-            case.pk, history, page,
+            case.pk, trusted_histories[-1], raw.state,
             provenance=forms._configured_alias(case.pk, COMPANY, case.wrapper))
-        forms.check_form(page, raw.filled, True, 'Resume.pdf', history)
+        forms.check_form(raw.state, raw.filled, True, 'Resume.pdf',
+                         trusted_histories[-1])
         return {'action': 'gate', 'question': 'Synthetic stop before submit'}
 
     monkeypatch.setattr(bsk, 'decision', decide)
@@ -696,10 +723,15 @@ async def test_later_picker_clears_earlier_phone_and_cumulative_readback_gates(
 
     raw.call = reactive_call
 
-    async def no_decision(*args, **kwargs):
-        pytest.fail('Cleared earlier committed phone must never reach first model decision')
+    async def review_before_final_submit(_prompt, page, history, *, model):
+        # A later approved picker may clear a prior fact. Preparation reaches
+        # the model; the real final form check still forbids Submit.
+        assert raw.target('#phone')['has_value'] is False
+        with pytest.raises(forms.Gate, match='Required field is empty: Phone'):
+            forms.check_form(page, {'#phone': PHONE}, uploaded=True, receipts=history)
+        return {'action': 'gate', 'question': 'Synthetic final form requires phone re-entry'}
 
-    monkeypatch.setattr(bsk, 'decision', no_decision)
+    monkeypatch.setattr(bsk, 'decision', review_before_final_submit)
     result = await _apply(case)
     assert result['status'] == 'gate' and result['form_question'] is None
     assert raw.writes == [('fill', '#phone'), picker_ipc]
@@ -709,7 +741,7 @@ async def test_later_picker_clears_earlier_phone_and_cumulative_readback_gates(
     else:
         assert raw.target('#city')['combobox']['selected_text'] == 'Test City'
     assert [d['decision'] for d in _decisions(caplog)] == [
-        'settled-from-bank', 'blocked']
+        'settled-from-bank', 'settled-from-bank']
 
 
 async def test_reordered_radio_after_phone_fill_still_gets_one_bound_gate(

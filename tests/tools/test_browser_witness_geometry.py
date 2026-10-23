@@ -198,7 +198,9 @@ def test_native_choice_caption_uses_same_literal_visible_predicate(
 def control(label, selector, *, tag='input', type='text', **changes):
     return {
         'selector': selector, 'label': label, 'question': '',
-        'tag': tag, 'type': type, 'required': True,
+        'tag': tag, 'type': type,
+        'native_type': type if tag in {'input', 'button'} else '',
+        'required': True,
         'disabled': False, 'readonly': False, 'in_form': True,
         'form_selector': '#application', 'form_action': URL,
         'native_form_owner_selector': '#application',
@@ -299,13 +301,22 @@ async def test_bootstrap_skips_invisible_selector_but_can_offer_visible_one(
     assert result['controls'][1]['visible'] is True
     session = Session(current, result)
     monkeypatch.setattr(forms, '_row', lambda pk: {'pk': pk, 'human_approved_answers': {}})
-    with pytest.raises(forms.Gate) as raised:
-        await forms._bootstrap(session, current, PK, {}, URL)
-    question = raised.value.form_question
-    assert question and question['selector'] == shown['selector']
+    prepared = await forms._bootstrap(session, current, PK, {}, URL)
+    # A refreshed, independently witnessed page is a new snapshot, not the
+    # original Python object. Its contents, not object identity, must match.
+    assert prepared == current
+    fixed = {c['selector']: c for c in result['controls']}
+    # Independent witnessing must still refuse the invisible receiver; the
+    # visible control remains identifiable without an early ordinary gate.
+    with pytest.raises(forms.Gate, match='not visibly editable'):
+        forms._disclosure_question(current, hidden, fixed, URL)
+    question = forms._disclosure_question(current, shown, fixed, URL)
+    assert question['selector'] == shown['selector']
     assert question['selector'] in {
         c['selector'] for c in result['controls'] if c['visible'] is True
     }
+    with pytest.raises(forms.Gate, match='Required field is empty: Hidden field'):
+        forms.check_form(prepared, {}, uploaded=True)
     no_mutation(session)
 
 
@@ -354,6 +365,20 @@ async def test_second_witness_prevents_write_after_visible_to_invisible_change(m
         await execute(session, current, c, 'fill', 'Test User')
     assert raised.value.form_question is None
     assert [call[0] for call in session.calls] == ['evaluate', 'evaluate']
+    no_mutation(session)
+
+
+async def test_committing_fixed_witness_cannot_be_normalized_to_an_absent_page_flag(monkeypatch):
+    c = control('Name', '#name', required=False)
+    current = page(c)
+    fixed = production_observation(current)
+    assert fixed['controls'][0]['commits_application'] is False
+    fixed['controls'][0]['commits_application'] = True
+    session = Session(current, fixed)
+    monkeypatch.setattr(forms, '_row', lambda pk: row_with_grant(c, 'Test User'))
+    with pytest.raises(forms.Gate, match='predicate=commits_application.equal'):
+        await execute(session, current, c, 'fill', 'Test User')
+    assert [call[0] for call in session.calls] == ['evaluate']
     no_mutation(session)
 
 

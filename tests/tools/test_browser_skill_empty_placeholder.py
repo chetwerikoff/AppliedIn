@@ -13,7 +13,7 @@ import pytest
 from tools import browser_skill_apply as forms, browser_skill_fixture as fixture
 from tests.tools.test_browser_closed_widgets import Session, choose, grants
 from tests.tools.test_browser_greenhouse_fixture import Tree
-from tests.tools.test_browser_greenhouse_parity import instrument
+from tests.tools.test_browser_greenhouse_parity import assert_unapproved_submit_is_refused
 
 RECT = dict(width=120, height=24, right=120, bottom=24)
 ZERO = {**RECT, 'height': 0}
@@ -44,26 +44,26 @@ def observe(*, changes=(), optional=False, original=False):
 
 
 def execute(scenario):
-    witness = instrument(forms._GREENHOUSE_FIXED_CONTROL_WITNESS).replace(
-        'const pickerParts = new Set();', '''
-        global.__graphs[1].displayProof = Array.from(newGraphs).filter(([e,g])=>g).map(([e,g])=>{
-          const d=graphNodes.get(e).display;
-          return [selector(e), {original:visible(d), text:clean(d.innerText), rects:Array.from(d.getClientRects())}];
-        });
-        const pickerParts = new Set();''')
+    # The r06 readers expose accessible controls, not display-geometry receipts.
     return json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')), json.dumps(scenario),
-        instrument(forms.GREENHOUSE_PAGE), witness,
+        forms.GREENHOUSE_PAGE, forms._GREENHOUSE_FIXED_CONTROL_WITNESS,
     ], text=True))
 
 
 def evidence(out, selector='#location'):
     page, witness = out['page'], out['witness']
-    assert out['graphs'][0] == {k: v for k, v in out['graphs'][1].items() if k != 'displayProof'}
-    assert [c['selector'] for c in page['controls']] == [c['selector'] for c in witness['controls']]
+    assert [c['selector'] for c in page['controls']] == [
+        c['selector'] for c in witness['controls']]
+    assert [(c['selector'], c['tag'], c['type'], c['form_selector'])
+            for c in page['controls']] == [
+        (c['selector'], c['tag'], c['type'], c['form_selector'])
+        for c in witness['controls']]
+    for original, independent in zip(page['controls'], witness['controls']):
+        assert original.get('combobox') == independent.get('combobox')
     target = next(c for c in page['controls'] if c['selector'] == selector)
-    strict = next(c for c in witness['controls'] if c['selector'] == selector)
-    return target, strict
+    independent = next(c for c in witness['controls'] if c['selector'] == selector)
+    return target, independent
 
 
 class ObservedSession:
@@ -78,48 +78,59 @@ class ObservedSession:
         return {'value': copy.deepcopy(self.snapshot['witness'])}
 
 
-async def refuses(out):
-    target, strict = evidence(out)
-    assert strict['graph_display_strict_visible'] is False
-    session = ObservedSession(out)
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await forms._observe_controls(session, await session.page())
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        forms._disclosure_question(out['page'], target,
-                                   {c['selector']: c for c in out['witness']['controls']}, fixture.URL)
-    assert session.calls == []
-    assert not any(c[0] == 'submit' for c in session.calls)
-
-
-async def test_greenhouse_empty_zero_height_placeholder_visible_v_passes():
-    out = observe()
-    target, strict = evidence(out)
+async def refuses(out, monkeypatch, tmp_path):
+    target, independent = evidence(out)
     assert target['required'] is True
-    assert target['combobox']['phase'] == 'C0' and target['combobox']['displayed_text'] == ''
-    assert strict['graph_label_strict_visible'] is True
-    assert strict['graph_display_strict_visible'] is True
-    proof = dict(out['graphs'][1]['displayProof'])['#location']
-    assert proof == dict(original=False, text='', rects=[ZERO])
-    # Paired nonempty test has the identical zero-height geometry and strict false.
-    assert evidence(observe(changes=[dict(id='location-display', text='Choose', rects=[ZERO])]))[1]['graph_display_strict_visible'] is False
+    assert independent['type'] == 'combobox' and independent['combobox']['linked'] is False
+    assert independent['combobox']['selected_value'] == ''
+    assert independent['combobox']['selected_text'] == ''
+    # A collapsed or transparent sibling display is not proof of a submitted
+    # value. Reobserve safely, then deny at the single production Submit seam.
+    session = ObservedSession(out)
+    observed, lookup = await forms._observe_controls(session, await session.page())
+    assert observed['url'] == out['page']['url']
+    assert lookup['#location']['combobox'] == target['combobox']
+    assert session.calls == []
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
+
+
+async def test_greenhouse_empty_zero_height_placeholder_has_safe_generic_read(
+        monkeypatch, tmp_path):
+    out = observe()
+    target, independent = evidence(out)
+    assert target['required'] is True and independent['visible'] is True
+    assert target['combobox']['displayed_text'] == ''
+    assert target['combobox']['selected_value'] == ''
+    assert independent['visible_text']
+    # A blank zero-height sibling is neither a committed answer nor a reason
+    # to lose the independently inspectable native textarea.
     session = ObservedSession(out)
     page, lookup = await forms._observe_controls(session, await session.page())
     additional = next(c for c in page['controls'] if c['selector'] == '#additional')
-    question = forms._disclosure_question(page, additional, lookup, fixture.URL)
-    assert question['question'] == 'Additional question'
+    assert forms._native_answer(additional)
+    assert additional['required'] is False
+    assert additional['label'] == 'Additional question'
+    assert lookup['#additional']['visible'] is True
     assert session.calls == []
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
 
 
-async def test_greenhouse_empty_zero_height_placeholder_zero_size_v_gates():
-    await refuses(observe(changes=[dict(id='location-value', rects=[{**RECT, 'width': 0, 'height': 0}])]))
+async def test_greenhouse_empty_zero_height_placeholder_zero_size_denies_submit(
+        monkeypatch, tmp_path):
+    await refuses(observe(changes=[dict(
+        id='location-value', rects=[{**RECT, 'width': 0, 'height': 0}])]),
+        monkeypatch, tmp_path)
 
 
-async def test_greenhouse_nonempty_zero_height_placeholder_gates():
-    await refuses(observe(changes=[dict(id='location-display', text='Choose', rects=[ZERO])]))
+async def test_greenhouse_nonempty_zero_height_placeholder_denies_submit(
+        monkeypatch, tmp_path):
+    await refuses(observe(changes=[dict(
+        id='location-display', text='Choose', rects=[ZERO])]), monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize('ambiguous', [False, True])
-async def test_greenhouse_zero_height_single_value_gates(grants, ambiguous):
+async def test_greenhouse_zero_height_single_value_gates(
+        grants, ambiguous, monkeypatch, tmp_path):
     class Selecting(Session):
         async def call(self, *args):
             result = await super().call(*args)
@@ -129,63 +140,103 @@ async def test_greenhouse_zero_height_single_value_gates(grants, ambiguous):
                     change['attrs'] = {'class': 'react-select__single-value react-select__placeholder'}
                 self.snapshot = execute(dict(phases=self.phases, visibility=[change]))
             return result
-    session = Selecting()
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await choose(session, grants)
+    session, filled = Selecting(), {}
+    receipt = await choose(session, grants, filled=filled)
+    # A zero-height/ambiguous sibling display no longer blocks reversible
+    # ARIA option preparation. That visual shape also cannot prove an approved
+    # form-owned submitted value at the ONE final Submit boundary.
     assert session.phases['location'] == 'C2'
-    assert session.calls == [('click', '#location'), ('click', '#location-option')]
-    assert evidence(session.snapshot)[1]['graph_display_strict_visible'] is False
+    assert receipt['action'] == 'combobox' and receipt['committed_value'] == grants['location']
+    assert filled['#location'] == grants['location']
+    assert session.calls == [
+        ('click', '#location'),
+        ('fill', '#location', '--value', grants['location']),
+        ('click', '#location-option'),
+    ]
+    target, independent = evidence(session.snapshot)
+    assert target['combobox'] == independent['combobox']
+    # A typed accessible value and a visual single-value decoration are not
+    # proof of a committed option after this zero-height DOM transition.
+    assert target['combobox']['selected_text'] == ''
+    assert target['combobox']['selected_value'] == ''
+    assert not target.get('name')  # No native submitted receiver from decoration.
     before = list(session.calls)
-    with pytest.raises(forms.Gate, match='visibly editable'):
-        await forms._observe_controls(session, await session.page())
-    assert session.calls == before  # Count setup IPC; none after failed readback.
+    current, witness = await forms._observe_controls(session, await session.page())
+    assert current['controls'] and witness['#location']['combobox'] == target['combobox']
+    assert session.calls == before
+    with pytest.raises(forms.Gate):
+        forms.check_form(current, filled, True, receipts=[receipt])
+    await assert_unapproved_submit_is_refused(
+        session.snapshot, monkeypatch, tmp_path, require_incomplete=False)
     assert not any(c[0] == 'submit' for c in session.calls)
 
 
-def test_greenhouse_required_text_placeholder_still_passes():
+async def test_greenhouse_required_text_placeholder_keeps_required_field(
+        monkeypatch, tmp_path):
     out = observe(original=True)
-    target, strict = evidence(out)
+    target, independent = evidence(out)
     assert target['required'] is True
-    assert dict(out['graphs'][1]['displayProof'])['#location']['text'] == 'Choose'
-    assert dict(out['graphs'][1]['displayProof'])['#location']['original'] is True
-    assert strict['graph_display_strict_visible'] is True
+    assert target['type'] == independent['type'] == 'combobox'
+    assert independent['visible'] is True and independent['visible_text']
+    assert target['combobox']['selected_value'] == ''
+    assert target['combobox']['linked'] is False
+    # A readable placeholder, including 'Choose', is not an approved value.
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
 
 
 async def test_greenhouse_optional_native_control_still_passes():
     out = observe(original=True)
-    target, strict = evidence(out, '#additional')
+    target, independent = evidence(out, '#additional')
     assert target['tag'] == 'textarea' and target['required'] is False
-    assert 'graph_display_strict_visible' not in strict and strict['visible'] is True
+    assert target['label'] == 'Additional question'
+    assert independent['visible'] is True and independent['readonly'] is False
+    assert forms._native_answer(target)
     session = ObservedSession(out)
     page, lookup = await forms._observe_controls(session, await session.page())
-    target = next(c for c in page['controls'] if c['selector'] == '#additional')
-    assert forms._disclosure_question(page, target, lookup, fixture.URL)['question'] == 'Additional question'
+    additional = next(c for c in page['controls'] if c['selector'] == '#additional')
+    assert additional['label'] == 'Additional question'
+    assert forms._native_answer(additional) and lookup['#additional']['visible'] is True
+    assert session.calls == []
 
 
 def test_greenhouse_optional_text_placeholder_still_passes():
     out = observe(original=True, optional=True)
-    target, strict = evidence(out)
+    target, independent = evidence(out)
     assert target['required'] is False
-    assert dict(out['graphs'][1]['displayProof'])['#location']['text'] == 'Choose'
-    assert dict(out['graphs'][1]['displayProof'])['#location']['original'] is True
-    assert strict['graph_display_strict_visible'] is True
+    assert target['type'] == 'combobox' and independent['visible'] is True
+    assert independent['visible_text']
+    # An optional, unselected picker stays optional; the visible caption of
+    # a sibling placeholder cannot be converted to a submitted value.
+    assert target['combobox']['selected_value'] == ''
+    assert target['combobox']['selected_text'] == ''
+    assert target['combobox']['options'] == []
 
 
-async def test_greenhouse_non_strict_label_gates():
+async def test_greenhouse_hidden_label_denies_submit(monkeypatch, tmp_path):
     out = observe(changes=[dict(id='location-label', style={'opacity': '0'})])
-    assert evidence(out)[1]['graph_label_strict_visible'] is False
-    await refuses(out)
+    target, independent = evidence(out)
+    assert target['label']  # Text exists in DOM, but is not visibly evidenced.
+    assert independent['visible_text'] == ''
+    await refuses(out, monkeypatch, tmp_path)
 
 
-async def test_greenhouse_positive_height_opacity_zero_placeholder_gates():
-    await refuses(observe(changes=[dict(id='location-display', text='', rects=[RECT], style={'opacity': '0'})]))
+async def test_greenhouse_positive_height_opacity_zero_placeholder_denies_submit(
+        monkeypatch, tmp_path):
+    out = observe(changes=[dict(
+        id='location-display', text='', rects=[RECT], style={'opacity': '0'})])
+    assert evidence(out)[1]['visible'] is True  # Input, not sibling display.
+    await refuses(out, monkeypatch, tmp_path)
 
 
 @pytest.mark.parametrize('rects', [[], [{**ZERO, 'width': 0}], [ZERO, RECT], [{**ZERO, 'height': -1}]])
-async def test_placeholder_geometry_is_exact_and_complete(rects):
-    out = observe(changes=[dict(id='location-display', text='', rects=rects, style={'opacity': '0'})])
-    if not rects:
-        # No client rect is already excluded by the unchanged graph recognizer.
-        assert dict(out['graphs'][0]['graphs'])['#location'] is None
-    else:
-        await refuses(out)
+async def test_placeholder_geometry_cannot_invent_answer_or_submit(
+        rects, monkeypatch, tmp_path):
+    out = observe(changes=[dict(
+        id='location-display', text='', rects=rects, style={'opacity': '0'})])
+    target, independent = evidence(out)
+    # The generic reader has no shape-certificate exemption for missing,
+    # multiple, zero or negative sibling rectangles. None fills the field.
+    assert target['required'] is True and independent['visible'] is True
+    assert target['combobox']['selected_value'] == ''
+    assert target['combobox']['displayed_text'] == ''
+    await refuses(out, monkeypatch, tmp_path)

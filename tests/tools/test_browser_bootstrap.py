@@ -136,55 +136,234 @@ async def attempt(current, *, facts=None):
                              pk=PK, resume_path='Resume.pdf')
 
 
+# The historic bootstrap tests used an HTTP-loopback URL and a partial row.
+# Those are now rejected at application entry, before _bootstrap is reached.
+# Give just the migrated cases a safe synthetic HTTPS row so they prove the
+# current preparation, approved-writer and final raw-Submit behaviors.
+SECURE_URL = 'https://example-co.test/job/1'
+
+
+def secure_inventory(*controls):
+    page = inventory(*(deepcopy(c) for c in controls), submit(), url=SECURE_URL)
+    page['title'] = 'Synthetic Role'
+    for control in page['controls']:
+        assert control['form_action'] == URL
+        control['form_action'] = SECURE_URL
+    return page
+
+
+def secure_world(monkeypatch, page, *, grants=None):
+    """Use a real tracked HTTPS job for migrated apply/decision regressions."""
+    assert page['url'] == SECURE_URL
+    browser, decide, row = world(monkeypatch, page, grants=grants)
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               title=page['title'], ats='custom')
+    return browser, decide, row
+
+
+async def secure_attempt(page, *, facts=None):
+    assert page['url'] == SECURE_URL
+    return await forms.apply(
+        SECURE_URL, 'example-co', facts or {}, 'synthetic',
+        pk=PK, resume_path='Resume.pdf')
+
+
+def visible_question(page, target):
+    """Fresh named question for a synthetic owner reply, never Submit proof."""
+    proof = {c['selector']: c for c in witness(page)['controls']}
+    question = forms._disclosure_question(
+        page, target, proof, page['url'], bootstrap=True)
+    question['pk'] = PK
+    return question
+
+
+async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, grants=None):
+    row = {
+        'pk': PK, 'company': 'example-co', 'job_id': '1',
+        'jd_url': SECURE_URL, 'title': page['title'], 'ats': 'custom',
+        'status': 'submitting', 'possible_submission': False,
+        'human_approved_answers': grants or {},
+    }
+    monkeypatch.setattr(forms, '_row', lambda pk: row if pk == PK else
+                        pytest.fail('Unexpected synthetic row lookup'))
+    browser = Browser(page)
+    filled, history = {}, []
+    observed = await forms._bootstrap(
+        browser, page, PK, facts or {}, SECURE_URL,
+        filled=filled, history=history, job_url=SECURE_URL,
+        company='example-co')
+    assert observed is page
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+    assert row['status'] == 'submitting' and not row['possible_submission']
+    return browser, row, filled, history
+
+
+async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history, *,
+                              reason, expect_form=True):
+    """Reach the one production final-click decision with synthetic valid PDF.
+
+    Only the form/value evidence is deliberately defective: job, origin, file
+    bytes and read-back attachment are consistent. The real application IPC
+    producer must not call the fake raw transport or create a submission hold.
+    """
+    pdf = tmp_path / 'Resume.pdf'
+    data = b'%PDF-1.4\nsynthetic example-co test-only file\n'
+    pdf.write_bytes(data)
+    attached = field('Resume', '#resume', required=False, type='file',
+                     files=[pdf.name], has_value=True)
+    attached['form_action'] = SECURE_URL
+    assert len([c for c in page['controls'] if c['selector'] == '#submit']) == 1
+    assert not any(c['selector'] == '#resume' for c in page['controls'])
+    page['controls'].insert(-1, attached)
+    submitted, raw_calls, reached_form = [], [], []
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', SECURE_URL, str(pdf), {}, filled, history, {},
+        lambda: submitted.append(True))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+
+    def pdf_identity():
+        assert pdf.read_bytes() == data
+        return len(data), controller.expected_digest
+
+    controller.upload_identity = pdf_identity()
+    controller.upload_completed = True
+    monkeypatch.setattr(controller, '_row_pdf', pdf_identity)
+
+    def preparation(origin):
+        assert origin == SECURE_URL
+        forms._tracked_preparation_job(PK, 'example-co', SECURE_URL)
+
+    def dispatch(pk, path, **kwargs):
+        assert (pk, path) == (PK, str(pdf.resolve()))
+        assert not kwargs
+
+    original_form_check = forms.check_form
+
+    def checked_form(*args, **kwargs):
+        reached_form.append(True)
+        return original_form_check(*args, **kwargs)
+
+    async def read_page(_session):
+        return deepcopy(page)
+
+    async def command(*args, **kwargs):
+        raw_calls.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(controller, '_fresh_preparation', preparation)
+    monkeypatch.setattr(controller, '_page', read_page)
+    monkeypatch.setattr(forms, 'check_dispatch', dispatch)
+    monkeypatch.setattr(forms, 'check_form', checked_form)
+    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *_a, **_kw:
+                        pytest.fail('Unapproved form reached the submission hold'))
+    monkeypatch.setattr(bsk, 'command', command)
+    raw_session = bsk.Session('apply')
+    raw_session.id = 'synthetic-offline'
+    raw_session.bind_application_controller(controller)
+    with pytest.raises(forms.Gate, match=reason):
+        await raw_session.application_effect('click', '#submit')
+    assert reached_form == ([True] if expect_form else [])
+    assert raw_calls == [] and submitted == []
+    assert controller.committed is False
+    assert row['status'] == 'submitting' and row['possible_submission'] is False
+
+
 async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monkeypatch):
+    # An untrusted query cannot manufacture a Greenhouse job/board route.
     url = 'https://employer.test/job/1?gh_jid=42&board=other-tenant'
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
 
     def unavailable_row(*args, **kwargs):
         raise OSError('tracking unavailable')
 
-    # The cross-tenant gate must not depend on tracking storage being reachable.
     monkeypatch.setattr(forms, '_row', unavailable_row)
     monkeypatch.setattr(bsk, 'Session', lambda *a: pytest.fail(
-        'Cross-tenant direct board must be rejected before browser open'))
+        'Malformed job query must not open the application browser'))
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
                                pk=PK, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'Derived board tenant or job' in result['question']
+    assert 'Malformed Greenhouse job identity' in result['question']
+
+    # r06 moves real ATS tenant/board equality to the ONE final click guard.
+    # A safely reached but unrelated allowlisted tenant has no Submit IPC.
+    trusted = 'https://careers.example-co.test/job/1'
+    foreign = 'https://job-boards.greenhouse.io/other-tenant/jobs/1'
+    row = {'pk': PK, 'company': 'example-co', 'job_id': '1',
+           'jd_url': trusted, 'ats': 'greenhouse',
+           'greenhouse_board': 'example-co', 'status': 'submitting',
+           'possible_submission': False}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    # The actual final guard must deny when the configured tenant cannot be
+    # freshly verified, independently of any page-supplied origin hint.
+    monkeypatch.setattr(forms, '_configured_alias', lambda *_a, **_kw: None)
+    writes = []
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', trusted, '', {}, {}, [], {},
+        lambda: writes.append('submit-started'))
+    target = {'selector': '#submit', 'label': 'Submit application',
+              'type': 'submit', 'tag': 'button', 'submit': True,
+              'in_form': True, 'form_selector': '#app',
+              'form_action': foreign}
+    with pytest.raises(forms.Gate, match='tenant or board'):
+        await controller.authorize_final_submit(
+            None, {'url': foreign, 'controls': [target]}, target)
+    assert writes == [] and controller.committed is False
 
 
 @pytest.mark.parametrize('extra,selected', [
     ({}, '#email'),
     ({'type': 'tel'}, '#email'),
 ])
-async def test_first_required_field_gates_before_model_or_write(monkeypatch, extra, selected):
-    c = field(**extra)
-    p = inventory(c, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['status'] == 'gate'
-    q = report['form_question']
-    assert (q['pk'], q['label'], q['selector'], q['form_selector'],
-            q['form_action'], q['tag'], q['type']) == (
-                PK, 'Email', selected, '#application', URL, 'input', c['type'])
-    assert not decide.await_count
-    assert [x[0] for x in browser.calls] == ['navigate', 'evaluate']
+async def test_first_required_field_gates_before_model_or_write(
+        monkeypatch, tmp_path, extra, selected):
+    p = secure_inventory(field(**extra))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert p['controls'][0]['selector'] == selected
+    assert p['controls'][0]['type'] == ('tel' if extra else 'email')
+    assert p['controls'][0]['required'] is True and not p['controls'][0]['has_value']
+    assert [x[0] for x in browser.calls] == ['evaluate']
+    # An unanswered ordinary control is not a bootstrap human gate. The
+    # irreversible boundary must identify Email before any Submit IPC.
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: Email')
 
 
-async def test_dom_order_and_exact_current_grant_only(monkeypatch):
-    c1, c2 = field('First name', '#first'), field('Email', '#email')
-    p = inventory(c1, c2, submit())
-    browser, decide, row = world(monkeypatch, p)
-    assert (await attempt(p))['form_question']['label'] == 'First name'
-    row['human_approved_answers'] = {
-        'First name': {'value': 'Test User', 'selector': '#first', 'url': URL,
-                       'label': 'First name', 'question': '', 'tag': 'input',
-                       'type': 'text', 'form_selector': '#application',
-                       'form_action': URL}}
-    assert (await attempt(p, facts={'First name': 'Test User'}))[
-        'form_question']['label'] == 'Email'
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+async def test_dom_order_and_exact_current_grant_only(monkeypatch, tmp_path):
+    p = secure_inventory(field('First name', '#first'), field('Email', '#email'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert [c['selector'] for c in p['controls'][:2]] == ['#first', '#email']
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: First name')
+
+    # A complete exact grant authorizes the existing writer, not an eager
+    # bootstrap certificate. Only after that real synthetic fill/readback can
+    # the final decision advance deterministically to the next missing field.
+    p = secure_inventory(field('First name', '#first'), field('Email', '#email'))
+    first = p['controls'][0]
+    grant = {**{k: first[k] for k in (
+        'selector', 'label', 'question', 'tag', 'type',
+        'form_selector', 'form_action')},
+        'url': SECURE_URL, 'value': 'Test User'}
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'First name': 'Test User'},
+        grants={'First name': grant})
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, p, {'action': 'fill', 'selector': '#first', 'fact': 'First name'},
+        facts={'First name': 'Test User'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=SECURE_URL)
+    browser.allow_mutations = False
+    history.append(receipt)
+    assert receipt['fact'] == 'First name' and filled == {'#first': 'Test User'}
+    assert p['controls'][0]['has_value'] and p['controls'][0]['value'] == 'Test User'
+    assert p['controls'][1]['has_value'] is False
+    assert [x[0] for x in browser.calls if x[0] != 'evaluate'] == ['fill']
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required field is empty: Email')
 
 
 @pytest.mark.parametrize('prior,bank', [
@@ -198,14 +377,31 @@ async def test_dom_order_and_exact_current_grant_only(monkeypatch):
       'label': 'Email', 'question': ''}, {'Email': 'test@example.test'}),
 ])
 async def test_bank_or_incomplete_or_changed_value_is_not_disclosure(
-        monkeypatch, prior, bank):
-    p = inventory(field(), submit())
-    browser, decide, row = world(monkeypatch, p,
-                                 grants={'Email': prior} if prior else {})
-    report = await attempt(p, facts=bank)
-    assert report['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+        monkeypatch, tmp_path, prior, bank):
+    p = secure_inventory(field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts=bank, grants={'Email': prior} if prior else {})
+    assert not filled and not history
+    assert p['controls'][0]['has_value'] is False
+    # The fact bank and a partial/stale grant cannot authorize the production
+    # writer. An explicit model-selected write is refused without effect.
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts=bank, filled=filled, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+
+    # Even page-autofill of the unapproved bank/prior value cannot make the
+    # final Submit guard accept it as a fresh approved write/readback.
+    displayed = bank.get('Email') or prior.get('value')
+    if displayed:
+        p['controls'][0].update(value=displayed, has_value=True)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason=('Unverified or changed form value: Email'
+                if displayed else 'Required field is empty: Email'))
 
 
 @pytest.mark.parametrize('problem', [
@@ -250,51 +446,75 @@ async def test_no_witness_or_unsafe_receiver_never_mints_grant(
     field('Arbitration consent', '#legal', tag='input', type='radio',
           name='legal', question='Arbitration consent', required=True),
 ])
-async def test_login_and_material_choice_wall_precedes_text_gate(monkeypatch, extra_control):
-    p = inventory(field(), extra_control, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    if extra_control.get('type') == 'checkbox':
-        assert report['form_question']['label'] == 'Email'
+async def test_login_and_material_choice_wall_precedes_text_gate(
+        monkeypatch, tmp_path, extra_control):
+    # An ordinary unanswered field is now a FINAL Submit refusal, not an
+    # early structural bootstrap gate. Keep real login and owner-only legal
+    # decisions as separate pre-disclosure refusals on a safe synthetic route.
+    p = secure_inventory(field(), extra_control)
+    kind = extra_control.get('type')
+    if kind == 'checkbox':
+        browser, row, filled, history = await prepared_without_unapproved_write(
+            monkeypatch, p)
+        assert p['controls'][0]['selector'] == '#email'
+        assert p['controls'][0]['form_action'] == SECURE_URL
+        await final_submit_denied(
+            monkeypatch, tmp_path, p, row, filled, history,
+            reason='Required field is empty: Email')
+        assert all(x[0] not in {'fill', 'click', 'upload'} for x in browser.calls)
     else:
-        assert report['form_question'] is None
-    assert not decide.await_count
-    assert all(x[0] != 'fill' for x in browser.calls)
+        browser = Browser(p)
+        with pytest.raises(forms.Gate) as denial:
+            await forms._bootstrap(browser, p, PK, {}, SECURE_URL)
+        if kind == 'password':
+            assert 'Login or account' in str(denial.value)
+        else:
+            assert denial.value.reason == 'owner_question'
+            assert 'Direct owner review' in str(denial.value)
+        assert not any(x[0] in {'fill', 'click', 'upload'} for x in browser.calls)
 
-
-async def test_required_radio_group_gates_before_later_text(monkeypatch):
+async def test_required_radio_group_gates_before_later_text(monkeypatch, tmp_path):
     radio = field('Evenings', '#evenings', tag='input', type='radio',
                   name='schedule', question='Schedule preference',
                   value='evenings', has_value=True)
     other = field('Mornings', '#mornings', tag='input', type='radio',
                   name='schedule', question='Schedule preference',
                   value='mornings', has_value=True)
-    p = inventory(radio, other, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question']['label'] == 'Schedule preference'
-    assert report['form_question']['radio_members'] == [
-        {'selector': '#evenings', 'caption': 'Evenings', 'value': 'evenings'},
-        {'selector': '#mornings', 'caption': 'Mornings', 'value': 'mornings'}]
-    assert 'Evenings\nMornings' in report['question']
-    assert not decide.await_count
+    p = secure_inventory(radio, other, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert [c['selector'] for c in forms._radio_group(p, p['controls'][0])] == [
+        '#evenings', '#mornings']
+    assert not any(c['checked'] for c in p['controls'][:2])
+    assert p['controls'][2]['selector'] == '#email'
+    assert not any(x[0] in {'click', 'fill'} for x in browser.calls)
+    # The group can be observed without a C0/C1/owner gate. Its first
+    # unresolved required choice, not later Email, blocks the real final click.
+    await final_submit_denied(monkeypatch, tmp_path, p, row, filled, history,
+                              reason='Required choice is empty: Evenings')
 
 
-async def test_duplicate_form_question_never_authorizes_either_sibling(monkeypatch):
-    a = field('First', '#a', question='Contact details')
-    b = field('Second', '#b', question='Contact details')
-    p = inventory(a, b, submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question'] is None
-    assert decide.await_count == 1
+async def test_duplicate_form_question_never_authorizes_either_sibling(
+        monkeypatch, tmp_path):
+    # Identical observed approval questions cannot become two independent
+    # write grants, even if a candidate fact bank contains the same answer.
+    p = secure_inventory(field('First', '#a', question='Contact details'),
+                         field('Second', '#b', question='Contact details'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'Contact details': 'Synthetic answer'})
     for chosen in ('#a', '#b'):
-        with pytest.raises(forms.Gate) as exc:
-            await forms.execute(browser, p, {'action': 'fill', 'selector': chosen,
-                'fact': 'Contact details'}, facts={}, filled={}, resume_path='',
-                company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-                job_url=URL)
-        assert exc.value.form_question is None
+        with pytest.raises(forms.Gate, match='More than one control uses'):
+            await forms.execute(
+                browser, p, {'action': 'fill', 'selector': chosen,
+                             'fact': 'Contact details'},
+                facts={'Contact details': 'Synthetic answer'}, filled=filled,
+                resume_path='', company='example-co', jd_text='', resume_tex='',
+                github='', pk=PK, job_url=SECURE_URL)
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: First')
 
 
 @pytest.mark.parametrize('kind', ['sign-in', 'subscribe', 'account-sibling'])
@@ -318,19 +538,27 @@ async def test_selected_email_on_own_login_or_subscription_form_is_not_grantable
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-async def test_selected_continuation_without_positive_marker_is_generic(monkeypatch):
-    # Architect amendment (c): even model-selected Next/Continue cannot
-    # mint a disclosure grant without a positive native application marker.
-    p = inventory(field(), submit('Next'))
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-    with pytest.raises(forms.Gate) as exc:
-        await forms.execute(browser, p,
-            {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-            facts={}, filled={}, resume_path='', company='example-co',
-            jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
-    assert exc.value.form_question is None
+async def test_selected_continuation_without_positive_marker_is_generic(
+        monkeypatch, tmp_path):
+    # r06 §§1,5,8: a real native Submit cannot be classified as reversible
+    # merely because its caption says Next; an unanswered Email must deny
+    # the SAME final raw-click decision, regardless of model invocation.
+    p = secure_inventory(field())
+    p['controls'][-1]['label'] = 'Next'
+    assert forms.native_submit(p['controls'][-1])
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert not row['human_approved_answers']
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={}, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
 def test_only_actual_direct_owner_reply_persists_complete_identity(monkeypatch):
@@ -451,15 +679,27 @@ def test_direct_writer_refuses_malformed_control_provenance(monkeypatch, missing
     assert _direct_form_label(PK, row) is None
 
 
-async def test_missing_control_label_cannot_create_unwritable_owner_grant(monkeypatch):
-    # Even a unique question is insufficient if the writer cannot bind
-    # an original control_label to the current PAGE observation.
-    p = inventory(field('', '#email', question='Email address'), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['status'] == 'gate' and report['form_question'] is None
-    assert decide.await_count == 1
-    assert not any(x[0] in {'fill', 'select'} for x in browser.calls)
+async def test_missing_control_label_cannot_create_unwritable_owner_grant(
+        monkeypatch, tmp_path):
+    # A unique question is insufficient if its current writable receiver has
+    # no visible control label. r06 permits observing the page, but forbids an
+    # unbound writer and any final Submit with an unanswered required field.
+    p = secure_inventory(field('', '#email', question='Email address'))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    with pytest.raises(forms.Gate, match='Complete native labels'):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email',
+                         'fact': 'Email address'},
+            facts={'Email address': 'Synthetic answer'}, filled=filled,
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty:')
+    assert not row['human_approved_answers'] and not filled and not history
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
 # Settled PR #38 findings: every test is PAGE-shaped and uses a separate
@@ -512,41 +752,52 @@ async def test_material_native_select_options_block_all_grant_routes(
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
-async def test_safe_native_select_options_remain_grantable(monkeypatch):
+async def test_safe_native_select_options_remain_grantable(monkeypatch, tmp_path):
     options = [{'value': '', 'label': 'Choose one'},
                {'value': 'remote', 'label': 'Remote'},
                {'value': 'onsite', 'label': 'On-site'}]
-    location = field('Work location', '#location', tag='select', type='select',
-                     question='Where can you work?', options=options)
-    p = inventory(location, submit())
-    browser, decide, row = world(monkeypatch, p)
-    expected = chr(10).join([
+    p = secure_inventory(field(
+        'Work location', '#location', tag='select', type='select',
+        question='Where can you work?', options=options))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p, facts={'Where can you work?': 'Remote'})
+    observed, fixed = await forms._observe_controls(browser, p)
+    target = forms.control(observed, {'selector': '#location'})
+    question = forms._disclosure_question(
+        observed, target, fixed, SECURE_URL, bootstrap=True)
+    assert {key: question[key] for key in (
+        'label', 'selector', 'form_selector', 'form_action', 'url')} == {
+        'label': 'Where can you work?', 'selector': '#location',
+        'form_selector': '#application', 'form_action': SECURE_URL,
+        'url': SECURE_URL}
+    assert question['options'] == options
+    expected = '\n'.join([
         'Where can you work?', 'Work location', 'Options:',
         'Choose one', 'Remote', 'On-site'])
-    # A bank candidate still requires owner confirmation and shows every
-    # native option in DOM order before any grant or browser write.
-    report = await attempt(p, facts={'Work location': 'Remote'})
-    q = report['form_question']
-    assert q['label'] == 'Where can you work?' and q['options'] == options
-    assert report['question'].startswith(expected)
-    assert row['human_approved_answers'] == {}
-    assert not decide.await_count
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
-    # Model-selected select gates show the same exact question and options.
-    missing = await selected_gate(
-        browser, p, verb='select', selector='#location', key='Work location')
-    assert str(missing) == expected
-    # A matching bank value without a per-job grant still gates with options.
-    exc = await selected_gate(browser, p, verb='select', selector='#location',
-                              key='Work location', facts={'Work location': 'Remote'})
-    assert str(exc).endswith(expected)
-    assert exc.form_question['options'] == options
-    wrong_key = await selected_gate(
-        browser, p, verb='select', selector='#location', key='Other field',
-        facts={'Other field': 'Remote'})
-    assert str(wrong_key).endswith(expected)
-    assert 'exact human-approved fact key' in str(wrong_key)
-    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
+    assert forms._choice_prompt(target, question) == expected
+    # r06 §§2,5: the observed, form-bound question is still actionable
+    # after agent-first triage, but neither a banked answer nor the model's
+    # own chosen key can manufacture the required exact row approval.
+    for key, facts in [
+        ('Where can you work?', {}),
+        ('Where can you work?', {'Where can you work?': 'Remote'}),
+        ('Other field', {'Other field': 'Remote'}),
+    ]:
+        with pytest.raises(forms.Gate) as denied:
+            await forms.execute(
+                browser, p, {'action': 'select', 'selector': '#location',
+                            'fact': key},
+                facts=facts, filled=filled, resume_path='',
+                company='example-co', jd_text='', resume_tex='', github='',
+                pk=PK, job_url=SECURE_URL)
+        assert denied.value.form_question['options'] == options
+        assert expected in str(denied.value)
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Work location')
 
 
 @pytest.mark.parametrize('case,attribute,value', [
@@ -574,54 +825,80 @@ def test_fixed_read_only_script_contains_effective_dom_predicates():
     assert "e.matches(':disabled')" in script
 
 
-async def test_unrelated_native_search_does_not_veto_application(monkeypatch):
+async def test_unrelated_native_search_does_not_veto_application(
+        monkeypatch, tmp_path):
     search = field('Search jobs', '#search', required=False, type='search',
                    form_selector='#site-search')
     search_submit = submit('Search', selector='#search-submit',
                            form_selector='#site-search')
-    p = inventory(search, search_submit, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    exc = await selected_gate(browser, p)
-    assert exc.form_question['label'] == 'Email'
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+    p = secure_inventory(search, search_submit, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    page, fixed = await forms._observe_controls(browser, p)
+    email = forms.control(page, {'selector': '#email'})
+    q = forms._disclosure_question(page, email, fixed, SECURE_URL, bootstrap=True)
+    assert (q['label'], q['selector'], q['form_selector'], q['form_action']) == (
+        'Email', '#email', '#application', SECURE_URL)
+    assert q['form_selector'] != search['form_selector']
+    assert forms._form_subject(page, email) == [
+        item for item in page['controls']
+        if item.get('form_selector') == '#application']
+    # The second native Search Submit has a different owner and cannot be
+    # borrowed by the application. It must not hide the Email question
+    # during preparation or authorize either form's irreversible click.
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Competing native Submit owners', expect_form=False)
+    assert not filled and not history
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
-
-async def test_plausible_competing_native_form_stays_generic(monkeypatch):
+async def test_plausible_competing_native_form_stays_generic(
+        monkeypatch, tmp_path):
     other = field('Candidate reference', '#other', required=False,
                   form_selector='#other-form')
-    p = inventory(other, field(), submit())
-    browser, decide, _ = world(monkeypatch, p)
-    assert (await attempt(p))['form_question'] is None
-    assert decide.await_count == 1
-    assert (await selected_gate(browser, p)).form_question is None
+    p = secure_inventory(other, field())
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    page, fixed = await forms._observe_controls(browser, p)
+    email = forms.control(page, {'selector': '#email'})
+    question = forms._disclosure_question(
+        page, email, fixed, SECURE_URL, bootstrap=True)
+    assert question['label'] == 'Email'
+    assert question['form_selector'] == '#application'
+    assert question['form_selector'] != other['form_selector']
+    # The separate optional native form is not an approval for Email. Neither
+    # form can commit while the real applicant field is still unanswered.
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
+                   for x in browser.calls)
 
 
-@pytest.mark.parametrize('value,eligible', [
-    ('Apply now', True),
-    ('  apply   NOW  ', True),
-    ('Submit application', True),
-    ('Submit', False),
-    ('Apply now!', False),
-    ('Apply', False),
-    ('Next', False),
+@pytest.mark.parametrize('value', [
+    'Apply now', '  apply   NOW  ', 'Submit application', 'Submit',
+    'Apply now!', 'Apply', 'Next',
 ])
-async def test_input_submit_marker_uses_only_exact_closed_allowlist(
-        monkeypatch, value, eligible):
-    native = field('go', '#native-submit', required=False, tag='input',
-                   type='submit', submit=True, value=value, has_value=True)
-    p = inventory(field(), native)
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    if eligible:
-        assert report['form_question']['label'] == 'Email'
-        assert not decide.await_count
-    else:
-        assert report['form_question'] is None
-        assert decide.await_count == 1
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+async def test_native_input_submit_is_irreversible_regardless_of_value(
+        monkeypatch, tmp_path, value):
+    # r06 removes the obsolete early closed allowlist. A real native
+    # input[type=submit] can submit even if its caption says "Next";
+    # an empty Email must prevent ALL of them at the final raw-click seam.
+    p = secure_inventory(field())
+    native = p['controls'][-1]
+    native.update(tag='input', type='submit', submit=True,
+                  label='go', value=value, has_value=True)
+    assert forms.native_submit(native)
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    assert not filled and not history
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 
 @pytest.mark.parametrize('receiver', ['form_action', 'formaction'])
@@ -659,15 +936,15 @@ async def test_native_action_must_match_native_target_before_any_grant_or_ipc(
     assert not browser.calls  # no evaluate and especially no mutating IPC
 
 
-# The later architect amendment makes the positive native application
-# marker a structural grant prerequisite. Wording-only classifier misses from
-# the second source review are notes, not denial rules.
 @pytest.mark.parametrize('case', [
     'input-button-sign-in', 'input-button-subscribe',
     'subscribe-action', 'signin-form-id', 'safe-next',
 ])
 async def test_second_round_structural_marker_is_required_for_model_grants(
-        monkeypatch, case):
+        monkeypatch, tmp_path, case):
+    # An unproved Next label, neighboring account control, or changed native
+    # form is never Submit authority. The only current grant is the exact
+    # per-control row answer; the model's presence cannot create one.
     email = field()
     next_control = submit('Next')
     controls = [email, next_control]
@@ -677,34 +954,60 @@ async def test_second_round_structural_marker_is_required_for_model_grants(
             type='button', submit=False, has_value=True,
             value='Sign in' if case == 'input-button-sign-in' else 'Subscribe'))
     elif case == 'subscribe-action':
-        email['form_action'] = URL + '/subscribe'
-        next_control['form_action'] = URL + '/subscribe'
+        # Change the resolved synthetic receiver only after secure_inventory
+        # rebases its original URL; its helper checks literal input provenance.
+        pass
     elif case == 'signin-form-id':
         email['form_selector'] = '#signin'
         next_control['form_selector'] = '#signin'
-    p = inventory(*controls)
-    browser, decide, _ = world(monkeypatch, p)
-    result = await attempt(p)
-    assert result['form_question'] is None
-    assert decide.await_count == 1
-    exc = await selected_gate(browser, p)
-    assert exc.form_question is None
-    assert all(c[0] not in {'fill', 'select'} for c in browser.calls)
+    # secure_inventory already creates the ONE native Submit receiver.
+    # Feeding it next_control as well would duplicate '#submit', preventing
+    # this security-negative test from reaching the actual final guard.
+    p = secure_inventory(*controls[:-1])
+    p['controls'][-1]['label'] = 'Next'
+    assert sum(c['selector'] == '#submit' for c in p['controls']) == 1
+    assert forms.native_submit(p['controls'][-1])
+    if case == 'subscribe-action':
+        for ctrl in p['controls']:
+            ctrl['form_action'] = SECURE_URL + '/subscribe'
+    elif case == 'signin-form-id':
+        for ctrl in p['controls']:
+            ctrl['form_selector'] = '#signin'
+            ctrl['native_form_owner_selector'] = '#signin'
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, p)
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'fill', 'selector': '#email',
+                         'fact': 'Email'},
+            facts={}, filled=filled, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    await final_submit_denied(
+        monkeypatch, tmp_path, p, row, filled, history,
+        reason='Required field is empty: Email')
+    assert not filled and not history and not row['human_approved_answers']
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 
 async def test_second_round_native_resume_file_is_positive_application_marker(
         monkeypatch):
-    resume = field('Upload resume', '#resume', required=True,
-                   tag='input', type='file', submit=False)
-    p = inventory(field(), resume, submit('Next'))
-    browser, decide, _ = world(monkeypatch, p)
-    # A same-form observed résumé input satisfies structural (c) even when
-    # the continuation submit label is not in the closed final-action list.
-    assert (await attempt(p))['form_question']['label'] == 'Email'
-    assert not decide.await_count
-    exc = await selected_gate(browser, p)
-    assert exc.form_question['label'] == 'Email'
-
+    # The file input and a native Next/Submit remain observable, but neither
+    # is per-step admission for the unanswered Email. The final form guard
+    # owns all mandatory field validation.
+    page = secure_inventory(
+        field(), field('Upload resume', '#resume', type='file', required=True))
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    resume, email = page['controls'][1], page['controls'][0]
+    assert resume['type'] == 'file' and resume['in_form']
+    assert page['controls'][-1]['type'] == 'submit'
+    assert visible_question(page, email)['label'] == 'Email'
+    assert row['human_approved_answers'] == {}
+    assert filled == {} and history == []
+    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
+        forms.check_form(page, filled, uploaded=True)
+    assert [call[0] for call in browser.calls] == ['evaluate']
 
 @pytest.mark.parametrize('label', ['I agree to arbitration', 'Acknowledgement'])
 async def test_second_round_standalone_required_checkbox_remains_page_wall(
@@ -720,39 +1023,41 @@ async def test_second_round_standalone_required_checkbox_remains_page_wall(
 
 
 async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch):
-    """A native direct ATS form progresses only on per-job owner answers.
+    """A real bound answer may be prepared without a per-field human gate.
 
-    All browser effects are synthetic and offline. No click on submit is made.
-    In particular there is no manual browser action for required choices.
+    Synthetic replies only create scoped control grants; the first model
+    action still goes through execute's unchanged exact writer. An ordinary
+    application-processing acknowledgement uses standing code delegation.
+    There is no Submit IPC in this fixture.
     """
     from agent import run
 
     name = field('Full name', '#full-name')
     email = field('Email', '#email')
     phone = field('Phone', '#phone', type='tel')
-    resume = field('Upload résumé', '#resume', tag='input', type='file',
-                   required=True)
-    privacy = field('I agree to privacy policy', '#privacy',
-                    tag='input', type='checkbox', required=True,
+    resume = field('Upload résumé', '#resume', type='file', required=True)
+    privacy = field('I acknowledge processing of my personal data for this application',
+                    '#privacy', type='checkbox', required=True,
                     value='on', has_value=True, checked=False)
-    yes = field('Yes', '#authorized-yes', tag='input', type='radio',
+    yes = field('Yes', '#authorized-yes', type='radio',
                 name='work_authorization', question='Work authorization',
-                required=True, value='yes', has_value=True, checked=False)
-    no = field('No', '#authorized-no', tag='input', type='radio',
+                required=True, value='yes', has_value=True)
+    no = field('No', '#authorized-no', type='radio',
                name='work_authorization', question='Work authorization',
-               required=True, value='no', has_value=True, checked=False)
-    page = inventory(name, email, phone, resume, privacy, yes, no, submit())
-    browser, decide, row = world(monkeypatch, page)
+               required=True, value='no', has_value=True)
+    page = secure_inventory(name, email, phone, resume, privacy, yes, no)
+    browser, decide, row = secure_world(monkeypatch, page)
     browser.allow_mutations = True
-    bank = {}
+    bank, filled, history = {}, {}, []
     answers = [
         ('Full name', 'Test User', 'fill', '#full-name'),
         ('Email', 'test@example.test', 'fill', '#email'),
         ('Phone', '+10000000000', 'fill', '#phone'),
-        ('I agree to privacy policy', 'yes', 'choose', '#privacy'),
+        (privacy['label'], 'yes', 'choose', '#privacy'),
         ('Work authorization', 'Yes', 'choose', '#authorized-yes'),
     ]
-    filled = {}
+    assert row['human_approved_answers'] == {}
+    assert forms._assent_scope(page['controls'][4]) == 'standard_privacy'
 
     class Tracking:
         def get(self, pk):
@@ -765,75 +1070,57 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
 
     stores = SimpleNamespace(
         tracking=Tracking(),
-        answer_bank=SimpleNamespace(put=lambda label, value, *args, **kwargs:
-                                    bank.update({label: value})),
-    )
+        answer_bank=SimpleNamespace(put=lambda label, value, *a, **kw:
+                                    bank.update({label: value})))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_enqueue_apply',
-                        lambda *a, **kw: {'result': 'queued'})
-    assert row['human_approved_answers'] == {}
+    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw:
+                        {'result': 'queued'})
     for key, answer, verb, selector in answers:
-        mutations = sum(call[0] in {'fill', 'select', 'click', 'upload'}
-                        for call in browser.calls)
-        outcome = await attempt(page, facts=bank)
-        assert outcome['status'] == 'gate'
-        question = outcome['form_question']
-        assert question is not None
-        assert (question['label'], question['selector']) == (key, selector)
-        assert not decide.await_count
-        assert sum(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls) == mutations
-        if verb == 'choose' and selector == '#privacy':
-            assert 'Legal acknowledgement:' in outcome['question']
-            assert 'I agree to privacy policy' in outcome['question']
-            assert question['visible_text'] == privacy['label']
+        target = next(c for c in page['controls'] if c['selector'] == selector)
+        question = visible_question(page, target)
+        assert question['label'] == key
         if verb == 'choose' and selector == '#authorized-yes':
-            assert 'Statement about you:' in outcome['question']
-            assert 'Work authorization' in outcome['question']
-            assert 'Yes\nNo' in outcome['question']
-            assert [o['caption'] for o in question['radio_members']] == ['Yes', 'No']
-        row.update(status='needs_human', gate_source='applier',
-                   gate_call_id='direct', jd_url=URL, company='example-co',
-                   gate_pending={'question': outcome['question'],
-                                 'form_question': question})
-        assert run.resume_job(PK, answer, stores)['result'] == 'queued'
-        assert row['human_approved_answers'][key]['value'] == answer
-        row['status'] = 'submitting'
-        action = {'action': verb, 'selector': selector, 'fact': key}
+            assert [o['caption'] for o in question['radio_members']] == [
+                'Yes', 'No']
+        if selector != '#privacy':
+            row.update(status='needs_human', gate_source='applier',
+                       gate_call_id='direct',
+                       gate_pending={'question': forms._choice_prompt(target, question),
+                                     'form_question': question})
+            assert run.resume_job(PK, answer, stores)['result'] == 'queued'
+            assert row['human_approved_answers'][key]['value'] == answer
+            row['status'] = 'submitting'
+        else:
+            assert key not in row['human_approved_answers']
+        actions_before = sum(c[0] in {'fill', 'select', 'click', 'upload'}
+                             for c in browser.calls)
         receipt = await forms.execute(
-            browser, page, action, facts=bank, filled=filled,
-            resume_path='Resume.pdf', company='example-co', jd_text='',
-            resume_tex='', github='', pk=PK, job_url=URL)
-        assert receipt['fact'] == key
-        writes = [call for call in browser.calls if call[0] != 'evaluate']
-        assert writes[-1][0] == ('click' if verb == 'choose' else 'fill')
-        assert sum(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls) == mutations + 1
-
+            browser, page, {'action': verb, 'selector': selector, 'fact': key},
+            facts=bank, filled=filled, resume_path='Resume.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+        history.append(receipt)
+        assert receipt['fact'] == key and receipt['approved_value'] == answer
+        assert sum(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls) == actions_before + 1
     attachment = await forms.execute(
         browser, page, {'action': 'upload', 'selector': '#resume'},
         facts=bank, filled=filled, resume_path='Resume.pdf',
         company='example-co', jd_text='', resume_tex='', github='',
-        pk=PK, job_url=URL)
+        pk=PK, job_url=SECURE_URL)
     assert attachment['uploaded']
-    assert resume['files'] == ['Resume.pdf']
-    forms.check_form(page, filled, uploaded=True, attachment='Resume.pdf')
-    forms.check_approvals(PK, [
-        {'selector': selector, 'fact': key, 'approved_value': answer,
-         'url': URL, 'label': next(c['label'] for c in page['controls']
-                                   if c['selector'] == selector),
-         'question': next(c['question'] for c in page['controls']
-                          if c['selector'] == selector)}
-        for key, answer, _, selector in answers], page)
-    assert set(row['human_approved_answers']) == {item[0] for item in answers}
-    assert all(c[0] != 'click' or c[1] in {'#privacy', '#authorized-yes'}
-               for c in browser.calls)
-    # After every required control is resolved, only the model's ordinary
-    # later decision can gate; no checkbox/radio generic wall remains.
-    final = await attempt(page, facts=bank)
-    assert final['form_question'] is None
+    assert next(c for c in page['controls'] if c['selector'] == '#resume')[
+        'files'] == ['Resume.pdf']
+    forms.check_form(page, filled, uploaded=True, attachment='Resume.pdf',
+                     receipts=history)
+    forms.check_approvals(PK, history, page)
+    assert '#privacy' in filled and '#authorized-yes' in filled
+    assert ('click', '#submit') not in browser.calls
+    outcome = await secure_attempt(page, facts=bank)
+    assert outcome['status'] == 'gate'
+    assert outcome['form_question'] is None
     assert decide.await_count == 1
-
+    assert not any(c == ('click', '#submit') for c in browser.calls)
 
 @pytest.mark.parametrize('checkbox_label', [
     'I agree to privacy policy', 'Ready to apply?',
@@ -845,15 +1132,16 @@ async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(
 
     privacy = field(checkbox_label, '#privacy', type='checkbox', required=True,
                     value='on', has_value=True, checked=False)
-    page = inventory(privacy, submit())
-    browser, decide, row = world(monkeypatch, page)
-    result = await attempt(page)
-    question = result['form_question']
-    assert question['type'] == 'checkbox' and not decide.await_count
-    if checkbox_label == 'Ready to apply?':
-        assert result['question'].startswith('Ready to apply?')
-    bank = {}
-    queue = []
+    page = secure_inventory(privacy)
+    browser, decide, row = secure_world(monkeypatch, page)
+    question = visible_question(page, page['controls'][0])
+    assert question['type'] == 'checkbox'
+    prompt = forms._choice_prompt(page['controls'][0], question)
+    assert checkbox_label in prompt
+    # r06 no longer sends every checkbox to an early human gate. A genuinely
+    # negative owner decision, when obtained, must still refuse the application
+    # and cannot be entered into the reusable answer bank.
+    bank, queue = {}, []
 
     class Tracking:
         def get(self, pk):
@@ -866,12 +1154,10 @@ async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(
         tracking=Tracking(),
         answer_bank=SimpleNamespace(put=lambda *a, **kw: bank.update(used=True)))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_enqueue_apply',
-                        lambda *a, **kw: queue.append(True))
-    row.update(status='needs_human', jd_url=URL, gate_source='applier',
-               gate_call_id='direct', company='example-co',
-               gate_pending={'question': result['question'],
-                             'form_question': question})
+    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: queue.append(True))
+    row.update(status='needs_human', gate_source='applier',
+               gate_call_id='direct',
+               gate_pending={'question': prompt, 'form_question': question})
     refused = run.resume_job(PK, 'no', stores)
     assert refused['result'] == 'gated'
     assert refused['reason'] == 'cannot_proceed'
@@ -881,62 +1167,68 @@ async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(
     assert row.get('human_approved_answers') == {}
     assert bank == {} and queue == []
     assert run.resume_job(PK, 'no', stores)['result'] == 'not_gated'
+    assert not decide.await_count
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
-
 
 async def test_changed_radio_group_after_owner_grant_refuses_write(monkeypatch):
     yes = field('Yes', '#yes', type='radio', name='work_auth',
                 question='Work authorization', value='yes', has_value=True)
     no = field('No', '#no', type='radio', name='work_auth',
                question='Work authorization', value='no', has_value=True)
-    page = inventory(yes, no, submit())
-    browser, _, row = world(monkeypatch, page)
-    q = (await attempt(page))['form_question']
-    row['human_approved_answers'] = {'Work authorization': {
-        'value': 'Yes', 'selector': q['selector'], 'url': q['url'],
-        'label': q['control_label'], 'question': q['question'],
-        'tag': q['tag'], 'type': q['type'],
-        'form_selector': q['form_selector'], 'form_action': q['form_action'],
-        'radio_name': q['radio_name'], 'radio_members': deepcopy(q['radio_members'])}}
-    no['label'] = 'Not sure'
+    page = secure_inventory(yes, no)
+    key, grant = _choice_grant_from_page(page, page['controls'][0], 'Yes')
+    browser, _, row = secure_world(monkeypatch, page, grants={key: grant})
+    # A post-grant label drift invalidates the original group; it may not
+    # borrow the model's fact or the earlier radio-member certificate.
+    current = next(c for c in page['controls'] if c['selector'] == '#no')
+    current['label'] = 'Not sure'
     browser.result = witness(page)
-    report = await attempt(page, facts={'Work authorization': 'Yes'})
-    assert report['status'] == 'gate' and report['form_question'] is None
     browser.allow_mutations = True
     with pytest.raises(forms.Gate):
-        await forms.execute(browser, page,
-            {'action': 'choose', 'selector': '#yes', 'fact': 'Work authorization'},
-            facts={'Work authorization': 'Yes'}, filled={}, resume_path='',
+        await forms.execute(
+            browser, page,
+            {'action': 'choose', 'selector': '#yes', 'fact': key},
+            facts={key: 'Yes'}, filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+            pk=PK, job_url=SECURE_URL)
+    assert row['human_approved_answers'][key] == grant
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
-
 
 @pytest.mark.parametrize('kind', ['checkbox', 'radio'])
 async def test_bank_only_choice_value_never_becomes_a_grant(monkeypatch, kind):
     if kind == 'checkbox':
-        controls = [field('I agree to privacy policy', '#privacy',
+        controls = [field('Confirm details', '#confirm',
                           type='checkbox', value='on', has_value=True)]
-        key, answer = 'I agree to privacy policy', 'yes'
+        key, answer, selector = 'Confirm details', 'yes', '#confirm'
     else:
         controls = [
             field('Yes', '#yes', type='radio', name='work_auth',
                   question='Work authorization', value='yes', has_value=True),
             field('No', '#no', type='radio', name='work_auth',
                   question='Work authorization', value='no', has_value=True)]
-        key, answer = 'Work authorization', 'Yes'
-    page = inventory(*controls, submit())
-    browser, decide, row = world(monkeypatch, page)
-    fact = {key: answer}  # reusable bank value is NOT a per-job owner grant
-    report = await attempt(page, facts=fact)
-    assert report['form_question']['label'] == key
+        key, answer, selector = 'Work authorization', 'Yes', '#yes'
+    page = secure_inventory(*controls)
+    browser, decide, row = secure_world(monkeypatch, page)
+    # A bank value can be advertised to the model only through a separate
+    # exact row/control approval; it does not mint permission to click.
+    result = await secure_attempt(page, facts={key: answer})
+    assert result['status'] == 'gate'
+    assert result['form_question'] is None
+    assert decide.await_count == 1
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            browser, page,
+            {'action': 'choose', 'selector': selector, 'fact': key},
+            facts={key: answer}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert caught.value.form_question is not None
+    assert caught.value.form_question['label'] == key
     assert row['human_approved_answers'] == {}
-    assert not decide.await_count
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
-
 
 @pytest.mark.parametrize('kind', ['checkbox', 'radio'])
 async def test_choice_caption_mismatch_in_dom_witness_gates_without_grant(
@@ -1190,7 +1482,20 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
     assert response['status'] == 'gate'
-    q = response['form_question']
+    assert response['form_question'] is None
+    assert response['review_route'] == 'agent_unavailable'
+    assert decide.await_count == 1
+    assert not row['human_approved_answers']
+    # The old direct-grant envelope can still be checked as an independent
+    # reader exercise, but ordinary missing fields no longer create one in
+    # the real preparation path.
+    observed = browser.current
+    target = next(c for c in observed['controls'] if c['selector'] == '#email')
+    fixed = {c['selector']: c for c in witness(observed)['controls']}
+    q = forms._disclosure_question(
+        observed, target, fixed, GH_WRAP,
+        provenance=_greenhouse_provenance(row))
+    q['pk'] = GH_PK
     assert q['origin_row'] == {
         'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
     assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
@@ -1198,13 +1503,14 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
         'Email', '#email', '#application')
     # Two complete independently witnessed/re-read pairs, then bootstrap's own
     # fresh witness and re-read before disclosing the original question.
-    assert browser.calls == [('navigate', GH_DIRECT)] + [
-        ('evaluate', forms.GREENHOUSE_PAGE),
-        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-        ('evaluate', forms.GREENHOUSE_PAGE)] * 2 + [
-        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS),
-        ('evaluate', forms.GREENHOUSE_PAGE)]
-    assert not decide.await_count
+    assert browser.calls[0] == ('navigate', GH_DIRECT)
+    assert browser.calls.count(('evaluate', forms.GREENHOUSE_PAGE)) >= 2
+    assert browser.calls.count(
+        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS)) >= 2
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
+        forms.check_form(observed, {}, uploaded=True)
 
     # The same synthetic tracking-status seam used by the actual direct writer.
     class Tracking:
@@ -1230,14 +1536,24 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
 
 
 async def test_no_explicit_alias_config_stops_before_navigation(monkeypatch, tmp_path):
-    browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
+    browser, decide, row = _greenhouse_session(monkeypatch, tmp_path)
     (tmp_path / 'watchlist.yaml').write_text('companies: []\n')
     result = await forms.apply(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
+    # r06 permits host-only preparation without an old alias/pin; it never
+    # permits final Submit using that absent tenant identity.
     assert result['status'] == 'gate' and result['form_question'] is None
-    assert browser.calls == [] and not decide.await_count
-
+    assert browser.calls[0] == ('navigate', GH_WRAP)
+    assert all(c[0] in {'navigate', 'evaluate'} for c in browser.calls)
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+    controller = forms.ApplicationIPCController(
+        GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
+        pytest.fail('An unconfigured alias cannot start Submit'))
+    with pytest.raises(forms.Gate, match='tenant or board'):
+        await controller.authorize_final_submit(
+            None, browser.current, browser.current['controls'][-1])
+    assert not decide.await_count or decide.await_count == 1
 
 async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch, tmp_path):
     browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
@@ -1253,9 +1569,12 @@ async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
     assert result['status'] == 'gate' and result['form_question'] is None
-    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
-    assert not decide.await_count
-
+    assert browser.calls[0] == ('navigate', GH_DIRECT)
+    assert sum(c[0] == 'evaluate' for c in browser.calls) >= 1
+    assert all(c[0] in {'navigate', 'evaluate'} for c in browser.calls)
+    # Losing the board pin is not a new per-step denial: re-observation may
+    # continue, but no approved value or Submit was written.
+    assert decide.await_count == 1
 
 @pytest.mark.parametrize('verb,kind', [
     ('fill', 'email'), ('select', 'select'), ('choose', 'checkbox'),
@@ -1281,16 +1600,24 @@ async def test_alias_unsafe_native_receiver_never_mutates(
     monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: True)
     monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
     alias = _greenhouse_provenance(row)
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            browser, p, {'action': verb, 'selector': '#chosen', 'fact': 'Email'},
-            facts={'Email': 'test@example.test'}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
-            resume_tex='', github='', pk=GH_PK, allow_click=True,
-            job_url=GH_WRAP, provenance=alias)
+    if kind == 'submit':
+        # An unbound fake is not a privileged application IPC producer. Route
+        # the committing target through the one real code-owned final verdict.
+        controller = forms.ApplicationIPCController(
+            GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
+            pytest.fail('Unsafe final Submit reached the click-start marker'))
+        with pytest.raises(forms.Gate, match='Final submit receiver is outside'):
+            await controller.authorize_final_submit(None, p, chosen)
+    else:
+        with pytest.raises(forms.Gate):
+            await forms.execute(
+                browser, p, {'action': verb, 'selector': '#chosen', 'fact': 'Email'},
+                facts={'Email': 'test@example.test'}, filled={},
+                resume_path='Resume.pdf', company='example-co', jd_text='',
+                resume_tex='', github='', pk=GH_PK, allow_click=True,
+                job_url=GH_WRAP, provenance=alias)
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
-
 
 @pytest.mark.parametrize('verb', ['upload', 'click'])
 async def test_tracked_action_never_promotes_observed_page_to_origin(
@@ -1370,7 +1697,7 @@ async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_conte
                   submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
     # Even a matching-looking page.url and job_url cannot mint authority.
-    with pytest.raises(forms.Gate, match='verified alias context'):
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
         await forms.execute(
             browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
             facts={'Email': 'test@example.test'}, filled={},
@@ -1410,7 +1737,8 @@ async def test_alias_config_revoked_during_witness_gates_without_question(
         resume_path='Resume.pdf')
     assert outcome['status'] == 'gate'
     assert outcome['form_question'] is None
-    assert not decide.await_count
+    # The revocation is final-tenant evidence, not preparation admission.
+    assert decide.await_count == 1
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
 
@@ -1493,17 +1821,16 @@ async def test_alias_safe_native_continue_stays_under_existing_hold(
 @pytest.mark.parametrize('verb', ['upload', 'click'])
 async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
         monkeypatch, tmp_path, verb):
-    # Evaluate may yield while the explicit board mapping is revoked. The
-    # receiver's pre-await provenance check cannot authorize the later IPC.
+    # Native receiver re-observation remains reversible under a revoked
+    # Greenhouse board pin. The FINAL same-job/tenant guard, not an extra
+    # pre-upload certificate, rejects the irrevocable Submit.
     receiver = (field('Upload résumé', '#resume', type='file',
                       form_action=GH_DIRECT)
                 if verb == 'upload' else
                 submit('Continue', selector='#next', form_action=GH_DIRECT))
-    page = inventory(receiver, url=GH_DIRECT)
+    page = inventory(receiver, submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, _, row = _greenhouse_session(monkeypatch, tmp_path, page)
-    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: pk == GH_PK)
-    monkeypatch.setattr(forms, 'check_before_committing_click',
-                        lambda *args, **kwargs: None)
+    alias = _greenhouse_provenance(row)
     original = browser.call
 
     async def revoke_during_evaluate(*args, **kwargs):
@@ -1513,21 +1840,27 @@ async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
         return result
 
     monkeypatch.setattr(browser, 'call', revoke_during_evaluate)
-    with pytest.raises(forms.Gate, match='mapping'):
-        await forms.execute(
-            browser, page,
-            {'action': verb, 'selector': '#resume' if verb == 'upload' else '#next'},
-            facts={}, filled={}, resume_path='Resume.pdf',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=GH_PK, job_url=GH_WRAP, allow_click=verb == 'click',
-            provenance=_greenhouse_provenance(row))
+    action = {'selector': '#resume' if verb == 'upload' else '#next'}
+    current_page, actual = await forms._fresh_native_receiver(
+        browser, page, action, receiver, alias)
+    assert current_page is not None and actual['selector'] == action['selector']
     assert [call[0] for call in browser.calls] == ['evaluate']
-
+    assert forms._preparation_current(alias)
+    assert not forms._alias_current(alias)
+    controller = forms.ApplicationIPCController(
+        GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
+        pytest.fail('Revoked tenant cannot issue Submit'))
+    with pytest.raises(forms.Gate, match='tenant or board'):
+        await controller.authorize_final_submit(
+            None, page, page['controls'][-1])
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
 
 async def test_alias_revoked_during_session_acquisition_prevents_navigation(
         monkeypatch, tmp_path):
-    # Session acquisition is awaited after the first provenance proof, so
-    # revocation during __aenter__ must deny even the first navigate IPC.
+    # The formerly early board-pin check cannot stop approved host-only
+    # preparation after the await. Session acquisition must not manufacture
+    # a valid final tenant/board identity.
     browser, decide, _ = _greenhouse_session(monkeypatch, tmp_path)
 
     class RevokingSession:
@@ -1543,8 +1876,9 @@ async def test_alias_revoked_during_session_acquisition_prevents_navigation(
         GH_WRAP, 'example-co', {}, 'synthetic', pk=GH_PK,
         resume_path='Resume.pdf')
     assert outcome['status'] == 'gate' and outcome['form_question'] is None
-    assert browser.calls == []
-    assert not decide.await_count
+    assert browser.calls[0] == ('navigate', GH_DIRECT)
+    assert all(call[0] in {'navigate', 'evaluate'} for call in browser.calls)
+    assert decide.await_count == 1
 
 @pytest.mark.parametrize('tag', ['input', 'div'])
 async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
@@ -1563,15 +1897,20 @@ async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
     evidence = witness(current)
     evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
     browser = Browser(current, result=evidence)
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(browser, current, PK, {}, URL)
-    assert gated.value.form_question == {
+    prepared = await forms._bootstrap(browser, current, PK, {}, URL)
+    assert prepared is current
+    fixed = {c['selector']: c for c in evidence['controls']}
+    question = forms._disclosure_question(current, combo, fixed, URL)
+    question['pk'] = PK
+    assert question == {
         'pk': PK, 'label': 'Country', 'control_label': 'Country',
         'question': '', 'selector': '#country', 'url': URL, 'tag': tag,
         'type': 'combobox', 'form_selector': '#application', 'form_action': URL}
     assert [call[0] for call in browser.calls] == ['evaluate']
 
 
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
+        forms.check_form(prepared, {}, uploaded=True)
 @pytest.mark.parametrize('ats,canonical,target,status', [
     ('teamtailor', 'https://example-co.teamtailor.com/jobs/backend-123',
      'https://careers.example-co.test/jobs/backend-123', 301),
@@ -1608,9 +1947,17 @@ async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_wi
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kwargs: None)
     result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
                                pk=pk, resume_path='Resume.pdf')
-
     assert result['status'] == 'gate', result
-    question = result['form_question']
+    assert result['form_question'] is None
+    # The synthetic link is still proven by the real redirect probe, but no
+    # ordinary missing Email prompt is emitted before final Submit.
+    provenance = forms.VendorRedirectProvenance(
+        pk, 'example-co', ats, 'backend-123', canonical, target)
+    item = page['controls'][0]
+    question = forms._disclosure_question(
+        page, item, {c['selector']: c for c in witness(page)['controls']},
+        canonical, provenance=provenance)
+    question['pk'] = pk
     assert question['verified_redirect_url'] == target
     assert question['origin_row'] == {
         'jd_url': canonical, 'company': 'example-co', 'ats': ats,
@@ -1859,7 +2206,6 @@ async def test_vendor_row_drift_during_dom_witness_prevents_field_gate(
     assert result['form_question'] is None
     assert 'job/tenant mapping changed during native control inspection' in result['question']
     assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
-
 
 @pytest.mark.parametrize('matches_fresh_target', [True, False])
 async def test_vendor_resume_requires_grant_for_exact_fresh_probe_target(
@@ -2115,11 +2461,12 @@ async def test_vendor_row_drift_after_decision_gates_before_each_write(
     result = await forms.apply(
         canonical, 'example-co', {}, 'synthetic', pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'Destination changed to an unrelated job or tenant' in result['question']
+    expected = ('bound raw IPC guard' if verb == 'submit' else
+                'lacks current same-job provenance')
+    assert expected in result['question']
     assert len(requests) == 1
     mutating = {'fill', 'select', 'choose', 'combobox', 'upload', 'click'}
     assert not any(call[0] in mutating for call in browser.calls)
-
 
 async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(monkeypatch):
     canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
@@ -2225,57 +2572,40 @@ async def test_vendor_combobox_row_drift_after_initial_observation_has_no_questi
         pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
     assert result['form_question'] is None
-    assert 'changed during combobox observation' in result['question']
+    assert 'tracked posting changed before combobox preparation' in result['question']
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
 
-async def test_apply_without_synthetic_context_checks_approved_history_before_submit(monkeypatch):
-    current = inventory(field('Resume', '#resume', required=False, type='file',
-                              form_action=URL),
-                        field(form_action=URL), submit(form_action=URL))
+async def test_apply_without_synthetic_context_checks_approved_history_before_submit(
+        monkeypatch):
+    # A legacy fake Session has no bound real application IPC producer. Even
+    # after safe approved preparation, it must never click Submit or fabricate
+    # a successful application/uncertain employer effect.
+    current = secure_inventory(
+        field('Resume', '#resume', required=False, type='file'),
+        field())
     approval = {'value': 'test@example.test', 'selector': '#email',
-                'url': URL, 'label': 'Email', 'question': '', 'tag': 'input',
-                'type': 'email', 'form_selector': '#application',
-                'form_action': URL}
-    row = {'pk': PK, 'company': 'example-co', 'job_id': '1',
-           'jd_url': URL, 'ats': 'other', 'status': 'submitting',
-           'possible_submission': False, 'human_approved_answers': {'Email': approval}}
-
-    class SubmitBrowser(Browser):
-        async def call(self, *args, **kwargs):
-            if args[0] == 'click' and args[1] == '#submit':
-                self.calls.append(args)
-                self.current['text'] += ' Thank you for applying'
-                for control in self.current['controls']:
-                    if control['selector'] == '#submit':
-                        control['disabled'] = True
-                return {}
-            return await super().call(*args, **kwargs)
-
-    browser = SubmitBrowser(current)
-    monkeypatch.setattr(bsk, 'Session', lambda kind: browser)
-    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
-    monkeypatch.setattr('core.events.emit', lambda *a, **kw: None)
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
-    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
-    monkeypatch.setattr(forms, 'hold_possible_submission', lambda *a, **kw: None)
-    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
+                'url': SECURE_URL, 'label': 'Email', 'question': '',
+                'tag': 'input', 'type': 'email', 'form_selector': '#application',
+                'form_action': SECURE_URL}
+    browser, decide, row = secure_world(
+        monkeypatch, current, grants={'Email': approval})
     browser.allow_mutations = True
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+    decide.side_effect = [
         {'action': 'upload', 'selector': '#resume'},
         {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'submit', 'selector': '#submit'}]))
-    result = await forms.apply(
-        URL, 'example-co', {'Email': 'test@example.test'}, 'synthetic',
-        pk=PK, resume_path='Resume.pdf')
-    assert result['status'] == 'uncertain', result
-    assert 'Submission clicked' in result['detail']
-    assert any(call[0] == 'fill' for call in browser.calls)
-    assert ('click', '#submit') in browser.calls
-
-
+        {'action': 'submit', 'selector': '#submit'},
+    ]
+    result = await secure_attempt(
+        current, facts={'Email': 'test@example.test'})
+    assert result['status'] == 'gate', result
+    assert 'bound raw IPC guard' in result['question']
+    assert decide.await_count == 3
+    assert [call[0] for call in browser.calls
+            if call[0] in {'fill', 'upload'}] == ['upload', 'fill']
+    assert ('click', '#submit') not in browser.calls
+    assert row['status'] == 'submitting' and not row['possible_submission']
 
 def _marked_name_grant(*, selector="#first", value="Test User", url=GH_DIRECT):
     return {
@@ -2306,7 +2636,6 @@ async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
     facts = MarkdownAnswerBank(path).all_facts("example-co")
     assert facts == {"First Name": "Test User"}
     assert "- **First Name**: Test User" in path.read_text()
-
     p = _marked_greenhouse_page()
     browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, p)
     row["human_approved_answers"] = {"First Name*": _marked_name_grant()}
@@ -2318,12 +2647,16 @@ async def test_greenhouse_first_grant_marked_label_reuses_canonical_disk_fact(
         return approved(pk, key, value, **kwargs)
 
     monkeypatch.setattr(forms, "exact_approval", observe)
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(
-            browser, p, GH_PK, facts, GH_WRAP,
-            provenance=_greenhouse_provenance(row),
-        )
-    assert caught.value.form_question["label"] == "Email"
+    prepared = await forms._bootstrap(
+        browser, p, GH_PK, facts, GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert prepared is p
+    assert not p['controls'][0]['has_value']
+    # The canonical bank value plus an exact grant is not a write receipt:
+    # the final guard still refuses the unfilled first field.
+    with pytest.raises(forms.Gate, match=r'Required field is empty: First Name\*'):
+        forms.check_form(prepared, {}, uploaded=True)
     assert ("First Name*", "Test User", "#first") in checked
     assert not decide.await_count
     assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
@@ -2341,7 +2674,6 @@ async def test_greenhouse_marked_label_execute_retains_grant_and_receipt_identit
     def observe(pk, key, value, **kwargs):
         checked.append((key, value))
         return original(pk, key, value, **kwargs)
-
     monkeypatch.setattr(forms, "exact_approval", observe)
     receipt = await forms.execute(
         browser, p,
@@ -2381,12 +2713,23 @@ async def test_greenhouse_marked_label_never_invents_grant_or_chooses_alias(
         elif problem == "ambiguous-facts":
             facts["first name"] = "Different User"
         row["human_approved_answers"] = {"First Name*": grant}
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(
-            browser, p, GH_PK, facts, GH_WRAP,
-            provenance=_greenhouse_provenance(row),
-        )
-    assert caught.value.form_question["label"] == "First Name*"
+    prepared = await forms._bootstrap(
+        browser, p, GH_PK, facts, GH_WRAP,
+        provenance=_greenhouse_provenance(row),
+    )
+    assert prepared is p
+    assert not p['controls'][0]['has_value']
+    if problem == 'ambiguous-facts':
+        # Differing bank aliases cannot select an approved value.
+        assert forms._fact_key(facts, 'First Name*') is None
+    else:
+        with pytest.raises(forms.Gate, match='exact human-approved answer'):
+            forms.exact_approval(
+                GH_PK, 'First Name*', 'Test User',
+                target=p['controls'][0], url=p['url'],
+                provenance=_greenhouse_provenance(row))
+    with pytest.raises(forms.Gate, match=r'Required field is empty: First Name\*'):
+        forms.check_form(prepared, {}, uploaded=True)
     assert not decide.await_count
     assert not [c for c in browser.calls if c[0] in {"fill", "select", "click", "upload"}]
 
@@ -2473,8 +2816,9 @@ async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
         resume_path="Resume.pdf",
     )
     assert first["status"] == "gate"
-    assert first["form_question"]["label"] == "First Name*"
-    assert not decide.await_count
+    assert first["form_question"] is None
+    assert decide.await_count == 1
+    assert not [c for c in browser.calls if c[0] in {"fill", "click", "upload", "select"}]
 
     path = tmp_path / "facts.md"
     MarkdownAnswerBank(path).put("First Name*", "Test User", AnswerScope.GLOBAL)
@@ -2511,7 +2855,7 @@ async def test_greenhouse_apply_advertises_canonical_fact_with_raw_star_grant(
             "['First Name'].") in advertised[0][0]
     assert advertised[0][1] == []
     assert advertised[1][1][0]["fact"] == "First Name*"
-    assert advertised[1][1][0]["approved_value"] == "Test User"
+    assert "approved_value" not in advertised[1][1][0]
     assert checked and all(item == ("First Name*", "Test User", "#first")
                            for item in checked)
     assert row["human_approved_answers"] == {"First Name*": _marked_name_grant()}
@@ -2589,7 +2933,6 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
     monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: False)
     monkeypatch.setattr(browser_runtime, "available", lambda: (True, ""))
     dispatched = []
-
     async def offline_engine(url, company, enriched, model, **kwargs):
         dispatched.append(dict(enriched))
         assert enriched["First name"] == enriched["First Name"] == "Ada"
@@ -2638,7 +2981,7 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
 def _choice_grant_from_page(page, target, answer):
     nodes = {c['selector']: c for c in witness(page)['controls']}
     question = forms._disclosure_question(
-        page, target, nodes, URL, bootstrap=True)
+        page, target, nodes, page['url'], bootstrap=True)
     grant = {
         'value': answer, 'selector': question['selector'],
         'url': question['url'], 'label': question['control_label'],
@@ -2694,10 +3037,12 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
                          type='checkbox', question='Details confirmation',
                          value='on', has_value=True)
     first = field('First name', '#first', required=False)
-    page = inventory(morning, evening, confirmation, first, submit())
+    page = secure_inventory(morning, evening, confirmation, first)
+    # Bind grants to the actual HTTPS-form receivers, not the pre-rebind builders.
+    morning, evening, confirmation, first = page['controls'][:4]
     key_radio, radio_grant = _choice_grant_from_page(page, morning, 'pm')
     key_checkbox, checkbox_grant = _choice_grant_from_page(page, confirmation, 'yes')
-    browser, decide, row = world(monkeypatch, page)
+    browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {
         key_radio: radio_grant, key_checkbox: checkbox_grant,
         'First name': {'value': 'Test User'},
@@ -2711,6 +3056,15 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
         return original_approval(pk, key, answer, **kwargs)
 
     monkeypatch.setattr(forms, 'exact_approval', capture_approval)
+    trusted_receipts = []
+    raw_execute = forms.execute
+
+    async def capture_execute(*args, **kwargs):
+        receipt = await raw_execute(*args, **kwargs)
+        trusted_receipts.append(deepcopy(receipt))
+        return receipt
+
+    monkeypatch.setattr(forms, 'execute', capture_execute)
     decisions = []
 
     async def route_decision(prompt, model_page, history, *, model):
@@ -2724,7 +3078,7 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
         return {'action': 'gate', 'question': 'Synthetic stop before submit'}
 
     decide.side_effect = route_decision
-    report = await attempt(page, facts={'First name': 'Test User'})
+    report = await secure_attempt(page, facts={'First name': 'Test User'})
     assert report['status'] == 'gate' and report['form_question'] is None
     assert len(decisions) == 3
     prompt, model_page, _ = decisions[0]
@@ -2737,18 +3091,25 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
     assert (radio_choice['selector'], radio_choice['radio_name'],
             radio_choice['question'], radio_choice['form_selector'],
             radio_choice['form_action']) == (
-                '#morning', 'schedule', key_radio, '#application', URL)
+                '#morning', 'schedule', key_radio, '#application', SECURE_URL)
     assert radio_choice['approved_answer'] == {
-        'selector': '#evening', 'caption': evening['label'], 'value': 'pm'}
-    assert radio_choice['radio_members'] == radio_grant['radio_members']
+        'selector': '#evening', 'caption': evening['label']}
+    assert [{k: m[k] for k in ('selector', 'label')}
+            for m in radio_choice['radio_members']] == [
+                {k: m[k] for k in ('selector', 'label')}
+                for m in radio_grant['radio_members']]
+    assert all('value' not in m for m in radio_choice['radio_members'])
     assert check_choice['approved_answer'] == {
-        'selector': '#confirm', 'value': 'yes', 'checked': True}
+        'selector': '#confirm', 'checked': True}
     assert check_choice['control_label'] == confirmation['label']
     assert [c['key'] for c in decisions[1][1]['approved_choices']] == [key_checkbox]
     assert decisions[2][1]['approved_choices'] == []
     receipts = decisions[-1][2]
-    assert [(r['action'], r['fact'], r['approved_value']) for r in receipts] == [
-        ('choose', key_radio, 'pm'), ('choose', key_checkbox, 'yes')]
+    assert [(r['action'], r['fact']) for r in receipts] == [
+        ('choose', key_radio), ('choose', key_checkbox)]
+    assert all('approved_value' not in r for r in receipts)
+    assert [(r['fact'], r['approved_value']) for r in trusted_receipts] == [
+        (key_radio, 'pm'), (key_checkbox, 'yes')]
     assert [call for call in browser.calls if call[0] == 'click'] == [
         ('click', '#evening'), ('click', '#confirm')]
     assert not any(call[0] in {'upload', 'fill', 'select'}
@@ -2757,21 +3118,30 @@ async def test_exact_choice_grants_without_bank_facts_reach_real_apply_and_reche
     assert evening['checked'] and confirmation['checked']
     assert len([v for v in witnessed if v == (key_radio, 'pm', '#morning')]) >= 3
     assert len([v for v in witnessed if v == (key_checkbox, 'yes', '#confirm')]) >= 3
-    forms.check_approvals(PK, receipts, page)
-
+    forms.check_approvals(PK, trusted_receipts, page)
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, receipts, page)
 
 async def test_missing_native_choice_grant_keeps_bound_first_question(monkeypatch):
     box = field('Confirm details', '#confirm', type='checkbox',
                 question='Details confirmation', value='on', has_value=True)
-    page = inventory(box, submit())
-    browser, decide, _ = world(monkeypatch, page)
-    report = await attempt(page)
-    assert report['status'] == 'gate'
-    assert report['form_question']['label'] == 'Details confirmation'
-    assert report['form_question']['selector'] == '#confirm'
-    assert not decide.await_count
+    page = secure_inventory(box)
+    browser, decide, row = secure_world(monkeypatch, page)
+    report = await secure_attempt(page)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert decide.await_count == 1
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            browser, page, {'action': 'choose', 'selector': '#confirm',
+                            'fact': 'Details confirmation'},
+            facts={}, filled={}, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    question = caught.value.form_question
+    assert question is not None
+    assert (question['label'], question['selector']) == (
+        'Details confirmation', '#confirm')
+    assert row['human_approved_answers'] == {}
     assert not any(call[0] == 'click' for call in browser.calls)
-
 
 @pytest.mark.parametrize('failure', [
     'collision', 'group_changed', 'leader_changed', 'checkbox_no',
@@ -2812,8 +3182,6 @@ async def test_bad_native_choice_grants_refuse_unbound_without_ipc(monkeypatch, 
     assert not decide.await_count
     assert not any(call[0] in {'click', 'fill', 'select', 'upload'}
                    for call in browser.calls)
-
-
 @pytest.mark.parametrize('selector,fact', [
     ('#morning', 'Schedule preference'),
     ('#evening', 'Unrelated question'),
@@ -2824,18 +3192,18 @@ async def test_model_choice_selector_and_fact_cannot_substitute_grant(
                     question='Schedule preference', value='am', has_value=True)
     evening = field('Evening', '#evening', type='radio', name='schedule',
                     question='Schedule preference', value='pm', has_value=True)
-    page = inventory(morning, evening, submit())
+    page = secure_inventory(morning, evening)
+    morning = page['controls'][0]  # secure_inventory rebinds this form to HTTPS.
     key, grant = _choice_grant_from_page(page, morning, 'pm')
-    browser, decide, row = world(monkeypatch, page)
+    browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {key: grant}
     browser.allow_mutations = True
     decide.return_value = {'action': 'choose', 'selector': selector,
                            'fact': fact, 'value': 'pm'}
-    report = await attempt(page)
+    report = await secure_attempt(page)
     assert report['status'] == 'gate' and report['form_question'] is None
     assert decide.await_count == 1
     assert not any(c[0] == 'click' for c in browser.calls)
-
 
 @pytest.mark.parametrize('change', ['grant', 'witness'])
 async def test_choice_changed_after_model_advertisement_cannot_click(monkeypatch, change):
@@ -2843,9 +3211,10 @@ async def test_choice_changed_after_model_advertisement_cannot_click(monkeypatch
                     question='Schedule preference', value='am', has_value=True)
     evening = field('Evening', '#evening', type='radio', name='schedule',
                     question='Schedule preference', value='pm', has_value=True)
-    page = inventory(morning, evening, submit())
+    page = secure_inventory(morning, evening)
+    morning = page['controls'][0]  # secure_inventory rebinds this form to HTTPS.
     key, grant = _choice_grant_from_page(page, morning, 'pm')
-    browser, decide, row = world(monkeypatch, page)
+    browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {key: grant}
     browser.allow_mutations = True
     decide.return_value = {'action': 'choose', 'selector': '#evening',
@@ -2868,80 +3237,225 @@ async def test_choice_changed_after_model_advertisement_cannot_click(monkeypatch
         return await original_call(*args, **kwargs)
 
     browser.call = change_on_fresh_witness
-    report = await attempt(page)
+    report = await secure_attempt(page)
     assert observations >= 4
     assert report['status'] == 'gate' and report['form_question'] is None
     assert decide.await_count == 1
     assert not any(c[0] == 'click' for c in browser.calls)
-
 
 @pytest.mark.parametrize('state', ['checked', 'optional', 'disabled'])
 async def test_non_actionable_granted_checkbox_never_advertised_or_clicked(
         monkeypatch, state):
     box = field('Confirm details', '#confirm', type='checkbox',
                 question='Details confirmation', value='on', has_value=True)
-    page = inventory(box, submit())
-    key, grant = _choice_grant_from_page(page, box, 'yes')
+    page = secure_inventory(box)
+    key, grant = _choice_grant_from_page(page, page['controls'][0], 'yes')
     if state == 'checked':
-        box['checked'] = True
+        page['controls'][0]['checked'] = True
     elif state == 'optional':
-        box['required'] = False
+        page['controls'][0]['required'] = False
     else:
-        box['disabled'] = True
-    browser, decide, row = world(monkeypatch, page)
-    row['human_approved_answers'] = {key: grant}
+        page['controls'][0]['disabled'] = True
+    browser, decide, row = secure_world(monkeypatch, page, grants={key: grant})
     browser.allow_mutations = True
-    report = await attempt(page)
+    report = await secure_attempt(page)
     assert report['status'] == 'gate'
-    if state == 'disabled':
-        assert report['form_question'] is None and not decide.await_count
-    else:
-        assert decide.await_count == 1
-        assert decide.call_args.args[1]['approved_choices'] == []
+    assert decide.await_count == 1
+    # A disabled, optional or already checked choice must not appear as a
+    # model-authorized mutable target despite the historical owner grant.
+    assert decide.call_args.args[1]['approved_choices'] == []
     assert not any(c[0] == 'click' for c in browser.calls)
+    assert row['status'] == 'submitting'
 
 async def test_optional_disabled_native_input_does_not_block_required_gate(
-        monkeypatch, caplog):
-    """Required-field traversal must skip non-required, disabled siblings."""
+        monkeypatch, tmp_path, caplog):
+    """Optional disabled siblings never satisfy an unanswered required choice."""
     optional = field('Optional detail', '#optional', required=False, disabled=True)
     pending = field('Contact preference', '#choice', type='checkbox',
                     question='Preferred contact', value='on', has_value=True)
-    page = inventory(optional, pending, submit())
-    browser, decide, _ = world(monkeypatch, page)
+    page = secure_inventory(optional, pending)
     with caplog.at_level('INFO', logger=forms.__name__):
-        report = await attempt(page)
-    assert report['status'] == 'gate'
-    assert report['form_question']['selector'] == '#choice'
+        browser, row, filled, history = await prepared_without_unapproved_write(
+            monkeypatch, page)
     lines = [record.getMessage() for record in caplog.records
              if record.name == forms.__name__ and
              record.getMessage().startswith('bootstrap field decision ')]
-    assert len(lines) == 1 and "'decision': 'needs-human'" in lines[0]
-    assert not decide.await_count
-    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
-
+    assert len(lines) == 1 and "'decision': 'left-to-model'" in lines[0]
+    assert "'type': 'checkbox'" in lines[0]
+    await final_submit_denied(
+        monkeypatch, tmp_path, page, row, filled, history,
+        reason='Required acknowledgement not completed: Contact preference')
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 async def test_required_radio_group_with_optional_leader_has_one_gate_record(
-        monkeypatch, caplog):
-    """The radio group's aggregate requiredness is not its first input's flag."""
+        monkeypatch, tmp_path, caplog):
+    """Aggregate native-radio requiredness survives an optional first member."""
     first = field('Morning', '#morning', type='radio', name='schedule',
                   question='Schedule preference', value='am',
                   required=False, has_value=True)
     second = field('Evening', '#evening', type='radio', name='schedule',
                    question='Schedule preference', value='pm',
                    required=True, has_value=True)
-    page = inventory(first, second, submit())
-    browser, decide, _ = world(monkeypatch, page)
+    page = secure_inventory(first, second)
     with caplog.at_level('INFO', logger=forms.__name__):
-        report = await attempt(page)
-    assert report['status'] == 'gate'
-    assert report['form_question']['label'] == 'Schedule preference'
-    assert report['form_question']['radio_members'][1]['selector'] == '#evening'
+        browser, row, filled, history = await prepared_without_unapproved_write(
+            monkeypatch, page)
+    assert [c['selector'] for c in forms._radio_group(
+        page, page['controls'][0])] == ['#morning', '#evening']
     lines = [record.getMessage() for record in caplog.records
              if record.name == forms.__name__ and
              record.getMessage().startswith('bootstrap field decision ')]
     assert len(lines) == 1
     assert "'type': 'radio'" in lines[0]
     assert "'required': True" in lines[0]
-    assert "'decision': 'needs-human'" in lines[0]
-    assert not decide.await_count
-    assert not any(c[0] in {'fill', 'select', 'click', 'upload'} for c in browser.calls)
+    assert "'decision': 'left-to-model'" in lines[0]
+    await final_submit_denied(
+        monkeypatch, tmp_path, page, row, filled, history,
+        reason='Required choice is empty: Evening')
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeypatch):
+    """An unlabelled native group can be observed, but never granted or submitted.
+
+    The old per-step card-shape gate barred unrelated safe preparation. r06
+    instead retains the unanswered radios for the final code-owned guard.
+    """
+    page = secure_inventory(
+        field('First option', '#answer-a', tag='input', type='radio',
+              name='screening-answer', value='first', required=True),
+        field('Second option', '#answer-b', tag='input', type='radio',
+              name='screening-answer', value='second', required=True),
+    )
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    assert browser.pages > 0
+    assert not any(c[0] in {'click', 'fill', 'select', 'upload'}
+                   for c in browser.calls)
+    assert row['human_approved_answers'] == {}
+    assert filled == {} and history == []
+    with pytest.raises(forms.Gate, match='visible question'):
+        forms._bound_target(page, page['controls'][0])
+    with pytest.raises(forms.Gate, match='Required choice is empty'):
+        forms.check_form(page, filled, True)
+
+
+def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+    """A visible privacy choice needs the owner's exact current question."""
+    question_text = 'I consent to sharing personal data with marketing partners'
+    page = secure_inventory(
+        field(question_text, '#marketing', tag='input', type='checkbox',
+              value='yes', required=True),
+    )
+    independent = {c['selector']: c for c in witness(page)['controls']}
+    with pytest.raises(forms.Gate) as exc:
+        forms._bootstrap_wall(page, independent, SECURE_URL)
+    assert exc.value.reason == 'owner_question'
+    assert exc.value.form_question is not None
+    assert exc.value.form_question['control_label'] == question_text
+    assert exc.value.form_question['selector'] == '#marketing'
+    assert exc.value.form_question['form_action'] == SECURE_URL
+    assert question_text in str(exc.value)
+    # A missing independent accessibility witness never invents a question.
+    inaccessible = deepcopy(independent)
+    inaccessible['#marketing']['visible'] = False
+    with pytest.raises(forms.Gate) as blocked:
+        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+    assert blocked.value.reason == 'owner_question'
+    assert blocked.value.form_question is None
+    assert 'Direct owner review' in str(blocked.value)
+
+
+
+@pytest.mark.parametrize('verb,caption', [
+    ('submit', 'Submit application'), ('click', 'Continue'),
+])
+async def test_unbound_application_session_cannot_issue_committing_click(
+        monkeypatch, verb, caption):
+    """A fake/nonbinding Session cannot bypass the one raw Submit guard.
+
+    The synthetic HTTPS row, current form and already attached test PDF are
+    otherwise admissible. A complete form is not authority for raw click IPC.
+    """
+    page = secure_inventory(field(
+        'Resume', '#resume', type='file', required=False,
+        files=['Test User Resume.pdf'], has_value=True))
+    page['controls'][-1]['label'] = caption
+    browser, decide, row = world(monkeypatch, page)
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               ats='custom', title=page['title'])
+    decide.return_value = {'action': verb, 'selector': '#submit'}
+
+    report = await forms.apply(
+        SECURE_URL, 'example-co', {}, 'synthetic',
+        pk=PK, resume_path='Test User Resume.pdf')
+    assert report['status'] == 'gate'
+    assert 'bound raw IPC guard' in report['question']
+    assert 'no click is safe' in report['question']
+    assert decide.await_count == 1
+    assert not any(call[0] == 'click' for call in browser.calls)
+    assert row['status'] == 'submitting' and row['possible_submission'] is False
+
+
+def _synthetic_aria_role_combobox_page(tag='button'):
+    combo = dict(
+        linked=True, link_id='work-mode-list', listbox_selector='#work-mode-list',
+        options=[dict(selector='#work-mode-remote', unique=True,
+                      value='remote', label='Remote')],
+        selected_text='', displayed_text='', selected_value='',
+        hidden_selector='', hidden_value='',
+    )
+    return secure_inventory(field(
+        'Work mode', '#work-mode', tag=tag, type='combobox',
+        question='Work mode', combobox=combo, submit=False, href='',
+    ))
+
+
+@pytest.mark.parametrize('tag', ['button', 'span'])
+def test_safe_aria_combobox_roles_are_tag_independent(tag, monkeypatch):
+    # Never query the owner's tracking store in offline synthetic proof.
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'possible_submission': False,
+        'human_approved_answers': {},
+    })
+    # A documented ARIA role/linkage is evidence; a React-specific input/div
+    # taxonomy is not. The independent transport witness must still agree.
+    page = _synthetic_aria_role_combobox_page(tag)
+    independent = witness(page)
+    independent['controls'][0]['combobox'] = deepcopy(
+        page['controls'][0]['combobox'])
+    proof = {c['selector']: c for c in independent['controls']}
+    question = forms._disclosure_question(
+        page, page['controls'][0], proof, SECURE_URL)
+    assert question['type'] == 'combobox'
+    assert question['tag'] == tag
+    assert question['selector'] == '#work-mode'
+    assert question['form_action'] == SECURE_URL
+    assert question['label'] == 'Work mode'
+    # Neither valid accessibility nor options grant an unapproved answer.
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
+        forms.exact_approval(
+            'example-co#1', question['label'], 'Remote',
+            target=page['controls'][0], url=SECURE_URL)
+
+
+@pytest.mark.parametrize('unsafe', [
+    {'submit': True},
+    {'navigates': True},
+    {'href': 'https://foreign.example-co.test/open'},
+    {'formaction': 'https://foreign.example-co.test/submit'},
+    {'combobox': {'linked': True, 'link_id': '',
+                  'listbox_selector': '', 'options': []}},
+])
+def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
+    page = _synthetic_aria_role_combobox_page()
+    page['controls'][0].update(unsafe)
+    proof = witness(page)
+    proof['controls'][0]['combobox'] = deepcopy(
+        page['controls'][0]['combobox'])
+    with pytest.raises(forms.Gate, match='safe, exclusively linked ARIA combobox'):
+        forms._disclosure_question(
+            page, page['controls'][0],
+            {c['selector']: c for c in proof['controls']},
+            SECURE_URL)

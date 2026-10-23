@@ -6,6 +6,8 @@ import subprocess
 from html.parser import HTMLParser
 from pathlib import Path
 
+import pytest
+
 from tools import browser_skill_apply as forms
 from tools import browser_skill_fixture as fixture
 from tests.tools.test_browser_greenhouse_parity import instrument
@@ -57,12 +59,22 @@ def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():
     assert initial['page']['greenhouse']['root']['selector'] == '#application-form'
     assert all(c['type'] == 'submit' for c in initial['page']['controls'])
     assert not any(forms._native_answer(c) for c in initial['page']['controls'])
-    assert later['page']['inventory_verified'] and not later['page']['opaque_controls']
-    assert later['graphs'][0] == later['graphs'][1]
-    assert len(later['graphs'][0]['proxies']) == 2
-    assert [c['selector'] for c in later['page']['controls']] == [c['selector'] for c in later['witness']['controls']]
-    assert not {'#country-clear', '#iti-0__search-input'} & {c['selector'] for c in later['page']['controls']}
+    # Hydration does not mint form-value authority. Generic ARIA exposes
+    # receivers, while the large unresolved phone-country list remains opaque
+    # at the one irreversible Submit boundary.
+    assert later['page']['opaque_controls'] is True
+    assert later['page']['inventory_verified'] is False
+    assert later['page']['opaque_count'] > 0
+    with pytest.raises(forms.Gate, match='opaque'):
+        forms._inventory_ok(later['page'])
+    assert [c['selector'] for c in later['page']['controls']] == [
+        c['selector'] for c in later['witness']['controls']]
     assert any(c['selector'] == '#additional' for c in later['page']['controls'])
+    assert any(c['selector'] == '#country' for c in later['page']['controls'])
+    # The two native required validation proxies cannot vanish merely
+    # because their visual React parents are hydration decorations.
+    assert sum(c['required'] and c['type'] == 'text' and not c['name']
+               for c in later['page']['controls']) >= 2
 
 
 def test_greenhouse_hydration_script_is_valid_and_other_leg_content_unchanged():

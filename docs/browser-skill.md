@@ -203,16 +203,17 @@ ledger is not a cross-PK identity index; no universal different-PK uniqueness
 or automatic historical merge is claimed.
 
 **Operator dry-run and adoption interpretation:** (a) a dry-run changes no
-data; a separately authorized **committed** Greenhouse pin is immediately
-relevant to existing **query-form** tenant admission on the already deployed
-application code, (b) a pin is tenant evidence, **never** human approval:
-existing approval, duplicate, hold, provenance, navigation and submit guards,
-and application-entry **code**, remain unchanged, and (c) changing the
-Databricks watchlist to a **nonempty independently verified board** changes
-still-unpinned rows' diagnostic reason from
-`defect_greenhouse_tenant_alias` to `defect_tenant` — **not**
-to successful tenant admission. Numeric-terminal suffix URLs are not asserted
-application-route eligible by #138.
+data; a separately authorized **committed** Greenhouse pin supplies tenant
+evidence to the existing query-form admission at #139's one final Submit
+guard, (b) a pin is tenant evidence, **never** human approval: existing
+approval, duplicate, hold, provenance, navigation and Submit protections
+remain. #138 itself does not change application-entry code; #139 uses the
+tenant evidence at the single final decision while allowing only its approved
+reversible preparation. (c) Changing the Databricks watchlist to a
+**nonempty independently verified board** changes still-unpinned rows'
+diagnostic reason from `defect_greenhouse_tenant_alias` to `defect_tenant` —
+**not** to successful tenant admission. Numeric-terminal suffix URLs are not
+asserted application-route eligible by #138.
 
 If Databricks company-wide board ownership is not independently proved from an
 official public employer-to-board link or equivalent source, leave its tracked
@@ -227,6 +228,29 @@ review, not a repair. After a later merge the operator records the adopted
 row re-derivation and any requeue require separate operator authorization.
 Tests and smoke use only synthetic offline data, never a real feed, record,
 browser, application, Redis instance or submission.
+
+
+### Issue #139: application preparation and final Submit boundary
+
+At application preparation, the code-owned approved HTTPS employer/ATS host
+restriction allows `jobs.ashbyhq.com`, `jobs.lever.co` and host-only
+`job-boards.greenhouse.io` without requiring an already-current board pin,
+legacy wrapper certificate or tenant equality before reversible work.
+This permits approved field writes, accessible-choice changes and upload of
+the exact seed-valid row PDF under their per-action protections; it does not
+authorize application submission. A uniquely observed native form owner may be
+projected to focus preparation, but an absent or hydrating native census is not
+an independent per-step approval or final Submit certificate. Independently
+witnessed form receivers, approved values and safe destinations still govern
+each write, and ambiguity cannot authorize the irreversible click.
+
+The one final code-owned raw-click guard re-reads the current tracked row,
+configured/pinned tenant, final job and origin, approvals, duplicate/hold
+state, posting generation and seed-bound PDF. A missing, stale or foreign
+board/pin refuses that irreversible click, even when approved fields,
+accessible options and the correct PDF were prepared. Re-verify the board
+and row through the existing operator mechanism; do not rewrite legacy
+tracking rows or infer tenant membership from page hints.
 
 ## Operation and guarantees
 

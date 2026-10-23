@@ -99,10 +99,22 @@ async def test_each_read_retries_safe_nonqualifying_observation(fast, at, flag, 
         forms._greenhouse_safety({**result, 'greenhouse': {**result['greenhouse'], 'root': None}},
                                  scoped.allowed, ALIAS)
     monkeypatch.setattr(forms, '_alias_current', lambda *args, **kwargs: True)
-    monkeypatch.setattr(forms, '_row', lambda *args, **kwargs: {})
-    with pytest.raises(forms.Gate) as human:
-        await forms._bootstrap(scoped, result, ALIAS.pk, {}, provenance=ALIAS)
-    assert human.value.form_question['label'] == 'Additional question'
+    tracked = {'pk': ALIAS.pk, 'company': ALIAS.company, 'job_id': ALIAS.job_id,
+               'jd_url': ALIAS.wrapper, 'ats': 'greenhouse',
+               'status': 'submitting', 'possible_submission': False,
+               'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda *args, **kwargs: tracked)
+    # The absent ordinary answer does not create a historic per-step human
+    # gate. Preparation may continue; the final guard must reject the current
+    # required form value rather than infer an approval from PAGE text.
+    prepared = await forms._bootstrap(
+        scoped, result, ALIAS.pk, {}, provenance=ALIAS)
+    assert prepared['controls'][0]['label'] == 'Additional question'
+    assert prepared['controls'][0]['value'] == ''
+    assert not prepared['controls'][0]['has_value']
+    with pytest.raises(forms.Gate, match='Required field is empty: Additional question'):
+        forms.check_form(prepared, {}, uploaded=True)
+    assert all(kind in {'page', 'witness'} for kind in raw.reads)
 
 
 @pytest.mark.parametrize('at', [0, 1, 2])
@@ -190,15 +202,30 @@ COMBO_EQUALS = ['mode', 'phase', 'quarantined', 'required_proxy_mounted', 'label
                 'field_selector', 'value_container_selector', 'input_wrapper_selector',
                 'receiverless_country', 'country_graph', 'link_id', 'linked', 'listbox_selector',
                 'options', 'selected_text', 'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value']
+# r06 treats malformed or split read-only identity evidence as a bounded,
+# non-authorizing reobservation, not an immediate per-step shape certificate.
 RETRY = ['greenhouse.equal', 'controls.length.equal', 'visible_text.required_nonempty',
          'combobox.link_id.required_nonempty', 'selector.equal', 'visible_text.equal', 'options.equal',
-         'combobox.equal', 'inventory.identity.equal'] + [k+'.equal' for k in CONTROL_EQUALS] + [
+         'combobox.equal', 'inventory.identity.equal', 'selector.unique', 'combobox.object',
+         'combobox.PAGE.object', 'combobox.linked.shape'] + [
+             k+'.equal' for k in CONTROL_EQUALS] + [
              'combobox.'+k+'.equal' for k in COMBO_EQUALS]
-FATAL = ['url.equal', 'selector.unique', 'unique.true', 'unique_form.true', 'witness.object',
-         'controls.list', 'control.object', 'combobox.object', 'combobox.PAGE.object',
-         'combobox.linked.shape', 'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
-         'caption-wrong-type', 'link-wrong-type']
+FATAL = ['url.equal', 'unique.true', 'unique_form.true', 'witness.object',
+         'controls.list', 'control.object',
+         'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
+         'caption-wrong-type']
+# No per-step graph certificate: a malformed optional link hint may be observed
+# reversibly, but cannot supply the missing submitted value at final Submit.
+OBSERVATIONAL = ['link-wrong-type']
 
+
+RETIRED_COMBOBOX_STEP_PREDICATES = {
+    'combobox.link_id.required_nonempty',
+    *('combobox.' + key + '.equal' for key in (
+        'mode', 'phase', 'quarantined', 'required_proxy_mounted',
+        'label_selector', 'field_selector', 'value_container_selector',
+        'input_wrapper_selector', 'receiverless_country', 'country_graph')),
+}
 
 def drift(predicate, p, w):
     c, wc = p['controls'][1], w['controls'][1]
@@ -239,7 +266,7 @@ def drift(predicate, p, w):
     return w
 
 
-@pytest.mark.parametrize('predicate', RETRY + FATAL)
+@pytest.mark.parametrize('predicate', RETRY + FATAL + OBSERVATIONAL)
 async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate, monkeypatch):
     p = combo_page()
     if predicate == 'options.equal':
@@ -275,25 +302,92 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
         raw.hook = recover
         await wait(scoped)
         assert len(raw.reads) >= 8
-        # Sensitivity: delete only this readiness permission in memory. The
-        # identical production comparison must now be fatal with this predicate.
-        monkeypatch.setattr(forms, '_GREENHOUSE_READINESS_PREDICATES', set(RETRY)-{predicate})
-        raw = Raw(deepcopy(baseline), change)
-        scoped = session(raw)
-        with pytest.raises(forms.Gate, match='predicate='+predicate.replace('.', r'\.')) as exc:
-            await wait(scoped)
-        assert 'bounded wait' not in str(exc.value)
+        if predicate not in RETIRED_COMBOBOX_STEP_PREDICATES:
+            # The catalog was removed: a permanent PAGE/fixed disagreement
+            # must still consume only the read-only budget, never grant IPC.
+            async def persistent(index, kind, value):
+                if predicate == 'inventory.identity.equal' and kind == 'page' and index % 3 == 2:
+                    value['controls'][0]['label'] = 'Changed question'
+                elif kind == 'witness':
+                    value = drift(predicate, permanent.current, value)
+                return value
+            permanent = Raw(deepcopy(baseline), persistent)
+            with pytest.raises(forms.Gate, match='after bounded wait'):
+                await wait(session(permanent), .02)
+            assert len(permanent.reads) >= 2
+            assert all(kind in {'page', 'witness'} for kind in permanent.reads)
+        # Retired shape/phase predicates are not per-step human gates. Their
+        # missing form-own receiver is refused by the final Submit guard.
+    elif predicate in OBSERVATIONAL:
+        # Both independent readers can agree on an optional, receiverless
+        # combobox despite its malformed historic link hint. Its missing
+        # form-owned value must still fail the one final code-owned guard.
+        admitted = await wait(scoped)
+        assert admitted['controls'][1]['combobox']['link_id'] is None
+        question, picker = admitted['controls'][0:2]
+        question.update(value='Approved detail', has_value=True)
+        picker['combobox'].update(
+            selected_text='Approved location', displayed_text='Approved location',
+            selected_value='location-code', hidden_selector='#receiver',
+            hidden_value='location-code')
+        with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+            forms.check_form(admitted, {
+                '#answer': 'Approved detail', '#location': 'Approved location'}, True)
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
-        assert 'bounded wait' not in str(exc.value)
-        assert len(raw.reads) <= 3
+        if predicate == 'unlisted':
+            # _page_identity raises ValueError during readiness. The r06
+            # waiter treats unavailable read-only identity evidence as bounded
+            # instability; it never authorizes an applicant IPC.
+            assert 'unstable application form inventory after bounded wait' in str(exc.value)
+            assert len(raw.reads) >= 3
+        else:
+            assert 'bounded wait' not in str(exc.value)
+            # These two structural failures require the second fresh PAGE read
+            # before the witness mismatch becomes observable; still fail closed.
+            assert len(raw.reads) <= (4 if predicate in {
+                'selector.unique', 'combobox.linked.shape'} else 3)
+        assert all(kind in {'page', 'witness'} for kind in raw.reads)
     assert scoped._readiness is False
 
 
-async def test_allowlist_is_closed_and_exact():
-    assert forms._GREENHOUSE_READINESS_PREDICATES == set(RETRY)
-    assert not (forms._GREENHOUSE_READINESS_PREDICATES & set(FATAL))
+def test_absent_hidden_form_receiver_is_a_final_submit_negative():
+    page = combo_page()
+    question = page['controls'][0]
+    question.update(value='Approved detail', has_value=True)
+    picker = page['controls'][1]
+    picker['combobox'].update(
+        linked=True, link_id='list', selected_text='Approved location',
+        displayed_text='Approved location', selected_value='location-code',
+        hidden_selector='#receiver', hidden_value='location-code')
+    # All visible values are correct; no actual hidden input exists. A shape
+    # phase is irrelevant, but the ONE final guard may not authorize Submit.
+    with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+        forms.check_form(
+            page, {'#answer': 'Approved detail', '#location': 'Approved location'},
+            uploaded=True)
+
+
+@pytest.mark.parametrize('fault', [
+    'unverified', 'truncated', 'opaque', 'shadow', 'frame',
+])
+def test_final_submit_refuses_incomplete_inventory_without_legacy_readiness_catalog(fault):
+    current = combo_page()
+    if fault == 'unverified':
+        current['inventory_verified'] = False
+    elif fault == 'truncated':
+        current['truncated'] = True
+    elif fault == 'opaque':
+        current['opaque_controls'] = True
+    elif fault == 'shadow':
+        current['shadow_roots'] = True
+    else:
+        current['unsupported_frames'] = ['synthetic-frame']
+    # A qualifying observed prefix is not a certificate for the unobserved
+    # remainder. This is the real final form guard, not a mutable pre-step list.
+    with pytest.raises(forms.Gate, match='incomplete|uninspectable'):
+        forms.check_form(current, {}, uploaded=True)
 
 
 async def test_null_multiple_root_never_admits_and_times_out(fast):

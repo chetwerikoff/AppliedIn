@@ -101,23 +101,35 @@ def traversal(state, *, premature=False):
     state.combo_observations = {k: dict(outcome='committed', visible_text=fixture._FACTS[k],
                                       selected_value=v, hidden_value=v)
                                 for k, v in fixture._MACHINE_VALUES.items()}
-    state.combo_observations['Country'] = {'outcome': 'committed'}
+    # An ID-less visual Greenhouse Country caption has no submitted form
+    # receiver. The aggregate reports stage progression, not a fake C2 grant.
+    state.combo_observations['Country'] = {'outcome': 'not_committed'}
     state.ipc_index = len(state._positive_ipc())
     state.input_values = {'#name': 'Test User', '#phone': fixture._FACTS['Phone']}
     state.last_page['controls'] = [dict(selector='#phone', value=fixture._FACTS['Phone'])]
+    # Four current form-owned combobox selections, each with its independent
+    # named hidden receiver. The fifth Country is only a visual preparation
+    # action: no invented form-owned value or obsolete _ClosedReceipt authority.
+    for key, selector in fixture._COMBO_SELECTORS.items():
+        answer = fixture._FACTS[key]
+        receiver = selector + '-code'
+        target = dict(selector=selector, tag='input', type='combobox',
+                      label=key, name=selector[1:], in_form=True,
+                      form_selector='#application-form', form_action=fixture.URL,
+                      has_value=False, value='',
+                      combobox=dict(linked=True, options=[], selected_text=answer,
+                                    displayed_text=answer, selected_value=answer,
+                                    hidden_selector=receiver, hidden_value=answer))
+        hidden = dict(selector=receiver, tag='input', type='hidden',
+                      name=selector[1:]+'_value', in_form=True,
+                      form_selector='#application-form', form_action=fixture.URL,
+                      has_value=True, value=answer)
+        state.last_page['controls'].extend((target, hidden))
     for key, selector in fixture._CHOICE_SELECTORS.items():
         answer = fixture._FACTS[key]
-        target = dict(selector=selector, tag='input', type='combobox', label=key,
-                      form_selector='#application-form', form_action=fixture.URL,
-                      combobox=dict(mode='closed-react-select', phase='C2',
-                                    hidden_selector=selector+'-code',
-                                    **dict.fromkeys(('selected_text', 'displayed_text', 'selected_value', 'hidden_value'), answer)))
-        state.last_page['controls'].append(target)
-        state.widget_receipts.append(forms._ClosedReceipt(dict(
-            selector=selector, approved_value=answer, committed_caption=answer,
-            committed_value=answer, hidden_value=answer,
-            hidden_selector=selector+'-code', hidden_value_before='',
-            closed_admission=forms._closed_key(target))))
+        state.widget_receipts.append(dict(
+            action='combobox', selector=selector, approved_value=answer,
+            committed_caption=answer, committed_value=answer))
     return dict(status='gate', form_question={'selector': '#wrong' if premature else '#additional'})
 
 
@@ -151,15 +163,10 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
     upload_reports = [r for r in reports[:-1] if r['scenario'] == 'ashby-upload']
     assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient+unwrap'}
     for report in reports[:-1]:
-        if report['scenario'] in {'greenhouse', 'greenhouse_empty_placeholder'}:
-            choice = report['country_choice_inventory']
-            assert choice is not None and choice['verified'] is True
-            assert choice['opaque_count'] == 0 and choice['opaque_locators'] == []
-            assert choice['country_phase'] == choice['location_phase'] == 'C2'
-            assert choice['country_selected'] == fixture._FACTS['Country']
-            assert choice['location_selected'] == fixture._FACTS['Where are you located?']
-        else:
-            assert report['country_choice_inventory'] is None
+        # The current reader does not issue a C2 form-owner certificate for
+        # Country. In particular, this synthetic path cannot claim one simply
+        # because a React single-value caption was observed.
+        assert report['country_choice_inventory'] is None
         failed = premature and report['scenario'] in {'entry', 'greenhouse', 'greenhouse_empty_placeholder'}
         assert report['final_stage'] == ('premature' if failed else STAGES[report['scenario']])
         assert report['safe_gate'] is (not failed)

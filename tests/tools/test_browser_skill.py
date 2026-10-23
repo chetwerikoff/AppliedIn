@@ -426,101 +426,67 @@ async def test_two_live_company_leases_cannot_splice_a_drifted_row_before_sessio
 @pytest.mark.parametrize(('verb', 'button'),
                          [('submit', 'Submit application'), ('click', 'Continue')])
 async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry(
-        monkeypatch, verb, button):
-    submit = target(selector='#submit', tag='button', type='submit',
-                    label=button, submit=True)
-    resume = target(selector='#resume', label='Resume', type='file', files=['Resume.pdf'])
-    current = page(resume, submit)
-    pk = 'example-co#job-1'
+        monkeypatch, tmp_path, verb, button):
+    # AC1/AC8: exercise the raw producer and real own-hold readback, not a
+    # facade whose incomplete dispatch prevents reaching the failing IPC.
+    from tests.tools.test_browser_integration_regressions import _world, URL, PK
+
+    row, current, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+    next(c for c in current['controls'] if c['selector'] == '#submit')['label'] = button
     evidence = []
-
-    class Tracking:
-        def __init__(self):
-            import fakeredis
-            self.r = fakeredis.FakeRedis(decode_responses=True)
-            from tools import posting_guard as pg
-            checked = pg.analyze(GOOD)
-            self.row = {'pk': pk, 'status': 'submitting',
-                        'company': 'example-co', 'jd_url': current['url'],
-                        'jd_text': checked['text'],
-                        'posting_guard': checked['posting_guard']}
-
-        def set_status(self, observed_pk, status, **attrs):
-            assert observed_pk == pk
-            evidence.append('write')
-            self.row.update(status=getattr(status, 'value', status), **attrs)
-
-        def get(self, observed_pk):
-            assert observed_pk == pk
-            evidence.append('readback')
-            return dict(self.row)
-
-        def get_current(self, observed_pk):
-            return self.get(observed_pk)
-
-    tracking = Tracking()
     real_set, real_get = tracking.r.set, tracking.r.get
+    real_update = tracking.update_if_status
     def held_set(*args, **kwargs):
         evidence.append('hold_set')
         return real_set(*args, **kwargs)
     def held_get(*args, **kwargs):
         evidence.append('hold_read')
         return real_get(*args, **kwargs)
+    def update_if_status(*args, **kwargs):
+        # The real durable hold uses a conditional WATCH-backed transition,
+        # not the old unconditional set_status API.
+        updated = real_update(*args, **kwargs)
+        if updated:
+            evidence.append('write')
+        return updated
     monkeypatch.setattr(tracking.r, 'set', held_set)
     monkeypatch.setattr(tracking.r, 'get', held_get)
-    monkeypatch.setattr('core.stores.make_stores', lambda *a, **kw:
-                        SimpleNamespace(tracking=tracking))
-    monkeypatch.setattr(forms, '_row', tracking.get)
-
-    class FakeSession:
-        def __init__(self, kind):
-            self.kind = kind
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def navigate(self, url):
-            return current
-
-        async def page(self):
-            return current
-
-        async def call(self, *args, **kwargs):
-            if args[0] == 'upload':
-                return {}
-            if args[0] == 'click':
-                evidence.append('click')
-                assert forms.submit_hold.is_held(pk, tracking=tracking)
-                assert tracking.row['status'] == 'needs_human'
-                assert tracking.row['gate_reason'] == 'submit_uncertain'
-                assert tracking.row['fail_kind'] == 'uncertain'
-                assert tracking.row['last_button'] == button
-                assert tracking.row['last_url'] == current['url']
-                assert 'possible_submission' not in tracking.row
-                raise bsk.Unavailable('BrowserSkill unavailable: offline')
-            pytest.fail('Unexpected browser IPC')
-
-    monkeypatch.setattr(bsk, 'Session', FakeSession)
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *args: None)
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: 'Resume.pdf')
+    monkeypatch.setattr(tracking, 'update_if_status', update_if_status)
+    command = bsk.command
+    async def fail_submit(*args, **kwargs):
+        if args[0] == 'click':
+            evidence.append('click')
+            assert forms.submit_hold.is_held(PK, tracking=tracking)
+            assert row['status'] == 'needs_human'
+            assert row['gate_reason'] == 'submit_uncertain'
+            assert row['fail_kind'] == 'uncertain'
+            assert row['last_button'] == button
+            assert row['last_url'] == current['url']
+            assert 'possible_submission' not in row
+            raise bsk.Unavailable('BrowserSkill unavailable: offline')
+        return await command(*args, **kwargs)
+    monkeypatch.setattr(bsk, 'command', fail_submit)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
         {'action': 'upload', 'selector': '#resume'},
         {'action': verb, 'selector': '#submit'},
     ]))
-    result = await forms.apply('https://employer.test/job/1', 'example-co', {},
-                               'chatgpt/model', pk=pk, resume_path='Resume.pdf')
-    assert result['status'] == 'uncertain'
+    result = await forms.apply(URL, 'example-co', {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
+    assert result['status'] == 'uncertain', result
     assert not runtime.is_disconnected(result['detail'])
     assert not runtime.is_infrastructure(result['detail'])
     assert result['step'] == {'last_button': button, 'url': current['url']}
     assert button in result['detail'] and current['url'] in result['detail']
-    assert 'click' in evidence
-    assert evidence.index('write') < evidence.index('click')
-    assert evidence.index('hold_set') < evidence.index('hold_read') < evidence.index('click')
-    assert forms.submit_hold.is_held(pk, tracking=tracking)
+    assert evidence.count('click') == 1
+    hold_set = evidence.index('hold_set')
+    write = evidence.index('write')
+    # The durable hold precedes its WATCH-conditional status transition; the
+    # click can happen only after both and a fresh hold readback.
+    assert hold_set < write < evidence.index('click')
+    # Preparation checks for prior holds too; require a fresh read after this set.
+    assert hold_set < evidence.index('hold_read', hold_set + 1) < evidence.index('click')
+    assert forms.submit_hold.is_held(PK, tracking=tracking)
 
 
 async def test_discovery_admits_only_links_seen_in_browser(monkeypatch):
@@ -686,9 +652,9 @@ async def test_untyped_role_button_cannot_bypass_self_id_guards():
 async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact():
     session = SimpleNamespace(call=AsyncMock())
     control = target(type='checkbox', label='I certify I am a US citizen', required=True)
-    # An isolated checkbox without an owning application marker cannot mint
-    # a disclosure grant, even when its caption makes a factual assertion.
-    with pytest.raises(forms.Gate, match='application-form marker'):
+    # A new legal/citizenship attestation routes directly to the owner even
+    # without an application marker; it cannot mint an unapproved fact answer.
+    with pytest.raises(forms.Gate, match='new legal attestation needs an owner decision'):
         await forms.execute(session, page(control),
                             {'action': 'choose', 'selector': '#field'}, facts={}, filled={},
                             resume_path='', company='Company', jd_text='',
@@ -700,10 +666,17 @@ def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
     with pytest.raises(forms.Gate, match='no longer present'):
         forms.check_form(page(), {}, True, 'Resume.pdf')
     control = target(type='radio', label='Yes', question='Authorized to work?',
-                     checked=True, name='work_auth')
+                     checked=True, name='work_auth', value='yes', has_value=True)
     with pytest.raises(forms.Gate, match='preselected'):
         forms.check_form(page(control), {}, True)
-    forms.check_form(page(control), {'#field': 'Yes'}, True)
+    # A preapproved checked radio still needs an independently observed
+    # second member: an orphan radio cannot become an authorized group.
+    with pytest.raises(forms.Gate, match='Radio group members'):
+        forms.check_form(page(control), {'#field': 'Yes'}, True)
+    decline = target(selector='#decline', type='radio', label='No',
+                     question='Authorized to work?', name='work_auth',
+                     value='no', has_value=True)
+    forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
 
 
 def test_native_select_can_derive_the_option_without_a_model_guessed_value():
@@ -850,12 +823,14 @@ async def test_application_gates_external_link_before_the_browser_follows_it(mon
             pytest.fail('A forbidden link must never reach browser click')
     monkeypatch.setattr(bsk, 'Session', FakeSession)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args: None)
-    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    # A coherent tracked row is required to reach the origin guard under test.
+    monkeypatch.setattr(forms, '_row', lambda pk: dict(
+        pk=pk, company='Company', job_id='1', jd_url=current['url'], status='submitting'))
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *args: 'Resume.pdf')
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
         'action': verb, 'selector': '#outside' if verb == 'click' else '', 'url': outside}))
     result = await forms.apply(current['url'], 'Company', {}, 'chatgpt/model',
-                               pk='Company#1', resume_path='Resume.pdf')
+                               pk='company#1', resume_path='Resume.pdf')
     assert result['status'] == 'gate'
     assert 'tracked job and tenant' in result['question']
     assert result['status'] == 'gate'
@@ -952,9 +927,13 @@ async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
             filled={}, resume_path='',
             company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
     if field['type'] == 'checkbox':
-        # A required native acknowledgement now gets a verbatim question;
-        # model selection and an empty bank alone still authorize no write.
-        assert 'Answer yes or no' in str(refusal.value)
+        # ARCH21:26 / binding 5/7: beyond-standard consent and ambiguous
+        # privacy scope require an owner decision, never an inferred checkbox.
+        if forms._assent_scope(field) == 'owner':
+            assert 'owner decision' in str(refusal.value)
+            assert refusal.value.reason == 'owner_question'
+        else:
+            assert 'Answer yes or no' in str(refusal.value)
         assert refusal.value.form_question['control_label'] == field['label']
     else:
         assert 'human-approved' in str(refusal.value)
@@ -998,7 +977,12 @@ async def test_unknown_or_timeout_upload_is_human_inspection_not_requeue(error):
     session.call.assert_awaited_once()
 
 
-async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc():
+async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc(monkeypatch):
+    # A synthetic tracked row makes this denial independent of the owner's Redis.
+    url = 'https://employer.test/job/1'
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'company': 'example-co', 'job_id': '1',
+        'jd_url': url, 'status': 'submitting'})
     for wording in ['View', 'Proceed', 'Apply now', 'Edit']:
         session = SimpleNamespace(call=AsyncMock())
         button = target(tag='button', type='button', label=wording)
@@ -1006,7 +990,8 @@ async def test_unclassified_js_proceed_or_one_click_apply_never_reaches_ipc():
             await forms.execute(
                 session, page(button), {'action': 'click', 'selector': '#field'},
                 facts={}, filled={}, resume_path='', company='example-co',
-                jd_text='', resume_tex='', github='', pk='example-co#1')
+                jd_text='', resume_tex='', github='', pk='example-co#1',
+                job_url=url)
         session.call.assert_not_awaited()
 
 
@@ -1093,6 +1078,10 @@ def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch
 
     tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
     pk = 'example-co#interleaved-stale-write'
+    # A legitimate new hold starts from an actually persisted, independently
+    # inspected posting. Missing posting evidence is not submission authority.
+    _seed_clean(tracking, 'example-co', 'interleaved-stale-write',
+                'https://example.test/job/1')
     tracking.set_status(pk, Status.SUBMITTING, company='example-co')
     stale_pre_hold_row = tracking.get(pk)
     monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(tracking=tracking))
@@ -1102,6 +1091,52 @@ def test_independent_hold_survives_existing_tracking_full_row_writer(monkeypatch
     assert tracking.get(pk)['status'] == 'submitting'
     assert forms.submit_hold.is_held(pk, tracking=tracking)
     assert forms.submit_hold.blocked(pk, tracking.get(pk), tracking=tracking)
+
+
+@pytest.mark.parametrize('when', ['preexisting', 'after-hold-mark'])
+def test_manual_outcome_is_never_replaced_by_own_possible_submit_hold(monkeypatch, when):
+    """The existing Redis WATCH transition must preserve manual reconciliation."""
+    import fakeredis
+    from core.models import Status
+    from core.storage.local import RedisTracking
+
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    pk = 'example-co#manual-outcome'
+    _seed_clean(tracking, 'example-co', 'manual-outcome',
+                'https://example.test/job/1')
+    tracking.set_status(pk, Status.SUBMITTING)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=tracking))
+
+    if when == 'preexisting':
+        tracking.set_status(pk, Status.APPLIED_MANUAL,
+                            confirmation_id='Synthetic manual confirmation')
+    else:
+        original_update = tracking.update_if_status
+
+        def human_between_mark_and_status(*args, **kwargs):
+            assert forms.submit_hold.is_held(pk, tracking=tracking)
+            tracking.set_status(pk, Status.APPLIED_MANUAL,
+                                confirmation_id='Synthetic manual confirmation')
+            return original_update(*args, **kwargs)
+
+        monkeypatch.setattr(tracking, 'update_if_status',
+                            human_between_mark_and_status)
+
+    with pytest.raises(forms.Gate, match='no click is safe'):
+        forms.hold_possible_submission(
+            pk, {'last_button': 'Submit',
+                 'url': 'https://example.test/job/1'})
+
+    current = tracking.get_current(pk)
+    assert current['status'] == 'applied_manual'
+    assert current['confirmation_id'] == 'Synthetic manual confirmation'
+    if when == 'preexisting':
+        assert not forms.submit_hold.is_held(pk, tracking=tracking)
+    else:
+        # A concurrent manual outcome must survive, but never erase the
+        # independently recorded possible-submit key without reconciliation.
+        assert forms.submit_hold.is_held(pk, tracking=tracking)
 
 
 def test_jit_approval_revocation_cannot_be_hidden_by_prior_fill_receipt(monkeypatch):
@@ -1285,7 +1320,17 @@ console.log(JSON.stringify({page,witness}));
         combos = [c for c in witness['controls'] if c.get('type') == 'combobox']
         if scenario in {'shared', 'wrong-role', 'duplicate-id'}:
             assert combos and all(not c['combobox']['linked'] for c in combos)
-        elif scenario in {'other-form', 'nested'}:
+        elif scenario == 'other-form':
+            # Cross-form ARIA ID references are not owned by this application
+            # receiver. Keep the unresolved claim visible but never lend its
+            # foreign option to an approved choice or final Submit.
+            for source in (page, witness):
+                owners = [c for c in source['controls'] if c.get('type') == 'combobox']
+                assert owners and all(
+                    c['combobox']['linked'] is False
+                    and c['combobox']['link_id'] == 'choices'
+                    and c['combobox']['options'] == [] for c in owners)
+        elif scenario == 'nested':
             assert combos and combos[0]['combobox']['linked']
         elif scenario == 'orphan-option':
             assert any(c['type'] == 'option' for c in witness['controls'])
@@ -1299,16 +1344,21 @@ def test_added_or_ambiguous_query_identity_never_authorizes_navigation(query):
                                         'https://example.test/job/1')
 
 
-async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch):
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
-    session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='inspectable'):
-        await forms.execute(session, {**page(target()), 'opaque_controls': True},
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
-                            facts={'Name': 'Test User'}, filled={}, resume_path='',
-                            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
-    session.call.assert_not_awaited()
+async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch, tmp_path):
+    from tests.tools.test_browser_integration_regressions import _world, URL, COMPANY, PK
+    row, current, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+    current['opaque_controls'] = True
+    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
+        dict(action='fill', selector='#email', fact='Email'),
+        dict(action='upload', selector='#resume'), dict(action='submit', selector='#submit')]))
+    # ARCH21:18/ARCH01:58, AC2/AC5: opacity is final Submit evidence, not a
+    # reason to block an exact approved answer or the row's protected PDF.
+    result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert 'uninspectable' in result['question']
+    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
+    assert not raw._application_controller.committed
 
 
 async def test_human_approved_fact_is_not_authorization_for_another_question(monkeypatch):
@@ -1364,17 +1414,24 @@ async def test_observed_same_job_action_link_cannot_commit_by_navigation(monkeyp
         async def page(self):
             return current
         async def call(self, *args, **kwargs):
-            pytest.fail('Unproven link must not click or write')
+            if args[0] == 'navigate':
+                navigations.append(args[1])
+                current['url'] = args[1]
+                return {}
+            pytest.fail('An observed link must not click or write private values')
     monkeypatch.setattr(bsk, 'Session', Session)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
-    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    monkeypatch.setattr(forms, '_row', lambda pk: dict(
+        pk=pk, company='example-co', job_id='1', jd_url=url, status='submitting'))
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': 'navigate', 'url': href}, {'action': 'gate', 'question': 'Stop'}]))
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
                                pk='example-co#1', resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert navigations == [url]  # initial approved posting read only, never the action href
+    # ARCH21:18 / binding 2(i): an observed same-job read-only Apply GET is
+    # preparation. An unapproved send/query identity still has zero effect.
+    assert navigations == ([url, href] if route == '/apply' else [url])
 
 
 @pytest.mark.parametrize('typ,label,in_form', [
@@ -1473,6 +1530,23 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
     first = await run._apply_direct(pk, stores)
     assert first['result'] == 'gated'
     writes.assert_not_awaited()
+    pending = stores.tracking.get(pk)
+    question = pending['gate_pending']['form_question']
+    # ARCH21:26 / binding 7: ordinary missing facts go agent-first. A raw
+    # owner reply to an unsupported review route cannot mint a control grant.
+    assert pending['gate_pending']['review_route'] == 'agent_unavailable'
+    assert pending.get('gate_call_id') is None
+    run.resume_job(pk, value, stores)
+    assert not stores.tracking.get(pk).get('human_approved_answers')
+    writes.assert_not_awaited()
+    # Offline post-triage owner-answer transition, explicitly allowed by
+    # binding 7. This supplies no reviewer override or live transport claim;
+    # the unchanged owner consumer still binds the exact observed control.
+    from core.models import Status
+    stores.tracking.set_status(
+        pk, Status.NEEDS_HUMAN, gate_source='applier', gate_call_id='direct',
+        gate_pending={'question': 'Synthetic post-triage owner answer',
+                      'form_question': question, 'review_route': 'owner'})
     run.resume_job(pk, value, stores)
     assert stores.tracking.get(pk)['human_approved_answers'] == {
         field: grant(field, value)}
@@ -1564,16 +1638,28 @@ async def test_discovery_keeps_reading_and_native_search_filter_writes(monkeypat
 
 @pytest.mark.parametrize('corruption', ['source', 'call_id', 'status', 'application',
     'destination', 'selector', 'ambiguous_label'])
-async def test_direct_form_grant_refuses_wrong_origin_or_scope(form_gate_world, corruption):
+async def test_direct_form_grant_refuses_wrong_origin_or_scope(monkeypatch, form_gate_world, corruption):
     run, stores, pk = form_gate_world
+    # Exercise the real granted question, not a Redis-fault Gate with no payload.
+    monkeypatch.setattr(forms, '_row', stores.tracking.get)
     current = page(target(label='Email'), application_marker=True)
     if corruption == 'ambiguous_label':
         current['controls'].append(target(selector='#field', label='Email'))
+    session = SimpleNamespace(call=AsyncMock())
     with pytest.raises(forms.Gate) as gated:
-        await forms.execute(SimpleNamespace(call=AsyncMock()), current,
+        await forms.execute(session, current,
             {'action': 'fill', 'selector': '#field', 'fact': 'Email'},
             facts={}, filled={}, resume_path='', company='example-co',
-            jd_text='', resume_tex='', github='', pk=pk)
+            jd_text='', resume_tex='', github='', pk=pk, job_url=current['url'])
+    session.call.assert_not_awaited()
+    if corruption == 'ambiguous_label':
+        # The duplicate selector is rejected before any grantable question exists.
+        assert gated.value.form_question is None
+    else:
+        assert gated.value.form_question is not None
+        assert gated.value.form_question['label'] == 'Email'
+        assert gated.value.form_question['pk'] == pk
+        assert gated.value.form_question['url'] == current['url']
     pending = {'question': str(gated.value), 'form_question': gated.value.form_question}
     attrs = {'gate_source': 'applier', 'gate_call_id': 'direct', 'gate_pending': pending}
     status = 'needs_human'
@@ -1658,7 +1744,8 @@ async def test_derived_cross_tenant_board_refuses_before_open(monkeypatch):
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
                                pk='example-co#1', resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert 'Derived board tenant or job' in result['question']
+    # This is a malformed tenant-bearing URL, not an absent board pin (AC14).
+    assert 'Malformed Greenhouse job identity' in result['question']
 
 
 @pytest.mark.parametrize('bad_receiver', ['form_action', 'formaction'])
@@ -1691,7 +1778,9 @@ async def test_external_form_receiver_gates_before_upload_or_submit_click(
             if args[0] == 'click':
                 pytest.fail('External form receiver reached committing click IPC')
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
-    monkeypatch.setattr(forms, '_row', lambda pk: {})
+    # Isolate the receiver boundary rather than failing on a missing dispatch.
+    monkeypatch.setattr(forms, '_row', lambda pk: dict(
+        pk=pk, company='example-co', job_id='1', jd_url=current['url'], status='submitting'))
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
     monkeypatch.setattr(bsk, 'Session', FakeSession)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
@@ -1707,46 +1796,36 @@ async def test_external_form_receiver_gates_before_upload_or_submit_click(
 
 @pytest.mark.parametrize('declared_submit', [False, True])
 async def test_submit_label_on_js_button_cannot_prove_native_click(
-        monkeypatch, declared_submit):
-    resume = target(selector='#resume', type='file', label='Resume', files=['Resume.pdf'])
-    button = target(selector='#submit', tag='button', type='button',
-                    label='Submit application', submit=declared_submit)
-    current = page(resume, button)
-    calls = []
-
-    class Session:
-        def __init__(self, kind):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def navigate(self, url):
-            return current
-
-        async def page(self):
-            return current
-
-        async def call(self, *args, **kwargs):
-            calls.append(args[0])
-            if args[0] == 'click':
-                pytest.fail('A JS-backed Submit button reached click IPC')
-
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
-    monkeypatch.setattr(forms, '_row', lambda pk: {})
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
-    monkeypatch.setattr(bsk, 'Session', Session)
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        {'action': 'upload', 'selector': '#resume'},
-        {'action': 'submit', 'selector': '#submit'}]))
-    result = await forms.apply(current['url'], 'example-co', {}, 'synthetic',
-                               pk='example-co#1', resume_path='Resume.pdf')
+        monkeypatch, tmp_path, declared_submit):
+    from tests.tools.test_browser_integration_regressions import _world, URL, COMPANY, PK
+    row, current, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
+    button = next(c for c in current['controls'] if c['selector'] == '#submit')
+    button.update(type='button', submit=declared_submit)
+    actions = iter([dict(action='fill', selector='#email', fact='Email'),
+                    dict(action='upload', selector='#resume'),
+                    dict(action='submit', selector='#submit')])
+    async def decide(*args, **kwargs):
+        action = next(actions)
+        if action['action'] == 'submit':
+            next(c for c in current['controls'] if c['selector'] == '#email')['value'] = (
+                'unapproved@example.test')
+        return action
+    monkeypatch.setattr(bsk, 'decision', decide)
+    final_calls = []
+    original = forms.ApplicationIPCController.authorize_final_submit
+    async def final(controller, *args):
+        final_calls.append(controller)
+        return await original(controller, *args)
+    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit', final)
+    # #139 binding 1/2(d): a known JS Submit uses the SAME final guard. Its
+    # label/flag cannot authorize an unapproved value; native shape is no longer
+    # the deciding certificate. Preserve actual upload and zero-click proof.
+    result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate'
-    assert 'native submit control' in result['question']
-    assert calls == ['upload']  # never a committing click
+    assert 'Unverified or changed form value' in result['question']
+    assert final_calls == [raw._application_controller]
+    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
 
 
 def test_form_receiver_preflight_scopes_distinct_native_forms():
@@ -2541,13 +2620,26 @@ def _proxy_dom(change=None, *, page_script=None, witness_script=None):
 @pytest.mark.parametrize('value_attribute', [False, True])
 def test_greenhouse_proxy_exact_four_or_five_names_in_both_readers(value_attribute):
     result = _proxy_dom({'proxyValueAttribute': value_attribute})
-    forms._inventory_ok(result['page'])
+    # ARCH21:18 / #139 binding 6/9: a React-select proxy fingerprint is no
+    # authority. Missing accessible linkage remains opaque at final Submit.
+    with pytest.raises(forms.Gate, match='opaque_controls'):
+        forms._inventory_ok(result['page'])
     for reader in result.values():
         for key in ['location', 'country']:
             target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
-            assert target['combobox']['mode'] == 'closed-react-select'
-            assert target['combobox']['required_proxy_mounted'] is True
-            forms._required_proxy_validity(target)
+            assert target['combobox']['linked'] is False
+            assert not target['combobox']['link_id']
+            assert 'mode' not in target['combobox']
+    # The same library can expose real rendered ARIA relationships. Generic
+    # option observation must work regardless of the hidden proxy's attributes.
+    opened = _proxy_dom({'proxyValueAttribute': value_attribute,
+                         'phases': {'location': 'C1', 'country': 'C1'}})
+    for reader in opened.values():
+        for key in ['location', 'country']:
+            target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
+            assert target['combobox']['linked'] is True
+            assert forms._combobox_options(target)
+            assert 'mode' not in target['combobox']
 
 
 @pytest.mark.parametrize('mutation', [
@@ -2563,25 +2655,34 @@ def test_greenhouse_proxy_five_name_isolated_negatives(mutation, key):
         forms._inventory_ok(result['page'])
     for reader in result.values():
         target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
-        assert target['combobox']['quarantined'] is True
-        assert target['combobox'].get('mode') != 'closed-react-select'
+        # Binding 6/9: changing a proxy cannot manufacture an ARIA link or a
+        # privileged phase certificate. Keep the opaque/no-authorization proof.
+        assert target['combobox']['linked'] is False
+        assert not target['combobox']['link_id']
+        assert target['combobox']['options'] == []
+        assert 'mode' not in target['combobox']
 
 
 def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
     old = ("(names.join(',')==='aria-hidden,class,required,tabindex' ||\n"
            "        (names.join(',')==='aria-hidden,class,required,tabindex,value' &&\n"
            "         p.getAttribute('value')===''))")
-    assert old in bsk.PAGE and old in forms._FIXED_CONTROL_WITNESS
+    # AC6/AC9/AC12 deliberately remove this fingerprint. Preserve the mutation
+    # sensitivity test for the replacement generic accessible relationship.
+    assert old not in bsk.PAGE and old not in forms._FIXED_CONTROL_WITNESS
     def positive(page_script, witness_script):
-        result = _proxy_dom(page_script=page_script, witness_script=witness_script)
-        forms._inventory_ok(result['page'])
-        assert all(next(c for c in reader['controls'] if c['selector'] == '#location')[
-            'combobox'].get('mode') == 'closed-react-select' for reader in result.values())
+        result = _proxy_dom({'phases': {'location': 'C1', 'country': 'C1'}},
+                            page_script=page_script, witness_script=witness_script)
+        for reader in result.values():
+            target = next(c for c in reader['controls'] if c['selector'] == '#location')
+            assert target['combobox']['linked'] is True
+            assert forms._combobox_options(target)
     positive(bsk.PAGE, forms._FIXED_CONTROL_WITNESS)
-    with pytest.raises(forms.Gate, match='opaque_controls'):
-        positive(bsk.PAGE.replace(old, "names.join(',')==='aria-hidden,class,required,tabindex'"),
-                 forms._FIXED_CONTROL_WITNESS.replace(old,
-                    "names.join(',')==='aria-hidden,class,required,tabindex'"))
+    marker = 'const linkId = e => {'
+    assert marker in bsk.PAGE and marker in forms._FIXED_CONTROL_WITNESS
+    with pytest.raises(AssertionError):
+        positive(bsk.PAGE.replace(marker, marker + " return '';"),
+                 forms._FIXED_CONTROL_WITNESS.replace(marker, marker + " return '';"))
     positive(bsk.PAGE, forms._FIXED_CONTROL_WITNESS)
 
 
@@ -2590,6 +2691,14 @@ def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
 async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(change, monkeypatch):
     monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
     monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: True)
+    # New preparation checks read the canonical tracked row. Keep this
+    # frame-mutation test entirely offline while proving a valid same-job
+    # dispatch rather than reaching the operator's Redis.
+    tracked = {'pk': _GH_ALIAS.pk, 'company': _GH_ALIAS.company,
+               'job_id': _GH_ALIAS.job_id, 'jd_url': _GH_ALIAS.wrapper,
+               'status': 'submitting', 'ats': 'greenhouse'}
+    monkeypatch.setattr(forms, '_row',
+                        lambda pk, *args, **kwargs: tracked if pk == _GH_ALIAS.pk else {})
     initial = _gh_dom()
     class Raw:
         def __init__(self):
@@ -2885,14 +2994,16 @@ async def test_bootstrap_positive_required_unanswered_witness_is_owner_question(
     monkeypatch.setattr(forms, '_row', lambda *a, **k: {
         'pk': 'example-co#synthetic', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(session, current, 'example-co#synthetic', {},
-                               current['url'])
-    assert gated.value.reason == 'owner_question'
-    question = gated.value.form_question
-    assert question['label'] == 'Location'
-    assert question['selector'] == '#field'
-    assert question['pk'] == 'example-co#synthetic'
+    prepared = await forms._bootstrap(
+        session, current, 'example-co#synthetic', {}, current['url'])
+    assert prepared is current
+    assert prepared['controls'][0]['label'] == 'Location'
+    assert prepared['controls'][0]['selector'] == '#field'
+    assert forms._missing_answer_reason(prepared['controls'][0]) == 'agent_review_unavailable'
+    # An ordinary missing answer no longer invents an owner question in
+    # preparation, but the real final-form boundary rejects it.
+    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
+        forms.check_form(prepared, {}, uploaded=True)
     session.call.assert_not_awaited()
 
 
@@ -2901,16 +3012,23 @@ async def test_bootstrap_unapproved_existing_fact_cannot_masquerade_as_new_quest
     monkeypatch.setattr(forms, '_row', lambda *a, **k: {
         'pk': 'example-co#synthetic', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as gated:
-        await forms._bootstrap(session, current, 'example-co#synthetic',
-                               {'Location': 'Synthetic Place'}, current['url'])
-    assert gated.value.reason == 'unknown_field'
-    assert gated.value.form_question['label'] == 'Location'
+    prepared = await forms._bootstrap(
+        session, current, 'example-co#synthetic',
+        {'Location': 'Synthetic Place'}, current['url'])
+    assert prepared is current and not prepared['controls'][0]['has_value']
+    # A fact bank is not approval. Without an exact per-control grant neither
+    # the writer nor the final Submit check may accept this value.
+    with pytest.raises(forms.Gate, match='exact human-approved answer'):
+        forms.exact_approval(
+            'example-co#synthetic', 'Location', 'Synthetic Place',
+            target=current['controls'][0], url=current['url'])
+    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
+        forms.check_form(prepared, {}, uploaded=True)
     session.call.assert_not_awaited()
 
 
 @pytest.mark.parametrize('required,expected', [
-    (True, 'owner_question'), (False, 'unknown_field'),
+    (True, 'agent_review_unavailable'), (False, 'unknown_field'),
 ])
 async def test_execute_missing_fact_requires_current_observed_unanswered_question(
         monkeypatch, required, expected):
@@ -2957,39 +3075,92 @@ def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
     assert gated.value.reason == cause
 
 
-def test_greenhouse_missing_board_diagnostic_is_verified_from_row_and_config(monkeypatch, tmp_path):
+def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, tmp_path):
     from core.ids import make_pk
+
     pk = make_pk('example-co', '101')
     url = 'https://careers.example.test/jobs?gh_jid=101'
     row = {'pk': pk, 'company': 'example-co', 'job_id': '101',
            'ats': 'greenhouse', 'jd_url': url}
     config = SimpleNamespace(name='example-co', ats='greenhouse', board=None,
                              careers_url='https://careers.example.test/')
-    monkeypatch.setattr(forms, '_row', lambda *_: row)
-    monkeypatch.setattr('core.config.get_settings', lambda: SimpleNamespace(config_dir=tmp_path))
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: row)
+    monkeypatch.setattr('core.config.get_settings',
+                        lambda: SimpleNamespace(config_dir=tmp_path))
     monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
-    assert forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    # Absent board and absent persisted pin grant no *final* ATS authority.
+    assert forms._configured_alias(pk, 'example-co', url) is None
     config.board = 'verified-board'
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    row['greenhouse_board'] = 'verified-board'
+    proof = forms._configured_alias(pk, 'example-co', url)
+    assert isinstance(proof, forms.GreenhouseJobAlias)
+    assert proof.url == 'https://job-boards.greenhouse.io/verified-board/jobs/101'
+    assert forms._alias_current(proof)
     config.board = None
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    assert not forms._alias_current(proof)
     config.careers_url = 'https://different.example.test/'
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'example-co', url)
-    assert not forms._greenhouse_wrapper_missing_board(pk, 'wrong-company', url)
+    config.board = 'verified-board'
+    assert forms._configured_alias(pk, 'example-co', url) is None
+    assert forms._configured_alias(pk, 'wrong-company', url) is None
 
 
-@pytest.mark.parametrize('narrow', [False, True])
-async def test_greenhouse_missing_board_returns_specific_or_generic_tenant_gate_without_browser(
-        monkeypatch, narrow):
+@pytest.mark.parametrize('pin', [None, 'stale-board'], ids=['absent-pin', 'stale-pin'])
+async def test_greenhouse_missing_or_stale_board_prepares_but_cannot_submit(
+        monkeypatch, tmp_path, pin):
     url = 'https://careers.example.test/jobs?gh_jid=101'
+    row = dict(pk='example-co#101', company='example-co', job_id='101',
+               jd_url=url, ats='greenhouse', status='submitting')
+    if pin is not None:
+        row['greenhouse_board'] = pin
+    config = SimpleNamespace(name='example-co', ats='greenhouse',
+                             board='verified-board',
+                             careers_url='https://careers.example.test/')
+    monkeypatch.setattr('core.config.get_settings',
+                        lambda: SimpleNamespace(config_dir=tmp_path))
+    monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
+    current = {**page(), 'url': url}
+    navigations = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def navigate(self, destination):
+            navigations.append(destination)
+            return current
+
+        async def page(self):
+            return current
+
+        async def call(self, *args, **kwargs):
+            pytest.fail('Unproved final tenant must never submit or write private data')
+
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **k: None)
-    monkeypatch.setattr(forms, '_configured_alias', lambda *a, **k: None)
-    monkeypatch.setattr(forms, '_greenhouse_wrapper_missing_board', lambda *a: narrow)
-    monkeypatch.setattr(bsk, 'Session', lambda *_: pytest.fail('Never start browser'))
+    monkeypatch.setattr(forms, '_row', lambda *a, **k: row)
+    assert forms._configured_alias(row['pk'], 'example-co', url) is None
+    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
+    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *a: '')
+    monkeypatch.setattr(bsk, 'Session', lambda *_: Session())
+    decide = AsyncMock(return_value={
+        'action': 'gate', 'question': 'Stop after synthetic preparation observation'})
+    monkeypatch.setattr(bsk, 'decision', decide)
     result = await forms.apply(url, 'example-co', {}, 'synthetic',
-                               pk='example-co#101', resume_path='Resume.pdf')
+                               pk=row['pk'], resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert result['reason'] == ('defect_greenhouse_tenant_alias'
-                                if narrow else 'defect_tenant')
+    # ARCH21:58 / AC14: missing or stale pins do not gate approved-host
+    # reversible navigation; absence is examined by the one final guard.
+    assert navigations == [url]
+    assert decide.await_count == 1
+    guard = forms.ApplicationIPCController(
+        row['pk'], 'example-co', url, '', {}, {}, [], {}, lambda: None)
+    with pytest.raises(forms.Gate, match='job/ATS tenant or board') as refusal:
+        await guard.authorize_final_submit(Session(), current, {'label': 'Submit'})
+    assert refusal.value.reason == 'defect_tenant'
 
 
 async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():

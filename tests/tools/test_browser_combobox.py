@@ -11,9 +11,9 @@ URL = 'http://127.0.0.1/fixture/example-co/job/1'
 PK = 'example-co#1'
 OPTIONS = [
     {'selector': '#country-example', 'unique': True, 'label': 'Example Country',
-     'value': 'EX', 'selected': False},
+     'value': 'EX', 'selected': False, 'safe': True},
     {'selector': '#country-other', 'unique': True, 'label': 'Other Country',
-     'value': 'OT', 'selected': False},
+     'value': 'OT', 'selected': False, 'safe': True},
 ]
 
 def control(*, selected_text='', selected_value='', hidden_value='',
@@ -238,8 +238,65 @@ async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypat
 
     changed_machine_value = page(control(
         selected_text='Example Country', selected_value='OT', hidden_value='OT'))
-    with pytest.raises(forms.Gate, match='committed combobox value changed'):
+    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
         forms.check_approvals(PK, [receipt], changed_machine_value)
+
+
+async def test_popup_link_may_disappear_after_verified_form_commit(monkeypatch):
+    """A closed listbox need not retain aria-controls through final Submit."""
+    current = page()
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_value='EX'))
+    chosen = committed['controls'][0]['combobox']
+    chosen.update(linked=False, link_id='', listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current, committed)
+    filled = {}
+    receipt = await forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
+    assert ('click', '#country-example') in session.calls
+    # The listbox may close after selecting a verified approved value.
+    # Current form-owned bytes, rather than past admission, determine Submit.
+    forms.check_form(committed, filled, True)
+    forms.check_form(committed, filled, True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], committed)
+    wrong_form_value = deepcopy(committed)
+    wrong_form_value['controls'][-1]['value'] = 'OTHER'
+    with pytest.raises(forms.Gate, match='hidden form value'):
+        forms.check_form(wrong_form_value, filled, True, receipts=[receipt])
+
+
+async def test_unbound_form_receiver_denies_display_only_combobox(monkeypatch):
+    """A visible choice with no named input or hidden receiver cannot Submit."""
+    current = page(control(hidden_selector=''))
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_selector=''))
+    committed['controls'][0]['name'] = ''  # no submitted form input name
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current, committed)
+    filled = {}
+    receipt = await forms.execute(
+        session, current,
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    # Selection is reversible preparation. A display-only choice must be
+    # refused at the code-owned final Submit check, not at the option click.
+    assert ('click', '#country-example') in session.calls
+    assert filled == {'#country': 'Example Country'}
+    with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
+        forms.check_form(committed, filled, True, receipts=[receipt])
+    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
 
 
 @pytest.mark.parametrize(('before', 'after'), [
@@ -255,14 +312,62 @@ async def test_hidden_value_must_change_to_the_selected_machine_value(
            'human_approved_answers': {'What country?': grant()}}
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
     session = Session(current, committed)
-    with pytest.raises(forms.Gate,
-                       match='A hidden form value is not independently authorized'):
-        await forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+    filled = {}
+    receipt = await forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    # The prior receiver state is no longer a per-step certificate. The
+    # current selected option and named hidden value own final authorization.
+    assert receipt['hidden_value_before'] == before
+    assert receipt['committed_value'] == 'EX'
+    assert filled == {'#country': 'Example Country'}
+    if after == 'EX':
+        forms.check_form(committed, filled, True)
+        forms.check_form(committed, filled, True, receipts=[receipt])
+    else:
+        with pytest.raises(forms.Gate, match='hidden form value'):
+            forms.check_form(committed, filled, True, receipts=[receipt])
+    assert [call for call in session.calls if call[0] == 'click'] == [
+        ('click', '#country-example')]
+
+
+async def test_picker_with_no_rendered_options_cannot_authorize_final_submit(
+        monkeypatch):
+    """An unresolved picker is reversible; no value or Submit is invented."""
+    initial = page()
+    initial['controls'][0]['combobox']['options'] = []
+    opened = deepcopy(initial)
+    committed = deepcopy(initial)
+    session = DynamicSession(initial, opened, committed)
+
+    async def no_sleep(_delay):
+        # The 20 re-observations are bounded without a real browser or timer.
+        return None
+
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    filled = {}
+    receipt = await forms.execute(
+        session, initial,
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+
+    assert receipt['action'] == 'combobox'
+    assert receipt['unresolved'] and 'committed_value' not in receipt
+    assert filled == {}
+    assert [call for call in session.calls if call[0] != 'evaluate'] == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', 'Example Country')]
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+        forms.check_form(await session.page(), filled, True, receipts=[receipt])
+    assert not any(args[:2] == ('click', '#submit') for args in session.calls)
 
 
 def test_unlinked_or_changed_without_selection_hidden_values_gate():
@@ -348,13 +453,23 @@ async def test_unmatched_ambiguous_or_dangerous_option_never_clicks(monkeypatch,
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant()}})
     session = Session(current)
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+    filled = {}
+    action = {'action': 'combobox', 'selector': '#country',
+              'fact': 'What country?'}
+    kwargs = dict(facts={'What country?': 'Example Country'}, filled=filled,
+                  resume_path='', company='example-co', jd_text='',
+                  resume_tex='', github='', pk=PK, job_url=URL)
+    if len(options) == 1 and options[0]['label'] == 'Other Country':
+        # No matching caption is incomplete preparation, not a human Gate.
+        receipt = await forms.execute(session, current, action, **kwargs)
+        assert receipt['unresolved'] and filled == {}
+        with pytest.raises(forms.Gate):
+            forms.check_form(current, filled, True, receipts=[receipt])
+    else:
+        # Ambiguous, navigating or submitting options remain hard pre-click
+        # refusals; they must never become ordinary reversible preparation.
+        with pytest.raises(forms.Gate):
+            await forms.execute(session, current, action, **kwargs)
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 @pytest.mark.parametrize('field', ['label', 'value'])
@@ -402,7 +517,7 @@ def test_typed_visible_combobox_drift_gates_pre_submit():
     with pytest.raises(forms.Gate, match='combobox'):
         forms.check_form(current, {'#country': 'Example Country'},
                          uploaded=True, receipts=[receipt])
-    with pytest.raises(forms.Gate, match='committed combobox value changed'):
+    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
         forms.check_approvals(PK, [receipt], current)
 
 
@@ -415,13 +530,18 @@ def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypat
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant('Example Country')}})
     session = Session(current)
+    filled = {}
+    receipt = asyncio.run(forms.execute(
+        session, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL))
+    # A machine value equal to the grant cannot substitute for the displayed
+    # approved caption. No selection receipt exists, and final Submit refuses.
+    assert receipt['unresolved'] and filled == {}
     with pytest.raises(forms.Gate):
-        asyncio.run(forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL))
+        forms.check_form(current, filled, True, receipts=[receipt])
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
@@ -448,58 +568,178 @@ async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
         async def page(self):
             return deepcopy(self.current)
     session = TimeoutSession()
-    with pytest.raises(forms.Gate, match='did not expose current selectable options'):
-        await forms.execute(
-            session, page(closed), {'action': 'combobox', 'selector': '#country',
-                                    'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
-    assert not any(call[0] == 'click' and call[1] != '#country'
-                   for call in session.calls)
-
-async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
-    closed = control()
-    closed['combobox'].update(linked=False, listbox_selector='', options=[])
-    opened = page()
-    committed = page(control(selected_text='Example Country', selected_value='EX',
-                            hidden_value='EX'))
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    from types import SimpleNamespace
-    token = SimpleNamespace(pk=PK, company='example-co', wrapper=URL, url=URL, ats='greenhouse')
-    monkeypatch.setattr(forms, '_alias_current', lambda *args, **kwargs: True)
-    checked = []
-    def route(_destination, *_origins, provenance=None):
-        checked.append(provenance)
-        return provenance is token
-    monkeypatch.setattr(forms, 'navigation_allowed', route)
-    session = DynamicSession(page(closed), opened, committed)
+    filled = {}
     receipt = await forms.execute(
         session, page(closed), {'action': 'combobox', 'selector': '#country',
                                 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    assert receipt['unresolved'] and filled == {}
+    with pytest.raises(forms.Gate):
+        forms.check_form(page(closed), filled, True, receipts=[receipt])
+    assert not any(call[0] == 'click' and call[1] != '#country'
+                   for call in session.calls)
+
+async def test_closed_aria_picker_binds_exclusive_listbox_after_open(monkeypatch):
+    """A closed ARIA combobox has no aria-controls until its options mount."""
+    closed = control()
+    closed['combobox'].update(linked=False, link_id='',
+                              listbox_selector='', options=[])
+    opened = page()
+    committed = page(control(selected_text='Example Country',
+                             selected_value='EX', hidden_value='EX'))
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+
+    class LazyLinkSession(DynamicSession):
+        def current(self):
+            # The actual linked listbox first appears after the picker click.
+            return (self.initial, self.opened, self.opened, self.committed)[self.stage]
+
+    session = LazyLinkSession(page(closed), opened, committed)
+    filled = {}
+    receipt = await forms.execute(
+        session, page(closed),
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    mutations = [call for call in session.calls if call[0] != 'evaluate']
+    assert mutations == [
+        ('click', '#country'),
+        ('fill', '#country', '--value', 'Example Country'),
+        ('click', '#country-example'),
+    ]
+    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
+    assert filled == {'#country': 'Example Country'}
+    forms.check_form(committed, filled, True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], committed)
+
+
+async def test_closed_aria_picker_without_rendered_link_never_selects(monkeypatch):
+    """Opening alone cannot confer a listbox/option identity or approval."""
+    closed = control()
+    closed['combobox'].update(linked=False, link_id='',
+                              listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+
+    class NeverLinked(DynamicSession):
+        def current(self):
+            return self.initial
+
+    session = NeverLinked(page(closed), page(), page())
+    filled = {}
+    receipt = await forms.execute(
+        session, page(closed),
+        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+        facts={'What country?': 'Example Country'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert receipt['unresolved'] and filled == {}
+    with pytest.raises(forms.Gate):
+        forms.check_form(page(closed), filled, True, receipts=[receipt])
+    assert not any(call == ('click', '#country-example') for call in session.calls)
+
+
+async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
+    """Reversible ARIA writes must retain a tracked canonical ATS route."""
+    job_id = '12345678-1234-4234-8234-123456789abc'
+    pk = 'example-co#' + job_id
+    posting = 'https://jobs.lever.co/example-co/' + job_id
+    form_url = posting + '/apply'
+
+    def on_form(snapshot):
+        snapshot['url'] = form_url
+        for item in snapshot['controls']:
+            item['form_action'] = form_url
+        return snapshot
+
+    closed = control()
+    closed['combobox'].update(linked=False, listbox_selector='', options=[])
+    initial = on_form(page(closed))
+    opened = on_form(page())
+    committed = on_form(page(control(
+        selected_text='Example Country', selected_value='EX', hidden_value='EX')))
+    approved = grant()
+    approved.update(url=form_url, form_action=form_url)
+    row = {
+        'pk': pk, 'company': 'example-co', 'job_id': job_id,
+        'ats': 'lever', 'jd_url': posting, 'status': 'submitting',
+        'possible_submission': False,
+        'human_approved_answers': {'What country?': approved},
+    }
+    monkeypatch.setattr(forms, '_row', lambda row_pk: row if row_pk == pk else {})
+    token = forms.ApplicationEntryProvenance(
+        pk=pk, company='example-co', ats='lever', job_id=job_id,
+        wrapper=posting, board='example-co', url=form_url)
+    # Host-only preparation must not demand the final ATS/board certificate.
+    # It *must* still re-read the same tracked job before each mutation.
+    preparation_current = forms._preparation_current
+    checked = []
+
+    def check_live(provenance, **kwargs):
+        checked.append(provenance)
+        return preparation_current(provenance, **kwargs)
+
+    monkeypatch.setattr(forms, '_preparation_current', check_live)
+    session = DynamicSession(initial, opened, committed)
+    receipt = await forms.execute(
+        session, initial, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'What country?'},
         facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-        job_url=URL, provenance=token)
+        company='example-co', jd_text='', resume_tex='', github='', pk=pk,
+        job_url=posting, provenance=token)
     assert receipt['action'] == 'combobox'
-    assert checked and all(item is token for item in checked)
+    assert len(checked) >= 3 and all(item is token for item in checked)
     assert ('click', '#country-example') in session.calls
+
 
 async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
     from tools import browser_skill as bsk
     from unittest.mock import AsyncMock
+
+    job_id = '12345678-1234-4234-8234-123456789abc'
+    pk = 'example-co#' + job_id
+    posting = 'https://jobs.lever.co/example-co/' + job_id
+    form_url = posting + '/apply'
+
+    def on_form(snapshot):
+        snapshot['url'] = form_url
+        for item in snapshot['controls']:
+            item['form_action'] = form_url
+        return snapshot
+
     calls = []
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kwargs: calls.append('dispatch'))
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'possible_submission': False,
-        'human_approved_answers': {'What country?': grant()}})
+    monkeypatch.setattr(forms, 'check_dispatch',
+                        lambda *args, **kwargs: calls.append('dispatch'))
+    approved = grant()
+    approved.update(url=form_url, form_action=form_url)
+    row = {'pk': pk, 'company': 'example-co', 'job_id': job_id,
+           'jd_url': posting, 'ats': 'lever', 'status': 'submitting',
+           'possible_submission': False,
+           'human_approved_answers': {'What country?': approved}}
+    monkeypatch.setattr(forms, '_row',
+                        lambda selected_pk: row if selected_pk == pk else {})
+    # The missing optional tenant pin must not block safe host preparation.
+    # No actual watchlist or owner configuration is read by this offline test.
+    monkeypatch.setattr(forms, '_configured_alias', lambda *args, **kwargs: None)
     monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
     monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
     monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: None)
-    initial = page()
-    committed = page(control(selected_text='Example Country', selected_value='EX',
-                             hidden_value='EX'))
+
+    initial = on_form(page())
+    committed = on_form(page(control(
+        selected_text='Example Country', selected_value='EX', hidden_value='EX')))
+
     class ApplySession(Session):
         async def __aenter__(self):
             return self
@@ -507,14 +747,52 @@ async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
             return False
         async def navigate(self, _url):
             return deepcopy(self.current)
+
     session = ApplySession(initial, committed)
     monkeypatch.setattr(bsk, 'Session', lambda _kind: session)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
         {'action': 'gate', 'question': 'Stop after the synthetic committed choice.'}]))
     outcome = await forms.apply(
-        URL, 'example-co', {'What country?': 'Example Country'}, 'synthetic',
-        pk=PK, resume_path='Resume.pdf')
+        posting, 'example-co', {'What country?': 'Example Country'}, 'synthetic',
+        pk=pk, resume_path='Resume.pdf')
     assert outcome['status'] == 'gate'
     assert ('click', '#country-example') in session.calls
     assert calls.count('dispatch') >= 4
+
+
+async def test_option_without_positive_safety_witness_never_clicks(monkeypatch):
+    """An omitted safety field is not a safe ARIA option, even in a fake DOM."""
+    current = page()
+    current['controls'][0]['combobox']['options'][0].pop('safe')
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current)
+    with pytest.raises(forms.Gate, match='unsafe navigating option'):
+        await forms.execute(
+            session, current,
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={},
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') not in session.calls
+
+
+async def test_unsafe_nested_option_effect_never_clicks(monkeypatch):
+    """A nested action is unsafe even without a submit/link on the option node."""
+    current = page()
+    chosen = current['controls'][0]['combobox']['options'][0]
+    chosen.update(safe=False, submit=False, navigates=False)
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting',
+        'human_approved_answers': {'What country?': grant()}})
+    session = Session(current)
+    with pytest.raises(forms.Gate, match='unsafe navigating option'):
+        await forms.execute(
+            session, current,
+            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
+            facts={'What country?': 'Example Country'}, filled={},
+            resume_path='', company='example-co', jd_text='', resume_tex='',
+            github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') not in session.calls

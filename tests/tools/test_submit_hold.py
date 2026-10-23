@@ -441,8 +441,22 @@ async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
         assert result['status'] == 'gate'
         assert 'no click is safe' in result['question']
         assert calls == ['upload']
+        # The old fake raw Session has no bound r06 click controller; it
+        # correctly refuses this model Submit *before* acquiring a hold.
+        assert stores.tracking.get(PK)['status'] == 'submitting'
+        assert not submit_hold.is_held(PK, tracking=stores.tracking)
+        # Exercise the REAL final JIT hold/readback with the already-leased
+        # synthetic row. This is where a human change may race the click.
+        forms.hold_possible_submission(
+            PK, {'url': URL, 'last_button': 'Submit application'})
+        assert not submit_hold.is_held(PK, tracking=stores.tracking)
         if human_change == 'applied_manual':
             assert stores.tracking.get(PK)['status'] == 'applied_manual'
+        else:
+            assert stores.tracking.get(PK)['status'] == 'needs_human'
+        with pytest.raises(forms.Gate, match='Human outcome changed'):
+            forms.check_before_committing_click(PK)
+        assert calls == ['upload']
     finally:
         queue.done(item)
 

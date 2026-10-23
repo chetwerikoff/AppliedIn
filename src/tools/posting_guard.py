@@ -103,7 +103,7 @@ class _VisibleHTML(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs = dict(attrs)
         parent_hidden = bool(self.stack and self.stack[-1][1])
-        parent_fg, parent_bg = self.stack[-1][2:] if self.stack else ("", "")
+        parent_fg, parent_bg = self.stack[-1][2:4] if self.stack else ("", "")
         local, same, fg, bg = _style_hidden(
             attrs.get("style") or "", parent_fg, parent_bg)
         invisible = (parent_hidden or tag in _DROP or local or "hidden" in attrs

@@ -680,10 +680,27 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';
+    // A child frame is often cross-origin. Inspect structural controls only
+    // when readable; never infer absence from an opaque or incomplete document.
+    let formControls='unknown';
+    if (!['H','R','W','X','Z'].includes(status)) try {
+      const child=e.contentDocument;
+      if (child) {
+        if (child.querySelector('input,textarea,select,button,[role="textbox"],' +
+            '[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable]'))
+          formControls='yes';
+        else if (child.readyState==='complete' && !child.querySelector('iframe,object,embed')) {
+          const descendants=child.querySelectorAll('*');
+          if (descendants.length<=1024 && !Array.from(descendants).some(n =>
+              n.shadowRoot || n.tagName.includes('-'))) formControls='no';
+        }
+      }
+    } catch (_) {}
     return {selector:selector(e),origin,path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
-      box,badge,bounds,status};
+      box,badge,bounds,status,
+      ...(!['H','R','W','X','Z'].includes(status) ? {form_controls:formControls} : {})};
   });
   let responseError=false;
   const entryResponses=responseNodes.map(e => {

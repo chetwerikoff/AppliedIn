@@ -214,34 +214,26 @@ def _hidden_material_retained(text: str, fragments: list[str]) -> bool:
     return False
 
 
-def _version(text: str, status: str, reasons: list[str], source_verified: bool,
-             removed_verified: bool = False) -> str:
-    evidence = [REVISION, text, status, reasons, source_verified]
-    if removed_verified:
-        # The earlier same-reason generation did not prove absence of the
-        # hidden payload; an unverified legacy stamp must not grant exemption.
-        evidence.append("hidden-removal-checked")
-    return hashlib.sha256(json.dumps(
-        evidence, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")).hexdigest()
+def _version(text: str, status: str, reasons: list[str], source_verified: bool) -> str:
+    evidence = json.dumps([REVISION, text, status, reasons, source_verified],
+                          ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(evidence.encode("utf-8")).hexdigest()
 
 
-def _result(text: str, reasons: set[str], source_verified: bool, *,
-            removed_verified: bool = False) -> dict:
+def _result(text: str, reasons: set[str], source_verified: bool) -> dict:
     reasons.intersection_update(_MESSAGES)
     codes = sorted(reasons)
     status = ("error" if "guard_error" in reasons else
               "flagged" if set(codes) & _POSITIVE else
               "unchecked" if "source_html_unavailable" in reasons else "clean")
-    checked = bool(removed_verified and set(codes) & _REMOVED_HIDDEN)
-    guard = {
-        "revision": REVISION, "status": status, "reasons": codes,
-        "generation": _version(text, status, codes, source_verified, checked),
-        "source_verified": source_verified,
+    return {
+        "text": text,
+        "posting_guard": {
+            "revision": REVISION, "status": status, "reasons": codes,
+            "generation": _version(text, status, codes, source_verified),
+            "source_verified": source_verified,
+        },
     }
-    if checked:
-        guard["removed_hidden_verified"] = True
-    return {"text": text, "posting_guard": guard}
 
 
 def analyze(text: str | None, *, html_variants=(), source_required: bool = False,
@@ -259,9 +251,7 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
         old = previous or {}
         if isinstance(old, dict):
             reasons.update(code for code in old.get("reasons", []) if code in _MESSAGES)
-        old_hidden = bool(reasons & _REMOVED_HIDDEN)
         hidden_fragments: list[str] = []
-        saw_hidden = False
         variants = tuple(html_variants or ())
         verified = (source_complete and bool(variants)
                     and all(isinstance(v, str) and bool(v.strip())
@@ -274,7 +264,6 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(source)
             parser.close()
             reasons.update(parser.reasons)
-            saw_hidden |= bool(parser.reasons & _REMOVED_HIDDEN)
             hidden_fragments.extend("".join(parts) for parts in parser.hidden_text)
             hidden_fragments.extend(parser.hidden_attrs)
             html_text = "".join(parser.parts)
@@ -289,27 +278,20 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(selected)
             parser.close()
             reasons.update(parser.reasons)
-            saw_hidden |= bool(parser.reasons & _REMOVED_HIDDEN)
             hidden_fragments.extend("".join(parts) for parts in parser.hidden_text)
             hidden_fragments.extend(parser.hidden_attrs)
             selected = "".join(parser.parts)
         clean = _text(selected, reasons, strip_trailing=strip_trailing)
         # The selected ATS plaintext may still contain content removed only
         # from descriptionHtml. It must not inherit the hidden-only exemption.
-        retained = saw_hidden and _hidden_material_retained(clean, hidden_fragments)
-        if retained:
+        if _hidden_material_retained(clean, hidden_fragments):
             reasons.add("hidden_text_retained")
-        old_proved = (not old_hidden or
-                      old.get("removed_hidden_verified") is True and valid(clean, old))
-        removed_verified = bool((reasons & _REMOVED_HIDDEN) and old_proved
-                                and not retained and (saw_hidden or old_hidden))
         if source_required and not verified:
             reasons.add("source_html_unavailable")
         elif verified:
             reasons.discard("source_html_unavailable")
         return _result(clean, reasons, verified or
-                       bool(old.get("source_verified")) and not source_required,
-                       removed_verified=removed_verified)
+                       bool(old.get("source_verified")) and not source_required)
     except Exception:
         return _result("", {"guard_error"} | {
             c for c in (previous or {}).get("reasons", []) if c in _MESSAGES
@@ -329,20 +311,8 @@ def merge(text: str, incoming: dict, previous: dict | None,
         reasons.discard("source_html_unavailable")
     if old.get("status") == "error" and not source_ok:
         reasons.add("guard_error")
-    old_hidden = bool(set(old.get("reasons", [])) & _REMOVED_HIDDEN)
-    incoming_hidden = bool(set(incoming.get("reasons", [])) & _REMOVED_HIDDEN)
-    # Rebinding to different JD bytes cannot invent a hidden-removal proof.
-    removed_verified = bool(
-        (old_hidden or incoming_hidden)
-        and (not old_hidden or
-             old.get("removed_hidden_verified") is True and valid(text, old))
-        and (not incoming_hidden or
-             incoming.get("removed_hidden_verified") is True
-             and valid(text, incoming))
-    )
     return _result(result["text"], reasons, source_ok or
-                   bool(old.get("source_verified")),
-                   removed_verified=removed_verified)
+                   bool(old.get("source_verified")))
 
 
 def valid(text: str, guard: dict | None) -> bool:
@@ -352,7 +322,6 @@ def valid(text: str, guard: dict | None) -> bool:
     codes = guard.get("reasons")
     status = guard.get("status")
     verified = guard.get("source_verified")
-    removed_verified = guard.get("removed_hidden_verified", False)
     return (guard.get("revision") == REVISION
             and isinstance(text, str)
             and isinstance(codes, list)
@@ -360,11 +329,8 @@ def valid(text: str, guard: dict | None) -> bool:
             and codes == sorted(set(codes))
             and status in {"clean", "flagged", "unchecked", "error"}
             and type(verified) is bool
-            and type(removed_verified) is bool
-            and (not removed_verified or bool(set(codes) & _REMOVED_HIDDEN))
             and _result(text, set(codes), verified)["posting_guard"]["status"] == status
-            and guard.get("generation") ==
-            _version(text, status, codes, verified, removed_verified))
+            and guard.get("generation") == _version(text, status, codes, verified))
 
 
 def projection(text: str, guard: dict | None) -> dict:
@@ -382,8 +348,7 @@ def _removed_hidden_only(guard: dict) -> bool:
     # Hidden HTML/links/URLs were dropped before the bound JD reached a model.
     # A missing-source annotation alone is never evidence of such removal.
     reasons = set(guard["reasons"])
-    return (guard.get("removed_hidden_verified") is True
-            and bool(reasons & _REMOVED_HIDDEN)
+    return (bool(reasons & _REMOVED_HIDDEN)
             and reasons <= (_REMOVED_HIDDEN | {"source_html_unavailable"}))
 
 

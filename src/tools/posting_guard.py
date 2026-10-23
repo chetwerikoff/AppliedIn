@@ -299,18 +299,30 @@ def projection(text: str, guard: dict | None) -> dict:
     return _result(inspected["text"], reasons, False)
 
 
+_REMOVED_HIDDEN = frozenset({"hidden_html", "hidden_link", "hidden_url"})
+
+
+def _removed_hidden_only(guard: dict) -> bool:
+    # Hidden HTML/links/URLs were dropped before the bound JD reached a model.
+    # A missing-source annotation alone is never evidence of such removal.
+    reasons = set(guard["reasons"])
+    return (bool(reasons & _REMOVED_HIDDEN)
+            and reasons <= (_REMOVED_HIDDEN | {"source_html_unavailable"}))
+
+
 def requires_review(row: dict) -> bool:
     text, guard = row.get("jd_text") or "", row.get("posting_guard")
-    return not valid(text, guard) or guard["status"] != "clean"
+    return (not valid(text, guard)
+            or (guard["status"] != "clean" and not _removed_hidden_only(guard)))
 
 
 def authorised(row: dict, *, text: str | None = None) -> bool:
-    """Only a currently bound, explicitly reviewed generation admits a risky JD."""
+    """Require a current text binding; only removed-hidden findings bypass review."""
     guard = row.get("posting_guard")
     stored = row.get("jd_text") or ""
     if not valid(stored, guard) or (text is not None and text != stored):
         return False
-    return (guard["status"] == "clean"
+    return (guard["status"] == "clean" or _removed_hidden_only(guard)
             or row.get("reviewed_guard_generation") == guard["generation"])
 
 

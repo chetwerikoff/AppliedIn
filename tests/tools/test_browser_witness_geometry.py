@@ -366,6 +366,20 @@ async def test_second_witness_prevents_write_after_visible_to_invisible_change(m
     no_mutation(session)
 
 
+async def test_committing_fixed_witness_cannot_be_normalized_to_an_absent_page_flag(monkeypatch):
+    c = control('Name', '#name', required=False)
+    current = page(c)
+    fixed = production_observation(current)
+    assert fixed['controls'][0]['commits_application'] is False
+    fixed['controls'][0]['commits_application'] = True
+    session = Session(current, fixed)
+    monkeypatch.setattr(forms, '_row', lambda pk: row_with_grant(c, 'Test User'))
+    with pytest.raises(forms.Gate, match='predicate=commits_application.equal'):
+        await execute(session, current, c, 'fill', 'Test User')
+    assert [call[0] for call in session.calls] == ['evaluate']
+    no_mutation(session)
+
+
 async def test_unrelated_excluded_caption_gates_even_granted_visible_text_fill(
         monkeypatch):
     c = control('Name', '#name', required=False)

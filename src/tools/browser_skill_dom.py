@@ -42,7 +42,10 @@ _WIDGET_GRAPH = r"""
     for (const key of ['aria-describedby','aria-errormessage']) {
       for (const id of (e.getAttribute(key)||'').split(/\s+/).filter(Boolean)) {
         const ref=byId(id);
-        if (ref && (nativeForm(ref)!==form || ref.hasAttribute('formaction'))) return false;
+        if (ref) {
+          const refOwner = nativeForm(ref);
+          if (refOwner !== form || ref.hasAttribute('formaction')) return false;
+        }
       }
     }
     return true;

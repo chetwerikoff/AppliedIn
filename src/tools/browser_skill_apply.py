@@ -676,7 +676,10 @@ def exact_approval(pk: str, key: str, value: str, *,
                      or not _same(value, 'yes')))
             or (target.get('type') == 'radio'
                 and (grant.get('radio_name') != target.get('name')
-                     or grant.get('radio_members') != target.get('radio_members')
+                     or not isinstance(grant.get('radio_members'), list)
+                     or not all(isinstance(m, dict) for m in grant['radio_members'])
+                     or [{**m, 'label': m.get('label', m.get('caption'))}
+                         for m in grant['radio_members']] != target.get('radio_members')
                      or not isinstance(target.get('radio_members'), list)))
             or (target.get('tag') == 'select'
                 and grant.get('options') != target.get('options'))):
@@ -1220,10 +1223,7 @@ def check_form_destination(page: dict, target: dict, *origins: str,
                 or (override and not isinstance(override, str))
                 or not _preparation_destination_allowed(base, *origins, provenance=provenance)
                 or (override and not _preparation_destination_allowed(
-                    override, *origins, provenance=provenance))
-                or (isinstance(provenance, ApplicationEntryProvenance) and
-                    any(receiver and not navigation_allowed(receiver, provenance=provenance)
-                        for receiver in (base, override)))):
+                    override, *origins, provenance=provenance))):
             if isinstance(provenance, ApplicationEntryProvenance):
                 raise Gate('native form receiver not proven; inspect the destination manually.')
             raise Gate('The form destination is external or not proven to be this tracked job.')
@@ -1890,11 +1890,7 @@ def _entry_safety(page, allowed, provenance):
         # Exhaustive foreign-owner classification precedes destination preflight.
         # Foreign candidates remain in the read-only census, never action targets.
         controls = page['controls']
-    root = entry.get('root')
-    if root:
-        check_form_destination(page, dict(in_form=True, form_selector=root['selector'],
-                                          form_action=root.get('action'), formaction=''),
-                               provenance=provenance)
+    # Native root authority is final-Submit evidence; preparation checks each receiver.
     for c in controls:
         if c.get('in_form'):
             owner = c.get('form_selector')
@@ -1962,7 +1958,8 @@ class _EntrySession:
                     tree = (witness.get('entry') or {}).get('upload_tree')
                     if not isinstance(tree, dict) or type(tree.get('complete')) is not bool:
                         raise Gate('Incomplete or overflowing upload structural witness; inspect manually.')
-                    if tree.get('filename') not in (None, '', filename):
+                    if (tree.get('filename') not in (None, '', filename)
+                            or (tree.get('items') and tree.get('attached') is not True)):
                         raise Gate('The exact passive attached-file item was not proven.')
                     if tree['complete'] is True:
                         _upload_tree(witness)
@@ -2036,9 +2033,6 @@ class _EntrySession:
                     if after is None:
                         await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
                         continue
-                    if (_formless_root(before) != _formless_root(after)
-                            or before['url'] != after['url']):
-                        raise Gate('Original application root or submit changed during upload.')
                     post = (after.get('entry') or {}).get('upload_tree')
                     opaque = isinstance(post, dict) and post.get('complete') is False
                     if not opaque and _upload_delta(before, after, filename):
@@ -2066,6 +2060,8 @@ class _EntrySession:
                 raise Gate('Autofill pane is forbidden at IPC producer.')
             if args[0] not in {'fill', 'select', 'upload', 'click'}:
                 raise Gate('Unsupported effectful application entry IPC.')
+            if args[0] == 'upload' and root:
+                return await self._upload(args, kwargs, selector)
             current, _ = await _observe_controls(self, current)
             matches = [c for c in current.get('controls', [])
                        if c.get('selector') == selector]
@@ -2080,7 +2076,7 @@ class _EntrySession:
                                     if isinstance(c, dict)} | {root['submit']}:
                     raise Gate('The current application root does not own this receiver.')
                 if args[0] == 'click' and selector != root['submit']:
-                    raise Gate('Unclassified structural click cannot reach application IPC.')
+                    raise Gate('The current application root forbids structural click at IPC producer.')
             else:
                 check_form_destination(current, target, provenance=self.provenance)
             if (args[0] == 'click' and
@@ -2088,8 +2084,6 @@ class _EntrySession:
                      or target.get('commits_application')) and
                     getattr(self.raw, '_application_controller', None) is None):
                 raise Gate('Submission-capable click lacks final approval from the application IPC controller.')
-            if args[0] == 'upload' and root:
-                return await self._upload(args, kwargs, selector)
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
@@ -2131,7 +2125,8 @@ def _entry_not_ready(page):
     for key in ('truncated', 'opaque_controls', 'shadow_roots'):
         if page.get(key):
             return key + ' application inventory'
-    if page.get('inventory_verified') is not True:
+    if page.get('inventory_verified') is not True and (
+            not _formless_root(page) or _formless_root(page).get('root')):
         return 'unverified application inventory'
     # Native forms can be prepared from their current accessible controls
     # without first proving an ATS/widget-specific root certificate. Only
@@ -2311,7 +2306,9 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
                         'form_action_attr_present', 'form_action_raw',
                         'formaction_attr_present', 'formaction_raw',
                         'commits_application'):
-                require(original.get(key) == observed.get(key), key + '.equal')
+                require((original.get(key, False) == observed.get(key, False)
+                         if key == 'commits_application' else
+                         original.get(key) == observed.get(key)), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
                 if isinstance(session, _GreenhouseSession) and readiness:
                     require(isinstance(observed.get('visible_text'), str), 'visible_text.string')
@@ -2409,7 +2406,7 @@ def _bound_target(page: dict, target: dict) -> dict:
     members = _radio_group(page, target)
     return {**members[0], 'radio_name': members[0]['name'],
             'radio_members': [
-                {'selector': c['selector'], 'caption': c['label'],
+                {'selector': c['selector'], 'caption': c['label'], 'label': c['label'],
                  'value': c['value']} for c in members]}
 
 
@@ -3446,6 +3443,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                   provenance: Provenance | None = None) -> dict:
     ctx = _synthetic(fixture_context, pk=pk)
     verb = action.get('action')
+    if pk and provenance is None and job_url != (
+            (_row(pk, fixture_context=ctx) if ctx else _row(pk)).get('jd_url') or job_url):
+        raise Gate('An exact human-approved answer is needed for this tracked job.')
     if provenance is not None:
         if (pk != provenance.pk or company != provenance.company
                 or job_url != provenance.wrapper

@@ -4,6 +4,7 @@ All browser observations below execute the two production JavaScript readers in
 Node on a synthetic graph; the Session transports only synthetic snapshots.
 """
 import copy
+from tests.tools.reader_node_harness import reader_output
 import json
 import subprocess
 from pathlib import Path
@@ -17,11 +18,21 @@ URL = 'https://example-co.test/job/1'
 KEYS = ('location', 'school', 'degree', 'discipline')
 
 
-def dom(**scenario):
+def _one_shot_dom(**scenario):
+    # Keep the exact pre-migration CLI arguments and the independent witness.
     return json.loads(subprocess.check_output([
         'node', str(Path(__file__).with_name('closed_widget_dom.cjs')),
         json.dumps(scenario), PAGE, forms._FIXED_CONTROL_WITNESS,
     ], text=True))
+
+
+def dom(**scenario):
+    if scenario.get('secondIti'):
+        # Cloning the full 244-option phone picker exceeds the VM request
+        # budget in CI. Preserve the original one-shot reader/witness command.
+        return _one_shot_dom(**scenario)
+    return json.loads(reader_output(
+        'closed_widget_dom.cjs', scenario, PAGE, forms._FIXED_CONTROL_WITNESS))
 
 
 def combo(snapshot, key='location'):
@@ -458,7 +469,11 @@ async def test_anchor_drift_does_not_confer_submit_authority(grants, anchor, sta
                          filled, True, receipts=[receipt])
 
 @pytest.mark.parametrize('phase', ['C0', 'C2'])
-async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase):
+async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase, monkeypatch):
+    if phase == 'C0':
+        # This failed-expansion negative exceeded the migrated-item budget.
+        # Keep *all* of its implicit Session/Drift reads on the original CLI.
+        monkeypatch.setitem(globals(), 'dom', _one_shot_dom)
     class Drift(Session):
         async def call(self, *args):
             result = await super().call(*args)

@@ -646,6 +646,9 @@ async def test_formless_upload_producer_binds_dropzone_to_exact_file_input(
         await session.application_effect(
             "upload", "#untrusted-drop", "--file", str(pdf), timeout=130)
     assert calls == []
+    with pytest.raises(forms.Gate):
+        await session.application_effect("click", "#dropzone")
+    assert calls == []
     await session.application_effect(
         "upload", "#dropzone", "--file", str(pdf), timeout=130)
     assert [entry[0][:2] for entry in calls] == [("upload", "#dropzone")]

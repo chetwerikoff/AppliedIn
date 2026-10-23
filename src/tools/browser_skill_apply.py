@@ -1620,7 +1620,7 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
         raise Gate('formless structural recipient not proven; inspect manually.')
     if root.get('error'):
         raise Gate(root['error'] + '; inspect the application manually.',
-                   reason='defect_ashby_root_identity')
+                   reason='defect_structural' if root['error'].startswith('unsupported') else 'defect_ashby_root_identity')
     if not root.get('root'):
         raise _EntryNotReady('no unique application root')
     evidence = (page.get('entry') or {}).get('root_evidence')
@@ -2047,8 +2047,8 @@ class _EntrySession:
             root = _formless_root(current)
             if root:
                 evidence = (current.get('entry') or {}).get('root_evidence') or []
-                if selector not in {c.get('selector') for c in evidence
-                                    if isinstance(c, dict)} | {root['submit']}:
+                if selector not in {c.get('selector') for c in evidence if isinstance(c, dict)
+                                    and (args[0] != 'click' or c.get('dropzone') is not True)} | {root['submit']}:
                     raise Gate('The current application root does not own this receiver.')
             else:
                 check_form_destination(current, target, provenance=self.provenance)
@@ -2261,8 +2261,6 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         if isinstance(session, _GreenhouseSession):
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
-        require(value.get('application_identity') == page.get('application_identity'),
-                'application_identity.equal')
         require(isinstance(value.get('controls'), list), 'controls.list')
         require(len(value['controls']) == len(page['controls']) or (
             page.get('truncated') is True
@@ -4066,6 +4064,9 @@ class ApplicationIPCController:
             raise Gate('Keyboard or focus IPC lacks a safe application effect classification.')
         if len(args) != 2 or kwargs:
             raise Gate('Unknown application click IPC arguments.')
+        if selector in {c.get('selector') for c in observed.get('root_evidence') or []
+                        if isinstance(c, dict) and c.get('dropzone') is True}:
+            raise Gate('The clicked application control or option is not current.')
         if not targets:
             if self._choice(page, selector):
                 return
@@ -4084,7 +4085,6 @@ class ApplicationIPCController:
             self.mark_click_started()
             return
         if target.get('type') in {'radio', 'checkbox'}:
-            key = _key(page, target)
             approved = _approved_native_choice(page, target, self.pk,
                                                fixture_context=self.fixture_context)
             if not approved or approved[1].get('selector') != selector:

@@ -198,7 +198,9 @@ def test_native_choice_caption_uses_same_literal_visible_predicate(
 def control(label, selector, *, tag='input', type='text', **changes):
     return {
         'selector': selector, 'label': label, 'question': '',
-        'tag': tag, 'type': type, 'required': True,
+        'tag': tag, 'type': type,
+        'native_type': type if tag in {'input', 'button'} else '',
+        'required': True,
         'disabled': False, 'readonly': False, 'in_form': True,
         'form_selector': '#application', 'form_action': URL,
         'native_form_owner_selector': '#application',

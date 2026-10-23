@@ -106,7 +106,8 @@ def test_exact_phone_inventory_uses_both_production_readers(phase):
     page, witness = snapshot['page'], snapshot['witness']
     assert page['opaque_controls'] is True and page['inventory_verified'] is False
     assert page['truncated'] is False
-    assert set(witness) == {'url', 'controls'}
+    assert set(witness) == {'url', 'controls', 'application_identity'}
+    assert witness['application_identity'] == page['application_identity']
     assert [c['selector'] for c in page['controls']] == [
         c['selector'] for c in witness['controls']]
     assert {'#country', '#phone', '#resume', '#submit'} <= {

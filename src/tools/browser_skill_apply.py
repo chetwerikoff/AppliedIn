@@ -2830,7 +2830,7 @@ def _unanswered(page: dict, target: dict) -> bool:
 def _choice_prompt(target: dict, question: dict) -> str:
     """Show original question, radio captions and native select options verbatim."""
     subject = label(target)
-    prefix = ('Legal acknowledgement: ' if (_MATERIAL_ASSENT.search(subject)
+    prefix = ('Legal acknowledgement: ' if (_material_assent_match(subject)
               or _material_form_choice(target))
               else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
               else '')

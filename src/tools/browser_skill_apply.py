@@ -5512,7 +5512,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         step, mark_click_started, seal_stage=True,
                         verified_redirect=(provenance if isinstance(
                             provenance, VendorRedirectProvenance) else None))
-                    try:                        raw_session.bind_application_controller(controller)
+                    try:
+                        raw_session.bind_application_controller(controller)
                         if getattr(raw_session, '_application_controller', None) is not controller:
                             raise Gate('Application producer did not retain its raw IPC guard; no click is safe.')
                     except BaseException:

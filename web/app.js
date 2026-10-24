@@ -4351,7 +4351,8 @@ function markTailoring(pk) {
 
 function markBusy(pk, detail) {
   const row = state.apps.find((a) => a.pk === pk);
-  if (!row || isReadOnly(row)) return;
+  // Structural Requeue must latch before POST despite the read-only route.
+  if (!row || (isReadOnly(row) && !canRequeueStructuralGate(row))) return;
   row.status = "submitting";
   state.activity[pk] = { detail, at: Date.now() / 1000, kind: "running" };
   renderPane();        // move the card into its working state

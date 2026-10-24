@@ -468,6 +468,36 @@ test('non-resumable structural gates render the existing Requeue control without
   assert.equal(h.requests.length, 0, 'rendering and authorization must not queue anything');
 });
 
+test('structural Requeue latches the first delegated click before another can POST', () => {
+  const h = harness();
+  const structural = row('structural-once', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: false,
+  });
+  h.state.apps = [structural];
+  h.context.sent = [];
+  // Mock the existing POST path: the regression must never fetch or queue a real job.
+  vm.runInContext('post = (path) => { globalThis.sent.push(path); return Promise.resolve({ok:true}); };'
+    + 'renderPane = () => {}; scheduleLive = () => {}; loadQueue = () => {}; toast = () => {};',
+    h.context);
+  h.fn('wire')();
+  const click = h.node('#pane').listeners.click.at(-1);
+  assert.ok(click);
+  const control = {dataset: {act: 'queue-apply', pk: structural.pk}};
+  const event = {target: {closest: (selector) => selector === '[data-act]' ? control : null},
+    stopPropagation() {}};
+  const requestsBefore = h.requests.length;
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+
+  click(event);
+  assert.deepEqual(Array.from(h.context.sent), ['/actions/queue-apply/structural-once']);
+  assert.equal(structural.status, 'submitting', 'first click must latch before POST completes');
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), false);
+  click(event);
+  assert.equal(h.context.sent.length, 1, 'rapid delegated retry must never POST again');
+  assert.equal(h.requests.length, requestsBefore, 'offline test must not fetch or queue a job');
+});
+
 test('structural Requeue fails closed for form/call witnesses, holds, uncertainty and completed rows', () => {
   const h = harness();
   const structural = {gate_reason: 'defect_structural',

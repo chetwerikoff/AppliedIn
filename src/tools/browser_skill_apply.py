@@ -2797,20 +2797,19 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current, complete=False)
         identity = _page_identity(current)
-        if site and _identity_try > 1 and _previous_identity == identity:
+        same_read = identity == _page_identity(page)
+        if site and _identity_try > 1 and same_read and _previous_identity == identity:
             return current, lookup
         if site and _identity_try < 4 and (
-                identity != _page_identity(page) or _identity_try > 1):
-            # Retry only after the initial inventory identity disagreement.
-            # Re-read PAGE and witness together; two adjacent complete matches
-            # are necessary before any material resume authority is returned.
+                not same_read or _identity_try > 1):
+            # Only the initial identity mismatch enables a bounded sequence of
+            # complete PAGE+witness rereads. Subsequent reads must agree twice.
             await asyncio.sleep(0.25)
             return await _observe_controls(
                 session, await session.page(), readiness=readiness,
                 site=site, _identity_try=_identity_try + 1,
                 _previous_identity=identity)
-        require(identity == _page_identity(page) and
-                (not site or _identity_try == 1),
+        require(same_read and (not site or _identity_try == 1),
                 'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup

@@ -337,6 +337,20 @@ def _navigation_host_path(value: str) -> str:
         return 'unavailable'
 
 
+def _navigation_observed_step_url(page: dict | None, tracked: str) -> str:
+    """Only retain a canonical tracked URL observed by the browser."""
+    observed = page.get('url') if isinstance(page, dict) else None
+    if not isinstance(observed, str) or observed != tracked:
+        return 'unavailable'
+    host_path = _navigation_host_path(observed)
+    if (host_path == 'unavailable'
+            or host_path.endswith('/(path unavailable)')
+            or observed != f'https://{host_path}'
+            or any(segment in {'.', '..'} for segment in
+                   urlsplit(observed).path.split('/'))):
+        return 'unavailable'
+    return observed
+
 def _navigation_failed_predicate(destination: str, tracked: str,
                                  provenance: Provenance | None) -> str:
     """Name the first failed *existing* route predicate; never grant authority."""
@@ -4563,6 +4577,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     filled, history = {}, []
     uploaded = False
     session = None
+    page = None
     try:
         verify_dispatch()
         if _greenhouse_id_query_attempt(url) and not greenhouse_alias_candidate(url):
@@ -4928,7 +4943,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
             context = (
                 {'text': str(exc), 'step': {'last_button': '(unavailable)',
-                                          'url': 'unavailable'}}
+                                          'url': _navigation_observed_step_url(page, url)}}
                 if isinstance(exc, NavigationProvenanceGate)
                 else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
                 else handoff(str(exc), step))

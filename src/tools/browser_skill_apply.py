@@ -2911,9 +2911,14 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                 raise Gate(_choice_prompt(c, question),
                            form_question=question, reason='owner_question')
             continue
-        if c.get('in_form') and (
-                _MATERIAL_ASSENT.search(subject) or _material_select_options(c)):
-            raise Gate('Material assent outside a bound choice needs human inspection.')
+        if c.get('in_form'):
+            assent_match = _MATERIAL_ASSENT.search(subject)
+            if assent_match or _material_select_options(c):
+                raise Gate(
+                    'Material assent outside a bound choice needs human inspection. '
+                    f"Control type: {c.get('type')}; tag: {c.get('tag')}; "
+                    f"visible label: {c.get('label', '')[:120]!r}; "
+                    f"matched: {assent_match.group(0) if assent_match else 'select options'}.")
 
 
 

@@ -731,6 +731,115 @@ async def test_input_submit_value_reveals_account_purpose(
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
 
 
+
+@pytest.mark.parametrize('cause,visible,question,expected', [
+    ('label', 'I AGREE to terms', '', 'AGREE'),
+    ('question', 'Response', 'Please consent to the policy', 'consent'),
+    ('options', 'Response', '', 'select options'),
+    ('both', 'Consent statement', '', 'Consent'),
+])
+async def test_material_assent_wall_reports_control_and_match_not_values(
+        monkeypatch, cause, visible, question, expected):
+    options = ([{'value': 'OPTION_VALUE_SENTINEL',
+                 'label': 'privacy consent OPTION_CAPTION_SENTINEL'}]
+               if cause in {'options', 'both'} else [])
+    material = field(visible, '#assent', tag='select', type='select',
+                     question=question, options=options,
+                     value='CONTROL_VALUE_SENTINEL', has_value=True)
+    page = secure_inventory(field(), material)
+    browser, decide, row = secure_world(monkeypatch, page)
+    report = await secure_attempt(page, facts={
+        'Synthetic fact': 'FACT_VALUE_SENTINEL',
+    })
+
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert report['reason'] == 'unknown_field'
+    assert report['review_route'] == 'agent_unavailable'
+    detail = report['question']
+    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
+    assert 'Control type: select; tag: select;' in detail
+    assert f"visible label: {visible!r};" in detail
+    assert f"matched: {expected}." in detail
+    assert 'Agent-first review is unavailable' in detail
+    assert 'Please consent to the policy' not in detail
+    for secret in ('CONTROL_VALUE_SENTINEL', 'OPTION_VALUE_SENTINEL',
+                   'OPTION_CAPTION_SENTINEL', 'FACT_VALUE_SENTINEL'):
+        assert secret not in detail
+    assert decide.await_count == 0
+    assert row['status'] == 'submitting'
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch):
+    prefix = 'I agree to terms '
+    visible_prefix = prefix + 'x' * (120 - len(prefix))
+    tail = 'TRUNCATED_LABEL_TAIL_SENTINEL'
+    page = secure_inventory(field(), field(
+        visible_prefix + tail, '#long-material', required=False))
+    browser, decide, _ = secure_world(monkeypatch, page)
+    report = await secure_attempt(page)
+
+    assert report['status'] == 'gate'
+    assert report['review_route'] == 'agent_unavailable'
+    assert (f"Control type: text; tag: input; visible label: {visible_prefix!r};"
+            in report['question'])
+    assert 'matched: agree.' in report['question']
+    assert tail not in str(report)
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+    bound = field('I agree to terms', '#bound-choice',
+                  tag='input', type=kind, required=False,
+                  checked=True, has_value=True, name='attestation')
+    forms._bootstrap_wall(inventory(bound, submit()), {}, URL)
+
+
+async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
+    radio = field('Arbitration consent', '#legal', tag='input', type='radio',
+                  name='legal', question='Arbitration consent', required=True)
+    page = secure_inventory(field(), radio)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    report = await secure_attempt(page)
+
+    assert report['status'] == 'gate'
+    assert report['review_route'] == 'owner'
+    assert report['reason'] == 'owner_question'
+    assert report['form_question'] is not None
+    assert 'Control type:' not in report['question']
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch):
+    page = secure_inventory(field())
+    browser, decide, row = secure_world(monkeypatch, page)
+    model_question = 'Synthetic prerequisite: approve test-only facts before continuing.'
+    decide.return_value = {'action': 'gate', 'question': model_question}
+    report = await secure_attempt(page)
+
+    assert decide.await_count == 1
+    prompt, model_page, model_history = decide.await_args.args
+    assert 'Exact human-authorized fact KEYS' in prompt
+    assert 'For the required résumé file input' in prompt
+    assert model_page['controls'][0]['label'] == 'Email'
+    assert model_history == []
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'unknown_field'
+    assert report['review_route'] == 'agent_unavailable'
+    assert report['form_question'] is None
+    assert report['question'].startswith(model_question + ' Last button:')
+    assert 'Agent-first review is unavailable' in report['question']
+    assert row['status'] == 'submitting'
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
 @pytest.mark.parametrize('option', [
     {'value': 'arbitration-accept', 'label': 'I agree to arbitration'},
     {'value': 'privacy consent', 'label': 'Accept'},

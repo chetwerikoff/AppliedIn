@@ -721,6 +721,20 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     const x=raw===null && !!box && box.width<=1 && box.height<=1 &&
       style.visibility==='hidden' && outside;
     const visibleR=visibleRecaptcha(origin,path,shown,outside,badge,bounds);
+    // The invisible Enterprise pair is provider-owned only when both exact
+    // frames are unique. Badge containment is checked on the actual anchor;
+    // its body-level bframe need not share the badge or an application root.
+    const passiveEnterprise=raw!==null && !e.hasAttribute('srcdoc') && hidden &&
+      enterpriseAnchors.length===1 &&
+      enterpriseBadgeAnchor(enterpriseAnchors[0].closest('div.grecaptcha-badge')) &&
+      entryFrameNodes.filter(f=>{
+        if(f.hasAttribute('srcdoc')) return false;
+        try {
+          const u=new URL(f.getAttribute('src'));
+          return ['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) &&
+            u.pathname==='/recaptcha/enterprise/bframe';
+        } catch (_) { return false; }
+      }).length===1 && r;
     // AC-Z is scoped to the entry reader; ordinary PAGE gains no frame waiver.
     const z=raw===null && e.getAttribute('title')===null &&
       !e.getAttributeNames().some(a=>a.startsWith('data-') || a.startsWith('aria-')) &&
@@ -731,7 +745,10 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     // Visible bframe precedence is independent of root proof/placement.
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
-    else if ((r && hiddenROutside && hidden) || visibleR==='R') status='R';
+    else if (!e.hasAttribute('srcdoc') && ((r && hiddenROutside && hidden) ||
+             visibleR==='R' || (passiveEnterprise &&
+             (path==='/recaptcha/enterprise/anchor' ||
+              (path==='/recaptcha/enterprise/bframe' && hidden))))) status='R';
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';

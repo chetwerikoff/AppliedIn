@@ -92,8 +92,9 @@ def test_passive_frames_do_not_become_captcha_gates_from_an_empty_response(statu
     classify(page)
 
 
-async def synthetic_controller(monkeypatch, case):
+async def synthetic_controller(monkeypatch, case, *, url=URL, prior_button=None):
     page = observation(case)
+    page["url"] = url
     calls = []
 
     class Session:
@@ -108,7 +109,7 @@ async def synthetic_controller(monkeypatch, case):
 
         async def navigate(self, address):
             calls.append(("navigate", address))
-            assert address == URL
+            assert address == url
             return deepcopy(page)
 
         async def call(self, *args):
@@ -133,7 +134,7 @@ async def synthetic_controller(monkeypatch, case):
     # Exercise challenge classification *after* that invariant, not against
     # an intentionally missing dispatch identity.
     tracked = {"pk": PK, "company": "example-co", "job_id": "captcha",
-               "jd_url": URL, "status": "submitting",
+               "jd_url": url, "status": "submitting",
                "possible_submission": False, "ats": "custom"}
     monkeypatch.setattr(forms, "_row", lambda pk: tracked if pk == PK else {})
     monkeypatch.setattr(forms, "_bootstrap", bootstrap)
@@ -143,12 +144,24 @@ async def synthetic_controller(monkeypatch, case):
     monkeypatch.setattr(claude_chrome, "_stage_resume", lambda *a, **k: "/synthetic/resume.pdf")
     monkeypatch.setattr(events, "emit", lambda *a, **k: None)
 
+    if prior_button is not None:
+        # Inject an already-observed page button at the real handoff boundary.
+        # The gate transport must not copy it into the owner-visible result.
+        ordinary_handoff = forms.handoff
+
+        def with_prior_button(message, step, **kwargs):
+            step["last_button"] = prior_button
+            return ordinary_handoff(message, step, **kwargs)
+
+        monkeypatch.setattr(forms, "handoff", with_prior_button)
+
     result = await forms.apply(
-        URL, "example-co", {}, "synthetic", pk=PK, resume_path="/synthetic/resume.pdf")
-    assert calls == [("navigate", URL)]
+        url, "example-co", {}, "synthetic", pk=PK, resume_path="/synthetic/resume.pdf")
+    assert calls == [("navigate", url)]
     assert result["status"] == "gate"
     assert result["question"] and URL in result["question"]
-    assert result["step"]["url"] == URL
+    assert result["step"]["url"] == (
+        URL if result.get("captcha_artifact_diagnostic") else url)
     if case == "control":
         # ControlGate clears stale button metadata, retaining code-owned diagnostics.
         assert result["step"]["last_button"] == ""
@@ -184,15 +197,60 @@ async def test_pre_submit_controller_gate_shape_and_reason(monkeypatch, case, re
         assert result["step"]["reason"] == "absent: 0 matches"
 
 
-@pytest.mark.parametrize("case", ["entry-visible-hcaptcha", "entry-response"])
+
+@pytest.mark.parametrize("captcha_artifact", [True, False])
+def test_only_captcha_artifact_handoff_drops_page_context(captcha_artifact):
+    # Plain Gates keep their historic safe job query and prior-button context.
+    page_url = (URL + "?job=GENERIC_JOB_QUERY_SENTINEL"
+                "&other=DROPPED_QUERY_SENTINEL#FRAGMENT_SENTINEL")
+    result = forms.handoff(
+        "Synthetic review required.",
+        {"url": page_url, "last_button": "PAGE_BUTTON_SENTINEL"},
+        captcha_artifact=captcha_artifact)
+    if captcha_artifact:
+        assert result["step"] == {"last_button": "(unavailable)", "url": URL}
+        for sentinel in ("GENERIC_JOB_QUERY_SENTINEL", "DROPPED_QUERY_SENTINEL",
+                         "FRAGMENT_SENTINEL", "PAGE_BUTTON_SENTINEL"):
+            assert sentinel not in result["text"]
+            assert sentinel not in repr(result["step"])
+    else:
+        assert result["step"]["last_button"] == "PAGE_BUTTON_SENTINEL"
+        assert result["step"]["url"] == URL + "?job=GENERIC_JOB_QUERY_SENTINEL"
+        assert "GENERIC_JOB_QUERY_SENTINEL" in result["text"]
+        assert "DROPPED_QUERY_SENTINEL" not in result["text"]
+        assert "FRAGMENT_SENTINEL" not in result["text"]
+
+
+@pytest.mark.parametrize("case", [
+    "entry-visible-hcaptcha", "entry-response", "entry-unknown",
+])
 async def test_unchanged_caller_persists_pre_submit_captcha_gate(monkeypatch, caplog, case):
     from agent import run
     from core import events, profiles, rotation
     from tools import browser_apply, browser_runtime, credentials
 
-    result = await synthetic_controller(monkeypatch, case)
-    if case == "entry-response":
+    artifact = case in {"entry-response", "entry-unknown"}
+    page_url = (URL + "?job=QUERY_JOB_SENTINEL&job_id=QUERY_JOB_ID_SENTINEL"
+                "&req=QUERY_REQ_SENTINEL&requisition=QUERY_REQUISITION_SENTINEL"
+                "&id=QUERY_ID_SENTINEL&other=QUERY_OTHER_SENTINEL"
+                "#FRAGMENT_SENTINEL" if artifact else URL)
+    result = await synthetic_controller(
+        monkeypatch, case, url=page_url,
+        prior_button="PAGE_LABEL_SENTINEL" if artifact else None)
+    forbidden = (
+        "QUERY_JOB_SENTINEL", "QUERY_JOB_ID_SENTINEL", "QUERY_REQ_SENTINEL",
+        "QUERY_REQUISITION_SENTINEL", "QUERY_ID_SENTINEL", "QUERY_OTHER_SENTINEL",
+        "FRAGMENT_SENTINEL", "PAGE_LABEL_SENTINEL",
+    )
+    if artifact:
         assert result["captcha_artifact_diagnostic"] is True
+        assert result["step"] == {"last_button": "(unavailable)", "url": URL}
+        assert f"Last button: (unavailable). Page: {URL}" in result["question"]
+        assert ("untrusted captcha response control" if case == "entry-response"
+                else "unknown/untrusted application frame") in result["question"]
+        for sentinel in forbidden:
+            assert sentinel not in result["question"]
+            assert sentinel not in repr(result["step"])
         # Owner-only synthetic text must survive storage but not direct logging.
         result["question"] += " OWNER_GATE_ONLY_SENTINEL"
 
@@ -201,7 +259,7 @@ async def test_unchanged_caller_persists_pre_submit_captcha_gate(monkeypatch, ca
             from tools import posting_guard as pg
             checked = pg.analyze("Synthetic engineering job. " * 40)
             self.row = {**{"pk": PK, "status": "tailored",
-                        "company": "example-co", "jd_url": URL}, "jd_text": checked["text"],
+                        "company": "example-co", "jd_url": page_url}, "jd_text": checked["text"],
                         "posting_guard": checked["posting_guard"]}
             self.writes = []
 
@@ -269,15 +327,19 @@ async def test_unchanged_caller_persists_pre_submit_captcha_gate(monkeypatch, ca
     finally:
         run.log.removeHandler(caplog.handler)
     expected = {"result": "gated", "pk": PK, "question": result["question"]}
-    if case == "entry-response":
+    if artifact:
         expected["captcha_artifact_diagnostic"] = True
     assert consumed == expected
     assert tracking.row["status"] == "needs_human"
-    assert tracking.row["gate_reason"] == (
-        "unknown_field" if case == "entry-response" else "captcha")
+    assert tracking.row["gate_reason"] == ("unknown_field" if artifact else "captcha")
     assert tracking.row["gate_pending"]["question"] == result["question"]
+    if artifact:
+        # The entire durable owner gate, not only the emitted log marker, is clean.
+        for sentinel in forbidden:
+            assert sentinel not in repr(tracking.row["gate_pending"])
+        assert "OWNER_GATE_ONLY_SENTINEL" in tracking.row["gate_pending"]["question"]
     assert not any(kind == "captcha_wait" for kind, _ in emitted)
-    if case == "entry-response":
+    if artifact:
         assert "captcha-artifact: human inspection required" in caplog.text
         assert "OWNER_GATE_ONLY_SENTINEL" not in caplog.text
         assert "OWNER_GATE_ONLY_SENTINEL" not in repr(emitted)

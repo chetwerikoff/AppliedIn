@@ -625,7 +625,7 @@ def _missing_answer_reason(target: dict) -> str:
 
 def exact_approval(pk: str, key: str, value: str, *,
                    target: dict | None = None, url: str = '', provenance=None,
-                   fixture_context=None) -> None:
+                   fixture_context=None, witnessed_options=None) -> None:
     """Approval belongs to one observed control, not a reusable bank label."""
     ctx = _synthetic(fixture_context, pk=pk)
     row = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
@@ -668,9 +668,10 @@ def exact_approval(pk: str, key: str, value: str, *,
             or (target.get('tag') == 'select'
                 and grant.get('options') != target.get('options'))
             or (target.get('type') == 'combobox' and _material_form_choice(target)
-                and grant.get('options') != [
-                    {key: option[key] for key in ('selector', 'label', 'value')}
-                    for option in _combobox_options(target)])):
+                and grant.get('options') != (
+                    witnessed_options if witnessed_options is not None else [
+                        {key: option[key] for key in ('selector', 'label', 'value')}
+                        for option in _combobox_options(target)]))):
         # Old label-only grants have no control identity and always gate.
         raise Gate('An exact human-approved answer is needed for this control.')
     if (isinstance(provenance, VendorRedirectProvenance)
@@ -720,8 +721,34 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 else:
                     raise Gate('The approved native choice control changed.')
                 _guard_native_choice_answer(target, answer)
+            # A committed ARIA picker may close. Preserve its witnessed option
+            # identity while rechecking the current caption and hidden receiver.
+            witnessed_options = None
+            if receipt.get('action') == 'combobox':
+                row = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
+                grant = (row.get('human_approved_answers') or {}).get(receipt['fact'])
+                if isinstance(grant, dict) and isinstance(grant.get('options'), list):
+                    witnessed_options = receipt.get('witnessed_options')
+                    selected_option = receipt.get('selected_option')
+                    if (not isinstance(witnessed_options, list)
+                            or not isinstance(selected_option, dict)
+                            or selected_option not in witnessed_options
+                            or selected_option.get('label') != receipt.get('committed_caption')
+                            or selected_option.get('value') != receipt.get('committed_value')):
+                        raise Gate('The material option receipt is missing or changed.')
+                    combo = target.get('combobox') or {}
+                    if combo.get('linked') is True:
+                        current_options = [
+                            {key: option[key] for key in ('selector', 'label', 'value')}
+                            for option in _combobox_options(target)]
+                        if current_options != witnessed_options:
+                            raise Gate('The material options changed before Submit.')
+                    elif (combo.get('linked') is not False
+                          or combo.get('options') not in (None, [])):
+                        raise Gate('The committed material listbox identity changed.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
+                           witnessed_options=witnessed_options,
                            provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
 
@@ -3078,12 +3105,10 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                                 pass
                             else:
                                 continue
-                        if unanswered:
-                            # Reuse the established material-gate telemetry flag:
-                            # the owner gets the real options, ordinary logs do not.
-                            raise MaterialAssentGate(
-                                _choice_prompt(c, question),
-                                form_question=question, reason='owner_question')
+                        # Preselection is never a fresh owner decision.
+                        raise MaterialAssentGate(
+                            _choice_prompt(c, question),
+                            form_question=question, reason='owner_question')
                 # PAGE.label can come from non-visible names or option captions.
                 # The independent witness identifies real rendered labeling text.
                 proof = witness.get(c.get('selector'))
@@ -3717,6 +3742,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     if len(candidates) != 1:
         return unresolved()
     selected = candidates[0]
+    witnessed_options = ([
+        {key: option[key] for key in ('selector', 'label', 'value')}
+        for option in _combobox_options(current)]
+        if _material_form_choice(current) else None)
     if (selected.get('submit') or selected.get('navigates')
             or selected.get('safe') is not True):
         raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
@@ -3732,7 +3761,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             'committed_caption': selected['label'], 'committed_value': committed,
             'hidden_selector': before.get('hidden_selector', ''),
             'hidden_value_before': before.get('hidden_value', ''),
-            'hidden_value': committed if before.get('hidden_selector') else ''}
+            'hidden_value': committed if before.get('hidden_selector') else '',
+            **({'witnessed_options': witnessed_options,
+                'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
+               if witnessed_options is not None else {})}
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
@@ -4240,8 +4272,15 @@ class ApplicationIPCController:
     def _approved(self, page, target, value):
         key = _key(page, target)
         fact_key = _fact_key(self.facts, key)
-        if (fact_key is None or not value
-                or str(self.facts[fact_key]).strip() != value):
+        if _material_form_choice(target):
+            # Consent belongs only to this job's exact observed owner grant.
+            approved = _material_exact_value(
+                self.pk, page, target, {'label': key},
+                fixture_context=self.fixture_context)
+            if not _same(approved, value):
+                raise Gate('The material choice differs from its owner grant.')
+        elif (fact_key is None or not value
+              or str(self.facts[fact_key]).strip() != value):
             raise Gate('The written field lacks its exact current approved answer.')
         exact_approval(self.pk, key, value, target=_bound_target(page, target),
                        url=page['url'], **self._ctx())
@@ -4282,8 +4321,14 @@ class ApplicationIPCController:
             for option in (owner.get('combobox') or {}).get('options') or []:
                 if option.get('selector') != selector:
                     continue
-                answer_key = _fact_key(self.facts, _key(page, owner))
-                answer = str(self.facts.get(answer_key) or '').strip()
+                key = _key(page, owner)
+                if _material_form_choice(owner):
+                    answer = _material_exact_value(
+                        self.pk, page, owner, {'label': key},
+                        fixture_context=self.fixture_context)
+                else:
+                    answer_key = _fact_key(self.facts, key)
+                    answer = str(self.facts.get(answer_key) or '').strip()
                 if (not answer or not _same(answer, option.get('label', ''))
                         or option.get('submit') or option.get('navigates')
                         or option.get('safe') is not True
@@ -4427,10 +4472,16 @@ class ApplicationIPCController:
             if target.get('href'):
                 raise Gate('A navigating combobox cannot be opened.')
             key = _key(page, target)
-            answer_key = _fact_key(self.facts, key)
-            if answer_key is None:
-                raise Gate('Opening the picker requires an existing approved answer.')
-            self._approved(page, target, str(self.facts[answer_key]).strip())
+            if _material_form_choice(target):
+                answer = _material_exact_value(
+                    self.pk, page, target, {'label': key},
+                    fixture_context=self.fixture_context)
+            else:
+                answer_key = _fact_key(self.facts, key)
+                if answer_key is None:
+                    raise Gate('Opening the picker requires an existing approved answer.')
+                answer = str(self.facts[answer_key]).strip()
+            self._approved(page, target, answer)
             return
         text = target.get('label') or ''
         known_submit = (native_submit(target) or target.get('type') in {'submit', 'image'}

@@ -935,3 +935,41 @@ async def test_material_combobox_bad_witness_cannot_request_grant(monkeypatch, p
                                 if x['selector'] == '#country')}
     with pytest.raises(forms.Gate):
         forms._disclosure_question(current, combo, witness, URL, bootstrap=True)
+
+async def test_material_closed_popup_exact_receipt_survives_final_approval(
+        monkeypatch):
+    opened = material_page()
+    closed = material_page(selected=True)
+    closed['controls'][0]['combobox'].update(
+        linked=False, link_id='', listbox_selector='', options=[])
+    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    question = forms._disclosure_question(
+        opened, opened['controls'][0],
+        {'#country': {'visible': True, 'readonly': False,
+                      'disabled': False, 'inert': False,
+                      'combobox': opened['controls'][0]['combobox']}}, URL)
+    row['human_approved_answers'] = {
+        question['label']: {
+            'value': 'I agree', 'selector': '#country', 'url': URL,
+            'label': 'Processing choice', 'question': 'Data processing consent?',
+            'tag': 'input', 'type': 'combobox',
+            'form_selector': '#application', 'form_action': URL,
+            'options': question['options']}}
+    session = Session(opened, closed)
+    filled = {}
+    receipt = await forms.execute(
+        session, opened, {'action': 'combobox', 'selector': '#country',
+                          'fact': 'Data processing consent?'},
+        facts={}, filled=filled, resume_path='', company='example-co',
+        jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
+    assert receipt['selected_option'] in receipt['witnessed_options']
+    forms.check_form(closed, filled, True, receipts=[receipt])
+    forms.check_approvals(PK, [receipt], closed)
+    wrong = deepcopy(receipt)
+    wrong['selected_option']['value'] = 'DIFFERENT'
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, [wrong], closed)
+    row['human_approved_answers'][question['label']]['options'][0]['value'] = 'DIFFERENT'
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PK, [receipt], closed)

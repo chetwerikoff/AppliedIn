@@ -4095,3 +4095,175 @@ async def test_material_select_optional_and_required_are_both_owner_decisions(
     assert report['material_assent_diagnostic'] is True
     assert decide.await_count == 0
     assert not any(call[0] in {'select', 'fill', 'click'} for call in browser.calls)
+
+@pytest.mark.parametrize('kind', ['select', 'combobox'])
+async def test_material_preselected_without_grant_raises_bound_owner_question(
+        monkeypatch, kind):
+    if kind == 'select':
+        consent = field('Data processing consent', '#consent',
+                        tag='select', type='select', required=False,
+                        value='yes', has_value=True,
+                        options=[{'value': 'yes', 'label': 'I agree'},
+                                 {'value': 'no', 'label': 'I decline'}])
+    else:
+        consent = field('Data processing consent', '#consent',
+                        tag='input', type='combobox', required=False,
+                        value='I agree', has_value=True,
+                        combobox={'linked': True, 'link_id': 'consent-options',
+                                  'listbox_selector': '#consent-options',
+                                  'options': [{'selector': '#agree', 'unique': True,
+                                               'label': 'I agree', 'value': 'yes',
+                                               'safe': True}],
+                                  'selected_text': 'I agree',
+                                  'displayed_text': 'I agree', 'selected_value': 'yes',
+                                  'hidden_selector': '#consent-hidden',
+                                  'hidden_value': 'yes'})
+    p = secure_inventory(consent)
+    browser, decide, row = secure_world(monkeypatch, p)
+    report = await secure_attempt(p)
+    assert report['reason'] == 'owner_question'
+    assert report['review_route'] == 'owner'
+    assert report['form_question']['options']
+    assert report['form_question']['selector'] == '#consent'
+    assert report['form_question']['url'] == SECURE_URL
+    assert row['human_approved_answers'] == {}
+    assert decide.await_count == 0
+    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
+
+
+@pytest.mark.parametrize('kind', ['select', 'combobox'])
+@pytest.mark.parametrize('drift', ['none', 'value', 'options', 'question', 'job'])
+async def test_material_owner_grant_raw_ipc_requires_exact_current_control(
+        monkeypatch, kind, drift):
+    """Exercise actual Session.application_effect -> raw IPC controller."""
+    from copy import deepcopy
+    if kind == 'select':
+        consent = field('Processing consent', '#material', tag='select',
+                        type='select', question='Data processing consent?',
+                        options=[{'value': 'Y', 'label': 'I agree'},
+                                 {'value': 'N', 'label': 'I decline'}])
+    else:
+        consent = field('Processing consent', '#material', tag='input',
+                        type='combobox', question='Data processing consent?',
+                        combobox={'linked': True, 'link_id': 'list',
+                                  'listbox_selector': '#list',
+                                  'options': [
+                                      {'selector': '#yes', 'unique': True,
+                                       'label': 'I agree', 'value': 'Y',
+                                       'safe': True},
+                                      {'selector': '#no', 'unique': True,
+                                       'label': 'I decline', 'value': 'N',
+                                       'safe': True}],
+                                  'selected_text': '', 'displayed_text': '',
+                                  'selected_value': '', 'hidden_selector': '#hidden',
+                                  'hidden_value': ''})
+    p = secure_inventory(consent)
+    browser, _, row = secure_world(monkeypatch, p)
+    proof = {c['selector']: c for c in witness(p)['controls']}
+    question = forms._disclosure_question(p, p['controls'][0], proof, SECURE_URL)
+    key = question['label']
+    row['human_approved_answers'] = {
+        key: {**{name: question[name] for name in (
+            'selector', 'url', 'question', 'tag', 'type', 'form_selector', 'form_action')},
+              'label': question['control_label'], 'value': 'I agree',
+              'options': question['options']}}
+    if drift == 'value':
+        row['human_approved_answers'][key]['value'] = 'I decline'
+    elif drift == 'options':
+        p['controls'][0]['options' if kind == 'select' else 'combobox'] = (
+            [{'value': 'Y', 'label': 'I agree updated'}] if kind == 'select'
+            else {**p['controls'][0]['combobox'], 'options': [
+                {'selector': '#yes', 'unique': True,
+                 'label': 'I agree updated', 'value': 'Y', 'safe': True}]})
+    elif drift == 'question':
+        p['controls'][0]['question'] = 'Changed processing consent?'
+    elif drift == 'job':
+        row['jd_url'] = SECURE_URL + '/changed'
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', SECURE_URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=deepcopy(p)))
+    monkeypatch.setattr(forms, '_tracked_preparation_job', lambda *a, **kw: None)
+    monkeypatch.setattr('tools.submit_hold.is_held', lambda *a, **kw: False)
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace()))
+    effects = []
+    monkeypatch.setattr(bsk, 'command',
+                        AsyncMock(side_effect=lambda *args, **kwargs:
+                                  effects.append(args) or {}))
+    raw = bsk.Session('apply')
+    raw.id = 'synthetic-offline'
+    raw.bind_application_controller(controller)
+    if kind == 'select':
+        action = ('select', '#material', '--value', 'Y')
+    else:
+        action = ('click', '#yes')
+    if drift == 'none':
+        await raw.application_effect(*action)
+        assert action in effects
+    else:
+        with pytest.raises(forms.Gate):
+            await raw.application_effect(*action)
+        assert action not in effects
+    assert row['human_approved_answers'][key]['value'] in {'I agree', 'I decline'}
+    assert not controller.facts
+
+
+@pytest.mark.parametrize('drift', ['none', 'label', 'grant'])
+async def test_owner_only_checkbox_grant_resumes_through_raw_click(
+        monkeypatch, drift):
+    name = 'I consent to sharing personal data with marketing partners'
+    checkbox = field(name, '#marketing', tag='input', type='checkbox',
+                     value='yes', required=True)
+    p = secure_inventory(checkbox)
+    browser, _, row = secure_world(monkeypatch, p)
+    first = await secure_attempt(p)
+    assert first['reason'] == 'owner_question'
+    question = first['form_question']
+    row['human_approved_answers'] = {
+        question['label']: {
+            'value': 'yes', 'selector': question['selector'],
+            'url': question['url'], 'label': question['control_label'],
+            'question': question['question'], 'tag': question['tag'],
+            'type': question['type'], 'form_selector': question['form_selector'],
+            'form_action': question['form_action'],
+            'visible_text': question['visible_text']}}
+    if drift == 'label':
+        p['controls'][0]['label'] = name + ' changed'
+    elif drift == 'grant':
+        row['human_approved_answers'][question['label']]['value'] = 'no'
+    if drift != 'none':
+        with pytest.raises(forms.Gate):
+            await forms._bootstrap(browser, p, PK, {}, SECURE_URL)
+        return
+    await forms._bootstrap(browser, p, PK, {}, SECURE_URL)
+    browser.allow_mutations = True
+    filled = {}
+    receipt = await forms.execute(
+        browser, p, {'action': 'choose', 'selector': '#marketing',
+                     'fact': question['label']},
+        facts={}, filled=filled, resume_path='', company='example-co',
+        jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'choose' and p['controls'][0]['checked']
+    forms.check_approvals(PK, [receipt], p)
+
+    # Re-test same grant with a fresh, unchecked producer receiver.
+    fresh = secure_inventory(field(name, '#marketing', tag='input', type='checkbox',
+                                   value='yes', required=True))
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', SECURE_URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=fresh))
+    monkeypatch.setattr(forms, '_tracked_preparation_job', lambda *a, **kw: None)
+    monkeypatch.setattr('tools.submit_hold.is_held', lambda *a, **kw: False)
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace()))
+    effects = []
+    monkeypatch.setattr(bsk, 'command',
+                        AsyncMock(side_effect=lambda *args, **kwargs:
+                                  effects.append(args) or {}))
+    raw = bsk.Session('apply')
+    raw.id = 'synthetic-offline'
+    raw.bind_application_controller(controller)
+    await raw.application_effect('click', '#marketing')
+    assert ('click', '#marketing') in effects

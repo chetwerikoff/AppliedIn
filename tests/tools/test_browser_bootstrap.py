@@ -979,12 +979,13 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
 @pytest.mark.parametrize('material', [True, False])
 async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
-        monkeypatch, capfd, material, queued_worker):
+        monkeypatch, material, queued_worker):
     """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
     import logging
-    import sys
+    from io import StringIO
 
     from agent import run
+    from core.logging import _ConsoleFormatter, _JsonFormatter
 
     label = 'I agree to terms OWNER_VISIBLE_LOG_SENTINEL'
     page = secure_inventory(field(), field(
@@ -1040,20 +1041,18 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     fake_apply = AsyncMock(return_value=gate)
     monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
 
-    # get_logger installs its own stdout StreamHandler with propagate=False.
-    # Root caplog records can differ between an isolated case and a full suite
-    # if other tests installed handlers. Observe this real INFO sink via capfd.
-    # The scoped patch restores every handler stream and logger level on exit.
+    # get_logger uses a non-propagating, application-formatted StreamHandler.
+    # A full suite can add pytest/root handlers that mirror its stdout output;
+    # count messages only from this one real application sink, not all of capfd.
     assert run.log.propagate is False
-    stdout_handlers = [handler for handler in run.log.handlers
-                       if isinstance(handler, logging.StreamHandler)
-                       and not isinstance(handler, logging.FileHandler)]
-    assert stdout_handlers
-    capfd.readouterr()  # discard any synthetic gate setup output
-    with monkeypatch.context() as log_capture:
+    app_handlers = [handler for handler in run.log.handlers
+                    if type(handler) is logging.StreamHandler
+                    and isinstance(handler.formatter,
+                                   (_ConsoleFormatter, _JsonFormatter))]
+    assert app_handlers
+    with StringIO() as app_output, monkeypatch.context() as log_capture:
         log_capture.setattr(run.log, 'level', logging.INFO)
-        for handler in stdout_handlers:
-            log_capture.setattr(handler, 'stream', sys.stdout)
+        log_capture.setattr(app_handlers[0], 'stream', app_output)
         if queued_worker:
             # Exercise the synchronous worker's actual INFO sink and async apply.
             monkeypatch.setattr(run, 'make_stores', lambda: stores)
@@ -1064,7 +1063,7 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
             queue.retry.assert_not_called()
         else:
             result = await run._apply_direct(PK, stores)
-        log_output = capfd.readouterr().out
+        log_output = app_output.getvalue()
     assert fake_apply.await_count == 1
     assert result['result'] == 'gated' and result['question'] == gate['question']
     assert (result.get('material_assent_diagnostic') is True) is material

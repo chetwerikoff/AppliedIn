@@ -3814,7 +3814,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      provenance: Provenance | None = None,
                      filled: dict | None = None, history: list | None = None,
                      resume_path: str = '', company: str = '', job_url: str = '',
-                     global_facts: dict | None = None) -> dict:
+                     global_facts: dict | None = None,
+                     required_gate: bool = False) -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _preparation_current(provenance, fixture_context=fixture_context)):
@@ -4024,10 +4025,12 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                           else f'An exact human-approved answer is needed for "{key}".')
                 record('needs-human')
                 raise Gate(prompt, form_question=question, reason='owner_question')
-            record('needs-human')
-            raise Gate(f'An exact human-approved answer is needed for "{key}".',
-                       form_question=question,
-                       reason=_missing_answer_reason(item))
+            if required_gate:
+                record('needs-human')
+                raise Gate(f'An exact human-approved answer is needed for "{key}".',
+                           form_question=question, reason='owner_question')
+            record('left-to-model')
+            continue
 
         if not _unanswered(page, item):
             # Without a previously validated controller receipt this is not a
@@ -5689,7 +5692,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance, filled=filled, history=history,
                         resume_path=resume_path, company=company, job_url=url,
-                        global_facts=global_facts,
+                        global_facts=global_facts, required_gate=True,
                         **({'fixture_context': ctx} if ctx else {}))
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(

@@ -3161,6 +3161,45 @@ _MATERIAL_DIAGNOSTIC_TYPES = frozenset({
 })
 
 
+_MATERIAL_WITNESS_GATE_REASONS = frozenset({
+    'The closed combobox linkage is incomplete or ambiguous.',
+    'This control is not visibly editable.',
+    'The tracked posting or preparation origin changed.',
+    'The picker origin or current tracked posting changed.',
+    'The material picker control changed while opening.',
+    'The combobox option linkage is incomplete or ambiguous.',
+    'The material picker changed during reversible inspection.',
+})
+_MATERIAL_WITNESS_GATE_OPAQUE = 'unspecified-witness-failure'
+
+
+def _material_witness_disclosure_detail(target: dict, *, attempted: bool,
+                                        reason: str | None = None) -> str:
+    """Only fixed code-owned states enter the existing owner Disclosure detail."""
+    combo = target.get('combobox')
+    combo = combo if isinstance(combo, dict) else {}
+    linked = combo.get('linked')
+    linked_state = ('true' if linked is True else
+                    'false' if linked is False else
+                    'absent' if linked is None else 'other')
+    options = combo.get('options')
+    options_state = ('none' if options is None else
+                     'empty' if options == [] else 'present')
+    fields = [
+        f"witness={'attempted' if attempted else 'not-attempted'}",
+        f'linked={linked_state}',
+        f'options={options_state}',
+        f"link_id={'present' if combo.get('link_id') not in (None, '') else 'absent'}",
+        f"listbox={'present' if combo.get('listbox_selector') not in (None, '') else 'absent'}",
+    ]
+    if attempted:
+        fields.append('witness_reason=' + (
+            reason if isinstance(reason, str)
+            and reason in _MATERIAL_WITNESS_GATE_REASONS
+            else _MATERIAL_WITNESS_GATE_OPAQUE))
+    return ','.join(fields)
+
+
 async def _witness_material_combobox(session, page: dict, witness: dict,
                                      target: dict, *origins: str,
                                      provenance=None, pk: str = '',
@@ -3316,15 +3355,19 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                 # already bound to this exact observed control may resume.
                 if _material_form_choice(c):
                     witnessed_question = None
+                    witness_attempted = False
+                    witness_failure = None
                     if (c.get('type') == 'combobox'
                             and (c.get('combobox') or {}).get('linked') is False):
+                        witness_attempted = True
                         try:
                             page, witness, c, witnessed_question = (
                                 await _witness_material_combobox(
                                     session, page, witness, c, *origins,
                                     provenance=provenance, pk=pk,
                                     fixture_context=fixture_context))
-                        except Gate:
+                        except Gate as exc:
+                            witness_failure = str(exc)
                             witnessed_question = None  # Inspection only.
                     # An optional, unselected assent is still an owner decision;
                     # a preselected value must instead prove an existing grant.
@@ -3384,8 +3427,15 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                     f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
                     f"visible label: {visible_label!r}; "
                     f"matched: {assent_match.group(0) if assent_match else 'select options'}."
-                    + (f" Disclosure: {disclosure_failure}."
-                       if _material_form_choice(c) and disclosure_failure else ''))
+                    + (f" Disclosure: {disclosure_failure}. "
+                       + _material_witness_disclosure_detail(
+                           c, attempted=witness_attempted,
+                           reason=witness_failure) + '.'
+                       if _material_form_choice(c) and disclosure_failure
+                       and c.get('type') == 'combobox'
+                       else (f" Disclosure: {disclosure_failure}."
+                             if _material_form_choice(c) and disclosure_failure
+                             else '')))
 
 
 
@@ -3513,7 +3563,24 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
-    page, witness = await _observe_controls(session, page)
+    try:
+        page, witness = await _observe_controls(session, page)
+    except Gate as exc:
+        # The independent DOM validator remains fail-closed. Its rejected
+        # linked shape still has a safe, code-normalized owner diagnostic;
+        # never proceed to grants or a witness attempt on this path.
+        malformed_link = ('predicate=combobox.linked.shape;' in str(exc))
+        material = next((c for c in page['controls']
+                         if c.get('in_form') and c.get('type') == 'combobox'
+                         and _material_form_choice(c)), None)
+        if not malformed_link or material is None:
+            raise
+        raise MaterialAssentGate(
+            'Material assent outside a bound choice needs human inspection. '
+            'Control type: combobox; tag: unavailable; '
+            "visible label: 'unavailable'; matched: select options."
+            ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
+            + _material_witness_disclosure_detail(material, attempted=False) + '.') from None
     if provenance is not None and (
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):

@@ -712,7 +712,8 @@ def _preparation_destination_allowed(href: str, *origins: str,
     # Existing same-route readers also serve offline HTTP loopback fixtures.
     # The application IPC producer independently requires a safe HTTPS origin;
     # observation compatibility cannot authorize a private write or submission.
-    return navigation_allowed(href, source) or _preparation_origin(href, source)
+    return _preparation_origin(href, source) or (
+        provenance is not None and navigation_allowed(href, provenance=provenance))
 
 
 def _assent_scope(target: dict) -> str:
@@ -4000,16 +4001,13 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
         part = urlsplit(href)
         if (part.scheme != 'https' or not part.hostname
                 or part.netloc != part.hostname
-                or any(ord(c) < 33 or c == '\\' for c in href)
-                or any(segment in {'.', '..'} for segment in part.path.split('/'))):
+                or any(ord(c) < 33 or 127 <= ord(c) <= 159 or c == '\\'
+                       for c in href)
+                or any(segment in {'.', '..'} for segment in part.path.split('/')):
             return False
-        if navigation_allowed(href, tracked_url):
-            return True
-        if part.fragment:
-            return False
-        return part.hostname in {
-            'jobs.ashbyhq.com', 'jobs.lever.co', 'job-boards.greenhouse.io'
-        } and bool(part.path.strip('/'))
+        # Shared ATS hosts cannot confer a different tenant/job the tracked
+        # row's private data. The tracked canonical route binds the job path.
+        return navigation_allowed(href, tracked_url)
     except (TypeError, ValueError):
         return False
 
@@ -4158,7 +4156,7 @@ class ApplicationIPCController:
 
     def _fresh_preparation(self, url: str) -> None:
         if not (_preparation_origin(url, self.url) or self._verified_redirect_url(url)):
-            raise Gate('The page is not the tracked employer or an approved HTTPS ATS host.')
+            raise Gate('The page is not a proven same-job preparation route.')
         _tracked_preparation_job(self.pk, self.company, self.url,
                                  fixture_context=self.fixture_context)
         row = self._row()
@@ -4606,12 +4604,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 direct_url = provenance.target_url
 
         def allowed(href: str) -> bool:
-            # Host-only HTTPS preparation is reversible; it cannot mint tenant
-            # or same-job final-submit authority. The already-authorized daemon
-            # synthetic fixture is the only non-HTTPS exact-route exception.
+            # A shared ATS host is not same-job evidence. The tracked route,
+            # a verified entry/alias, or a verified redirect is required.
             return (ctx is not None and href == url) or _preparation_origin(href, url) or (
-                isinstance(provenance, VendorRedirectProvenance)
-                and navigation_allowed(href, provenance=provenance))
+                provenance is not None and
+                navigation_allowed(href, provenance=provenance))
 
         if not allowed(direct_url):
             raise _navigation_gate(

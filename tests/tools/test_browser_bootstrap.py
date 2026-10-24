@@ -4388,3 +4388,33 @@ async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
         assert secret not in report['question']
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
+        monkeypatch):
+    closed = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    current = inventory(closed)
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, ('click', '#privacy'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, ('press', 'Escape'), {})
+    controller._material_witness_request = '#privacy'
+    await controller.before_ipc(None, ('click', '#privacy'), {})
+    assert controller._material_witness_selector == '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, ('press', 'Enter'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, ('click', '#privacy'), {})
+    await controller.before_ipc(None, ('press', 'Escape'), {})
+    assert controller._material_witness_selector is None
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, ('press', 'Escape'), {})
+

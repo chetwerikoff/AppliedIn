@@ -15,6 +15,10 @@ import pytest
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
 
+# secure_world replaces the module Session with an inspection-only fake.
+# Raw IPC regressions retain the actual producer class before that patch.
+REAL_BSK_SESSION = bsk.Session
+
 URL = 'http://127.0.0.1/fixture/example-co/job/1'
 PK = 'example-co#1'
 
@@ -746,6 +750,10 @@ async def test_material_assent_wall_reports_control_and_match_not_values(
     options = ([{'value': 'OPTION_VALUE_SENTINEL',
                  'label': 'privacy consent OPTION_CAPTION_SENTINEL'}]
                if cause in {'options', 'both'} else [])
+    if options:
+        # Duplicate native option identity is not a grantable witnessed choice.
+        # The bounded inspection diagnostic must not expose option values.
+        options.append(deepcopy(options[0]))
     material = field(visible, '#assent', tag='select', type='select',
                      question=question, options=options,
                      value='CONTROL_VALUE_SENTINEL', has_value=True,
@@ -4191,7 +4199,7 @@ async def test_material_owner_grant_raw_ipc_requires_exact_current_control(
     monkeypatch.setattr(bsk, 'command',
                         AsyncMock(side_effect=lambda *args, **kwargs:
                                   effects.append(args) or {}))
-    raw = bsk.Session('apply')
+    raw = REAL_BSK_SESSION('apply')
     raw.id = 'synthetic-offline'
     raw.bind_application_controller(controller)
     if kind == 'select':
@@ -4262,7 +4270,7 @@ async def test_owner_only_checkbox_grant_resumes_through_raw_click(
     monkeypatch.setattr(bsk, 'command',
                         AsyncMock(side_effect=lambda *args, **kwargs:
                                   effects.append(args) or {}))
-    raw = bsk.Session('apply')
+    raw = REAL_BSK_SESSION('apply')
     raw.id = 'synthetic-offline'
     raw.bind_application_controller(controller)
     await raw.application_effect('click', '#marketing')

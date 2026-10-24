@@ -554,7 +554,7 @@ _VISIBLE_RECAPTCHA = r"""
 # Metadata only: neither consumer may inspect a response value to recognize it.
 _CAPTCHA_RESPONSE_NODES = r"""
   const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
-    ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
+    /^(?:h-captcha-response|g-recaptcha-response(?:-[0-9]{1,6})?)$/.test(e.getAttribute('name') || ''));
 """
 
 # Inserted before either reader's graph: filtering the final list is too late,
@@ -661,6 +661,10 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     return value.length<=160 ? value : 'unknown';
   };
   const recaptchaContainer=e=>e.closest('div.grecaptcha-badge,div.g-recaptcha');
+  // Provider anchors must be exact-origin/path and actually nested in a badge.
+  // Never use ordinal diagnostic paths as evidence of DOM containment.
+  const enterpriseBadgeAnchor = e => !!e && e.matches('div.grecaptcha-badge') &&
+    enterpriseAnchors.length===1 && e.contains(enterpriseAnchors[0]);
   const entryFrames = entryFrameNodes.map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='', diagnosticOrigin='', diagnosticPath='';
@@ -757,6 +761,14 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
         }
       }
     } catch (_) { documentReadability='unreadable'; }
+    // A source-less companion is an artifact only after its own readable,
+    // complete child has proved the closed absence of controls. This proof
+    // has no root or ordinal dependency and never admits a visible challenge.
+    if (status==='unknown' && raw===null && !e.hasAttribute('srcdoc') &&
+        style.display==='none' && documentReadability==='readable' &&
+        formControls==='no' && enterpriseAnchors.length===1 &&
+        enterpriseBadgeAnchor(aContainer) && !!parent &&
+        parent.contains(aContainer)) status='R';
     return {selector:selector(e),origin:diagnosticOrigin || origin,
       path:diagnosticPath || path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       srcdoc:e.hasAttribute('srcdoc') ? 'present' : 'absent',
@@ -785,8 +797,17 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const name=e.getAttribute('name'), ancestor=e.closest('form'),
       owner=e.form || ancestor;
     const signature=name==='h-captcha-response' ? 'H' : 'R';
+    const reservedName=name==='g-recaptcha-response' ||
+      /^g-recaptcha-response-[0-9]{1,6}$/.test(name || '');
+    const id=e.getAttribute('id');
+    const reservedId=id==='g-recaptcha-response' ||
+      /^g-recaptcha-response-[0-9]{1,6}$/.test(id || '');
+    const ownBadge=e.closest('div.grecaptcha-badge');
+    const badgeProvider=signature==='R' && e.localName==='textarea' &&
+      reservedName && reservedId && !ancestor && !owner &&
+      !e.hasAttribute('form') && enterpriseBadgeAnchor(ownBadge);
     const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
-    const providerFrame=entryFrames.some(f=>f.status===signature);
+    const providerFrame=badgeProvider || entryFrames.some(f=>f.status===signature);
     const wrongOwner=!!owner && owner!==root;
     const issues=[];
     if (duplicates) issues.push('duplicate-name');

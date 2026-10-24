@@ -4749,3 +4749,87 @@ def test_tracked_literal_origin_does_not_borrow_destination_policy(monkeypatch):
     forms._tracked_preparation_job(pk, company, url)
     assert not forms._preparation_origin(
         'https://jobs.ashbyhq.com/other-co/' + job, url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'material-resume-open', 'material-witness', 'execute',
+])
+async def test_identity_flaps_then_stabilizes_with_complete_witness(
+        monkeypatch, site):
+    import asyncio
+    base = inventory(field(), submit())
+    pages = [deepcopy(base) for _ in range(7)]
+    pages[1]['text'] = 'Different synthetic inventory'
+    # Identity changes are made in inventory-relevant properties, not prose.
+    pages[1]['controls'][0]['label'] = 'Changed initial receiver'
+    sequence = iter([pages[1], pages[2], pages[3], pages[4], pages[5]])
+    calls = []
+    class Flapping:
+        async def call(self, *args):
+            calls.append(('evaluate', args))
+            return {'value': witness(self.page_snapshot)}
+        async def page(self):
+            self.page_snapshot = next(sequence)
+            calls.append(('page', None))
+            return deepcopy(self.page_snapshot)
+    browser = Flapping()
+    browser.page_snapshot = base
+    slept = []
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    current, proof = await forms._observe_controls(browser, base, site=site)
+    assert current['controls'][0]['label'] == 'Email'
+    assert '#email' in proof
+    assert len(slept) <= 3
+    assert all(delay == 0.25 for delay in slept)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'material-resume-open', 'material-witness', 'execute',
+])
+async def test_identity_never_stabilizes_and_gates_with_literal_site(
+        monkeypatch, site):
+    base = inventory(field(), submit())
+    class Flapping:
+        reads = 0
+        async def call(self, *args):
+            return {'value': witness(self.last_page)}
+        async def page(self):
+            self.reads += 1
+            fresh = deepcopy(base)
+            fresh['controls'][0]['label'] = 'Synthetic version ' + str(self.reads)
+            self.last_page = fresh
+            return deepcopy(fresh)
+    browser = Flapping()
+    browser.last_page = base
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as exc:
+        await forms._observe_controls(browser, base, site=site)
+    assert 'predicate=inventory.identity.equal' in str(exc.value)
+    assert 'site=' + site in str(exc.value)
+    assert len(delays) == 3
+    assert all(delay == 0.25 for delay in delays)
+
+
+@pytest.mark.asyncio
+async def test_other_witness_predicates_remain_single_read(monkeypatch):
+    base = inventory(field(), submit())
+    bad = witness(base)
+    bad['controls'][0]['selector'] = '#wrong'
+    browser = Browser(base, result=bad)
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as exc:
+        await forms._observe_controls(browser, base, site='execute')
+    assert 'predicate=selector.equal' in str(exc.value)
+    assert 'site=execute' in str(exc.value)
+    assert not delays
+    assert len([call for call in browser.calls if call[0] == 'evaluate']) == 1

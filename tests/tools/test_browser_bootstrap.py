@@ -4957,9 +4957,10 @@ def test_every_production_observe_controls_caller_names_its_site():
             continue
         kw = next((x.value for x in node.keywords if x.arg == 'site'), None)
         if kw is None:
-            # The bootstrap wrapper forwards its fixed code-owned context
-            # through the legacy two-argument observation seam.
-            assert 2720 <= node.lineno <= 2760
+            # Both bootstrap and execute preserve the two-argument seam for
+            # fixed synthetic witness doubles; code-owned context supplies site.
+            assert (2720 <= node.lineno <= 2760 or
+                    4320 <= node.lineno <= 4360)
             continue
         if isinstance(kw, ast.Name):
             assert kw.id == 'site' and 2720 <= node.lineno <= 2910
@@ -5023,3 +5024,18 @@ async def test_bootstrap_initially_stable_witness_never_rereads(monkeypatch, sit
     assert [call[0] for call in browser.calls] == ['evaluate']
     assert browser.pages == 1
     assert not delays
+
+
+@pytest.mark.asyncio
+async def test_execute_observer_preserves_two_argument_witness_seam(monkeypatch):
+    """Synthetic guard-order tests patch the observer with exactly two arguments."""
+    page = inventory(field(), submit())
+    called = []
+    async def two_argument_witness(session, current):
+        called.append((session, current))
+        return current, {}
+    monkeypatch.setattr(forms, '_observe_controls', two_argument_witness)
+    browser = Browser(page)
+    observed, controls = await forms._execute_observe_controls(browser, page)
+    assert observed is page and controls == {}
+    assert called == [(browser, page)]

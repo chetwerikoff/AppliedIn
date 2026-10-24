@@ -4327,7 +4327,7 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
     """Keep the legacy two-argument observation seam in execute()."""
     token = _EXECUTE_OBSERVATION_SITE.set(True)
     try:
-        return await _observe_controls(session, page, site='execute')
+        return await _observe_controls(session, page)
     finally:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 

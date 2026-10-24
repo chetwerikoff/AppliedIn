@@ -1983,3 +1983,55 @@ def test_greenhouse_reader_redirect_is_typed_and_bounded():
     assert 'Failed predicate: same_tracked_employer_https_origin' in detail
     assert 'destination host/path: foreign.example.test/other-job' in detail
     assert 'QUERY_SENTINEL' not in detail
+
+
+def test_unpinned_greenhouse_preparation_uses_configured_board_and_row(
+        monkeypatch):
+    """A missing final board pin does not turn a different tenant into a PDF sink."""
+    from types import SimpleNamespace
+    from core.ids import make_pk
+    from discovery.watchlist import CompanyConfig
+    from core import config as core_config
+    from discovery import watchlist
+    company, job = 'example-co', '123456'
+    tracked = 'https://careers.example-co.test/openings?gh_jid=' + job
+    pk = make_pk(company, job)
+    row = {'pk': pk, 'company': company, 'job_id': job, 'ats': 'greenhouse',
+           'jd_url': tracked, 'status': 'submitting',
+           'possible_submission': False}
+    cfg = CompanyConfig(name=company, ats='greenhouse', board=company,
+                        careers_url='https://careers.example-co.test/openings')
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kw: row)
+    monkeypatch.setattr(core_config, 'get_settings',
+                        lambda: SimpleNamespace(config_dir='/synthetic-only'))
+    monkeypatch.setattr(watchlist, 'load_watchlist', lambda *_args: [cfg])
+    approved = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+    wrong_board = 'https://job-boards.greenhouse.io/other-co/jobs/123456'
+    wrong_job = 'https://job-boards.greenhouse.io/example-co/jobs/999999'
+    assert forms._preparation_origin(wrong_board, tracked)  # host classification only
+    assert forms._job_preparation_route(approved, tracked, pk=pk, company=company)
+    assert forms._job_preparation_route(approved + '/application', tracked,
+                                        pk=pk, company=company)
+    for wrong in [wrong_board, wrong_job,
+                  'https://job-boards.greenhouse.io.example.test/example-co/jobs/123456']:
+        assert not forms._job_preparation_route(wrong, tracked, pk=pk, company=company)
+        assert not forms._preparation_destination_allowed(
+            wrong, tracked, pk=pk, company=company)
+    assert forms._preparation_destination_allowed(
+        approved, tracked, pk=pk, company=company)
+    assert not forms._job_preparation_route(
+        approved, tracked, pk=pk, company='other-co')
+    row['possible_submission'] = True
+    assert not forms._job_preparation_route(approved, tracked, pk=pk, company=company)
+
+
+def test_legacy_host_admission_cannot_authorize_cross_tenant_effect():
+    """Shared ATS host classification is not navigation/upload authority."""
+    tracked = 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc'
+    other = 'https://jobs.lever.co/other-co/12345678-1234-4234-8234-123456789abc/apply'
+    valid = tracked + '/apply'
+    assert forms._preparation_origin(other, tracked)
+    assert not forms._job_preparation_route(other, tracked)
+    assert not forms._preparation_destination_allowed(other, tracked)
+    assert forms._job_preparation_route(valid, tracked)
+    assert forms._preparation_destination_allowed(valid, tracked)

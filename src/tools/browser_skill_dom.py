@@ -811,9 +811,13 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     const reservedId=id==='g-recaptcha-response' ||
       /^g-recaptcha-response-[0-9]{1,6}$/.test(id || '');
     const ownBadge=e.closest('div.grecaptcha-badge');
+    // A badge-owned receiver is passive only without *any* form link.
+    // Check the attribute independently of its resolved form owner.
+    const badgeFormConflict=signature==='R' && !!ownBadge &&
+      (!!ancestor || !!owner || e.hasAttribute('form'));
     const badgeProvider=signature==='R' && e.localName==='textarea' &&
-      reservedName && reservedId && !ancestor && !owner &&
-      !e.hasAttribute('form') && enterpriseBadgeAnchor(ownBadge);
+      reservedName && reservedId && !badgeFormConflict &&
+      enterpriseBadgeAnchor(ownBadge);
     const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
     const supported=signature==='H' ? name==='h-captcha-response' : reservedName;
     const frameProvider=entryFrames.some(f=>f.status===signature);
@@ -824,8 +828,7 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     if (duplicates) issues.push('duplicate-name');
     if (!providerFrame) issues.push('provider-unproven');
     if (wrongOwner) issues.push('owner-conflict');
-    if (!frameProvider && signature==='R' && ownBadge &&
-        (ancestor || owner || e.hasAttribute('form')))
+    if (!frameProvider && badgeFormConflict)
       issues.push('badge-form-conflict');
     if (issues.length) responseError=true;
     return {selector:selector(e),name,form:owner ? selector(owner) : '',

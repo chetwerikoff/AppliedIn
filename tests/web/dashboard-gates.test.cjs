@@ -437,3 +437,74 @@ test('posting-safety warning survives read-only portal hold and remains escaped'
   assert.match(drawer,/&lt;svg/);
   assert.doesNotMatch(drawer,/data-act="apply-now"/);
 });
+
+
+test('non-resumable structural gates render the existing Requeue control without unlocking other actions', () => {
+  const h = harness();
+  const structural = row('structural-recovery', {
+    gate_reason: 'defect_structural', gate_has_form_question: false,
+    gate_has_call_id: false, gate_question: 'Synthetic structural gate',
+  });
+  h.state.apps = [structural];
+  assert.equal(h.fn('routeOf')(structural), 'waiting_for_fix');
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('canRequeueStructuralGate')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+  for (const act of ['answer', 'retry', 'reopen', 'retailor', 'apply-now',
+    'mark-applied', 'force-apply', 'skip', 'save-tracker']) {
+    assert.equal(h.fn('rowActionAllowed')(structural.pk, act), false, act);
+  }
+  for (const name of ['laneCard', 'closedRow', 'needsCard']) {
+    assert.match(h.fn(name)(structural), /data-act="queue-apply"/, name);
+  }
+  for (const name of ['viewPipeline', 'viewNeeds', 'viewStuck']) {
+    assert.match(h.fn(name)(), /data-act="queue-apply"/, name);
+  }
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  h.fn('openDrawer')(structural.pk);
+  const drawer = h.node('#drawer-body').innerHTML;
+  assert.match(drawer, /data-act="queue-apply"/);
+  assert.doesNotMatch(drawer, /data-act="answer"|data-act="mark-applied"|data-act="retailor"/);
+  assert.equal(h.requests.length, 0, 'rendering and authorization must not queue anything');
+});
+
+test('structural Requeue fails closed for form/call witnesses, holds, uncertainty and completed rows', () => {
+  const h = harness();
+  const structural = {gate_reason: 'defect_structural',
+    gate_has_form_question: false, gate_has_call_id: false};
+  const negatives = [
+    ['field-object', {gate_has_form_question: true}],
+    ['call-id', {gate_has_call_id: true}],
+    ['call-id-missing', {gate_has_call_id: undefined}],
+    ['call-id-untyped', {gate_has_call_id: 'false'}],
+    ['question-missing', {gate_has_form_question: undefined}],
+    ['hold-blocked', {submit_hold_state: 'blocked'}],
+    ['hold-unknown', {submit_hold_state: 'unknown'}],
+    ['hold-missing', {submit_hold_state: undefined}],
+    ['possible-submit', {possible_submission: true}],
+    ['uncertain-failure', {fail_kind: 'uncertain'}],
+    ['uncertain-status', {status: 'uncertain'}],
+    ['submit-uncertain', {gate_reason: 'submit_uncertain'}],
+    ['applied', {status: 'applied'}],
+    ['applied-manual', {status: 'applied_manual'}],
+    ['confirmed', {confirmation_id: 'synthetic-confirmation'}],
+    ['unknown-reason', {gate_reason: 'unknown_field'}],
+  ].map(([pk, override]) => row(pk, {...structural, ...override}));
+  const field = row('answerable-field', {
+    gate_reason: 'owner_question', gate_has_form_question: true,
+    gate_has_call_id: true, gate_question: 'Synthetic field question?',
+  });
+  h.state.apps = [...negatives, field];
+  for (const r of negatives) {
+    assert.equal(h.fn('canRequeueStructuralGate')(r), false, r.pk);
+    assert.equal(h.fn('rowActionAllowed')(r.pk, 'queue-apply'), false, r.pk);
+    for (const name of ['laneCard', 'closedRow', 'needsCard'])
+      assert.doesNotMatch(h.fn(name)(r), /data-act="queue-apply"/, r.pk + '/' + name);
+    h.fn('paneAction')('queue-apply', r.pk);
+  }
+  assert.equal(h.requests.length, 0, 'stale negative clicks must not POST');
+  assert.equal(h.fn('routeOf')(field), 'owner_question');
+  assert.match(h.fn('needsCard')(field), /data-answer-for="answerable-field"/);
+  assert.equal(h.fn('rowActionAllowed')(field.pk, 'answer'), true);
+  assert.equal(h.fn('resumeAnswer')(field.pk, ' synthetic answer '), 'synthetic answer');
+});

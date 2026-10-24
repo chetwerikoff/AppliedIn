@@ -267,6 +267,17 @@ const isReadOnly = (r) => READ_ONLY_ROUTES.has(routeOf(r));
 const isStuck = (r) => isReadOnly(r)
   || ["failed", "error", "job_gone", "uncertain"].includes(r.status);
 const RETRYABLE = ["failed", "error", "capped"];
+// Missing projection is not proof that a stored call ID was absent.
+// Keep all other actions read-only; this exception only authorizes Requeue.
+function canRequeueStructuralGate(r) {
+  return r?.status === "needs_human" && routeOf(r) === "waiting_for_fix"
+    && r.gate_has_form_question === false && r.gate_has_call_id === false
+    && !r.confirmation_id;
+}
+function requeueButton(r, classes) {
+  return `<button class="${classes}" data-act="queue-apply" data-pk="${esc(r.pk)}"
+    title="Clear the failure and put this job back on the apply queue">↻ Requeue</button>`;
+}
 function routeTag(r) {
   const meta = {portal_check:["Portal check","s-bad"],
     waiting_for_fix:["Waiting for fix","s-warn"],
@@ -305,6 +316,7 @@ function rowActionAllowed(pk, act) {
   // A stale control cannot override a blocked or unverified independent hold.
   if (!r || r.submit_hold_state !== "clear") return false;
   const kind = routeOf(r);
+  if (act === "queue-apply" && canRequeueStructuralGate(r)) return true;
   if (READ_ONLY_ROUTES.has(kind)) return false;
   if (act === "answer") return ["owner_question", "approval", "low_confidence", "tailored"].includes(kind);
   if (act === "run-now") return kind === "found";
@@ -1200,7 +1212,9 @@ function postingGuardHtml(r) {
 
 function laneCard(r) {
   let retry = "";
-  if (isReadOnly(r)) {
+  if (canRequeueStructuralGate(r)) {
+    retry = requeueButton(r, "kc-retry kc-queue");
+  } else if (isReadOnly(r)) {
     retry = '<span class="diag-mini">View details to reconcile</span>';
   } else if (r.status === "failed" && r.fail_kind === "spam_flagged") {
     retry = `<button class="kc-retry" data-act="retry" data-pk="${esc(r.pk)}"
@@ -1220,8 +1234,7 @@ function laneCard(r) {
        title="Score and tailor this job now. It stops before applying">▶ Run now</button>`;
   } else if (isStuck(r)) {
     // The recovery path that used to mean editing the store by hand.
-    retry = `<button class="kc-retry kc-queue" data-act="queue-apply" data-pk="${esc(r.pk)}"
-       title="Clear the failure and put this job back on the apply queue">↻ Requeue</button>`;
+    retry = requeueButton(r, "kc-retry kc-queue");
   }
   const aged = r.tailored_at && canApply(r)
     ? `<span class="kc-age" title="résumé written ${esc(new Date(r.tailored_at).toLocaleString())}">${esc(ageLabel(r.tailored_at))}</span>`
@@ -1497,12 +1510,13 @@ function closedRow(r) {
   const failed = isStuck(r);
   const guarded = isReadOnly(r);
   let act = "";
-  if (!guarded && r.status === "failed" && r.fail_kind === "spam_flagged") {
+  if (canRequeueStructuralGate(r)) {
+    act = requeueButton(r, "kc-retry kc-queue jr-act");
+  } else if (!guarded && r.status === "failed" && r.fail_kind === "spam_flagged") {
     act = `<button class="kc-retry jr-act" data-act="retry" data-pk="${esc(r.pk)}"
       title="Run this application again with human style clicks">↻ Retry</button>`;
   } else if (failed && !guarded) {
-    act = `<button class="kc-retry kc-queue jr-act" data-act="queue-apply" data-pk="${esc(r.pk)}"
-      title="Clear the failure and put this job back on the apply queue">↻ Requeue</button>`;
+    act = requeueButton(r, "kc-retry kc-queue jr-act");
   }
   if (canForceApply(r)) act = forceApplyButton(r, "kc-retry jr-act");
   if (!guarded && r.review_rejected) act = `<button class="ps-link jr-act" data-review-undo-pk="${esc(r.pk)}" data-company="${esc(r.company)}">Undo rejection</button>`;
@@ -2144,6 +2158,7 @@ function diagnosticSec(rows, title, hint, cls) {
       <span class="ps-n mono">${rows.length}</span><span class="ps-hint">${hint}</span></div>
     <div class="diag-grid">${rows.map((r) => `<article class="diag-card">
       <b>${esc(r.company)} · ${esc(r.title)}</b>${routeNotice(r)}
+      ${canRequeueStructuralGate(r) ? requeueButton(r, "btn btn-primary") : ""}
       <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button>
     </article>`).join("")}</div></section>`;
 }
@@ -2410,7 +2425,8 @@ function needsCard(r) {
     <header><div><span class="gc-co">${esc(r.company)}</span>
       <span class="gc-role">${esc(r.title)}</span></div>${routeTag(r)}</header>
     ${routeNotice(r)}
-    <div class="gc-actions"><button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
+    <div class="gc-actions">${canRequeueStructuralGate(r) ? requeueButton(r, "btn btn-primary") : ""}
+      <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
   </article>`;
   return `<article class="gatecard">
     <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
@@ -2510,6 +2526,7 @@ function viewStuck() {
         <div class="gc-actions">
           ${!isReadOnly(r) && RETRYABLE.includes(r.status)
             ? `<button class="btn btn-primary" data-act="retry" data-pk="${esc(r.pk)}">Retry</button>` : ""}
+          ${canRequeueStructuralGate(r) ? requeueButton(r, "btn btn-primary") : ""}
           <button class="btn btn-ghost" data-open="${esc(r.pk)}">
             Full details${nf ? ` · ${nf} fields` : ""}</button>
         </div>
@@ -4787,6 +4804,7 @@ function openDrawer(pk) {
 
   $("#drawer-body").innerHTML = `
     ${guarded ? routeNotice(r) : trackerEditor(r)}
+    ${canRequeueStructuralGate(r) ? `<div class="section">${requeueButton(r, "btn btn-primary")}</div>` : ""}
     ${gate}
     ${failBlock}
     ${postingGuardHtml(r)}
@@ -4857,7 +4875,9 @@ function openDrawer(pk) {
             counted, because the slot is what protects the address.` : ""}</div>
       </div></div>
 ` : `<div class="section"><div class="section-t">applying as</div>
-      <p class="diag-unlinked">Read-only until this blocker or portal outcome is reconciled.</p>
+      <p class="diag-unlinked">${canRequeueStructuralGate(r)
+        ? "Other actions stay read-only; Requeue is available above for this non-resumable gate."
+        : "Read-only until this blocker or portal outcome is reconciled."}</p>
     </div>`}
 
     <div class="section"><div class="section-t">everything the agent did

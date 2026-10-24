@@ -963,3 +963,22 @@ def test_dashboard_projects_native_question_witness_not_display_prose():
                             "gate_pending": {"question": "synthetic",
                                              "form_question": {"label": "Location"}}}, artifacts)
     assert defect["gate_has_form_question"] is True
+
+
+def test_dashboard_projects_only_boolean_call_id_presence():
+    """A stored call witness blocks structural Requeue without exposing its value."""
+    artifacts = SimpleNamespace(exists=lambda *_: False, version=lambda *_: "")
+    base = {"pk": PK, "company": "example-co", "status": "needs_human",
+            "gate_reason": "defect_structural",
+            "gate_pending": {"question": "Synthetic structural gate"}}
+    for stored, expected in [
+        (None, False),
+        ("", False),
+        ("synthetic-call-id", True),
+        ({"id": "synthetic-call-id"}, True),
+    ]:
+        projected = server._to_ui({**base, "gate_call_id": stored}, artifacts)
+        assert projected["gate_has_call_id"] is expected
+        assert "gate_call_id" not in projected
+        assert "gate_pending" not in projected
+        assert "synthetic-call-id" not in str(projected)

@@ -1348,21 +1348,8 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         # and is the only answer source allowed for material select/combobox.
         material_form = False
         if form_label:
-            from tools.browser_skill_apply import (
-                _MATERIAL_ASSENT, _material_form_choice,
-            )
-            observed = row['gate_pending']['form_question']
-            material_control = {
-                'tag': observed['tag'], 'type': observed['type'],
-                'label': observed['control_label'],
-                'question': observed['question'],
-                'options': observed.get('options', []),
-                'combobox': {'options': observed.get('options', [])},
-            }
-            material_form = bool(
-                _MATERIAL_ASSENT.search(
-                    observed['question'] + ' ' + observed['control_label'])
-                or _material_form_choice(material_control))
+            from tools.browser_skill_apply import _material_question
+            material_form = _material_question(row['gate_pending']['form_question'])
         if not material_form:
             stores.answer_bank.put(label, answer, scope,
                                    company=company or None, source="dashboard")

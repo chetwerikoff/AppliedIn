@@ -2037,8 +2037,9 @@ def test_legacy_host_admission_cannot_authorize_cross_tenant_effect():
     assert forms._preparation_destination_allowed(valid, tracked)
 
 
-def test_greenhouse_confirmation_read_does_not_reimpose_pre_submit_shape():
-    """Only the final IPC authorizes Submit; a post-click read is observational."""
+@pytest.mark.asyncio
+async def test_greenhouse_confirmation_read_does_not_reimpose_pre_submit_shape():
+    """Only a post-click session observation skips the strict entry shape."""
     after = {
         'url': 'https://foreign.example.test/thank-you?token=QUERY_SENTINEL',
         'controls': [], 'greenhouse': {
@@ -2047,11 +2048,23 @@ def test_greenhouse_confirmation_read_does_not_reimpose_pre_submit_shape():
         },
         'unsupported_frames': ['synthetic unsupported frame'],
     }
-    # Deliberately invalid provisional evidence: no read may certify a
-    # successful application, but a passive read must reach settlement logic.
-    forms._greenhouse_safety(after, lambda _href: False, None, submitted=True)
+    class Raw:
+        async def call(self, *args, **kwargs):
+            assert args == ('evaluate', forms.GREENHOUSE_PAGE)
+            return {'value': after}
+    # A direct pre-commit structural check stays authoritative. After the
+    # guarded click only, the reader may observe an ambiguous response;
+    # separate same-job confirmation decides whether it means success.
     with pytest.raises(forms.Gate):
-        forms._greenhouse_safety(after, lambda _href: False, None, submitted=False)
+        forms._greenhouse_safety(after, lambda _href: False, None,
+                                 submitted=True)
+    passive = forms._GreenhouseSession(
+        Raw(), lambda _href: False, None, submitted=lambda: True)
+    assert await passive.page() == after
+    guarded = forms._GreenhouseSession(
+        Raw(), lambda _href: False, None, submitted=lambda: False)
+    with pytest.raises(forms.Gate):
+        await guarded.page()
 
 
 def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(

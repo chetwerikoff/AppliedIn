@@ -3313,6 +3313,7 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                 # picker can present an answerable owner question. A grant
                 # already bound to this exact observed control may resume.
                 if _material_form_choice(c):
+                    witnessed_question = None
                     if (c.get('type') == 'combobox'
                             and (c.get('combobox') or {}).get('linked') is False):
                         try:
@@ -3331,7 +3332,6 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                     try:
                         question = (witnessed_question if (
                             c.get('type') == 'combobox'
-                            and 'witnessed_question' in locals()
                             and witnessed_question is not None) else
                             _disclosure_question(
                                 page, c, witness, *origins,

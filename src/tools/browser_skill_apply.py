@@ -3192,9 +3192,10 @@ def _material_witness_disclosure_detail(target: dict, *, attempted: bool,
         f"link_id={'present' if combo.get('link_id') not in (None, '') else 'absent'}",
         f"listbox={'present' if combo.get('listbox_selector') not in (None, '') else 'absent'}",
     ]
-    if attempted and reason is not None:
+    if attempted:
         fields.append('witness_reason=' + (
-            reason if reason in _MATERIAL_WITNESS_GATE_REASONS
+            reason if isinstance(reason, str)
+            and reason in _MATERIAL_WITNESS_GATE_REASONS
             else _MATERIAL_WITNESS_GATE_OPAQUE))
     return ','.join(fields)
 

@@ -3849,3 +3849,193 @@ def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
             page, page['controls'][0],
             {c['selector']: c for c in proof['controls']},
             SECURE_URL)
+
+@pytest.mark.parametrize('positive', [
+    'acknowledge', 'acknowledges', 'acknowledged', 'acknowledging',
+    'acknowledgement', 'acknowledgments', 'acknowledgment',
+    'certify', 'certifies', 'certified', 'certifying',
+    'certification', 'certifications', 'certificate', 'certificates',
+    'authorization', 'authorizations', 'authorisation', 'authorisations',
+    'authorize', 'authorizes', 'authorized', 'authorizing',
+    'authorise', 'authorises', 'authorised', 'authorising',
+])
+def test_material_real_word_inflections_match_at_word_boundaries(positive):
+    assert forms._MATERIAL_ASSENT.search('Please ' + positive + ' this application.')
+    assert not forms._MATERIAL_ASSENT.search('pre' + positive + 'suffix')
+
+
+@pytest.mark.parametrize('negative', [
+    'acknowledg', 'certif', 'authori', 'authoriz', 'authorizationless',
+    'authoriseable', 'certifiable', 'uncertifiedness', 'acknowledgability',
+])
+def test_material_partial_stems_are_not_standalone_legal_words(negative):
+    assert forms._MATERIAL_ASSENT.search(negative) is None
+
+
+async def test_material_native_select_owner_resume_exact_grant_and_stale_options(
+        monkeypatch):
+    from agent import run
+    legal = field('Please authorize processing', '#consent',
+                  tag='select', type='select', question='Processing consent?',
+                  options=[{'value': '', 'label': 'Choose'},
+                           {'value': 'Y', 'label': 'I agree'},
+                           {'value': 'N', 'label': 'I decline'}])
+    p = secure_inventory(legal)
+    browser, decision, row = secure_world(monkeypatch, p)
+    report = await secure_attempt(p, facts={'Processing consent?': 'I agree'})
+    assert report['review_route'] == 'owner'
+    assert report['material_assent_diagnostic'] is True
+    assert report['form_question']['options'] == legal['options']
+    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
+
+    row.update(status='needs_human', gate_source='applier',
+               gate_call_id='direct', gate_pending={
+                   'question': report['question'],
+                   'form_question': report['form_question']})
+    saved = {}
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return deepcopy(row)
+        def set_status(self, pk, status, **changes):
+            assert pk == PK
+            row.update(status=status, **changes)
+    stores = SimpleNamespace(tracking=Tracking(),
+                             answer_bank=SimpleNamespace(
+                                 put=lambda name, value, *args, **kwargs:
+                                 saved.update({name: value})))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
+    assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
+    assert saved == {'Processing consent?': 'I agree'}
+    grant = row['human_approved_answers']['Processing consent?']
+    assert grant['options'] == legal['options']
+    assert grant['form_action'] == SECURE_URL
+
+    # The synthetic queue handoff restores the submitting status, not authority.
+    row['status'] = 'submitting'
+    assert forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                                target=p['controls'][0], url=SECURE_URL) is None
+    without_mutation = await forms._bootstrap(
+        browser, p, PK, saved, SECURE_URL,
+        company='example-co', job_url=SECURE_URL)
+    assert without_mutation['url'] == SECURE_URL
+    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
+
+    browser.allow_mutations = True
+    receipt = await forms.execute(
+        browser, p, {'action': 'select', 'selector': '#consent',
+                     'fact': 'Processing consent?', 'value': 'Y'},
+        facts=saved, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'select'
+    assert ('select', '#consent', '--value', 'Y') in browser.calls
+
+    altered = deepcopy(legal)
+    altered['options'][1]['label'] = 'New assent'
+    with pytest.raises(forms.Gate):
+        forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                             target=altered, url=SECURE_URL)
+    changed = deepcopy(legal)
+    changed['question'] = 'Processing updated?'
+    with pytest.raises(forms.Gate):
+        forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                             target=changed, url=SECURE_URL)
+    with pytest.raises(forms.Gate):
+        forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                             target=legal, url=SECURE_URL + '/other')
+
+
+@pytest.mark.parametrize('ungrantable', [
+    'invisible', 'disabled', 'unbound', 'foreign-action', 'not-select'
+])
+async def test_material_unwitnessed_or_unbound_assent_never_becomes_owner_grant(
+        monkeypatch, ungrantable):
+    legal = field('I agree to processing', '#material',
+                  tag='select', type='select',
+                  options=[{'value': 'yes', 'label': 'I agree'}])
+    p = secure_inventory(legal)
+    if ungrantable == 'invisible':
+        p['controls'][0]['synthetic_visible'] = False
+    elif ungrantable == 'disabled':
+        p['controls'][0]['disabled'] = True
+    elif ungrantable == 'unbound':
+        p['controls'][0]['in_form'] = False
+    elif ungrantable == 'foreign-action':
+        p['controls'][0]['form_action'] = 'https://foreign.test/form'
+    else:
+        p['controls'][0].update(tag='input', type='text')
+    browser, decide, _ = secure_world(monkeypatch, p)
+    report = await secure_attempt(p)
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert report['review_route'] != 'owner'
+    assert not decide.await_count
+    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
+
+
+@pytest.mark.parametrize('host', [
+    'example-co.test', 'job-boards.greenhouse.io', 'job-boards.eu.greenhouse.io',
+])
+@pytest.mark.parametrize('scope', ['empty', 'global', 'company', 'shadow'])
+async def test_scoped_facts_reach_runtime_and_decision_keys_on_regional_hosts(
+        monkeypatch, tmp_path, host, scope):
+    """Offline source transport proof, not an assertion about any live model."""
+    from core.models import AnswerScope
+    from core.storage.local import MarkdownAnswerBank
+    from core import stores as store_module
+    from tools import browser_apply as dispatch, browser_runtime as runtime
+    from tools import submit_hold, posting_guard
+
+    company = 'example-co'
+    bank = MarkdownAnswerBank(tmp_path / 'synthetic-facts.md')
+    if scope in {'global', 'shadow'}:
+        bank.put('Contact detail', 'GLOBAL_SENTINEL', AnswerScope.GLOBAL)
+    if scope in {'company', 'shadow'}:
+        bank.put('Contact detail', 'COMPANY_SENTINEL', AnswerScope.COMPANY,
+                 company=company)
+    facts = bank.all_facts(company)
+    expect = ('COMPANY_SENTINEL' if scope in {'company', 'shadow'}
+              else 'GLOBAL_SENTINEL' if scope == 'global' else '')
+    assert facts == ({'Contact detail': expect} if expect else {})
+    assert bank.all_facts('another-co') == (
+        {'Contact detail': 'GLOBAL_SENTINEL'} if scope in {'global', 'shadow'} else {})
+
+    url = ('https://example-co.test/job/1' if host == 'example-co.test'
+           else f'https://{host}/example-co/jobs/1')
+    target = field('Contact detail', '#contact', required=False)
+    p = inventory(target, submit(), url=url)
+    for item in p['controls']:
+        item['form_action'] = url
+    browser, decide, row = world(monkeypatch, p)
+    row.update(company=company, jd_url=url, job_id='1',
+               ats='greenhouse' if 'greenhouse.io' in host else 'custom')
+    if expect:
+        row['human_approved_answers'] = {
+            'Contact detail': {
+                'value': expect, 'selector': '#contact', 'url': url,
+                'label': 'Contact detail', 'question': '', 'tag': 'input',
+                'type': 'text', 'form_selector': '#application',
+                'form_action': url,
+            }}
+    monkeypatch.setattr(store_module, 'make_stores',
+                        lambda: SimpleNamespace(tracking=SimpleNamespace(
+                            get_current=lambda pk: deepcopy(row))))
+    monkeypatch.setattr(submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(posting_guard, 'authorised', lambda *a, **kw: True)
+    monkeypatch.setattr(runtime, 'available', lambda: (True, ''))
+    monkeypatch.setattr(runtime, 'backend',
+                        lambda: SimpleNamespace(apply_chrome=forms.apply))
+    report = await dispatch.apply(
+        url, company, facts, 'synthetic', pk=PK, jd_text='Synthetic role',
+        resume_path='Resume.pdf')
+    assert report['status'] == 'gate' and decide.await_count == 1
+    prompt, model_page, history = decide.await_args.args
+    advertised = "['Contact detail']" if expect else '[]'
+    assert f'Exact human-authorized fact KEYS on this tracked job: {advertised}' in prompt
+    assert model_page['controls'][0]['label'] == 'Contact detail'
+    assert history == []
+    assert not any(secret in str((prompt, model_page, history))
+                   for secret in ('GLOBAL_SENTINEL', 'COMPANY_SENTINEL'))
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)

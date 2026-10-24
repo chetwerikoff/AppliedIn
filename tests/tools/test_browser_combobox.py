@@ -973,3 +973,95 @@ async def test_material_closed_popup_exact_receipt_survives_final_approval(
     row['human_approved_answers'][question['label']]['options'][0]['value'] = 'DIFFERENT'
     with pytest.raises(forms.Gate):
         forms.check_approvals(PK, [receipt], closed)
+
+@pytest.mark.parametrize('caption', [
+    'Please Acknowledge receipt of our Candidate Privacy Notice.',
+    'I confirm, that I have read the Example Co Privacy Notice …',
+    'By selecting "I agree," …',
+])
+async def test_closed_material_assent_bootstrap_witnesses_without_selection(
+        monkeypatch, caption):
+    closed = material_page()
+    closed['controls'][0].update(label=caption, question=caption)
+    closed['controls'][0]['combobox'].update(
+        linked=False, link_id='', listbox_selector='', options=[])
+    opened = material_page()
+    opened['controls'][0].update(label=caption, question=caption)
+    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+
+    class Reversible:
+        def __init__(self):
+            self.current = deepcopy(closed)
+            self.calls = []
+        async def page(self):
+            return deepcopy(self.current)
+        async def call(self, *args):
+            self.calls.append(args)
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(self.current)}
+            if args == ('click', '#country'):
+                self.current = deepcopy(opened)
+                return {}
+            if args == ('press', 'Escape'):
+                self.current = deepcopy(closed)
+                return {}
+            pytest.fail(f'unapproved witness action: {args}')
+
+    session = Reversible()
+    with pytest.raises(forms.MaterialAssentGate) as exc:
+        await forms._bootstrap(session, closed, PK, {}, URL)
+    assert exc.value.reason == 'owner_question'
+    assert exc.value.form_question['options'] == [
+        {k: option[k] for k in ('selector', 'label', 'value')}
+        for option in opened['controls'][0]['combobox']['options']]
+    assert [c for c in session.calls if c[0] != 'evaluate'] == [
+        ('click', '#country'), ('press', 'Escape')]
+
+
+@pytest.mark.parametrize('failure', ['empty', 'duplicate', 'foreign'])
+async def test_closed_material_assent_invalid_listbox_remains_inspection_only(
+        monkeypatch, failure):
+    closed = material_page()
+    closed['controls'][0]['combobox'].update(
+        linked=False, link_id='', listbox_selector='', options=[])
+    opened = material_page()
+    combo = opened['controls'][0]['combobox']
+    if failure == 'empty':
+        combo['options'] = []
+    elif failure == 'duplicate':
+        combo['options'][1]['label'] = combo['options'][0]['label']
+    else:
+        combo.update(linked=False, link_id='', listbox_selector='', options=[])
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
+    async def no_wait(_):
+        return None
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+
+    class Session:
+        def __init__(self):
+            self.current = deepcopy(closed)
+            self.calls = []
+        async def page(self):
+            return deepcopy(self.current)
+        async def call(self, *args):
+            self.calls.append(args)
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(self.current)}
+            if args == ('click', '#country'):
+                self.current = deepcopy(opened)
+                return {}
+            if args == ('press', 'Escape'):
+                self.current = deepcopy(closed)
+                return {}
+            pytest.fail(f'unapproved witness action: {args}')
+
+    session = Session()
+    with pytest.raises(forms.MaterialAssentGate) as exc:
+        await forms._bootstrap(session, closed, PK, {}, URL)
+    assert exc.value.form_question is None
+    assert 'Disclosure: ' in str(exc.value)
+    assert [call for call in session.calls if call[0] != 'evaluate'] == [
+        ('click', '#country'), ('press', 'Escape')]
+

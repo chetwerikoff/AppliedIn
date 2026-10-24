@@ -4187,11 +4187,13 @@ def _job_preparation_route(href: str, tracked: str, *,
                            pk: str = '', company: str = '',
                            fixture_context=None) -> bool:
     """Effectful route authority: exact tracked job, typed proof, or row-bound GH."""
+    # Typed redirect/alias proof can establish a different HTTPS origin; do
+    # not incorrectly subject that witness to the legacy host classifier.
+    if provenance is not None and navigation_allowed(href, provenance=provenance):
+        return True
     if not _preparation_origin(href, tracked):
         return False
     if href == tracked or navigation_allowed(href, tracked):
-        return True
-    if provenance is not None and navigation_allowed(href, provenance=provenance):
         return True
     return (bool(pk and company)
             and _greenhouse_row_preparation(href, tracked, pk, company,

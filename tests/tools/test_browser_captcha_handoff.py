@@ -341,6 +341,7 @@ def test_response_id_and_owner_injection_never_reaches_owner_detail(reader):
     script = forms.ENTRY_PAGE if reader == "page" else forms._ENTRY_FIXED_CONTROL_WITNESS
     page = dom({
         "url": URL, "frames": [], "tokens": ["g-recaptcha-response"],
+        "tokenBadge": True,
         "tokenEdit": {"id": "PRIVATE_ID_SENTINEL", "data-secret": "PRIVATE_ATTR_SENTINEL"},
     }, script)
     assert page["entry"]["response_error"] is True

@@ -752,10 +752,12 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
     else if (!e.hasAttribute('srcdoc') && ((r && hiddenROutside && hidden &&
-             // Existing native-root classification remains; an Ashby bframe
-             // with any Enterprise anchor must use the exact-pair proof.
-             !(ashbyNative && path==='/recaptcha/enterprise/bframe' &&
-               enterpriseAnchors.length>0)) ||
+             // Preserve the already-proven rooted hidden-R fallback, but never
+             // let a duplicate bframe independently inherit its authority.
+             !(ashbyNative && enterpriseAnchors.length>0 &&
+               (enterpriseBframes.length>1 ||
+                (path==='/recaptcha/enterprise/bframe' &&
+                 !nativeRoot && !structuralRoot)))) ||
              visibleR==='R' || passiveEnterprise)) status='R';
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';

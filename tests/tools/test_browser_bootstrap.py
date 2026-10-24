@@ -397,8 +397,7 @@ async def test_bank_or_incomplete_or_changed_value_is_not_disclosure(
 
     # Even page-autofill of the unapproved bank/prior value cannot make the
     # final Submit guard accept it as a fresh approved write/readback.
-    displayed = bank.get('Email') or prior.get('value')
-    if displayed:
+    displayed = bank.get('Email') or prior.get('value')    if displayed:
         p['controls'][0].update(value=displayed, has_value=True)
     await final_submit_denied(
         monkeypatch, tmp_path, p, row, filled, history,
@@ -797,8 +796,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
-    bound = field('I agree to terms', '#bound-choice',
-                  tag='input', type=kind, required=True,
+    bound = field('I agree to terms', '#bound-choice',                  tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
                   question='Arbitration consent' if kind == 'radio' else '',
                   value='accept')
@@ -936,6 +934,43 @@ async def test_actual_readers_supply_only_proven_visible_material_label(kind):
         assert 'x' * (120 - len('I agree to terms ')) in detail
     else:
         assert "visible label: 'unavailable';" in detail
+    assert denial.value.reason == 'unknown_field'
+
+
+async def test_actual_reader_hidden_role_is_not_owner_material_type():
+    """A hidden input's arbitrary ARIA role is matching input, not display-safe type."""
+    role = 'HIDDEN_ROLE_SENTINEL_' + 'x' * 240
+    page, independent = _material_readers_with_synthetic_dom("""
+        const e = document.getElementById('email');
+        e.setAttribute('type', 'hidden');
+        e.setAttribute('name', 'consent-HIDDEN_NAME_SENTINEL');
+        e.setAttribute('role', 'HIDDEN_ROLE_SENTINEL_' + 'x'.repeat(240));
+        e.getClientRects = () => [];
+        node('input', {id:'required-other', type:'text', required:true},
+             document.getElementById('application-form'));
+    """)
+    original = next(c for c in page['controls'] if c['selector'] == '#email')
+    observed = next(c for c in independent['controls']
+                    if c['selector'] == '#email')
+    assert original['type'] == role and observed['type'] == role
+    assert 'consent-HIDDEN_NAME_SENTINEL' in original['label']
+    assert original['in_form'] is True and observed['visible'] is False
+
+    class OfflineReaderSession:
+        async def call(self, operation, script):
+            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
+            return {'value': deepcopy(independent)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    with pytest.raises(forms.MaterialAssentGate) as denial:
+        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    detail = str(denial.value)
+    assert ("Control type: unavailable; tag: input; "
+            "visible label: 'unavailable'; matched: consent." in detail)
+    assert 'HIDDEN_ROLE_SENTINEL_' not in detail
+    assert 'HIDDEN_NAME_SENTINEL' not in detail
     assert denial.value.reason == 'unknown_field'
 
 
@@ -1197,8 +1232,7 @@ async def test_input_submit_marker_requires_safe_native_receiver(
         monkeypatch, receiver):
     native = field('go', '#native-submit', required=False, tag='input',
                    type='submit', submit=True, value='Apply now', has_value=True)
-    native[receiver] = 'https://foreign.test/submit'
-    p = inventory(field(), native)
+    native[receiver] = 'https://foreign.test/submit'    p = inventory(field(), native)
     browser, _, _ = world(monkeypatch, p)
     assert (await attempt(p))['form_question'] is None
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
@@ -1597,8 +1631,7 @@ def _greenhouse_session(monkeypatch, tmp_path, page=None, *, careers_url=GH_CARE
         if args == ('evaluate', forms.GREENHOUSE_PAGE):
             browser.calls.append(args)
             return {'value': scoped(await browser.page())}
-        if args == ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS):
-            result = await original_call('evaluate', forms._FIXED_CONTROL_WITNESS)
+        if args == ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS):            result = await original_call('evaluate', forms._FIXED_CONTROL_WITNESS)
             browser.calls[-1] = args
             result['value'] = scoped(result['value'])
             return result
@@ -1997,8 +2030,7 @@ async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_conte
     assert browser.calls == []
 
 
-async def test_alias_wrong_tracked_caller_identity_never_mutates(monkeypatch, tmp_path):
-    p = inventory(field(form_action=GH_DIRECT),
+async def test_alias_wrong_tracked_caller_identity_never_mutates(monkeypatch, tmp_path):    p = inventory(field(form_action=GH_DIRECT),
                   submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
     with pytest.raises(forms.Gate):
@@ -2398,7 +2430,6 @@ async def test_vendor_redirect_rejections_gate_before_browser(
                ats='teamtailor', jd_url=canonical)
     monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
     requests = []
-
     def response(request):
         requests.append(request)
         if status is None:
@@ -2797,8 +2828,7 @@ async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(mon
         if args[0] == 'evaluate':
             evidence = witness(browser.current)
             for source, observed in zip(browser.current['controls'], evidence['controls']):
-                if source.get('type') == 'combobox':
-                    observed['combobox'] = deepcopy(source['combobox'])
+                if source.get('type') == 'combobox':                    observed['combobox'] = deepcopy(source['combobox'])
             browser.result = evidence
         if args[0] == 'click' and args[1] == '#country-example':
             browser.calls.append(args)
@@ -3197,8 +3227,7 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
         "First Name*": _marked_name_grant(value="Ada"),
         "Last Name*": {
             **_marked_name_grant(selector="#last", value="Lovelace"),
-            "label": "Last Name*",
-        },
+            "label": "Last Name*",        },
         # Previously granted spellings must not duplicate model-visible data
         # or substitute for the raw First Name*/Last Name* control grants.
         "First name": {**_marked_name_grant(value="Ada"), "label": "First name"},
@@ -3597,8 +3626,7 @@ async def test_required_radio_group_with_optional_leader_has_one_gate_record(
     lines = [record.getMessage() for record in caplog.records
              if record.name == forms.__name__ and
              record.getMessage().startswith('bootstrap field decision ')]
-    assert len(lines) == 1
-    assert "'type': 'radio'" in lines[0]
+    assert len(lines) == 1    assert "'type': 'radio'" in lines[0]
     assert "'required': True" in lines[0]
     assert "'decision': 'left-to-model'" in lines[0]
     await final_submit_denied(

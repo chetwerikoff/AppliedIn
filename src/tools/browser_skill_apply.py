@@ -397,8 +397,7 @@ def control(page: dict, action: dict, caller: str = 'external') -> dict:
             reason = f'ambiguous: {len(matches)} matches'
         else:
             reason = 'disabled'
-        operation = action.get('action')
-        diagnostics = {
+        operation = action.get('action')        diagnostics = {
             'action': operation if isinstance(operation, str) and operation in _CONTROL_ACTIONS
                       else 'control',
             'selector': _control_selector_display(action.get('selector')),
@@ -797,7 +796,6 @@ def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> No
 def _guard_model_page(model_page: dict, pk: str, company: str, *,
                       fixture_context=None) -> dict:
     """Guard Python-assembled page descriptions before the next model decision.
-
     The native browser observation occurs earlier and is not covered here.
     Keep structural controls/approved choices intact; only JD-derived string
     fields can be replaced. An invalid field is an error, never model input.
@@ -1197,8 +1195,7 @@ def check_form_destination(page: dict, target: dict, *origins: str,
     # destinations is safer than guessing which Submit button owns this input.
     relevant = [target] + [
         item for item in page.get('controls', [])
-        if item is not target and item.get('in_form')
-        and (not form_selector or not item.get('form_selector')
+        if item is not target and item.get('in_form')        and (not form_selector or not item.get('form_selector')
              or item.get('form_selector') == form_selector)]
     observed = urlsplit(page.get('url', ''))
     route = (_APPLICATION_ENTRY.get(provenance.ats)
@@ -1597,8 +1594,7 @@ class _GreenhouseSession:
 
     async def call(self, *args, **kwargs):
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
-            args = ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)
-        elif args == ('evaluate', bsk.PAGE):
+            args = ('evaluate', _GREENHOUSE_FIXED_CONTROL_WITNESS)        elif args == ('evaluate', bsk.PAGE):
             args = ('evaluate', GREENHOUSE_PAGE)
         result = await (_effect_call(self.raw, *args, **kwargs) if args and args[0] != 'evaluate'
                         else self.raw.call(*args, **kwargs))
@@ -1997,8 +1993,7 @@ class _EntrySession:
                  fixture_context=None):
         self.raw, self.allowed, self.provenance = raw, allowed, provenance
         self.step = step
-        self.fixture_context = fixture_context
-        self.committing = False
+        self.fixture_context = fixture_context        self.committing = False
         self.on_committing_click = None
         self.upload_attempted = False
         self.upload_pending = False
@@ -2397,8 +2392,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
             if original.get('tag') == 'select':
                 require(original.get('options') == observed.get('options'), 'options.equal')
             if original.get('type') == 'combobox':
-                combo = observed.get('combobox')
-                require(isinstance(combo, dict), 'combobox.object')
+                combo = observed.get('combobox')                require(isinstance(combo, dict), 'combobox.object')
                 source = original.get('combobox')
                 require(isinstance(source, dict), 'combobox.PAGE.object')
                 keys = ('link_id', 'linked', 'listbox_selector', 'options',
@@ -2797,8 +2791,7 @@ def _same_key(value: str) -> str:
 
 
 def _disclosure_question(page: dict, target: dict, witness: dict,
-                         *origins: str, bootstrap: bool = False,
-                         provenance: Provenance | None = None,
+                         *origins: str, bootstrap: bool = False,                         provenance: Provenance | None = None,
                          lever_location: bool = False) -> dict:
     structural = _formless_root(page)
     if structural:
@@ -2901,6 +2894,17 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     return question
 
 
+# The PAGE type may be an arbitrary role attribute, not a native control kind.
+# Only code-owned known names belong in the owner-facing diagnostic.
+_MATERIAL_DIAGNOSTIC_TYPES = frozenset({
+    'text', 'email', 'tel', 'url', 'number', 'search', 'password',
+    'date', 'datetime-local', 'time', 'month', 'week', 'file', 'hidden',
+    'checkbox', 'radio', 'range', 'color', 'button', 'submit', 'reset',
+    'select', 'textarea', 'combobox', 'textbox', 'searchbox',
+    'spinbutton', 'switch', 'listbox',
+})
+
+
 def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                     provenance: Provenance | None = None) -> None:
     for c in page['controls']:
@@ -2944,9 +2948,13 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                         and isinstance(proof.get('diagnostic_visible_label'), str)
                         and proof['diagnostic_visible_label'].strip()):
                     visible_label = proof['diagnostic_visible_label'][:120]
+                kind = c.get('type')
+                diagnostic_type = (kind if isinstance(kind, str)
+                                   and kind in _MATERIAL_DIAGNOSTIC_TYPES
+                                   else 'unavailable')
                 raise MaterialAssentGate(
                     'Material assent outside a bound choice needs human inspection. '
-                    f"Control type: {c.get('type')}; tag: {c.get('tag')}; "
+                    f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
                     f"visible label: {visible_label!r}; "
                     f"matched: {assent_match.group(0) if assent_match else 'select options'}.")
 
@@ -3197,8 +3205,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if provenance is not None and not _preparation_current(
                     provenance, fixture_context=fixture_context):
                 raise Gate('The trusted same-job provenance is no longer current.')
-            question = _disclosure_question(
-                page, item, witness, *origins, bootstrap=True,
+            question = _disclosure_question(                page, item, witness, *origins, bootstrap=True,
                 provenance=provenance)
         except Gate:
             record('blocked')
@@ -3597,8 +3604,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 and target.get('tag') == 'textarea'):
             key = _fact_key(facts, target['label']) or key
         if verb == 'choose':
-            # Missing safe answers still produce the original bound question.
-            # Once granted, the model's fact is only a routing label.
+            # Missing safe answers still produce the original bound question.            # Once granted, the model's fact is only a routing label.
             try:
                 approved = _approved_native_choice(
                     page, target, pk, provenance=provenance, fixture_context=ctx)
@@ -3997,8 +4003,7 @@ class ApplicationIPCController:
             raise Gate('The page is not the tracked employer or an approved HTTPS ATS host.')
         _tracked_preparation_job(self.pk, self.company, self.url,
                                  fixture_context=self.fixture_context)
-        row = self._row()
-        if (not self.pk or row.get('pk') != self.pk
+        row = self._row()        if (not self.pk or row.get('pk') != self.pk
                 or row.get('company') != self.company
                 or row.get('jd_url') != self.url
                 or row.get('status') != 'submitting' or row.get('possible_submission')):
@@ -4397,8 +4402,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     producer_guard = None
 
     def verify_dispatch():
-        if ctx is not None:
-            check_dispatch(pk, resume_path, fixture_context=ctx)
+        if ctx is not None:            check_dispatch(pk, resume_path, fixture_context=ctx)
         else:
             check_dispatch(pk, resume_path)
 

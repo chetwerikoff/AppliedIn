@@ -637,7 +637,7 @@ async def _fresh_confirmed_outcome(session, before: dict, after: dict,
                 or greenhouse.get('root') == {}
                 or after.get('unsupported_frames')):
             return ''
-    current, _ = await _observe_controls(session, after)
+    current, _ = await _observe_controls(session, after, site='confirmation-readback')
     if current.get('url') != href:
         return ''
     # A new success phrase does not confirm the original tracked job if its
@@ -2503,7 +2503,7 @@ class _EntrySession:
                 if len(receivers) != 1:
                     raise Gate('unsupported root target forbidden at IPC producer.')
                 return await self._upload(args, kwargs, selector)
-            current, _ = await _observe_controls(self, current)
+            current, _ = await _observe_controls(self, current, site='upload-root-readback')
             matches = [c for c in current.get('controls', [])
                        if c.get('selector') == selector]
             if len(matches) != 1:
@@ -2675,7 +2675,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         reason = _entry_not_ready(page)
                     if reason:
                         raise _EntryNotReady(reason)
-                    page, witness = await _observe_controls(session, page, readiness=True)
+                    page, witness = await _observe_controls(session, page, readiness=True, site='readiness-witness')
                     if loop.time() >= deadline:
                         raise TimeoutError
                     reason = _greenhouse_not_ready(page) if greenhouse else _entry_not_ready(page)
@@ -2804,6 +2804,17 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         _inventory_ok(current, complete=False)
         identity = _page_identity(current)
         same_read = identity == _page_identity(page)
+        if site in {'bootstrap-formless', 'bootstrap-material'}:
+            # Bootstrap needs two identical full PAGE+witness reads, not a transient match.
+            if same_read and _identity_try > 1 and _previous_identity == identity:
+                return current, lookup
+            if _identity_try < 4:
+                await asyncio.sleep(0.25)
+                return await _observe_controls(
+                    session, await session.page(), readiness=readiness,
+                    site=site, _identity_try=_identity_try + 1,
+                    _previous_identity=identity if same_read else None)
+            require(False, 'inventory.identity.equal')
         if site and _identity_try > 1 and same_read:
             return current, lookup
         if site and _identity_try < 4 and (
@@ -2822,6 +2833,14 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
     except Gate:
         raise
     except (Exception, asyncio.CancelledError) as exc:
+        if (isinstance(exc, ValueError) and predicate == 'controls.length.equal'
+                and site in {'bootstrap-formless', 'bootstrap-material'}
+                and _identity_try < 4):
+            await asyncio.sleep(0.25)
+            return await _observe_controls(
+                session, await session.page(), readiness=readiness,
+                site=site, _identity_try=_identity_try + 1,
+                _previous_identity=None)
         if isinstance(session, _GreenhouseSession) and readiness and session._readiness:
             if isinstance(exc, (asyncio.CancelledError, OSError, bsk.Unavailable)):
                 raise
@@ -3706,7 +3725,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if getattr(session, '_application_controller', None) is not None:
                 return page  # Missing historic root proof cannot block preparation.
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
-        page, witness = await _observe_controls(session, page)
+        page, witness = await _observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)
         for observed in members:
             if observed['type'] == 'file':
@@ -3759,7 +3778,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             for c in page['controls']):
         return page
     try:
-        page, witness = await _observe_controls(session, page)
+        page, witness = await _observe_controls(session, page, site='bootstrap-material')
     except Gate as exc:
         # The independent DOM validator remains fail-closed. Its rejected
         # linked shape still has a safe, code-normalized owner diagnostic;
@@ -4036,7 +4055,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 provenance=provenance,
                 **({'fixture_context': fixture_context} if fixture_context else {}))
             committed, observed_witness = await _observe_controls(
-                session, await session.page())
+                session, await session.page(), site='bootstrap-commit-readback')
             if (not _preparation_destination_allowed(committed.get('url', ''), *origins,
                                        provenance=provenance)
                     or (provenance is not None and not _preparation_current(
@@ -4066,7 +4085,7 @@ async def _current_approved_choices(session, page: dict, pk: str,
     if not any(c.get('type') in {'radio', 'checkbox'} and _unanswered(page, c)
                for c in page['controls']):
         return []
-    current, witness = await _observe_controls(session, page)
+    current, witness = await _observe_controls(session, page, site='bootstrap-native-readback')
     if (not _preparation_destination_allowed(current.get('url', ''), *origins, provenance=provenance)
             or (provenance is not None
                 and (provenance.pk != pk
@@ -4117,7 +4136,7 @@ async def _fresh_native_receiver(session, page: dict, action: dict,
     """An alias needs a current native receiver before *every* mutating IPC."""
     if not _preparation_current(provenance, fixture_context=fixture_context):
         raise Gate('The original same-job tenant mapping is no longer current.')
-    observed, _ = await _observe_controls(session, page)
+    observed, _ = await _observe_controls(session, page, site='native-receiver-readback')
     if not _preparation_current(provenance, fixture_context=fixture_context):
         raise Gate('The original same-job tenant mapping changed during native inspection.')
     if not _preparation_destination_allowed(observed.get('url', ''), provenance=provenance):
@@ -4138,7 +4157,7 @@ def _combobox_stable_identity(target: dict) -> tuple:
 
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                             filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
-    observed, witness = await _observe_controls(session, page)
+    observed, witness = await _observe_controls(session, page, site='combobox-observe')
     if provenance is not None and not _preparation_current(
             provenance, fixture_context=ctx):
         raise Gate('The tracked posting changed before combobox preparation.')
@@ -4195,7 +4214,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         # Opening the picker and typing only the already-approved answer are
         # reversible. A missing/mutating listbox is not a human Submit gate.
         await _effect_call(session, 'click', current['selector'])
-        latest, latest_witness = await _observe_controls(session, await session.page())
+        latest, latest_witness = await _observe_controls(session, await session.page(), site='combobox-open')
         current = control(latest, action, 'combobox-open')
         if (not _preparation_destination_allowed(
                 latest.get('url', ''), job_url or observed['url'],
@@ -4209,7 +4228,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         for attempt in range(20):
             try:
                 refreshed, refreshed_witness = await _observe_controls(
-                    session, await session.page())
+                    session, await session.page(), site='combobox-options')
                 candidate = control(refreshed, action, 'combobox-options')
             except Gate:
                 candidate = None
@@ -4240,7 +4259,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     # identity, binds the one option that may be clicked during preparation.
     try:
         latest, latest_witness = await _observe_controls(
-            session, await session.page())
+            session, await session.page(), site='combobox-verify')
         current = control(latest, action, 'combobox-verify')
     except Gate:
         return unresolved()
@@ -4291,7 +4310,7 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
     """Keep the legacy two-argument observation seam in execute()."""
     token = _EXECUTE_OBSERVATION_SITE.set(True)
     try:
-        return await _observe_controls(session, page)
+        return await _observe_controls(session, page, site='execute')
     finally:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
@@ -4495,7 +4514,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _guard_native_choice_answer(current, value)
             await _effect_call(session, 'click', current['selector'])
         if _formless_root(page):
-            readback, _ = await _observe_controls(session, await session.page())
+            readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
             if actual.get('value') != write_value or not actual.get('has_value'):
                 raise Gate('The approved structural field value did not read back exactly.')
@@ -4503,7 +4522,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                            url=readback['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':
-            readback, _ = await _observe_controls(session, await session.page())
+            readback, _ = await _observe_controls(session, await session.page(), site='execute-phone')
             phone = control(readback, action, 'execute-phone')
             if (_combobox_stable_identity(phone) != _combobox_stable_identity(current)
                     or phone.get('value') != write_value or phone.get('has_value') is not True):
@@ -4521,7 +4540,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                provenance=provenance)
         if _formless_root(page) and isinstance(session, _EntrySession):
             await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
-            observed, _ = await _observe_controls(session, await session.page())
+            observed, _ = await _observe_controls(session, await session.page(), site='execute-upload-readback')
             tree = _upload_tree(observed)
             _upload_input(observed, tree)
             if not tree.get('attached') or tree.get('filename') != Path(resume_path).name:
@@ -4539,7 +4558,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
             observed = await session.page()
             if _formless_root(page):
-                observed, _ = await _observe_controls(session, observed)
+                observed, _ = await _observe_controls(session, observed, site='execute-formless-upload')
         except (Exception, asyncio.CancelledError) as exc:
             if isinstance(exc, Gate):
                 raise
@@ -5676,7 +5695,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             await asyncio.sleep(1)
                             after = await session.page()
                             if _formless_root(after):
-                                after, _ = await _observe_controls(session, after)
+                                after, _ = await _observe_controls(session, after, site='confirmation-formless-readback')
                             step['url'] = after['url']
                             if (phrase := await _fresh_confirmed_outcome(
                                     session, before, after, provenance, url)):

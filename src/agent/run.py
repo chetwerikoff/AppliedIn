@@ -1383,14 +1383,16 @@ def run_queued(item: dict, q: Any) -> dict:
     pk = item["pk"]
     try:
         result = _run(_apply_direct(pk, make_stores())) or {}
-        # Keep the owner's full material-assent diagnostic in the result, not
-        # in a routine worker log that persists page-controlled labels.
+        # Owner-only Gate details never enter the queued worker's INFO result.
+        navigation_detail = result.get("navigation_provenance_diagnostic") is True
+        material_detail = result.get("material_assent_diagnostic") is True
         logged_result = (
             {"result": "gated", "pk": pk,
-             "question": "material-assent: human inspection required"}
-            if (result.get("result") == "gated"
-                and result.get("material_assent_diagnostic") is True)
-            else result
+             "question": ("navigation-provenance: human inspection required"
+                          if navigation_detail else
+                          "material-assent: human inspection required")}
+            if result.get("result") == "gated"
+            and (navigation_detail or material_detail) else result
         )
         log.info("apply: %s", logged_result)
         again, why = is_retryable(result)
@@ -1647,16 +1649,25 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
                                        "review_route": review_route or "hard_refusal"},
                                    gate_call_id="direct" if review_route == "owner" else None,
                                    gate_source="applier")
-        # The full independently witnessed diagnostic is kept for the owner.
-        # Ordinary events and daemon logs must not echo page-controlled labels.
+        # Keep full details in the owner row/reply only, never INFO/queued/event.
         material_assent = (configuration()['engine'] == 'browser_skill'
                            and result.get('material_assent_diagnostic') is True)
-        routine_detail = ("material-assent: human inspection required"
+        navigation_detail = (configuration()['engine'] == 'browser_skill'
+                             and result.get('navigation_provenance_diagnostic') is True)
+        routine_detail = ("navigation-provenance: human inspection required"
+                          if navigation_detail else
+                          "material-assent: human inspection required"
                           if material_assent else q)
-        emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
+        if navigation_detail:
+            # A host/path is owner detail, not even ordinary event URL metadata.
+            emit("gate", pk=pk, agent="applier", detail=routine_detail)
+        else:
+            emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
         log.info("gated pk=%s: %s", pk, routine_detail)
         return {"result": "gated", "pk": pk, "question": q,
-                **({"material_assent_diagnostic": True} if material_assent else {})}
+                **({"material_assent_diagnostic": True} if material_assent else {}),
+                **({"navigation_provenance_diagnostic": True}
+                   if navigation_detail else {})}
     reason = _fail_reason(result)
     # A browser held by something else is an ENVIRONMENT fault, not a verdict on
     # this job: the form was never reached, nothing was filled, and the same job

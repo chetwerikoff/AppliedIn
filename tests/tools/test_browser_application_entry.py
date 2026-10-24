@@ -1861,3 +1861,58 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     assert tracking.r.get(f'submit_hold:{PK}') is not None
     assert row['status'] == 'needs_human'
     assert row.get('gate_reason') == 'submit_uncertain'
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+@pytest.mark.parametrize('shape,failed', [
+    ('query', 'literal_canonical_ats_host_board_uuid_route'),
+    ('credentials', 'literal_canonical_ats_host_board_uuid_route'),
+    ('encoded-board', 'literal_canonical_ats_host_board_uuid_route'),
+    ('wrong-job', 'canonical_ats_job_id_equals_tracked_id'),
+])
+async def test_tracked_ats_literal_route_gate_identifies_predicate_without_secrets(
+        monkeypatch, ats, shape, failed):
+    """Source row authority is required even before host-only preparation."""
+    row, _, session, decision = world(monkeypatch, ats)
+    original = posting(ats)
+    alternate = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    if shape == 'query':
+        changed = original + '?key=QUERY_SENTINEL#FRAGMENT_SENTINEL'
+    elif shape == 'credentials':
+        changed = original.replace('https://',
+                                   'https://USER_SENTINEL:PW_SENTINEL@')
+    elif shape == 'encoded-board':
+        changed = original.replace('/example-co/', '/example%2dco/')
+    else:
+        changed = original.replace(JOB, alternate)
+    row['jd_url'] = changed
+    report = await forms.apply(changed, COMPANY, {}, 'synthetic', pk=PK,
+                               resume_path='Resume.pdf')
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'defect_provenance'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert 'The tracked ATS posting is not a literal canonical job route.' in report['question']
+    assert 'Failed predicate: ' + failed in report['question']
+    assert 'Tracked host/path: ' + forms._APPLICATION_ENTRY[ats][0] in report['question']
+    assert 'destination host/path:' in report['question']
+    for secret in ('QUERY_SENTINEL', 'FRAGMENT_SENTINEL', 'USER_SENTINEL',
+                   'PW_SENTINEL', '%2d', 'https://'):
+        assert secret not in report['question']
+    assert report['step']['url'] == 'unavailable'
+    assert session.calls == [] and not decision.await_count
+
+
+def test_canonical_ats_job_binding_keeps_real_refusals_and_existing_entry():
+    """Diagnostic text cannot become authority for a new ATS or job route."""
+    for ats in ('ashby', 'lever'):
+        current = posting(ats)
+        proof = forms.ApplicationEntryProvenance(
+            PK, COMPANY, ats, JOB, current, 'example-co', entry(ats))
+        assert forms.navigation_allowed(entry(ats), provenance=proof)
+        for href in (entry(ats).replace('example-co/', 'other-co/'),
+                     entry(ats).replace(JOB, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+                     entry(ats).replace('https://', 'https://user:secret@'),
+                     entry(ats) + '?job=another',
+                     entry(ats).replace('/example-co/', '/example%2dco/')):
+            assert not forms.navigation_allowed(href, provenance=proof)
+

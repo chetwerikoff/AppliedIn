@@ -307,6 +307,114 @@ class Gate(ValueError):
         self.form_question = form_question
         self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
 
+
+class NavigationProvenanceGate(Gate):
+    """Owner-only routing evidence; never place its message in ordinary telemetry."""
+
+
+def _navigation_host_path(value: str) -> str:
+    """Display only bounded literal host/path, not a credential or URL authority."""
+    if (not isinstance(value, str) or len(value) > 4096
+            or any(ord(c) < 32 or 127 <= ord(c) <= 159 or c == '\\'
+                   for c in value)):
+        return 'unavailable'
+    try:
+        part = urlsplit(value)
+        host = part.hostname or ''
+        if (part.scheme not in {'https', 'http'}
+                or not re.fullmatch(r'[A-Za-z0-9.-]{1,96}', host)
+                or host.startswith('.') or host.endswith('.')):
+            return 'unavailable'
+        path = part.path or '/'
+        segments = path.split('/')
+        if (len(path) > 160 or len(segments) > 8 or '%' in path
+                or any(len(s) > 48 or
+                       not re.fullmatch(r'[A-Za-z0-9._~-]*', s)
+                       for s in segments)):
+            return host + '/(path unavailable)'
+        return host + path
+    except (TypeError, ValueError, AttributeError):
+        return 'unavailable'
+
+
+def _navigation_failed_predicate(destination: str, tracked: str,
+                                 provenance: Provenance | None) -> str:
+    """Name the first failed *existing* route predicate; never grant authority."""
+    if not isinstance(destination, str) or not destination:
+        return 'destination_observation_available'
+    try:
+        if (any(ord(c) <= 32 or 127 <= ord(c) <= 159 or c == '\\'
+                for c in destination)):
+            return 'literal_safe_destination_url'
+        part = urlsplit(destination)
+        source = urlsplit(tracked)
+        if (part.scheme != 'https' or not part.hostname
+                or part.netloc != part.hostname or not bsk.web_url(destination)):
+            return 'literal_https_destination_origin'
+        if ('%' in part.path or any(s in {'.', '..'} for s in part.path.split('/'))):
+            return 'literal_unencoded_destination_path'
+        if isinstance(provenance, VendorRedirectProvenance):
+            proof = urlsplit(provenance.target_url)
+            if destination == provenance.wrapper:
+                return 'destination_is_verified_redirect_not_vendor_wrapper'
+            if part.netloc != proof.netloc:
+                return 'same_verified_redirect_host'
+            if (part.path != proof.path
+                    and not part.path.startswith(proof.path.rstrip('/') + '/')):
+                return 'same_verified_redirect_job_path'
+            if part.query != proof.query or ('?' in destination and not proof.query):
+                return 'same_verified_redirect_query_identity'
+            if part.fragment:
+                return 'verified_redirect_has_no_fragment'
+            return 'literal_verified_redirect_destination'
+        if isinstance(provenance, ApplicationEntryProvenance):
+            return 'exact_tracked_ats_application_entry_url'
+        if isinstance(provenance, GreenhouseJobAlias):
+            return 'verified_greenhouse_board_and_job_route'
+        if (part.scheme, part.hostname, part.port) != (
+                source.scheme, source.hostname, source.port):
+            return 'same_tracked_employer_https_origin'
+        job_path = source.path.rstrip('/')
+        if (not job_path or
+                (part.path != job_path
+                 and not part.path.startswith(job_path + '/'))):
+            return 'same_tracked_job_path'
+        former = parse_qsl(source.query, keep_blank_values=True)
+        current = parse_qsl(part.query, keep_blank_values=True)
+        if (len({k for k, _ in former}) != len(former)
+                or len({k for k, _ in current}) != len(current)):
+            return 'unique_tracked_job_query_keys'
+        if sorted(former) != sorted(current):
+            return 'same_tracked_job_query_identity'
+        if part.fragment != source.fragment:
+            return 'same_tracked_job_fragment_identity'
+        return 'approved_preparation_origin'
+    except (TypeError, ValueError, AttributeError):
+        return 'parseable_literal_destination_url'
+
+
+def _navigation_gate(message: str, tracked: str, destination: str | None, *,
+                     provenance: Provenance | None = None,
+                     predicate: str | None = None) -> NavigationProvenanceGate:
+    if isinstance(provenance, VendorRedirectProvenance):
+        evidence = ('single-location redirect witness: present; verified target host/path: '
+                    + _navigation_host_path(provenance.target_url))
+    elif isinstance(provenance, ApplicationEntryProvenance):
+        evidence = 'tracked ATS application-entry candidate: present'
+    elif isinstance(provenance, GreenhouseJobAlias):
+        evidence = 'tracked Greenhouse board/job candidate: present'
+    else:
+        evidence = 'independent redirect/ATS provenance: unavailable'
+    failed = predicate or _navigation_failed_predicate(destination, tracked, provenance)
+    return NavigationProvenanceGate(
+        f'{message} Failed predicate: {failed}. '
+        f'Tracked host/path: {_navigation_host_path(tracked)}; '
+        f'destination host/path: {_navigation_host_path(destination)}; '
+        f'{evidence}. Inspect the tracked route and independently verified '
+        'same-job/tenant evidence; neither page links nor model output grant authority.',
+        reason='defect_provenance')
+
+
 class MaterialAssentGate(Gate):
     """Code-issued material Gate: its verbose label is owner detail, not telemetry."""
 
@@ -3930,15 +4038,23 @@ def _tracked_preparation_job(pk: str, company: str, url: str, *,
     if known_ats or host in {entry[0] for entry in _APPLICATION_ENTRY.values()}:
         expected = _APPLICATION_ENTRY.get(ats)
         if expected is None:
-            raise Gate('The tracked ATS posting identity changed; no navigation is safe.')
+            raise _navigation_gate(
+                'The tracked ATS posting identity changed; no navigation is safe.',
+                url, None, predicate='tracked_ats_matches_canonical_host')
         board_host, _suffix = expected
         match = re.fullmatch(
             rf'https://{re.escape(board_host)}/({_BOARD_TOKEN.pattern})/({_JOB_UUID.pattern})',
             url)
         if not match or match.group(2) != job_id:
-            raise Gate('The tracked ATS posting is not a literal canonical job route.')
+            raise _navigation_gate(
+                'The tracked ATS posting is not a literal canonical job route.',
+                url, url, predicate=(
+                    'literal_canonical_ats_host_board_uuid_route' if not match
+                    else 'canonical_ats_job_id_equals_tracked_id'))
     if not _preparation_origin(url, url):
-        raise Gate('The tracked posting is not a safe HTTPS preparation origin.')
+        raise _navigation_gate(
+            'The tracked posting is not a safe HTTPS preparation origin.',
+            url, url, predicate='safe_https_preparation_origin')
 
 
 def _protected_resume_snapshot(staged: str) -> str:
@@ -4469,7 +4585,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             if tracked.get('ats') in _VENDOR_PATH:
                 provenance = await _probe_vendor_redirect(tracked, pk, company, url)
                 if provenance is None:
-                    raise Gate('The tracked vendor job did not prove one safe same-job redirect.')
+                    raise _navigation_gate(
+                        'The tracked vendor job did not prove one safe same-job redirect.',
+                        url, None, predicate='single_safe_same_job_vendor_location_present')
                 direct_url = provenance.target_url
 
         def allowed(href: str) -> bool:
@@ -4481,7 +4599,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 and navigation_allowed(href, provenance=provenance))
 
         if not allowed(direct_url):
-            raise Gate('The initial application route is not an approved preparation origin.')
+            raise _navigation_gate(
+                'The initial application route is not an approved preparation origin.',
+                url, direct_url, provenance=provenance)
         owner = facts.get('Full name') or facts.get('Name') or 'Resume'
         resume_path = _stage_resume(resume_path, owner)
         # Staging may yield to storage callbacks. Recheck the vendor-specific
@@ -4594,9 +4714,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     step['url'] = page['url']
                     if (isinstance(provenance, VendorRedirectProvenance)
                             and page.get('url') != provenance.target_url):
-                        raise Gate('Initial page did not match the exact vendor-verified target.')
+                        raise _navigation_gate(
+                            'Initial page did not match the exact vendor-verified target.',
+                            url, page.get('url'), provenance=provenance,
+                            predicate='exact_verified_redirect_target_url')
                     if not allowed(page['url']):
-                        raise Gate('Initial redirect is not proven to be the same employer job.')
+                        raise _navigation_gate(
+                            'Initial redirect is not proven to be the same employer job.',
+                            url, page.get('url'), provenance=provenance)
                 for _ in range(100):
                     if submitted:
                         context = handoff(
@@ -4605,7 +4730,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
                     if not allowed(page['url']):
-                        raise Gate('Current page is not proven to be the same tracked job.')
+                        raise _navigation_gate(
+                            'Current page is not proven to be the same tracked job.',
+                            url, page.get('url'), provenance=provenance)
                     verify_dispatch()
                     page = await _bootstrap(
                         session, page, pk, facts, *trusted_origins,
@@ -4653,11 +4780,15 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         page = await session.page()
                         step['url'] = page['url']
                         if not allowed(page['url']):
-                            raise Gate('Destination changed to an unrelated job or tenant.')
+                            raise _navigation_gate(
+                                'Destination changed to an unrelated job or tenant.',
+                                url, page.get('url'), provenance=provenance)
                         current = control(page, action, 'decision-fresh')
                         if current.get('tag') == 'a' and current.get('href') and not (
                                 allowed(current['href'])):
-                            raise Gate('Navigation requires provenance to the same tracked job and tenant.')
+                            raise _navigation_gate(
+                                'Navigation requires provenance to the same tracked job and tenant.',
+                                url, current['href'], provenance=provenance)
                         if any(current.get(k) != old.get(k) for k in
                                ('label', 'question', 'tag', 'type', 'href', 'options',
                                 'form_action', 'formaction', 'form_selector', 'in_form',
@@ -4674,7 +4805,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if href not in {c.get('href') for c in page['controls']}:
                             raise Gate('Only a link on the current application page may be opened.')
                         if not allowed(href):
-                            raise Gate('Navigation requires provenance to the same tracked job and tenant.')
+                            raise _navigation_gate(
+                                'Navigation requires provenance to the same tracked job and tenant.',
+                                url, href, provenance=provenance)
                         # Code-issued GET of an observed approved-host link is
                         # preparation; the raw producer rejects executable
                         # action paths independently of this model-selected href.
@@ -4762,7 +4895,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         return {'status': 'uncertain', 'detail': context['text'],
                                 'step': context['step']}
                     if not allowed(page['url']):
-                        raise Gate('Click redirected to an unrelated job or tenant.')
+                        raise _navigation_gate(
+                            'Click redirected to an unrelated job or tenant.',
+                            url, page.get('url'), provenance=provenance)
                     if submitted and (phrase := await _fresh_confirmed_outcome(
                             session, before, page, provenance, url)):
                         return {'status': 'applied', 'confirmation': phrase,
@@ -4791,8 +4926,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'A submission-capable step was executed before the form stopped. '
                     'Check the employer portal before retrying.', step)
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-            context = (_control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
-                       else handoff(str(exc), step))
+            context = (
+                {'text': str(exc), 'step': {'last_button': '(unavailable)',
+                                          'url': 'unavailable'}}
+                if isinstance(exc, NavigationProvenanceGate)
+                else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
+                else handoff(str(exc), step))
             hard = (isinstance(exc, CaptchaGate)
                     or exc.reason in {'defect_tenant', 'defect_provenance',
                                       'posting_guard_review_required'})
@@ -4811,6 +4950,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                       'form_question': exc.form_question}
             if isinstance(exc, MaterialAssentGate):
                 report['material_assent_diagnostic'] = True
+            if isinstance(exc, NavigationProvenanceGate):
+                report['navigation_provenance_diagnostic'] = True
             return report
         if submitted:
             context = handoff(

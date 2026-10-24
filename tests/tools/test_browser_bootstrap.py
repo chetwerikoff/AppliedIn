@@ -3826,3 +3826,192 @@ def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
             page, page['controls'][0],
             {c['selector']: c for c in proof['controls']},
             SECURE_URL)
+
+
+def test_navigation_diagnostic_has_bounded_host_path_and_unavailable_evidence():
+    """No URL text, userinfo, query, fragment or path payload escapes the Gate."""
+    tracked = 'https://example-co.test/job/1?tracked=PRIVATE_QUERY'
+    url = ('https://USER_SECRET:PASSWORD_SECRET@foreign.example.test/other-job'
+           '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    failure = forms._navigation_gate(
+        'Initial redirect is not proven to be the same employer job.',
+        tracked, url)
+    message = str(failure)
+    assert failure.reason == 'defect_provenance'
+    assert 'Failed predicate: literal_https_destination_origin' in message
+    assert 'Tracked host/path: example-co.test/job/1' in message
+    assert 'destination host/path: foreign.example.test/other-job' in message
+    assert 'independent redirect/ATS provenance: unavailable' in message
+    for secret in ('PRIVATE_QUERY', 'USER_SECRET', 'PASSWORD_SECRET',
+                   'QUERY_SECRET', 'FRAGMENT_SECRET', 'https://', '@'):
+        assert secret not in message
+    oversized = 'https://foreign.example.test/' + 'PATH_SECRET' * 30
+    assert forms._navigation_host_path(oversized) == (
+        'foreign.example.test/(path unavailable)')
+    assert forms._navigation_host_path(
+        'https://foreign.example.test/opening\nCONTROL_SECRET') == 'unavailable'
+    assert forms._navigation_host_path('missing destination') == 'unavailable'
+
+
+async def test_initial_navigation_redirect_explains_same_employer_origin(monkeypatch):
+    page = secure_inventory(field())
+    browser, _, row = secure_world(monkeypatch, page)
+    bad = ('https://foreign.example.test/job/1'
+           '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    browser.current = {**deepcopy(page), 'url': bad}
+    report = await secure_attempt(page)
+    assert report['status'] == 'gate'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert report['review_route'] == 'hard_refusal'
+    assert 'Initial redirect is not proven' in report['question']
+    assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
+    assert 'Tracked host/path: example-co.test/job/1' in report['question']
+    assert 'destination host/path: foreign.example.test/job/1' in report['question']
+    assert report['step']['url'] == 'unavailable'
+    assert 'QUERY_SECRET' not in report['question']
+    assert 'FRAGMENT_SECRET' not in report['question']
+    assert browser.calls == [('navigate', SECURE_URL)]
+    assert row.get('possible_submission') is False
+
+
+@pytest.mark.parametrize('verb', ['click', 'navigate'])
+async def test_observed_link_and_model_navigation_share_failed_provenance_predicate(
+        monkeypatch, verb):
+    destination = ('https://foreign.example.test/other-job'
+                   '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    linked = field('Read more', '#next', tag='a', type='link',
+                   href=destination, required=False, in_form=False)
+    page = secure_inventory(field(), linked)
+    browser, decide, row = secure_world(monkeypatch, page)
+    # Retain the production action-scope and route predicates. Only the
+    # unrelated field reader/approved-choice setup is skipped by this fixture.
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _s, current, *a, **k: current))
+    monkeypatch.setattr(forms, '_current_approved_choices',
+                        AsyncMock(return_value=[]))
+    decide.return_value = ({'action': 'click', 'selector': '#next'}
+                           if verb == 'click'
+                           else {'action': 'navigate', 'url': destination})
+    report = await secure_attempt(page)
+    assert decide.await_count == 1
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'defect_provenance'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert 'Navigation requires provenance to the same tracked job and tenant.' in (
+        report['question'])
+    assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
+    assert 'destination host/path: foreign.example.test/other-job' in report['question']
+    assert 'QUERY_SECRET' not in report['question']
+    assert 'FRAGMENT_SECRET' not in report['question']
+    assert browser.calls == [('navigate', SECURE_URL)]
+    assert row.get('possible_submission') is False
+
+
+@pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
+async def test_navigation_owner_detail_is_not_ordinary_events_or_worker_info(
+        monkeypatch, queued_worker):
+    """The actual direct and queued application sinks preserve owner-only detail."""
+    import logging
+    from io import StringIO
+
+    from agent import run
+    from core.logging import _ConsoleFormatter, _JsonFormatter
+
+    page = secure_inventory(field())
+    browser, _, _ = secure_world(monkeypatch, page)
+    browser.current = {
+        **deepcopy(page),
+        'url': ('https://USER_SECRET:PASSWORD_SECRET@foreign.example.test/other-job'
+                '?token=QUERY_SECRET#FRAGMENT_SECRET')}
+    report = await secure_attempt(page)
+    assert report['status'] == 'gate'
+    assert report['navigation_provenance_diagnostic'] is True
+
+    row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
+
+    class Tracking:
+        def get(self, key):
+            assert key == PK
+            return dict(row)
+
+        def get_current(self, key):
+            assert key == PK
+            return dict(row)
+
+        def set_status(self, key, status, **updates):
+            assert key == PK
+            row.update(status=getattr(status, 'value', status), **updates)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(), secrets=None,
+        answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+    events = []
+    monkeypatch.setattr('core.events.emit',
+                        lambda kind, **kw: events.append((kind, kw)))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
+        return_value={'text': 'Synthetic offline description'}))
+    monkeypatch.setattr(run, '_commit_posting_meta',
+                        lambda pk, current, meta, stores: dict(current))
+    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
+    monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
+    monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
+    monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
+    monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
+    monkeypatch.setattr('tools.credentials.get_login', lambda *a, **kw: None)
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Synthetic.pdf')
+    monkeypatch.setattr(
+        run, 'get_settings', lambda: SimpleNamespace(browser_model='offline'))
+    monkeypatch.setattr(
+        'tools.browser_runtime.configuration', lambda: {'engine': 'browser_skill'})
+    fake_apply = AsyncMock(return_value=report)
+    monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
+
+    assert run.log.propagate is False
+    handlers = [handler for handler in run.log.handlers
+                if type(handler) is logging.StreamHandler
+                and isinstance(handler.formatter,
+                               (_ConsoleFormatter, _JsonFormatter))]
+    assert handlers
+    with StringIO() as stream, monkeypatch.context() as capture:
+        capture.setattr(run.log, 'level', logging.INFO)
+        capture.setattr(handlers[0], 'stream', stream)
+        if queued_worker:
+            monkeypatch.setattr(run, 'make_stores', lambda: stores)
+            queue = SimpleNamespace(retry=Mock(), done=Mock())
+            item = {'pk': PK}
+            result = run.run_queued(item, queue)
+            queue.done.assert_called_once_with(item)
+            queue.retry.assert_not_called()
+        else:
+            result = await run._apply_direct(PK, stores)
+        info_output = stream.getvalue()
+    assert fake_apply.await_count == 1
+    assert result['result'] == 'gated'
+    assert result['question'] == report['question']
+    assert result['navigation_provenance_diagnostic'] is True
+    assert row['status'] == 'needs_human'
+    assert row['gate_reason'] == 'defect_provenance'
+    assert row['gate_pending']['question'] == report['question']
+    gate_events = [data for kind, data in events if kind == 'gate']
+    assert len(gate_events) == 1
+    assert gate_events[0]['detail'] == 'navigation-provenance: human inspection required'
+    assert 'url' not in gate_events[0]
+    gated = [line for line in info_output.splitlines() if 'gated pk=' in line]
+    assert len(gated) == 1
+    assert 'navigation-provenance: human inspection required' in gated[0]
+    if queued_worker:
+        queued = [line for line in info_output.splitlines() if 'apply: ' in line]
+        assert len(queued) == 1
+        assert "'question': 'navigation-provenance: human inspection required'" in queued[0]
+    for detail in (info_output, str(gate_events)):
+        for secret in ('foreign.example.test', 'example-co.test/job/1',
+                       'other-job', 'USER_SECRET', 'PASSWORD_SECRET',
+                       'QUERY_SECRET', 'FRAGMENT_SECRET'):
+            assert secret not in detail
+    assert 'foreign.example.test/other-job' in row['gate_pending']['question']
+    for secret in ('USER_SECRET', 'PASSWORD_SECRET',
+                   'QUERY_SECRET', 'FRAGMENT_SECRET'):
+        assert secret not in row['gate_pending']['question']

@@ -5039,3 +5039,18 @@ async def test_execute_observer_preserves_two_argument_witness_seam(monkeypatch)
     observed, controls = await forms._execute_observe_controls(browser, page)
     assert observed is page and controls == {}
     assert called == [(browser, page)]
+
+
+@pytest.mark.asyncio
+async def test_execute_production_observer_has_literal_gate_site(monkeypatch):
+    """The real observer carries execute's literal without changing fixture doubles."""
+    page = inventory(field(), submit())
+    browser = Browser(page)
+    bad = witness(page)
+    bad['controls'][0]['selector'] = '#changed'
+    browser.result = bad
+    with pytest.raises(forms.Gate) as error:
+        await forms._execute_observe_controls(browser, page)
+    assert 'predicate=selector.equal' in str(error.value)
+    assert 'site=execute' in str(error.value)
+    assert [call[0] for call in browser.calls] == ['evaluate']

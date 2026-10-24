@@ -4323,10 +4323,17 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                if witnessed_options is not None else {})}
 
 
+_PRODUCTION_OBSERVE_CONTROLS = _observe_controls
+
+
 async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
-    """Keep the legacy two-argument observation seam in execute()."""
+    """Name the production site without breaking two-argument fixture doubles."""
     token = _EXECUTE_OBSERVATION_SITE.set(True)
     try:
+        if _observe_controls is _PRODUCTION_OBSERVE_CONTROLS:
+            return await _observe_controls(session, page, site='execute')
+        # Existing offline guard-order tests replace this function with a
+        # two-argument witness. Only that substituted seam uses positional args.
         return await _observe_controls(session, page)
     finally:
         _EXECUTE_OBSERVATION_SITE.reset(token)

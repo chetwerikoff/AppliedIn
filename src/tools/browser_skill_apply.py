@@ -2804,7 +2804,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         _inventory_ok(current, complete=False)
         identity = _page_identity(current)
         same_read = identity == _page_identity(page)
-        if site and _identity_try > 1 and same_read and _previous_identity == identity:
+        if site and _identity_try > 1 and same_read:
             return current, lookup
         if site and _identity_try < 4 and (
                 not same_read or _identity_try > 1):

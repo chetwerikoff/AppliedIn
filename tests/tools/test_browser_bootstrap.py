@@ -4986,15 +4986,16 @@ async def test_bank_auto_does_not_use_company_only_facts_or_overwrite_owner(monk
 async def test_required_unmatched_field_has_deterministic_form_question(monkeypatch):
     page = secure_inventory(field('Unmatched field', '#missing'))
     browser, decision, row = secure_world(monkeypatch, page)
-    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as exc:
-        await forms._bootstrap(browser, page, PK, {}, SECURE_URL,
-                               required_gate=True, global_facts={},
-                               company='example-co')
-    assert exc.value.form_question['pk'] == PK
-    assert exc.value.form_question['label'] == 'Unmatched field'
-    assert exc.value.form_question['selector'] == '#missing'
-    assert not decision.await_count
+    report = await secure_attempt(page)
+    assert report['status'] == 'gate'
+    assert 'An exact human-approved answer is needed' in report['question']
+    question = report['form_question']
+    assert question['pk'] == PK
+    assert question['label'] == 'Unmatched field'
+    assert question['selector'] == '#missing'
+    assert decision.await_count == 1  # gate follows guarded model refusal
     assert row['human_approved_answers'] == {}
+    assert not any(c[0] in {'fill', 'select', 'click'} for c in browser.calls)
 
 
 def test_bank_global_partition_only(monkeypatch):

@@ -734,7 +734,16 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
           return ['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) &&
             u.pathname==='/recaptcha/enterprise/bframe';
         } catch (_) { return false; }
-      }).length===1 && r;
+      }).length===1 && r &&
+      entryFrameNodes.every(f=>{
+        if(f===enterpriseAnchors[0] || f===e) return true;
+        // A third provider iframe cannot be waived by the two-frame proof.
+        try {
+          const u=new URL(f.getAttribute('src'));
+          return !['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) ||
+            !['/recaptcha/enterprise/anchor','/recaptcha/enterprise/bframe'].includes(u.pathname);
+        } catch (_) { return true; }
+      });
     // AC-Z is scoped to the entry reader; ordinary PAGE gains no frame waiver.
     const z=raw===null && e.getAttribute('title')===null &&
       !e.getAttributeNames().some(a=>a.startsWith('data-') || a.startsWith('aria-')) &&

@@ -3794,7 +3794,8 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
 
 
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:
-    row = _row(pk, fixture_context=fixture_context)
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}
     result, seen = [], set()
     if isinstance(grants, dict):
@@ -4027,10 +4028,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                           else f'An exact human-approved answer is needed for "{key}".')
                 record('needs-human')
                 raise Gate(prompt, form_question=question, reason='owner_question')
-            if required_gate:
-                record('needs-human')
-                raise Gate(f'An exact human-approved answer is needed for "{key}".',
-                           form_question=question, reason='owner_question')
+            # Ordinary native controls retain their guarded model/submit
+            # sequencing; a prose refusal is converted to a structured owner
+            # question only at the decision boundary below.
             record('left-to-model')
             continue
 
@@ -5758,6 +5758,32 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
+                        # Preserve all earlier native-root, model and provenance
+                        # checks. Only an ordinary reviewer refusal without a
+                        # specific approved answer becomes an owner question.
+                        if (not granted_keys and not choices
+                                and action.get('question')
+                                and not _formless_root(page)):
+                            unanswered = [c for c in page['controls']
+                                          if c.get('in_form') and c.get('required')
+                                          and _unanswered(page, c)
+                                          and (_native_answer(c) or c.get('type')
+                                               in {'radio', 'checkbox', 'combobox'})]
+                            if unanswered:
+                                current_page, witness = await _observe_controls(session, page)
+                                for pending in unanswered:
+                                    try:
+                                        key = _key(current_page, pending)
+                                        question = _disclosure_question(
+                                            current_page, pending, witness,
+                                            *trusted_origins, bootstrap=True,
+                                            provenance=provenance)
+                                    except Gate:
+                                        continue
+                                    question['pk'] = pk
+                                    raise Gate(
+                                        f'An exact human-approved answer is needed for "{key}".',
+                                        form_question=question, reason='owner_question')
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
                     if verb == 'finish':
                         raise Gate('The application has not been submitted; review the form.')

@@ -1781,7 +1781,7 @@ def _issue164_reader(reader, *, position=2, resolved=False, variant='ok',
 """
     mutation=(mutation.replace('POSITION',str(position))
               .replace('INNER','true' if variant=='nested-container' else 'false')
-              .replaceAll('VARIANT',repr(variant).replace("'",'"')))
+              .replace('VARIANT',repr(variant).replace("'",'"')))
     script=script.replace(opener,opener+mutation,1)
     return _dom_with_readable_child(spec,script)
 

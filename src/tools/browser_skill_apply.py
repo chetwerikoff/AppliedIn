@@ -3575,13 +3575,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                          and _material_form_choice(c)), None)
         if not malformed_link or material is None:
             raise
-        assent = _material_assent_match(label(material))
-        kind = material.get('type')
         raise MaterialAssentGate(
             'Material assent outside a bound choice needs human inspection. '
-            f"Control type: {kind}; tag: {material.get('tag')}; "
-            "visible label: 'unavailable'; "
-            f"matched: {assent.group(0) if assent else 'select options'}."
+            'Control type: combobox; tag: unavailable; '
+            "visible label: 'unavailable'; matched: select options."
             ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
             + _material_witness_disclosure_detail(material, attempted=False) + '.') from None
     if provenance is not None and (

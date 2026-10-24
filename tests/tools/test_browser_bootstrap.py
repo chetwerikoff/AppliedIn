@@ -805,7 +805,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
                   tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
@@ -817,7 +817,7 @@ def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
             'I decline', '#decline-choice', tag='input', type='radio',
             required=True, checked=False, has_value=True, name='attestation',
             question='Arbitration consent', value='decline'))
-    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
+    await forms._bootstrap_wall(None, inventory(*members, submit()), {}, URL)
 
 
 async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
@@ -3739,7 +3739,7 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
         forms.check_form(page, filled, True)
 
 
-def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+async def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     """A visible privacy choice needs the owner's exact current question."""
     question_text = 'I consent to sharing personal data with marketing partners'
     page = secure_inventory(
@@ -3748,7 +3748,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     )
     independent = {c['selector']: c for c in witness(page)['controls']}
     with pytest.raises(forms.Gate) as exc:
-        forms._bootstrap_wall(page, independent, SECURE_URL)
+        await forms._bootstrap_wall(None, page, independent, SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert exc.value.form_question is not None
     assert exc.value.form_question['control_label'] == question_text
@@ -3759,7 +3759,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     inaccessible = deepcopy(independent)
     inaccessible['#marketing']['visible'] = False
     with pytest.raises(forms.Gate) as blocked:
-        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+        await forms._bootstrap_wall(None, page, inaccessible, SECURE_URL)
     assert blocked.value.reason == 'owner_question'
     assert blocked.value.form_question is None
     assert 'Direct owner review' in str(blocked.value)
@@ -4275,3 +4275,278 @@ async def test_owner_only_checkbox_grant_resumes_through_raw_click(
     raw.bind_application_controller(controller)
     await raw.application_effect('click', '#marketing')
     assert effects == [('click', '#marketing', '--session', 'synthetic-offline')]
+
+
+@pytest.mark.parametrize('label', [
+    'Are you legally authorized to work in the country…',
+    'Are you currently authorized to work in the U.S.?',
+    'Do you have work authorization?',
+    'Do you have authorization to work in this country?',
+    'Are you legally eligible to work in the U.S.?',
+    'Are you authorised to work in this country?',
+])
+@pytest.mark.parametrize('kind', ['text', 'select', 'combobox'])
+async def test_ordinary_work_eligibility_uses_bank_fact_preparation(
+        monkeypatch, label, kind):
+    """The production bootstrap, not a regex-only assertion, admits these facts."""
+    eligible = field(label, '#eligibility', type=kind, tag=(
+        'select' if kind == 'select' else 'input'))
+    if kind == 'select':
+        eligible['options'] = [
+            {'value': '', 'label': 'Choose'},
+            {'value': 'yes', 'label': 'Yes'},
+            {'value': 'no', 'label': 'No'},
+        ]
+    if kind == 'combobox':
+        eligible['combobox'] = {
+            'linked': True, 'link_id': 'eligibility-options',
+            'listbox_selector': '#eligibility-options',
+            'options': [{'selector': '#yes', 'unique': True,
+                         'label': 'Yes', 'value': 'yes', 'safe': True},
+                        {'selector': '#no', 'unique': True,
+                         'label': 'No', 'value': 'no', 'safe': True}],
+            'selected_text': '', 'displayed_text': '', 'selected_value': '',
+            'hidden_selector': '#eligibility-hidden', 'hidden_value': '',
+        }
+    page = secure_inventory(eligible)
+    browser, decide, row = secure_world(monkeypatch, page)
+    # An ordinary bank fact is eligible for preparation; it must never
+    # manufacture a same-job material-assent grant.
+    row['human_approved_answers'] = {}
+    report = await secure_attempt(page, facts={label: 'Yes'})
+    assert report['status'] == 'gate'
+    assert report.get('material_assent_diagnostic') is not True
+    assert report['form_question'] is None
+    assert decide.await_count == 1
+    assert not row['human_approved_answers']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('label', [
+    'I authorize Example Co to conduct a background check',
+    'Are you authorized to work? I consent to a background check.',
+    'Work authorization and Candidate Privacy Notice acknowledgement',
+    'Authorization to work and agreement to legal terms',
+])
+async def test_work_eligibility_never_hides_independent_material_assent(
+        monkeypatch, label):
+    material = field(label, '#material', tag='select', type='select',
+                     options=[{'value': '', 'label': 'Choose'},
+                              {'value': 'yes', 'label': 'I agree'},
+                              {'value': 'no', 'label': 'I decline'}])
+    page = secure_inventory(material)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    result = await secure_attempt(page, facts={label: 'Yes'})
+    assert result['status'] == 'gate'
+    assert result['material_assent_diagnostic'] is True
+    assert result['review_route'] == 'owner'
+    assert result['form_question'] is not None
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('The closed combobox linkage is incomplete or ambiguous.',
+     'The closed combobox linkage is incomplete or ambiguous.'),
+    ('The combobox option linkage is incomplete or ambiguous.',
+     'The combobox option linkage is incomplete or ambiguous.'),
+    ('This control is not visibly editable.',
+     'This control is not visibly editable.'),
+    ('PRIVATE_URL_TOKEN_SENTINEL malicious text',
+     forms._DISCLOSURE_FAILURE_OPAQUE),
+])
+async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
+        monkeypatch, failure, expected):
+    import logging
+    privacy = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = secure_inventory(privacy)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    actual = forms._disclosure_question
+
+    def fail_disclosure(*args, **kwargs):
+        if args[1].get('selector') == '#privacy':
+            raise forms.Gate(failure)
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(forms, '_disclosure_question', fail_disclosure)
+    report = await secure_attempt(page, facts={
+        'PRIVATE_FACT_SENTINEL': 'PRIVATE_VALUE_SENTINEL'})
+    assert report['status'] == 'gate'
+    assert report['form_question'] is None
+    assert report['material_assent_diagnostic'] is True
+    assert f'Disclosure: {expected}.' in report['question']
+    assert decide.await_count == 0
+    for secret in ('PRIVATE_URL_TOKEN_SENTINEL', 'PRIVATE_FACT_SENTINEL',
+                   'PRIVATE_VALUE_SENTINEL'):
+        assert secret not in report['question']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+@pytest.mark.parametrize('unsafe', [None, 'readonly', 'offscreen', 'wrong-owner'])
+async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
+        monkeypatch, unsafe):
+    closed = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    current = inventory(closed)
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(controller, '_row', lambda: {'ats': 'other'})
+    class Raw:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            proof = witness(current)
+            if unsafe == 'readonly':
+                proof['controls'][0]['readonly'] = True
+            if unsafe == 'offscreen':
+                proof['controls'][0]['visible'] = False
+            return {'value': proof}
+    raw = Raw()
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_request = '#privacy'
+    controller._material_witness_expected = {
+        k: v for k, v in closed.items() if k != 'combobox'}
+    if unsafe == 'wrong-owner':
+        current['controls'][0]['form_selector'] = '#foreign'
+    if unsafe:
+        with pytest.raises(forms.Gate):
+            await controller.before_ipc(raw, ('click', '#privacy'), {})
+        assert controller._material_witness_selector is None
+        return
+    await controller.before_ipc(raw, ('click', '#privacy'), {})
+    assert controller._material_witness_selector == '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_close_request = '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Enter'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    await controller.before_ipc(raw, ('press', 'Escape'), {})
+    assert controller._material_witness_selector == '#privacy'
+    controller._material_witness_selector = None
+    controller._material_witness_close_request = None
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+
+
+@pytest.mark.parametrize('witness_error,expected', [
+    ('The material picker control changed while opening.',
+     'The material picker control changed while opening.'),
+    ('PRIVATE_LABEL_SENTINEL #PRIVATE_SELECTOR_SENTINEL',
+     forms._MATERIAL_WITNESS_GATE_OPAQUE),
+])
+async def test_material_witness_clause_stays_owner_only_across_direct_and_queue(
+        monkeypatch, witness_error, expected):
+    import logging
+    from io import StringIO
+
+    from agent import run
+    from core.logging import _ConsoleFormatter, _JsonFormatter
+
+    privacy = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = secure_inventory(privacy)
+    _, decide, _ = secure_world(monkeypatch, page)
+    attempts = []
+
+    async def witness_failure(*args, **kwargs):
+        attempts.append(True)
+        raise forms.Gate(witness_error)
+
+    monkeypatch.setattr(forms, '_witness_material_combobox', witness_failure)
+    gate = await secure_attempt(page)
+    assert gate['status'] == 'gate'
+    assert gate['material_assent_diagnostic'] is True
+    assert attempts == [True]
+    assert 'witness=attempted,linked=false,options=empty,' in gate['question']
+    assert f'witness_reason={expected}' in gate['question']
+    assert 'PRIVATE_LABEL_SENTINEL' not in gate['question']
+    assert 'PRIVATE_SELECTOR_SENTINEL' not in gate['question']
+    assert decide.await_count == 0
+
+    row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
+
+    class Tracking:
+        def get(self, pk):
+            return dict(row)
+
+        def get_current(self, pk):
+            return dict(row)
+
+        def set_status(self, pk, status, **updates):
+            row.update(status=getattr(status, 'value', status), **updates)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(), secrets=None,
+        answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+    monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: events.append(
+        (args, kwargs)))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
+        return_value={'text': 'Synthetic job description'}))
+    monkeypatch.setattr(run, '_commit_posting_meta',
+                        lambda pk, current, meta, stores: dict(current))
+    monkeypatch.setattr('tools.posting_guard.authorised', lambda *args, **kwargs: True)
+    monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
+    monkeypatch.setattr('core.rotation.ensure', lambda *args, **kwargs: None)
+    monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
+    monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
+    monkeypatch.setattr('tools.credentials.get_login', lambda *args, **kwargs: None)
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Synthetic.pdf')
+    monkeypatch.setattr(run, 'get_settings',
+                        lambda: SimpleNamespace(browser_model='offline'))
+    monkeypatch.setattr('tools.browser_runtime.configuration',
+                        lambda: {'engine': 'browser_skill'})
+    monkeypatch.setattr('tools.browser_apply.apply',
+                        AsyncMock(return_value=gate))
+    handlers = [handler for handler in run.log.handlers
+                if type(handler) is logging.StreamHandler
+                and isinstance(handler.formatter, (_ConsoleFormatter, _JsonFormatter))]
+    assert handlers
+    for queued in (False, True):
+        events = []
+        row['status'] = 'tailored'
+        with StringIO() as output, monkeypatch.context() as capture:
+            capture.setattr(run.log, 'level', logging.INFO)
+            capture.setattr(handlers[0], 'stream', output)
+            if queued:
+                capture.setattr(run, 'make_stores', lambda: stores)
+                queue = SimpleNamespace(retry=Mock(), done=Mock())
+                result = run.run_queued({'pk': PK}, queue)
+                queue.done.assert_called_once()
+            else:
+                result = await run._apply_direct(PK, stores)
+            logged = output.getvalue()
+        assert result['result'] == 'gated'
+        assert row['gate_pending']['question'] == gate['question']
+        assert [kwargs['detail'] for args, kwargs in events
+                if args[0] == 'gate'] == [
+            'material-assent: human inspection required']
+        assert 'material-assent: human inspection required' in logged
+        assert 'witness=attempted' not in logged
+        assert 'witness_reason=' not in logged
+        assert 'PRIVATE_LABEL_SENTINEL' not in logged

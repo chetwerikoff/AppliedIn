@@ -5582,7 +5582,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                  and not re.search(r'password|login|credential|token', k, re.I)}
         if ctx is None:
             from core.stores import make_stores
-            global_facts = _global_owner_facts(make_stores().answer_bank)
+            # Some read-only/fixture store adapters do not expose a bank.
+            # Lack of an independently inspectable GLOBAL partition grants
+            # nothing; it must not prevent unrelated guarded form actions.
+            global_facts = _global_owner_facts(
+                getattr(make_stores(), 'answer_bank', None))
         else:
             global_facts = {}  # Synthetic fixture never consults owner storage.
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '

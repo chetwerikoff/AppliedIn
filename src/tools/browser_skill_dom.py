@@ -724,7 +724,8 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     // The invisible Enterprise pair is provider-owned only when both exact
     // frames are unique. Badge containment is checked on the actual anchor;
     // its body-level bframe need not share the badge or an application root.
-    const passiveEnterprise=raw!==null && !e.hasAttribute('srcdoc') && hidden &&
+    const passiveEnterprise=raw!==null && !e.hasAttribute('srcdoc') &&
+      style.visibility==='hidden' && hidden &&
       enterpriseAnchors.length===1 &&
       enterpriseBadgeAnchor(enterpriseAnchors[0].closest('div.grecaptcha-badge')) &&
       entryFrameNodes.filter(f=>{

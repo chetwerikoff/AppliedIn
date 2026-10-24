@@ -2035,3 +2035,52 @@ def test_legacy_host_admission_cannot_authorize_cross_tenant_effect():
     assert not forms._preparation_destination_allowed(other, tracked)
     assert forms._job_preparation_route(valid, tracked)
     assert forms._preparation_destination_allowed(valid, tracked)
+
+
+def test_greenhouse_confirmation_read_does_not_reimpose_pre_submit_shape():
+    """Only the final IPC authorizes Submit; a post-click read is observational."""
+    after = {
+        'url': 'https://foreign.example.test/thank-you?token=QUERY_SENTINEL',
+        'controls': [], 'greenhouse': {
+            'root': None, 'frames': [{'status': 'unknown'}],
+            'response_controls': True,
+        },
+        'unsupported_frames': ['synthetic unsupported frame'],
+    }
+    # Deliberately invalid provisional evidence: no read may certify a
+    # successful application, but a passive read must reach settlement logic.
+    forms._greenhouse_safety(after, lambda _href: False, None, submitted=True)
+    with pytest.raises(forms.Gate):
+        forms._greenhouse_safety(after, lambda _href: False, None, submitted=False)
+
+
+def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
+        monkeypatch):
+    """The row/config route proof is narrow and never turns into host-wide trust."""
+    from types import SimpleNamespace
+    from core import config as core_config
+    from discovery import watchlist
+    from discovery.watchlist import CompanyConfig
+    from core.ids import make_pk
+
+    company = 'example-co'
+    jid = '123456'
+    pk = make_pk(company, jid)
+    tracked = 'https://careers.example-co.test/openings?gh_jid=' + jid
+    row = dict(pk=pk, company=company, job_id=jid, jd_url=tracked,
+               ats='greenhouse', status='submitting', possible_submission=False)
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: row)
+    monkeypatch.setattr(core_config, 'get_settings',
+                        lambda: SimpleNamespace(config_dir='/synthetic'))
+    monkeypatch.setattr(watchlist, 'load_watchlist', lambda *_args: [
+        CompanyConfig(name=company, ats='greenhouse', board=company,
+                      careers_url='https://careers.example-co.test/openings')
+    ])
+    allowed = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+    refused = 'https://job-boards.greenhouse.io/other-co/jobs/123456'
+    assert forms._job_preparation_route(allowed, tracked, pk=pk, company=company)
+    assert not forms._job_preparation_route(refused, tracked, pk=pk, company=company)
+    # Merely declaring the same shared HTTPS host remains insufficient.
+    assert forms._preparation_origin(refused, tracked)
+    assert not forms._preparation_destination_allowed(
+        refused, tracked, pk=pk, company=company)

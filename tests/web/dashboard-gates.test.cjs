@@ -508,3 +508,30 @@ test('structural Requeue fails closed for form/call witnesses, holds, uncertaint
   assert.equal(h.fn('rowActionAllowed')(field.pk, 'answer'), true);
   assert.equal(h.fn('resumeAnswer')(field.pk, ' synthetic answer '), 'synthetic answer');
 });
+
+
+test('drawer delegates only eligible structural Requeue through the existing action', () => {
+  const h = harness();
+  const structural = row('drawer-structural', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: false,
+  });
+  const withCall = row('drawer-call', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: true,
+  });
+  h.state.apps = [structural, withCall];
+  h.fn('wire')();
+  const click = h.node('#drawer').listeners.click.at(-1);
+  assert.ok(click);
+  vm.runInContext('paneAction = (act, pk) => { (globalThis.drawerDelegations ||= []).push({act, pk}); };',
+    h.context);
+  const requestsBefore = h.requests.length;
+  const invoke = (pk) => click({target: {closest: (selector) => selector === '[data-act]'
+    ? {dataset: {act: 'queue-apply', pk}} : null}});
+  invoke(structural.pk);
+  assert.equal(h.context.drawerDelegations.length, 1);
+  assert.equal(h.context.drawerDelegations[0].act, 'queue-apply');
+  assert.equal(h.context.drawerDelegations[0].pk, structural.pk);
+  invoke(withCall.pk);
+  assert.equal(h.context.drawerDelegations.length, 1, 'stored call IDs deny stale drawer clicks');
+  assert.equal(h.requests.length, requestsBefore, 'no network or queue mutations in the VM');
+});

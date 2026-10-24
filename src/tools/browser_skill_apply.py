@@ -279,16 +279,18 @@ def navigation_allowed(href: str, *origins: str,
         return True
     return False
 
-def handoff(message: str, step: dict) -> dict:
-    """Only safe action context, never browser tokens or URL fragments."""
+def handoff(message: str, step: dict, *, captcha_artifact: bool = False) -> dict:
+    """Retain ordinary action context; never echo page values for artifact gates."""
     parsed = urlsplit(step.get('url', ''))
-    query = [(k, v) for k, v in parse_qsl(parsed.query)
-             if k.lower() in {'job', 'job_id', 'req', 'requisition', 'id'}
-             and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', v)]
+    query = [] if captcha_artifact else [
+        (k, v) for k, v in parse_qsl(parsed.query)
+        if k.lower() in {'job', 'job_id', 'req', 'requisition', 'id'}
+        and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', v)]
     path = parsed.path if not re.search(r'/[^/]{120,}', parsed.path) else '/'
     url = urlunsplit((parsed.scheme, parsed.netloc.rsplit('@', 1)[-1], path,
                      urlencode(query), ''))
-    button = re.sub(r'\s+', ' ', str(step.get('last_button') or ''))[:80]
+    button = ('' if captcha_artifact else
+              re.sub(r'\s+', ' ', str(step.get('last_button') or ''))[:80])
     if not re.fullmatch(r'[\w .-]{1,80}', button):
         button = '(unavailable)'
     context = {'last_button': button, 'url': url}
@@ -4875,10 +4877,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             if submitted:
                 context = handoff(
                     'A submission-capable step was executed before the form stopped. '
-                    'Check the employer portal before retrying.', step)
+                    'Check the employer portal before retrying.', step,
+                    captcha_artifact=isinstance(exc, CaptchaArtifactGate))
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+            # Preserve other Gate context. Artifact owner detail must never gain
+            # prior-button text or URL query values through handoff/storage.
             context = (_control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
-                       else handoff(str(exc), step))
+                       else handoff(str(exc), step,
+                                    captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
             hard = (isinstance(exc, CaptchaGate)
                     or exc.reason in {'defect_tenant', 'defect_provenance',
                                       'posting_guard_review_required'})

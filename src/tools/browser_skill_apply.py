@@ -4001,12 +4001,18 @@ def _committing_get_route(href: str) -> bool:
     classifier, not a tenant certificate or page-text assertion.
     """
     try:
-        parts = bsk._discovery_parts(urlsplit(href))
-        if parts is None:
+        # Discovery URL parsing is not a classifier for reversible form GETs.
+        if (not isinstance(href, str) or len(href) > 4096
+                or any(ord(ch) <= 32 or ord(ch) >= 127 or ch == '\\'
+                       for ch in href)):
             return True
-        path, fragment, query = parts
-        candidates = (path.split('/') + fragment.split('/')
-                      + [term for pair in query for term in pair])
+        parts = urlsplit(href)
+        if (parts.scheme != 'https' or not parts.hostname
+                or parts.netloc != parts.hostname or '%' in parts.path
+                or '%' in parts.fragment or '%' in parts.query):
+            return True
+        candidates = (parts.path.split('/') + parts.fragment.split('/')
+                      + [term for pair in parse_qsl(parts.query) for term in pair])
         effect = re.compile(
             r'requestsubmit|submit(?:application)?|sendapplication|'
             r'completeapplication|confirmapplication|approveapplication|'
@@ -4087,7 +4093,19 @@ def _tracked_preparation_job(pk: str, company: str, url: str, *,
                 url, url, predicate=(
                     'literal_canonical_ats_host_board_uuid_route' if not match
                     else 'canonical_ats_job_id_equals_tracked_id'))
-    if not _preparation_origin(url, url):
+    # The persisted tracked starting route is not a candidate redirect. Check
+    # literal URL safety here; every effect still checks its destination.
+    try:
+        parts = urlsplit(url)
+        safe_origin = (parts.scheme == 'https' and bool(parts.hostname)
+                       and parts.netloc == parts.hostname
+                       and not any(ord(ch) <= 32 or ord(ch) >= 127
+                                   or ch == '\\' for ch in url)
+                       and not any(seg in {'.', '..'}
+                                   for seg in parts.path.split('/')))
+    except (TypeError, ValueError):
+        safe_origin = False
+    if not safe_origin:
         raise _navigation_gate(
             'The tracked posting is not a safe HTTPS preparation origin.',
             url, url, predicate='safe_https_preparation_origin')

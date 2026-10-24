@@ -4995,3 +4995,21 @@ async def test_named_non_retry_observers_remain_single_read(monkeypatch, site):
     assert [call[0] for call in browser.calls] == ['evaluate']
     assert reads == 1
     assert not delays
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
+async def test_bootstrap_initially_stable_witness_never_rereads(monkeypatch, site):
+    """A stable first bootstrap observation retains the one-evaluate contract."""
+    page = inventory(field(), submit())
+    browser = Browser(page)
+    delays = []
+    async def no_wait(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+    observed, controls = await forms._observe_controls(browser, page, site=site)
+    assert observed == page
+    assert set(controls) == {'#email', '#submit'}
+    assert [call[0] for call in browser.calls] == ['evaluate']
+    assert browser.pages == 1
+    assert not delays

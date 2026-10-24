@@ -2805,8 +2805,10 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         identity = _page_identity(current)
         same_read = identity == _page_identity(page)
         if site in {'bootstrap-formless', 'bootstrap-material'}:
-            # Bootstrap needs two identical full PAGE+witness reads, not a transient match.
-            if same_read and _identity_try > 1 and _previous_identity == identity:
+            # An initially consistent witness needs no retry. Once a mismatch
+            # starts recovery, require two consecutive identical complete reads.
+            if same_read and (_identity_try == 1 or
+                              (_identity_try > 1 and _previous_identity == identity)):
                 return current, lookup
             if _identity_try < 4:
                 await asyncio.sleep(0.25)

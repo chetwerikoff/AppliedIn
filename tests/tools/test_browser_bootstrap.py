@@ -4015,3 +4015,31 @@ async def test_navigation_owner_detail_is_not_ordinary_events_or_worker_info(
     for secret in ('USER_SECRET', 'PASSWORD_SECRET',
                    'QUERY_SECRET', 'FRAGMENT_SECRET'):
         assert secret not in row['gate_pending']['question']
+
+
+@pytest.mark.parametrize('suffix', ['', '%2Dencoded'])
+def test_foreign_host_predicate_precedes_path_encoding(suffix):
+    destination = 'https://foreign.example.test/other' + suffix
+    gate = forms._navigation_gate(
+        'Navigation requires same-job provenance.',
+        SECURE_URL, destination)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in str(gate)
+
+
+@pytest.mark.parametrize('ats,route_suffix', [
+    ('ashby', 'application'), ('lever', 'apply'),
+])
+def test_typed_entry_foreign_host_uses_rejecting_origin_predicate(ats, route_suffix):
+    job = '12345678-1234-4234-8234-123456789abc'
+    tracked = f'https://{forms._APPLICATION_ENTRY[ats][0]}/example-co/{job}'
+    proof = forms.ApplicationEntryProvenance(
+        'example-co#' + job, 'example-co', ats, job,
+        tracked, 'example-co', tracked + '/' + route_suffix)
+    gate = forms._navigation_gate(
+        'Navigation requires same-job provenance.', tracked,
+        'https://foreign.example.test/other%2Djob?job=QUERY_SENTINEL',
+        provenance=proof)
+    detail = str(gate)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'QUERY_SENTINEL' not in detail
+    assert 'foreign.example.test/(path unavailable)' in detail

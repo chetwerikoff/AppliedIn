@@ -828,7 +828,7 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     if (duplicates) issues.push('duplicate-name');
     if (!providerFrame) issues.push('provider-unproven');
     if (wrongOwner) issues.push('owner-conflict');
-    if (!frameProvider && badgeFormConflict)
+    if (badgeFormConflict)
       issues.push('badge-form-conflict');
     if (issues.length) responseError=true;
     return {selector:selector(e),name,form:owner ? selector(owner) : '',

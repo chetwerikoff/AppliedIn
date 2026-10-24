@@ -2008,7 +2008,7 @@ def test_unpinned_greenhouse_preparation_uses_configured_board_and_row(
     approved = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
     wrong_board = 'https://job-boards.greenhouse.io/other-co/jobs/123456'
     wrong_job = 'https://job-boards.greenhouse.io/example-co/jobs/999999'
-    assert forms._preparation_origin(wrong_board, tracked)  # host classification only
+    assert not forms._preparation_origin(wrong_board, tracked)  # wrong tenant
     assert forms._job_preparation_route(approved, tracked, pk=pk, company=company)
     assert forms._job_preparation_route(approved + '/application', tracked,
                                         pk=pk, company=company)
@@ -2094,6 +2094,6 @@ def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
     assert forms._job_preparation_route(allowed, tracked, pk=pk, company=company)
     assert not forms._job_preparation_route(refused, tracked, pk=pk, company=company)
     # Merely declaring the same shared HTTPS host remains insufficient.
-    assert forms._preparation_origin(refused, tracked)
+    assert not forms._preparation_origin(refused, tracked)
     assert not forms._preparation_destination_allowed(
         refused, tracked, pk=pk, company=company)

@@ -554,12 +554,19 @@ _VISIBLE_RECAPTCHA = r"""
 # Metadata only: neither consumer may inspect a response value to recognize it.
 _CAPTCHA_RESPONSE_NODES = r"""
   const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
-    /^(?:h-captcha-response|g-recaptcha-response(?:-[0-9]{1,6})?)$/.test(e.getAttribute('name') || ''));
+    ['h-captcha-response','g-recaptcha-response'].includes(e.getAttribute('name')));
 """
 
 # Inserted before either reader's graph: filtering the final list is too late,
 # because closedGraph and linked receivers read hidden values eagerly.
-_ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
+_ENTRY_RESPONSE_NODES = r"""
+  // Entry-only reserved-prefix quarantine; malformed variants fail closed.
+  const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
+    e.getAttribute('name')==='h-captcha-response' ||
+    /^g-recaptcha-response(?:-|$)/.test(e.getAttribute('name') || ''));
+"""
+
+_ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button'))
     .filter(e => e.id === 'hcaptchaSubmitBtn');
   const excluded = new Set([...responseNodes, ...reservedButtons]);
@@ -685,6 +692,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const anchor=enterpriseAnchors.length===1 && enterpriseAnchors[0]!==e ?
       enterpriseAnchors[0] : null;
     const aContainer=anchor ? recaptchaContainer(anchor) : null;
+    const anchorBadge=anchor?.closest('div.grecaptcha-badge');
     const ownContainer=recaptchaContainer(e);
     const anchorSibling=anchor && parent && anchor.parentElement ?
       (parent===anchor.parentElement ? 'yes' : 'no') : 'unknown';
@@ -767,8 +775,8 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     if (status==='unknown' && raw===null && !e.hasAttribute('srcdoc') &&
         style.display==='none' && documentReadability==='readable' &&
         formControls==='no' && enterpriseAnchors.length===1 &&
-        enterpriseBadgeAnchor(aContainer) && !!parent &&
-        parent.contains(aContainer)) status='R';
+        enterpriseBadgeAnchor(anchorBadge) && !!parent &&
+        parent.contains(anchorBadge)) status='R';
     return {selector:selector(e),origin:diagnosticOrigin || origin,
       path:diagnosticPath || path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       srcdoc:e.hasAttribute('srcdoc') ? 'present' : 'absent',
@@ -807,14 +815,18 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       reservedName && reservedId && !ancestor && !owner &&
       !e.hasAttribute('form') && enterpriseBadgeAnchor(ownBadge);
     const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
-    // The badge-local route is an independent proof, but conflicting or
-    // multiply named reserved receivers always remain a gate.
-    const providerFrame=badgeProvider || entryFrames.some(f=>f.status===signature);
+    const supported=signature==='H' ? name==='h-captcha-response' : reservedName;
+    const frameProvider=entryFrames.some(f=>f.status===signature);
+    const providerFrame=frameProvider || badgeProvider;
     const wrongOwner=!!owner && owner!==root;
     const issues=[];
+    if (!supported) issues.push('invalid-reserved-name');
     if (duplicates) issues.push('duplicate-name');
     if (!providerFrame) issues.push('provider-unproven');
     if (wrongOwner) issues.push('owner-conflict');
+    if (!frameProvider && signature==='R' && ownBadge &&
+        (ancestor || owner || e.hasAttribute('form')))
+      issues.push('badge-form-conflict');
     if (issues.length) responseError=true;
     return {selector:selector(e),name,form:owner ? selector(owner) : '',
       diagnostic:{

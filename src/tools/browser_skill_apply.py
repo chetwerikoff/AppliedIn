@@ -622,7 +622,8 @@ def _assent_scope(target: dict) -> str:
 
 
 def _missing_answer_reason(target: dict) -> str:
-    if (re.search(r'\b(salary|compensation|pay expectation)\b', label(target), re.I)
+    if (_material_form_choice(target)
+            or re.search(r'\b(salary|compensation|pay expectation)\b', label(target), re.I)
             or _assent_scope(target) == 'owner'):
         return 'owner_question'
     return 'agent_review_unavailable'
@@ -630,7 +631,7 @@ def _missing_answer_reason(target: dict) -> str:
 
 def exact_approval(pk: str, key: str, value: str, *,
                    target: dict | None = None, url: str = '', provenance=None,
-                   fixture_context=None) -> None:
+                   fixture_context=None, witnessed_options=None) -> None:
     """Approval belongs to one observed control, not a reusable bank label."""
     ctx = _synthetic(fixture_context, pk=pk)
     row = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
@@ -671,7 +672,12 @@ def exact_approval(pk: str, key: str, value: str, *,
                          for m in grant['radio_members']] != target.get('radio_members')
                      or not isinstance(target.get('radio_members'), list)))
             or (target.get('tag') == 'select'
-                and grant.get('options') != target.get('options'))):
+                and grant.get('options') != target.get('options'))
+            or (target.get('type') == 'combobox' and _material_form_choice(target)
+                and grant.get('options') != (
+                    witnessed_options if witnessed_options is not None else [
+                        {key: option[key] for key in ('selector', 'label', 'value')}
+                        for option in _combobox_options(target)]))):
         # Old label-only grants have no control identity and always gate.
         raise Gate('An exact human-approved answer is needed for this control.')
     if (isinstance(provenance, VendorRedirectProvenance)
@@ -721,8 +727,34 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 else:
                     raise Gate('The approved native choice control changed.')
                 _guard_native_choice_answer(target, answer)
+            # A committed ARIA picker may close. Preserve its witnessed option
+            # identity while rechecking the current caption and hidden receiver.
+            witnessed_options = None
+            if receipt.get('action') == 'combobox':
+                row = (_row(pk, fixture_context=ctx) if ctx else _row(pk))
+                grant = (row.get('human_approved_answers') or {}).get(receipt['fact'])
+                if isinstance(grant, dict) and isinstance(grant.get('options'), list):
+                    witnessed_options = receipt.get('witnessed_options')
+                    selected_option = receipt.get('selected_option')
+                    if (not isinstance(witnessed_options, list)
+                            or not isinstance(selected_option, dict)
+                            or selected_option not in witnessed_options
+                            or selected_option.get('label') != receipt.get('committed_caption')
+                            or selected_option.get('value') != receipt.get('committed_value')):
+                        raise Gate('The material option receipt is missing or changed.')
+                    combo = target.get('combobox') or {}
+                    if combo.get('linked') is True:
+                        current_options = [
+                            {key: option[key] for key in ('selector', 'label', 'value')}
+                            for option in _combobox_options(target)]
+                        if current_options != witnessed_options:
+                            raise Gate('The material options changed before Submit.')
+                    elif (combo.get('linked') is not False
+                          or combo.get('options') not in (None, [])):
+                        raise Gate('The committed material listbox identity changed.')
             exact_approval(pk, receipt['fact'], receipt['approved_value'],
                            target=_bound_target(page, target), url=page['url'],
+                           witnessed_options=witnessed_options,
                            provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
 
@@ -1420,7 +1452,10 @@ _ACCOUNT_PURPOSE = re.compile(
     r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
     r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
 _MATERIAL_ASSENT = re.compile(
-    r'\b(?:agree(?:ment)?|consent|acknowledg|certif|authori[sz]|'
+    r'\b(?:agree(?:d|s|ing|ments?)?|consent(?:s|ed|ing)?|'
+    r'acknowledg(?:e(?:d|s|ments?)?|ing|ments?)|'
+    r'certif(?:y|ies|ied|ying|ications?|icates?|icated|icating)|'
+    r'authori[sz](?:e(?:s|d)?|ing|ations?)|'
     r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
     r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
 
@@ -1444,6 +1479,51 @@ def _material_select_options(target: dict) -> bool:
         isinstance(o, dict) and any(
             isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
             for k in ('value', 'label')) for o in options))
+
+
+def _material_form_choice(target: dict) -> bool:
+    """Only select and combobox receivers may bind witnessed material assent."""
+    return (((target.get('tag') == 'select' and target.get('type') == 'select')
+             or target.get('type') == 'combobox')
+            and (_MATERIAL_ASSENT.search(label(target))
+                 or _material_select_options(target)))
+
+
+def _material_exact_value(pk: str, page: dict, target: dict, question: dict,
+                          *, provenance=None, fixture_context=None) -> str:
+    """Use only the current control-bound owner grant, never generic bank consent."""
+    if not pk or not _material_form_choice(target):
+        raise Gate('A bound material owner grant is required.')
+    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+    grants = row.get('human_approved_answers')
+    grant = grants.get(question['label']) if isinstance(grants, dict) else None
+    value = grant.get('value') if isinstance(grant, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise Gate('A current material owner answer is not available.')
+    value = value.strip()
+    exact_approval(pk, question['label'], value, target=_bound_target(page, target),
+                   url=page['url'], provenance=provenance,
+                   **({'fixture_context': fixture_context} if fixture_context else {}))
+    return value
+
+
+def _material_question(question: dict | None) -> bool:
+    """Classify observed material questions for log redaction and no banking."""
+    if not isinstance(question, dict):
+        return False
+    title, subtitle = question.get('question'), question.get('control_label')
+    if not isinstance(title, str) or not isinstance(subtitle, str):
+        return False
+    if _MATERIAL_ASSENT.search(title + ' ' + subtitle):
+        return True
+    opts = question.get('options', [])
+    target = {
+        'tag': question.get('tag'), 'type': question.get('type'),
+        'label': subtitle, 'question': title, 'options': opts,
+        'combobox': {'options': opts},
+    }
+    return bool(_material_form_choice(target))
+
 
 def _unrelated_search_form(controls: list[dict]) -> bool:
     """Ignore only a proven search-only form, not a second plausible application."""
@@ -2734,7 +2814,8 @@ def _unanswered(page: dict, target: dict) -> bool:
 def _choice_prompt(target: dict, question: dict) -> str:
     """Show original question, radio captions and native select options verbatim."""
     subject = label(target)
-    prefix = ('Legal acknowledgement: ' if _MATERIAL_ASSENT.search(subject)
+    prefix = ('Legal acknowledgement: ' if (_MATERIAL_ASSENT.search(subject)
+              or _material_form_choice(target))
               else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
               else '')
     observed = question['question'] or question['control_label']
@@ -2788,8 +2869,14 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     if target.get('type') == 'checkbox':
         scope = _assent_scope(target)
         if scope == 'owner':
-            raise Gate('The privacy scope or new legal attestation needs an owner decision.',
-                       reason='owner_question')
+            # Standing standard-privacy delegation never approves an owner-only
+            # attestation. Only an existing exact question-bound grant can do so.
+            row = (_row(pk, fixture_context=fixture_context)
+                   if fixture_context else _row(pk))
+            grants = row.get('human_approved_answers')
+            if not isinstance(grants, dict) or key not in grants:
+                raise Gate('The privacy scope or new legal attestation needs an owner decision.',
+                           reason='owner_question')
         if scope == 'standard_privacy':
             exact_approval(pk, key, 'yes', target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
@@ -2961,7 +3048,11 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
     if not choice and (_MATERIAL_ASSENT.search(subject) or _material_select_options(target)):
-        raise Gate('Legal or material assent requires direct human review.')
+        if not _material_form_choice(target):
+            raise Gate('Legal or material assent requires direct human review.')
+        # Unlinked or partly observed ARIA options cannot become an approval.
+        if target.get('type') == 'combobox':
+            _combobox_options(target)
     key = _key(page, target)
     siblings = _form_subject(page, target)
     if bootstrap and (not _unanswered(page, target)
@@ -2999,6 +3090,12 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question['verified_redirect_url'] = provenance.target_url
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
+    if target.get('type') == 'combobox' and _material_form_choice(target):
+        # Ordinary dynamic picker grants bind stable receivers; assent must
+        # additionally bind the complete currently witnessed options.
+        question['options'] = [
+            {key: option[key] for key in ('selector', 'label', 'value')}
+            for option in _combobox_options(target)]
     if target.get('type') == 'checkbox':
         question['visible_text'] = witness[target['selector']]['visible_text']
     if target.get('type') == 'radio':
@@ -3020,7 +3117,8 @@ _MATERIAL_DIAGNOSTIC_TYPES = frozenset({
 
 
 def _bootstrap_wall(page: dict, witness: dict, *origins: str,
-                    provenance: Provenance | None = None) -> None:
+                    provenance: Provenance | None = None, pk: str = '',
+                    fixture_context=None) -> None:
     for c in page['controls']:
         subject = label(c)
         if (c.get('type') == 'password'
@@ -3046,12 +3144,59 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                 except Gate:
                     raise Gate('Direct owner review is required for this choice.',
                                reason='owner_question') from None
+                question['pk'] = pk
+                if pk:
+                    try:
+                        granted = _approved_native_choice(
+                            page, c, pk, provenance=provenance,
+                            fixture_context=fixture_context)
+                    except Gate:
+                        granted = None
+                    if granted is not None:
+                        continue
                 raise Gate(_choice_prompt(c, question),
                            form_question=question, reason='owner_question')
             continue
         if c.get('in_form'):
             assent_match = _MATERIAL_ASSENT.search(subject)
             if assent_match or _material_select_options(c):
+                # An empty required native select or exclusively linked ARIA
+                # picker can present an answerable owner question. A grant
+                # already bound to this exact observed control may resume.
+                if _material_form_choice(c):
+                    # An optional, unselected assent is still an owner decision;
+                    # a preselected value must instead prove an existing grant.
+                    unanswered = (not c.get('has_value') if c.get('tag') == 'select'
+                                  else not (c.get('combobox') or {}).get('selected_text'))
+                    try:
+                        question = _disclosure_question(
+                            page, c, witness, *origins,
+                            bootstrap=unanswered and bool(c.get('required')),
+                            provenance=provenance)
+                    except Gate:
+                        pass  # Unwitnessed assent remains inspection-only.
+                    else:
+                        question['pk'] = pk
+                        grants = ((_row(pk, fixture_context=fixture_context)
+                                   if fixture_context else _row(pk))
+                                  .get('human_approved_answers') or {}) if pk else {}
+                        grant = grants.get(question['label']) if isinstance(grants, dict) else None
+                        if isinstance(grant, dict) and isinstance(grant.get('value'), str):
+                            try:
+                                exact_approval(
+                                    pk, question['label'], grant['value'],
+                                    target=_bound_target(page, c), url=page['url'],
+                                    provenance=provenance,
+                                    **({'fixture_context': fixture_context}
+                                       if fixture_context else {}))
+                            except Gate:
+                                pass
+                            else:
+                                continue
+                        # Preselection is never a fresh owner decision.
+                        raise MaterialAssentGate(
+                            _choice_prompt(c, question),
+                            form_question=question, reason='owner_question')
                 # PAGE.label can come from non-visible names or option captions.
                 # The independent witness identifies real rendered labeling text.
                 proof = witness.get(c.get('selector'))
@@ -3119,6 +3264,8 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
         expected['radio_members'] = question.get('radio_members')
     elif item.get('tag') == 'select':
         expected['options'] = item.get('options')
+    elif item.get('type') == 'combobox' and _material_form_choice(item):
+        expected['options'] = question.get('options')
     if any(grant[key] != seen for key, seen in expected.items() if key in grant):
         return 'stale'
     if any(key not in grant for key in expected):
@@ -3192,6 +3339,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                  and _unanswered(page, c)]
     if not candidate and not (settlement_route and history) and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
+            or (c.get('in_form') and _material_form_choice(c))
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
@@ -3200,7 +3348,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
-    _bootstrap_wall(page, witness, *origins, provenance=provenance)
+    _bootstrap_wall(page, witness, *origins, provenance=provenance,
+                    pk=pk, fixture_context=fixture_context)
     # Earlier reversible writes may be temporarily reset by later pickers.
     # The complete current form and all receipts are checked only at Submit.
     seen = set()
@@ -3276,6 +3425,20 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     and previous['radio_members'] != question['radio_members']):
                 record('blocked')
                 raise Gate('The previously approved radio group has changed; inspect it again.')
+            if _material_form_choice(item):
+                # Material assent is not a reusable bank fact: the only
+                # possible answer comes from the fresh same-job owner grant.
+                try:
+                    _material_exact_value(
+                        pk, page, item, question, provenance=provenance,
+                        fixture_context=fixture_context)
+                except Gate:
+                    record('needs-human')
+                    raise MaterialAssentGate(
+                        _choice_prompt(item, question), form_question=question,
+                        reason='owner_question') from None
+                record('left-to-model')
+                continue
             if kind in {'radio', 'checkbox'}:
                 if _approved_native_choice(
                         page, item, pk, provenance=provenance,
@@ -3332,8 +3495,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         grants = (_row(pk, fixture_context=fixture_context) if fixture_context
                   else _row(pk)).get('human_approved_answers')
         previous = grants.get(key) if isinstance(grants, dict) else None
-        grant_value = (previous.get('value', '') if kind in {'radio', 'checkbox'}
-                       and not value and isinstance(previous, dict) else value)
+        grant_value = (previous.get('value', '')
+                       if isinstance(previous, dict)
+                       and (_material_form_choice(item)
+                            or (kind in {'radio', 'checkbox'} and not value))
+                       else value)
         authority = _bootstrap_grant_state(previous, item, question, grant_value)
         prompt = (_choice_prompt(item, question)
                   if kind in {'radio', 'checkbox', 'combobox'} or kind == 'select'
@@ -3342,6 +3508,20 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             record('blocked')
             raise Gate('The earlier control approval has changed; inspect manually.',
                        reason='defect_witness')
+
+        if _material_form_choice(item):
+            # Never auto-select a legal/privacy answer on settlement routes.
+            # Only a current exact owner grant may be offered to the model.
+            try:
+                _material_exact_value(
+                    pk, page, item, question, provenance=provenance,
+                    fixture_context=fixture_context)
+            except Gate:
+                record('needs-human')
+                raise MaterialAssentGate(
+                    prompt, form_question=question, reason='owner_question') from None
+            record('left-to-model')
+            continue
 
         if kind == 'checkbox' and _assent_scope(item) == 'standard_privacy':
             _approved_native_choice(page, item, pk, provenance=provenance,
@@ -3535,12 +3715,24 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     question['pk'] = pk
     key = action.get('fact', '')
-    answer = str(facts.get(key) or '').strip() if key in facts else ''
-    if not answer or key != _fact_key(facts, question['label']):
-        raise Gate('Choose an exact approved answer for this combobox.',
-                   form_question=question,
-                   reason=_missing_answer_reason(target) if _unanswered(observed, target)
-                   and not answer else 'unknown_field')
+    if _material_form_choice(target):
+        if key != question['label']:
+            raise Gate('The material choice requires its observed question key.',
+                       form_question=question, reason='owner_question')
+        try:
+            answer = _material_exact_value(
+                pk, observed, target, question, provenance=provenance,
+                fixture_context=ctx)
+        except Gate:
+            raise Gate('A current owner-approved material choice is required.',
+                       form_question=question, reason='owner_question') from None
+    else:
+        answer = str(facts.get(key) or '').strip() if key in facts else ''
+        if not answer or key != _fact_key(facts, question['label']):
+            raise Gate('Choose an exact approved answer for this combobox.',
+                       form_question=question,
+                       reason=_missing_answer_reason(target) if _unanswered(observed, target)
+                       and not answer else 'unknown_field')
 
     def approve(current, current_page):
         exact_approval(pk, question['label'], answer, target=current,
@@ -3638,6 +3830,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     if len(candidates) != 1:
         return unresolved()
     selected = candidates[0]
+    witnessed_options = ([
+        {key: option[key] for key in ('selector', 'label', 'value')}
+        for option in _combobox_options(current)]
+        if _material_form_choice(current) else None)
     if (selected.get('submit') or selected.get('navigates')
             or selected.get('safe') is not True):
         raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
@@ -3653,7 +3849,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             'committed_caption': selected['label'], 'committed_value': committed,
             'hidden_selector': before.get('hidden_selector', ''),
             'hidden_value_before': before.get('hidden_value', ''),
-            'hidden_value': committed if before.get('hidden_selector') else ''}
+            'hidden_value': committed if before.get('hidden_selector') else '',
+            **({'witnessed_options': witnessed_options,
+                'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
+               if witnessed_options is not None else {})}
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
@@ -3743,17 +3942,29 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if chosen['selector'] != target['selector']:
                 raise Gate('The selected radio does not match the exact owner answer.')
         else:
-            if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
-                value = str(facts[key]).strip()
+            if verb == 'select' and _material_form_choice(target):
+                if key != form_question['label']:
+                    raise Gate('The material select requires its observed question key.',
+                               form_question=form_question, reason='owner_question')
+                try:
+                    value = _material_exact_value(
+                        pk, page, target, form_question, provenance=provenance,
+                        fixture_context=ctx)
+                except Gate:
+                    raise Gate(gate_prompt, form_question=form_question,
+                               reason='owner_question') from None
             else:
-                raise Gate(gate_prompt, form_question=form_question,
-                           reason=_missing_answer_reason(target) if _unanswered(page, target)
-                           and not key else 'unknown_field')
-            if key != _fact_key(facts, form_question['label']):
-                detail = 'An exact human-approved fact key for this observed question is required.'
-                if verb == 'select':
-                    detail += '\n' + gate_prompt
-                raise Gate(detail, form_question=form_question)
+                if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
+                    value = str(facts[key]).strip()
+                else:
+                    raise Gate(gate_prompt, form_question=form_question,
+                               reason=_missing_answer_reason(target) if _unanswered(page, target)
+                               and not key else 'unknown_field')
+                if key != _fact_key(facts, form_question['label']):
+                    detail = 'An exact human-approved fact key for this observed question is required.'
+                    if verb == 'select':
+                        detail += '\n' + gate_prompt
+                    raise Gate(detail, form_question=form_question)
         try:
             exact_approval(pk, form_question['label'], value, target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
@@ -3819,8 +4030,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if (fresh_choice is None or fresh_choice[0] != value
                     or fresh_choice[1]['selector'] != current['selector']):
                 raise Gate('The exact native choice grant changed before a browser write.')
-        exact_approval(pk, form_question['label'],
-                       value if verb == 'choose' else str(facts[key]).strip(),
+        exact_approval(pk, form_question['label'], value,
                        target=_bound_target(latest, current), url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
@@ -3828,7 +4038,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             guarded_value(current, write_value)
             await _effect_call(session, 'fill', current['selector'], '--value', write_value)
         elif verb == 'select':
-            write_value = choose_value(current, str(facts[key]).strip(),
+            write_value = choose_value(current, value,
                                        str(action.get('value', '')))
             await _effect_call(session, 'select', current['selector'], '--value', write_value)
         else:
@@ -4150,8 +4360,15 @@ class ApplicationIPCController:
     def _approved(self, page, target, value):
         key = _key(page, target)
         fact_key = _fact_key(self.facts, key)
-        if (fact_key is None or not value
-                or str(self.facts[fact_key]).strip() != value):
+        if _material_form_choice(target):
+            # Consent belongs only to this job's exact observed owner grant.
+            approved = _material_exact_value(
+                self.pk, page, target, {'label': key},
+                fixture_context=self.fixture_context)
+            if not _same(approved, value):
+                raise Gate('The material choice differs from its owner grant.')
+        elif (fact_key is None or not value
+              or str(self.facts[fact_key]).strip() != value):
             raise Gate('The written field lacks its exact current approved answer.')
         exact_approval(self.pk, key, value, target=_bound_target(page, target),
                        url=page['url'], **self._ctx())
@@ -4192,8 +4409,14 @@ class ApplicationIPCController:
             for option in (owner.get('combobox') or {}).get('options') or []:
                 if option.get('selector') != selector:
                     continue
-                answer_key = _fact_key(self.facts, _key(page, owner))
-                answer = str(self.facts.get(answer_key) or '').strip()
+                key = _key(page, owner)
+                if _material_form_choice(owner):
+                    answer = _material_exact_value(
+                        self.pk, page, owner, {'label': key},
+                        fixture_context=self.fixture_context)
+                else:
+                    answer_key = _fact_key(self.facts, key)
+                    answer = str(self.facts.get(answer_key) or '').strip()
                 if (not answer or not _same(answer, option.get('label', ''))
                         or option.get('submit') or option.get('navigates')
                         or option.get('safe') is not True
@@ -4337,10 +4560,16 @@ class ApplicationIPCController:
             if target.get('href'):
                 raise Gate('A navigating combobox cannot be opened.')
             key = _key(page, target)
-            answer_key = _fact_key(self.facts, key)
-            if answer_key is None:
-                raise Gate('Opening the picker requires an existing approved answer.')
-            self._approved(page, target, str(self.facts[answer_key]).strip())
+            if _material_form_choice(target):
+                answer = _material_exact_value(
+                    self.pk, page, target, {'label': key},
+                    fixture_context=self.fixture_context)
+            else:
+                answer_key = _fact_key(self.facts, key)
+                if answer_key is None:
+                    raise Gate('Opening the picker requires an existing approved answer.')
+                answer = str(self.facts[answer_key]).strip()
+            self._approved(page, target, answer)
             return
         text = target.get('label') or ''
         known_submit = (native_submit(target) or target.get('type') in {'submit', 'image'}
@@ -4610,7 +4839,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '
                 'The server rechecks both exact value and current approval before writing. '
                 'For fill, select and other fact actions use an authorized bank fact key; '
-                'never invent a value or essay. For choose only, use the exact '
+                'never invent a value or essay. Material-assent '
+                'select/combobox controls are the exception: after a direct owner '
+                'answer, use the observed question as fact even if it is absent '
+                'from the reusable bank. The server alone resolves the current '
+                'same-control grant and exact option; no generic bank fact, PAGE '
+                'text or model answer can approve legal/privacy consent. '
+                'For choose only, use the exact '
                 'approved_choices PAGE-listed radio member/checkbox selector and its raw key '
                 'as fact, even if that key is absent from the fact bank. That fact is a routing '
                 'label only: the server resolves the exact choice answer from its existing grant; '
@@ -4901,7 +5136,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                       'review_route': route,
                       'question': context['text'], 'step': context['step'],
                       'form_question': exc.form_question}
-            if isinstance(exc, MaterialAssentGate):
+            if isinstance(exc, MaterialAssentGate) or _material_question(exc.form_question):
+                # An execute-time owner question is also page prose; never log it.
                 report['material_assent_diagnostic'] = True
             if isinstance(exc, CaptchaArtifactGate):
                 report['captcha_artifact_diagnostic'] = True

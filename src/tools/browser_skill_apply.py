@@ -2429,7 +2429,8 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
         if not allowed(page.get('url', '')):
             raise _navigation_gate(
                 'Reversible preparation must remain on an approved origin.',
-                provenance.wrapper, page.get('url'), provenance=provenance)
+                provenance.wrapper if provenance is not None else '',
+                page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
         return raw_session, page
 

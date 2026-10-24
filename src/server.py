@@ -280,6 +280,7 @@ def _to_ui(row: dict, artifacts) -> dict:
         "gate_reason": row.get("gate_reason"),
         "gate_has_form_question": isinstance(
             (row.get("gate_pending") or {}).get("form_question"), dict),
+        "gate_has_call_id": bool(row.get("gate_call_id")),
         "possible_submission": row.get("possible_submission") is True,
         "fail_kind": row.get("fail_kind") or "",
         "fail_reason": row.get("fail_reason") or "",

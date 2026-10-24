@@ -437,3 +437,181 @@ test('posting-safety warning survives read-only portal hold and remains escaped'
   assert.match(drawer,/&lt;svg/);
   assert.doesNotMatch(drawer,/data-act="apply-now"/);
 });
+
+
+test('non-resumable structural gates render the existing Requeue control without unlocking other actions', () => {
+  const h = harness();
+  const structural = row('structural-recovery', {
+    gate_reason: 'defect_structural', gate_has_form_question: false,
+    gate_has_call_id: false, gate_question: 'Synthetic structural gate',
+  });
+  h.state.apps = [structural];
+  assert.equal(h.fn('routeOf')(structural), 'waiting_for_fix');
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('canRequeueStructuralGate')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+  for (const act of ['answer', 'retry', 'reopen', 'retailor', 'apply-now',
+    'mark-applied', 'force-apply', 'skip', 'save-tracker']) {
+    assert.equal(h.fn('rowActionAllowed')(structural.pk, act), false, act);
+  }
+  for (const name of ['laneCard', 'closedRow', 'needsCard']) {
+    assert.match(h.fn(name)(structural), /data-act="queue-apply"/, name);
+  }
+  for (const name of ['viewPipeline', 'viewNeeds', 'viewStuck']) {
+    assert.match(h.fn(name)(), /data-act="queue-apply"/, name);
+  }
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  h.fn('openDrawer')(structural.pk);
+  const drawer = h.node('#drawer-body').innerHTML;
+  assert.match(drawer, /data-act="queue-apply"/);
+  assert.doesNotMatch(drawer, /data-act="answer"|data-act="mark-applied"|data-act="retailor"/);
+  assert.equal(h.requests.length, 0, 'rendering and authorization must not queue anything');
+});
+
+test('structural Requeue latches the first delegated click before another can POST', () => {
+  const h = harness();
+  const structural = row('structural-once', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: false,
+  });
+  h.state.apps = [structural];
+  h.context.sent = [];
+  // Mock the existing POST path: the regression must never fetch or queue a real job.
+  vm.runInContext('post = (path) => { globalThis.sent.push(path); return Promise.resolve({ok:true}); };'
+    + 'renderPane = () => {}; scheduleLive = () => {}; loadQueue = () => {}; toast = () => {};',
+    h.context);
+  h.fn('wire')();
+  const click = h.node('#pane').listeners.click.at(-1);
+  assert.ok(click);
+  const control = {dataset: {act: 'queue-apply', pk: structural.pk}};
+  const event = {target: {closest: (selector) => selector === '[data-act]' ? control : null},
+    stopPropagation() {}};
+  const requestsBefore = h.requests.length;
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+
+  click(event);
+  assert.deepEqual(Array.from(h.context.sent), ['/actions/queue-apply/structural-once']);
+  assert.equal(structural.status, 'submitting', 'first click must latch before POST completes');
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), false);
+  click(event);
+  assert.equal(h.context.sent.length, 1, 'rapid delegated retry must never POST again');
+  assert.equal(h.requests.length, requestsBefore, 'offline test must not fetch or queue a job');
+});
+
+test('unknown_field manual_triage structural Requeue renders and first delegated click latches', () => {
+  const h = harness();
+  const structural = row('synthetic-unknown-field', {
+    status: 'needs_human',
+    gate_pending: {review_route: 'agent_unavailable', form_question: null},
+    gate_reason: 'unknown_field', gate_question: '',
+    gate_call_id: null, confirmation_id: null,
+    fail_kind: '', possible_submission: false, submit_hold_state: 'clear',
+    gate_has_form_question: false, gate_has_call_id: false,
+  });
+  h.state.apps = [structural];
+  assert.equal(h.fn('routeOf')(structural), 'manual_triage');
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('canRequeueStructuralGate')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+  for (const act of ['answer', 'retry', 'reopen', 'retailor', 'apply-now',
+    'mark-applied', 'force-apply', 'skip', 'save-tracker']) {
+    assert.equal(h.fn('rowActionAllowed')(structural.pk, act), false, act);
+  }
+  for (const name of ['laneCard', 'closedRow', 'needsCard'])
+    assert.match(h.fn(name)(structural), /data-act="queue-apply"/, name);
+  for (const name of ['viewPipeline', 'viewNeeds', 'viewStuck'])
+    assert.match(h.fn(name)(), /data-act="queue-apply"/, name);
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  h.fn('openDrawer')(structural.pk);
+  assert.match(h.node('#drawer-body').innerHTML, /data-act="queue-apply"/);
+  assert.equal(h.requests.length, 0, 'only synthetic rendering and eligibility checks');
+
+  h.context.sent = [];
+  // Existing delegated POST is replaced with an in-memory recorder, never a real queue operation.
+  vm.runInContext('post = (path) => { globalThis.sent.push(path); return Promise.resolve({ok:true}); };'
+    + 'renderPane = () => {}; scheduleLive = () => {}; loadQueue = () => {}; toast = () => {};',
+    h.context);
+  h.fn('wire')();
+  const click = h.node('#pane').listeners.click.at(-1);
+  assert.ok(click);
+  const control = {dataset: {act: 'queue-apply', pk: structural.pk}};
+  const event = {target: {closest: (selector) => selector === '[data-act]' ? control : null},
+    stopPropagation() {}};
+  const requestsBefore = h.requests.length;
+  click(event);
+  assert.deepEqual(Array.from(h.context.sent), ['/actions/queue-apply/synthetic-unknown-field']);
+  assert.equal(structural.status, 'submitting', 'first click must latch before POST completes');
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), false);
+  click(event);
+  assert.equal(h.context.sent.length, 1, 'second delegated click must not POST');
+  assert.equal(h.requests.length, requestsBefore, 'test must not fetch or queue a job');
+});
+
+test('structural Requeue fails closed for form/call witnesses, holds, uncertainty and completed rows', () => {
+  const h = harness();
+  const structural = {gate_reason: 'defect_structural',
+    gate_has_form_question: false, gate_has_call_id: false};
+  const negatives = [
+    ['field-object', {gate_has_form_question: true}],
+    ['call-id', {gate_has_call_id: true}],
+    ['call-id-missing', {gate_has_call_id: undefined}],
+    ['call-id-untyped', {gate_has_call_id: 'false'}],
+    ['question-missing', {gate_has_form_question: undefined}],
+    ['hold-blocked', {submit_hold_state: 'blocked'}],
+    ['hold-unknown', {submit_hold_state: 'unknown'}],
+    ['hold-missing', {submit_hold_state: undefined}],
+    ['possible-submit', {possible_submission: true}],
+    ['uncertain-failure', {fail_kind: 'uncertain'}],
+    ['uncertain-status', {status: 'uncertain'}],
+    ['submit-uncertain', {gate_reason: 'submit_uncertain'}],
+    ['applied', {status: 'applied'}],
+    ['applied-manual', {status: 'applied_manual'}],
+    ['confirmed', {confirmation_id: 'synthetic-confirmation'}],
+    ['manual-triage-fail-kind', {gate_reason: 'unknown_field', fail_kind: 'failed'}],
+    ['manual-triage-possible-submit', {gate_reason: 'unknown_field', possible_submission: true}],
+  ].map(([pk, override]) => row(pk, {...structural, ...override}));
+  const field = row('answerable-field', {
+    gate_reason: 'owner_question', gate_has_form_question: true,
+    gate_has_call_id: true, gate_question: 'Synthetic field question?',
+  });
+  h.state.apps = [...negatives, field];
+  for (const r of negatives) {
+    assert.equal(h.fn('canRequeueStructuralGate')(r), false, r.pk);
+    assert.equal(h.fn('rowActionAllowed')(r.pk, 'queue-apply'), false, r.pk);
+    for (const name of ['laneCard', 'closedRow', 'needsCard'])
+      assert.doesNotMatch(h.fn(name)(r), /data-act="queue-apply"/, r.pk + '/' + name);
+    h.fn('paneAction')('queue-apply', r.pk);
+  }
+  assert.equal(h.requests.length, 0, 'stale negative clicks must not POST');
+  assert.equal(h.fn('routeOf')(field), 'owner_question');
+  assert.match(h.fn('needsCard')(field), /data-answer-for="answerable-field"/);
+  assert.equal(h.fn('rowActionAllowed')(field.pk, 'answer'), true);
+  assert.equal(h.fn('resumeAnswer')(field.pk, ' synthetic answer '), 'synthetic answer');
+});
+
+
+test('drawer delegates only eligible structural Requeue through the existing action', () => {
+  const h = harness();
+  const structural = row('drawer-structural', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: false,
+  });
+  const withCall = row('drawer-call', {
+    gate_reason: 'defect_structural', gate_has_form_question: false, gate_has_call_id: true,
+  });
+  h.state.apps = [structural, withCall];
+  h.fn('wire')();
+  const click = h.node('#drawer').listeners.click.at(-1);
+  assert.ok(click);
+  vm.runInContext('paneAction = (act, pk) => { (globalThis.drawerDelegations ||= []).push({act, pk}); };',
+    h.context);
+  const requestsBefore = h.requests.length;
+  const invoke = (pk) => click({target: {closest: (selector) => selector === '[data-act]'
+    ? {dataset: {act: 'queue-apply', pk}} : null}});
+  invoke(structural.pk);
+  assert.equal(h.context.drawerDelegations.length, 1);
+  assert.equal(h.context.drawerDelegations[0].act, 'queue-apply');
+  assert.equal(h.context.drawerDelegations[0].pk, structural.pk);
+  invoke(withCall.pk);
+  assert.equal(h.context.drawerDelegations.length, 1, 'stored call IDs deny stale drawer clicks');
+  assert.equal(h.requests.length, requestsBefore, 'no network or queue mutations in the VM');
+});

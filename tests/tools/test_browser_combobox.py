@@ -1177,3 +1177,112 @@ async def test_material_witness_rejects_post_escape_rebinding(monkeypatch, chang
     with pytest.raises(forms.MaterialAssentGate) as exc:
         await forms._bootstrap(Transport(), closed, PK, {}, URL)
     assert exc.value.form_question is None
+
+
+@pytest.mark.parametrize('linked,expected', [
+    (True, 'true'), (False, 'false'), (None, 'absent'),
+    ('PRIVATE_LINKED_SENTINEL', 'other'),
+])
+@pytest.mark.parametrize('options,expected_options', [
+    (None, 'none'), ([], 'empty'), ([{'label': 'PRIVATE_OPTION_SENTINEL'}], 'present'),
+])
+@pytest.mark.parametrize('link_id,listbox', [
+    ('', ''), ('opaque-link', ''), ('', '#opaque-listbox'),
+    ('opaque-link', '#opaque-listbox'),
+])
+def test_material_witness_diagnostic_normalizes_field_classes(
+        linked, expected, options, expected_options, link_id, listbox):
+    combo = {'linked': linked, 'options': options,
+             'link_id': link_id, 'listbox_selector': listbox}
+    detail = forms._material_witness_disclosure_detail(
+        {'combobox': combo}, attempted=False)
+    assert detail == (
+        f'witness=not-attempted,linked={expected},options={expected_options},'
+        f"link_id={'present' if link_id else 'absent'},"
+        f"listbox={'present' if listbox else 'absent'}")
+    for sentinel in ('PRIVATE_LINKED_SENTINEL', 'PRIVATE_OPTION_SENTINEL',
+                     'opaque-link', '#opaque-listbox'):
+        assert sentinel not in detail
+    assert 'witness_reason=' not in detail
+
+
+@pytest.mark.parametrize('failure', sorted(forms._MATERIAL_WITNESS_GATE_REASONS))
+def test_material_witness_diagnostic_accepts_only_witness_gate_literals(failure):
+    target = {'combobox': {'linked': False, 'options': [],
+                           'link_id': None, 'listbox_selector': None}}
+    detail = forms._material_witness_disclosure_detail(
+        target, attempted=True, reason=failure)
+    assert detail.endswith('witness_reason=' + failure)
+    unsafe = forms._material_witness_disclosure_detail(
+        target, attempted=True, reason='PRIVATE_GATE_TOKEN_SENTINEL ' + failure)
+    assert unsafe.endswith('witness_reason=' + forms._MATERIAL_WITNESS_GATE_OPAQUE)
+    assert 'PRIVATE_GATE_TOKEN_SENTINEL' not in unsafe
+
+
+@pytest.mark.parametrize('linked,expected', [
+    (None, 'absent'), ('unknown', 'other'), (True, 'true'),
+])
+async def test_closed_material_without_false_link_skips_witness_diagnostic(
+        monkeypatch, linked, expected):
+    current = material_page()
+    combo = current['controls'][0]['combobox']
+    combo.update(linked=linked, options=[], link_id='', listbox_selector='')
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
+
+    class NoEffects:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(current)}
+            pytest.fail(f'witness must not execute on linked={expected}: {args}')
+
+    with pytest.raises(forms.MaterialAssentGate) as exc:
+        await forms._bootstrap(NoEffects(), current, PK, {}, URL)
+    detail = str(exc.value)
+    assert 'Disclosure: ' in detail
+    assert f'witness=not-attempted,linked={expected},options=empty,' in detail
+    assert 'witness_reason=' not in detail
+    assert exc.value.form_question is None
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('The closed combobox linkage is incomplete or ambiguous.',
+     'The closed combobox linkage is incomplete or ambiguous.'),
+    ('The material picker changed during reversible inspection.',
+     'The material picker changed during reversible inspection.'),
+    ('PRIVATE_GATE_TOKEN_SENTINEL with #selector and URL',
+     forms._MATERIAL_WITNESS_GATE_OPAQUE),
+])
+async def test_closed_material_witness_failure_disclosed_without_changing_gate(
+        monkeypatch, failure, expected):
+    current = material_page()
+    current['controls'][0]['combobox'].update(
+        linked=False, options=[], link_id='', listbox_selector='')
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
+    called = []
+
+    async def rejected_witness(*args, **kwargs):
+        called.append(True)
+        raise forms.Gate(failure)
+
+    monkeypatch.setattr(forms, '_witness_material_combobox', rejected_witness)
+    class NoEffects:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(current)}
+            pytest.fail(f'no irreversible effects permitted: {args}')
+
+    with pytest.raises(forms.MaterialAssentGate) as exc:
+        await forms._bootstrap(NoEffects(), current, PK, {}, URL)
+    detail = str(exc.value)
+    assert called == [True]
+    assert 'witness=attempted,linked=false,options=empty,' in detail
+    assert 'witness_reason=' + expected in detail
+    assert 'PRIVATE_GATE_TOKEN_SENTINEL' not in detail
+    assert '#selector' not in detail
+    assert exc.value.form_question is None

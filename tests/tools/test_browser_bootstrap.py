@@ -5075,3 +5075,72 @@ async def test_bank_auto_native_checkbox_witnessed_grant(monkeypatch):
     assert row['human_approved_answers']['Confirm details']['source'] == 'bank-auto'
     assert row['human_approved_answers']['Confirm details']['visible_text'] == 'Confirm details'
     assert writes
+
+
+async def test_issue178_required_with_bank_fact_but_no_grant_gates(monkeypatch):
+    page = secure_inventory(field('Email', '#email'))
+    browser, _, row = secure_world(monkeypatch, page)
+    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
+        await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
+                               SECURE_URL, required_gate=True, global_facts={})
+    assert caught.value.form_question['selector'] == '#email'
+    assert row['human_approved_answers'] == {}
+
+
+async def test_issue178_required_after_unrelated_grant_gates(monkeypatch):
+    page = secure_inventory(field('Email', '#email'), field('City', '#city'))
+    browser, _, row = secure_world(monkeypatch, page)
+    row['human_approved_answers'] = {'Email': {
+        'value': 'test@example.test', 'selector': '#email', 'url': SECURE_URL,
+        'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
+        'form_selector': '#application', 'form_action': SECURE_URL}}
+    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
+        await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
+                               SECURE_URL, required_gate=True)
+    assert caught.value.form_question['label'] == 'City'
+    assert row['human_approved_answers']['Email']['value'] == 'test@example.test'
+
+
+async def test_issue178_radio_global_grant_is_bound_and_witnessed(monkeypatch):
+    yes = field('Yes', '#yes', type='radio', name='work_choice',
+                question='Work preference', value='yes', has_value=True)
+    no = field('No', '#no', type='radio', name='work_choice',
+               question='Work preference', value='no', has_value=True)
+    page = secure_inventory(yes, no)
+    browser, _, row = secure_world(monkeypatch, page)
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            row.update(attrs)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    await forms._bootstrap(browser, page, PK, {'Work preference': 'Yes'},
+                           SECURE_URL, global_facts={'Work preference': 'Yes'})
+    grant = row['human_approved_answers']['Work preference']
+    assert grant['source'] == 'bank-auto'
+    assert grant['radio_name'] == 'work_choice'
+    assert len(grant['radio_members']) == 2
+    assert grant['selector'] == '#yes'
+    assert not any(x[0] in {'click', 'fill', 'select'} for x in browser.calls)
+
+
+async def test_issue178_radio_unmatched_global_choice_never_grants(monkeypatch):
+    yes = field('Yes', '#yes', type='radio', name='work_choice',
+                question='Work preference', value='yes', has_value=True)
+    no = field('No', '#no', type='radio', name='work_choice',
+               question='Work preference', value='no', has_value=True)
+    page = secure_inventory(yes, no)
+    browser, _, row = secure_world(monkeypatch, page)
+    await forms._bootstrap(browser, page, PK, {'Work preference': 'Unobserved'},
+                           SECURE_URL, global_facts={'Work preference': 'Unobserved'})
+    assert row['human_approved_answers'] == {}
+
+
+async def test_issue178_shadowed_required_needs_owner_question(monkeypatch):
+    page = secure_inventory(field('Email', '#email'))
+    browser, _, row = secure_world(monkeypatch, page)
+    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
+        await forms._bootstrap(
+            browser, page, PK, {'Email': 'company@example.test'}, SECURE_URL,
+            global_facts={'Email': 'global@example.test'}, required_gate=True)
+    assert caught.value.form_question['label'] == 'Email'
+    assert not row['human_approved_answers']

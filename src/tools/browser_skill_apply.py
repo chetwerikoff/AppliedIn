@@ -3959,8 +3959,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             previous = grants.get(key) if isinstance(grants, dict) else None
             if isinstance(previous, dict):
                 continue
-            if _fact_key(facts, key) is not None:
-                continue
+            # An unapproved bank value is data, never a row-bound grant.
+            # Resolve the owner question regardless of global/company facts.
             question['pk'] = pk
             raise Gate(f'An exact human-approved answer is needed for "{key}".',
                        form_question=question, reason='owner_question')

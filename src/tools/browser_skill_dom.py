@@ -729,7 +729,10 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     if (!['H','R','W','X','Z'].includes(status)) try {
       const child=e.contentDocument;
       documentReadability=child ? 'readable' : 'unavailable';
-      let current=false;
+      // An actual readable, complete source-less child can establish current
+      // control presence/absence for diagnostics. It still proves no root
+      // relationship and never changes the unknown frame admission.
+      let current=!!child && raw===null && !e.hasAttribute('srcdoc');
       if (child && raw!==null && !e.hasAttribute('srcdoc') &&
           typeof child.URL==='string' && child.URL) {
         try {

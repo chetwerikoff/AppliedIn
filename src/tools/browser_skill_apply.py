@@ -3707,10 +3707,10 @@ def _bank_auto_eligible(item: dict, value: str) -> bool:
             or _SENSITIVE.search(subject) or _SANCTIONS_RX.search(subject)
             or _assent_scope(item) != 'fact'
             or _material_assent_match(subject) or _material_form_choice(item)
-            or re.search(r'\\b(salary|compensation|pay|wage|remuneration|'
+            or re.search(r'\b(salary|compensation|pay|wage|remuneration|'
                          r'consent|agree|privacy|certify|attest|declar|sanction|'
                          r'restricted.country|why|essay|describe|explain|'
-                         r'motivation|cover letter)\\b', subject, re.I)):
+                         r'motivation|cover letter)\b', subject, re.I)):
         return False
     try:
         guarded_value(item, value)

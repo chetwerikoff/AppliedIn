@@ -3012,7 +3012,10 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                 # picker can present an answerable owner question. A grant
                 # already bound to this exact observed control may resume.
                 if _material_form_choice(c):
-                    unanswered = _unanswered(page, c)
+                    # An optional, unselected assent is still an owner decision;
+                    # a preselected value must instead prove an existing grant.
+                    unanswered = (not c.get('has_value') if c.get('tag') == 'select'
+                                  else not (c.get('combobox') or {}).get('selected_text'))
                     try:
                         question = _disclosure_question(
                             page, c, witness, *origins,
@@ -3038,8 +3041,11 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                             else:
                                 continue
                         if unanswered:
-                            raise Gate(_choice_prompt(c, question),
-                                       form_question=question, reason='owner_question')
+                            # Reuse the established material-gate telemetry flag:
+                            # the owner gets the real options, ordinary logs do not.
+                            raise MaterialAssentGate(
+                                _choice_prompt(c, question),
+                                form_question=question, reason='owner_question')
                 # PAGE.label can come from non-visible names or option captions.
                 # The independent witness identifies real rendered labeling text.
                 proof = witness.get(c.get('selector'))

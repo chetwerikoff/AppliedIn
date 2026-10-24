@@ -1537,3 +1537,142 @@ async def test_forless_witnessed_aria_picker_and_native_choices_reach_real_entry
         ('click', '#work-picker'), ('click', '#radio-no'),
         ('click', '#consent-choice')]
     assert not any(c[0] == 'submit' for c in raw.calls)
+
+
+def _source_less_enterprise_fixture(script, *, variant='exact'):
+    """The extra iframe has no src/srcdoc, but no root/document proof is invented.
+
+    This injects only an offline DOM mutation into the two production readers;
+    the underlying local Node fixture, browser engine and guards are unchanged.
+    """
+    spec = dict(root=False, formless=True, missingPane=variant != 'with-root',
+                url=entry('ashby'), sibling=True, **_hidden_enterprise_anchor())
+    if variant == 'separate-containers':
+        spec['badge'] = True
+    opener = '(() => {\n'
+    assert script.startswith(opener)
+    injection = """
+  {
+    const frames = document.querySelectorAll('iframe');
+    const anchor = frames[0], companion = frames[1];
+    anchor.setAttribute('src',
+      'https://www.recaptcha.net/recaptcha/enterprise/anchor?private=FRAME_QUERY_SENTINEL');
+    companion.removeAttribute('src');
+    companion.style.display = 'none';
+    companion.setAttribute('data-private', 'FRAME_ATTRIBUTE_SENTINEL');
+    companion.setAttribute('id', 'FRAME_ID_SENTINEL');
+    companion.parentElement.setAttribute('data-private', 'PARENT_ATTRIBUTE_SENTINEL');
+  }
+"""
+    additional = {
+        'sourced': """
+  document.querySelectorAll('iframe')[1].setAttribute('src',
+    'https://widgets.example.test/frame/trace?secret=FRAME_QUERY_SENTINEL');
+""",
+        'srcdoc': """
+  document.querySelectorAll('iframe')[1].setAttribute('srcdoc',
+    '<input value="SRCDOC_TOKEN_SENTINEL">');
+""",
+        'visible': """
+  document.querySelectorAll('iframe')[1].style.display = 'block';
+  document.querySelectorAll('iframe')[1].style.visibility = 'visible';
+""",
+    }.get(variant, '')
+    return dom(spec, script.replace(opener, opener + injection + additional, 1))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_source_less_companion_unproved_root_retains_gate_with_bounded_detail(reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = _source_less_enterprise_fixture(script)
+    assert page['entry']['formless']['root'] == ''
+    assert [f['status'] for f in page['entry']['frames']] == ['unknown', 'unknown']
+    anchor, companion = page['entry']['frames']
+    assert anchor['rootless_hidden_r'] is True
+    assert companion.get('rootless_hidden_r') is not True
+    assert companion['source'] == 'absent' and companion['srcdoc'] == 'absent'
+    assert companion['visibility'] == 'hidden' and companion['display'] == 'none'
+    assert companion['root'] == '' and companion['outside'] is False
+    assert companion['form_controls'] == 'unknown'
+    assert companion['document_readability'] == 'unreadable'
+    assert companion['parent_pattern'] == 'body:nth-of-type(1)'
+    assert companion['anchor_sibling'] == 'yes'
+    assert companion['shared_recaptcha_container'] == 'unknown'
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame') as raised:
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+    detail = str(raised.value)
+    assert 'frame[2]' in detail
+    assert 'source_kind=absent' in detail and 'outside_root=unknown' in detail
+    assert 'srcdoc=absent parent_pattern=body:nth-of-type(1)' in detail
+    assert 'anchor_sibling=yes shared_recaptcha_container=unknown' in detail
+    assert 'document_readability=unreadable' in detail
+    assert 'Step2 unproven: independent application-root placement' in detail
+    assert 'shared reCAPTCHA container' in detail
+    for forbidden in ('FRAME_QUERY_SENTINEL', 'FRAME_ATTRIBUTE_SENTINEL',
+                      'FRAME_ID_SENTINEL', 'PARENT_ATTRIBUTE_SENTINEL'):
+        assert forbidden not in detail
+
+
+async def test_source_less_companion_does_not_inherit_rootless_r_readiness(monkeypatch):
+    first = tuple(_source_less_enterprise_fixture(script) for script in
+                  (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS))
+    assert first[0]['entry'] == first[1]['entry']
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, first)
+    start = clock[0]
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] == 1 and clock[0] == start
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('variant', [
+    'sourced', 'srcdoc', 'visible', 'separate-containers', 'with-root',
+])
+def test_source_less_companion_negative_evidence_never_admits(reader, variant):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = _source_less_enterprise_fixture(script, variant=variant)
+    first, companion = page['entry']['frames']
+    assert companion['status'] == 'unknown'
+    if variant == 'sourced':
+        assert companion['source'] == 'url'
+    elif variant == 'srcdoc':
+        assert companion['srcdoc'] == 'present'
+    elif variant == 'visible':
+        assert companion['display'] == 'block' and companion['visibility'] == 'visible'
+    elif variant == 'separate-containers':
+        assert companion['anchor_sibling'] == 'no'
+        assert companion['shared_recaptcha_container'] == 'no'
+    else:
+        assert first['status'] == 'R'
+        assert companion['outside'] is True and companion['anchor_sibling'] == 'yes'
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame') as raised:
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+    detail = str(raised.value)
+    for forbidden in ('FRAME_QUERY_SENTINEL', 'FRAME_ATTRIBUTE_SENTINEL',
+                      'FRAME_ID_SENTINEL', 'PARENT_ATTRIBUTE_SENTINEL',
+                      'SRCDOC_TOKEN_SENTINEL'):
+        assert forbidden not in detail
+
+
+def test_frame_owner_detail_never_trusts_raw_parent_pattern_or_control_strings():
+    # Malformed injected metadata is not a selector/logging escape hatch.
+    page = _source_less_enterprise_fixture(forms.ENTRY_PAGE)
+    frame = page['entry']['frames'][1]
+    frame.update(parent_pattern='div#PRIVATE_CONTROL_SENTINEL',
+                 form_controls='PRIVATE_TOKEN_SENTINEL',
+                 document_readability='PRIVATE_DOC_SENTINEL',
+                 anchor_sibling='PRIVATE_SIBLING_SENTINEL')
+    with pytest.raises(forms.CaptchaArtifactGate) as raised:
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+    detail = str(raised.value)
+    assert 'parent_pattern=unknown' in detail
+    assert 'form_controls=unknown' in detail
+    assert 'document_readability=unknown' in detail
+    assert 'anchor_sibling=unknown' in detail
+    for token in ('PRIVATE_CONTROL_SENTINEL', 'PRIVATE_TOKEN_SENTINEL',
+                  'PRIVATE_DOC_SENTINEL', 'PRIVATE_SIBLING_SENTINEL'):
+        assert token not in detail

@@ -979,8 +979,11 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
 @pytest.mark.parametrize('material', [True, False])
 async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
-        monkeypatch, caplog, material, queued_worker):
+        monkeypatch, capfd, material, queued_worker):
     """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
+    import logging
+    import sys
+
     from agent import run
 
     label = 'I agree to terms OWNER_VISIBLE_LOG_SENTINEL'
@@ -1037,7 +1040,20 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     fake_apply = AsyncMock(return_value=gate)
     monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
 
-    with caplog.at_level('INFO', logger=run.log.name):
+    # get_logger installs its own stdout StreamHandler with propagate=False.
+    # Root caplog records can differ between an isolated case and a full suite
+    # if other tests installed handlers. Observe this real INFO sink via capfd.
+    # The scoped patch restores every handler stream and logger level on exit.
+    assert run.log.propagate is False
+    stdout_handlers = [handler for handler in run.log.handlers
+                       if isinstance(handler, logging.StreamHandler)
+                       and not isinstance(handler, logging.FileHandler)]
+    assert stdout_handlers
+    capfd.readouterr()  # discard any synthetic gate setup output
+    with monkeypatch.context() as log_capture:
+        log_capture.setattr(run.log, 'level', logging.INFO)
+        for handler in stdout_handlers:
+            log_capture.setattr(handler, 'stream', sys.stdout)
         if queued_worker:
             # Exercise the synchronous worker's actual INFO sink and async apply.
             monkeypatch.setattr(run, 'make_stores', lambda: stores)
@@ -1048,6 +1064,7 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
             queue.retry.assert_not_called()
         else:
             result = await run._apply_direct(PK, stores)
+        log_output = capfd.readouterr().out
     assert fake_apply.await_count == 1
     assert result['result'] == 'gated' and result['question'] == gate['question']
     assert (result.get('material_assent_diagnostic') is True) is material
@@ -1058,23 +1075,28 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     ordinary = [args['detail'] for event, args in events if event == 'gate']
     assert ordinary == (['material-assent: human inspection required']
                         if material else [gate['question']])
-    lines = [record.getMessage() for record in caplog.records
-             if record.name == run.log.name]
-    assert any('gated pk=' in text for text in lines)
-    assert any(ordinary[0] in text for text in lines)
+    lines = log_output.splitlines()
+    gated_lines = [text for text in lines if 'gated pk=' in text]
+    assert len(gated_lines) == 1
+    assert 'INFO' in gated_lines[0]
+    assert f'gated pk={PK}:' in gated_lines[0]
+    assert ordinary[0] in log_output
     if queued_worker:
-        queued_lines = [text for text in lines if text.startswith('apply: ')]
+        queued_lines = [text for text in lines if 'apply: ' in text]
         assert len(queued_lines) == 1
+        assert 'INFO' in queued_lines[0]
         if material:
-            assert 'material-assent: human inspection required' in queued_lines[0]
+            assert "'question': 'material-assent: human inspection required'" in queued_lines[0]
         else:
             assert 'OTHER_GATE_SENTINEL' in queued_lines[0]
     if material:
         assert 'OWNER_VISIBLE_LOG_SENTINEL' in row['gate_pending']['question']
-        assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text
-                   for text in lines + ordinary)
+        assert 'gated pk=' + PK + ': material-assent: human inspection required' in gated_lines[0]
+        assert 'OWNER_VISIBLE_LOG_SENTINEL' not in log_output
+        assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text for text in ordinary)
     else:
         assert 'OTHER_GATE_SENTINEL' in ordinary[0]
+        assert 'OTHER_GATE_SENTINEL' in gated_lines[0]
 
 
 @pytest.mark.parametrize('option', [

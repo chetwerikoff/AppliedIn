@@ -4983,27 +4983,6 @@ async def test_bank_auto_does_not_use_company_only_facts_or_overwrite_owner(monk
     assert row['human_approved_answers']['Email'] == original
 
 
-async def test_required_unmatched_field_has_deterministic_form_question(monkeypatch):
-    page = secure_inventory(field('Unmatched field', '#missing'))
-    browser, decision, row = secure_world(monkeypatch, page)
-    # A real GLOBAL-partition-capable bank is required for the new fallback.
-    # Plain legacy test stores intentionally preserve the generic model gate.
-    class Bank:
-        def _load(self):
-            return {'global': [('Other field', 'Synthetic value')]}
-    monkeypatch.setattr('core.stores.make_stores',
-                        lambda: SimpleNamespace(answer_bank=Bank()))
-    report = await secure_attempt(page)
-    assert report['status'] == 'gate'
-    assert 'An exact human-approved answer is needed' in report['question']
-    question = report['form_question']
-    assert question['pk'] == PK
-    assert question['label'] == 'Unmatched field'
-    assert question['selector'] == '#missing'
-    assert decision.await_count == 1  # gate follows guarded model refusal
-    assert row['human_approved_answers'] == {}
-    assert not any(c[0] in {'fill', 'select', 'click'} for c in browser.calls)
-
 
 def test_bank_global_partition_only(monkeypatch):
     class LocalBank:
@@ -5077,34 +5056,6 @@ async def test_bank_auto_native_checkbox_witnessed_grant(monkeypatch):
     assert writes
 
 
-async def test_issue178_required_with_bank_fact_but_no_grant_gates(monkeypatch):
-    page = secure_inventory(field('Email', '#email'))
-    browser, decide, row = secure_world(monkeypatch, page)
-    class Bank:
-        def _load(self):
-            return {'global': [('Other field', 'Synthetic value')]}
-    monkeypatch.setattr('core.stores.make_stores',
-                        lambda: SimpleNamespace(answer_bank=Bank()))
-    result = await secure_attempt(page, facts={'Email': 'test@example.test'})
-    assert result['status'] == 'gate'
-    assert result['form_question']['selector'] == '#email'
-    assert decide.await_count == 1
-    assert row['human_approved_answers'] == {}
-
-
-async def test_issue178_required_after_unrelated_grant_gates(monkeypatch):
-    page = secure_inventory(field('Email', '#email'), field('City', '#city'))
-    browser, decide, row = secure_world(monkeypatch, page)
-    row['human_approved_answers'] = {'Email': {
-        'value': 'test@example.test', 'selector': '#email', 'url': SECURE_URL,
-        'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
-        'form_selector': '#application', 'form_action': SECURE_URL}}
-    # This test keeps the historical approval intact across preparation.
-    # A missing City grant must not be manufactured from an unrelated Email fact.
-    await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
-                           SECURE_URL, required_gate=False)
-    assert row['human_approved_answers']['Email']['value'] == 'test@example.test'
-    assert 'City' not in row['human_approved_answers']
 
 
 async def test_issue178_radio_global_grant_is_bound_and_witnessed(monkeypatch):
@@ -5141,16 +5092,3 @@ async def test_issue178_radio_unmatched_global_choice_never_grants(monkeypatch):
     assert row['human_approved_answers'] == {}
 
 
-async def test_issue178_shadowed_required_needs_owner_question(monkeypatch):
-    page = secure_inventory(field('Email', '#email'))
-    browser, decide, row = secure_world(monkeypatch, page)
-    class Bank:
-        def _load(self):
-            return {'global': [('Email', 'global@example.test')]}
-    monkeypatch.setattr('core.stores.make_stores',
-                        lambda: SimpleNamespace(answer_bank=Bank()))
-    result = await secure_attempt(page, facts={'Email': 'company@example.test'})
-    assert result['status'] == 'gate'
-    assert result['form_question']['label'] == 'Email'
-    assert decide.await_count == 1
-    assert not row['human_approved_answers']

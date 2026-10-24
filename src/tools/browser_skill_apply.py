@@ -3840,8 +3840,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      provenance: Provenance | None = None,
                      filled: dict | None = None, history: list | None = None,
                      resume_path: str = '', company: str = '', job_url: str = '',
-                     global_facts: dict | None = None,
-                     required_gate: bool = False) -> dict:
+                     global_facts: dict | None = None) -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _preparation_current(provenance, fixture_context=fixture_context)):
@@ -5620,11 +5619,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             # Lack of an independently inspectable GLOBAL partition grants
             # nothing; it must not prevent unrelated guarded form actions.
             global_bank = getattr(make_stores(), 'answer_bank', None)
-            bank_partition_known = (hasattr(global_bank, '_scope_facts')
-                                    or hasattr(global_bank, '_load'))
             global_facts = _global_owner_facts(global_bank)
         else:
-            bank_partition_known = False
             global_facts = {}  # Synthetic fixture never consults owner storage.
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 'Exact human-authorized fact KEYS on this tracked job appear in the '
@@ -5733,7 +5729,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance, filled=filled, history=history,
                         resume_path=resume_path, company=company, job_url=url,
-                        global_facts=global_facts, required_gate=True,
+                        global_facts=global_facts,
                         **({'fixture_context': ctx} if ctx else {}))
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
@@ -5793,32 +5789,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
-                        # Preserve all earlier native-root, model and provenance
-                        # checks. Only an ordinary reviewer refusal without a
-                        # specific approved answer becomes an owner question.
-                        if (False and bank_partition_known and global_facts and not granted_keys and not choices
-                                and action.get('question')
-                                and not _formless_root(page)):
-                            unanswered = [c for c in page['controls']
-                                          if c.get('in_form') and c.get('required')
-                                          and _unanswered(page, c)
-                                          and (_native_answer(c) or c.get('type')
-                                               in {'radio', 'checkbox', 'combobox'})]
-                            if unanswered:
-                                current_page, witness = await _observe_controls(session, page)
-                                for pending in unanswered:
-                                    try:
-                                        key = _key(current_page, pending)
-                                        question = _disclosure_question(
-                                            current_page, pending, witness,
-                                            *trusted_origins, bootstrap=True,
-                                            provenance=provenance)
-                                    except Gate:
-                                        continue
-                                    question['pk'] = pk
-                                    raise Gate(
-                                        f'An exact human-approved answer is needed for "{key}".',
-                                        form_question=question, reason='owner_question')
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
                     if verb == 'finish':
                         raise Gate('The application has not been submitted; review the form.')

@@ -4068,7 +4068,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('An unclassified click cannot reach application IPC.')
         if (target.get('href') and not _job_preparation_route(target['href'], job_url, provenance=provenance)):
             raise Gate('Click target navigates outside the approved preparation host.')
-        if target.get('formaction') and not _preparation_origin(
+        if target.get('formaction') and not _job_preparation_route(
                 target['formaction'], job_url, provenance=provenance):
             raise Gate('Unknown form override may submit outside the approved host.')
         # Before private data, the raw controller may permit an ordinary JS

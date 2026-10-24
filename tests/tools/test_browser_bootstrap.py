@@ -4899,6 +4899,163 @@ async def test_execute_inventory_retry_at_actual_observation_points(
     assert len(delays) == (1 if stabilizes else 3)
     assert all(delay == 0.25 for delay in delays)
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
+@pytest.mark.parametrize('failure', ['length', 'identity'])
+@pytest.mark.parametrize('stabilizes', [True, False])
+async def test_bootstrap_witness_bounded_reread(monkeypatch, site, failure, stabilizes):
+    """A transient synthetic length/identity flap needs two stable complete reads."""
+    base = inventory(field(), submit())
+    class Flapping:
+        def __init__(self):
+            self.reads = 0
+            self.evaluations = 0
+            self.current = deepcopy(base)
+        async def page(self):
+            self.reads += 1
+            self.current = deepcopy(base)
+            if failure == 'identity' and (not stabilizes or self.reads == 1):
+                self.current['controls'][0]['label'] = 'Synthetic version ' + str(self.reads)
+            return deepcopy(self.current)
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            self.evaluations += 1
+            value = witness(self.current if failure == 'identity' else base)
+            if failure == 'length' and (not stabilizes or self.evaluations == 1):
+                value['controls'].pop()
+            return {'value': value}
+    browser = Flapping()
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    if stabilizes:
+        observed, proof = await forms._observe_controls(browser, base, site=site)
+        assert observed['url'] == base['url']
+        assert set(proof) == {'#email', '#submit'}
+        assert browser.evaluations <= 4
+    else:
+        with pytest.raises(forms.Gate) as denied:
+            await forms._observe_controls(browser, base, site=site)
+        assert 'site=' + site in str(denied.value)
+        assert ('predicate=controls.length.equal' if failure == 'length'
+                else 'predicate=inventory.identity.equal') in str(denied.value)
+        assert browser.evaluations == 4
+        assert len(delays) == 3
+    assert all(delay == 0.25 for delay in delays)
+
+
+def test_every_production_observe_controls_caller_names_its_site():
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(forms))
+    literal_sites = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != '_observe_controls':
+            continue
+        kw = next((x.value for x in node.keywords if x.arg == 'site'), None)
+        if kw is None:
+            # Both bootstrap and execute preserve the two-argument seam for
+            # fixed synthetic witness doubles; code-owned context supplies site.
+            assert (2720 <= node.lineno <= 2760 or
+                    4320 <= node.lineno <= 4360)
+            continue
+        if isinstance(kw, ast.Name):
+            assert kw.id == 'site' and 2720 <= node.lineno <= 2910
+        else:
+            assert isinstance(kw, ast.Constant) and isinstance(kw.value, str) and kw.value
+            literal_sites.append(kw.value)
+    assert {'execute', 'execute-readback'} <= set(literal_sites)
+    assert len(literal_sites) >= 19
+    # Bootstrap uses a two-positional-argument seam required by existing
+    # synthetic submission guards; its scoped wrapper still owns fixed sites.
+    wrappers = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == '_bootstrap_observe_controls']
+    assert {next(k.value.value for k in node.keywords if k.arg == 'site')
+            for node in wrappers} == {'bootstrap-formless', 'bootstrap-material'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'confirmation-readback', 'readiness-witness', 'bootstrap-commit-readback',
+    'native-receiver-readback', 'combobox-observe', 'execute-readback',
+])
+async def test_named_non_retry_observers_remain_single_read(monkeypatch, site):
+    """An attribution-only site never opts a caller into inventory retries."""
+    base = inventory(field(), submit())
+    browser = Browser(base)
+    reads = 0
+    async def unstable_page():
+        nonlocal reads
+        reads += 1
+        fresh = deepcopy(base)
+        fresh['controls'][0]['label'] = 'Synthetic changed field'
+        return fresh
+    monkeypatch.setattr(browser, 'page', unstable_page)
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as denied:
+        await forms._observe_controls(browser, base, site=site)
+    assert 'predicate=inventory.identity.equal' in str(denied.value)
+    assert 'site=' + site in str(denied.value)
+    assert [call[0] for call in browser.calls] == ['evaluate']
+    assert reads == 1
+    assert not delays
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
+async def test_bootstrap_initially_stable_witness_never_rereads(monkeypatch, site):
+    """A stable first bootstrap observation retains the one-evaluate contract."""
+    page = inventory(field(), submit())
+    browser = Browser(page)
+    delays = []
+    async def no_wait(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+    observed, controls = await forms._observe_controls(browser, page, site=site)
+    assert observed == page
+    assert set(controls) == {'#email', '#submit'}
+    assert [call[0] for call in browser.calls] == ['evaluate']
+    assert browser.pages == 1
+    assert not delays
+
+
+@pytest.mark.asyncio
+async def test_execute_observer_preserves_two_argument_witness_seam(monkeypatch):
+    """Synthetic guard-order tests patch the observer with exactly two arguments."""
+    page = inventory(field(), submit())
+    called = []
+    async def two_argument_witness(session, current):
+        called.append((session, current))
+        return current, {}
+    monkeypatch.setattr(forms, '_observe_controls', two_argument_witness)
+    browser = Browser(page)
+    observed, controls = await forms._execute_observe_controls(browser, page)
+    assert observed is page and controls == {}
+    assert called == [(browser, page)]
+
+
+@pytest.mark.asyncio
+async def test_execute_production_observer_has_literal_gate_site(monkeypatch):
+    """The real observer carries execute's literal without changing fixture doubles."""
+    page = inventory(field(), submit())
+    browser = Browser(page)
+    bad = witness(page)
+    bad['controls'][0]['selector'] = '#changed'
+    browser.result = bad
+    with pytest.raises(forms.Gate) as error:
+        await forms._execute_observe_controls(browser, page)
+    assert 'predicate=selector.equal' in str(error.value)
+    assert 'site=execute' in str(error.value)
+    assert [call[0] for call in browser.calls] == ['evaluate']
+
+
 @pytest.mark.parametrize('case,expected', [
     ('passive', ('yes', '1', '1', 'yes', 'yes')),
     ('non_ashby', ('no', '1', '1', 'yes', 'no')),

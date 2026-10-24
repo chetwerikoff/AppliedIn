@@ -2720,7 +2720,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
-async def _observe_controls(session, page: dict, *, readiness: bool = False) -> tuple[dict, dict]:
+async def _observe_controls(session, page: dict, *, readiness: bool = False,
+                            site: str = '', _identity_try: int = 1,
+                            _previous_identity=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
     predicate, locator = 'unavailable', 'unavailable'
@@ -2794,6 +2796,24 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current, complete=False)
+        if _page_identity(current) != _page_identity(page) and site:
+            if _identity_try < 4:
+                # Only identity disagreement triggers a complete fresh read.
+                await asyncio.sleep(0.25)
+                return await _observe_controls(
+                    session, await session.page(), readiness=readiness,
+                    site=site, _identity_try=_identity_try + 1)
+        elif site and _identity_try > 1:
+            # A lone equality with the initial page is not stabilization.
+            if _previous_identity == _page_identity(current):
+                return current, lookup
+            if _identity_try < 4:
+                await asyncio.sleep(0.25)
+                return await _observe_controls(
+                    session, await session.page(), readiness=readiness,
+                    site=site, _identity_try=_identity_try + 1,
+                    _previous_identity=_page_identity(current))
+            require(False, 'inventory.identity.equal')
         require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup
@@ -2818,7 +2838,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         prefix = ('application form inventory read timed out/unavailable; '
                   if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)) else '')
         raise Gate(prefix + 'The current DOM witness is unavailable or changed; '
-                   f'exception={error}; predicate={predicate}; control={locator}') from None
+                   f'exception={error}; predicate={predicate}; control={locator}'
+                   + (f'; site={site}' if site else '')) from None
 
 
 def _radio_group(page: dict, target: dict) -> list[dict]:
@@ -3418,7 +3439,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
         await _effect_call(session, 'click', selector)
         for attempt in range(20):
             current_page, current_witness = await _observe_controls(
-                session, await session.page())
+                session, await session.page(), site='material-witness')
             if (not _preparation_destination_allowed(
                     current_page['url'], *origins, provenance=provenance)
                     or (provenance is not None and not _preparation_current(
@@ -3458,7 +3479,8 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
                 controller._material_witness_close_request = None
                 controller._material_witness_selector = None
                 controller._material_witness_target = None
-    closed_page, closed_witness = await _observe_controls(session, await session.page())
+    closed_page, closed_witness = await _observe_controls(
+        session, await session.page(), site='material-witness')
     closed = control(closed_page, action, 'material-witness-close')
     if (not _preparation_destination_allowed(
             closed_page['url'], *origins, provenance=provenance)
@@ -4298,7 +4320,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_choice(target)
         else:
             _require_native_action(target, verb)
-        observed, witness = await _observe_controls(session, page)
+        observed, witness = await _observe_controls(session, page, site='execute')
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
                 or not _preparation_destination_allowed(observed.get('url', ''),
@@ -4411,7 +4433,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             else:
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _observe_controls(session, page)
+        latest, latest_witness = await _observe_controls(
+            session, page, site='execute')
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_native_choice(current)
@@ -5140,7 +5163,8 @@ class ApplicationIPCController:
                                       else _FIXED_CONTROL_WITNESS)
                             return await session.call('evaluate', script)
                         raise Gate('Only the fixed control witness may be read.')
-                current, proof = await _observe_controls(RawWitnessReader(), page)
+                current, proof = await _observe_controls(
+                    RawWitnessReader(), page, site='material-resume-open')
                 matches = [c for c in current['controls']
                            if c.get('selector') == selector and not c.get('disabled')]
                 if len(matches) != 1:

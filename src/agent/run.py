@@ -1383,7 +1383,16 @@ def run_queued(item: dict, q: Any) -> dict:
     pk = item["pk"]
     try:
         result = _run(_apply_direct(pk, make_stores())) or {}
-        log.info("apply: %s", result)
+        # Keep the owner's full material-assent diagnostic in the result, not
+        # in a routine worker log that persists page-controlled labels.
+        logged_result = (
+            {"result": "gated", "pk": pk,
+             "question": "material-assent: human inspection required"}
+            if (result.get("result") == "gated"
+                and result.get("material_assent_diagnostic") is True)
+            else result
+        )
+        log.info("apply: %s", logged_result)
         again, why = is_retryable(result)
         if again:
             # The DETAIL, not the code. `retry()` decides whether a failure spends
@@ -1638,9 +1647,16 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
                                        "review_route": review_route or "hard_refusal"},
                                    gate_call_id="direct" if review_route == "owner" else None,
                                    gate_source="applier")
-        emit("gate", pk=pk, agent="applier", detail=q, url=jd_url)
-        log.info("gated pk=%s: %s", pk, q)
-        return {"result": "gated", "pk": pk, "question": q}
+        # The full independently witnessed diagnostic is kept for the owner.
+        # Ordinary events and daemon logs must not echo page-controlled labels.
+        material_assent = (configuration()['engine'] == 'browser_skill'
+                           and result.get('material_assent_diagnostic') is True)
+        routine_detail = ("material-assent: human inspection required"
+                          if material_assent else q)
+        emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
+        log.info("gated pk=%s: %s", pk, routine_detail)
+        return {"result": "gated", "pk": pk, "question": q,
+                **({"material_assent_diagnostic": True} if material_assent else {})}
     reason = _fail_reason(result)
     # A browser held by something else is an ENVIRONMENT fault, not a verdict on
     # this job: the form was never reached, nothing was filled, and the same job

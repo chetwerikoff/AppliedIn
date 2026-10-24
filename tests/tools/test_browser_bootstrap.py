@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -55,8 +55,10 @@ def witness(page):
          'native_form_owner_selector': c.get('native_form_owner_selector', ''),
          'form_action': c.get('form_action', ''),
          'formaction': c.get('formaction', ''), 'disabled': c['disabled'],
-         'readonly': False, 'inert': False, 'visible': True,
+         'readonly': False, 'inert': False,
+         'visible': c.get('synthetic_visible', True),
          'visible_text': c['label'] if c.get('type') in {'radio', 'checkbox'} else '',
+         'diagnostic_visible_label': c.get('diagnostic_visible_label', ''),
          'options': deepcopy(c.get('options', []))}
         for c in page['controls']]}
 
@@ -729,6 +731,371 @@ async def test_input_submit_value_reveals_account_purpose(
     exc = await selected_gate(browser, p)
     assert exc.form_question is None  # own-form model-selected safety
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
+
+
+
+@pytest.mark.parametrize('cause,visible,question,expected', [
+    ('label', 'I AGREE to terms', '', 'AGREE'),
+    ('question', 'Response', 'Please consent to the policy', 'consent'),
+    ('options', 'Response', '', 'select options'),
+    ('both', 'Consent statement', '', 'Consent'),
+])
+async def test_material_assent_wall_reports_control_and_match_not_values(
+        monkeypatch, cause, visible, question, expected):
+    options = ([{'value': 'OPTION_VALUE_SENTINEL',
+                 'label': 'privacy consent OPTION_CAPTION_SENTINEL'}]
+               if cause in {'options', 'both'} else [])
+    material = field(visible, '#assent', tag='select', type='select',
+                     question=question, options=options,
+                     value='CONTROL_VALUE_SENTINEL', has_value=True,
+                     diagnostic_visible_label=visible)
+    page = secure_inventory(field(), material)
+    browser, decide, row = secure_world(monkeypatch, page)
+    report = await secure_attempt(page, facts={
+        'Synthetic fact': 'FACT_VALUE_SENTINEL',
+    })
+
+    assert report['status'] == 'gate' and report['form_question'] is None
+    assert report['reason'] == 'unknown_field'
+    assert report['review_route'] == 'agent_unavailable'
+    detail = report['question']
+    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
+    assert 'Control type: select; tag: select;' in detail
+    assert f"visible label: {visible!r};" in detail
+    assert f"matched: {expected}." in detail
+    assert 'Agent-first review is unavailable' in detail
+    assert 'Please consent to the policy' not in detail
+    for secret in ('CONTROL_VALUE_SENTINEL', 'OPTION_VALUE_SENTINEL',
+                   'OPTION_CAPTION_SENTINEL', 'FACT_VALUE_SENTINEL'):
+        assert secret not in detail
+    assert decide.await_count == 0
+    assert row['status'] == 'submitting'
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch):
+    prefix = 'I agree to terms '
+    visible_prefix = prefix + 'x' * (120 - len(prefix))
+    tail = 'TRUNCATED_LABEL_TAIL_SENTINEL'
+    page = secure_inventory(field(), field(
+        visible_prefix + tail, '#long-material', required=False,
+        diagnostic_visible_label=visible_prefix + tail))
+    browser, decide, _ = secure_world(monkeypatch, page)
+    report = await secure_attempt(page)
+
+    assert report['status'] == 'gate'
+    assert report['review_route'] == 'agent_unavailable'
+    assert (f"Control type: text; tag: input; visible label: {visible_prefix!r};"
+            in report['question'])
+    assert 'matched: agree.' in report['question']
+    assert tail not in str(report)
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('kind', ['radio', 'checkbox'])
+def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+    bound = field('I agree to terms', '#bound-choice',
+                  tag='input', type=kind, required=True,
+                  checked=True, has_value=True, name='attestation',
+                  question='Arbitration consent' if kind == 'radio' else '',
+                  value='accept')
+    members = [bound]
+    if kind == 'radio':
+        members.append(field(
+            'I decline', '#decline-choice', tag='input', type='radio',
+            required=True, checked=False, has_value=True, name='attestation',
+            question='Arbitration consent', value='decline'))
+    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
+
+
+async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
+    radio = field('Accept', '#legal-yes', tag='input', type='radio',
+                  name='legal', question='Arbitration consent', required=True,
+                  value='yes', has_value=True)
+    declined = field('Decline', '#legal-no', tag='input', type='radio',
+                     name='legal', question='Arbitration consent', required=True,
+                     value='no', has_value=True)
+    page = secure_inventory(field(), radio, declined)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    report = await secure_attempt(page)
+
+    assert report['status'] == 'gate'
+    assert report['review_route'] == 'owner'
+    assert report['reason'] == 'owner_question'
+    assert report['form_question'] is not None
+    assert 'Control type:' not in report['question']
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch):
+    page = secure_inventory(field())
+    browser, decide, row = secure_world(monkeypatch, page)
+    model_question = 'Synthetic prerequisite: approve test-only facts before continuing.'
+    decide.return_value = {'action': 'gate', 'question': model_question}
+    report = await secure_attempt(page)
+
+    assert decide.await_count == 1
+    prompt, model_page, model_history = decide.await_args.args
+    assert 'Exact human-authorized fact KEYS' in prompt
+    assert 'For the required résumé file input' in prompt
+    assert model_page['controls'][0]['label'] == 'Email'
+    assert model_history == []
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'unknown_field'
+    assert report['review_route'] == 'agent_unavailable'
+    assert report['form_question'] is None
+    assert report['question'].startswith(model_question + ' Last button:')
+    assert 'Agent-first review is unavailable' in report['question']
+    assert row['status'] == 'submitting'
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+
+def _material_readers_with_synthetic_dom(edit):
+    """Two actual production readers over one offline synthetic DOM shape."""
+    from tests.tools.test_browser_application_entry import dom
+    from tools.browser_skill_dom import PAGE
+    opener = '(() => {\n'
+    assert PAGE.startswith(opener) and forms._FIXED_CONTROL_WITNESS.startswith(opener)
+    spec = {'url': SECURE_URL}
+    return (dom(spec, PAGE.replace(opener, opener + edit, 1)),
+            dom(spec, forms._FIXED_CONTROL_WITNESS.replace(opener, opener + edit, 1)))
+
+
+@pytest.mark.parametrize('kind', ['hidden-name', 'select-options', 'visible-label'])
+async def test_actual_readers_supply_only_proven_visible_material_label(kind):
+    if kind == 'hidden-name':
+        edit = """
+          const e = document.getElementById('email');
+          e.setAttribute('type', 'hidden');
+          e.setAttribute('name', 'consent-HIDDEN_NAME_SENTINEL');
+          e.getClientRects = () => [];
+          node('input', {id:'required-other', type:'text', required:true},
+               document.getElementById('application-form'));
+        """
+        match, unsafe = 'consent', 'HIDDEN_NAME_SENTINEL'
+    elif kind == 'select-options':
+        edit = """
+          const e = document.getElementById('email');
+          e.tagName = 'SELECT'; e.localName = 'select';
+          e.removeAttribute('type'); e.type = ''; e.required = true;
+          const option = node('option',
+            {text:'Privacy consent OPTION_CAPTION_SENTINEL'}, e);
+          option.value = 'OPTION_VALUE_SENTINEL';
+          e.options = [option];
+        """
+        match, unsafe = 'Privacy', 'OPTION_CAPTION_SENTINEL'
+    else:
+        edit = """
+          const e = document.getElementById('email');
+          e.required = true;
+          node('label', {'for':'email',
+            text:'I agree to terms ' + 'x'.repeat(140) + 'VISIBLE_TAIL_SENTINEL'},
+            document.getElementById('application-form'));
+        """
+        match, unsafe = 'agree', 'VISIBLE_TAIL_SENTINEL'
+    page, independent = _material_readers_with_synthetic_dom(edit)
+    original = next(c for c in page['controls'] if c['selector'] == '#email')
+    observed = next(c for c in independent['controls'] if c['selector'] == '#email')
+    assert unsafe in original['label']
+    if kind == 'hidden-name':
+        assert original['type'] == 'hidden'
+        assert observed['visible'] is False
+    elif kind == 'select-options':
+        assert original['tag'] == 'select'
+        assert 'OPTION_VALUE_SENTINEL' in str(original['options'])
+        assert observed['diagnostic_visible_label'] == ''
+    else:
+        assert original['tag'] == 'input'
+        assert observed['visible'] is True
+        assert observed['diagnostic_visible_label'].startswith('I agree to terms ')
+
+    class OfflineReaderSession:
+        async def call(self, operation, script):
+            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
+            return {'value': deepcopy(independent)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    with pytest.raises(forms.MaterialAssentGate) as denial:
+        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    detail = str(denial.value)
+    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
+    assert f'matched: {match}.' in detail
+    assert unsafe not in detail
+    assert 'OPTION_VALUE_SENTINEL' not in detail
+    if kind == 'visible-label':
+        assert "visible label: 'I agree to terms " in detail
+        assert 'x' * (120 - len('I agree to terms ')) in detail
+    else:
+        assert "visible label: 'unavailable';" in detail
+    assert denial.value.reason == 'unknown_field'
+
+
+async def test_actual_reader_hidden_role_is_not_owner_material_type():
+    """A hidden input's arbitrary ARIA role is matching input, not display-safe type."""
+    role = 'HIDDEN_ROLE_SENTINEL_' + 'x' * 240
+    page, independent = _material_readers_with_synthetic_dom("""
+        const e = document.getElementById('email');
+        e.setAttribute('type', 'hidden');
+        e.setAttribute('name', 'consent-HIDDEN_NAME_SENTINEL');
+        e.setAttribute('role', 'HIDDEN_ROLE_SENTINEL_' + 'x'.repeat(240));
+        e.getClientRects = () => [];
+        node('input', {id:'required-other', type:'text', required:true},
+             document.getElementById('application-form'));
+    """)
+    original = next(c for c in page['controls'] if c['selector'] == '#email')
+    observed = next(c for c in independent['controls']
+                    if c['selector'] == '#email')
+    assert original['type'] == role and observed['type'] == role
+    assert 'consent-HIDDEN_NAME_SENTINEL' in original['label']
+    assert original['in_form'] is True and observed['visible'] is False
+
+    class OfflineReaderSession:
+        async def call(self, operation, script):
+            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
+            return {'value': deepcopy(independent)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    with pytest.raises(forms.MaterialAssentGate) as denial:
+        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    detail = str(denial.value)
+    assert ("Control type: unavailable; tag: input; "
+            "visible label: 'unavailable'; matched: consent." in detail)
+    assert 'HIDDEN_ROLE_SENTINEL_' not in detail
+    assert 'HIDDEN_NAME_SENTINEL' not in detail
+    assert denial.value.reason == 'unknown_field'
+
+
+@pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
+@pytest.mark.parametrize('material', [True, False])
+async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
+        monkeypatch, material, queued_worker):
+    """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
+    import logging
+    from io import StringIO
+
+    from agent import run
+    from core.logging import _ConsoleFormatter, _JsonFormatter
+
+    label = 'I agree to terms OWNER_VISIBLE_LOG_SENTINEL'
+    page = secure_inventory(field(), field(
+        label, '#material', required=False,
+        diagnostic_visible_label=label)) if material else secure_inventory(field())
+    _, decide, _ = secure_world(monkeypatch, page)
+    if not material:
+        decide.return_value = {
+            'action': 'gate', 'question': 'Synthetic OTHER_GATE_SENTINEL'}
+    gate = await secure_attempt(page)
+    assert gate['status'] == 'gate'
+    assert ('OWNER_VISIBLE_LOG_SENTINEL' in gate['question']) is material
+    assert (gate.get('material_assent_diagnostic') is True) is material
+
+    row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return dict(row)
+
+        def get_current(self, pk):
+            assert pk == PK
+            return dict(row)
+
+        def set_status(self, pk, status, **updates):
+            assert pk == PK
+            row.update(status=getattr(status, 'value', status), **updates)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(), secrets=None,
+        answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+    events = []
+    monkeypatch.setattr('core.events.emit',
+                        lambda kind, **kwargs: events.append((kind, kwargs)))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
+        return_value={'text': 'Synthetic offline job description'}))
+    monkeypatch.setattr(run, '_commit_posting_meta',
+                        lambda pk, current, meta, stores: dict(current))
+    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
+    monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
+    monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
+    monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
+    monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
+    monkeypatch.setattr('tools.credentials.get_login', lambda *a, **kw: None)
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Synthetic.pdf')
+    monkeypatch.setattr(
+        run, 'get_settings', lambda: SimpleNamespace(browser_model='offline'))
+    monkeypatch.setattr(
+        'tools.browser_runtime.configuration', lambda: {'engine': 'browser_skill'})
+    fake_apply = AsyncMock(return_value=gate)
+    monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
+
+    # get_logger uses a non-propagating, application-formatted StreamHandler.
+    # A full suite can add pytest/root handlers that mirror its stdout output;
+    # count messages only from this one real application sink, not all of capfd.
+    assert run.log.propagate is False
+    app_handlers = [handler for handler in run.log.handlers
+                    if type(handler) is logging.StreamHandler
+                    and isinstance(handler.formatter,
+                                   (_ConsoleFormatter, _JsonFormatter))]
+    assert app_handlers
+    with StringIO() as app_output, monkeypatch.context() as log_capture:
+        log_capture.setattr(run.log, 'level', logging.INFO)
+        log_capture.setattr(app_handlers[0], 'stream', app_output)
+        if queued_worker:
+            # Exercise the synchronous worker's actual INFO sink and async apply.
+            monkeypatch.setattr(run, 'make_stores', lambda: stores)
+            queue = SimpleNamespace(retry=Mock(), done=Mock())
+            item = {'pk': PK}
+            result = run.run_queued(item, queue)
+            queue.done.assert_called_once_with(item)
+            queue.retry.assert_not_called()
+        else:
+            result = await run._apply_direct(PK, stores)
+        log_output = app_output.getvalue()
+    assert fake_apply.await_count == 1
+    assert result['result'] == 'gated' and result['question'] == gate['question']
+    assert (result.get('material_assent_diagnostic') is True) is material
+    assert row['status'] == 'needs_human'
+    assert row['gate_pending']['question'] == gate['question']
+    assert row['gate_pending']['review_route'] == 'agent_unavailable'
+    assert row['gate_reason'] == 'unknown_field'
+    ordinary = [args['detail'] for event, args in events if event == 'gate']
+    assert ordinary == (['material-assent: human inspection required']
+                        if material else [gate['question']])
+    lines = log_output.splitlines()
+    gated_lines = [text for text in lines if 'gated pk=' in text]
+    assert len(gated_lines) == 1
+    assert 'INFO' in gated_lines[0]
+    assert f'gated pk={PK}:' in gated_lines[0]
+    assert ordinary[0] in log_output
+    if queued_worker:
+        queued_lines = [text for text in lines if 'apply: ' in text]
+        assert len(queued_lines) == 1
+        assert 'INFO' in queued_lines[0]
+        if material:
+            assert "'question': 'material-assent: human inspection required'" in queued_lines[0]
+        else:
+            assert 'OTHER_GATE_SENTINEL' in queued_lines[0]
+    if material:
+        assert 'OWNER_VISIBLE_LOG_SENTINEL' in row['gate_pending']['question']
+        assert 'gated pk=' + PK + ': material-assent: human inspection required' in gated_lines[0]
+        assert 'OWNER_VISIBLE_LOG_SENTINEL' not in log_output
+        assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text for text in ordinary)
+    else:
+        assert 'OTHER_GATE_SENTINEL' in ordinary[0]
+        assert 'OTHER_GATE_SENTINEL' in gated_lines[0]
 
 
 @pytest.mark.parametrize('option', [

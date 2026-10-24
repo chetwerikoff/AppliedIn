@@ -1833,3 +1833,38 @@ def test_issue164_visible_bframe_keeps_challenge_precedence(reader):
     assert any(f['status']=='visible-recaptcha' for f in page['entry']['frames'])
     with pytest.raises(forms.CaptchaGate):
         forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader', ['entry','greenhouse'])
+def test_issue164_suffix_is_entry_only_not_greenhouse_applicant_census(reader):
+    from tools import browser_skill_dom
+    script=(forms.ENTRY_PAGE if reader=='entry' else browser_skill_dom.GREENHOUSE_PAGE)
+    opener='(() => {\n'
+    assert script.startswith(opener)
+    script=script.replace(opener,opener+"""
+  {
+    const owned=document.querySelector('form');
+    const field=node('input',{id:'ordinary-suffix',type:'text',
+      name:'g-recaptcha-response-123'},owned);
+    field.value='synthetic';
+  }
+""",1)
+    page=dom(dict(url=entry('ashby'),root=True),script)
+    control_names={c.get('name') for c in page['controls']}
+    if reader=='greenhouse':
+        assert 'g-recaptcha-response-123' in control_names
+        assert page['greenhouse']['response_controls'] is False
+    else:
+        assert 'g-recaptcha-response-123' not in control_names
+        assert page['entry']['response_error'] is True
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+def test_issue164_invalid_reserved_suffix_fails_before_throwing_value_getter(reader):
+    page=_issue164_reader(reader,response=True,variant='invalid-suffix')
+    assert page['entry']['response_error'] is True
+    assert 'invalid-reserved-name' in page['entry']['responses'][0]['diagnostic']['issues']
+    assert not any(c.get('name','').startswith('g-recaptcha-response')
+                   for c in page['controls'])
+    with pytest.raises(forms.Gate):
+        forms._entry_safety(page,lambda u:u==entry('ashby'),None)

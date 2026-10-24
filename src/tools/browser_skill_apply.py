@@ -3191,8 +3191,18 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
     witnessed = None
     opened = False
     try:
-        await _effect_call(session, 'click', selector)
-        opened = True
+        controller = getattr(session, '_application_controller', None)
+        if controller is None:
+            controller = getattr(getattr(session, 'raw', None),
+                                 '_application_controller', None)
+        if controller is not None:
+            controller._material_witness_request = selector
+        try:
+            await _effect_call(session, 'click', selector)
+            opened = True
+        finally:
+            if controller is not None:
+                controller._material_witness_request = None
         for attempt in range(20):
             current_page, current_witness = await _observe_controls(
                 session, await session.page())
@@ -4422,6 +4432,7 @@ class ApplicationIPCController:
         self.upload_pending = False
         self.committed = False
         self._material_witness_selector = None
+        self._material_witness_request = None
         self.expected_digest = None
         if self.resume_path and Path(self.resume_path).is_file():
             self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
@@ -4696,7 +4707,8 @@ class ApplicationIPCController:
             if (_material_assent_match(label(target))
                     and (target.get('combobox') or {}).get('linked') is False):
                 combo = target.get('combobox') or {}
-                if (combo.get('options') not in (None, [])
+                if (self._material_witness_request != selector
+                        or combo.get('options') not in (None, [])
                         or combo.get('link_id') not in ('', None)
                         or combo.get('listbox_selector') not in ('', None)
                         or target.get('commits_application')

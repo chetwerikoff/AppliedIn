@@ -342,6 +342,8 @@ _CONTROL_CALLERS = frozenset({
     'combobox-observe',
     'combobox-open',
     'combobox-options',
+    'material-witness-open',
+    'material-witness-close',
     'combobox-verify',
     'execute-formless',
     'execute-initial',
@@ -3216,7 +3218,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
                     or (provenance is not None and not _preparation_current(
                         provenance, fixture_context=fixture_context))):
                 raise Gate('The picker origin or current tracked posting changed.')
-            current = control(current_page, action, 'combobox-options')
+            current = control(current_page, action, 'material-witness-open')
             if (any(current.get(k) != value for k, value in stable.items())
                     or current_witness.get(selector, {}).get('visible') is not True):
                 raise Gate('The material picker control changed while opening.')
@@ -3238,7 +3240,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
             # A witness never dismisses the listbox by choosing an option.
             await _effect_call(session, 'press', 'Escape')
     closed_page, _ = await _observe_controls(session, await session.page())
-    closed = control(closed_page, action, 'combobox-options')
+    closed = control(closed_page, action, 'material-witness-close')
     if (not _preparation_destination_allowed(
             closed_page['url'], *origins, provenance=provenance)
             or (provenance is not None and not _preparation_current(

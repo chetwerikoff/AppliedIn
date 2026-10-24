@@ -1970,9 +1970,10 @@ def test_entry_reader_redirect_is_typed_and_bounded(ats):
 def test_greenhouse_reader_redirect_is_typed_and_bounded():
     from tools.claude_chrome import GreenhouseJobAlias
     tracked = 'https://boards.greenhouse.io/example-co/jobs/123456'
-    proof = GreenhouseJobAlias('example-co#123456', COMPANY, tracked,
-                               'example-co', '123456',
-                               'https://job-boards.greenhouse.io/example-co/jobs/123456')
+    proof = GreenhouseJobAlias(
+        'example-co#123456', COMPANY, '123456', 'greenhouse',
+        tracked, tracked, 'example-co',
+        'https://job-boards.greenhouse.io/example-co/jobs/123456')
     target = 'https://foreign.example.test/other-job?job=QUERY_SENTINEL'
     with pytest.raises(forms.NavigationProvenanceGate) as caught:
         forms._greenhouse_safety(

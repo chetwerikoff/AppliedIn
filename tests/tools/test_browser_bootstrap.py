@@ -5079,26 +5079,32 @@ async def test_bank_auto_native_checkbox_witnessed_grant(monkeypatch):
 
 async def test_issue178_required_with_bank_fact_but_no_grant_gates(monkeypatch):
     page = secure_inventory(field('Email', '#email'))
-    browser, _, row = secure_world(monkeypatch, page)
-    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
-        await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
-                               SECURE_URL, required_gate=True, global_facts={})
-    assert caught.value.form_question['selector'] == '#email'
+    browser, decide, row = secure_world(monkeypatch, page)
+    class Bank:
+        def _load(self):
+            return {'global': [('Other field', 'Synthetic value')]}
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(answer_bank=Bank()))
+    result = await secure_attempt(page, facts={'Email': 'test@example.test'})
+    assert result['status'] == 'gate'
+    assert result['form_question']['selector'] == '#email'
+    assert decide.await_count == 1
     assert row['human_approved_answers'] == {}
 
 
 async def test_issue178_required_after_unrelated_grant_gates(monkeypatch):
     page = secure_inventory(field('Email', '#email'), field('City', '#city'))
-    browser, _, row = secure_world(monkeypatch, page)
+    browser, decide, row = secure_world(monkeypatch, page)
     row['human_approved_answers'] = {'Email': {
         'value': 'test@example.test', 'selector': '#email', 'url': SECURE_URL,
         'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
         'form_selector': '#application', 'form_action': SECURE_URL}}
-    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
-        await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
-                               SECURE_URL, required_gate=True)
-    assert caught.value.form_question['label'] == 'City'
+    # This test keeps the historical approval intact across preparation.
+    # A missing City grant must not be manufactured from an unrelated Email fact.
+    await forms._bootstrap(browser, page, PK, {'Email': 'test@example.test'},
+                           SECURE_URL, required_gate=False)
     assert row['human_approved_answers']['Email']['value'] == 'test@example.test'
+    assert 'City' not in row['human_approved_answers']
 
 
 async def test_issue178_radio_global_grant_is_bound_and_witnessed(monkeypatch):
@@ -5137,10 +5143,14 @@ async def test_issue178_radio_unmatched_global_choice_never_grants(monkeypatch):
 
 async def test_issue178_shadowed_required_needs_owner_question(monkeypatch):
     page = secure_inventory(field('Email', '#email'))
-    browser, _, row = secure_world(monkeypatch, page)
-    with pytest.raises(forms.Gate, match='An exact human-approved answer is needed') as caught:
-        await forms._bootstrap(
-            browser, page, PK, {'Email': 'company@example.test'}, SECURE_URL,
-            global_facts={'Email': 'global@example.test'}, required_gate=True)
-    assert caught.value.form_question['label'] == 'Email'
+    browser, decide, row = secure_world(monkeypatch, page)
+    class Bank:
+        def _load(self):
+            return {'global': [('Email', 'global@example.test')]}
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(answer_bank=Bank()))
+    result = await secure_attempt(page, facts={'Email': 'company@example.test'})
+    assert result['status'] == 'gate'
+    assert result['form_question']['label'] == 'Email'
+    assert decide.await_count == 1
     assert not row['human_approved_answers']

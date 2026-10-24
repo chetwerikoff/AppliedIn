@@ -3906,7 +3906,12 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not (settlement_route and history) and not any(
+    optional_bank_candidate = bool(global_facts) and any(
+        c.get('in_form') and not c.get('required')
+        and not c.get('disabled') and not c.get('has_value')
+        and _fact_key(global_facts, c.get('question') or c.get('label') or '') is not None
+        for c in page['controls'])
+    if not candidate and not optional_bank_candidate and not (settlement_route and history) and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('in_form') and _material_form_choice(c))
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
@@ -3939,31 +3944,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
                             *origins, provenance=provenance,
                             fixture_context=fixture_context)
-    if required_gate:
-        grants = (_row(pk, fixture_context=fixture_context)
-                  if fixture_context is not None else _row(pk)).get(
-                      'human_approved_answers') or {}
-        for pending in page['controls']:
-            if (not pending.get('in_form') or not pending.get('required')
-                    or pending.get('disabled') or not _unanswered(page, pending)
-                    or not (_native_answer(pending) or pending.get('type')
-                            in {'radio', 'checkbox', 'combobox'})):
-                continue
-            try:
-                question = _disclosure_question(
-                    page, pending, witness, *origins, bootstrap=True,
-                    provenance=provenance)
-                key = question['label']
-            except Gate:
-                continue
-            previous = grants.get(key) if isinstance(grants, dict) else None
-            if isinstance(previous, dict):
-                continue
-            # An unapproved bank value is data, never a row-bound grant.
-            # Resolve the owner question regardless of global/company facts.
-            question['pk'] = pk
-            raise Gate(f'An exact human-approved answer is needed for "{key}".',
-                       form_question=question, reason='owner_question')
+    # Native owner questions cannot supersede site/entry and controller
+    # prerequisite decisions merely because an input is empty. The model
+    # refusal fallback remains narrow until the independent route checks
+    # complete, and the final controller remains the submission authority.
     # Earlier reversible writes may be temporarily reset by later pickers.
     # The complete current form and all receipts are checked only at Submit.
     seen = set()

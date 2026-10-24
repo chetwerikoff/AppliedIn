@@ -1694,6 +1694,12 @@ _GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
 
 
 def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=False):
+    # Once the guarded raw click has run, observations are passive. A success
+    # document can have no application root, foreign URL, unknown frame or
+    # response controls. These cannot authorize success: the independent
+    # _fresh_confirmed_outcome route/phrase/current-provenance checks still do.
+    if submitted:
+        return
     if not isinstance(provenance, GreenhouseJobAlias):
         raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
     if not isinstance(page, dict):

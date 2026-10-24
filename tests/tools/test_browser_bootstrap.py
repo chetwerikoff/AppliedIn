@@ -794,15 +794,27 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
-                  tag='input', type=kind, required=False,
-                  checked=True, has_value=True, name='attestation')
-    forms._bootstrap_wall(inventory(bound, submit()), {}, URL)
+                  tag='input', type=kind, required=True,
+                  checked=True, has_value=True, name='attestation',
+                  question='Arbitration consent' if kind == 'radio' else '',
+                  value='accept')
+    members = [bound]
+    if kind == 'radio':
+        members.append(field(
+            'I decline', '#decline-choice', tag='input', type='radio',
+            required=True, checked=False, has_value=True, name='attestation',
+            question='Arbitration consent', value='decline'))
+    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
 
 
 async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
-    radio = field('Arbitration consent', '#legal', tag='input', type='radio',
-                  name='legal', question='Arbitration consent', required=True)
-    page = secure_inventory(field(), radio)
+    radio = field('Accept', '#legal-yes', tag='input', type='radio',
+                  name='legal', question='Arbitration consent', required=True,
+                  value='yes', has_value=True)
+    declined = field('Decline', '#legal-no', tag='input', type='radio',
+                     name='legal', question='Arbitration consent', required=True,
+                     value='no', has_value=True)
+    page = secure_inventory(field(), radio, declined)
     browser, decide, _ = secure_world(monkeypatch, page)
     report = await secure_attempt(page)
 

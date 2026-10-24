@@ -261,8 +261,13 @@ async def test_unchanged_caller_persists_pre_submit_captcha_gate(monkeypatch, ca
     monkeypatch.setattr(events, "emit", lambda kind, **kw: emitted.append((kind, kw)))
 
     import logging
-    with caplog.at_level(logging.INFO):
-        consumed = await run._apply_direct(PK, stores)
+    # get_logger sets propagate=False: root-only caplog would prove nothing.
+    run.log.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=run.log.name):
+            consumed = await run._apply_direct(PK, stores)
+    finally:
+        run.log.removeHandler(caplog.handler)
     expected = {"result": "gated", "pk": PK, "question": result["question"]}
     if case == "entry-response":
         expected["captcha_artifact_diagnostic"] = True
@@ -273,6 +278,7 @@ async def test_unchanged_caller_persists_pre_submit_captcha_gate(monkeypatch, ca
     assert tracking.row["gate_pending"]["question"] == result["question"]
     assert not any(kind == "captcha_wait" for kind, _ in emitted)
     if case == "entry-response":
+        assert "captcha-artifact: human inspection required" in caplog.text
         assert "OWNER_GATE_ONLY_SENTINEL" not in caplog.text
         assert "OWNER_GATE_ONLY_SENTINEL" not in repr(emitted)
         assert any(kind == "gate" and details["detail"] ==
@@ -382,8 +388,12 @@ def test_queued_captcha_artifact_logs_only_neutral_detail(monkeypatch, caplog):
     monkeypatch.setattr(run, "make_stores", lambda: object())
     monkeypatch.setattr(run, "_apply_direct", fake_direct)
     q = Queue()
-    with caplog.at_level(logging.INFO):
-        result = run.run_queued({"pk": PK}, q)
+    run.log.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=run.log.name):
+            result = run.run_queued({"pk": PK}, q)
+    finally:
+        run.log.removeHandler(caplog.handler)
     assert result == record
     assert q.done_items == [{"pk": PK}]
     assert sentinel not in caplog.text

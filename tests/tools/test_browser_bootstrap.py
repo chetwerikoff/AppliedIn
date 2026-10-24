@@ -4966,8 +4966,7 @@ def test_every_production_observe_controls_caller_names_its_site():
         else:
             assert isinstance(kw, ast.Constant) and isinstance(kw.value, str) and kw.value
             literal_sites.append(kw.value)
-    assert {'bootstrap-formless', 'bootstrap-material', 'execute',
-            'execute-readback'} <= set(literal_sites)
+    assert {'execute', 'execute-readback'} <= set(literal_sites)
     assert len(literal_sites) >= 19
     # Bootstrap uses a two-positional-argument seam required by existing
     # synthetic submission guards; its scoped wrapper still owns fixed sites.

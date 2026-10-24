@@ -719,7 +719,9 @@ def _preparation_destination_allowed(href: str, *origins: str,
     # Existing same-route readers also serve offline HTTP loopback fixtures.
     # The application IPC producer independently requires a safe HTTPS origin;
     # observation compatibility cannot authorize a private write or submission.
-    return _preparation_origin(href, source) or (
+    # Local fixture loopback remains observable, but an unrelated ATS host
+    # cannot become job authority simply by being a recognized provider.
+    return navigation_allowed(href, source) or _preparation_origin(href, source) or (
         provenance is not None and navigation_allowed(href, provenance=provenance))
 
 

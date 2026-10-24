@@ -2030,7 +2030,7 @@ def test_legacy_host_admission_cannot_authorize_cross_tenant_effect():
     tracked = 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc'
     other = 'https://jobs.lever.co/other-co/12345678-1234-4234-8234-123456789abc/apply'
     valid = tracked + '/apply'
-    assert forms._preparation_origin(other, tracked)
+    assert not forms._preparation_origin(other, tracked)
     assert not forms._job_preparation_route(other, tracked)
     assert not forms._preparation_destination_allowed(other, tracked)
     assert forms._job_preparation_route(valid, tracked)

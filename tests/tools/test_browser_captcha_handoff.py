@@ -160,8 +160,15 @@ async def synthetic_controller(monkeypatch, case, *, url=URL, prior_button=None)
     assert calls == [("navigate", url)]
     assert result["status"] == "gate"
     assert result["question"] and URL in result["question"]
-    assert result["step"]["url"] == (
-        URL if result.get("captcha_artifact_diagnostic") else url)
+    if case in {"entry-response", "entry-unknown"}:
+        # These production safety paths raise CaptchaArtifactGate, not an
+        # ordinary Gate: the direct caller must receive the typed diagnostic.
+        assert result.get("captcha_artifact_diagnostic") is True
+        assert result["step"]["url"] == URL
+    else:
+        assert result.get("captcha_artifact_diagnostic") is not True
+        assert result["step"]["url"] == forms.handoff(
+            "", {"url": url})["step"]["url"]
     if case == "control":
         # ControlGate clears stale button metadata, retaining code-owned diagnostics.
         assert result["step"]["last_button"] == ""

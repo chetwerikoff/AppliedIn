@@ -1685,8 +1685,12 @@ _GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
 def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=False):
     if not isinstance(provenance, GreenhouseJobAlias):
         raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
-    if not isinstance(page, dict) or not allowed(page.get('url', '')):
-        raise Gate('Greenhouse route or current row/config changed; inspect manually.')
+    if not isinstance(page, dict):
+        raise Gate('The current form control inventory is malformed.')
+    if not allowed(page.get('url', '')):
+        raise _navigation_gate(
+            'Greenhouse route or current row/config changed; inspect manually.',
+            provenance.wrapper, page.get('url'), provenance=provenance)
     observed = page.get('greenhouse')
     if not isinstance(observed, dict) or not isinstance(observed.get('frames'), list):
         raise Gate('The current form control inventory is malformed.')
@@ -2065,7 +2069,10 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
     if not isinstance(page, dict):
         raise Gate('The current form control inventory is malformed.')
     if not allowed(page.get('url', '')):
-        raise Gate('Application entry route or current row/config changed; inspect manually.')
+        raise _navigation_gate(
+            'Application entry route or current row/config changed; inspect manually.',
+            provenance.wrapper if isinstance(provenance, ApplicationEntryProvenance)
+            else '', page.get('url'), provenance=provenance)
     controls = page.get('controls')
     if (not isinstance(controls, list) or any(not isinstance(c, dict) or
             not isinstance(c.get('selector'), str) or not c['selector']
@@ -2324,9 +2331,13 @@ class _EntrySession:
                 # only passive confirmation reads are allowed: the form may
                 # disappear before independent confirmation can be observed.
                 entry = page.get('entry') if isinstance(page, dict) else None
+                if not self.allowed(page.get('url', '')):
+                    raise _navigation_gate(
+                        'Post-click application entry changed origin.',
+                        self.provenance.wrapper, page.get('url'),
+                        provenance=self.provenance)
                 if (not isinstance(entry, dict)
                         or not isinstance(entry.get('frames'), list)
-                        or not self.allowed(page.get('url', ''))
                         or entry.get('response_error') or entry.get('helper_challenge')):
                     raise Gate('Post-click application evidence is unavailable or changed.')
                 for frame in entry['frames']:
@@ -2411,8 +2422,12 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
             # Offline command spies still expose the existing fixed reader.
             result = await raw_session.call('evaluate', ENTRY_PAGE)
             page = result.get('value') if isinstance(result, dict) else None
-        if not isinstance(page, dict) or not allowed(page.get('url', '')):
-            raise Gate('Reversible preparation must remain on an approved origin.')
+        if not isinstance(page, dict):
+            raise Gate('Reversible preparation page observation is unavailable.')
+        if not allowed(page.get('url', '')):
+            raise _navigation_gate(
+                'Reversible preparation must remain on an approved origin.',
+                provenance.wrapper, page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
         return raw_session, page
 

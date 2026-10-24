@@ -1949,7 +1949,9 @@ def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
                         .replace('BFRAME_INDEX',str(shape+1))
                         .replace('VARIANT',repr(variant).replace("'",'"')))
     script=script.replace(opener,opener+injection,1)
-    return dom(dict(url=entry('ashby'),root=resolved,formless=not resolved,
+    # A resolved root uses the proven Ashby three-child structural receiver;
+    # a generic native form would introduce an unrelated, unproved action URL.
+    return dom(dict(url=entry('ashby'),root=False,formless=True,
                     missingPane=not resolved,frames=['R']),script)
 
 
@@ -1967,6 +1969,8 @@ def test_issue174_hidden_pair_root_independent(reader,shape,resolved):
     assert frames[0]['srcdoc']==frames[1]['srcdoc']=='absent'
     if not resolved:
         assert all(f['root']=='' and f['outside'] is False for f in frames)
+    else:
+        assert page['entry']['formless']['root']=='#application-root'
     forms._entry_safety(page,lambda u:u==entry('ashby'),None)
 
 

@@ -398,6 +398,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
                          prepare_only: bool = False) -> dict:
     """Settle the actual admitted TAILORING generation, never an old FOUND row."""
     from tools.jd import PostingReadUnavailable
+
     try:
         jd_meta = await _jd_meta(row)
         jd_text = jd_meta["text"]
@@ -796,7 +797,8 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
         except Exception as exc:
             # Do not let the caller's unconditional generic ERROR catch turn a
             # late storage fault into an overwrite of a human terminal result.
-            _reader_storage_error(pk, stores, observed, exc)            continue
+            _reader_storage_error(pk, stores, observed, exc)
+            continue
         if committed:
             if url in gone:
                 closed += 1
@@ -1195,7 +1197,8 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
     if not row:
         return {"result": "missing_row", "pk": pk}
     status = row.get("status") or ""
-    if submit_hold.blocked(pk, row, tracking=stores.tracking):        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
+    if submit_hold.blocked(pk, row, tracking=stores.tracking):
+        return {'result': 'failed', 'pk': pk, 'reason': 'uncertain',
                 'detail': submit_hold.REASON}
     if status in _NO_RETAILOR:
         why = ("that application has already gone out — a fresh résumé under this "
@@ -1604,6 +1607,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         for q, a in drafted.items():
             from core.models import AnswerScope
             stores.answer_bank.put(q, a, AnswerScope.COMPANY, company=company, source='writer')
+
     status = result.get("status")
     # The durable pre-click marker outranks a transport return that says
     # "gate" or "unknown": the browser might already have committed a form.
@@ -2003,7 +2007,8 @@ def _score_gate(pk: str, score_result: Any, stores: Any) -> dict | None:
     score, reasoning = score_result.score, (score_result.reasoning + " " + original_text)
 
     # A schema-valid refusal is not evidence of a weak fit and must not be
-    # buried as low_score or consume the malformed-content correction.    if score <= 1 and re.search(
+    # buried as low_score or consume the malformed-content correction.
+    if score <= 1 and re.search(
             r"i'?m an ai|as an ai|i cannot|i can'?t|unable to (access|assist)"
             r"|don'?t have (a|any) (resume|r\u00e9sum\u00e9|personal)",
             reasoning, re.I):

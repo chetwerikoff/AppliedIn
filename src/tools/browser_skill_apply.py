@@ -1285,6 +1285,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       .map(id => document.getElementById(id)).filter(n => n && visible(n));
     const sources = labels.length ? labels : aria;
     return clean(sources.filter(n =>
+      // A partial synthetic witness cannot prove a rendered diagnostic label.
+      typeof n.matches === 'function' && typeof n.querySelector === 'function' &&
       !n.matches('select,option,[role="option"],[role="listbox"]') &&
       !n.querySelector('select,option,[role="option"],[role="listbox"]'))
       .map(n => n.innerText).join(' ')).slice(0, 120);

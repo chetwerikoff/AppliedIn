@@ -1916,3 +1916,69 @@ def test_canonical_ats_job_binding_keeps_real_refusals_and_existing_entry():
                      entry(ats).replace('/example-co/', '/example%2dco/')):
             assert not forms.navigation_allowed(href, provenance=proof)
 
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_preparation_and_raw_ipc_reject_other_tenant_and_job_before_pdf(ats):
+    tracked = posting(ats)
+    good = entry(ats)
+    wrong_tenant = good.replace('/example-co/', '/other-co/')
+    wrong_job = good.replace(JOB, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, tracked, '', {}, {}, [], {}, lambda: None)
+    for destination in (wrong_tenant, wrong_job):
+        assert not forms._preparation_origin(destination, tracked)
+        assert not forms._preparation_destination_allowed(destination, tracked)
+        with pytest.raises(forms.Gate, match='proven same-job'):
+            guard._fresh_preparation(destination)
+    assert forms._preparation_origin(good, tracked)
+    assert forms._preparation_destination_allowed(good, tracked)
+
+
+def test_custom_origin_cannot_borrow_foreign_ats_host_for_pdf():
+    tracked = 'https://careers.example-co.test/jobs/123456'
+    foreign = ('https://jobs.ashbyhq.com/other-co/'
+               'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application')
+    assert not forms._preparation_origin(foreign, tracked)
+    assert not forms._preparation_destination_allowed(foreign, tracked)
+    assert forms._preparation_origin(tracked, tracked)
+    # Raw upload verifies this route before considering any private receiver.
+    guard = forms.ApplicationIPCController(
+        'example-co#123456', COMPANY, tracked, '', {}, {}, [], {}, lambda: None)
+    with pytest.raises(forms.Gate, match='proven same-job'):
+        guard._fresh_preparation(foreign)
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_entry_reader_redirect_is_typed_and_bounded(ats):
+    tracked = posting(ats)
+    proof = forms.ApplicationEntryProvenance(
+        PK, COMPANY, ats, JOB, tracked, 'example-co', entry(ats))
+    target = ('https://foreign.example.test/other-job'
+              '?job=QUERY_SENTINEL#FRAGMENT_SENTINEL')
+    page = application(ats)
+    page['url'] = target
+    with pytest.raises(forms.NavigationProvenanceGate) as caught:
+        forms._entry_safety(page, lambda u: forms._preparation_origin(u, tracked), proof)
+    detail = str(caught.value)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'destination host/path: foreign.example.test/other-job' in detail
+    assert 'QUERY_SENTINEL' not in detail
+    assert 'FRAGMENT_SENTINEL' not in detail
+
+
+def test_greenhouse_reader_redirect_is_typed_and_bounded():
+    from tools.claude_chrome import GreenhouseJobAlias
+    tracked = 'https://boards.greenhouse.io/example-co/jobs/123456'
+    proof = GreenhouseJobAlias('example-co#123456', COMPANY, tracked,
+                               'example-co', '123456',
+                               'https://job-boards.greenhouse.io/example-co/jobs/123456')
+    target = 'https://foreign.example.test/other-job?job=QUERY_SENTINEL'
+    with pytest.raises(forms.NavigationProvenanceGate) as caught:
+        forms._greenhouse_safety(
+            {'url': target},
+            lambda u: forms._preparation_origin(u, tracked), proof)
+    detail = str(caught.value)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'destination host/path: foreign.example.test/other-job' in detail
+    assert 'QUERY_SENTINEL' not in detail

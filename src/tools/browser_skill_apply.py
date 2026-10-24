@@ -307,6 +307,10 @@ class Gate(ValueError):
         self.form_question = form_question
         self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
 
+class MaterialAssentGate(Gate):
+    """Code-issued material Gate: its verbose label is owner detail, not telemetry."""
+
+
 class CaptchaGate(Gate):
     """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
 
@@ -1272,6 +1276,19 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       .map(n=>n.innerText).join(' ');
     return clean(labels || aria);
   };
+  // PAGE.label may be a name/ARIA fallback or native select option captions.
+  // Only independently visible labeling nodes are diagnostic evidence.
+  const diagnosticVisibleLabel = e => {
+    if (!visible(e) || (e.tagName === 'INPUT' && e.type === 'hidden')) return '';
+    const labels = Array.from(e.labels || []).filter(n => n && visible(n));
+    const aria = (e.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id => document.getElementById(id)).filter(n => n && visible(n));
+    const sources = labels.length ? labels : aria;
+    return clean(sources.filter(n =>
+      !n.matches('select,option,[role="option"],[role="listbox"]') &&
+      !n.querySelector('select,option,[role="option"],[role="listbox"]'))
+      .map(n => n.innerText).join(' ')).slice(0, 120);
+  };
   // Standalone fixed reads cannot borrow the entry reader's Ashby bindings.
   const fixedAshbyNative = location.protocol==='https:' &&
     location.hostname==='jobs.ashbyhq.com';
@@ -1371,6 +1388,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           })())} : {}),
         visible_text:type === 'radio' || type === 'checkbox' ||
           (type === 'combobox' && e.tagName === 'INPUT') ? visibleText(e) : '',
+        diagnostic_visible_label:diagnosticVisibleLabel(e),
         options:e.options ? Array.from(e.options)
           .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
         combobox:type === 'combobox' ? {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
@@ -2914,10 +2932,20 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
         if c.get('in_form'):
             assent_match = _MATERIAL_ASSENT.search(subject)
             if assent_match or _material_select_options(c):
-                raise Gate(
+                # PAGE.label can come from non-visible names or option captions.
+                # The independent witness identifies real rendered labeling text.
+                proof = witness.get(c.get('selector'))
+                visible_label = 'unavailable'
+                if (isinstance(proof, dict) and proof.get('visible') is True
+                        and proof.get('type') == c.get('type')
+                        and proof.get('tag') == c.get('tag')
+                        and isinstance(proof.get('diagnostic_visible_label'), str)
+                        and proof['diagnostic_visible_label'].strip()):
+                    visible_label = proof['diagnostic_visible_label'][:120]
+                raise MaterialAssentGate(
                     'Material assent outside a bound choice needs human inspection. '
                     f"Control type: {c.get('type')}; tag: {c.get('tag')}; "
-                    f"visible label: {c.get('label', '')[:120]!r}; "
+                    f"visible label: {visible_label!r}; "
                     f"matched: {assent_match.group(0) if assent_match else 'select options'}.")
 
 
@@ -4740,11 +4768,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'transport and original-tab retention have not been verified. '
                     'The operator must establish both before any same-session '
                     'correction; do not requeue or submit automatically.')
-            return {'status': 'gate',
-                    'reason': 'captcha' if isinstance(exc, CaptchaGate) else exc.reason,
-                    'review_route': route,
-                    'question': context['text'], 'step': context['step'],
-                    'form_question': exc.form_question}
+            report = {'status': 'gate',
+                      'reason': 'captcha' if isinstance(exc, CaptchaGate) else exc.reason,
+                      'review_route': route,
+                      'question': context['text'], 'step': context['step'],
+                      'form_question': exc.form_question}
+            if isinstance(exc, MaterialAssentGate):
+                report['material_assent_diagnostic'] = True
+            return report
         if submitted:
             context = handoff(
                 'Submission outcome uncertain after a browser interruption. '

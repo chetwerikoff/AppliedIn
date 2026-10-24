@@ -1638,8 +1638,14 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
                                        "review_route": review_route or "hard_refusal"},
                                    gate_call_id="direct" if review_route == "owner" else None,
                                    gate_source="applier")
-        emit("gate", pk=pk, agent="applier", detail=q, url=jd_url)
-        log.info("gated pk=%s: %s", pk, q)
+        # The full independently witnessed diagnostic is kept for the owner.
+        # Ordinary events and daemon logs must not echo page-controlled labels.
+        routine_detail = (
+            "material-assent: human inspection required"
+            if (configuration()['engine'] == 'browser_skill'
+                and result.get('material_assent_diagnostic') is True) else q)
+        emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
+        log.info("gated pk=%s: %s", pk, routine_detail)
         return {"result": "gated", "pk": pk, "question": q}
     reason = _fail_reason(result)
     # A browser held by something else is an ENVIRONMENT fault, not a verdict on

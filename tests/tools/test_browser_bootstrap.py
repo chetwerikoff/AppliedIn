@@ -55,8 +55,10 @@ def witness(page):
          'native_form_owner_selector': c.get('native_form_owner_selector', ''),
          'form_action': c.get('form_action', ''),
          'formaction': c.get('formaction', ''), 'disabled': c['disabled'],
-         'readonly': False, 'inert': False, 'visible': True,
+         'readonly': False, 'inert': False,
+         'visible': c.get('synthetic_visible', True),
          'visible_text': c['label'] if c.get('type') in {'radio', 'checkbox'} else '',
+         'diagnostic_visible_label': c.get('diagnostic_visible_label', ''),
          'options': deepcopy(c.get('options', []))}
         for c in page['controls']]}
 
@@ -745,7 +747,8 @@ async def test_material_assent_wall_reports_control_and_match_not_values(
                if cause in {'options', 'both'} else [])
     material = field(visible, '#assent', tag='select', type='select',
                      question=question, options=options,
-                     value='CONTROL_VALUE_SENTINEL', has_value=True)
+                     value='CONTROL_VALUE_SENTINEL', has_value=True,
+                     diagnostic_visible_label=visible)
     page = secure_inventory(field(), material)
     browser, decide, row = secure_world(monkeypatch, page)
     report = await secure_attempt(page, facts={
@@ -776,7 +779,8 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
     visible_prefix = prefix + 'x' * (120 - len(prefix))
     tail = 'TRUNCATED_LABEL_TAIL_SENTINEL'
     page = secure_inventory(field(), field(
-        visible_prefix + tail, '#long-material', required=False))
+        visible_prefix + tail, '#long-material', required=False,
+        diagnostic_visible_label=visible_prefix + tail))
     browser, decide, _ = secure_world(monkeypatch, page)
     report = await secure_attempt(page)
 
@@ -850,6 +854,172 @@ async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch)
     assert row['status'] == 'submitting'
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+
+
+def _material_readers_with_synthetic_dom(edit):
+    """Two actual production readers over one offline synthetic DOM shape."""
+    from tests.tools.test_browser_application_entry import dom
+    from tools.browser_skill_dom import PAGE
+    opener = '(() => {\n'
+    assert PAGE.startswith(opener) and forms._FIXED_CONTROL_WITNESS.startswith(opener)
+    spec = {'url': SECURE_URL}
+    return (dom(spec, PAGE.replace(opener, opener + edit, 1)),
+            dom(spec, forms._FIXED_CONTROL_WITNESS.replace(opener, opener + edit, 1)))
+
+
+@pytest.mark.parametrize('kind', ['hidden-name', 'select-options', 'visible-label'])
+async def test_actual_readers_supply_only_proven_visible_material_label(kind):
+    if kind == 'hidden-name':
+        edit = """
+          const e = document.getElementById('email');
+          e.setAttribute('type', 'hidden');
+          e.setAttribute('name', 'consent-HIDDEN_NAME_SENTINEL');
+          e.getClientRects = () => [];
+          node('input', {id:'required-other', type:'text', required:true},
+               document.getElementById('application-form'));
+        """
+        match, unsafe = 'consent', 'HIDDEN_NAME_SENTINEL'
+    elif kind == 'select-options':
+        edit = """
+          const e = document.getElementById('email');
+          e.tagName = 'SELECT'; e.localName = 'select';
+          e.removeAttribute('type'); e.type = ''; e.required = true;
+          const option = node('option',
+            {text:'Privacy consent OPTION_CAPTION_SENTINEL'}, e);
+          option.value = 'OPTION_VALUE_SENTINEL';
+          e.options = [option];
+        """
+        match, unsafe = 'Privacy', 'OPTION_CAPTION_SENTINEL'
+    else:
+        edit = """
+          const e = document.getElementById('email');
+          e.required = true;
+          node('label', {'for':'email',
+            text:'I agree to terms ' + 'x'.repeat(140) + 'VISIBLE_TAIL_SENTINEL'},
+            document.getElementById('application-form'));
+        """
+        match, unsafe = 'agree', 'VISIBLE_TAIL_SENTINEL'
+    page, independent = _material_readers_with_synthetic_dom(edit)
+    original = next(c for c in page['controls'] if c['selector'] == '#email')
+    observed = next(c for c in independent['controls'] if c['selector'] == '#email')
+    assert unsafe in original['label']
+    if kind == 'hidden-name':
+        assert original['type'] == 'hidden'
+        assert observed['visible'] is False
+    elif kind == 'select-options':
+        assert original['tag'] == 'select'
+        assert 'OPTION_VALUE_SENTINEL' in str(original['options'])
+        assert observed['diagnostic_visible_label'] == ''
+    else:
+        assert original['tag'] == 'input'
+        assert observed['visible'] is True
+        assert observed['diagnostic_visible_label'].startswith('I agree to terms ')
+
+    class OfflineReaderSession:
+        async def call(self, operation, script):
+            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
+            return {'value': deepcopy(independent)}
+
+        async def page(self):
+            return deepcopy(page)
+
+    with pytest.raises(forms.MaterialAssentGate) as denial:
+        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    detail = str(denial.value)
+    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
+    assert f'matched: {match}.' in detail
+    assert unsafe not in detail
+    assert 'OPTION_VALUE_SENTINEL' not in detail
+    if kind == 'visible-label':
+        assert "visible label: 'I agree to terms " in detail
+        assert 'x' * (120 - len('I agree to terms ')) in detail
+    else:
+        assert "visible label: 'unavailable';" in detail
+    assert denial.value.reason == 'unknown_field'
+
+
+@pytest.mark.parametrize('material', [True, False])
+async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
+        monkeypatch, caplog, material):
+    """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
+    from agent import run
+
+    label = 'I agree to terms OWNER_VISIBLE_LOG_SENTINEL'
+    page = secure_inventory(field(), field(
+        label, '#material', required=False,
+        diagnostic_visible_label=label)) if material else secure_inventory(field())
+    _, decide, _ = secure_world(monkeypatch, page)
+    if not material:
+        decide.return_value = {
+            'action': 'gate', 'question': 'Synthetic OTHER_GATE_SENTINEL'}
+    gate = await secure_attempt(page)
+    assert gate['status'] == 'gate'
+    assert ('OWNER_VISIBLE_LOG_SENTINEL' in gate['question']) is material
+    assert (gate.get('material_assent_diagnostic') is True) is material
+
+    row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return dict(row)
+
+        def get_current(self, pk):
+            assert pk == PK
+            return dict(row)
+
+        def set_status(self, pk, status, **updates):
+            assert pk == PK
+            row.update(status=getattr(status, 'value', status), **updates)
+
+    stores = SimpleNamespace(
+        tracking=Tracking(), secrets=None,
+        answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+    events = []
+    monkeypatch.setattr('core.events.emit',
+                        lambda kind, **kwargs: events.append((kind, kwargs)))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
+        return_value={'text': 'Synthetic offline job description'}))
+    monkeypatch.setattr(run, '_commit_posting_meta',
+                        lambda pk, current, meta, stores: dict(current))
+    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
+    monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
+    monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
+    monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
+    monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
+    monkeypatch.setattr('tools.credentials.get_login', lambda *a, **kw: None)
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Synthetic.pdf')
+    monkeypatch.setattr(
+        run, 'get_settings', lambda: SimpleNamespace(browser_model='offline'))
+    monkeypatch.setattr(
+        'tools.browser_runtime.configuration', lambda: {'engine': 'browser_skill'})
+    fake_apply = AsyncMock(return_value=gate)
+    monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
+
+    with caplog.at_level('INFO', logger=run.log.name):
+        result = await run._apply_direct(PK, stores)
+    assert fake_apply.await_count == 1
+    assert result['result'] == 'gated' and result['question'] == gate['question']
+    assert row['status'] == 'needs_human'
+    assert row['gate_pending']['question'] == gate['question']
+    assert row['gate_pending']['review_route'] == 'agent_unavailable'
+    assert row['gate_reason'] == 'unknown_field'
+    ordinary = [args['detail'] for event, args in events if event == 'gate']
+    assert ordinary == (['material-assent: human inspection required']
+                        if material else [gate['question']])
+    lines = [record.getMessage() for record in caplog.records
+             if record.name == run.log.name]
+    assert any('gated pk=' in text for text in lines)
+    assert any(ordinary[0] in text for text in lines)
+    if material:
+        assert 'OWNER_VISIBLE_LOG_SENTINEL' in row['gate_pending']['question']
+        assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text
+                   for text in lines + ordinary)
+    else:
+        assert 'OTHER_GATE_SENTINEL' in ordinary[0]
 
 
 @pytest.mark.parametrize('option', [

@@ -6840,7 +6840,7 @@ function wire() {
         : "Skip this job"}? It moves to closed.`)) return;
       post(`/actions/skip/${encodeURIComponent(pk)}`);
       toast(st === "submitting" ? "Cancelled — moved to closed." : "Skipped.");
-    } else if (kind === "reopen" || kind === "mark-applied") {
+    } else if (kind === "reopen" || kind === "mark-applied" || kind === "queue-apply") {
       paneAction(kind, pk, act);
     } else if (kind === "skip") {
       post(`/actions/skip/${encodeURIComponent(pk)}`);

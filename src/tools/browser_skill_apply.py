@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 import ipaddress
 import socket
 import re
@@ -2720,9 +2721,16 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
-async def _observe_controls(session, page: dict, *, readiness: bool = False) -> tuple[dict, dict]:
+_EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
+
+
+async def _observe_controls(session, page: dict, *, readiness: bool = False,
+                            site: str = '', _identity_try: int = 1,
+                            _previous_identity=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
+    if not site and _EXECUTE_OBSERVATION_SITE.get():
+        site = 'execute'
     predicate, locator = 'unavailable', 'unavailable'
 
     def require(ok, key):
@@ -2794,7 +2802,21 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current, complete=False)
-        require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
+        identity = _page_identity(current)
+        same_read = identity == _page_identity(page)
+        if site and _identity_try > 1 and same_read:
+            return current, lookup
+        if site and _identity_try < 4 and (
+                not same_read or _identity_try > 1):
+            # Only the initial identity mismatch enables a bounded sequence of
+            # complete PAGE+witness rereads. Subsequent reads must agree twice.
+            await asyncio.sleep(0.25)
+            return await _observe_controls(
+                session, await session.page(), readiness=readiness,
+                site=site, _identity_try=_identity_try + 1,
+                _previous_identity=identity)
+        require(same_read and (not site or _identity_try == 1),
+                'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup
     except Gate:
@@ -2818,7 +2840,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False) -> 
         prefix = ('application form inventory read timed out/unavailable; '
                   if readiness and not isinstance(exc, (ValueError, asyncio.CancelledError)) else '')
         raise Gate(prefix + 'The current DOM witness is unavailable or changed; '
-                   f'exception={error}; predicate={predicate}; control={locator}') from None
+                   f'exception={error}; predicate={predicate}; control={locator}'
+                   + (f'; site={site}' if site else '')) from None
 
 
 def _radio_group(page: dict, target: dict) -> list[dict]:
@@ -3418,7 +3441,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
         await _effect_call(session, 'click', selector)
         for attempt in range(20):
             current_page, current_witness = await _observe_controls(
-                session, await session.page())
+                session, await session.page(), site='material-witness')
             if (not _preparation_destination_allowed(
                     current_page['url'], *origins, provenance=provenance)
                     or (provenance is not None and not _preparation_current(
@@ -3458,7 +3481,8 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
                 controller._material_witness_close_request = None
                 controller._material_witness_selector = None
                 controller._material_witness_target = None
-    closed_page, closed_witness = await _observe_controls(session, await session.page())
+    closed_page, closed_witness = await _observe_controls(
+        session, await session.page(), site='material-witness')
     closed = control(closed_page, action, 'material-witness-close')
     if (not _preparation_destination_allowed(
             closed_page['url'], *origins, provenance=provenance)
@@ -4263,6 +4287,15 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                if witnessed_options is not None else {})}
 
 
+async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
+    """Keep the legacy two-argument observation seam in execute()."""
+    token = _EXECUTE_OBSERVATION_SITE.set(True)
+    try:
+        return await _observe_controls(session, page)
+    finally:
+        _EXECUTE_OBSERVATION_SITE.reset(token)
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -4298,7 +4331,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_choice(target)
         else:
             _require_native_action(target, verb)
-        observed, witness = await _observe_controls(session, page)
+        observed, witness = await _execute_observe_controls(session, page)
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
                 or not _preparation_destination_allowed(observed.get('url', ''),
@@ -4411,7 +4444,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             else:
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _observe_controls(session, page)
+        latest, latest_witness = await _execute_observe_controls(session, page)
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_native_choice(current)
@@ -5140,7 +5173,8 @@ class ApplicationIPCController:
                                       else _FIXED_CONTROL_WITNESS)
                             return await session.call('evaluate', script)
                         raise Gate('Only the fixed control witness may be read.')
-                current, proof = await _observe_controls(RawWitnessReader(), page)
+                current, proof = await _observe_controls(
+                    RawWitnessReader(), page, site='material-resume-open')
                 matches = [c for c in current['controls']
                            if c.get('selector') == selector and not c.get('disabled')]
                 if len(matches) != 1:

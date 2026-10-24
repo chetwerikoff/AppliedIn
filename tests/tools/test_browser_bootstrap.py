@@ -4749,3 +4749,152 @@ def test_tracked_literal_origin_does_not_borrow_destination_policy(monkeypatch):
     forms._tracked_preparation_job(pk, company, url)
     assert not forms._preparation_origin(
         'https://jobs.ashbyhq.com/other-co/' + job, url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'material-resume-open', 'material-witness', 'execute',
+])
+async def test_identity_flaps_then_stabilizes_with_complete_witness(
+        monkeypatch, site):
+    import asyncio
+    base = inventory(field(), submit())
+    pages = [deepcopy(base) for _ in range(7)]
+    pages[1]['text'] = 'Different synthetic inventory'
+    # Identity changes are made in inventory-relevant properties, not prose.
+    pages[1]['controls'][0]['label'] = 'Changed initial receiver'
+    sequence = iter([pages[1], pages[2], pages[3], pages[4], pages[5]])
+    calls = []
+    class Flapping:
+        async def call(self, *args):
+            calls.append(('evaluate', args))
+            return {'value': witness(self.page_snapshot)}
+        async def page(self):
+            self.page_snapshot = next(sequence)
+            calls.append(('page', None))
+            return deepcopy(self.page_snapshot)
+    browser = Flapping()
+    browser.page_snapshot = base
+    slept = []
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    current, proof = await forms._observe_controls(browser, base, site=site)
+    assert current['controls'][0]['label'] == 'Email'
+    assert '#email' in proof
+    assert len(slept) <= 3
+    assert all(delay == 0.25 for delay in slept)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'material-resume-open', 'material-witness', 'execute',
+])
+async def test_identity_never_stabilizes_and_gates_with_literal_site(
+        monkeypatch, site):
+    base = inventory(field(), submit())
+    class Flapping:
+        reads = 0
+        async def call(self, *args):
+            return {'value': witness(self.last_page)}
+        async def page(self):
+            self.reads += 1
+            fresh = deepcopy(base)
+            fresh['controls'][0]['label'] = 'Synthetic version ' + str(self.reads)
+            self.last_page = fresh
+            return deepcopy(fresh)
+    browser = Flapping()
+    browser.last_page = base
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as exc:
+        await forms._observe_controls(browser, base, site=site)
+    assert 'predicate=inventory.identity.equal' in str(exc.value)
+    assert 'site=' + site in str(exc.value)
+    assert len(delays) == 3
+    assert all(delay == 0.25 for delay in delays)
+
+
+@pytest.mark.asyncio
+async def test_other_witness_predicates_remain_single_read(monkeypatch):
+    base = inventory(field(), submit())
+    bad = witness(base)
+    bad['controls'][0]['selector'] = '#wrong'
+    browser = Browser(base, result=bad)
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as exc:
+        await forms._observe_controls(browser, base, site='execute')
+    assert 'predicate=selector.equal' in str(exc.value)
+    assert 'site=execute' in str(exc.value)
+    assert not delays
+    assert len([call for call in browser.calls if call[0] == 'evaluate']) == 1
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('point', ['first', 'prewrite'])
+@pytest.mark.parametrize('stabilizes', [True, False])
+async def test_execute_inventory_retry_at_actual_observation_points(
+        monkeypatch, point, stabilizes):
+    """Real execute() inventory gates retain the legacy two-arg observer seam."""
+    page = secure_inventory(field())
+    browser, _, row = secure_world(monkeypatch, page)
+    answer = 'test@example.test'
+    row['human_approved_answers'] = {
+        'Email': {
+            'value': answer, 'selector': '#email', 'url': SECURE_URL,
+            'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
+            'form_selector': '#application', 'form_action': SECURE_URL,
+        },
+    }
+    browser.allow_mutations = True
+    reads, evaluations, delays = 0, 0, []
+    original_call, original_page = browser.call, browser.page
+
+    async def no_wait(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+
+    async def observe(*args, **kwargs):
+        nonlocal evaluations
+        if args[0] == 'evaluate':
+            evaluations += 1
+        return await original_call(*args, **kwargs)
+
+    async def changing_page():
+        nonlocal reads
+        reads += 1
+        fresh = deepcopy(await original_page())
+        # In the prewrite variant the first independent read stays stable;
+        # otherwise the first observation mismatches immediately.
+        local_round = reads if point == 'first' else reads - 1
+        if point == 'prewrite' and reads == 1:
+            return fresh
+        if local_round == 1 or (not stabilizes and local_round >= 1):
+            fresh['controls'][0]['label'] = 'Flapping synthetic receiver ' + str(
+                local_round if not stabilizes else 1)
+        return fresh
+
+    monkeypatch.setattr(browser, 'call', observe)
+    monkeypatch.setattr(browser, 'page', changing_page)
+    kwargs = dict(
+        facts={'Email': answer}, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=SECURE_URL)
+    action = {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
+    if stabilizes:
+        receipt = await forms.execute(browser, page, action, **kwargs)
+        assert receipt['action'] == 'fill'
+        assert ('fill', '#email', '--value', answer) in browser.calls
+    else:
+        with pytest.raises(forms.Gate) as exc:
+            await forms.execute(browser, page, action, **kwargs)
+        assert 'predicate=inventory.identity.equal' in str(exc.value)
+        assert 'site=execute' in str(exc.value)
+        assert not any(call[0] == 'fill' for call in browser.calls)
+    assert 0 < evaluations <= (5 if point == 'prewrite' else 4)
+    assert len(delays) == (1 if stabilizes else 3)
+    assert all(delay == 0.25 for delay in delays)

@@ -805,7 +805,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
                   tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
@@ -817,7 +817,7 @@ def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
             'I decline', '#decline-choice', tag='input', type='radio',
             required=True, checked=False, has_value=True, name='attestation',
             question='Arbitration consent', value='decline'))
-    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
+    await forms._bootstrap_wall(None, inventory(*members, submit()), {}, URL)
 
 
 async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
@@ -3739,7 +3739,7 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
         forms.check_form(page, filled, True)
 
 
-def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+async def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     """A visible privacy choice needs the owner's exact current question."""
     question_text = 'I consent to sharing personal data with marketing partners'
     page = secure_inventory(
@@ -3748,7 +3748,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     )
     independent = {c['selector']: c for c in witness(page)['controls']}
     with pytest.raises(forms.Gate) as exc:
-        forms._bootstrap_wall(page, independent, SECURE_URL)
+        await forms._bootstrap_wall(None, page, independent, SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert exc.value.form_question is not None
     assert exc.value.form_question['control_label'] == question_text
@@ -3759,7 +3759,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     inaccessible = deepcopy(independent)
     inaccessible['#marketing']['visible'] = False
     with pytest.raises(forms.Gate) as blocked:
-        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+        await forms._bootstrap_wall(None, page, inaccessible, SECURE_URL)
     assert blocked.value.reason == 'owner_question'
     assert blocked.value.form_question is None
     assert 'Direct owner review' in str(blocked.value)
@@ -4388,3 +4388,60 @@ async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
         assert secret not in report['question']
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+@pytest.mark.parametrize('unsafe', [None, 'readonly', 'offscreen', 'wrong-owner'])
+async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
+        monkeypatch, unsafe):
+    closed = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    current = inventory(closed)
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(controller, '_row', lambda: {'ats': 'other'})
+    class Raw:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            proof = witness(current)
+            if unsafe == 'readonly':
+                proof['controls'][0]['readonly'] = True
+            if unsafe == 'offscreen':
+                proof['controls'][0]['visible'] = False
+            return {'value': proof}
+    raw = Raw()
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_request = '#privacy'
+    controller._material_witness_expected = {
+        k: v for k, v in closed.items() if k != 'combobox'}
+    if unsafe == 'wrong-owner':
+        current['controls'][0]['form_selector'] = '#foreign'
+    if unsafe:
+        with pytest.raises(forms.Gate):
+            await controller.before_ipc(raw, ('click', '#privacy'), {})
+        assert controller._material_witness_selector is None
+        return
+    await controller.before_ipc(raw, ('click', '#privacy'), {})
+    assert controller._material_witness_selector == '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_close_request = '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Enter'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    await controller.before_ipc(raw, ('press', 'Escape'), {})
+    assert controller._material_witness_selector == '#privacy'
+    controller._material_witness_selector = None
+    controller._material_witness_close_request = None
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})

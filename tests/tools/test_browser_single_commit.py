@@ -429,12 +429,27 @@ async def test_raw_application_get_commit_bypass_refuses_before_cli(monkeypatch,
 @pytest.mark.asyncio
 async def test_code_issued_form_get_stays_reversible(monkeypatch):
     """A normal /application GET is not a Submit just because of its path name."""
-    controller = _controller()
+    controller = forms.ApplicationIPCController(
+        "example-co#job", "example-co",
+        "https://jobs.ashbyhq.com/example-co/job",
+        "", {}, {}, [], {"url": ""}, lambda: None)
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": []}, controller)
     await session.application_effect(
         "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
     assert [c[0][0] for c in calls] == ["navigate"]
+
+
+@pytest.mark.asyncio
+async def test_code_issued_form_get_mismatched_tracked_job_refuses(monkeypatch):
+    """An observed Ashby form GET cannot borrow another tracked job identity."""
+    controller = _controller()
+    session, calls = await _setup(
+        monkeypatch, {"url": controller.url, "controls": []}, controller)
+    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET navigation"):
+        await session.application_effect(
+            "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
+    assert calls == []
 
 
 @pytest.mark.parametrize("checked,form_value,approved,valid", [

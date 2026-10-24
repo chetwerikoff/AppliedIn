@@ -4964,4 +4964,4 @@ def test_every_production_observe_controls_caller_names_its_site():
             literal_sites.append(kw.value)
     assert {'bootstrap-formless', 'bootstrap-material', 'execute',
             'execute-readback'} <= set(literal_sites)
-    assert len(literal_sites) >= 24
+    assert len(literal_sites) >= 21

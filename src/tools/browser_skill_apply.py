@@ -2796,25 +2796,22 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
             raise _EntryNotReady(_entry_not_ready(current))
         _inventory_ok(current, complete=False)
-        if _page_identity(current) != _page_identity(page) and site:
-            if _identity_try < 4:
-                # Only identity disagreement triggers a complete fresh read.
-                await asyncio.sleep(0.25)
-                return await _observe_controls(
-                    session, await session.page(), readiness=readiness,
-                    site=site, _identity_try=_identity_try + 1)
-        elif site and _identity_try > 1:
-            # A lone equality with the initial page is not stabilization.
-            if _previous_identity == _page_identity(current):
-                return current, lookup
-            if _identity_try < 4:
-                await asyncio.sleep(0.25)
-                return await _observe_controls(
-                    session, await session.page(), readiness=readiness,
-                    site=site, _identity_try=_identity_try + 1,
-                    _previous_identity=_page_identity(current))
-            require(False, 'inventory.identity.equal')
-        require(_page_identity(current) == _page_identity(page), 'inventory.identity.equal')
+        identity = _page_identity(current)
+        if site and _identity_try > 1 and _previous_identity == identity:
+            return current, lookup
+        if site and _identity_try < 4 and (
+                identity != _page_identity(page) or _identity_try > 1):
+            # Retry only after the initial inventory identity disagreement.
+            # Re-read PAGE and witness together; two adjacent complete matches
+            # are necessary before any material resume authority is returned.
+            await asyncio.sleep(0.25)
+            return await _observe_controls(
+                session, await session.page(), readiness=readiness,
+                site=site, _identity_try=_identity_try + 1,
+                _previous_identity=identity)
+        require(identity == _page_identity(page) and
+                (not site or _identity_try == 1),
+                'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup
     except Gate:

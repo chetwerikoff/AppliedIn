@@ -2113,12 +2113,15 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
     if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
         raise Gate('The current form control inventory is malformed.')
     pending_hidden_r = False
+    # Reader-proven visible challenges outrank an earlier unknown frame.
     for frame in entry['frames']:
         status = frame.get('status') if isinstance(frame, dict) else None
         if status == 'visible-recaptcha':
             raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
         if status == 'visible-hcaptcha':
             raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
+    for frame in entry['frames']:
+        status = frame.get('status') if isinstance(frame, dict) else None
         if status not in {'H', 'R', 'W', 'X'} and not (
                 status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
             # Only the bounded Ashby waiter retries this exact reader-proven

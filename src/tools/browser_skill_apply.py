@@ -368,7 +368,7 @@ def _navigation_failed_predicate(destination: str, tracked: str,
             return 'literal_https_destination_origin'
         # The verified alias/redirect branch can accept a different origin,
         # but only after the ordinary tracked-origin check fails.
-        if _preparation_origin(destination, tracked):
+        if _job_preparation_route(destination, tracked, provenance=provenance):
             return 'approved_preparation_origin'
         if isinstance(provenance, VendorRedirectProvenance):
             if destination == provenance.wrapper:
@@ -727,8 +727,8 @@ def _preparation_destination_allowed(href: str, *origins: str,
     # observation compatibility cannot authorize a private write or submission.
     # Local fixture loopback remains observable, but an unrelated ATS host
     # cannot become job authority simply by being a recognized provider.
-    return navigation_allowed(href, source) or _preparation_origin(href, source) or (
-        provenance is not None and navigation_allowed(href, provenance=provenance))
+    return navigation_allowed(href, source) or _job_preparation_route(
+        href, source, provenance=provenance)
 
 
 def _assent_scope(target: dict) -> str:
@@ -4056,10 +4056,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     elif verb == 'click':
         if not allow_click or not pk or not job_url:
             raise Gate('An unclassified click cannot reach application IPC.')
-        if (target.get('href') and not _preparation_origin(target['href'], job_url)):
+        if (target.get('href') and not _job_preparation_route(target['href'], job_url, provenance=provenance)):
             raise Gate('Click target navigates outside the approved preparation host.')
         if target.get('formaction') and not _preparation_origin(
-                target['formaction'], job_url):
+                target['formaction'], job_url, provenance=provenance):
             raise Gate('Unknown form override may submit outside the approved host.')
         # Before private data, the raw controller may permit an ordinary JS
         # Apply/Continue progression. Any possible commit is classified and
@@ -4113,7 +4113,11 @@ def _committing_get_route(href: str) -> bool:
 
 
 def _preparation_origin(href: str, tracked_url: str) -> bool:
-    """Code-owned origin policy for reversible preparation, never tenant proof."""
+    """Legacy HTTPS preparation-host classification, NOT tenant/job authority.
+
+    This compatibility predicate never grants navigation, upload, or a click.
+    Effectful sites use _job_preparation_route instead.
+    """
     if not isinstance(href, str) or not isinstance(tracked_url, str):
         return False
     try:
@@ -4124,11 +4128,69 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
                        for c in href)
                 or any(segment in {'.', '..'} for segment in part.path.split('/'))):
             return False
-        # Shared ATS hosts cannot confer a different tenant/job the tracked
-        # row's private data. The tracked canonical route binds the job path.
-        return navigation_allowed(href, tracked_url)
+        source = urlsplit(tracked_url)
+        if (part.scheme, part.hostname, part.port) == (
+                source.scheme, source.hostname, source.port):
+            return True
+        return part.hostname in {
+            'jobs.ashbyhq.com', 'jobs.lever.co', 'job-boards.greenhouse.io'
+        } and bool(part.path.strip('/'))
     except (TypeError, ValueError):
         return False
+
+
+def _greenhouse_row_preparation(href: str, tracked: str, pk: str,
+                                company: str, *, fixture_context=None) -> bool:
+    """Same tracked Greenhouse job using the configured board, not page hints.
+
+    The row's board pin is intentionally a separate final-Submit condition.
+    The configured board plus persisted row and exact job ID bound reversible
+    effects before that pin is available; a different board/job is rejected.
+    """
+    try:
+        row = _row(pk, fixture_context=fixture_context)
+        if (row.get('pk') != pk or row.get('company') != company
+                or row.get('jd_url') != tracked or row.get('ats') != 'greenhouse'
+                or row.get('status') != 'submitting'
+                or row.get('possible_submission')
+                or not greenhouse_alias_candidate(tracked)):
+            return False
+        job_id = row.get('job_id')
+        if (not isinstance(job_id, str) or not job_id
+                or parse_qsl(urlsplit(tracked).query) != [('gh_jid', job_id)]):
+            return False
+        from core.config import get_settings
+        from discovery.watchlist import load_watchlist
+        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        boards = [cfg.board for cfg in configs
+                  if cfg.name == company and cfg.ats == 'greenhouse'
+                  and isinstance(cfg.board, str)
+                  and re.fullmatch(_BOARD_TOKEN.pattern, cfg.board)]
+        if len(boards) != 1:
+            return False
+        route = _alias_https_parts(href)
+        if not route or route[0] != 'job-boards.greenhouse.io':
+            return False
+        job_path = f'/{boards[0]}/jobs/{job_id}'
+        return route[1] == job_path or route[1].startswith(job_path + '/')
+    except (TypeError, ValueError, AttributeError, OSError):
+        return False
+
+
+def _job_preparation_route(href: str, tracked: str, *,
+                           provenance: Provenance | None = None,
+                           pk: str = '', company: str = '',
+                           fixture_context=None) -> bool:
+    """Effectful route authority: exact tracked job, typed proof, or row-bound GH."""
+    if not _preparation_origin(href, tracked):
+        return False
+    if href == tracked or navigation_allowed(href, tracked):
+        return True
+    if provenance is not None and navigation_allowed(href, provenance=provenance):
+        return True
+    return (bool(pk and company)
+            and _greenhouse_row_preparation(href, tracked, pk, company,
+                                            fixture_context=fixture_context))
 
 
 
@@ -4286,7 +4348,9 @@ class ApplicationIPCController:
                 and navigation_allowed(url, provenance=proof))
 
     def _fresh_preparation(self, url: str) -> None:
-        if not (_preparation_origin(url, self.url) or self._verified_redirect_url(url)):
+        if not (_job_preparation_route(url, self.url, pk=self.pk, company=self.company,
+                                       fixture_context=self.fixture_context)
+                or self._verified_redirect_url(url)):
             raise Gate('The page is not a proven same-job preparation route.')
         _tracked_preparation_job(self.pk, self.company, self.url,
                                  fixture_context=self.fixture_context)
@@ -4398,7 +4462,9 @@ class ApplicationIPCController:
             if len(args) != 2 or kwargs:
                 raise Gate('Unknown application navigation IPC arguments.')
             self._fresh_preparation(self.url)
-            if (not (_preparation_origin(args[1], self.url)
+            if (not (_job_preparation_route(args[1], self.url, pk=self.pk,
+                                             company=self.company,
+                                             fixture_context=self.fixture_context)
                      or self._verified_redirect_url(args[1]))
                     or _committing_get_route(args[1])):
                 raise Gate('Unknown, executable or committing GET navigation is not preparation.')
@@ -4526,7 +4592,9 @@ class ApplicationIPCController:
         # Owner-approved pre-private JS Apply/Continue may navigate on the
         # current allowed origin, but a known native/explicit Submit never can.
         if (not _NAVIGATION.match(text) or
-                (target.get('href') and not _preparation_origin(target['href'], self.url))
+                (target.get('href') and not _job_preparation_route(
+                    target['href'], self.url, pk=self.pk, company=self.company,
+                    fixture_context=self.fixture_context))
                 or target.get('formaction')):
             raise Gate('Unclassified application click could commit; no IPC.')
         return
@@ -4737,9 +4805,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         def allowed(href: str) -> bool:
             # A shared ATS host is not same-job evidence. The tracked route,
             # a verified entry/alias, or a verified redirect is required.
-            return (ctx is not None and href == url) or _preparation_origin(href, url) or (
-                provenance is not None and
-                navigation_allowed(href, provenance=provenance))
+            return (ctx is not None and href == url) or _job_preparation_route(
+                href, url, provenance=provenance, pk=pk, company=company,
+                fixture_context=ctx)
 
         if not allowed(direct_url):
             raise _navigation_gate(

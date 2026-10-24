@@ -4275,3 +4275,116 @@ async def test_owner_only_checkbox_grant_resumes_through_raw_click(
     raw.bind_application_controller(controller)
     await raw.application_effect('click', '#marketing')
     assert effects == [('click', '#marketing', '--session', 'synthetic-offline')]
+
+
+@pytest.mark.parametrize('label', [
+    'Are you legally authorized to work in the country…',
+    'Are you currently authorized to work in the U.S.?',
+    'Do you have work authorization?',
+    'Do you have authorization to work in this country?',
+    'Are you legally eligible to work in the U.S.?',
+    'Are you authorised to work in this country?',
+])
+@pytest.mark.parametrize('kind', ['text', 'select', 'combobox'])
+async def test_ordinary_work_eligibility_uses_bank_fact_preparation(
+        monkeypatch, label, kind):
+    """The production bootstrap, not a regex-only assertion, admits these facts."""
+    eligible = field(label, '#eligibility', type=kind, tag=(
+        'select' if kind == 'select' else 'input'))
+    if kind == 'select':
+        eligible['options'] = [
+            {'value': '', 'label': 'Choose'},
+            {'value': 'yes', 'label': 'Yes'},
+            {'value': 'no', 'label': 'No'},
+        ]
+    if kind == 'combobox':
+        eligible['combobox'] = {
+            'linked': True, 'link_id': 'eligibility-options',
+            'listbox_selector': '#eligibility-options',
+            'options': [{'selector': '#yes', 'unique': True,
+                         'label': 'Yes', 'value': 'yes', 'safe': True},
+                        {'selector': '#no', 'unique': True,
+                         'label': 'No', 'value': 'no', 'safe': True}],
+            'selected_text': '', 'displayed_text': '', 'selected_value': '',
+            'hidden_selector': '#eligibility-hidden', 'hidden_value': '',
+        }
+    page = secure_inventory(eligible)
+    browser, decide, row = secure_world(monkeypatch, page)
+    # An ordinary bank fact is eligible for preparation; it must never
+    # manufacture a same-job material-assent grant.
+    row['human_approved_answers'] = {}
+    report = await secure_attempt(page, facts={label: 'Yes'})
+    assert report['status'] == 'gate'
+    assert report.get('material_assent_diagnostic') is not True
+    assert report['form_question'] is None
+    assert decide.await_count == 1
+    assert not row['human_approved_answers']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('label', [
+    'I authorize Example Co to conduct a background check',
+    'Are you authorized to work? I consent to a background check.',
+    'Work authorization and Candidate Privacy Notice acknowledgement',
+    'Authorization to work and agreement to legal terms',
+])
+async def test_work_eligibility_never_hides_independent_material_assent(
+        monkeypatch, label):
+    material = field(label, '#material', tag='select', type='select',
+                     options=[{'value': '', 'label': 'Choose'},
+                              {'value': 'yes', 'label': 'I agree'},
+                              {'value': 'no', 'label': 'I decline'}])
+    page = secure_inventory(material)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    result = await secure_attempt(page, facts={label: 'Yes'})
+    assert result['status'] == 'gate'
+    assert result['material_assent_diagnostic'] is True
+    assert result['review_route'] == 'owner'
+    assert result['form_question'] is not None
+    assert decide.await_count == 0
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('The closed combobox linkage is incomplete or ambiguous.',
+     'The closed combobox linkage is incomplete or ambiguous.'),
+    ('The combobox option linkage is incomplete or ambiguous.',
+     'The combobox option linkage is incomplete or ambiguous.'),
+    ('This control is not visibly editable.',
+     'This control is not visibly editable.'),
+    ('PRIVATE_URL_TOKEN_SENTINEL malicious text',
+     forms._DISCLOSURE_FAILURE_OPAQUE),
+])
+async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
+        monkeypatch, failure, expected):
+    import logging
+    privacy = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = secure_inventory(privacy)
+    browser, decide, _ = secure_world(monkeypatch, page)
+    actual = forms._disclosure_question
+
+    def fail_disclosure(*args, **kwargs):
+        if args[1].get('selector') == '#privacy':
+            raise forms.Gate(failure)
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(forms, '_disclosure_question', fail_disclosure)
+    report = await secure_attempt(page, facts={
+        'PRIVATE_FACT_SENTINEL': 'PRIVATE_VALUE_SENTINEL'})
+    assert report['status'] == 'gate'
+    assert report['form_question'] is None
+    assert report['material_assent_diagnostic'] is True
+    assert f'Disclosure: {expected}.' in report['question']
+    assert decide.await_count == 0
+    for secret in ('PRIVATE_URL_TOKEN_SENTINEL', 'PRIVATE_FACT_SENTINEL',
+                   'PRIVATE_VALUE_SENTINEL'):
+        assert secret not in report['question']
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)

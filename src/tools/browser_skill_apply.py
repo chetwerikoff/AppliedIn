@@ -1458,6 +1458,22 @@ _MATERIAL_ASSENT = re.compile(
     r'authori[sz](?:e(?:s|d)?|ing|ations?)|'
     r'arbitration|terms(?: of (?:use|service))?|privacy(?: policy)?|'
     r'ai[\s-]*(?:use|policy)|waiver|release|attest|signature)\b', re.I)
+_WORK_ELIGIBILITY = re.compile(
+    r'\b(?:authori[sz]ed\s+to\s+work|work\s+authori[sz]ation|'
+    r'authori[sz]ation\s+to\s+work|'
+    r'legally\s+(?:authori[sz]ed|eligible)\s+to\s+work)\b', re.I)
+
+
+def _material_assent_match(text: str):
+    """One classifier for material terms, excluding only work-eligibility phrases."""
+    if not isinstance(text, str):
+        return None
+    eligibility = tuple(_WORK_ELIGIBILITY.finditer(text))
+    for match in _MATERIAL_ASSENT.finditer(text):
+        if not any(start.start() <= match.start() < start.end()
+                   for start in eligibility):
+            return match
+    return None
 
 
 def _submitter_texts(target: dict) -> tuple[str, ...]:
@@ -1477,7 +1493,7 @@ def _material_select_options(target: dict) -> bool:
         options = (target.get('combobox') or {}).get('options')
     return (isinstance(options, list) and any(
         isinstance(o, dict) and any(
-            isinstance(o.get(k), str) and _MATERIAL_ASSENT.search(o[k])
+            isinstance(o.get(k), str) and _material_assent_match(o[k])
             for k in ('value', 'label')) for o in options))
 
 
@@ -1485,7 +1501,7 @@ def _material_form_choice(target: dict) -> bool:
     """Only select and combobox receivers may bind witnessed material assent."""
     return (((target.get('tag') == 'select' and target.get('type') == 'select')
              or target.get('type') == 'combobox')
-            and (_MATERIAL_ASSENT.search(label(target))
+            and (_material_assent_match(label(target))
                  or _material_select_options(target)))
 
 
@@ -1514,7 +1530,7 @@ def _material_question(question: dict | None) -> bool:
     title, subtitle = question.get('question'), question.get('control_label')
     if not isinstance(title, str) or not isinstance(subtitle, str):
         return False
-    if _MATERIAL_ASSENT.search(title + ' ' + subtitle):
+    if _material_assent_match(title + ' ' + subtitle):
         return True
     opts = question.get('options', [])
     target = {
@@ -2814,7 +2830,7 @@ def _unanswered(page: dict, target: dict) -> bool:
 def _choice_prompt(target: dict, question: dict) -> str:
     """Show original question, radio captions and native select options verbatim."""
     subject = label(target)
-    prefix = ('Legal acknowledgement: ' if (_MATERIAL_ASSENT.search(subject)
+    prefix = ('Legal acknowledgement: ' if (_material_assent_match(subject)
               or _material_form_choice(target))
               else 'Statement about you: ' if _FACT_ASSERTION.search(subject)
               else '')
@@ -3047,7 +3063,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if not choice and (_MATERIAL_ASSENT.search(subject) or _material_select_options(target)):
+    if not choice and (_material_assent_match(subject) or _material_select_options(target)):
         if not _material_form_choice(target):
             raise Gate('Legal or material assent requires direct human review.')
         # Unlinked or partly observed ARIA options cannot become an approval.
@@ -3105,6 +3121,31 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     return question
 
 
+# Only these literal disclosure-path Gate messages may reach owner detail.
+# Any other message (including a crafted exception) is deliberately opaque.
+_DISCLOSURE_FAILURE_REASONS = frozenset({
+    'Only witnessed text-entry controls may request a structural grant.',
+    'A grantable choice must be a native input.',
+    'Only a safe, exclusively linked ARIA combobox may request a grant.',
+    'The combobox option linkage is incomplete or ambiguous.',
+    'The closed combobox linkage is incomplete or ambiguous.',
+    'Only observed native or linked combobox controls may request a grant.',
+    'Complete native labels and questions are required.',
+    'This control is not visibly editable.',
+    'This control requires human sign-in or account review.',
+    'Legal or material assent requires direct human review.',
+    'This is not a required unanswered field.',
+    'The native select options are incomplete or ambiguous.',
+    'A password field makes this owning form unsafe for disclosure.',
+})
+_DISCLOSURE_FAILURE_OPAQUE = 'Disclosure witness failed for an unspecified reason'
+
+
+def _disclosure_failure_detail(reason: str) -> str:
+    return (reason if reason in _DISCLOSURE_FAILURE_REASONS
+            else _DISCLOSURE_FAILURE_OPAQUE)
+
+
 # The PAGE type may be an arbitrary role attribute, not a native control kind.
 # Only code-owned known names belong in the owner-facing diagnostic.
 _MATERIAL_DIAGNOSTIC_TYPES = frozenset({
@@ -3158,7 +3199,7 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                            form_question=question, reason='owner_question')
             continue
         if c.get('in_form'):
-            assent_match = _MATERIAL_ASSENT.search(subject)
+            assent_match = _material_assent_match(subject)
             if assent_match or _material_select_options(c):
                 # An empty required native select or exclusively linked ARIA
                 # picker can present an answerable owner question. A grant
@@ -3168,13 +3209,16 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                     # a preselected value must instead prove an existing grant.
                     unanswered = (not c.get('has_value') if c.get('tag') == 'select'
                                   else not (c.get('combobox') or {}).get('selected_text'))
+                    disclosure_failure = None
                     try:
                         question = _disclosure_question(
                             page, c, witness, *origins,
                             bootstrap=unanswered and bool(c.get('required')),
                             provenance=provenance)
-                    except Gate:
-                        pass  # Unwitnessed assent remains inspection-only.
+                    except Gate as exc:
+                        # Keep the same inspection-only decision; reveal only
+                        # literal code-owned diagnostics, never arbitrary text.
+                        disclosure_failure = _disclosure_failure_detail(str(exc))
                     else:
                         question['pk'] = pk
                         grants = ((_row(pk, fixture_context=fixture_context)
@@ -3215,7 +3259,9 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                     'Material assent outside a bound choice needs human inspection. '
                     f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
                     f"visible label: {visible_label!r}; "
-                    f"matched: {assent_match.group(0) if assent_match else 'select options'}.")
+                    f"matched: {assent_match.group(0) if assent_match else 'select options'}."
+                    + (f" Disclosure: {disclosure_failure}."
+                       if _material_form_choice(c) and disclosure_failure else ''))
 
 
 

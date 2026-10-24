@@ -4833,3 +4833,68 @@ async def test_other_witness_predicates_remain_single_read(monkeypatch):
     assert 'site=execute' in str(exc.value)
     assert not delays
     assert len([call for call in browser.calls if call[0] == 'evaluate']) == 1
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('point', ['first', 'prewrite'])
+@pytest.mark.parametrize('stabilizes', [True, False])
+async def test_execute_inventory_retry_at_actual_observation_points(
+        monkeypatch, point, stabilizes):
+    """Real execute() inventory gates retain the legacy two-arg observer seam."""
+    page = secure_inventory(field())
+    browser, _, row = secure_world(monkeypatch, page)
+    answer = 'test@example.test'
+    row['human_approved_answers'] = {
+        'Email': {
+            'value': answer, 'selector': '#email', 'url': SECURE_URL,
+            'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
+            'form_selector': '#application', 'form_action': SECURE_URL,
+        },
+    }
+    browser.allow_mutations = True
+    reads, evaluations, delays = 0, 0, []
+    original_call, original_page = browser.call, browser.page
+
+    async def no_wait(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
+
+    async def observe(*args, **kwargs):
+        nonlocal evaluations
+        if args[0] == 'evaluate':
+            evaluations += 1
+        return await original_call(*args, **kwargs)
+
+    async def changing_page():
+        nonlocal reads
+        reads += 1
+        fresh = deepcopy(await original_page())
+        # In the prewrite variant the first independent read stays stable;
+        # otherwise the first observation mismatches immediately.
+        local_round = reads if point == 'first' else reads - 1
+        if point == 'prewrite' and reads == 1:
+            return fresh
+        if local_round == 1 or (not stabilizes and local_round >= 1):
+            fresh['controls'][0]['label'] = 'Flapping synthetic receiver ' + str(
+                local_round if not stabilizes else 1)
+        return fresh
+
+    monkeypatch.setattr(browser, 'call', observe)
+    monkeypatch.setattr(browser, 'page', changing_page)
+    kwargs = dict(
+        facts={'Email': answer}, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=SECURE_URL)
+    action = {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
+    if stabilizes:
+        receipt = await forms.execute(browser, page, action, **kwargs)
+        assert receipt['action'] == 'fill'
+        assert ('fill', '#email', '--value', answer) in browser.calls
+    else:
+        with pytest.raises(forms.Gate) as exc:
+            await forms.execute(browser, page, action, **kwargs)
+        assert 'predicate=inventory.identity.equal' in str(exc.value)
+        assert 'site=execute' in str(exc.value)
+        assert not any(call[0] == 'fill' for call in browser.calls)
+    assert 0 < evaluations <= (5 if point == 'prewrite' else 4)
+    assert len(delays) == (1 if stabilizes else 3)
+    assert all(delay == 0.25 for delay in delays)

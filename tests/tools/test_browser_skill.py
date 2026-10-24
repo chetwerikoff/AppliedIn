@@ -649,8 +649,12 @@ async def test_untyped_role_button_cannot_bypass_self_id_guards():
     session.call.assert_not_awaited()
 
 
-async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact():
+async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact(monkeypatch):
     session = SimpleNamespace(call=AsyncMock())
+    # An offline tracked row is enough to exercise the actual protected-field
+    # refusal. No live Redis lookup is permitted by this isolated regression.
+    monkeypatch.setattr(forms, '_row', lambda pk: {
+        'pk': pk, 'status': 'submitting', 'human_approved_answers': {}})
     control = target(type='checkbox', label='I certify I am a US citizen', required=True)
     # A new legal/citizenship attestation routes directly to the owner even
     # without an application marker; it cannot mint an unapproved fact answer.

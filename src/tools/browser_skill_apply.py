@@ -4755,7 +4755,19 @@ class ApplicationIPCController:
                     raise Gate('The closed combobox linkage is incomplete or ambiguous.')
                 # Fresh fixed witness and safe owning form are mandatory at
                 # the last raw effect boundary, not merely at bootstrap.
-                current, proof = await _observe_controls(session, page)
+                controller = self
+                class RawWitnessReader:
+                    async def page(self):
+                        return await controller._page(session)
+
+                    async def call(self, *request):
+                        if request == ('evaluate', _FIXED_CONTROL_WITNESS):
+                            script = (_GREENHOUSE_FIXED_CONTROL_WITNESS
+                                      if controller._row().get('ats') == 'greenhouse'
+                                      else _FIXED_CONTROL_WITNESS)
+                            return await session.call('evaluate', script)
+                        raise Gate('Only the fixed control witness may be read.')
+                current, proof = await _observe_controls(RawWitnessReader(), page)
                 actual = control(current, {'selector': selector},
                                  'material-witness-open')
                 _disclosure_question(current, actual, proof, self.url,

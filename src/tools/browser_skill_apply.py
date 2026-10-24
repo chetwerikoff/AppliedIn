@@ -4201,6 +4201,22 @@ def _job_preparation_route(href: str, tracked: str, *,
         return False
     if href == tracked or navigation_allowed(href, tracked):
         return True
+    # Some legacy discovery URL grammars reject /application and /apply even
+    # when they are literal descendants of this exact tracked job. Compare
+    # the route directly, preserving every query/fragment identity byte.
+    try:
+        source, target = urlsplit(tracked), urlsplit(href)
+        root = source.path.rstrip('/')
+        if (source.scheme == target.scheme == 'https'
+                and source.netloc == target.netloc
+                and root and (target.path == root or
+                              target.path.startswith(root + '/'))
+                and '%' not in target.path
+                and source.query == target.query
+                and source.fragment == target.fragment):
+            return True
+    except (TypeError, ValueError, AttributeError):
+        pass
     return (bool(pk and company)
             and _greenhouse_row_preparation(href, tracked, pk, company,
                                             fixture_context=fixture_context))

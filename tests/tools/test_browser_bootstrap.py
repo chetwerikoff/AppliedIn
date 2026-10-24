@@ -4986,6 +4986,13 @@ async def test_bank_auto_does_not_use_company_only_facts_or_overwrite_owner(monk
 async def test_required_unmatched_field_has_deterministic_form_question(monkeypatch):
     page = secure_inventory(field('Unmatched field', '#missing'))
     browser, decision, row = secure_world(monkeypatch, page)
+    # A real GLOBAL-partition-capable bank is required for the new fallback.
+    # Plain legacy test stores intentionally preserve the generic model gate.
+    class Bank:
+        def _load(self):
+            return {'global': [('Other field', 'Synthetic value')]}
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(answer_bank=Bank()))
     report = await secure_attempt(page)
     assert report['status'] == 'gate'
     assert 'An exact human-approved answer is needed' in report['question']

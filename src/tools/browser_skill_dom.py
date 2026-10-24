@@ -814,6 +814,18 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
       box,badge,bounds,status,
       // Parent-reader proof; the rootless frame remains unadmitted.
+      // Explain failed Enterprise-pair evidence with code-owned, value-free
+      // fields. The actual provider admission decision above is unchanged.
+      ...(r ? {
+        ashby_native:ashbyNative ? 'yes' : 'no',
+        enterprise_anchors:enterpriseAnchors.length,
+        enterprise_bframes:enterpriseBframes.length,
+        anchor_in_badge:pairAnchor &&
+          !!pairAnchor.closest('div.grecaptcha-badge') &&
+          enterpriseBadgeAnchor(pairAnchor.closest('div.grecaptcha-badge'))
+          ? 'yes' : 'no',
+        passive_enterprise:passiveEnterprise ? 'yes' : 'no',
+      } : {}),
       ...(status==='unknown' && ashbyNative && !root && r && hidden
         ? {rootless_hidden_r:true} : {}),
       ...(!['H','R','W','X','Z'].includes(status) ? {form_controls:formControls} : {})};

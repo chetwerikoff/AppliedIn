@@ -1883,3 +1883,105 @@ async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkey
         with pytest.raises(forms.Gate):
             await session.call(method,*args)
     no_mutations(raw)
+
+
+def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
+    """Offline production-reader pair: badge and body-level bframe do not share a root."""
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    opener = '(() => {\n'
+    assert script.startswith(opener)
+    injection = r"""
+  {
+    const move=(e,p)=>{
+      if(e.parentElement){
+        const siblings=e.parentElement.children;
+        siblings.splice(siblings.indexOf(e),1);
+      }
+      e.parentElement=p;p.children.push(e);
+    };
+    const body=document.body;
+    const anchor=document.querySelectorAll('iframe')[0];
+    const badgeOuter=node('div',{},body);
+    // Parent #3/#4 (or #2/#3) are independent body-level containers.
+    const bframeOuter=node('div',{},body);
+    const at=(parent,count)=>{
+      while(parent.children.filter(e=>e.tagName==='DIV').length<count)
+        node('div',{},parent);
+      return parent.children.filter(e=>e.tagName==='DIV')[count-1];
+    };
+    const badge=node('div',{class:'grecaptcha-badge'},
+      node('div',{},at(body,BADGE_INDEX)));
+    const badgeInner=node('div',{},badge);
+    move(anchor,badgeInner);
+    anchor.style.visibility='hidden';anchor.style.display='inline';
+    const bframe=node('iframe',{
+      src:'https://www.google.com/recaptcha/enterprise/bframe'
+    },at(body,BFRAME_INDEX));
+    bframe.style.visibility='hidden';bframe.style.display='inline';
+    if(VARIANT==='visible-bframe')bframe.style.visibility='visible';
+    if(VARIANT==='second-anchor'){
+      const duplicate=node('iframe',{
+        src:'https://www.google.com/recaptcha/enterprise/anchor'
+      },badge);
+      duplicate.style.visibility='hidden';
+    }
+    if(VARIANT==='second-bframe'){
+      const duplicate=node('iframe',{
+        src:'https://www.recaptcha.net/recaptcha/enterprise/bframe'
+      },bframeOuter);
+      duplicate.style.visibility='hidden';
+    }
+    if(VARIANT==='wrong-path')bframe.setAttribute('src',
+      'https://www.google.com/recaptcha/api2/bframe');
+    if(VARIANT==='wrong-origin')bframe.setAttribute('src',
+      'https://widgets.example.test/recaptcha/enterprise/bframe');
+    if(VARIANT==='srcdoc')bframe.setAttribute('srcdoc','');
+    if(VARIANT==='anchor-srcdoc')anchor.setAttribute('srcdoc','');
+    if(VARIANT==='anchor-outside')move(anchor,bframeOuter);
+    if(VARIANT==='anchor-wrong-origin')anchor.setAttribute('src',
+      'https://widgets.example.test/recaptcha/enterprise/anchor');
+    if(VARIANT==='anchor-wrong-path')anchor.setAttribute('src',
+      'https://www.recaptcha.net/recaptcha/api2/anchor');
+  }
+"""
+    injection=(injection.replace('BADGE_INDEX',str(shape))
+                        .replace('BFRAME_INDEX',str(shape+1))
+                        .replace('VARIANT',repr(variant).replace("'",'"')))
+    script=script.replace(opener,opener+injection,1)
+    return dom(dict(url=entry('ashby'),root=resolved,formless=not resolved,
+                    missingPane=not resolved,frames=['R']),script)
+
+
+@pytest.mark.parametrize('reader',['page','witness'])
+@pytest.mark.parametrize('shape',[2,3])
+@pytest.mark.parametrize('resolved',[False,True])
+def test_issue174_hidden_pair_root_independent(reader,shape,resolved):
+    page=_issue174_reader(reader,shape=shape,resolved=resolved)
+    frames=page['entry']['frames']
+    assert len(frames)==2
+    assert [f['status'] for f in frames]==['R','R'],frames
+    assert frames[0]['badge'] is True
+    assert frames[1]['badge'] is False
+    assert frames[1]['visibility']=='hidden'
+    assert frames[0]['srcdoc']==frames[1]['srcdoc']=='absent'
+    if not resolved:
+        assert all(f['root']=='' and f['outside'] is False for f in frames)
+    forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader',['page','witness'])
+@pytest.mark.parametrize('variant',[
+    'visible-bframe','second-anchor','second-bframe','wrong-path','wrong-origin',
+    'srcdoc','anchor-srcdoc','anchor-outside','anchor-wrong-origin',
+    'anchor-wrong-path',
+])
+def test_issue174_hidden_pair_negative_cases(reader,variant):
+    page=_issue174_reader(reader,variant=variant)
+    if variant=='visible-bframe':
+        assert any(f['status']=='visible-recaptcha' for f in page['entry']['frames'])
+        with pytest.raises(forms.CaptchaGate,match='visible reCAPTCHA'):
+            forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+    else:
+        assert any(f['status']=='unknown' for f in page['entry']['frames']),page['entry']['frames']
+        with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
+            forms._entry_safety(page,lambda u:u==entry('ashby'),None)

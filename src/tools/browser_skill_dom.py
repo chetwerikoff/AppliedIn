@@ -635,7 +635,33 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       return permitted;
     } catch (_) { wUnreadable=true; return null; }
   };
-  const entryFrames = Array.from(document.querySelectorAll('iframe')).map(e => {
+  // Observe structural relationships independently; unknown roots remain unknown.
+  // Position patterns use only fixed tag names and bounded sibling ordinals.
+  const entryFrameNodes=Array.from(document.querySelectorAll('iframe'));
+  const enterpriseAnchors=entryFrameNodes.filter(e => {
+    try {
+      const raw=e.getAttribute('src');
+      if(raw===null) return false;
+      const u=new URL(raw);
+      return ['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) &&
+        u.pathname==='/recaptcha/enterprise/anchor';
+    } catch (_) { return false; }
+  });
+  const frameParentPattern = parent => {
+    if (!parent) return 'unknown';
+    const parts=[], tags=new Set(['html','body','form','div','span','section','main']);
+    for (let n=parent;n && n.nodeType===1 && parts.length<4;n=n.parentElement) {
+      const siblings=n.parentElement ? Array.from(n.parentElement.children) : [n];
+      const ordinal=siblings.filter(s=>s.tagName===n.tagName).indexOf(n)+1;
+      if (ordinal<1 || ordinal>999) return 'unknown';
+      parts.unshift((tags.has(n.localName) ? n.localName : 'other')+
+        ':nth-of-type('+ordinal+')');
+    }
+    const value=parts.join(' > ');
+    return value.length<=160 ? value : 'unknown';
+  };
+  const recaptchaContainer=e=>e.closest('div.grecaptcha-badge,div.g-recaptcha');
+  const entryFrames = entryFrameNodes.map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='', diagnosticOrigin='', diagnosticPath='';
     // Absolute-only H/R/W/X/Z classifier inputs are unchanged. Resolve
@@ -652,6 +678,14 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const hiddenROutside=nativeRoot ? !nativeRoot.contains(e) :
       ashbyNative && !!structuralRoot && !structuralRoot.contains(e);
     const parent=e.parentElement;
+    const anchor=enterpriseAnchors.length===1 && enterpriseAnchors[0]!==e ?
+      enterpriseAnchors[0] : null;
+    const aContainer=anchor ? recaptchaContainer(anchor) : null;
+    const ownContainer=recaptchaContainer(e);
+    const anchorSibling=anchor && parent && anchor.parentElement ?
+      (parent===anchor.parentElement ? 'yes' : 'no') : 'unknown';
+    const sharedRecaptchaContainer=aContainer && ownContainer ?
+      (aContainer===ownContainer ? 'yes' : 'no') : 'unknown';
     const h=origin==='https://newassets.hcaptcha.com' && path.endsWith('/static/hcaptcha-enclave.html') &&
       !!nativeRoot && parent?.matches('div#h-captcha.h-captcha') && parent.parentElement===nativeRoot;
     const r=['https://www.recaptcha.net','https://www.google.com'].includes(origin) &&
@@ -691,10 +725,14 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     else if (z) status='Z';
     // A stale complete child (including about:blank) can outlive a src
     // change. Check full URLs internally, but export no URL payload or DOM.
-    let formControls='unknown';
+    let formControls='unknown', documentReadability='unknown';
     if (!['H','R','W','X','Z'].includes(status)) try {
       const child=e.contentDocument;
-      let current=false;
+      documentReadability=child ? 'readable' : 'unavailable';
+      // An actual readable, complete source-less child can establish current
+      // control presence/absence for diagnostics. It still proves no root
+      // relationship and never changes the unknown frame admission.
+      let current=!!child && raw===null && !e.hasAttribute('srcdoc');
       if (child && raw!==null && !e.hasAttribute('srcdoc') &&
           typeof child.URL==='string' && child.URL) {
         try {
@@ -718,9 +756,13 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
             formControls='no';
         }
       }
-    } catch (_) {}
+    } catch (_) { documentReadability='unreadable'; }
     return {selector:selector(e),origin:diagnosticOrigin || origin,
       path:diagnosticPath || path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
+      srcdoc:e.hasAttribute('srcdoc') ? 'present' : 'absent',
+      parent_pattern:frameParentPattern(parent),anchor_sibling:anchorSibling,
+      shared_recaptcha_container:sharedRecaptchaContainer,
+      document_readability:documentReadability,
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
       box,badge,bounds,status,
@@ -730,12 +772,38 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       ...(!['H','R','W','X','Z'].includes(status) ? {form_controls:formControls} : {})};
   });
   let responseError=false;
+  const responseIdPattern = (id, signature) => {
+    if (typeof id!=='string' || !id) return 'absent';
+    const prefix=signature==='H' ? 'h-captcha-response' : 'g-recaptcha-response';
+    if (id===prefix) return prefix;
+    if (new RegExp('^'+prefix+'-[0-9]{1,6}$').test(id)) return prefix+'[-digits]';
+    return 'other-id';
+  };
+  const formRelation = n => !n ? 'none' : !root ? 'root-unknown' :
+    n===root ? 'entry-root' : 'other-form';
   const entryResponses=responseNodes.map(e => {
-    const name=e.getAttribute('name'), owner=e.form || e.closest('form');
+    const name=e.getAttribute('name'), ancestor=e.closest('form'),
+      owner=e.form || ancestor;
     const signature=name==='h-captcha-response' ? 'H' : 'R';
-    if (responseNodes.filter(n=>n.getAttribute('name')===name).length!==1 ||
-        !entryFrames.some(f=>f.status===signature) || (owner && owner!==root)) responseError=true;
-    return {selector:selector(e),name,form:owner ? selector(owner) : ''};
+    const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
+    const providerFrame=entryFrames.some(f=>f.status===signature);
+    const wrongOwner=!!owner && owner!==root;
+    const issues=[];
+    if (duplicates) issues.push('duplicate-name');
+    if (!providerFrame) issues.push('provider-unproven');
+    if (wrongOwner) issues.push('owner-conflict');
+    if (issues.length) responseError=true;
+    return {selector:selector(e),name,form:owner ? selector(owner) : '',
+      diagnostic:{
+        tag:['input','textarea'].includes(e.localName) ? e.localName : 'unknown',
+        name_pattern:signature==='H' ? 'h-captcha-response' : 'g-recaptcha-response',
+        id_pattern:responseIdPattern(e.getAttribute('id'),signature),
+        ancestor:formRelation(ancestor),owner:formRelation(owner),
+        explicit_form:e.hasAttribute('form') ? 'yes' : 'no',
+        provider:signature==='H' ? 'hcaptcha' : 'recaptcha',
+        provider_frame:providerFrame ? 'yes' : 'no',
+        badge:e.closest('div.grecaptcha-badge') ? 'yes' : 'no',
+        issues}};
   });
   // Reject a graph claiming a reserved receiver before closedGraph/newGraphs or
   // any linked combobox path can touch its value (including a throwing getter).
@@ -746,11 +814,16 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     let field=c.parentElement;
     if (labels.length===1) while(field && !field.contains(labels[0])) field=field.parentElement;
     else field=c.closest('[data-automation-id="formField"],.form-group');
-    if (responseNodes.some(h =>
-      c.getAttribute('data-value-input')===h.id && !!h.id ||
-      c.getAttribute('data-value-name')===h.getAttribute('name') || c.contains(h) ||
-      (field && field!==form && field.contains(h) && (h.form || h.closest('form'))===form)))
-      responseError=true;
+    for (const h of responseNodes) {
+      if (c.getAttribute('data-value-input')===h.id && !!h.id ||
+          c.getAttribute('data-value-name')===h.getAttribute('name') || c.contains(h) ||
+          (field && field!==form && field.contains(h) && (h.form || h.closest('form'))===form)) {
+        responseError=true;
+        const diagnostic=entryResponses[responseNodes.indexOf(h)].diagnostic;
+        if (!diagnostic.issues.includes('linked-receiver'))
+          diagnostic.issues.push('linked-receiver');
+      }
+    }
   }
   const entry={frames:entryFrames,responses:entryResponses,response_error:responseError,
     // A native Ashby element is only a CANDIDATE until Python binds the raw

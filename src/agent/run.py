@@ -1390,6 +1390,10 @@ def run_queued(item: dict, q: Any) -> dict:
              "question": "material-assent: human inspection required"}
             if (result.get("result") == "gated"
                 and result.get("material_assent_diagnostic") is True)
+            else {"result": "gated", "pk": pk,
+                  "question": "captcha-artifact: human inspection required"}
+            if (result.get("result") == "gated"
+                and result.get("captcha_artifact_diagnostic") is True)
             else result
         )
         log.info("apply: %s", logged_result)
@@ -1651,12 +1655,17 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         # Ordinary events and daemon logs must not echo page-controlled labels.
         material_assent = (configuration()['engine'] == 'browser_skill'
                            and result.get('material_assent_diagnostic') is True)
+        captcha_artifact = (configuration()['engine'] == 'browser_skill'
+                            and result.get('captcha_artifact_diagnostic') is True)
         routine_detail = ("material-assent: human inspection required"
-                          if material_assent else q)
+                          if material_assent else
+                          "captcha-artifact: human inspection required"
+                          if captcha_artifact else q)
         emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
         log.info("gated pk=%s: %s", pk, routine_detail)
         return {"result": "gated", "pk": pk, "question": q,
-                **({"material_assent_diagnostic": True} if material_assent else {})}
+                **({"material_assent_diagnostic": True} if material_assent else {}),
+                **({"captcha_artifact_diagnostic": True} if captcha_artifact else {})}
     reason = _fail_reason(result)
     # A browser held by something else is an ENVIRONMENT fault, not a verdict on
     # this job: the form was never reached, nothing was filled, and the same job

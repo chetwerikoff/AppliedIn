@@ -3907,7 +3907,8 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
     assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
-    assert saved == {'Processing consent?': 'I agree'}
+    # The exact per-job grant is the only consent store: not the fact bank.
+    assert saved == {}
     grant = row['human_approved_answers']['Processing consent?']
     assert grant['options'] == legal['options']
     assert grant['form_action'] == SECURE_URL
@@ -3970,7 +3971,7 @@ async def test_material_unwitnessed_or_unbound_assent_never_becomes_owner_grant(
     report = await secure_attempt(p)
     assert report['status'] == 'gate' and report['form_question'] is None
     assert report['review_route'] != 'owner'
-    assert not decide.await_count
+    assert decide.await_count == (1 if ungrantable == 'unbound' else 0)
     assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
 
 
@@ -4039,3 +4040,21 @@ async def test_scoped_facts_reach_runtime_and_decision_keys_on_regional_hosts(
                    for secret in ('GLOBAL_SENTINEL', 'COMPANY_SENTINEL'))
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
+
+@pytest.mark.parametrize('optional', [True, False])
+async def test_material_select_optional_and_required_are_both_owner_decisions(
+        monkeypatch, optional):
+    consent = field('Data privacy agreement', '#consent-optional',
+                    required=not optional, tag='select', type='select',
+                    options=[{'value': '', 'label': 'Please choose'},
+                             {'value': 'yes', 'label': 'I agree'},
+                             {'value': 'no', 'label': 'I decline'}])
+    p = secure_inventory(consent)
+    browser, decide, _ = secure_world(monkeypatch, p)
+    report = await secure_attempt(p, facts={'Data privacy agreement': 'I agree'})
+    assert report['reason'] == 'owner_question'
+    assert report['review_route'] == 'owner'
+    assert report['form_question']['options'] == consent['options']
+    assert report['material_assent_diagnostic'] is True
+    assert decide.await_count == 0
+    assert not any(call[0] in {'select', 'fill', 'click'} for call in browser.calls)

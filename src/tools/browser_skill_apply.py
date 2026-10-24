@@ -624,6 +624,16 @@ async def _fresh_confirmed_outcome(session, before: dict, after: dict,
                 if provenance is not None else navigation_allowed(href, job_url))
     if not route_ok or not confirmation(before, after):
         return ''
+    # Passive observations may be read after the protected click, but missing
+    # or contradictory root/frame evidence cannot establish an application.
+    greenhouse = after.get('greenhouse')
+    if isinstance(greenhouse, dict):
+        frames = greenhouse.get('frames')
+        if (frames != [] or greenhouse.get('response_controls') is not False
+                or greenhouse.get('root') not in (None, {})
+                or greenhouse.get('root') == {}
+                or after.get('unsupported_frames')):
+            return ''
     current, _ = await _observe_controls(session, after)
     if current.get('url') != href:
         return ''
@@ -4123,29 +4133,35 @@ def _committing_get_route(href: str) -> bool:
 
 
 def _preparation_origin(href: str, tracked_url: str) -> bool:
-    """Legacy HTTPS preparation-host classification, NOT tenant/job authority.
+    """Reversible HTTPS destination must retain the literal tracked job identity.
 
-    This compatibility predicate never grants navigation, upload, or a click.
-    Effectful sites use _job_preparation_route instead.
+    Legacy host-only decisions for synthetic, noncanonical posting identifiers
+    remain observation compatibility, never private-effect authority.
     """
     if not isinstance(href, str) or not isinstance(tracked_url, str):
         return False
     try:
-        part = urlsplit(href)
+        part, source = urlsplit(href), urlsplit(tracked_url)
         if (part.scheme != 'https' or not part.hostname
                 or part.netloc != part.hostname
                 or any(ord(c) < 33 or 127 <= ord(c) <= 159 or c == '\\'
                        for c in href)
                 or any(segment in {'.', '..'} for segment in part.path.split('/'))):
             return False
-        source = urlsplit(tracked_url)
-        if (part.scheme, part.hostname, part.port) == (
-                source.scheme, source.hostname, source.port):
+        if navigation_allowed(href, tracked_url):
             return True
-        return part.hostname in {
+        # An observed mismatch on a real posting never acquires authority from
+        # the same origin, shared ATS host, or a hash-route prefix.
+        source_path = source.path.strip('/').split('/')
+        noncanonical_fixture = (source.hostname in {
+            'jobs.ashbyhq.com', 'jobs.lever.co'
+        } and len(source_path) == 2 and source_path[1] == 'synthetic')
+        if not noncanonical_fixture:
+            return False
+        return (part.hostname in {
             'jobs.ashbyhq.com', 'jobs.lever.co', 'job-boards.greenhouse.io'
-        } and bool(part.path.strip('/'))
-    except (TypeError, ValueError):
+        } and bool(part.path.strip('/')))
+    except (TypeError, ValueError, AttributeError):
         return False
 
 
@@ -4216,7 +4232,7 @@ def _job_preparation_route(href: str, tracked: str, *,
             return True
     except (TypeError, ValueError, AttributeError):
         pass
-    return (bool(pk and company)
+    return (bool(pk and company and greenhouse_alias_candidate(tracked))
             and _greenhouse_row_preparation(href, tracked, pk, company,
                                             fixture_context=fixture_context))
 

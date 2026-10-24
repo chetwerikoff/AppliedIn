@@ -4150,6 +4150,16 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
             return False
         if navigation_allowed(href, tracked_url):
             return True
+        # Reversible application subpaths belong to the same literal posting
+        # when origin, opaque job query and fragment are unchanged. Never use
+        # the vendor-host match as a substitute for this route comparison.
+        root = source.path.rstrip('/')
+        if (source.scheme == part.scheme == 'https'
+                and source.netloc == part.netloc and root
+                and (part.path == root or part.path.startswith(root + '/'))
+                and '%' not in part.path and source.query == part.query
+                and source.fragment == part.fragment):
+            return True
         # An observed mismatch on a real posting never acquires authority from
         # the same origin, shared ATS host, or a hash-route prefix.
         source_path = source.path.strip('/').split('/')

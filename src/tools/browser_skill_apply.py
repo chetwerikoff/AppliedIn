@@ -5764,7 +5764,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # Preserve all earlier native-root, model and provenance
                         # checks. Only an ordinary reviewer refusal without a
                         # specific approved answer becomes an owner question.
-                        if (bank_partition_known and not granted_keys and not choices
+                        if (bank_partition_known and global_facts and not granted_keys and not choices
                                 and action.get('question')
                                 and not _formless_root(page)):
                             unanswered = [c for c in page['controls']

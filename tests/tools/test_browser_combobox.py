@@ -851,7 +851,8 @@ def test_material_combobox_reply_stores_original_option_identity(monkeypatch):
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
     assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
-    assert stored == {'Data processing consent?': 'I agree'}
+    # No material owner assent may be written to the reusable fact bank.
+    assert stored == {}
     approved = row['human_approved_answers']['Data processing consent?']
     assert approved['options'] == question['options']
     assert approved['selector'] == '#country'
@@ -879,8 +880,7 @@ async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
     no_write = Session(current)
     with pytest.raises(forms.MaterialAssentGate) as first:
-        await forms._bootstrap(
-            no_write, current, PK, {'Data processing consent?': 'I agree'}, URL)
+        await forms._bootstrap(no_write, current, PK, {}, URL)
     assert first.value.reason == 'owner_question'
     assert first.value.form_question['options'] == [
         {key: option[key] for key in ('selector', 'label', 'value')}
@@ -895,8 +895,7 @@ async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_
             'tag': 'input', 'type': 'combobox', 'form_selector': '#application',
             'form_action': URL, 'options': form_question['options'],
         }}
-    await forms._bootstrap(
-        no_write, current, PK, {'Data processing consent?': 'I agree'}, URL)
+    await forms._bootstrap(no_write, current, PK, {}, URL)
     assert not any(call[0] != 'evaluate' for call in no_write.calls)
 
     committed = material_page(selected=True)
@@ -905,7 +904,7 @@ async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_
     receipt = await forms.execute(
         browser, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'Data processing consent?'},
-        facts={'Data processing consent?': 'I agree'}, filled=filled,
+        facts={}, filled=filled,
         resume_path='', company='example-co', jd_text='', resume_tex='',
         github='', pk=PK, job_url=URL)
     assert ('click', '#country-example') in browser.calls
@@ -932,8 +931,6 @@ async def test_material_combobox_bad_witness_cannot_request_grant(monkeypatch, p
         independent['controls'][0]['visible'] = False
     row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    session = Session(current)
-    session.call = None  # Prohibit even simulated effects after a refused grant.
     witness = {'#country': next(x for x in independent['controls']
                                 if x['selector'] == '#country')}
     with pytest.raises(forms.Gate):

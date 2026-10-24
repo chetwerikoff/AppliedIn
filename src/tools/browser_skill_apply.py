@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 import ipaddress
 import socket
 import re
@@ -2720,11 +2721,16 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
+_EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
+
+
 async def _observe_controls(session, page: dict, *, readiness: bool = False,
                             site: str = '', _identity_try: int = 1,
                             _previous_identity=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
+    if not site and _EXECUTE_OBSERVATION_SITE.get():
+        site = 'execute'
     predicate, locator = 'unavailable', 'unavailable'
 
     def require(ok, key):
@@ -4281,6 +4287,15 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                if witnessed_options is not None else {})}
 
 
+async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
+    """Keep the legacy two-argument observation seam in execute()."""
+    token = _EXECUTE_OBSERVATION_SITE.set(True)
+    try:
+        return await _observe_controls(session, page)
+    finally:
+        _EXECUTE_OBSERVATION_SITE.reset(token)
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -4316,7 +4331,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_choice(target)
         else:
             _require_native_action(target, verb)
-        observed, witness = await _observe_controls(session, page)
+        observed, witness = await _execute_observe_controls(session, page)
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
                 or not _preparation_destination_allowed(observed.get('url', ''),
@@ -4429,7 +4444,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             else:
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _observe_controls(session, page)
+        latest, latest_witness = await _execute_observe_controls(session, page)
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_native_choice(current)
@@ -5497,8 +5512,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         step, mark_click_started, seal_stage=True,
                         verified_redirect=(provenance if isinstance(
                             provenance, VendorRedirectProvenance) else None))
-                    try:
-                        raw_session.bind_application_controller(controller)
+                    try:                        raw_session.bind_application_controller(controller)
                         if getattr(raw_session, '_application_controller', None) is not controller:
                             raise Gate('Application producer did not retain its raw IPC guard; no click is safe.')
                     except BaseException:

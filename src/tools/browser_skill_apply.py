@@ -3009,7 +3009,8 @@ def _same_key(value: str) -> str:
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None,
-                         lever_location: bool = False) -> dict:
+                         lever_location: bool = False,
+                         closed_witness: bool = False) -> dict:
     structural = _formless_root(page)
     if structural:
         members = _formless_boundary(page, provenance)
@@ -3067,7 +3068,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if not _material_form_choice(target):
             raise Gate('Legal or material assent requires direct human review.')
         # Unlinked or partly observed ARIA options cannot become an approval.
-        if target.get('type') == 'combobox':
+        if target.get('type') == 'combobox' and not closed_witness:
             _combobox_options(target)
     key = _key(page, target)
     siblings = _form_subject(page, target)
@@ -3106,7 +3107,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question['verified_redirect_url'] = provenance.target_url
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
-    if target.get('type') == 'combobox' and _material_form_choice(target):
+    if (target.get('type') == 'combobox' and _material_form_choice(target)
+            and not closed_witness):
         # Ordinary dynamic picker grants bind stable receivers; assent must
         # additionally bind the complete currently witnessed options.
         question['options'] = [
@@ -3180,7 +3182,10 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
             or proof.get('readonly') is True or proof.get('disabled') is True
             or proof.get('inert') is True or proof.get('combobox') != combo):
         raise Gate('This control is not visibly editable.')
-    _disclosure_question(page, target, witness, *origins, provenance=provenance)
+    # Code-only safety preflight: no grant/question is returned to the owner
+    # until independently linked, complete options have been witnessed.
+    _disclosure_question(page, target, witness, *origins,
+                         provenance=provenance, closed_witness=True)
     check_form_destination(page, target, *origins, provenance=provenance)
     if (not _preparation_destination_allowed(
             page['url'], *origins, provenance=provenance)

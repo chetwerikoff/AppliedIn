@@ -805,7 +805,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
                   tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
@@ -817,7 +817,7 @@ def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
             'I decline', '#decline-choice', tag='input', type='radio',
             required=True, checked=False, has_value=True, name='attestation',
             question='Arbitration consent', value='decline'))
-    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
+    await forms._bootstrap_wall(None, inventory(*members, submit()), {}, URL)
 
 
 async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):

@@ -5054,3 +5054,64 @@ async def test_execute_production_observer_has_literal_gate_site(monkeypatch):
     assert 'predicate=selector.equal' in str(error.value)
     assert 'site=execute' in str(error.value)
     assert [call[0] for call in browser.calls] == ['evaluate']
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('passive', ('yes', '1', '1', 'yes', 'yes')),
+    ('non_ashby', ('no', '1', '1', 'yes', 'no')),
+    ('duplicate_anchor', ('yes', '2', '1', 'no', 'no')),
+    ('duplicate_bframe', ('yes', '1', '2', 'yes', 'no')),
+    ('outside_badge', ('yes', '1', '1', 'no', 'no')),
+    ('visible_bframe', ('yes', '1', '1', 'yes', 'no')),
+])
+def test_issue179_owner_gate_includes_bounded_enterprise_evidence(case, expected):
+    # Assert the actual owner-facing exception, not a reader dictionary or the
+    # formatter in isolation: a passive candidate can still need manual review
+    # for a separate untrusted frame, without changing Enterprise admission.
+    ashby, anchors, bframes, badge, passive = expected
+    candidate = {
+        'status': 'unknown', 'origin': 'https://www.google.com',
+        'path': '/recaptcha/enterprise/anchor', 'source': 'url',
+        'visibility': 'hidden', 'display': 'inline',
+        'ashby_native': ashby, 'enterprise_anchors': int(anchors),
+        'enterprise_bframes': int(bframes), 'anchor_in_badge': badge,
+        'passive_enterprise': passive,
+    }
+    page = inventory(url=SECURE_URL)
+    page['entry'] = {'frames': [candidate]}
+    with pytest.raises(forms.CaptchaArtifactGate) as caught:
+        forms._entry_safety(page, lambda url: url == SECURE_URL, None)
+    message = str(caught.value)
+    expected_text = (
+        'unknown/untrusted application frame; inspect manually. '
+        'Non-admitted frames: frame[1] origin=https://www.google.com '
+        'path=/recaptcha/enterprise/anchor source_kind=url '
+        'box=unknown outside_root=unknown visibility=hidden display=inline '
+        'form_controls=unknown srcdoc=unknown parent_pattern=unknown '
+        'anchor_sibling=unknown shared_recaptcha_container=unknown '
+        f'ashby_native={ashby} enterprise_anchors={anchors} '
+        f'enterprise_bframes={bframes} anchor_in_badge={badge} '
+        f'passive_enterprise={passive} document_readability=unknown'
+    )
+    assert message == expected_text
+
+
+@pytest.mark.parametrize('field,bad_value', [
+    ('enterprise_anchors', True),
+    ('enterprise_anchors', 10),
+    ('enterprise_bframes', -1),
+    ('enterprise_bframes', '2'),
+])
+def test_issue179_owner_gate_does_not_render_unbounded_counts(field, bad_value):
+    frame = {
+        'status': 'unknown', 'source': 'url',
+        'ashby_native': 'yes', 'enterprise_anchors': 1,
+        'enterprise_bframes': 1, 'anchor_in_badge': 'yes',
+        'passive_enterprise': 'no',
+    }
+    frame[field] = bad_value
+    page = inventory(url=SECURE_URL)
+    page['entry'] = {'frames': [frame]}
+    with pytest.raises(forms.CaptchaArtifactGate) as caught:
+        forms._entry_safety(page, lambda url: url == SECURE_URL, None)
+    assert f'{field}=other' in str(caught.value)

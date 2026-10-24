@@ -2201,6 +2201,11 @@ def _unknown_frame_details(frames, provenance):
             f"parent_pattern={parent_pattern(frame.get('parent_pattern'))} "
             f"anchor_sibling={literal(frame.get('anchor_sibling'), {'yes', 'no'})} "
             f"shared_recaptcha_container={literal(frame.get('shared_recaptcha_container'), {'yes', 'no'})} "
+            f"ashby_native={literal(frame.get('ashby_native'), {'yes', 'no'})} "
+            f"enterprise_anchors={frame['enterprise_anchors'] if type(frame.get('enterprise_anchors')) is int and 0 <= frame['enterprise_anchors'] <= 9 else 'other'} "
+            f"enterprise_bframes={frame['enterprise_bframes'] if type(frame.get('enterprise_bframes')) is int and 0 <= frame['enterprise_bframes'] <= 9 else 'other'} "
+            f"anchor_in_badge={literal(frame.get('anchor_in_badge'), {'yes', 'no'})} "
+            f"passive_enterprise={literal(frame.get('passive_enterprise'), {'yes', 'no'})} "
             f"document_readability={literal(frame.get('document_readability'), {'readable', 'unreadable', 'unavailable'})}")
     return '; '.join(rows)
 

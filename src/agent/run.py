@@ -1295,6 +1295,15 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
 
     question = (row.get("gate_pending") or {}).get("question") or ""
     form_label = _direct_form_label(pk, row)
+    bound_field = (row.get('gate_pending') or {}).get('form_question')
+    if (form_label is None and row.get('gate_source') == 'applier'
+            and isinstance(bound_field, dict)):
+        # A stale or malformed legal form question is not a reusable applicant
+        # fact. Fail closed instead of laundering the owner's reply into GLOBAL.
+        from tools.browser_skill_apply import _material_question
+        if _material_question(bound_field):
+            return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                    'detail': 'The observed material form question is no longer current.'}
     approval = form_label is None and question.startswith("Ready to apply")
     if (form_label is not None
             or (question and not approval

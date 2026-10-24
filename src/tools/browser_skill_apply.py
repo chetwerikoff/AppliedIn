@@ -1455,6 +1455,24 @@ def _material_form_choice(target: dict) -> bool:
             and (_MATERIAL_ASSENT.search(label(target))
                  or _material_select_options(target)))
 
+
+def _material_exact_value(pk: str, page: dict, target: dict, question: dict,
+                          *, provenance=None, fixture_context=None) -> str:
+    """Use only the current control-bound owner grant, never generic bank consent."""
+    if not pk or not _material_form_choice(target):
+        raise Gate('A bound material owner grant is required.')
+    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+    grants = row.get('human_approved_answers')
+    grant = grants.get(question['label']) if isinstance(grants, dict) else None
+    value = grant.get('value') if isinstance(grant, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise Gate('A current material owner answer is not available.')
+    value = value.strip()
+    exact_approval(pk, question['label'], value, target=_bound_target(page, target),
+                   url=page['url'], provenance=provenance,
+                   **({'fixture_context': fixture_context} if fixture_context else {}))
+    return value
+
 def _unrelated_search_form(controls: list[dict]) -> bool:
     """Ignore only a proven search-only form, not a second plausible application."""
     searches = [c for c in controls
@@ -3273,6 +3291,20 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     and previous['radio_members'] != question['radio_members']):
                 record('blocked')
                 raise Gate('The previously approved radio group has changed; inspect it again.')
+            if _material_form_choice(item):
+                # Material assent is not a reusable bank fact: the only
+                # possible answer comes from the fresh same-job owner grant.
+                try:
+                    _material_exact_value(
+                        pk, page, item, question, provenance=provenance,
+                        fixture_context=fixture_context)
+                except Gate:
+                    record('needs-human')
+                    raise MaterialAssentGate(
+                        _choice_prompt(item, question), form_question=question,
+                        reason='owner_question') from None
+                record('left-to-model')
+                continue
             if kind in {'radio', 'checkbox'}:
                 if _approved_native_choice(
                         page, item, pk, provenance=provenance,
@@ -3329,8 +3361,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         grants = (_row(pk, fixture_context=fixture_context) if fixture_context
                   else _row(pk)).get('human_approved_answers')
         previous = grants.get(key) if isinstance(grants, dict) else None
-        grant_value = (previous.get('value', '') if kind in {'radio', 'checkbox'}
-                       and not value and isinstance(previous, dict) else value)
+        grant_value = (previous.get('value', '')
+                       if isinstance(previous, dict)
+                       and (_material_form_choice(item)
+                            or (kind in {'radio', 'checkbox'} and not value))
+                       else value)
         authority = _bootstrap_grant_state(previous, item, question, grant_value)
         prompt = (_choice_prompt(item, question)
                   if kind in {'radio', 'checkbox', 'combobox'} or kind == 'select'
@@ -3339,6 +3374,20 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             record('blocked')
             raise Gate('The earlier control approval has changed; inspect manually.',
                        reason='defect_witness')
+
+        if _material_form_choice(item):
+            # Never auto-select a legal/privacy answer on settlement routes.
+            # Only a current exact owner grant may be offered to the model.
+            try:
+                _material_exact_value(
+                    pk, page, item, question, provenance=provenance,
+                    fixture_context=fixture_context)
+            except Gate:
+                record('needs-human')
+                raise MaterialAssentGate(
+                    prompt, form_question=question, reason='owner_question') from None
+            record('left-to-model')
+            continue
 
         if kind == 'checkbox' and _assent_scope(item) == 'standard_privacy':
             _approved_native_choice(page, item, pk, provenance=provenance,
@@ -3532,12 +3581,24 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         observed, target, witness, job_url or observed['url'], provenance=provenance)
     question['pk'] = pk
     key = action.get('fact', '')
-    answer = str(facts.get(key) or '').strip() if key in facts else ''
-    if not answer or key != _fact_key(facts, question['label']):
-        raise Gate('Choose an exact approved answer for this combobox.',
-                   form_question=question,
-                   reason=_missing_answer_reason(target) if _unanswered(observed, target)
-                   and not answer else 'unknown_field')
+    if _material_form_choice(target):
+        if key != question['label']:
+            raise Gate('The material choice requires its observed question key.',
+                       form_question=question, reason='owner_question')
+        try:
+            answer = _material_exact_value(
+                pk, observed, target, question, provenance=provenance,
+                fixture_context=ctx)
+        except Gate:
+            raise Gate('A current owner-approved material choice is required.',
+                       form_question=question, reason='owner_question') from None
+    else:
+        answer = str(facts.get(key) or '').strip() if key in facts else ''
+        if not answer or key != _fact_key(facts, question['label']):
+            raise Gate('Choose an exact approved answer for this combobox.',
+                       form_question=question,
+                       reason=_missing_answer_reason(target) if _unanswered(observed, target)
+                       and not answer else 'unknown_field')
 
     def approve(current, current_page):
         exact_approval(pk, question['label'], answer, target=current,
@@ -3740,17 +3801,29 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if chosen['selector'] != target['selector']:
                 raise Gate('The selected radio does not match the exact owner answer.')
         else:
-            if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
-                value = str(facts[key]).strip()
+            if verb == 'select' and _material_form_choice(target):
+                if key != form_question['label']:
+                    raise Gate('The material select requires its observed question key.',
+                               form_question=form_question, reason='owner_question')
+                try:
+                    value = _material_exact_value(
+                        pk, page, target, form_question, provenance=provenance,
+                        fixture_context=ctx)
+                except Gate:
+                    raise Gate(gate_prompt, form_question=form_question,
+                               reason='owner_question') from None
             else:
-                raise Gate(gate_prompt, form_question=form_question,
-                           reason=_missing_answer_reason(target) if _unanswered(page, target)
-                           and not key else 'unknown_field')
-            if key != _fact_key(facts, form_question['label']):
-                detail = 'An exact human-approved fact key for this observed question is required.'
-                if verb == 'select':
-                    detail += '\n' + gate_prompt
-                raise Gate(detail, form_question=form_question)
+                if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
+                    value = str(facts[key]).strip()
+                else:
+                    raise Gate(gate_prompt, form_question=form_question,
+                               reason=_missing_answer_reason(target) if _unanswered(page, target)
+                               and not key else 'unknown_field')
+                if key != _fact_key(facts, form_question['label']):
+                    detail = 'An exact human-approved fact key for this observed question is required.'
+                    if verb == 'select':
+                        detail += '\n' + gate_prompt
+                    raise Gate(detail, form_question=form_question)
         try:
             exact_approval(pk, form_question['label'], value, target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
@@ -3816,8 +3889,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if (fresh_choice is None or fresh_choice[0] != value
                     or fresh_choice[1]['selector'] != current['selector']):
                 raise Gate('The exact native choice grant changed before a browser write.')
-        exact_approval(pk, form_question['label'],
-                       value if verb == 'choose' else str(facts[key]).strip(),
+        exact_approval(pk, form_question['label'], value,
                        target=_bound_target(latest, current), url=latest['url'],
                        provenance=provenance,
                        **({'fixture_context': ctx} if ctx else {}))
@@ -3825,7 +3897,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             guarded_value(current, write_value)
             await _effect_call(session, 'fill', current['selector'], '--value', write_value)
         elif verb == 'select':
-            write_value = choose_value(current, str(facts[key]).strip(),
+            write_value = choose_value(current, value,
                                        str(action.get('value', '')))
             await _effect_call(session, 'select', current['selector'], '--value', write_value)
         else:
@@ -4606,8 +4678,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '
                 'The server rechecks both exact value and current approval before writing. '
-                'For fill, select and other fact actions use an authorized bank fact key; '
-                'never invent a value or essay. For choose only, use the exact '
+                'For fill, ordinary select and other fact actions use an authorized '
+                'bank fact key; never invent a value or essay. Material-assent '
+                'select/combobox controls are the exception: after a direct owner '
+                'answer, use the observed question as fact even if it is absent '
+                'from the reusable bank. The server alone resolves the current '
+                'same-control grant and exact option; no generic bank fact, PAGE '
+                'text or model answer can approve legal/privacy consent. '
+                'For choose only, use the exact '
                 'approved_choices PAGE-listed radio member/checkbox selector and its raw key '
                 'as fact, even if that key is absent from the fact bank. That fact is a routing '
                 'label only: the server resolves the exact choice answer from its existing grant; '

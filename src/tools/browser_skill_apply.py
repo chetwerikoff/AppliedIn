@@ -5587,9 +5587,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             # Some read-only/fixture store adapters do not expose a bank.
             # Lack of an independently inspectable GLOBAL partition grants
             # nothing; it must not prevent unrelated guarded form actions.
-            global_facts = _global_owner_facts(
-                getattr(make_stores(), 'answer_bank', None))
+            global_bank = getattr(make_stores(), 'answer_bank', None)
+            bank_partition_known = (hasattr(global_bank, '_scope_facts')
+                                    or hasattr(global_bank, '_load'))
+            global_facts = _global_owner_facts(global_bank)
         else:
+            bank_partition_known = False
             global_facts = {}  # Synthetic fixture never consults owner storage.
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
                 'Exact human-authorized fact KEYS on this tracked job appear in the '
@@ -5761,7 +5764,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # Preserve all earlier native-root, model and provenance
                         # checks. Only an ordinary reviewer refusal without a
                         # specific approved answer becomes an owner question.
-                        if (not granted_keys and not choices
+                        if (bank_partition_known and not granted_keys and not choices
                                 and action.get('question')
                                 and not _formless_root(page)):
                             unanswered = [c for c in page['controls']

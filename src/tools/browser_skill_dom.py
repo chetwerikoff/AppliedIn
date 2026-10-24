@@ -648,7 +648,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const style=getComputedStyle(e), hidden=style.visibility==='hidden' || style.display==='none';
     const shown=style.visibility==='visible' && style.display!=='none';
     const outside=!!root && !root.contains(e), box=rectOf(e);
-    // Structural fallback is Ashby hidden-R-only, not shared X/Z placement.
+    // Ashby already uses structuralRoot for outside; do not lend it to non-Ashby R.
     const hiddenROutside=nativeRoot ? !nativeRoot.contains(e) :
       ashbyNative && !!structuralRoot && !structuralRoot.contains(e);
     const parent=e.parentElement;
@@ -724,6 +724,9 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       visibility:style.visibility,display:style.display,outside,root:root ? selector(root) : '',
       ancestors:(() => {const a=[]; for(let p=e.parentElement;p;p=p.parentElement) a.push(selector(p)); return a;})(),
       box,badge,bounds,status,
+      // Parent-reader proof; the rootless frame remains unadmitted.
+      ...(status==='unknown' && ashbyNative && !root && r && hidden
+        ? {rootless_hidden_r:true} : {}),
       ...(!['H','R','W','X','Z'].includes(status) ? {form_controls:formControls} : {})};
   });
   let responseError=false;

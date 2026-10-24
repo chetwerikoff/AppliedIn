@@ -160,30 +160,12 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     assert not transport._application_controller.committed
 
 
-def _hidden_enterprise_anchor():
+def _hidden_enterprise_anchor(kind='R'):
     # Scrubbed 256x60 enterprise-anchor shape, with no provider child reads.
-    return dict(frames=['R'], edit={
+    return dict(frames=[kind], edit={
         'rect': {'width': 256, 'height': 60, 'right': 256, 'bottom': 60},
         'style': {'visibility': 'hidden', 'display': 'inline'},
     })
-
-
-@pytest.mark.parametrize('reader', ['page', 'witness'])
-def test_hidden_enterprise_outside_ashby_structural_root_is_existing_r(reader):
-    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
-    page = dom(dict(root=False, formless=True, url=entry('ashby'),
-                    **_hidden_enterprise_anchor()), script)
-    assert page['entry']['root'] is None  # No native form is present.
-    assert page['entry']['formless']['root'] == '#application-root'
-    frame = page['entry']['frames'][0]
-    assert frame['status'] == 'R'
-    assert frame['root'] == '#application-root' and frame['outside'] is True
-    assert frame['box'] == {'width': 256, 'height': 60}
-    assert frame['visibility'] == 'hidden' and frame['display'] == 'inline'
-    assert frame['origin'] == 'https://www.recaptcha.net'
-    assert frame['path'] == '/recaptcha/enterprise/anchor'
-    assert 'form_controls' not in frame
-    forms._entry_safety(page, lambda url: url == entry('ashby'), None)
 
 
 @pytest.mark.parametrize('reader', ['page', 'witness'])
@@ -274,6 +256,213 @@ def test_ashby_hidden_r_does_not_hide_other_frames_or_visible_challenge(reader):
         'visible-recaptcha', 'unknown']
     with pytest.raises(forms.CaptchaGate, match='visible reCAPTCHA Enterprise challenge'):
         forms._entry_safety(shown, lambda url: url == entry('ashby'), None)
+
+
+def _synthetic_enterprise_pair(*, ats='ashby', missing_root=False, inside=False,
+                               sibling=False, visible_bframe=False, kind='R', edit=None):
+    shape = _hidden_enterprise_anchor(kind)
+    if edit:
+        shape['edit'].update(edit)
+    shape.update(root=False, formless=True, url=entry(ats))
+    if missing_root:
+        shape['missingPane'] = True
+    if sibling:
+        shape['sibling'] = True
+    if visible_bframe:
+        shape['frames'] = ['R', 'B']
+    injection = ''
+    if inside:
+        injection = """
+  {
+    const anchor = document.querySelector('iframe');
+    const container = document.querySelector('.ashby-application-form-container');
+    const siblings = anchor.parentElement.children;
+    siblings.splice(siblings.indexOf(anchor), 1);
+    anchor.parentElement = container;
+    container.children.push(anchor);
+  }
+"""
+    if visible_bframe:
+        injection = """
+  {
+    const frames = document.querySelectorAll('iframe');
+    frames[1].style.visibility = 'visible';
+  }
+"""
+    def reader(script):
+        if not injection:
+            return script
+        opener = '(() => {\n'
+        assert script.startswith(opener)
+        return script.replace(opener, opener + injection, 1)
+    return (dom(shape, reader(forms.ENTRY_PAGE)),
+            dom(shape, reader(forms._ENTRY_FIXED_CONTROL_WITNESS)))
+
+
+def _temporal_entry_session(monkeypatch, first, second=None, *, ats='ashby'):
+    from tests.tools.test_browser_application_entry import fake_clock
+    clock = fake_clock(monkeypatch)
+    row, configs, _, decision = world(monkeypatch, ats)
+    raw = RootSession(*first)
+    reads = [0]
+    original = raw.call
+
+    async def stepped(method, *args, **kwargs):
+        if method == 'evaluate' and args == (forms.ENTRY_PAGE,):
+            reads[0] += 1
+            if reads[0] == 2 and second is not None:
+                raw.current, raw.fixed = deepcopy(second)
+        return await original(method, *args, **kwargs)
+
+    raw.call = stepped
+    provenance = forms._application_entry(row, PK, COMPANY, posting(ats), configs)
+    scoped = forms._EntrySession(raw, lambda url: url == entry(ats), provenance)
+    return clock, raw, scoped, provenance, decision, reads
+
+
+@pytest.mark.parametrize('kind', ['R', 'B'])
+@pytest.mark.parametrize('display_none', [False, True])
+async def test_rootless_hidden_enterprise_retries_until_real_structural_root(monkeypatch, kind,
+                                                                            display_none):
+    edit = {'style': {'visibility': 'visible', 'display': 'none'}} if display_none else None
+    first = _synthetic_enterprise_pair(missing_root=True, kind=kind, edit=edit)
+    second = _synthetic_enterprise_pair(kind=kind, edit=edit)
+    assert first[0]['entry']['root'] is None
+    assert first[0]['entry']['formless']['root'] == ''
+    assert first[0]['entry']['frames'][0]['status'] == 'unknown'
+    assert first[0]['entry']['frames'][0]['rootless_hidden_r'] is True
+    assert first[0]['entry'] == first[1]['entry']
+    assert second[0]['entry']['formless']['root'] == '#application-root'
+    assert second[0]['entry']['frames'][0]['status'] == 'R'
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, first, second)
+    start = clock[0]
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert page['entry']['frames'][0]['status'] == 'R'
+    assert page['entry']['frames'][0]['outside'] is True
+    assert reads[0] >= 4  # Rootless, hydrated, then the stable fresh read pair.
+    assert start < clock[0] < start + forms._ASHBY_WAIT_SECONDS
+    assert session._readiness is False
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_rootless_hidden_enterprise_expiry_keeps_original_gate_details(monkeypatch):
+    first = _synthetic_enterprise_pair(missing_root=True)
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
+    start = clock[0]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame') as raised:
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    detail = str(raised.value)
+    assert not isinstance(raised.value, forms._EntryNotReady)
+    assert 'frame[1] origin=https://www.recaptcha.net' in detail
+    assert 'path=/recaptcha/enterprise/anchor source_kind=url box=256x60' in detail
+    assert 'outside_root=unknown visibility=hidden display=inline form_controls=unknown' in detail
+    assert clock[0] - start == pytest.approx(forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] > 1 and session._readiness is False
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_root_appears_around_hidden_enterprise_anchor_and_immediately_gates(monkeypatch):
+    first = _synthetic_enterprise_pair(missing_root=True)
+    second = _synthetic_enterprise_pair(inside=True)
+    assert second[0]['entry']['formless']['root'] == '#application-root'
+    assert second[0]['entry']['frames'][0]['status'] == 'unknown'
+    assert second[0]['entry']['frames'][0].get('rootless_hidden_r') is not True
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, first, second)
+    start = clock[0]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] == 2 and clock[0] - start < 1
+    assert session._readiness is False and not decision.await_count
+    no_mutations(raw)
+
+
+async def test_rootless_hidden_enterprise_plus_unknown_gates_on_first_read(monkeypatch):
+    first = _synthetic_enterprise_pair(missing_root=True, sibling=True)
+    assert [f['status'] for f in first[0]['entry']['frames']] == ['unknown', 'unknown']
+    assert first[0]['entry']['frames'][0]['rootless_hidden_r'] is True
+    assert first[0]['entry']['frames'][1].get('rootless_hidden_r') is not True
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
+    start = clock[0]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] == 1 and clock[0] == start
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('edit', [
+    {'src': 'https://www.recaptcha.net/recaptcha/api2/anchor'},
+    {'src': 'https://widgets.example.test/recaptcha/enterprise/anchor'},
+    {'src': '/recaptcha/enterprise/anchor'},
+    {'style': {'visibility': 'visible', 'display': 'inline'}},
+])
+async def test_rootless_enterprise_lookalikes_cannot_use_readiness_deferral(monkeypatch, edit):
+    first = _synthetic_enterprise_pair(missing_root=True, edit=edit)
+    assert first[0]['entry']['frames'][0]['status'] == 'unknown'
+    assert first[0]['entry']['frames'][0].get('rootless_hidden_r') is not True
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
+    start = clock[0]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] == 1 and clock[0] == start
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_rootless_hidden_recap_does_not_defer_non_ashby_entry(monkeypatch):
+    first = _synthetic_enterprise_pair(ats='lever', missing_root=True)
+    assert first[0]['entry']['frames'][0].get('rootless_hidden_r') is not True
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, first, ats='lever')
+    start = clock[0]
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._APPLICATION_WAIT_SECONDS)
+    assert reads[0] == 1 and clock[0] == start
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_rootless_hidden_recap_keeps_visible_challenge_precedence(monkeypatch):
+    first = _synthetic_enterprise_pair(missing_root=True, visible_bframe=True)
+    assert [f['status'] for f in first[0]['entry']['frames']] == [
+        'unknown', 'visible-recaptcha']
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
+    start = clock[0]
+    with pytest.raises(forms.CaptchaGate, match='visible reCAPTCHA Enterprise challenge'):
+        await forms._stable_application_form(
+            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert reads[0] == 1 and clock[0] == start
+    assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_unknown_frames_gate_after_readiness_and_on_every_post_commit_read(monkeypatch):
+    first = _synthetic_enterprise_pair(missing_root=True)
+    second = _synthetic_enterprise_pair()
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, first, second)
+    await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
+    assert session._readiness is False
+    raw.current, raw.fixed = deepcopy(first)
+    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
+        await session.page()
+    session.committing = True
+    for _ in range(2):
+        with pytest.raises(forms.Gate, match='Untrusted frame after a committing click'):
+            await session.page()
+    assert not decision.await_count
+    no_mutations(raw)
 
 
 def test_readers_independently_agree_on_real_shape_and_never_read_autofill():

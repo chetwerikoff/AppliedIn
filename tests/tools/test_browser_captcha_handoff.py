@@ -58,7 +58,7 @@ def classify(page):
     if "greenhouse" in page:
         forms._greenhouse_safety(page, lambda url: url == URL, PORTAL)
     else:
-        forms._entry_safety(page, lambda url: url == URL, None)
+        forms._entry_safety(page, lambda url: url == page["url"], None)
 
 
 @pytest.mark.parametrize("case,fragment", [
@@ -160,7 +160,7 @@ async def synthetic_controller(monkeypatch, case, *, url=URL, prior_button=None)
     assert calls == [("navigate", url)]
     assert result["status"] == "gate"
     assert result["question"] and URL in result["question"]
-    if case in {"entry-response", "entry-unknown"}:
+    if case in {"entry-response", "entry-unknown", "entry-Z"}:
         # These production safety paths raise CaptchaArtifactGate, not an
         # ordinary Gate: the direct caller must receive the typed diagnostic.
         assert result.get("captcha_artifact_diagnostic") is True

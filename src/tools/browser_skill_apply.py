@@ -279,16 +279,18 @@ def navigation_allowed(href: str, *origins: str,
         return True
     return False
 
-def handoff(message: str, step: dict) -> dict:
-    """Only safe action context, never browser tokens or URL fragments."""
+def handoff(message: str, step: dict, *, captcha_artifact: bool = False) -> dict:
+    """Retain ordinary action context; never echo page values for artifact gates."""
     parsed = urlsplit(step.get('url', ''))
-    query = [(k, v) for k, v in parse_qsl(parsed.query)
-             if k.lower() in {'job', 'job_id', 'req', 'requisition', 'id'}
-             and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', v)]
+    query = [] if captcha_artifact else [
+        (k, v) for k, v in parse_qsl(parsed.query)
+        if k.lower() in {'job', 'job_id', 'req', 'requisition', 'id'}
+        and re.fullmatch(r'[A-Za-z0-9_-]{1,80}', v)]
     path = parsed.path if not re.search(r'/[^/]{120,}', parsed.path) else '/'
     url = urlunsplit((parsed.scheme, parsed.netloc.rsplit('@', 1)[-1], path,
                      urlencode(query), ''))
-    button = re.sub(r'\s+', ' ', str(step.get('last_button') or ''))[:80]
+    button = ('' if captcha_artifact else
+              re.sub(r'\s+', ' ', str(step.get('last_button') or ''))[:80])
     if not re.fullmatch(r'[\w .-]{1,80}', button):
         button = '(unavailable)'
     context = {'last_button': button, 'url': url}
@@ -442,6 +444,10 @@ class MaterialAssentGate(Gate):
 
 class CaptchaGate(Gate):
     """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
+
+
+class CaptchaArtifactGate(Gate):
+    """Code-issued structural detail is for the owner, never routine telemetry."""
 
 def _synthetic(fixture_context, *, pk: str = '', company: str = '',
                url: str = ''):
@@ -2048,6 +2054,16 @@ def _unknown_frame_details(frames, provenance):
             return 'unknown'
         return f'{width}x{height}'
 
+    def parent_pattern(value):
+        if type(value) is not str or len(value) > 160:
+            return 'unknown'
+        # Only known HTML tags / opaque 'other' and bounded positional indices:
+        # no IDs, classes, arbitrary attributes or page-derived selector tokens.
+        segment = r'(?:html|body|form|div|span|section|main|other):nth-of-type\([1-9][0-9]{0,2}\)'
+        if re.fullmatch(segment + r'(?: > ' + segment + r'){0,3}', value):
+            return value
+        return 'unknown'
+
     rows = []
     for index, frame in enumerate(frames, 1):
         if isinstance(frame, dict) and frame.get('status') in admitted:
@@ -2063,8 +2079,78 @@ def _unknown_frame_details(frames, provenance):
             f"box={box(frame.get('box'))} outside_root={outside} "
             f"visibility={literal(frame.get('visibility'), {'visible', 'hidden', 'collapse'})} "
             f"display={literal(frame.get('display'), {'block', 'none', 'inline', 'inline-block', 'flex', 'grid', 'contents', 'table', 'table-row', 'table-cell', 'list-item', 'flow-root'})} "
-            f"form_controls={literal(frame.get('form_controls'), {'yes', 'no'})}")
+            f"form_controls={literal(frame.get('form_controls'), {'yes', 'no'})} "
+            f"srcdoc={literal(frame.get('srcdoc'), {'present', 'absent'})} "
+            f"parent_pattern={parent_pattern(frame.get('parent_pattern'))} "
+            f"anchor_sibling={literal(frame.get('anchor_sibling'), {'yes', 'no'})} "
+            f"shared_recaptcha_container={literal(frame.get('shared_recaptcha_container'), {'yes', 'no'})} "
+            f"document_readability={literal(frame.get('document_readability'), {'readable', 'unreadable', 'unavailable'})}")
     return '; '.join(rows)
+
+
+def _captcha_frame_missing_evidence(frames):
+    """Explain an unadmitted source-less companion; never infer shared roots."""
+    missing = []
+    for frame in frames:
+        if (not isinstance(frame, dict) or frame.get('status') != 'unknown'
+                or frame.get('source') != 'absent'):
+            continue
+        if frame.get('root') == '' or type(frame.get('outside')) is not bool:
+            missing.append('independent application-root placement')
+        if frame.get('anchor_sibling') != 'yes':
+            missing.append('anchor sibling relationship')
+        if frame.get('shared_recaptcha_container') != 'yes':
+            missing.append('shared reCAPTCHA container')
+        if (frame.get('form_controls') != 'no'
+                and not (frame.get('document_readability') == 'unreadable'
+                         and frame.get('display') == 'none')):
+            missing.append('child controls or unreadable-and-hidden document evidence')
+        if frame.get('srcdoc') != 'absent':
+            missing.append('absence of srcdoc')
+        if frame.get('display') != 'none':
+            missing.append('display:none')
+    if not missing:
+        return ''
+    return ' Step2 unproven: ' + ', '.join(dict.fromkeys(missing)) + '.'
+
+
+def _captcha_response_details(responses):
+    """Render only reader-normalized control patterns, never raw selectors/values."""
+    if not isinstance(responses, list):
+        return 'offending-control=unavailable'
+    permitted = {
+        'tag': {'input', 'textarea'},
+        'name_pattern': {'h-captcha-response', 'g-recaptcha-response'},
+        'id_pattern': {
+            'absent', 'other-id', 'h-captcha-response', 'g-recaptcha-response',
+            'h-captcha-response[-digits]', 'g-recaptcha-response[-digits]',
+        },
+        'ancestor': {'none', 'root-unknown', 'entry-root', 'other-form'},
+        'owner': {'none', 'root-unknown', 'entry-root', 'other-form'},
+        'explicit_form': {'yes', 'no'},
+        'provider': {'hcaptcha', 'recaptcha'},
+        'provider_frame': {'yes', 'no'},
+        'badge': {'yes', 'no'},
+    }
+    known_issues = {'duplicate-name', 'provider-unproven', 'owner-conflict',
+                    'linked-receiver'}
+    rows = []
+    for index, item in enumerate(responses[:8], 1):
+        d = item.get('diagnostic') if isinstance(item, dict) else None
+        if not isinstance(d, dict):
+            continue
+        issues = d.get('issues')
+        if not isinstance(issues, list):
+            continue
+        safe_issues = [x for x in issues if type(x) is str and x in known_issues]
+        if not safe_issues:
+            continue
+        facts = ['%s=%s' % (key, d.get(key) if type(d.get(key)) is str
+                          and d.get(key) in values else 'unknown')
+                 for key, values in permitted.items()]
+        rows.append('control[%d] %s issue=%s' % (
+            index, ' '.join(facts), ','.join(dict.fromkeys(safe_issues))))
+    return '; '.join(rows) if rows else 'offending-control=unavailable'
 
 
 def _entry_safety(page, allowed, provenance, *, readiness=False):
@@ -2102,10 +2188,12 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
                     and frame.get('rootless_hidden_r') is True):
                 pending_hidden_r = True
                 continue
-            raise Gate('unknown/untrusted application frame; inspect manually. '
-                       'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance))
+            raise CaptchaArtifactGate('unknown/untrusted application frame; inspect manually. '
+                       'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance)
+                       + _captcha_frame_missing_evidence(entry['frames']))
     if entry.get('response_error'):
-        raise Gate('untrusted captcha response control; ambiguous owner or provider.')
+        raise CaptchaArtifactGate('untrusted captcha response control; ambiguous owner or provider. '
+                                 + _captcha_response_details(entry.get('responses')))
     if entry.get('helper_challenge'):
         raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
     if (isinstance(provenance, ApplicationEntryProvenance)
@@ -2505,7 +2593,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
             await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
         if (entry_session and last_reason.startswith(
                 'unknown/untrusted application frame; inspect manually. Non-admitted frames: ')):
-            raise Gate(last_reason)
+            raise CaptchaArtifactGate(last_reason)
         raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
     finally:
         if greenhouse or entry_session:
@@ -4979,14 +5067,16 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             if submitted:
                 context = handoff(
                     'A submission-capable step was executed before the form stopped. '
-                    'Check the employer portal before retrying.', step)
+                    'Check the employer portal before retrying.', step,
+                    captcha_artifact=isinstance(exc, CaptchaArtifactGate))
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
             context = (
                 {'text': str(exc), 'step': {'last_button': '(unavailable)',
                                           'url': _navigation_observed_step_url(page, url)}}
                 if isinstance(exc, NavigationProvenanceGate)
                 else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
-                else handoff(str(exc), step))
+                else handoff(str(exc), step,
+                             captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
             hard = (isinstance(exc, CaptchaGate)
                     or exc.reason in {'defect_tenant', 'defect_provenance',
                                       'posting_guard_review_required'})
@@ -5007,6 +5097,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 report['material_assent_diagnostic'] = True
             if isinstance(exc, NavigationProvenanceGate):
                 report['navigation_provenance_diagnostic'] = True
+            if isinstance(exc, CaptchaArtifactGate):
+                report['captcha_artifact_diagnostic'] = True
             return report
         if submitted:
             context = handoff(

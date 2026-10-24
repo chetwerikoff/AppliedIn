@@ -1390,9 +1390,12 @@ def run_queued(item: dict, q: Any) -> dict:
             {"result": "gated", "pk": pk,
              "question": ("navigation-provenance: human inspection required"
                           if navigation_detail else
-                          "material-assent: human inspection required")}
+                          "material-assent: human inspection required"
+                          if material_detail else
+                          "captcha-artifact: human inspection required")}
             if result.get("result") == "gated"
-            and (navigation_detail or material_detail) else result
+            and (navigation_detail or material_detail
+                 or result.get("captcha_artifact_diagnostic") is True) else result
         )
         log.info("apply: %s", logged_result)
         again, why = is_retryable(result)
@@ -1654,12 +1657,16 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
                            and result.get('material_assent_diagnostic') is True)
         navigation_detail = (configuration()['engine'] == 'browser_skill'
                              and result.get('navigation_provenance_diagnostic') is True)
+        captcha_artifact = (configuration()['engine'] == 'browser_skill'
+                            and result.get('captcha_artifact_diagnostic') is True)
         routine_detail = ("navigation-provenance: human inspection required"
                           if navigation_detail else
                           "material-assent: human inspection required"
-                          if material_assent else q)
+                          if material_assent else
+                          "captcha-artifact: human inspection required"
+                          if captcha_artifact else q)
         if navigation_detail:
-            # A host/path is owner detail, not even ordinary event URL metadata.
+            # Host/path is owner detail, not even ordinary event URL metadata.
             emit("gate", pk=pk, agent="applier", detail=routine_detail)
         else:
             emit("gate", pk=pk, agent="applier", detail=routine_detail, url=jd_url)
@@ -1667,7 +1674,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "gated", "pk": pk, "question": q,
                 **({"material_assent_diagnostic": True} if material_assent else {}),
                 **({"navigation_provenance_diagnostic": True}
-                   if navigation_detail else {})}
+                   if navigation_detail else {}),
+                **({"captcha_artifact_diagnostic": True}
+                   if captcha_artifact else {})}
     reason = _fail_reason(result)
     # A browser held by something else is an ENVIRONMENT fault, not a verdict on
     # this job: the form was never reached, nothing was filled, and the same job

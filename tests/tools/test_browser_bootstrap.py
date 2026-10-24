@@ -3872,11 +3872,13 @@ def test_material_partial_stems_are_not_standalone_legal_words(negative):
     assert forms._MATERIAL_ASSENT.search(negative) is None
 
 
+@pytest.mark.parametrize('optional', [True, False])
 async def test_material_native_select_owner_resume_exact_grant_and_stale_options(
-        monkeypatch):
+        monkeypatch, optional):
     from agent import run
     legal = field('Please authorize processing', '#consent',
-                  tag='select', type='select', question='Processing consent?',
+                  required=not optional, tag='select', type='select',
+                  question='Processing consent?',
                   options=[{'value': '', 'label': 'Choose'},
                            {'value': 'Y', 'label': 'I agree'},
                            {'value': 'N', 'label': 'I decline'}])
@@ -3886,6 +3888,17 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
     assert report['review_route'] == 'owner'
     assert report['material_assent_diagnostic'] is True
     assert report['form_question']['options'] == legal['options']
+    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
+
+    # Even an exact-looking reusable fact cannot authorize material assent.
+    with pytest.raises(forms.Gate) as missing:
+        await forms.execute(
+            browser, p, {'action': 'select', 'selector': '#consent',
+                         'fact': 'Processing consent?', 'value': 'Y'},
+            facts={'Processing consent?': 'I agree'}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert missing.value.reason == 'owner_question'
     assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
 
     row.update(status='needs_human', gate_source='applier',
@@ -3924,6 +3937,15 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
     assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
 
     browser.allow_mutations = True
+    # The model cannot use a different live option as the owner's choice.
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            browser, p, {'action': 'select', 'selector': '#consent',
+                         'fact': 'Processing consent?', 'value': 'N'},
+            facts={}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert not any(c[0] == 'select' for c in browser.calls)
     receipt = await forms.execute(
         browser, p, {'action': 'select', 'selector': '#consent',
                      'fact': 'Processing consent?', 'value': 'Y'},
@@ -3933,28 +3955,41 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
     assert receipt['action'] == 'select'
     assert ('select', '#consent', '--value', 'Y') in browser.calls
 
-    altered = deepcopy(legal)
-    altered['options'][1]['label'] = 'New assent'
+    # Start each stale-grant negative from a valid bound receiver, not the
+    # original HTTP-form helper that secure_inventory() rebinds to HTTPS.
+    bound = deepcopy(p['controls'][0])
+    assert forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                                target=bound, url=SECURE_URL) is None
+    for attr, stale in (
+            ('options', [{'value': '', 'label': 'Choose'},
+                         {'value': 'Y', 'label': 'New assent'},
+                         {'value': 'N', 'label': 'I decline'}]),
+            ('question', 'Processing updated?'),
+            ('form_selector', '#changed-form'),
+            ('form_action', SECURE_URL + '/changed-form')):
+        changed = deepcopy(bound)
+        changed[attr] = stale
+        with pytest.raises(forms.Gate):
+            forms.exact_approval(PK, 'Processing consent?', 'I agree',
+                                 target=changed, url=SECURE_URL)
     with pytest.raises(forms.Gate):
         forms.exact_approval(PK, 'Processing consent?', 'I agree',
-                             target=altered, url=SECURE_URL)
-    changed = deepcopy(legal)
-    changed['question'] = 'Processing updated?'
+                             target=bound, url=SECURE_URL + '/other')
     with pytest.raises(forms.Gate):
-        forms.exact_approval(PK, 'Processing consent?', 'I agree',
-                             target=changed, url=SECURE_URL)
-    with pytest.raises(forms.Gate):
-        forms.exact_approval(PK, 'Processing consent?', 'I agree',
-                             target=legal, url=SECURE_URL + '/other')
+        forms.exact_approval('other-job#1', 'Processing consent?', 'I agree',
+                             target=bound, url=SECURE_URL)
 
 
-@pytest.mark.parametrize('ungrantable', [
-    'invisible', 'disabled', 'unbound', 'foreign-action', 'not-select'
+@pytest.mark.parametrize('ungrantable,optional', [
+    ('invisible', False), ('disabled', False), ('unbound', False),
+    ('foreign-action', False), ('not-select', False),
+    ('invisible', True), ('disabled', True), ('unbound', True),
+    ('foreign-action', True), ('malformed-options', True),
 ])
 async def test_material_unwitnessed_or_unbound_assent_never_becomes_owner_grant(
-        monkeypatch, ungrantable):
+        monkeypatch, ungrantable, optional):
     legal = field('I agree to processing', '#material',
-                  tag='select', type='select',
+                  required=not optional, tag='select', type='select',
                   options=[{'value': 'yes', 'label': 'I agree'}])
     p = secure_inventory(legal)
     if ungrantable == 'invisible':
@@ -3965,6 +4000,8 @@ async def test_material_unwitnessed_or_unbound_assent_never_becomes_owner_grant(
         p['controls'][0]['in_form'] = False
     elif ungrantable == 'foreign-action':
         p['controls'][0]['form_action'] = 'https://foreign.test/form'
+    elif ungrantable == 'malformed-options':
+        p['controls'][0]['options'].append({'value': 'yes', 'label': 'I decline'})
     else:
         p['controls'][0].update(tag='input', type='text')
     browser, decide, _ = secure_world(monkeypatch, p)

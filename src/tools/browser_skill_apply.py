@@ -3056,7 +3056,8 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                     try:
                         question = _disclosure_question(
                             page, c, witness, *origins,
-                            bootstrap=unanswered, provenance=provenance)
+                            bootstrap=unanswered and bool(c.get('required')),
+                            provenance=provenance)
                     except Gate:
                         pass  # Unwitnessed assent remains inspection-only.
                     else:

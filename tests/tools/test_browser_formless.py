@@ -1885,7 +1885,7 @@ async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkey
     no_mutations(raw)
 
 
-def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
+def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False, ats='ashby'):
     """Offline production-reader pair: badge and body-level bframe do not share a root."""
     script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
     opener = '(() => {\n'
@@ -1926,12 +1926,15 @@ def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
       },badge);
       duplicate.style.visibility='hidden';
     }
-    if(VARIANT==='second-bframe'){
+    if(VARIANT==='second-bframe' || VARIANT==='second-bframe-srcdoc' ||
+       VARIANT==='duplicate-outside-badge'){
       const duplicate=node('iframe',{
         src:'https://www.recaptcha.net/recaptcha/enterprise/bframe'
       },bframeOuter);
       duplicate.style.visibility='hidden';
+      if(VARIANT==='second-bframe-srcdoc')duplicate.setAttribute('srcdoc','');
     }
+    if(VARIANT==='duplicate-outside-badge')move(anchor,bframeOuter);
     if(VARIANT==='wrong-path')bframe.setAttribute('src',
       'https://www.google.com/recaptcha/api2/bframe');
     if(VARIANT==='wrong-origin')bframe.setAttribute('src',
@@ -1951,7 +1954,7 @@ def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
     script=script.replace(opener,opener+injection,1)
     # A resolved root uses the proven Ashby three-child structural receiver;
     # a generic native form would introduce an unrelated, unproved action URL.
-    return dom(dict(url=entry('ashby'),root=False,formless=True,
+    return dom(dict(url=entry(ats),root=False,formless=True,
                     missingPane=not resolved,frames=['R']),script)
 
 
@@ -1978,7 +1981,7 @@ def test_issue174_hidden_pair_root_independent(reader,shape,resolved):
 @pytest.mark.parametrize('variant',[
     'visible-bframe','second-anchor','second-bframe','wrong-path','wrong-origin',
     'srcdoc','anchor-srcdoc','anchor-outside','anchor-wrong-origin',
-    'anchor-wrong-path',
+    'anchor-wrong-path','second-bframe-srcdoc',
 ])
 def test_issue174_hidden_pair_negative_cases(reader,variant):
     page=_issue174_reader(reader,variant=variant)
@@ -1990,3 +1993,34 @@ def test_issue174_hidden_pair_negative_cases(reader,variant):
         assert any(f['status']=='unknown' for f in page['entry']['frames']),page['entry']['frames']
         with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
             forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader',['page','witness'])
+def test_issue174_duplicate_bframes_outside_badge_with_resolved_ashby_root(reader):
+    page=_issue174_reader(reader,variant='duplicate-outside-badge',resolved=True)
+    assert page['entry']['formless']['root']=='#application-root'
+    assert [f['status'] for f in page['entry']['frames']]==[
+        'unknown','unknown','unknown']
+    with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
+        forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader',['page','witness'])
+def test_issue174_second_bframe_with_srcdoc_invalidates_entire_pair(reader):
+    page=_issue174_reader(reader,variant='second-bframe-srcdoc')
+    assert len(page['entry']['frames'])==3
+    assert [f['status'] for f in page['entry']['frames']]==[
+        'unknown','unknown','unknown']
+    with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
+        forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader',['page','witness'])
+def test_issue174_non_ashby_hidden_pair_cannot_borrow_ashby_exception(reader):
+    # Change only the page route. Both real readers observe unchanged provider
+    # DOM proof, but the entry site identity is no longer Ashby.
+    # The shared fixture builder supports a site override on the DOM itself.
+    page=_issue174_reader(reader,ats='lever')
+    assert [f['status'] for f in page['entry']['frames']]==['unknown','unknown']
+    with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
+        forms._entry_safety(page,lambda u:u==entry('lever'),None)

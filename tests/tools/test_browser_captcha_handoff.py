@@ -468,3 +468,31 @@ def test_queued_captcha_artifact_logs_only_neutral_detail(monkeypatch, caplog):
     assert q.done_items == [{"pk": PK}]
     assert sentinel not in caplog.text
     assert "captcha-artifact: human inspection required" in caplog.text
+
+# Issue #164: structural source-less artifacts may not inherit frame status
+# from an ordinal, guessed root, or same-class sibling. These assertions pin
+# the production reader source that the synthetic reader tests execute.
+def test_enterprise_companion_source_requires_closed_child_and_real_ancestry():
+    from tools import browser_skill_dom as reader
+
+    source = reader.ENTRY_PAGE
+    assert "parent.contains(aContainer)" in source
+    assert "enterpriseBadgeAnchor(aContainer)" in source
+    assert "formControls==='no'" in source
+    assert "documentReadability==='readable'" in source
+    assert "raw===null && !e.hasAttribute('srcdoc')" in source
+    assert "style.display==='none'" in source
+    assert "enterpriseAnchors.length===1" in source
+    assert "if (visibleR==='visible-recaptcha') status=visibleR" in source
+
+
+def test_enterprise_badge_response_is_independent_and_reserved():
+    from tools import browser_skill_dom as reader
+
+    source = reader.ENTRY_PAGE
+    assert "badgeProvider || entryFrames.some" in source
+    assert "enterpriseBadgeAnchor(ownBadge)" in source
+    assert "reservedName && reservedId && !ancestor && !owner" in source
+    assert "!e.hasAttribute('form')" in source
+    assert "const excluded = new Set([...responseNodes" in source
+    assert "nodes.filter(e => !excluded.has(e) &&" in source

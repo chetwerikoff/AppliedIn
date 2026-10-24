@@ -498,6 +498,55 @@ test('structural Requeue latches the first delegated click before another can PO
   assert.equal(h.requests.length, requestsBefore, 'offline test must not fetch or queue a job');
 });
 
+test('unknown_field manual_triage structural Requeue renders and first delegated click latches', () => {
+  const h = harness();
+  const structural = row('synthetic-unknown-field', {
+    status: 'needs_human',
+    gate_pending: {review_route: 'agent_unavailable', form_question: null},
+    gate_reason: 'unknown_field', gate_question: '',
+    gate_call_id: null, confirmation_id: null,
+    fail_kind: '', possible_submission: false, submit_hold_state: 'clear',
+    gate_has_form_question: false, gate_has_call_id: false,
+  });
+  h.state.apps = [structural];
+  assert.equal(h.fn('routeOf')(structural), 'manual_triage');
+  assert.equal(h.fn('isReadOnly')(structural), true);
+  assert.equal(h.fn('canRequeueStructuralGate')(structural), true);
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), true);
+  for (const act of ['answer', 'retry', 'reopen', 'retailor', 'apply-now',
+    'mark-applied', 'force-apply', 'skip', 'save-tracker']) {
+    assert.equal(h.fn('rowActionAllowed')(structural.pk, act), false, act);
+  }
+  for (const name of ['laneCard', 'closedRow', 'needsCard'])
+    assert.match(h.fn(name)(structural), /data-act="queue-apply"/, name);
+  for (const name of ['viewPipeline', 'viewNeeds', 'viewStuck'])
+    assert.match(h.fn(name)(), /data-act="queue-apply"/, name);
+  vm.runInContext('loadAgentLog = () => {};', h.context);
+  h.fn('openDrawer')(structural.pk);
+  assert.match(h.node('#drawer-body').innerHTML, /data-act="queue-apply"/);
+  assert.equal(h.requests.length, 0, 'only synthetic rendering and eligibility checks');
+
+  h.context.sent = [];
+  // Existing delegated POST is replaced with an in-memory recorder, never a real queue operation.
+  vm.runInContext('post = (path) => { globalThis.sent.push(path); return Promise.resolve({ok:true}); };'
+    + 'renderPane = () => {}; scheduleLive = () => {}; loadQueue = () => {}; toast = () => {};',
+    h.context);
+  h.fn('wire')();
+  const click = h.node('#pane').listeners.click.at(-1);
+  assert.ok(click);
+  const control = {dataset: {act: 'queue-apply', pk: structural.pk}};
+  const event = {target: {closest: (selector) => selector === '[data-act]' ? control : null},
+    stopPropagation() {}};
+  const requestsBefore = h.requests.length;
+  click(event);
+  assert.deepEqual(Array.from(h.context.sent), ['/actions/queue-apply/synthetic-unknown-field']);
+  assert.equal(structural.status, 'submitting', 'first click must latch before POST completes');
+  assert.equal(h.fn('rowActionAllowed')(structural.pk, 'queue-apply'), false);
+  click(event);
+  assert.equal(h.context.sent.length, 1, 'second delegated click must not POST');
+  assert.equal(h.requests.length, requestsBefore, 'test must not fetch or queue a job');
+});
+
 test('structural Requeue fails closed for form/call witnesses, holds, uncertainty and completed rows', () => {
   const h = harness();
   const structural = {gate_reason: 'defect_structural',
@@ -518,7 +567,8 @@ test('structural Requeue fails closed for form/call witnesses, holds, uncertaint
     ['applied', {status: 'applied'}],
     ['applied-manual', {status: 'applied_manual'}],
     ['confirmed', {confirmation_id: 'synthetic-confirmation'}],
-    ['unknown-reason', {gate_reason: 'unknown_field'}],
+    ['manual-triage-fail-kind', {gate_reason: 'unknown_field', fail_kind: 'failed'}],
+    ['manual-triage-possible-submit', {gate_reason: 'unknown_field', possible_submission: true}],
   ].map(([pk, override]) => row(pk, {...structural, ...override}));
   const field = row('answerable-field', {
     gate_reason: 'owner_question', gate_has_form_question: true,

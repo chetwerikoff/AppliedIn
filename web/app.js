@@ -270,7 +270,9 @@ const RETRYABLE = ["failed", "error", "capped"];
 // Missing projection is not proof that a stored call ID was absent.
 // Keep all other actions read-only; this exception only authorizes Requeue.
 function canRequeueStructuralGate(r) {
-  return r?.status === "needs_human" && routeOf(r) === "waiting_for_fix"
+  return r?.status === "needs_human"
+    && (routeOf(r) === "waiting_for_fix"
+      || (routeOf(r) === "manual_triage" && !r.fail_kind && r.possible_submission !== true))
     && r.gate_has_form_question === false && r.gate_has_call_id === false
     && !r.confirmation_id;
 }

@@ -4212,6 +4212,13 @@ def _job_preparation_route(href: str, tracked: str, *,
     # not incorrectly subject that witness to the legacy host classifier.
     if provenance is not None and navigation_allowed(href, provenance=provenance):
         return True
+    # A Greenhouse custom-careers wrapper and its canonical board route have
+    # different origins: only the persisted row plus configured board/job may
+    # bridge them, never the vendor hostname alone.
+    if (pk and company and greenhouse_alias_candidate(tracked)
+            and _greenhouse_row_preparation(href, tracked, pk, company,
+                                            fixture_context=fixture_context)):
+        return True
     if not _preparation_origin(href, tracked):
         return False
     if href == tracked or navigation_allowed(href, tracked):
@@ -4232,9 +4239,7 @@ def _job_preparation_route(href: str, tracked: str, *,
             return True
     except (TypeError, ValueError, AttributeError):
         pass
-    return (bool(pk and company and greenhouse_alias_candidate(tracked))
-            and _greenhouse_row_preparation(href, tracked, pk, company,
-                                            fixture_context=fixture_context))
+    return False
 
 
 

@@ -4965,3 +4965,33 @@ def test_every_production_observe_controls_caller_names_its_site():
     assert {'bootstrap-formless', 'bootstrap-material', 'execute',
             'execute-readback'} <= set(literal_sites)
     assert len(literal_sites) >= 21
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('site', [
+    'confirmation-readback', 'readiness-witness', 'bootstrap-commit-readback',
+    'native-receiver-readback', 'combobox-observe', 'execute-readback',
+])
+async def test_named_non_retry_observers_remain_single_read(monkeypatch, site):
+    """An attribution-only site never opts a caller into inventory retries."""
+    base = inventory(field(), submit())
+    browser = Browser(base)
+    reads = 0
+    async def unstable_page():
+        nonlocal reads
+        reads += 1
+        fresh = deepcopy(base)
+        fresh['controls'][0]['label'] = 'Synthetic changed field'
+        return fresh
+    monkeypatch.setattr(browser, 'page', unstable_page)
+    delays = []
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
+    with pytest.raises(forms.Gate) as denied:
+        await forms._observe_controls(browser, base, site=site)
+    assert 'predicate=inventory.identity.equal' in str(denied.value)
+    assert 'site=' + site in str(denied.value)
+    assert [call[0] for call in browser.calls] == ['evaluate']
+    assert reads == 1
+    assert not delays

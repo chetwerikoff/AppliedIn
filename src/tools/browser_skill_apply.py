@@ -2815,9 +2815,12 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                     site=site, _identity_try=_identity_try + 1,
                     _previous_identity=identity if same_read else None)
             require(False, 'inventory.identity.equal')
-        if site and _identity_try > 1 and same_read:
+        # A diagnostic site must not turn an ordinary observation into a retry.
+        # Keep the PR #173 identity-retry sites and their original bounds.
+        identity_retry = site in {'execute', 'material-witness', 'material-resume-open'}
+        if identity_retry and _identity_try > 1 and same_read:
             return current, lookup
-        if site and _identity_try < 4 and (
+        if identity_retry and _identity_try < 4 and (
                 not same_read or _identity_try > 1):
             # Only the initial identity mismatch enables a bounded sequence of
             # complete PAGE+witness rereads. Subsequent reads must agree twice.
@@ -2826,7 +2829,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 session, await session.page(), readiness=readiness,
                 site=site, _identity_try=_identity_try + 1,
                 _previous_identity=identity)
-        require(same_read and (not site or _identity_try == 1),
+        require(same_read and (not identity_retry or _identity_try == 1),
                 'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
         return current, lookup

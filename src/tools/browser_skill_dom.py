@@ -807,6 +807,8 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
       reservedName && reservedId && !ancestor && !owner &&
       !e.hasAttribute('form') && enterpriseBadgeAnchor(ownBadge);
     const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
+    // The badge-local route is an independent proof, but conflicting or
+    // multiply named reserved receivers always remain a gate.
     const providerFrame=badgeProvider || entryFrames.some(f=>f.status===signature);
     const wrongOwner=!!owner && owner!==root;
     const issues=[];

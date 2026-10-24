@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -397,8 +397,7 @@ async def test_bank_or_incomplete_or_changed_value_is_not_disclosure(
 
     # Even page-autofill of the unapproved bank/prior value cannot make the
     # final Submit guard accept it as a fresh approved write/readback.
-    displayed = bank.get('Email') or prior.get('value')    if displayed:
-        p['controls'][0].update(value=displayed, has_value=True)
+    displayed = bank.get('Email') or prior.get('value')    if displayed:        p['controls'][0].update(value=displayed, has_value=True)
     await final_submit_denied(
         monkeypatch, tmp_path, p, row, filled, history,
         reason=('Unverified or changed form value: Email'
@@ -797,8 +796,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',                  tag='input', type=kind, required=True,
-                  checked=True, has_value=True, name='attestation',
-                  question='Arbitration consent' if kind == 'radio' else '',
+                  checked=True, has_value=True, name='attestation',                  question='Arbitration consent' if kind == 'radio' else '',
                   value='accept')
     members = [bound]
     if kind == 'radio':
@@ -974,9 +972,10 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
     assert denial.value.reason == 'unknown_field'
 
 
+@pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
 @pytest.mark.parametrize('material', [True, False])
 async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
-        monkeypatch, caplog, material):
+        monkeypatch, caplog, material, queued_worker):
     """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
     from agent import run
 
@@ -1035,9 +1034,19 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
 
     with caplog.at_level('INFO', logger=run.log.name):
-        result = await run._apply_direct(PK, stores)
+        if queued_worker:
+            # Exercise the synchronous worker's actual INFO sink and async apply.
+            monkeypatch.setattr(run, 'make_stores', lambda: stores)
+            queue = SimpleNamespace(retry=Mock(), done=Mock())
+            item = {'pk': PK}
+            result = run.run_queued(item, queue)
+            queue.done.assert_called_once_with(item)
+            queue.retry.assert_not_called()
+        else:
+            result = await run._apply_direct(PK, stores)
     assert fake_apply.await_count == 1
     assert result['result'] == 'gated' and result['question'] == gate['question']
+    assert (result.get('material_assent_diagnostic') is True) is material
     assert row['status'] == 'needs_human'
     assert row['gate_pending']['question'] == gate['question']
     assert row['gate_pending']['review_route'] == 'agent_unavailable'
@@ -1049,6 +1058,13 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
              if record.name == run.log.name]
     assert any('gated pk=' in text for text in lines)
     assert any(ordinary[0] in text for text in lines)
+    if queued_worker:
+        queued_lines = [text for text in lines if text.startswith('apply: ')]
+        assert len(queued_lines) == 1
+        if material:
+            assert 'material-assent: human inspection required' in queued_lines[0]
+        else:
+            assert 'OTHER_GATE_SENTINEL' in queued_lines[0]
     if material:
         assert 'OWNER_VISIBLE_LOG_SENTINEL' in row['gate_pending']['question']
         assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text
@@ -1197,8 +1213,7 @@ async def test_plausible_competing_native_form_stays_generic(
     # form can commit while the real applicant field is still unanswered.
     await final_submit_denied(
         monkeypatch, tmp_path, p, row, filled, history,
-        reason='Required field is empty: Email')
-    assert not filled and not history and not row['human_approved_answers']
+        reason='Required field is empty: Email')    assert not filled and not history and not row['human_approved_answers']
     assert not any(x[0] in {'fill', 'select', 'click', 'upload'}
                    for x in browser.calls)
 
@@ -1597,8 +1612,7 @@ def _greenhouse_row():
 def _greenhouse_config(monkeypatch, tmp_path, *, careers_url=GH_CAREERS):
     from agent import run
 
-    config = tmp_path / 'watchlist.yaml'
-    config.write_text(
+    config = tmp_path / 'watchlist.yaml'    config.write_text(
         'companies:\n  - name: example-co\n    ats: greenhouse\n'
         '    board: example-co\n'
         f'    careers_url: {careers_url}\n')
@@ -1999,7 +2013,6 @@ async def test_alias_exact_approved_field_writes_only_verified_receiver(
     assert [c for c in browser.calls if c[0] == 'fill'] == [
         ('fill', '#email', '--value', 'test@example.test')]
 
-
 async def test_alias_exact_upload_uses_fresh_native_receiver(monkeypatch, tmp_path):
     p = inventory(field('Upload résumé', '#resume', tag='input', type='file',
                         form_action=GH_DIRECT),
@@ -2398,7 +2411,6 @@ async def test_vendor_initial_page_must_equal_exact_redirect_target(
         return async_client(transport=httpx.MockTransport(
             lambda request: httpx.Response(
                 301, headers={'Location': target}, request=request)), **kwargs)
-
     monkeypatch.setattr(forms.httpx, 'AsyncClient', client_factory)
     result = await forms.apply(canonical, 'example-co', {}, 'synthetic',
                                pk=pk, resume_path='Resume.pdf')
@@ -2797,8 +2809,7 @@ async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(mon
     combo = field('Country', '#country', required=False, type='combobox',
                   form_action=target, combobox={
                       'linked': True, 'link_id': 'country-list',
-                      'listbox_selector': '#country-list',
-                      'options': [{'selector': '#country-example', 'unique': True,
+                      'listbox_selector': '#country-list',                      'options': [{'selector': '#country-example', 'unique': True,
                                    'label': 'Example Country', 'value': 'EX'}],
                       'selected_text': '', 'displayed_text': '',
                       'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
@@ -3198,7 +3209,6 @@ def test_marked_native_fact_key_deduplicates_only_identical_value_aliases(
         facts, observed, expected):
     assert forms._fact_key(facts, observed) == expected
 
-
 async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliases(
         monkeypatch, tmp_path):
     """Production wrapper derives name twins; neither creates a new approval."""
@@ -3597,8 +3607,7 @@ async def test_optional_disabled_native_input_does_not_block_required_gate(
     with caplog.at_level('INFO', logger=forms.__name__):
         browser, row, filled, history = await prepared_without_unapproved_write(
             monkeypatch, page)
-    lines = [record.getMessage() for record in caplog.records
-             if record.name == forms.__name__ and
+    lines = [record.getMessage() for record in caplog.records             if record.name == forms.__name__ and
              record.getMessage().startswith('bootstrap field decision ')]
     assert len(lines) == 1 and "'decision': 'left-to-model'" in lines[0]
     assert "'type': 'checkbox'" in lines[0]

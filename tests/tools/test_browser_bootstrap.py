@@ -4389,8 +4389,9 @@ async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
+@pytest.mark.parametrize('unsafe', [None, 'readonly', 'offscreen', 'wrong-owner'])
 async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
-        monkeypatch):
+        monkeypatch, unsafe):
     closed = field(
         'Please Acknowledge receipt of our Candidate Privacy Notice.',
         '#privacy', tag='input', type='combobox',
@@ -4402,19 +4403,45 @@ async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape
         PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
     monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
     monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(controller, '_row', lambda: {'ats': 'other'})
+    class Raw:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            proof = witness(current)
+            if unsafe == 'readonly':
+                proof['controls'][0]['readonly'] = True
+            if unsafe == 'offscreen':
+                proof['controls'][0]['visible'] = False
+            return {'value': proof}
+    raw = Raw()
     with pytest.raises(forms.Gate):
-        await controller.before_ipc(None, ('click', '#privacy'), {})
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
     with pytest.raises(forms.Gate):
-        await controller.before_ipc(None, ('press', 'Escape'), {})
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
     controller._material_witness_request = '#privacy'
-    await controller.before_ipc(None, ('click', '#privacy'), {})
+    controller._material_witness_expected = {
+        k: v for k, v in closed.items() if k != 'combobox'}
+    if unsafe == 'wrong-owner':
+        current['controls'][0]['form_selector'] = '#foreign'
+    if unsafe:
+        with pytest.raises(forms.Gate):
+            await controller.before_ipc(raw, ('click', '#privacy'), {})
+        assert controller._material_witness_selector is None
+        return
+    await controller.before_ipc(raw, ('click', '#privacy'), {})
     assert controller._material_witness_selector == '#privacy'
     with pytest.raises(forms.Gate):
-        await controller.before_ipc(None, ('press', 'Enter'), {})
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_close_request = '#privacy'
     with pytest.raises(forms.Gate):
-        await controller.before_ipc(None, ('click', '#privacy'), {})
-    await controller.before_ipc(None, ('press', 'Escape'), {})
-    assert controller._material_witness_selector is None
+        await controller.before_ipc(raw, ('press', 'Enter'), {})
     with pytest.raises(forms.Gate):
-        await controller.before_ipc(None, ('press', 'Escape'), {})
-
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    await controller.before_ipc(raw, ('press', 'Escape'), {})
+    assert controller._material_witness_selector == '#privacy'
+    controller._material_witness_selector = None
+    controller._material_witness_close_request = None
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})

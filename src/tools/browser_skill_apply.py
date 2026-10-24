@@ -1694,12 +1694,6 @@ _GREENHOUSE_FIXED_CONTROL_WITNESS = greenhouse_reader(_FIXED_CONTROL_WITNESS)
 
 
 def _greenhouse_safety(page, allowed, provenance, *, readiness=False, submitted=False):
-    # Once the guarded raw click has run, observations are passive. A success
-    # document can have no application root, foreign URL, unknown frame or
-    # response controls. These cannot authorize success: the independent
-    # _fresh_confirmed_outcome route/phrase/current-provenance checks still do.
-    if submitted:
-        return
     if not isinstance(provenance, GreenhouseJobAlias):
         raise Gate('Greenhouse frame observation lacks typed same-job provenance.')
     if not isinstance(page, dict):
@@ -1758,9 +1752,14 @@ class _GreenhouseSession:
             page = result.get('value') if isinstance(result, dict) else None
             if self.step is not None and isinstance(page, dict):
                 self.step['url'] = page.get('url', '')
-            _greenhouse_safety(page, self.allowed, self.provenance, readiness=self._readiness,
-                               submitted=bool(self._submitted and self._submitted()))
-            if self._readiness:
+            # After the raw guarded click, this read can be a rootless response
+            # or foreign redirect. Do not use entry-shape admission on passive
+            # confirmation reads; settlement checks the tracked route anew.
+            committed = bool(self._submitted and self._submitted())
+            if not committed:
+                _greenhouse_safety(page, self.allowed, self.provenance,
+                                   readiness=self._readiness, submitted=False)
+            if self._readiness and not committed:
                 if args == ('evaluate', GREENHOUSE_PAGE):
                     reason = _greenhouse_not_ready(page)
                 else:

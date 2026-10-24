@@ -331,6 +331,7 @@ async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeyp
     case, raw = _world(monkeypatch, 'greenhouse')
     case.row.pop('greenhouse_board')
     visited = []
+    reached_preparation = []
 
     async def navigate(url):
         visited.append(url)
@@ -338,6 +339,7 @@ async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeyp
 
     async def stop_after_navigation(_session, page, *_args, **_kwargs):
         assert page['url'] == case.url
+        reached_preparation.append(page['url'])
         raise forms.Gate('Synthetic stop after allowed host-only preparation.')
 
     raw.navigate = navigate
@@ -346,7 +348,7 @@ async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeyp
     assert outcome['status'] == 'gate'
     assert 'Synthetic stop after allowed host-only preparation' in outcome['question']
     assert visited == [case.wrapper]
-    assert forms._preparation_origin(case.url, case.wrapper)
+    assert reached_preparation == [case.url]
     assert raw.writes == []
 
     # This is the original production final-click decision. Even after

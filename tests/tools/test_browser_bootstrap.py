@@ -4389,6 +4389,87 @@ async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
+
+
+def test_navigation_diagnostic_has_bounded_host_path_and_unavailable_evidence():
+    """No URL text, userinfo, query, fragment or path payload escapes the Gate."""
+    tracked = 'https://example-co.test/job/1?tracked=PRIVATE_QUERY'
+    url = ('https://USER_SECRET:PASSWORD_SECRET@foreign.example.test/other-job'
+           '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    failure = forms._navigation_gate(
+        'Initial redirect is not proven to be the same employer job.',
+        tracked, url)
+    message = str(failure)
+    assert failure.reason == 'defect_provenance'
+    assert 'Failed predicate: literal_https_destination_origin' in message
+    assert 'Tracked host/path: example-co.test/job/1' in message
+    assert 'destination host/path: foreign.example.test/other-job' in message
+    assert 'independent redirect/ATS provenance: unavailable' in message
+    for secret in ('PRIVATE_QUERY', 'USER_SECRET', 'PASSWORD_SECRET',
+                   'QUERY_SECRET', 'FRAGMENT_SECRET', 'https://', '@'):
+        assert secret not in message
+    oversized = 'https://foreign.example.test/' + 'PATH_SECRET' * 30
+    assert forms._navigation_host_path(oversized) == (
+        'foreign.example.test/(path unavailable)')
+    assert forms._navigation_host_path(
+        'https://foreign.example.test/opening\nCONTROL_SECRET') == 'unavailable'
+    assert forms._navigation_host_path('missing destination') == 'unavailable'
+
+
+async def test_initial_navigation_redirect_explains_same_employer_origin(monkeypatch):
+    page = secure_inventory(field())
+    browser, _, row = secure_world(monkeypatch, page)
+    bad = ('https://foreign.example.test/job/1'
+           '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    browser.current = {**deepcopy(page), 'url': bad}
+    report = await secure_attempt(page)
+    assert report['status'] == 'gate'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert report['review_route'] == 'hard_refusal'
+    assert 'Initial redirect is not proven' in report['question']
+    assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
+    assert 'Tracked host/path: example-co.test/job/1' in report['question']
+    assert 'destination host/path: foreign.example.test/job/1' in report['question']
+    assert report['step']['url'] == 'unavailable'
+    assert 'QUERY_SECRET' not in report['question']
+    assert 'FRAGMENT_SECRET' not in report['question']
+    assert browser.calls == [('navigate', SECURE_URL)]
+    assert row.get('possible_submission') is False
+
+
+@pytest.mark.parametrize('verb', ['click', 'navigate'])
+async def test_observed_link_and_model_navigation_share_failed_provenance_predicate(
+        monkeypatch, verb):
+    destination = ('https://foreign.example.test/other-job'
+                   '?token=QUERY_SECRET#FRAGMENT_SECRET')
+    linked = field('Read more', '#next', tag='a', type='link',
+                   href=destination, required=False, in_form=False)
+    page = secure_inventory(field(), linked)
+    browser, decide, row = secure_world(monkeypatch, page)
+    # Retain the production action-scope and route predicates. Only the
+    # unrelated field reader/approved-choice setup is skipped by this fixture.
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _s, current, *a, **k: current))
+    monkeypatch.setattr(forms, '_current_approved_choices',
+                        AsyncMock(return_value=[]))
+    decide.return_value = ({'action': 'click', 'selector': '#next'}
+                           if verb == 'click'
+                           else {'action': 'navigate', 'url': destination})
+    report = await secure_attempt(page)
+    assert decide.await_count == 1
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'defect_provenance'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert 'Navigation requires provenance to the same tracked job and tenant.' in (
+        report['question'])
+    assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
+    assert 'destination host/path: foreign.example.test/other-job' in report['question']
+    assert 'QUERY_SECRET' not in report['question']
+    assert 'FRAGMENT_SECRET' not in report['question']
+    assert browser.calls == [('navigate', SECURE_URL)]
+    assert row.get('possible_submission') is False
+
+
 @pytest.mark.parametrize('unsafe', [None, 'readonly', 'offscreen', 'wrong-owner'])
 async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
         monkeypatch, unsafe):
@@ -4453,13 +4534,25 @@ async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape
     ('PRIVATE_LABEL_SENTINEL #PRIVATE_SELECTOR_SENTINEL',
      forms._MATERIAL_WITNESS_GATE_OPAQUE),
 ])
-async def test_material_witness_clause_stays_owner_only_across_direct_and_queue(
+async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
         monkeypatch, witness_error, expected):
     import logging
     from io import StringIO
 
     from agent import run
     from core.logging import _ConsoleFormatter, _JsonFormatter
+
+    # The same real consumer sinks must redact both owner-only diagnostics.
+    nav_page = secure_inventory(field())
+    nav_browser, _, _ = secure_world(monkeypatch, nav_page)
+    nav_browser.current = {
+        **deepcopy(nav_page),
+        'url': ('https://USER_SECRET:PASSWORD_SECRET@foreign.example.test/other-job'
+                '?token=QUERY_SECRET#FRAGMENT_SECRET')}
+    navigation = await secure_attempt(nav_page)
+    assert navigation['status'] == 'gate'
+    assert navigation['navigation_provenance_diagnostic'] is True
+    assert navigation['reason'] == 'defect_provenance'
 
     privacy = field(
         'Please Acknowledge receipt of our Candidate Privacy Notice.',
@@ -4476,77 +4569,183 @@ async def test_material_witness_clause_stays_owner_only_across_direct_and_queue(
         raise forms.Gate(witness_error)
 
     monkeypatch.setattr(forms, '_witness_material_combobox', witness_failure)
-    gate = await secure_attempt(page)
-    assert gate['status'] == 'gate'
-    assert gate['material_assent_diagnostic'] is True
+    material = await secure_attempt(page)
+    assert material['status'] == 'gate'
+    assert material['material_assent_diagnostic'] is True
     assert attempts == [True]
-    assert 'witness=attempted,linked=false,options=empty,' in gate['question']
-    assert f'witness_reason={expected}' in gate['question']
-    assert 'PRIVATE_LABEL_SENTINEL' not in gate['question']
-    assert 'PRIVATE_SELECTOR_SENTINEL' not in gate['question']
+    assert 'witness=attempted,linked=false,options=empty,' in material['question']
+    assert f'witness_reason={expected}' in material['question']
+    assert 'PRIVATE_LABEL_SENTINEL' not in material['question']
+    assert 'PRIVATE_SELECTOR_SENTINEL' not in material['question']
     assert decide.await_count == 0
 
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
            'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
 
     class Tracking:
-        def get(self, pk):
+        def get(self, key):
+            assert key == PK
             return dict(row)
 
-        def get_current(self, pk):
+        def get_current(self, key):
+            assert key == PK
             return dict(row)
 
-        def set_status(self, pk, status, **updates):
+        def set_status(self, key, status, **updates):
+            assert key == PK
             row.update(status=getattr(status, 'value', status), **updates)
 
     stores = SimpleNamespace(
         tracking=Tracking(), secrets=None,
         answer_bank=SimpleNamespace(all_facts=lambda company: {}))
-    monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: events.append(
-        (args, kwargs)))
-    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_jd_meta', AsyncMock(
-        return_value={'text': 'Synthetic job description'}))
+        return_value={'text': 'Synthetic offline description'}))
     monkeypatch.setattr(run, '_commit_posting_meta',
                         lambda pk, current, meta, stores: dict(current))
-    monkeypatch.setattr('tools.posting_guard.authorised', lambda *args, **kwargs: True)
+    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
     monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
-    monkeypatch.setattr('core.rotation.ensure', lambda *args, **kwargs: None)
+    monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
     monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
     monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
-    monkeypatch.setattr('tools.credentials.get_login', lambda *args, **kwargs: None)
+    monkeypatch.setattr('tools.credentials.get_login', lambda *a, **kw: None)
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Synthetic.pdf')
-    monkeypatch.setattr(run, 'get_settings',
-                        lambda: SimpleNamespace(browser_model='offline'))
-    monkeypatch.setattr('tools.browser_runtime.configuration',
-                        lambda: {'engine': 'browser_skill'})
-    monkeypatch.setattr('tools.browser_apply.apply',
-                        AsyncMock(return_value=gate))
+    monkeypatch.setattr(
+        run, 'get_settings', lambda: SimpleNamespace(browser_model='offline'))
+    monkeypatch.setattr(
+        'tools.browser_runtime.configuration', lambda: {'engine': 'browser_skill'})
+    assert run.log.propagate is False
     handlers = [handler for handler in run.log.handlers
                 if type(handler) is logging.StreamHandler
-                and isinstance(handler.formatter, (_ConsoleFormatter, _JsonFormatter))]
+                and isinstance(handler.formatter,
+                               (_ConsoleFormatter, _JsonFormatter))]
     assert handlers
-    for queued in (False, True):
-        events = []
-        row['status'] = 'tailored'
-        with StringIO() as output, monkeypatch.context() as capture:
-            capture.setattr(run.log, 'level', logging.INFO)
-            capture.setattr(handlers[0], 'stream', output)
-            if queued:
-                capture.setattr(run, 'make_stores', lambda: stores)
-                queue = SimpleNamespace(retry=Mock(), done=Mock())
-                result = run.run_queued({'pk': PK}, queue)
-                queue.done.assert_called_once()
+
+    cases = (
+        (material, 'material-assent: human inspection required',
+         ('witness=attempted', 'witness_reason=', 'PRIVATE_LABEL_SENTINEL',
+          'PRIVATE_SELECTOR_SENTINEL')),
+        (navigation, 'navigation-provenance: human inspection required',
+         ('foreign.example.test', 'example-co.test/job/1', 'other-job',
+          'USER_SECRET', 'PASSWORD_SECRET', 'QUERY_SECRET', 'FRAGMENT_SECRET')),
+    )
+    for report, safe_detail, private_values in cases:
+        monkeypatch.setattr('tools.browser_apply.apply',
+                            AsyncMock(return_value=report))
+        for queued_worker in (False, True):
+            events = []
+            monkeypatch.setattr(
+                'core.events.emit',
+                lambda kind, **kw: events.append((kind, kw)))
+            row['status'] = 'tailored'
+            with StringIO() as stream, monkeypatch.context() as capture:
+                capture.setattr(run.log, 'level', logging.INFO)
+                capture.setattr(handlers[0], 'stream', stream)
+                if queued_worker:
+                    capture.setattr(run, 'make_stores', lambda: stores)
+                    queue = SimpleNamespace(retry=Mock(), done=Mock())
+                    item = {'pk': PK}
+                    result = run.run_queued(item, queue)
+                    queue.done.assert_called_once_with(item)
+                    queue.retry.assert_not_called()
+                else:
+                    result = await run._apply_direct(PK, stores)
+                info_output = stream.getvalue()
+            assert result['result'] == 'gated'
+            assert result['question'] == report['question']
+            assert row['status'] == 'needs_human'
+            assert row['gate_pending']['question'] == report['question']
+            gate_events = [data for kind, data in events if kind == 'gate']
+            assert len(gate_events) == 1
+            assert gate_events[0]['detail'] == safe_detail
+            if report is navigation:
+                assert 'url' not in gate_events[0]
+            gated = [line for line in info_output.splitlines()
+                     if 'gated pk=' in line]
+            assert len(gated) == 1
+            assert safe_detail in gated[0]
+            if queued_worker:
+                queued = [line for line in info_output.splitlines()
+                          if 'apply: ' in line]
+                assert len(queued) == 1
+                assert safe_detail in queued[0]
+            for private in private_values:
+                assert private not in info_output
+                assert private not in str(gate_events)
+            if report is navigation:
+                assert result['navigation_provenance_diagnostic'] is True
+                assert row['gate_reason'] == 'defect_provenance'
+                assert 'foreign.example.test/other-job' in report['question']
+                for secret in ('USER_SECRET', 'PASSWORD_SECRET',
+                               'QUERY_SECRET', 'FRAGMENT_SECRET'):
+                    assert secret not in report['question']
             else:
-                result = await run._apply_direct(PK, stores)
-            logged = output.getvalue()
-        assert result['result'] == 'gated'
-        assert row['gate_pending']['question'] == gate['question']
-        assert [kwargs['detail'] for args, kwargs in events
-                if args[0] == 'gate'] == [
-            'material-assent: human inspection required']
-        assert 'material-assent: human inspection required' in logged
-        assert 'witness=attempted' not in logged
-        assert 'witness_reason=' not in logged
-        assert 'PRIVATE_LABEL_SENTINEL' not in logged
+                assert result['material_assent_diagnostic'] is True
+                assert 'witness=attempted,linked=false,options=empty,' in (
+                    report['question'])
+                assert f'witness_reason={expected}' in report['question']
+                assert decide.await_count == 0
+
+
+
+@pytest.mark.parametrize('suffix', ['', '%2Dencoded'])
+def test_foreign_host_predicate_precedes_path_encoding(suffix):
+    destination = 'https://foreign.example.test/other' + suffix
+    gate = forms._navigation_gate(
+        'Navigation requires same-job provenance.',
+        SECURE_URL, destination)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in str(gate)
+
+
+@pytest.mark.parametrize('ats,route_suffix', [
+    ('ashby', 'application'), ('lever', 'apply'),
+])
+def test_typed_entry_foreign_host_uses_rejecting_origin_predicate(ats, route_suffix):
+    job = '12345678-1234-4234-8234-123456789abc'
+    tracked = f'https://{forms._APPLICATION_ENTRY[ats][0]}/example-co/{job}'
+    proof = forms.ApplicationEntryProvenance(
+        'example-co#' + job, 'example-co', ats, job,
+        tracked, 'example-co', tracked + '/' + route_suffix)
+    gate = forms._navigation_gate(
+        'Navigation requires same-job provenance.', tracked,
+        'https://foreign.example.test/other%2Djob?job=QUERY_SENTINEL',
+        provenance=proof)
+    detail = str(gate)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'QUERY_SENTINEL' not in detail
+    assert 'foreign.example.test/(path unavailable)' in detail
+
+
+@pytest.mark.parametrize('href,commits', [
+    ('https://jobs.ashbyhq.com/example-co/job/application', False),
+    ('https://jobs.lever.co/example-co/job/apply', False),
+    ('https://jobs.ashbyhq.com/example-co/job/submit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/requestSubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/%73ubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/application?next=%73ubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/application#finalize', True),
+])
+def test_raw_get_effect_classification_keeps_safe_application_reversible(
+        href, commits):
+    """Only the final IPC producer may commit; plain form GET is preparation."""
+    assert forms._committing_get_route(href) is commits
+
+
+def test_tracked_literal_origin_does_not_borrow_destination_policy(monkeypatch):
+    """A tracked canonical posting is checked independently of chosen navigation."""
+    from core.ids import make_pk
+    job = '12345678-1234-4234-8234-123456789abc'
+    company = 'example-co'
+    url = f'https://jobs.ashbyhq.com/{company}/{job}'
+    pk = make_pk(company, job)
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kw: {
+        'pk': pk, 'company': company, 'job_id': job, 'jd_url': url,
+        'ats': 'ashby', 'status': 'submitting',
+        'possible_submission': False,
+    })
+    monkeypatch.setattr(forms, 'navigation_allowed',
+                        lambda *_args, **_kwargs: False)
+    forms._tracked_preparation_job(pk, company, url)
+    assert not forms._preparation_origin(
+        'https://jobs.ashbyhq.com/other-co/' + job, url)

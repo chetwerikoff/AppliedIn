@@ -1861,3 +1861,239 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     assert tracking.r.get(f'submit_hold:{PK}') is not None
     assert row['status'] == 'needs_human'
     assert row.get('gate_reason') == 'submit_uncertain'
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+@pytest.mark.parametrize('shape,failed', [
+    ('query', 'literal_canonical_ats_host_board_uuid_route'),
+    ('credentials', 'literal_canonical_ats_host_board_uuid_route'),
+    ('encoded-board', 'literal_canonical_ats_host_board_uuid_route'),
+    ('wrong-job', 'canonical_ats_job_id_equals_tracked_id'),
+])
+async def test_tracked_ats_literal_route_gate_identifies_predicate_without_secrets(
+        monkeypatch, ats, shape, failed):
+    """Source row authority is required even before host-only preparation."""
+    row, _, session, decision = world(monkeypatch, ats)
+    original = posting(ats)
+    alternate = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    if shape == 'query':
+        changed = original + '?key=QUERY_SENTINEL#FRAGMENT_SENTINEL'
+    elif shape == 'credentials':
+        changed = original.replace('https://',
+                                   'https://USER_SENTINEL:PW_SENTINEL@')
+    elif shape == 'encoded-board':
+        changed = original.replace('/example-co/', '/example%2dco/')
+    else:
+        changed = original.replace(JOB, alternate)
+    row['jd_url'] = changed
+    report = await forms.apply(changed, COMPANY, {}, 'synthetic', pk=PK,
+                               resume_path='Resume.pdf')
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'defect_provenance'
+    assert report['navigation_provenance_diagnostic'] is True
+    assert 'The tracked ATS posting is not a literal canonical job route.' in report['question']
+    assert 'Failed predicate: ' + failed in report['question']
+    assert 'Tracked host/path: ' + forms._APPLICATION_ENTRY[ats][0] in report['question']
+    assert 'destination host/path:' in report['question']
+    for secret in ('QUERY_SENTINEL', 'FRAGMENT_SENTINEL', 'USER_SENTINEL',
+                   'PW_SENTINEL', '%2d', 'https://'):
+        assert secret not in report['question']
+    assert report['step']['url'] == 'unavailable'
+    assert session.calls == [] and not decision.await_count
+
+
+def test_canonical_ats_job_binding_keeps_real_refusals_and_existing_entry():
+    """Diagnostic text cannot become authority for a new ATS or job route."""
+    for ats in ('ashby', 'lever'):
+        current = posting(ats)
+        proof = forms.ApplicationEntryProvenance(
+            PK, COMPANY, ats, JOB, current, 'example-co', entry(ats))
+        assert forms.navigation_allowed(entry(ats), provenance=proof)
+        for href in (entry(ats).replace('example-co/', 'other-co/'),
+                     entry(ats).replace(JOB, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+                     entry(ats).replace('https://', 'https://user:secret@'),
+                     entry(ats) + '?job=another',
+                     entry(ats).replace('/example-co/', '/example%2dco/')):
+            assert not forms.navigation_allowed(href, provenance=proof)
+
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_preparation_and_raw_ipc_reject_other_tenant_and_job_before_pdf(ats):
+    tracked = posting(ats)
+    good = entry(ats)
+    wrong_tenant = good.replace('/example-co/', '/other-co/')
+    wrong_job = good.replace(JOB, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, tracked, '', {}, {}, [], {}, lambda: None)
+    for destination in (wrong_tenant, wrong_job):
+        assert not forms._preparation_origin(destination, tracked)
+        assert not forms._preparation_destination_allowed(destination, tracked)
+        with pytest.raises(forms.Gate, match='proven same-job'):
+            guard._fresh_preparation(destination)
+    assert forms._preparation_origin(good, tracked)
+    assert forms._preparation_destination_allowed(good, tracked)
+
+
+def test_custom_origin_cannot_borrow_foreign_ats_host_for_pdf():
+    tracked = 'https://careers.example-co.test/jobs/123456'
+    foreign = ('https://jobs.ashbyhq.com/other-co/'
+               'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/application')
+    assert not forms._preparation_origin(foreign, tracked)
+    assert not forms._preparation_destination_allowed(foreign, tracked)
+    assert forms._preparation_origin(tracked, tracked)
+    # Raw upload verifies this route before considering any private receiver.
+    guard = forms.ApplicationIPCController(
+        'example-co#123456', COMPANY, tracked, '', {}, {}, [], {}, lambda: None)
+    with pytest.raises(forms.Gate, match='proven same-job'):
+        guard._fresh_preparation(foreign)
+
+
+@pytest.mark.parametrize('ats', ['ashby', 'lever'])
+def test_entry_reader_redirect_is_typed_and_bounded(ats):
+    tracked = posting(ats)
+    proof = forms.ApplicationEntryProvenance(
+        PK, COMPANY, ats, JOB, tracked, 'example-co', entry(ats))
+    target = ('https://foreign.example.test/other-job'
+              '?job=QUERY_SENTINEL#FRAGMENT_SENTINEL')
+    page = application(ats)
+    page['url'] = target
+    with pytest.raises(forms.NavigationProvenanceGate) as caught:
+        forms._entry_safety(page, lambda u: forms._preparation_origin(u, tracked), proof)
+    detail = str(caught.value)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'destination host/path: foreign.example.test/other-job' in detail
+    assert 'QUERY_SENTINEL' not in detail
+    assert 'FRAGMENT_SENTINEL' not in detail
+
+
+def test_greenhouse_reader_redirect_is_typed_and_bounded():
+    from tools.claude_chrome import GreenhouseJobAlias
+    tracked = 'https://boards.greenhouse.io/example-co/jobs/123456'
+    proof = GreenhouseJobAlias(
+        'example-co#123456', COMPANY, '123456', 'greenhouse',
+        tracked, tracked, 'example-co',
+        'https://job-boards.greenhouse.io/example-co/jobs/123456')
+    target = 'https://foreign.example.test/other-job?job=QUERY_SENTINEL'
+    with pytest.raises(forms.NavigationProvenanceGate) as caught:
+        forms._greenhouse_safety(
+            {'url': target},
+            lambda u: forms._preparation_origin(u, tracked), proof)
+    detail = str(caught.value)
+    assert 'Failed predicate: same_tracked_employer_https_origin' in detail
+    assert 'destination host/path: foreign.example.test/other-job' in detail
+    assert 'QUERY_SENTINEL' not in detail
+
+
+def test_unpinned_greenhouse_preparation_uses_configured_board_and_row(
+        monkeypatch):
+    """A missing final board pin does not turn a different tenant into a PDF sink."""
+    from types import SimpleNamespace
+    from core.ids import make_pk
+    from discovery.watchlist import CompanyConfig
+    from core import config as core_config
+    from discovery import watchlist
+    company, job = 'example-co', '123456'
+    tracked = 'https://careers.example-co.test/openings?gh_jid=' + job
+    pk = make_pk(company, job)
+    row = {'pk': pk, 'company': company, 'job_id': job, 'ats': 'greenhouse',
+           'jd_url': tracked, 'status': 'submitting',
+           'possible_submission': False}
+    cfg = CompanyConfig(name=company, ats='greenhouse', board=company,
+                        careers_url='https://careers.example-co.test/openings')
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kw: row)
+    monkeypatch.setattr(core_config, 'get_settings',
+                        lambda: SimpleNamespace(config_dir='/synthetic-only'))
+    monkeypatch.setattr(watchlist, 'load_watchlist', lambda *_args: [cfg])
+    approved = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+    wrong_board = 'https://job-boards.greenhouse.io/other-co/jobs/123456'
+    wrong_job = 'https://job-boards.greenhouse.io/example-co/jobs/999999'
+    assert not forms._preparation_origin(wrong_board, tracked)  # wrong tenant
+    assert forms._job_preparation_route(approved, tracked, pk=pk, company=company)
+    assert forms._job_preparation_route(approved + '/application', tracked,
+                                        pk=pk, company=company)
+    for wrong in [wrong_board, wrong_job,
+                  'https://job-boards.greenhouse.io.example.test/example-co/jobs/123456']:
+        assert not forms._job_preparation_route(wrong, tracked, pk=pk, company=company)
+        assert not forms._preparation_destination_allowed(
+            wrong, tracked, pk=pk, company=company)
+    assert forms._preparation_destination_allowed(
+        approved, tracked, pk=pk, company=company)
+    assert not forms._job_preparation_route(
+        approved, tracked, pk=pk, company='other-co')
+    row['possible_submission'] = True
+    assert not forms._job_preparation_route(approved, tracked, pk=pk, company=company)
+
+
+def test_legacy_host_admission_cannot_authorize_cross_tenant_effect():
+    """Shared ATS host classification is not navigation/upload authority."""
+    tracked = 'https://jobs.lever.co/example-co/12345678-1234-4234-8234-123456789abc'
+    other = 'https://jobs.lever.co/other-co/12345678-1234-4234-8234-123456789abc/apply'
+    valid = tracked + '/apply'
+    assert not forms._preparation_origin(other, tracked)
+    assert not forms._job_preparation_route(other, tracked)
+    assert not forms._preparation_destination_allowed(other, tracked)
+    assert forms._job_preparation_route(valid, tracked)
+    assert forms._preparation_destination_allowed(valid, tracked)
+
+
+@pytest.mark.asyncio
+async def test_greenhouse_confirmation_read_does_not_reimpose_pre_submit_shape():
+    """Only a post-click session observation skips the strict entry shape."""
+    after = {
+        'url': 'https://foreign.example.test/thank-you?token=QUERY_SENTINEL',
+        'controls': [], 'greenhouse': {
+            'root': None, 'frames': [{'status': 'unknown'}],
+            'response_controls': True,
+        },
+        'unsupported_frames': ['synthetic unsupported frame'],
+    }
+    class Raw:
+        async def call(self, *args, **kwargs):
+            assert args == ('evaluate', forms.GREENHOUSE_PAGE)
+            return {'value': after}
+    # A direct pre-commit structural check stays authoritative. After the
+    # guarded click only, the reader may observe an ambiguous response;
+    # separate same-job confirmation decides whether it means success.
+    with pytest.raises(forms.Gate):
+        forms._greenhouse_safety(after, lambda _href: False, None,
+                                 submitted=True)
+    passive = forms._GreenhouseSession(
+        Raw(), lambda _href: False, None, submitted=lambda: True)
+    assert await passive.page() == after
+    guarded = forms._GreenhouseSession(
+        Raw(), lambda _href: False, None, submitted=lambda: False)
+    with pytest.raises(forms.Gate):
+        await guarded.page()
+
+
+def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
+        monkeypatch):
+    """The row/config route proof is narrow and never turns into host-wide trust."""
+    from types import SimpleNamespace
+    from core import config as core_config
+    from discovery import watchlist
+    from discovery.watchlist import CompanyConfig
+    from core.ids import make_pk
+
+    company = 'example-co'
+    jid = '123456'
+    pk = make_pk(company, jid)
+    tracked = 'https://careers.example-co.test/openings?gh_jid=' + jid
+    row = dict(pk=pk, company=company, job_id=jid, jd_url=tracked,
+               ats='greenhouse', status='submitting', possible_submission=False)
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: row)
+    monkeypatch.setattr(core_config, 'get_settings',
+                        lambda: SimpleNamespace(config_dir='/synthetic'))
+    monkeypatch.setattr(watchlist, 'load_watchlist', lambda *_args: [
+        CompanyConfig(name=company, ats='greenhouse', board=company,
+                      careers_url='https://careers.example-co.test/openings')
+    ])
+    allowed = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+    refused = 'https://job-boards.greenhouse.io/other-co/jobs/123456'
+    assert forms._job_preparation_route(allowed, tracked, pk=pk, company=company)
+    assert not forms._job_preparation_route(refused, tracked, pk=pk, company=company)
+    # Merely declaring the same shared HTTPS host remains insufficient.
+    assert not forms._preparation_origin(refused, tracked)
+    assert not forms._preparation_destination_allowed(
+        refused, tracked, pk=pk, company=company)

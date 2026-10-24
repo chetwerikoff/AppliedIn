@@ -3726,7 +3726,8 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             provenance=None, fixture_context=None) -> None:
     if not global_facts or not pk:
         return
-    row = _row(pk, fixture_context=fixture_context)
+    row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
+           else _row(pk))
     if (row.get('pk') != pk or row.get('status') != 'submitting'
             or row.get('possible_submission')):
         return
@@ -3772,7 +3773,8 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
     if not pending:
         return
     # Re-read immediately before persistence. Existing explicit grants win.
-    row = _row(pk, fixture_context=fixture_context)
+    row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
+           else _row(pk))
     if (row.get('pk') != pk or row.get('status') != 'submitting'
             or row.get('possible_submission')):
         raise Gate('Tracked row changed before automatic approval.')

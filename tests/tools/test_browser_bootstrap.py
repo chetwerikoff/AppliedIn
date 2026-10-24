@@ -4208,11 +4208,11 @@ async def test_material_owner_grant_raw_ipc_requires_exact_current_control(
         action = ('click', '#yes')
     if drift == 'none':
         await raw.application_effect(*action)
-        assert action in effects
+        assert effects == [(*action, '--session', 'synthetic-offline')]
     else:
         with pytest.raises(forms.Gate):
             await raw.application_effect(*action)
-        assert action not in effects
+        assert effects == []
     assert row['human_approved_answers'][key]['value'] in {'I agree', 'I decline'}
     assert not controller.facts
 
@@ -4274,4 +4274,4 @@ async def test_owner_only_checkbox_grant_resumes_through_raw_click(
     raw.id = 'synthetic-offline'
     raw.bind_application_controller(controller)
     await raw.application_effect('click', '#marketing')
-    assert ('click', '#marketing') in effects
+    assert effects == [('click', '#marketing', '--session', 'synthetic-offline')]

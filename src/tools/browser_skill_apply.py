@@ -3205,6 +3205,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
                                  '_application_controller', None)
         if controller is not None:
             controller._material_witness_request = selector
+            controller._material_witness_expected = stable
         attempted = True
         await _effect_call(session, 'click', selector)
         for attempt in range(20):
@@ -3245,6 +3246,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
         finally:
             if controller is not None:
                 controller._material_witness_request = None
+                controller._material_witness_expected = None
                 controller._material_witness_close_request = None
                 controller._material_witness_selector = None
                 controller._material_witness_target = None
@@ -4460,6 +4462,7 @@ class ApplicationIPCController:
         self.committed = False
         self._material_witness_selector = None
         self._material_witness_request = None
+        self._material_witness_expected = None
         self._material_witness_close_request = None
         self._material_witness_target = None
         self.expected_digest = None
@@ -4745,6 +4748,9 @@ class ApplicationIPCController:
                     and (target.get('combobox') or {}).get('linked') is False):
                 combo = target.get('combobox') or {}
                 if (self._material_witness_request != selector
+                        or not isinstance(self._material_witness_expected, dict)
+                        or any(target.get(k) != v
+                               for k, v in self._material_witness_expected.items())
                         or combo.get('options') not in (None, [])
                         or combo.get('link_id') not in ('', None)
                         or combo.get('listbox_selector') not in ('', None)

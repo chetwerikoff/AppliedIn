@@ -4027,7 +4027,7 @@ def _preparation_origin(href: str, tracked_url: str) -> bool:
                 or part.netloc != part.hostname
                 or any(ord(c) < 33 or 127 <= ord(c) <= 159 or c == '\\'
                        for c in href)
-                or any(segment in {'.', '..'} for segment in part.path.split('/')):
+                or any(segment in {'.', '..'} for segment in part.path.split('/'))):
             return False
         # Shared ATS hosts cannot confer a different tenant/job the tracked
         # row's private data. The tracked canonical route binds the job path.

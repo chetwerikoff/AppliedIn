@@ -1057,6 +1057,18 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                 or len({' '.join(o['label'].casefold().split())
                         for o in field['options']}) != len(field['options'])))):
         return None
+    if field['type'] == 'combobox' and 'options' in field:
+        # Only material combobox gates bind options; ordinary dynamic pickers
+        # still bind their stable control without pre-approving an option list.
+        opts = field['options']
+        if (not isinstance(opts, list) or not opts
+                or any(not isinstance(o, dict)
+                       or not isinstance(o.get('selector'), str) or not o['selector']
+                       or not isinstance(o.get('label'), str) or not o['label'].strip()
+                       or not isinstance(o.get('value'), str) for o in opts)
+                or len({o['selector'] for o in opts}) != len(opts)
+                or len({' '.join(o['label'].casefold().split()) for o in opts}) != len(opts)):
+            return None
     from tools.browser_skill_apply import navigation_allowed
     from tools.claude_chrome import (
         greenhouse_alias_candidate, verified_greenhouse_alias,
@@ -1283,6 +1295,15 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
 
     question = (row.get("gate_pending") or {}).get("question") or ""
     form_label = _direct_form_label(pk, row)
+    bound_field = (row.get('gate_pending') or {}).get('form_question')
+    if (form_label is None and row.get('gate_source') == 'applier'
+            and isinstance(bound_field, dict)):
+        # A stale or malformed legal form question is not a reusable applicant
+        # fact. Fail closed instead of laundering the owner's reply into GLOBAL.
+        from tools.browser_skill_apply import _material_question
+        if _material_question(bound_field):
+            return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                    'detail': 'The observed material form question is no longer current.'}
     approval = form_label is None and question.startswith("Ready to apply")
     if (form_label is not None
             or (question and not approval
@@ -1326,11 +1347,21 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         personal = label.lower().startswith("why") or "this role" in label.lower() \
             or (company and company.lower() in label.lower())
         scope = AnswerScope.COMPANY if personal else AnswerScope.GLOBAL
-        if label != question:
+        # A bound form label is untrusted page prose; keep it in the owner gate,
+        # never in the ordinary answer-bank telemetry.
+        if label != question and not form_label:
             log.info("banking the gate answer for %s under %r (from a %d-char question)",
                      pk, label, len(question))
-        stores.answer_bank.put(label, answer, scope,
-                               company=company or None, source="dashboard")
+        # Owner-attested material assent is per-job permission, not a global
+        # reusable fact. The original observed control grant is persisted below
+        # and is the only answer source allowed for material select/combobox.
+        material_form = False
+        if form_label:
+            from tools.browser_skill_apply import _material_question
+            material_form = _material_question(row['gate_pending']['form_question'])
+        if not material_form:
+            stores.answer_bank.put(label, answer, scope,
+                                   company=company or None, source="dashboard")
         # Internal answers stay reusable bank facts, not employer disclosure
         # grants. The exact observed direct form question owns the latter.
         if form_label:
@@ -1344,7 +1375,10 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 'form_action': observed['form_action'],
                 **({'verified_redirect_url': observed['verified_redirect_url']}
                    if observed.get('verified_redirect_url') else {}),
-                **({'options': observed['options']} if observed['tag'] == 'select' else {}),
+                **({'options': observed['options']}
+                   if observed['tag'] == 'select'
+                   or (observed['type'] == 'combobox' and 'options' in observed)
+                   else {}),
                 **({'visible_text': observed['visible_text']}
                    if observed['type'] == 'checkbox' else {}),
                 **({'radio_name': observed['radio_name'],

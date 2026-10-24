@@ -1958,6 +1958,42 @@ def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False, ats='ashb
                     missingPane=not resolved,frames=['R']),script)
 
 
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('ats,variant,expected', [
+    ('ashby', 'ok', ('yes', 1, 1, 'yes', 'yes')),
+    ('lever', 'ok', ('no', 1, 1, 'yes', 'no')),
+    ('ashby', 'second-anchor', ('yes', 2, 1, 'no', 'no')),
+    ('ashby', 'second-bframe', ('yes', 1, 2, 'yes', 'no')),
+    ('ashby', 'anchor-outside', ('yes', 1, 1, 'no', 'no')),
+    ('ashby', 'visible-bframe', ('yes', 1, 1, 'yes', 'no')),
+])
+def test_issue179_enterprise_pair_diagnostic_fields(reader, ats, variant, expected):
+    # Both shipped readers must explain exactly which passive pair evidence is
+    # missing, without changing status or publishing page-owned values.
+    page = _issue174_reader(reader, ats=ats, variant=variant)
+    frames = page['entry']['frames']
+    anchor = next(f for f in frames if f['path'] == '/recaptcha/enterprise/anchor')
+    fields = ('ashby_native', 'enterprise_anchors', 'enterprise_bframes',
+              'anchor_in_badge', 'passive_enterprise')
+    assert tuple(anchor[key] for key in fields) == expected
+    assert {anchor['ashby_native'], anchor['anchor_in_badge'],
+            anchor['passive_enterprise']} <= {'yes', 'no'}
+    assert type(anchor['enterprise_anchors']) is int
+    assert type(anchor['enterprise_bframes']) is int
+    # A bframe (even a visible one) uses the same decision and counts.
+    bframe = next(f for f in frames if f['path'] == '/recaptcha/enterprise/bframe')
+    assert tuple(bframe[key] for key in fields) == expected
+    for frame in (anchor, bframe):
+        assert not any(token in str(frame[key]) for key in fields
+                       for token in ('example-co', 'Test User', 'QUERY_SENTINEL'))
+    if variant == 'ok' and ats == 'ashby':
+        assert [f['status'] for f in frames] == ['R', 'R']
+    elif variant == 'visible-bframe':
+        assert bframe['status'] == 'visible-recaptcha'
+    else:
+        assert anchor['status'] == 'unknown'
+
+
 @pytest.mark.parametrize('reader',['page','witness'])
 @pytest.mark.parametrize('shape',[2,3])
 @pytest.mark.parametrize('resolved',[False,True])

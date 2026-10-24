@@ -3739,7 +3739,7 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
         forms.check_form(page, filled, True)
 
 
-def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+async def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     """A visible privacy choice needs the owner's exact current question."""
     question_text = 'I consent to sharing personal data with marketing partners'
     page = secure_inventory(
@@ -3748,7 +3748,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     )
     independent = {c['selector']: c for c in witness(page)['controls']}
     with pytest.raises(forms.Gate) as exc:
-        forms._bootstrap_wall(page, independent, SECURE_URL)
+        await forms._bootstrap_wall(None, page, independent, SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert exc.value.form_question is not None
     assert exc.value.form_question['control_label'] == question_text
@@ -3759,7 +3759,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     inaccessible = deepcopy(independent)
     inaccessible['#marketing']['visible'] = False
     with pytest.raises(forms.Gate) as blocked:
-        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+        await forms._bootstrap_wall(None, page, inaccessible, SECURE_URL)
     assert blocked.value.reason == 'owner_question'
     assert blocked.value.form_question is None
     assert 'Direct owner review' in str(blocked.value)

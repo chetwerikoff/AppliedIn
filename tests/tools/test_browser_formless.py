@@ -1778,8 +1778,10 @@ def _issue164_reader(reader, *, position=2, resolved=False, variant='ok',
     if(VARIANT==='linked')node('input',{role:'combobox',
       'data-value-name':'g-recaptcha-response'},badge);
     if(VARIANT==='visible-bframe') {
-      const f=node('iframe',{src:'https://www.recaptcha.net/recaptcha/enterprise/bframe'},badge);
-      f.style.visibility='visible';
+      // Make the challenge the only exceptional frame, not a stray unknown anchor.
+      move(anchor,badge);
+      anchor.setAttribute('src','https://www.recaptcha.net/recaptcha/enterprise/bframe');
+      anchor.style.visibility='visible';
     }
   }
 """

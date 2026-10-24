@@ -1137,6 +1137,7 @@ async def test_material_witness_failure_clears_raw_escape_authority(monkeypatch,
     session.application_effect = raw_effect
     with pytest.raises(TimeoutError):
         await forms._bootstrap(session, closed, PK, {}, URL)
+    assert ('click', '#country') in session.calls
     assert controller._material_witness_request is None
     assert controller._material_witness_close_request is None
     assert controller._material_witness_selector is None

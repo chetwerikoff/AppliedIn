@@ -3427,7 +3427,7 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                     f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
                     f"visible label: {visible_label!r}; "
                     f"matched: {assent_match.group(0) if assent_match else 'select options'}."
-                    + (f" Disclosure: {disclosure_failure}; "
+                    + (f" Disclosure: {disclosure_failure}. "
                        + _material_witness_disclosure_detail(
                            c, attempted=witness_attempted,
                            reason=witness_failure) + '.'
@@ -3563,7 +3563,27 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
-    page, witness = await _observe_controls(session, page)
+    try:
+        page, witness = await _observe_controls(session, page)
+    except Gate as exc:
+        # The independent DOM validator remains fail-closed. Its rejected
+        # linked shape still has a safe, code-normalized owner diagnostic;
+        # never proceed to grants or a witness attempt on this path.
+        malformed_link = ('predicate=combobox.linked.shape;' in str(exc))
+        material = next((c for c in page['controls']
+                         if c.get('in_form') and c.get('type') == 'combobox'
+                         and _material_form_choice(c)), None)
+        if not malformed_link or material is None:
+            raise
+        assent = _material_assent_match(label(material))
+        kind = material.get('type')
+        raise MaterialAssentGate(
+            'Material assent outside a bound choice needs human inspection. '
+            f"Control type: {kind}; tag: {material.get('tag')}; "
+            "visible label: 'unavailable'; "
+            f"matched: {assent.group(0) if assent else 'select options'}."
+            ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
+            + _material_witness_disclosure_detail(material, attempted=False) + '.') from None
     if provenance is not None and (
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):

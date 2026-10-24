@@ -1473,6 +1473,25 @@ def _material_exact_value(pk: str, page: dict, target: dict, question: dict,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
     return value
 
+
+def _material_question(question: dict | None) -> bool:
+    """Classify observed material questions for log redaction and no banking."""
+    if not isinstance(question, dict):
+        return False
+    title, subtitle = question.get('question'), question.get('control_label')
+    if not isinstance(title, str) or not isinstance(subtitle, str):
+        return False
+    if _MATERIAL_ASSENT.search(title + ' ' + subtitle):
+        return True
+    opts = question.get('options', [])
+    target = {
+        'tag': question.get('tag'), 'type': question.get('type'),
+        'label': subtitle, 'question': title, 'options': opts,
+        'combobox': {'options': opts},
+    }
+    return bool(_material_form_choice(target))
+
+
 def _unrelated_search_form(controls: list[dict]) -> bool:
     """Ignore only a proven search-only form, not a second plausible application."""
     searches = [c for c in controls
@@ -3206,6 +3225,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                  and _unanswered(page, c)]
     if not candidate and not (settlement_route and history) and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
+            or (c.get('in_form') and _material_form_choice(c))
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
@@ -4972,7 +4992,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                       'review_route': route,
                       'question': context['text'], 'step': context['step'],
                       'form_question': exc.form_question}
-            if isinstance(exc, MaterialAssentGate):
+            if isinstance(exc, MaterialAssentGate) or _material_question(exc.form_question):
+                # An execute-time owner question is also page prose; never log it.
                 report['material_assent_diagnostic'] = True
             return report
         if submitted:

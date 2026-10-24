@@ -1539,7 +1539,7 @@ async def test_forless_witnessed_aria_picker_and_native_choices_reach_real_entry
     assert not any(c[0] == 'submit' for c in raw.calls)
 
 
-def _source_less_enterprise_fixture(script, *, variant='exact'):
+def _source_less_enterprise_fixture(script, *, variant='exact', child=None):
     """The extra iframe has no src/srcdoc, but no root/document proof is invented.
 
     This injects only an offline DOM mutation into the two production readers;
@@ -1578,7 +1578,13 @@ def _source_less_enterprise_fixture(script, *, variant='exact'):
   document.querySelectorAll('iframe')[1].style.visibility = 'visible';
 """,
     }.get(variant, '')
-    return dom(spec, script.replace(opener, opener + injection + additional, 1))
+    reader=script.replace(opener, opener + injection + additional, 1)
+    if child is None:
+        return dom(spec, reader)
+    # Borrow the existing offline current-child fixture, not a live browser.
+    from tests.tools.test_browser_application_entry import _dom_with_readable_child
+    spec['child'] = {'url': 'about:blank', 'readyState': 'complete', 'control': child}
+    return _dom_with_readable_child(spec, reader)
 
 
 @pytest.mark.parametrize('reader', ['page', 'witness'])
@@ -1676,3 +1682,22 @@ def test_frame_owner_detail_never_trusts_raw_parent_pattern_or_control_strings()
     for token in ('PRIVATE_CONTROL_SENTINEL', 'PRIVATE_TOKEN_SENTINEL',
                   'PRIVATE_DOC_SENTINEL', 'PRIVATE_SIBLING_SENTINEL'):
         assert token not in detail
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('child,expected', [('button', 'yes'), ('none', 'no')])
+def test_source_less_readable_child_controls_are_evidence_not_root_admission(reader,
+                                                                             child, expected):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = _source_less_enterprise_fixture(script, child=child)
+    companion=page['entry']['frames'][1]
+    assert companion['source'] == 'absent' and companion['srcdoc'] == 'absent'
+    assert companion['document_readability'] == 'readable'
+    assert companion['form_controls'] == expected
+    assert companion['root'] == '' and companion['outside'] is False
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame') as raised:
+        forms._entry_safety(page, lambda url: url == entry('ashby'), None)
+    detail=str(raised.value)
+    assert f'form_controls={expected}' in detail
+    assert 'independent application-root placement' in detail
+    assert 'shared reCAPTCHA container' in detail

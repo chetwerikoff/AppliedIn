@@ -4708,7 +4708,8 @@ class ApplicationIPCController:
                 if (len(owner) != 1 or
                         any(owner[0].get(k) != v
                             for k, v in self._material_witness_target.items())
-                        or not _preparation_origin(page['url'], self.url)):
+                        or not _preparation_destination_allowed(
+                            page['url'], self.url)):
                     raise Gate('The material witness control or origin changed.')
                 return
             raise Gate('Keyboard or focus IPC lacks a safe application effect classification.')
@@ -4774,8 +4775,11 @@ class ApplicationIPCController:
                             return await session.call('evaluate', script)
                         raise Gate('Only the fixed control witness may be read.')
                 current, proof = await _observe_controls(RawWitnessReader(), page)
-                actual = control(current, {'selector': selector},
-                                 'material-witness-open')
+                matches = [c for c in current['controls']
+                           if c.get('selector') == selector and not c.get('disabled')]
+                if len(matches) != 1:
+                    raise Gate('The material witness control changed before raw click.')
+                actual = matches[0]
                 _disclosure_question(current, actual, proof, self.url,
                                      closed_witness=True)
                 self._material_witness_target = {

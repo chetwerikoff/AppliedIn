@@ -645,6 +645,15 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
   // Observe structural relationships independently; unknown roots remain unknown.
   // Position patterns use only fixed tag names and bounded sibling ordinals.
   const entryFrameNodes=Array.from(document.querySelectorAll('iframe'));
+  const enterpriseBframes=entryFrameNodes.filter(e => {
+    try {
+      const raw=e.getAttribute('src');
+      if(raw===null) return false;
+      const u=new URL(raw);
+      return ['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) &&
+        u.pathname==='/recaptcha/enterprise/bframe';
+    } catch (_) { return false; }
+  });
   const enterpriseAnchors=entryFrameNodes.filter(e => {
     try {
       const raw=e.getAttribute('src');
@@ -724,18 +733,14 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     // The invisible Enterprise pair is provider-owned only when both exact
     // frames are unique. Badge containment is checked on the actual anchor;
     // its body-level bframe need not share the badge or an application root.
-    const passiveEnterprise=raw!==null && !e.hasAttribute('srcdoc') &&
-      style.visibility==='hidden' && hidden &&
-      enterpriseAnchors.length===1 &&
-      enterpriseBadgeAnchor(enterpriseAnchors[0].closest('div.grecaptcha-badge')) &&
-      entryFrameNodes.filter(f=>{
-        if(f.hasAttribute('srcdoc')) return false;
-        try {
-          const u=new URL(f.getAttribute('src'));
-          return ['https://www.recaptcha.net','https://www.google.com'].includes(u.origin) &&
-            u.pathname==='/recaptcha/enterprise/bframe';
-        } catch (_) { return false; }
-      }).length===1 && r;
+    const pairAnchor=enterpriseAnchors.length===1 ? enterpriseAnchors[0] : null;
+    const pairBframe=enterpriseBframes.length===1 ? enterpriseBframes[0] : null;
+    const passiveEnterprise=ashbyNative && !!pairAnchor && !!pairBframe &&
+      !pairAnchor.hasAttribute('srcdoc') && !pairBframe.hasAttribute('srcdoc') &&
+      enterpriseBadgeAnchor(pairAnchor.closest('div.grecaptcha-badge')) &&
+      getComputedStyle(pairAnchor).visibility==='hidden' &&
+      getComputedStyle(pairBframe).visibility==='hidden' &&
+      (e===pairAnchor || e===pairBframe);
     // AC-Z is scoped to the entry reader; ordinary PAGE gains no frame waiver.
     const z=raw===null && e.getAttribute('title')===null &&
       !e.getAttributeNames().some(a=>a.startsWith('data-') || a.startsWith('aria-')) &&
@@ -747,9 +752,10 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
     else if (!e.hasAttribute('srcdoc') && ((r && hiddenROutside && hidden &&
-             !(path==='/recaptcha/enterprise/bframe' &&
-               enterpriseAnchors.length===1 &&
-               enterpriseBadgeAnchor(enterpriseAnchors[0].closest('div.grecaptcha-badge')))) ||
+             // Existing native-root classification remains; an Ashby bframe
+             // with any Enterprise anchor must use the exact-pair proof.
+             !(ashbyNative && path==='/recaptcha/enterprise/bframe' &&
+               enterpriseAnchors.length>0)) ||
              visibleR==='R' || passiveEnterprise)) status='R';
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';

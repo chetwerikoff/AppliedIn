@@ -4043,3 +4043,37 @@ def test_typed_entry_foreign_host_uses_rejecting_origin_predicate(ats, route_suf
     assert 'Failed predicate: same_tracked_employer_https_origin' in detail
     assert 'QUERY_SENTINEL' not in detail
     assert 'foreign.example.test/(path unavailable)' in detail
+
+
+@pytest.mark.parametrize('href,commits', [
+    ('https://jobs.ashbyhq.com/example-co/job/application', False),
+    ('https://jobs.lever.co/example-co/job/apply', False),
+    ('https://jobs.ashbyhq.com/example-co/job/submit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/requestSubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/%73ubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/application?next=%73ubmit', True),
+    ('https://jobs.ashbyhq.com/example-co/job/application#finalize', True),
+])
+def test_raw_get_effect_classification_keeps_safe_application_reversible(
+        href, commits):
+    """Only the final IPC producer may commit; plain form GET is preparation."""
+    assert forms._committing_get_route(href) is commits
+
+
+def test_tracked_literal_origin_does_not_borrow_destination_policy(monkeypatch):
+    """A tracked canonical posting is checked independently of chosen navigation."""
+    from core.ids import make_pk
+    job = '12345678-1234-4234-8234-123456789abc'
+    company = 'example-co'
+    url = f'https://jobs.ashbyhq.com/{company}/{job}'
+    pk = make_pk(company, job)
+    monkeypatch.setattr(forms, '_row', lambda *_args, **_kw: {
+        'pk': pk, 'company': company, 'job_id': job, 'jd_url': url,
+        'ats': 'ashby', 'status': 'submitting',
+        'possible_submission': False,
+    })
+    monkeypatch.setattr(forms, 'navigation_allowed',
+                        lambda *_args, **_kwargs: False)
+    forms._tracked_preparation_job(pk, company, url)
+    assert not forms._preparation_origin(
+        'https://jobs.ashbyhq.com/other-co/' + job, url)

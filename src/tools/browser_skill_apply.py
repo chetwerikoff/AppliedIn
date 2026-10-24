@@ -471,6 +471,8 @@ _CONTROL_CALLERS = frozenset({
     'combobox-observe',
     'combobox-open',
     'combobox-options',
+    'material-witness-open',
+    'material-witness-close',
     'combobox-verify',
     'execute-formless',
     'execute-initial',
@@ -2286,12 +2288,15 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
     if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
         raise Gate('The current form control inventory is malformed.')
     pending_hidden_r = False
+    # Reader-proven visible challenges outrank an earlier unknown frame.
     for frame in entry['frames']:
         status = frame.get('status') if isinstance(frame, dict) else None
         if status == 'visible-recaptcha':
             raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
         if status == 'visible-hcaptcha':
             raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
+    for frame in entry['frames']:
+        status = frame.get('status') if isinstance(frame, dict) else None
         if status not in {'H', 'R', 'W', 'X'} and not (
                 status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
             # Only the bounded Ashby waiter retries this exact reader-proven
@@ -3175,7 +3180,8 @@ def _same_key(value: str) -> str:
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None,
-                         lever_location: bool = False) -> dict:
+                         lever_location: bool = False,
+                         closed_witness: bool = False) -> dict:
     structural = _formless_root(page)
     if structural:
         members = _formless_boundary(page, provenance)
@@ -3233,7 +3239,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if not _material_form_choice(target):
             raise Gate('Legal or material assent requires direct human review.')
         # Unlinked or partly observed ARIA options cannot become an approval.
-        if target.get('type') == 'combobox':
+        if target.get('type') == 'combobox' and not closed_witness:
             _combobox_options(target)
     key = _key(page, target)
     siblings = _form_subject(page, target)
@@ -3272,7 +3278,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question['verified_redirect_url'] = provenance.target_url
     if target.get('tag') == 'select':
         question['options'] = _native_options(target)
-    if target.get('type') == 'combobox' and _material_form_choice(target):
+    if (target.get('type') == 'combobox' and _material_form_choice(target)
+            and not closed_witness):
         # Ordinary dynamic picker grants bind stable receivers; assent must
         # additionally bind the complete currently witnessed options.
         question['options'] = [
@@ -3323,7 +3330,152 @@ _MATERIAL_DIAGNOSTIC_TYPES = frozenset({
 })
 
 
-def _bootstrap_wall(page: dict, witness: dict, *origins: str,
+_MATERIAL_WITNESS_GATE_REASONS = frozenset({
+    'The closed combobox linkage is incomplete or ambiguous.',
+    'This control is not visibly editable.',
+    'The tracked posting or preparation origin changed.',
+    'The picker origin or current tracked posting changed.',
+    'The material picker control changed while opening.',
+    'The combobox option linkage is incomplete or ambiguous.',
+    'The material picker changed during reversible inspection.',
+})
+_MATERIAL_WITNESS_GATE_OPAQUE = 'unspecified-witness-failure'
+
+
+def _material_witness_disclosure_detail(target: dict, *, attempted: bool,
+                                        reason: str | None = None) -> str:
+    """Only fixed code-owned states enter the existing owner Disclosure detail."""
+    combo = target.get('combobox')
+    combo = combo if isinstance(combo, dict) else {}
+    linked = combo.get('linked')
+    linked_state = ('true' if linked is True else
+                    'false' if linked is False else
+                    'absent' if linked is None else 'other')
+    options = combo.get('options')
+    options_state = ('none' if options is None else
+                     'empty' if options == [] else 'present')
+    fields = [
+        f"witness={'attempted' if attempted else 'not-attempted'}",
+        f'linked={linked_state}',
+        f'options={options_state}',
+        f"link_id={'present' if combo.get('link_id') not in (None, '') else 'absent'}",
+        f"listbox={'present' if combo.get('listbox_selector') not in (None, '') else 'absent'}",
+    ]
+    if attempted:
+        fields.append('witness_reason=' + (
+            reason if isinstance(reason, str)
+            and reason in _MATERIAL_WITNESS_GATE_REASONS
+            else _MATERIAL_WITNESS_GATE_OPAQUE))
+    return ','.join(fields)
+
+
+async def _witness_material_combobox(session, page: dict, witness: dict,
+                                     target: dict, *origins: str,
+                                     provenance=None, pk: str = '',
+                                     fixture_context=None):
+    """Witness a lazy material option list with exact-control open/Escape only."""
+    selector = target['selector']
+    action = {'action': 'combobox', 'selector': selector}
+    combo = target.get('combobox') or {}
+    if (not pk or not _material_assent_match(label(target))
+            or combo.get('linked') is not False
+            or combo.get('options') not in (None, [])
+            or combo.get('link_id') not in ('', None)
+            or combo.get('listbox_selector') not in ('', None)
+            or target.get('submit') is True or target.get('navigates') is True
+            or target.get('commits_application') or target.get('formaction')
+            or target.get('href') or target.get('disabled')
+            or not target.get('in_form')):
+        raise Gate('The closed combobox linkage is incomplete or ambiguous.')
+    proof = witness.get(selector)
+    if (not isinstance(proof, dict) or proof.get('visible') is not True
+            or proof.get('readonly') is True or proof.get('disabled') is True
+            or proof.get('inert') is True or proof.get('combobox') != combo):
+        raise Gate('This control is not visibly editable.')
+    # Code-only safety preflight: no grant/question is returned to the owner
+    # until independently linked, complete options have been witnessed.
+    _disclosure_question(page, target, witness, *origins,
+                         provenance=provenance, closed_witness=True)
+    check_form_destination(page, target, *origins, provenance=provenance)
+    if (not _preparation_destination_allowed(
+            page['url'], *origins, provenance=provenance)
+            or (provenance is not None and not _preparation_current(
+                provenance, fixture_context=fixture_context))):
+        raise Gate('The tracked posting or preparation origin changed.')
+    stable = {k: v for k, v in target.items() if k != 'combobox'}
+    witnessed = None
+    attempted = False
+    controller = None
+    try:
+        controller = getattr(session, '_application_controller', None)
+        if controller is None:
+            controller = getattr(getattr(session, 'raw', None),
+                                 '_application_controller', None)
+        if controller is not None:
+            controller._material_witness_request = selector
+            controller._material_witness_expected = stable
+        attempted = True
+        await _effect_call(session, 'click', selector)
+        for attempt in range(20):
+            current_page, current_witness = await _observe_controls(
+                session, await session.page())
+            if (not _preparation_destination_allowed(
+                    current_page['url'], *origins, provenance=provenance)
+                    or (provenance is not None and not _preparation_current(
+                        provenance, fixture_context=fixture_context))):
+                raise Gate('The picker origin or current tracked posting changed.')
+            current = control(current_page, action, 'material-witness-open')
+            if (any(current.get(k) != value for k, value in stable.items())
+                    or current_witness.get(selector, {}).get('visible') is not True):
+                raise Gate('The material picker control changed while opening.')
+            candidate = current.get('combobox') or {}
+            if candidate.get('linked') is True:
+                _combobox_options(current)
+                _disclosure_question(current_page, current, current_witness,
+                                     *origins, provenance=provenance)
+                witnessed = _disclosure_question(
+                    current_page, current, current_witness,
+                    *origins, provenance=provenance)
+                opened_owner = current
+                break
+            if candidate.get('linked') is not False or candidate.get('options'):
+                raise Gate('The closed combobox linkage is incomplete or ambiguous.')
+            if attempt < 19:
+                await asyncio.sleep(0.25)
+        if witnessed is None:
+            raise Gate('The combobox option linkage is incomplete or ambiguous.')
+    finally:
+        try:
+            if attempted:
+                # Attempt cleanup even if the click executed but transport failed.
+                if controller is not None:
+                    controller._material_witness_close_request = selector
+                await _effect_call(session, 'press', 'Escape')
+        finally:
+            if controller is not None:
+                controller._material_witness_request = None
+                controller._material_witness_expected = None
+                controller._material_witness_close_request = None
+                controller._material_witness_selector = None
+                controller._material_witness_target = None
+    closed_page, closed_witness = await _observe_controls(session, await session.page())
+    closed = control(closed_page, action, 'material-witness-close')
+    if (not _preparation_destination_allowed(
+            closed_page['url'], *origins, provenance=provenance)
+            or (provenance is not None and not _preparation_current(
+                provenance, fixture_context=fixture_context))
+            or any(closed.get(k) != value for k, value in stable.items())
+            or closed.get('combobox') != combo
+            or closed_witness.get(selector, {}).get('combobox') != combo
+            or (witnessed is not None and
+                any(opened_owner.get(k) != value for k, value in stable.items()))):
+        raise Gate('The material picker changed during reversible inspection.')
+    # Captions were witnessed while the listbox was mounted. Any grant must
+    # bind the fresh post-Escape control, never the opened snapshot.
+    return closed_page, closed_witness, closed, witnessed
+
+
+async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                     provenance: Provenance | None = None, pk: str = '',
                     fixture_context=None) -> None:
     for c in page['controls']:
@@ -3371,16 +3523,34 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                 # picker can present an answerable owner question. A grant
                 # already bound to this exact observed control may resume.
                 if _material_form_choice(c):
+                    witnessed_question = None
+                    witness_attempted = False
+                    witness_failure = None
+                    if (c.get('type') == 'combobox'
+                            and (c.get('combobox') or {}).get('linked') is False):
+                        witness_attempted = True
+                        try:
+                            page, witness, c, witnessed_question = (
+                                await _witness_material_combobox(
+                                    session, page, witness, c, *origins,
+                                    provenance=provenance, pk=pk,
+                                    fixture_context=fixture_context))
+                        except Gate as exc:
+                            witness_failure = str(exc)
+                            witnessed_question = None  # Inspection only.
                     # An optional, unselected assent is still an owner decision;
                     # a preselected value must instead prove an existing grant.
                     unanswered = (not c.get('has_value') if c.get('tag') == 'select'
                                   else not (c.get('combobox') or {}).get('selected_text'))
                     disclosure_failure = None
                     try:
-                        question = _disclosure_question(
-                            page, c, witness, *origins,
-                            bootstrap=unanswered and bool(c.get('required')),
-                            provenance=provenance)
+                        question = (witnessed_question if (
+                            c.get('type') == 'combobox'
+                            and witnessed_question is not None) else
+                            _disclosure_question(
+                                page, c, witness, *origins,
+                                bootstrap=unanswered and bool(c.get('required')),
+                                provenance=provenance))
                     except Gate as exc:
                         # Keep the same inspection-only decision; reveal only
                         # literal code-owned diagnostics, never arbitrary text.
@@ -3426,8 +3596,15 @@ def _bootstrap_wall(page: dict, witness: dict, *origins: str,
                     f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
                     f"visible label: {visible_label!r}; "
                     f"matched: {assent_match.group(0) if assent_match else 'select options'}."
-                    + (f" Disclosure: {disclosure_failure}."
-                       if _material_form_choice(c) and disclosure_failure else ''))
+                    + (f" Disclosure: {disclosure_failure}. "
+                       + _material_witness_disclosure_detail(
+                           c, attempted=witness_attempted,
+                           reason=witness_failure) + '.'
+                       if _material_form_choice(c) and disclosure_failure
+                       and c.get('type') == 'combobox'
+                       else (f" Disclosure: {disclosure_failure}."
+                             if _material_form_choice(c) and disclosure_failure
+                             else '')))
 
 
 
@@ -3557,13 +3734,30 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
-    page, witness = await _observe_controls(session, page)
+    try:
+        page, witness = await _observe_controls(session, page)
+    except Gate as exc:
+        # The independent DOM validator remains fail-closed. Its rejected
+        # linked shape still has a safe, code-normalized owner diagnostic;
+        # never proceed to grants or a witness attempt on this path.
+        malformed_link = ('predicate=combobox.linked.shape;' in str(exc))
+        material = next((c for c in page['controls']
+                         if c.get('in_form') and c.get('type') == 'combobox'
+                         and _material_form_choice(c)), None)
+        if not malformed_link or material is None:
+            raise
+        raise MaterialAssentGate(
+            'Material assent outside a bound choice needs human inspection. '
+            'Control type: combobox; tag: unavailable; '
+            "visible label: 'unavailable'; matched: select options."
+            ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
+            + _material_witness_disclosure_detail(material, attempted=False) + '.') from None
     if provenance is not None and (
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('The job/tenant mapping changed during native control inspection.')
-    _bootstrap_wall(page, witness, *origins, provenance=provenance,
-                    pk=pk, fixture_context=fixture_context)
+    await _bootstrap_wall(session, page, witness, *origins, provenance=provenance,
+                          pk=pk, fixture_context=fixture_context)
     # Earlier reversible writes may be temporarily reset by later pickers.
     # The complete current form and all receipts are checked only at Submit.
     seen = set()
@@ -4628,6 +4822,11 @@ class ApplicationIPCController:
         self.upload_identity = None
         self.upload_pending = False
         self.committed = False
+        self._material_witness_selector = None
+        self._material_witness_request = None
+        self._material_witness_expected = None
+        self._material_witness_close_request = None
+        self._material_witness_target = None
         self.expected_digest = None
         if self.resume_path and Path(self.resume_path).is_file():
             self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
@@ -4866,8 +5065,19 @@ class ApplicationIPCController:
                 self._approved(page, target, args[3])
             return
         if op in {'press', 'focus'}:
-            # Enter/press can submit the form and is not an approved-answer
-            # writer. The generic accessible click path replaces key macros.
+            if (op == 'press' and args == ('press', 'Escape') and not kwargs
+                    and self._material_witness_close_request
+                    == self._material_witness_selector
+                    and self._material_witness_target is not None):
+                owner = [c for c in page['controls']
+                         if c.get('selector') == self._material_witness_selector]
+                if (len(owner) != 1 or
+                        any(owner[0].get(k) != v
+                            for k, v in self._material_witness_target.items())
+                        or not _preparation_destination_allowed(
+                            page['url'], self.url)):
+                    raise Gate('The material witness control or origin changed.')
+                return
             raise Gate('Keyboard or focus IPC lacks a safe application effect classification.')
         if len(args) != 2 or kwargs:
             raise Gate('Unknown application click IPC arguments.')
@@ -4901,6 +5111,47 @@ class ApplicationIPCController:
             # The preceding sole commit classification owns submit/form overrides.
             if target.get('href'):
                 raise Gate('A navigating combobox cannot be opened.')
+            if (_material_assent_match(label(target))
+                    and (target.get('combobox') or {}).get('linked') is False):
+                combo = target.get('combobox') or {}
+                if (self._material_witness_request != selector
+                        or not isinstance(self._material_witness_expected, dict)
+                        or any(target.get(k) != v
+                               for k, v in self._material_witness_expected.items())
+                        or combo.get('options') not in (None, [])
+                        or combo.get('link_id') not in ('', None)
+                        or combo.get('listbox_selector') not in ('', None)
+                        or target.get('commits_application')
+                        or target.get('in_form') is not True
+                        or not target.get('form_action')
+                        or self._material_witness_selector is not None):
+                    raise Gate('The closed combobox linkage is incomplete or ambiguous.')
+                # Fresh fixed witness and safe owning form are mandatory at
+                # the last raw effect boundary, not merely at bootstrap.
+                controller = self
+                class RawWitnessReader:
+                    async def page(self):
+                        return await controller._page(session)
+
+                    async def call(self, *request):
+                        if request == ('evaluate', _FIXED_CONTROL_WITNESS):
+                            script = (_GREENHOUSE_FIXED_CONTROL_WITNESS
+                                      if controller._row().get('ats') == 'greenhouse'
+                                      else _FIXED_CONTROL_WITNESS)
+                            return await session.call('evaluate', script)
+                        raise Gate('Only the fixed control witness may be read.')
+                current, proof = await _observe_controls(RawWitnessReader(), page)
+                matches = [c for c in current['controls']
+                           if c.get('selector') == selector and not c.get('disabled')]
+                if len(matches) != 1:
+                    raise Gate('The material witness control changed before raw click.')
+                actual = matches[0]
+                _disclosure_question(current, actual, proof, self.url,
+                                     closed_witness=True)
+                self._material_witness_target = {
+                    k: v for k, v in actual.items() if k != 'combobox'}
+                self._material_witness_selector = selector
+                return
             key = _key(page, target)
             if _material_form_choice(target):
                 answer = _material_exact_value(

@@ -559,7 +559,14 @@ _CAPTCHA_RESPONSE_NODES = r"""
 
 # Inserted before either reader's graph: filtering the final list is too late,
 # because closedGraph and linked receivers read hidden values eagerly.
-_ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
+_ENTRY_RESPONSE_NODES = r"""
+  // Entry-only reserved-prefix quarantine; malformed variants fail closed.
+  const responseNodes = Array.from(document.querySelectorAll('input,textarea')).filter(e =>
+    e.getAttribute('name')==='h-captcha-response' ||
+    /^g-recaptcha-response(?:-|$)/.test(e.getAttribute('name') || ''));
+"""
+
+_ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button'))
     .filter(e => e.id === 'hcaptchaSubmitBtn');
   const excluded = new Set([...responseNodes, ...reservedButtons]);
@@ -661,6 +668,10 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     return value.length<=160 ? value : 'unknown';
   };
   const recaptchaContainer=e=>e.closest('div.grecaptcha-badge,div.g-recaptcha');
+  // Provider anchors must be exact-origin/path and actually nested in a badge.
+  // Never use ordinal diagnostic paths as evidence of DOM containment.
+  const enterpriseBadgeAnchor = e => !!e && e.matches('div.grecaptcha-badge') &&
+    enterpriseAnchors.length===1 && e.contains(enterpriseAnchors[0]);
   const entryFrames = entryFrameNodes.map(e => {
     const raw = e.getAttribute('src');
     let origin='', path='', diagnosticOrigin='', diagnosticPath='';
@@ -681,6 +692,7 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const anchor=enterpriseAnchors.length===1 && enterpriseAnchors[0]!==e ?
       enterpriseAnchors[0] : null;
     const aContainer=anchor ? recaptchaContainer(anchor) : null;
+    const anchorBadge=anchor?.closest('div.grecaptcha-badge');
     const ownContainer=recaptchaContainer(e);
     const anchorSibling=anchor && parent && anchor.parentElement ?
       (parent===anchor.parentElement ? 'yes' : 'no') : 'unknown';
@@ -757,6 +769,14 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
         }
       }
     } catch (_) { documentReadability='unreadable'; }
+    // A source-less companion is an artifact only after its own readable,
+    // complete child has proved the closed absence of controls. This proof
+    // has no root or ordinal dependency and never admits a visible challenge.
+    if (status==='unknown' && raw===null && !e.hasAttribute('srcdoc') &&
+        style.display==='none' && documentReadability==='readable' &&
+        formControls==='no' && enterpriseAnchors.length===1 &&
+        enterpriseBadgeAnchor(anchorBadge) && !!parent &&
+        parent.contains(anchorBadge)) status='R';
     return {selector:selector(e),origin:diagnosticOrigin || origin,
       path:diagnosticPath || path,source:raw===null ? 'absent' : raw==='about:blank' ? 'blank' : 'url',
       srcdoc:e.hasAttribute('srcdoc') ? 'present' : 'absent',
@@ -785,13 +805,31 @@ _ENTRY_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
     const name=e.getAttribute('name'), ancestor=e.closest('form'),
       owner=e.form || ancestor;
     const signature=name==='h-captcha-response' ? 'H' : 'R';
+    const reservedName=name==='g-recaptcha-response' ||
+      /^g-recaptcha-response-[0-9]{1,6}$/.test(name || '');
+    const id=e.getAttribute('id');
+    const reservedId=id==='g-recaptcha-response' ||
+      /^g-recaptcha-response-[0-9]{1,6}$/.test(id || '');
+    const ownBadge=e.closest('div.grecaptcha-badge');
+    // A badge-owned receiver is passive only without *any* form link.
+    // Check the attribute independently of its resolved form owner.
+    const badgeFormConflict=signature==='R' && !!ownBadge &&
+      (!!ancestor || !!owner || e.hasAttribute('form'));
+    const badgeProvider=signature==='R' && e.localName==='textarea' &&
+      reservedName && reservedId && !badgeFormConflict &&
+      enterpriseBadgeAnchor(ownBadge);
     const duplicates=responseNodes.filter(n=>n.getAttribute('name')===name).length!==1;
-    const providerFrame=entryFrames.some(f=>f.status===signature);
+    const supported=signature==='H' ? name==='h-captcha-response' : reservedName;
+    const frameProvider=entryFrames.some(f=>f.status===signature);
+    const providerFrame=frameProvider || badgeProvider;
     const wrongOwner=!!owner && owner!==root;
     const issues=[];
+    if (!supported) issues.push('invalid-reserved-name');
     if (duplicates) issues.push('duplicate-name');
     if (!providerFrame) issues.push('provider-unproven');
     if (wrongOwner) issues.push('owner-conflict');
+    if (badgeFormConflict)
+      issues.push('badge-form-conflict');
     if (issues.length) responseError=true;
     return {selector:selector(e),name,form:owner ? selector(owner) : '',
       diagnostic:{

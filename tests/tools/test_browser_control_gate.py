@@ -118,21 +118,21 @@ def test_external_two_argument_helper_stays_safe_without_legacy_call_sites():
             forms.control({'controls': controls}, {'selector': 'button'})
 
 
-def test_all_nineteen_current_control_call_sites_keep_named_provenance():
+def test_all_twenty_one_current_control_call_sites_keep_named_provenance():
     source = inspect.getsource(forms)
     tree = ast.parse(source)
     sites = [call for call in ast.walk(tree)
              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
              and call.func.id == 'control']
-    # Nineteen resolution call sites remain across raw/preparation/final.
+    # Twenty-one resolution call sites include two material witness stages.
     # Two initial-decision branches share the same code-owned diagnostic tag.
-    assert len(sites) == 19
+    assert len(sites) == 21
     assert all(len(call.args) == 3 and not call.keywords
                and isinstance(call.args[2], ast.Constant)
                and isinstance(call.args[2].value, str)
                for call in sites)
     tags = [call.args[2].value for call in sites]
-    assert len(set(tags)) == 18
+    assert len(set(tags)) == 20
     assert tags.count('decision-initial') == 2
     assert all(tags.count(tag) == 1 for tag in set(tags) - {'decision-initial'})
     assert all(0 < len(tag) <= 32 for tag in tags)

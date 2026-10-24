@@ -1701,3 +1701,185 @@ def test_source_less_readable_child_controls_are_evidence_not_root_admission(rea
     assert f'form_controls={expected}' in detail
     assert 'independent application-root placement' in detail
     assert 'shared reCAPTCHA container' in detail
+
+
+def _issue164_reader(reader, *, position=2, resolved=False, variant='ok',
+                     response=False):
+    """Execute the real reader against synthetic DOM relationships, not labels."""
+    from tests.tools.test_browser_application_entry import _dom_with_readable_child
+    spec = dict(url=entry('ashby'), root=resolved, frames=['R'], sibling=True,
+                badge=True, tokens=['g-recaptcha-response'] if response else [],
+                tokenBadge=response, tokenOutside=True, textarea=True,
+                child={'url':'about:blank', 'readyState':'complete', 'control':
+                       'button' if variant=='child-control' else 'none'})
+    script = forms.ENTRY_PAGE if reader=='page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    opener = '(() => {\n'
+    assert script.startswith(opener)
+    mutation = r"""
+  {
+    const move=(e,p)=>{
+      if(e.parentElement) {
+        const siblings=e.parentElement.children;
+        siblings.splice(siblings.indexOf(e),1);
+      }
+      e.parentElement=p;p.children.push(e);
+    };
+    const body=document.body, anchor=document.querySelectorAll('iframe')[0],
+      companion=document.querySelectorAll('iframe')[1];
+    // Build the wrapper from actual DOM nodes; only its position changes.
+    const wrapper=node('div',{},body);
+    const badge=node('div',{class:'grecaptcha-badge'},wrapper);
+    const inner=node('div',{class:'g-recaptcha'},badge);
+    move(anchor,INNER ? inner : badge);
+    move(companion,wrapper);
+    companion.removeAttribute('src');
+    companion.style.display='none';
+    const responses=document.querySelectorAll('textarea');
+    for(const e of responses) {
+      if(e.getAttribute('name')?.startsWith('g-recaptcha-response'))
+        move(e,badge);
+    }
+    // Insert inert div siblings before the wrapper (no authority from order).
+    for(let i=1;i<POSITION;i++){
+      const inert=node('div',{},body);
+      move(inert,body);
+      body.children.splice(body.children.indexOf(inert),1);
+      body.children.splice(body.children.indexOf(wrapper),0,inert);
+    }
+    if(VARIANT==='src') companion.setAttribute('src','about:blank');
+    if(VARIANT==='srcdoc') companion.setAttribute('srcdoc','');
+    if(VARIANT==='visible') companion.style.display='block';
+    if(VARIANT==='no-badge') move(anchor,wrapper);
+    if(VARIANT==='outside-parent')move(companion,node('div',{},body));
+    if(VARIANT==='wrong-origin')anchor.setAttribute('src',
+      'https://example.test/recaptcha/enterprise/anchor');
+    if(VARIANT==='wrong-path')anchor.setAttribute('src',
+      'https://www.recaptcha.net/recaptcha/enterprise/other');
+    if(VARIANT==='second-anchor') {
+      const other=node('iframe',{src:'https://www.google.com/recaptcha/enterprise/anchor'},badge);
+      other.style.visibility='hidden';
+    }
+    if(VARIANT==='explicit-form')responses[0].setAttribute('form','missing-owner');
+    if(VARIANT==='ancestor-form') {
+      const f=node('form',{},badge);move(responses[0],f);responses[0].form=f;
+    }
+    if(VARIANT==='form-owner') responses[0].form=document.querySelector('form') ||
+      node('form',{},body);
+    if(VARIANT==='invalid-suffix')
+      responses[0].setAttribute('name','g-recaptcha-response-1234567');
+    if(VARIANT==='duplicate') {
+      const t=node('textarea',{name:'g-recaptcha-response',id:'g-recaptcha-response-101'},badge);
+      Object.defineProperty(t,'value',{get:()=>{throw Error('TOKEN READ');}});
+    }
+    if(VARIANT==='linked')node('input',{role:'combobox',
+      'data-value-name':'g-recaptcha-response'},badge);
+    if(VARIANT==='visible-bframe') {
+      const f=node('iframe',{src:'https://www.recaptcha.net/recaptcha/enterprise/bframe'},badge);
+      f.style.visibility='visible';
+    }
+  }
+"""
+    mutation=(mutation.replace('POSITION',str(position))
+              .replace('INNER','true' if variant=='nested-container' else 'false')
+              .replace('VARIANT',repr(variant).replace("'",'"')))
+    script=script.replace(opener,opener+mutation,1)
+    return _dom_with_readable_child(spec,script)
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+@pytest.mark.parametrize('position', [2,3])
+@pytest.mark.parametrize('resolved', [False,True])
+@pytest.mark.parametrize('variant', ['ok','nested-container'])
+def test_issue164_nested_hidden_companion_actual_dom_proof(reader,position,resolved,variant):
+    page=_issue164_reader(reader,position=position,resolved=resolved,variant=variant)
+    frames=page['entry']['frames']
+    assert frames[1]['status']=='R', frames
+    assert frames[1]['source']=='absent' and frames[1]['srcdoc']=='absent'
+    assert frames[1]['document_readability']=='readable'
+    assert frames[1]['root']==('' if not resolved else frames[1]['root'])
+    assert frames[1]['anchor_sibling']=='no'
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+@pytest.mark.parametrize('variant', [
+    'src','srcdoc','visible','child-control','no-badge','outside-parent',
+    'wrong-origin','wrong-path','second-anchor',
+])
+def test_issue164_unproved_companion_refused_by_reader(reader,variant):
+    page=_issue164_reader(reader,variant=variant)
+    assert page['entry']['frames'][1]['status']!='R'
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+@pytest.mark.parametrize('variant', [
+    'ok','explicit-form','ancestor-form','form-owner','invalid-suffix',
+    'duplicate','linked','wrong-origin','wrong-path','second-anchor','no-badge',
+])
+def test_issue164_badge_local_reserved_response_predicates(reader,variant):
+    page=_issue164_reader(reader,response=True,variant=variant)
+    response=page['entry']['responses'][0]
+    if variant=='ok':
+        assert response['diagnostic']['provider_frame']=='yes'
+        assert not page['entry']['response_error']
+        assert all(c.get('name')!='g-recaptcha-response' for c in page['controls'])
+    else:
+        assert page['entry']['response_error'], (variant,response)
+        assert response['diagnostic']['issues']
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+def test_issue164_visible_bframe_keeps_challenge_precedence(reader):
+    page=_issue164_reader(reader,response=True,variant='visible-bframe')
+    assert any(f['status']=='visible-recaptcha' for f in page['entry']['frames'])
+    with pytest.raises(forms.CaptchaGate):
+        forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+@pytest.mark.parametrize('reader', ['entry','greenhouse'])
+def test_issue164_suffix_is_entry_only_not_greenhouse_applicant_census(reader):
+    from tools import browser_skill_dom
+    script=(forms.ENTRY_PAGE if reader=='entry' else browser_skill_dom.GREENHOUSE_PAGE)
+    opener='(() => {\n'
+    assert script.startswith(opener)
+    script=script.replace(opener,opener+"""
+  {
+    const owned=document.querySelector('form');
+    const field=node('input',{id:'ordinary-suffix',type:'text',
+      name:'g-recaptcha-response-123'},owned);
+    field.value='synthetic';
+  }
+""",1)
+    page=dom(dict(url=entry('ashby'),root=True),script)
+    control_names={c.get('name') for c in page['controls']}
+    if reader=='greenhouse':
+        assert 'g-recaptcha-response-123' in control_names
+        assert page['greenhouse']['response_controls'] is False
+    else:
+        assert 'g-recaptcha-response-123' not in control_names
+        assert page['entry']['response_error'] is True
+
+
+@pytest.mark.parametrize('reader', ['page','witness'])
+def test_issue164_invalid_reserved_suffix_fails_before_throwing_value_getter(reader):
+    page=_issue164_reader(reader,response=True,variant='invalid-suffix')
+    assert page['entry']['response_error'] is True
+    assert 'invalid-reserved-name' in page['entry']['responses'][0]['diagnostic']['issues']
+    assert not any(c.get('name','').startswith('g-recaptcha-response')
+                   for c in page['controls'])
+    with pytest.raises(forms.Gate):
+        forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkeypatch):
+    _, raw, _, provenance=root_world(monkeypatch)
+    raw.current=_issue164_reader('page',response=True)
+    raw.fixed=_issue164_reader('witness',response=True)
+    receiver=raw.current['entry']['responses'][0]['selector']
+    assert receiver not in {c['selector'] for c in raw.current['controls']}
+    session=forms._EntrySession(raw,lambda u:u==entry('ashby'),provenance,
+                                resume_path='Resume.pdf')
+    for method,args in [('fill',(receiver,'--value','synthetic-not-a-token')),
+                        ('click',(receiver,))]:
+        with pytest.raises(forms.Gate):
+            await session.call(method,*args)
+    no_mutations(raw)

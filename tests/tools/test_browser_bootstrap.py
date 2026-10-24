@@ -805,7 +805,7 @@ async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
                   tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
@@ -817,7 +817,7 @@ def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
             'I decline', '#decline-choice', tag='input', type='radio',
             required=True, checked=False, has_value=True, name='attestation',
             question='Arbitration consent', value='decline'))
-    forms._bootstrap_wall(inventory(*members, submit()), {}, URL)
+    await forms._bootstrap_wall(None, inventory(*members, submit()), {}, URL)
 
 
 async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
@@ -3739,7 +3739,7 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
         forms.check_form(page, filled, True)
 
 
-def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
+async def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     """A visible privacy choice needs the owner's exact current question."""
     question_text = 'I consent to sharing personal data with marketing partners'
     page = secure_inventory(
@@ -3748,7 +3748,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     )
     independent = {c['selector']: c for c in witness(page)['controls']}
     with pytest.raises(forms.Gate) as exc:
-        forms._bootstrap_wall(page, independent, SECURE_URL)
+        await forms._bootstrap_wall(None, page, independent, SECURE_URL)
     assert exc.value.reason == 'owner_question'
     assert exc.value.form_question is not None
     assert exc.value.form_question['control_label'] == question_text
@@ -3759,7 +3759,7 @@ def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
     inaccessible = deepcopy(independent)
     inaccessible['#marketing']['visible'] = False
     with pytest.raises(forms.Gate) as blocked:
-        forms._bootstrap_wall(page, inaccessible, SECURE_URL)
+        await forms._bootstrap_wall(None, page, inaccessible, SECURE_URL)
     assert blocked.value.reason == 'owner_question'
     assert blocked.value.form_question is None
     assert 'Direct owner review' in str(blocked.value)
@@ -4470,25 +4470,114 @@ async def test_observed_link_and_model_navigation_share_failed_provenance_predic
     assert row.get('possible_submission') is False
 
 
-@pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
-async def test_navigation_owner_detail_is_not_ordinary_events_or_worker_info(
-        monkeypatch, queued_worker):
-    """The actual direct and queued application sinks preserve owner-only detail."""
+@pytest.mark.parametrize('unsafe', [None, 'readonly', 'offscreen', 'wrong-owner'])
+async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape(
+        monkeypatch, unsafe):
+    closed = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    current = inventory(closed)
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(controller, '_row', lambda: {'ats': 'other'})
+    class Raw:
+        async def page(self):
+            return deepcopy(current)
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            proof = witness(current)
+            if unsafe == 'readonly':
+                proof['controls'][0]['readonly'] = True
+            if unsafe == 'offscreen':
+                proof['controls'][0]['visible'] = False
+            return {'value': proof}
+    raw = Raw()
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_request = '#privacy'
+    controller._material_witness_expected = {
+        k: v for k, v in closed.items() if k != 'combobox'}
+    if unsafe == 'wrong-owner':
+        current['controls'][0]['form_selector'] = '#foreign'
+    if unsafe:
+        with pytest.raises(forms.Gate):
+            await controller.before_ipc(raw, ('click', '#privacy'), {})
+        assert controller._material_witness_selector is None
+        return
+    await controller.before_ipc(raw, ('click', '#privacy'), {})
+    assert controller._material_witness_selector == '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+    controller._material_witness_close_request = '#privacy'
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Enter'), {})
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('click', '#privacy'), {})
+    await controller.before_ipc(raw, ('press', 'Escape'), {})
+    assert controller._material_witness_selector == '#privacy'
+    controller._material_witness_selector = None
+    controller._material_witness_close_request = None
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(raw, ('press', 'Escape'), {})
+
+
+@pytest.mark.parametrize('witness_error,expected', [
+    ('The material picker control changed while opening.',
+     'The material picker control changed while opening.'),
+    ('PRIVATE_LABEL_SENTINEL #PRIVATE_SELECTOR_SENTINEL',
+     forms._MATERIAL_WITNESS_GATE_OPAQUE),
+])
+async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
+        monkeypatch, witness_error, expected):
     import logging
     from io import StringIO
 
     from agent import run
     from core.logging import _ConsoleFormatter, _JsonFormatter
 
-    page = secure_inventory(field())
-    browser, _, _ = secure_world(monkeypatch, page)
-    browser.current = {
-        **deepcopy(page),
+    # The same real consumer sinks must redact both owner-only diagnostics.
+    nav_page = secure_inventory(field())
+    nav_browser, _, _ = secure_world(monkeypatch, nav_page)
+    nav_browser.current = {
+        **deepcopy(nav_page),
         'url': ('https://USER_SECRET:PASSWORD_SECRET@foreign.example.test/other-job'
                 '?token=QUERY_SECRET#FRAGMENT_SECRET')}
-    report = await secure_attempt(page)
-    assert report['status'] == 'gate'
-    assert report['navigation_provenance_diagnostic'] is True
+    navigation = await secure_attempt(nav_page)
+    assert navigation['status'] == 'gate'
+    assert navigation['navigation_provenance_diagnostic'] is True
+    assert navigation['reason'] == 'defect_provenance'
+
+    privacy = field(
+        'Please Acknowledge receipt of our Candidate Privacy Notice.',
+        '#privacy', tag='input', type='combobox',
+        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
+                  'options': [], 'selected_text': '', 'displayed_text': '',
+                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
+    page = secure_inventory(privacy)
+    _, decide, _ = secure_world(monkeypatch, page)
+    attempts = []
+
+    async def witness_failure(*args, **kwargs):
+        attempts.append(True)
+        raise forms.Gate(witness_error)
+
+    monkeypatch.setattr(forms, '_witness_material_combobox', witness_failure)
+    material = await secure_attempt(page)
+    assert material['status'] == 'gate'
+    assert material['material_assent_diagnostic'] is True
+    assert attempts == [True]
+    assert 'witness=attempted,linked=false,options=empty,' in material['question']
+    assert f'witness_reason={expected}' in material['question']
+    assert 'PRIVATE_LABEL_SENTINEL' not in material['question']
+    assert 'PRIVATE_SELECTOR_SENTINEL' not in material['question']
+    assert decide.await_count == 0
 
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
            'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
@@ -4509,9 +4598,6 @@ async def test_navigation_owner_detail_is_not_ordinary_events_or_worker_info(
     stores = SimpleNamespace(
         tracking=Tracking(), secrets=None,
         answer_bank=SimpleNamespace(all_facts=lambda company: {}))
-    events = []
-    monkeypatch.setattr('core.events.emit',
-                        lambda kind, **kw: events.append((kind, kw)))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_jd_meta', AsyncMock(
         return_value={'text': 'Synthetic offline description'}))
@@ -4529,55 +4615,78 @@ async def test_navigation_owner_detail_is_not_ordinary_events_or_worker_info(
         run, 'get_settings', lambda: SimpleNamespace(browser_model='offline'))
     monkeypatch.setattr(
         'tools.browser_runtime.configuration', lambda: {'engine': 'browser_skill'})
-    fake_apply = AsyncMock(return_value=report)
-    monkeypatch.setattr('tools.browser_apply.apply', fake_apply)
-
     assert run.log.propagate is False
     handlers = [handler for handler in run.log.handlers
                 if type(handler) is logging.StreamHandler
                 and isinstance(handler.formatter,
                                (_ConsoleFormatter, _JsonFormatter))]
     assert handlers
-    with StringIO() as stream, monkeypatch.context() as capture:
-        capture.setattr(run.log, 'level', logging.INFO)
-        capture.setattr(handlers[0], 'stream', stream)
-        if queued_worker:
-            monkeypatch.setattr(run, 'make_stores', lambda: stores)
-            queue = SimpleNamespace(retry=Mock(), done=Mock())
-            item = {'pk': PK}
-            result = run.run_queued(item, queue)
-            queue.done.assert_called_once_with(item)
-            queue.retry.assert_not_called()
-        else:
-            result = await run._apply_direct(PK, stores)
-        info_output = stream.getvalue()
-    assert fake_apply.await_count == 1
-    assert result['result'] == 'gated'
-    assert result['question'] == report['question']
-    assert result['navigation_provenance_diagnostic'] is True
-    assert row['status'] == 'needs_human'
-    assert row['gate_reason'] == 'defect_provenance'
-    assert row['gate_pending']['question'] == report['question']
-    gate_events = [data for kind, data in events if kind == 'gate']
-    assert len(gate_events) == 1
-    assert gate_events[0]['detail'] == 'navigation-provenance: human inspection required'
-    assert 'url' not in gate_events[0]
-    gated = [line for line in info_output.splitlines() if 'gated pk=' in line]
-    assert len(gated) == 1
-    assert 'navigation-provenance: human inspection required' in gated[0]
-    if queued_worker:
-        queued = [line for line in info_output.splitlines() if 'apply: ' in line]
-        assert len(queued) == 1
-        assert "'question': 'navigation-provenance: human inspection required'" in queued[0]
-    for detail in (info_output, str(gate_events)):
-        for secret in ('foreign.example.test', 'example-co.test/job/1',
-                       'other-job', 'USER_SECRET', 'PASSWORD_SECRET',
-                       'QUERY_SECRET', 'FRAGMENT_SECRET'):
-            assert secret not in detail
-    assert 'foreign.example.test/other-job' in row['gate_pending']['question']
-    for secret in ('USER_SECRET', 'PASSWORD_SECRET',
-                   'QUERY_SECRET', 'FRAGMENT_SECRET'):
-        assert secret not in row['gate_pending']['question']
+
+    cases = (
+        (material, 'material-assent: human inspection required',
+         ('witness=attempted', 'witness_reason=', 'PRIVATE_LABEL_SENTINEL',
+          'PRIVATE_SELECTOR_SENTINEL')),
+        (navigation, 'navigation-provenance: human inspection required',
+         ('foreign.example.test', 'example-co.test/job/1', 'other-job',
+          'USER_SECRET', 'PASSWORD_SECRET', 'QUERY_SECRET', 'FRAGMENT_SECRET')),
+    )
+    for report, safe_detail, private_values in cases:
+        monkeypatch.setattr('tools.browser_apply.apply',
+                            AsyncMock(return_value=report))
+        for queued_worker in (False, True):
+            events = []
+            monkeypatch.setattr(
+                'core.events.emit',
+                lambda kind, **kw: events.append((kind, kw)))
+            row['status'] = 'tailored'
+            with StringIO() as stream, monkeypatch.context() as capture:
+                capture.setattr(run.log, 'level', logging.INFO)
+                capture.setattr(handlers[0], 'stream', stream)
+                if queued_worker:
+                    capture.setattr(run, 'make_stores', lambda: stores)
+                    queue = SimpleNamespace(retry=Mock(), done=Mock())
+                    item = {'pk': PK}
+                    result = run.run_queued(item, queue)
+                    queue.done.assert_called_once_with(item)
+                    queue.retry.assert_not_called()
+                else:
+                    result = await run._apply_direct(PK, stores)
+                info_output = stream.getvalue()
+            assert result['result'] == 'gated'
+            assert result['question'] == report['question']
+            assert row['status'] == 'needs_human'
+            assert row['gate_pending']['question'] == report['question']
+            gate_events = [data for kind, data in events if kind == 'gate']
+            assert len(gate_events) == 1
+            assert gate_events[0]['detail'] == safe_detail
+            if report is navigation:
+                assert 'url' not in gate_events[0]
+            gated = [line for line in info_output.splitlines()
+                     if 'gated pk=' in line]
+            assert len(gated) == 1
+            assert safe_detail in gated[0]
+            if queued_worker:
+                queued = [line for line in info_output.splitlines()
+                          if 'apply: ' in line]
+                assert len(queued) == 1
+                assert safe_detail in queued[0]
+            for private in private_values:
+                assert private not in info_output
+                assert private not in str(gate_events)
+            if report is navigation:
+                assert result['navigation_provenance_diagnostic'] is True
+                assert row['gate_reason'] == 'defect_provenance'
+                assert 'foreign.example.test/other-job' in report['question']
+                for secret in ('USER_SECRET', 'PASSWORD_SECRET',
+                               'QUERY_SECRET', 'FRAGMENT_SECRET'):
+                    assert secret not in report['question']
+            else:
+                assert result['material_assent_diagnostic'] is True
+                assert 'witness=attempted,linked=false,options=empty,' in (
+                    report['question'])
+                assert f'witness_reason={expected}' in report['question']
+                assert decide.await_count == 0
+
 
 
 @pytest.mark.parametrize('suffix', ['', '%2Dencoded'])

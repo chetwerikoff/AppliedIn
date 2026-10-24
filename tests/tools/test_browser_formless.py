@@ -1868,3 +1868,18 @@ def test_issue164_invalid_reserved_suffix_fails_before_throwing_value_getter(rea
                    for c in page['controls'])
     with pytest.raises(forms.Gate):
         forms._entry_safety(page,lambda u:u==entry('ashby'),None)
+
+
+async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkeypatch):
+    _, raw, _, provenance=root_world(monkeypatch)
+    raw.current=_issue164_reader('page',response=True)
+    raw.fixed=_issue164_reader('witness',response=True)
+    receiver=raw.current['entry']['responses'][0]['selector']
+    assert receiver not in {c['selector'] for c in raw.current['controls']}
+    session=forms._EntrySession(raw,lambda u:u==entry('ashby'),provenance,
+                                resume_path='Resume.pdf')
+    for method,args in [('fill',(receiver,'--value','synthetic-not-a-token')),
+                        ('click',(receiver,))]:
+        with pytest.raises(forms.Gate):
+            await session.call(method,*args)
+    no_mutations(raw)

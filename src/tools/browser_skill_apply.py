@@ -1911,7 +1911,7 @@ def _unknown_frame_details(frames, provenance):
     return '; '.join(rows)
 
 
-def _entry_safety(page, allowed, provenance):
+def _entry_safety(page, allowed, provenance, *, readiness=False):
     if not isinstance(page, dict):
         raise Gate('The current form control inventory is malformed.')
     if not allowed(page.get('url', '')):
@@ -1926,6 +1926,7 @@ def _entry_safety(page, allowed, provenance):
     entry = page.get('entry')
     if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
         raise Gate('The current form control inventory is malformed.')
+    pending_hidden_r = False
     for frame in entry['frames']:
         status = frame.get('status') if isinstance(frame, dict) else None
         if status == 'visible-recaptcha':
@@ -1934,6 +1935,14 @@ def _entry_safety(page, allowed, provenance):
             raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
         if status not in {'H', 'R', 'W', 'X'} and not (
                 status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
+            # Only the bounded Ashby waiter retries this exact reader-proven
+            # rootless hidden Enterprise frame. Any other unknown gates now.
+            if (readiness and isinstance(provenance, ApplicationEntryProvenance)
+                    and provenance.ats == 'ashby' and status == 'unknown'
+                    and frame.get('root') == ''
+                    and frame.get('rootless_hidden_r') is True):
+                pending_hidden_r = True
+                continue
             raise Gate('unknown/untrusted application frame; inspect manually. '
                        'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance))
     if entry.get('response_error'):
@@ -1957,6 +1966,10 @@ def _entry_safety(page, allowed, provenance):
                     and _unrelated_search_form(siblings)):
                 continue
             check_form_destination(page, c, provenance=provenance)
+    if pending_hidden_r:
+        # Not an R admission: the original deadline retains the diagnostic Gate.
+        raise _EntryNotReady('unknown/untrusted application frame; inspect manually. '
+                             'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance))
     # Receiver and approved-value evidence is refreshed for preparation;
     # completeness of the structural root is a final-Submit requirement.
 
@@ -1979,6 +1992,7 @@ class _EntrySession:
         self.step = step
         self.fixture_context = fixture_context
         self.committing = False
+        self._readiness = False
         self.on_committing_click = None
         self.upload_attempted = False
         self.upload_pending = False
@@ -2176,7 +2190,8 @@ class _EntrySession:
                                             fixture_context=self.fixture_context):
                     raise Gate('Application entry route or current row/config changed; inspect manually.',
                                reason='defect_provenance')
-                _entry_safety(page, self.allowed, self.provenance)
+                _entry_safety(page, self.allowed, self.provenance,
+                              readiness=self._readiness)
         return result
 
 
@@ -2260,8 +2275,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
     last_reason = 'no qualifying application form'
     page = initial
     greenhouse = isinstance(session, _GreenhouseSession)
-    prior_readiness = session._readiness if greenhouse else False
-    if greenhouse:
+    entry_session = isinstance(session, _EntrySession)
+    prior_readiness = session._readiness if (greenhouse or entry_session) else False
+    if greenhouse or entry_session:
         session._readiness = True
     try:
         while loop.time() < deadline:
@@ -2278,8 +2294,8 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         # Re-classifying that filtered copy mistakes quarantine
                         # for a missing foreign control. Unchecked initial PAGE
                         # inputs must still pass the full admission gate.
-                        if not (fresh_session_read and isinstance(session, _EntrySession)):
-                            _entry_safety(page, allowed, provenance)
+                        if not (fresh_session_read and entry_session):
+                            _entry_safety(page, allowed, provenance, readiness=entry_session)
                         reason = _entry_not_ready(page)
                     if reason:
                         raise _EntryNotReady(reason)
@@ -2319,9 +2335,12 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                 last_reason, previous = 'application form inventory read timed out/unavailable', None
             page = None
             await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
+        if (entry_session and last_reason.startswith(
+                'unknown/untrusted application frame; inspect manually. Non-admitted frames: ')):
+            raise Gate(last_reason)
         raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
     finally:
-        if greenhouse:
+        if greenhouse or entry_session:
             session._readiness = prior_readiness
 
 

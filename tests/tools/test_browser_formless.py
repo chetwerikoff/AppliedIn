@@ -1750,7 +1750,7 @@ def _issue164_reader(reader, *, position=2, resolved=False, variant='ok',
     if(VARIANT==='srcdoc') companion.setAttribute('srcdoc','');
     if(VARIANT==='visible') companion.style.display='block';
     if(VARIANT==='no-badge') move(anchor,wrapper);
-    if(VARIANT==='outside-parent')move(companion,body);
+    if(VARIANT==='outside-parent')move(companion,node('div',{},body));
     if(VARIANT==='wrong-origin')anchor.setAttribute('src',
       'https://example.test/recaptcha/enterprise/anchor');
     if(VARIANT==='wrong-path')anchor.setAttribute('src',

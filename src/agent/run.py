@@ -1666,7 +1666,8 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return {"result": "failed", "pk": pk, "reason": "uncertain", "detail": reason}
     if status == "applied":
         conf = result.get("confirmation") or "submitted"
-        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf)
+        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=conf,
+                                   **_clear_infra_failure(pk, stores))
         if getattr(stores.tracking, 'r', None) is not None:
             submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)
@@ -1680,6 +1681,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         review_route = (result.get("review_route") if configuration()['engine'] == 'browser_skill'
                         else "owner")
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
+                                   **_clear_infra_failure(pk, stores),
                                    gate_reason=result.get("reason") or "unknown_field",
                                    gate_pending={"question": q, 'form_question':
                                        result.get('form_question') if configuration()['engine'] == 'browser_skill' else None,
@@ -1777,6 +1779,19 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     # no-sponsorship close were all retried too. The sentence moves to `detail`.
     return {"result": "failed", "pk": pk, "reason": code, "detail": reason}
 
+
+
+def _clear_infra_failure(pk: str, stores: Any) -> dict:
+    """Clear only the previous infrastructure-attributed failure on settlement."""
+    row = stores.tracking.get(pk) or {}
+    kind = row.get("fail_kind") or ""
+    from tools.browser_runtime import is_infrastructure
+
+    # Old rows used 'unknown' even for permission_denied. Never erase a real
+    # unknown/error merely because a later attempt reached a gate.
+    if kind in {"unknown", "failed"} and is_infrastructure(str(row.get("fail_reason") or "")):
+        return {"fail_kind": "", "fail_reason": ""}
+    return {}
 
 
 def _requeue_untouched(pk: str, stores: Any) -> None:
@@ -2251,6 +2266,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                     gate_status = (Status.TAILORED if reason == "approval"
                                    else Status.NEEDS_HUMAN)
                     stores.tracking.set_status(pk, gate_status,
+                                               **_clear_infra_failure(pk, stores),
                                                gate_reason=reason,
                                                gate_pending={"question": question},
                                                gate_call_id=call.id,
@@ -2324,6 +2340,7 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                  detail="Résumé ready — queued to apply, as you asked")
             return {"result": "queued_apply", "pk": pk}
         stores.tracking.set_status(pk, Status.TAILORED, gate_reason="approval",
+                                   **_clear_infra_failure(pk, stores),
                                    gate_pending={"question":
                                                  "Ready to apply? Review the résumé first."})
         emit("gate", pk=pk, detail="Résumé ready for review. Nothing submitted.")
@@ -2336,7 +2353,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
     outcome = _apply_outcome(apply_result)
     if outcome.get("status") == "applied":
         confirmation = outcome.get("confirmation") or "submitted"
-        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=confirmation)
+        stores.tracking.set_status(pk, Status.APPLIED, confirmation_id=confirmation,
+                                   **_clear_infra_failure(pk, stores))
         if getattr(stores.tracking, 'r', None) is not None:
             submit_hold.clear(pk, tracking=stores.tracking)
         _note_rotation_use(pk, stores)

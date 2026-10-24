@@ -59,7 +59,8 @@ def witness(page):
          'visible': c.get('synthetic_visible', True),
          'visible_text': c['label'] if c.get('type') in {'radio', 'checkbox'} else '',
          'diagnostic_visible_label': c.get('diagnostic_visible_label', ''),
-         'options': deepcopy(c.get('options', []))}
+         'options': deepcopy(c.get('options', [])),
+         'combobox': deepcopy(c.get('combobox'))}
         for c in page['controls']]}
 
 
@@ -869,7 +870,7 @@ def _material_readers_with_synthetic_dom(edit):
 
 
 @pytest.mark.parametrize('kind', ['hidden-name', 'select-options', 'visible-label'])
-async def test_actual_readers_supply_only_proven_visible_material_label(kind):
+async def test_actual_readers_supply_only_proven_visible_material_label(kind, monkeypatch):
     if kind == 'hidden-name':
         edit = """
           const e = document.getElementById('email');
@@ -924,8 +925,17 @@ async def test_actual_readers_supply_only_proven_visible_material_label(kind):
         async def page(self):
             return deepcopy(page)
 
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
     with pytest.raises(forms.MaterialAssentGate) as denial:
         await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    if kind == 'select-options' and denial.value.reason == 'owner_question':
+        # A fully witnessed, unselected native option list can be answered by
+        # the owner. The options themselves still authorize no write.
+        question = denial.value.form_question
+        assert question['tag'] == question['type'] == 'select'
+        assert question['options'] and question['pk'] == PK
+        return
     detail = str(denial.value)
     assert detail.startswith('Material assent outside a bound choice needs human inspection.')
     assert f'matched: {match}.' in detail
@@ -1103,21 +1113,34 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     {'value': 'privacy consent', 'label': 'Accept'},
 ])
 @pytest.mark.parametrize('with_text', [True, False])
-async def test_material_native_select_options_block_all_grant_routes(
+async def test_material_native_select_options_require_bound_owner_grant(
         monkeypatch, option, with_text):
     material = field('Response', '#response', tag='select', type='select',
                      options=[{'value': 'decline', 'label': 'Decline'}, option])
-    controls = ([field()] if with_text else []) + [material, submit()]
-    p = inventory(*controls)
-    browser, decide, _ = world(monkeypatch, p)
-    report = await attempt(p)
-    assert report['status'] == 'gate' and report['form_question'] is None
-    assert not decide.await_count
-    exc = await selected_gate(browser, p, verb='select',
-                              selector='#response', key='Response')
-    assert exc.form_question is None
-    assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
+    controls = ([field()] if with_text else []) + [material]
+    p = secure_inventory(*controls)
+    browser, decide, _ = secure_world(monkeypatch, p)
+    report = await secure_attempt(p)
+    assert report['status'] == 'gate'
+    assert report['reason'] == 'owner_question' and report['review_route'] == 'owner'
+    assert report['material_assent_diagnostic'] is True
+    question = report['form_question']
+    assert question and question['pk'] == PK and question['label'] == 'Response'
+    assert question['selector'] == '#response' and question['form_selector'] == '#application'
+    assert question['url'] == question['form_action'] == SECURE_URL
+    assert question['options'] == material['options']
+    assert option['label'] in report['question'] or option['value'] in report['question']
+    assert decide.await_count == 0
+    # Neither a bank answer nor PAGE-supplied options authorize the first selection.
+    with pytest.raises(forms.Gate) as denied:
+        await forms.execute(
+            browser, p, {'action': 'select', 'selector': '#response',
+                         'fact': 'Response', 'value': option['value']},
+            facts={'Response': option['label']}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert denied.value.form_question['options'] == material['options']
+    assert all(x[0] not in {'fill', 'select', 'click'} for x in browser.calls)
 
 async def test_safe_native_select_options_remain_grantable(monkeypatch, tmp_path):
     options = [{'value': '', 'label': 'Choose one'},

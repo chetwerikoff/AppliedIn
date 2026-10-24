@@ -1009,6 +1009,26 @@ async def test_closed_material_assent_bootstrap_witnesses_without_selection(
             pytest.fail(f'unapproved witness action: {args}')
 
     session = Reversible()
+    if caption.startswith('Please Acknowledge'):
+        # Intercept the real bootstrap open/Escape through the raw controller,
+        # not only the synthetic transport's permissive call method.
+        controller = forms.ApplicationIPCController(
+            PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+        async def raw_page(_session):
+            return await session.page()
+        controller._page = raw_page
+        controller._fresh_preparation = lambda _origin: None
+        session._application_controller = controller
+        async def raw_effect(*args):
+            await controller.before_ipc(session, args, {})
+            try:
+                result = await session.call(*args)
+            except Exception:
+                await controller.after_ipc(session, args, {}, succeeded=False)
+                raise
+            await controller.after_ipc(session, args, {}, succeeded=True)
+            return result
+        session.application_effect = raw_effect
     with pytest.raises(forms.MaterialAssentGate) as exc:
         await forms._bootstrap(session, closed, PK, {}, URL)
     assert exc.value.reason == 'owner_question'
@@ -1065,3 +1085,94 @@ async def test_closed_material_assent_invalid_listbox_remains_inspection_only(
     assert [call for call in session.calls if call[0] != 'evaluate'] == [
         ('click', '#country'), ('press', 'Escape')]
 
+
+@pytest.mark.parametrize('failure', ['open-timeout', 'escape-failure'])
+async def test_material_witness_failure_clears_raw_escape_authority(monkeypatch, failure):
+    closed = material_page()
+    closed['controls'][0]['combobox'].update(
+        linked=False, link_id='', listbox_selector='', options=[])
+    opened = material_page()
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
+
+    class Transport:
+        def __init__(self):
+            self.current = deepcopy(closed)
+            self.calls = []
+        async def page(self):
+            return deepcopy(self.current)
+        async def call(self, *args):
+            self.calls.append(args)
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(self.current)}
+            if args == ('click', '#country'):
+                self.current = deepcopy(opened)
+                if failure == 'open-timeout':
+                    raise TimeoutError('synthetic click acknowledgement lost')
+                return {}
+            if args == ('press', 'Escape'):
+                if failure == 'escape-failure':
+                    raise TimeoutError('synthetic Escape acknowledgement lost')
+                self.current = deepcopy(closed)
+                return {}
+            pytest.fail('Witness attempted an unapproved action')
+
+    session = Transport()
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    controller._fresh_preparation = lambda _origin: None
+    async def raw_page(_session):
+        return await session.page()
+    controller._page = raw_page
+    session._application_controller = controller
+    async def raw_effect(*args):
+        await controller.before_ipc(session, args, {})
+        try:
+            result = await session.call(*args)
+        except Exception:
+            await controller.after_ipc(session, args, {}, succeeded=False)
+            raise
+        await controller.after_ipc(session, args, {}, succeeded=True)
+        return result
+    session.application_effect = raw_effect
+    with pytest.raises(TimeoutError):
+        await forms._bootstrap(session, closed, PK, {}, URL)
+    assert controller._material_witness_request is None
+    assert controller._material_witness_close_request is None
+    assert controller._material_witness_selector is None
+    assert ('press', 'Escape') in session.calls
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(session, ('press', 'Escape'), {})
+
+
+@pytest.mark.parametrize('change', ['receiver', 'options'])
+async def test_material_witness_rejects_post_escape_rebinding(monkeypatch, change):
+    closed = material_page()
+    closed['controls'][0]['combobox'].update(
+        linked=False, link_id='', listbox_selector='', options=[])
+    opened = material_page()
+    rebound = deepcopy(closed)
+    if change == 'receiver':
+        rebound['controls'][0]['combobox']['hidden_selector'] = '#new-receiver'
+    else:
+        rebound['controls'][0]['combobox']['link_id'] = 'new-listbox'
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
+    class Transport:
+        def __init__(self):
+            self.current = deepcopy(closed)
+        async def page(self):
+            return deepcopy(self.current)
+        async def call(self, *args):
+            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+                return {'value': evidence(self.current)}
+            if args == ('click', '#country'):
+                self.current = deepcopy(opened)
+                return {}
+            if args == ('press', 'Escape'):
+                self.current = deepcopy(rebound)
+                return {}
+            pytest.fail('Unexpected mutation')
+    with pytest.raises(forms.MaterialAssentGate) as exc:
+        await forms._bootstrap(Transport(), closed, PK, {}, URL)
+    assert exc.value.form_question is None

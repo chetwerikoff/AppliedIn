@@ -717,7 +717,9 @@ def _preparation_current(provenance: Provenance, *, fixture_context=None) -> boo
 
 
 def _preparation_destination_allowed(href: str, *origins: str,
-                                     provenance: Provenance | None = None) -> bool:
+                                     provenance: Provenance | None = None,
+                                     pk: str = '', company: str = '',
+                                     fixture_context=None) -> bool:
     if isinstance(provenance, VendorRedirectProvenance):
         return navigation_allowed(href, provenance=provenance)
     source = (provenance.wrapper if provenance is not None else
@@ -728,7 +730,8 @@ def _preparation_destination_allowed(href: str, *origins: str,
     # Local fixture loopback remains observable, but an unrelated ATS host
     # cannot become job authority simply by being a recognized provider.
     return navigation_allowed(href, source) or _job_preparation_route(
-        href, source, provenance=provenance)
+        href, source, provenance=provenance, pk=pk, company=company,
+        fixture_context=fixture_context)
 
 
 def _assent_scope(target: dict) -> str:
@@ -3285,7 +3288,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         raise Gate('The configured job/tenant correspondence changed; review the form.',
                    reason='defect_provenance')
     _inventory_ok(page, complete=False)
-    if not _preparation_destination_allowed(page['url'], *origins, provenance=provenance):
+    if not _preparation_destination_allowed(
+            page['url'], *origins, provenance=provenance, pk=pk, company=company,
+            fixture_context=fixture_context):
         raise Gate('The current form is not on the tracked job route.')
     if _formless_root(page):
         if not isinstance(session, _EntrySession):

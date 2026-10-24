@@ -3702,8 +3702,8 @@ def _bank_auto_eligible(item: dict, value: str) -> bool:
     subject = label(item)
     if (not item.get('in_form') or item.get('disabled')
             or item.get('tag') == 'textarea'
-            or item.get('type') in {'checkbox', 'radio', 'password'}
-            or not (_native_answer(item) or item.get('type') == 'combobox')
+            or item.get('type') == 'password'
+            or not (_native_answer(item) or item.get('type') in {'combobox', 'radio', 'checkbox'})
             or _SENSITIVE.search(subject) or _SANCTIONS_RX.search(subject)
             or _assent_scope(item) != 'fact'
             or _material_assent_match(subject) or _material_form_choice(item)
@@ -3714,6 +3714,11 @@ def _bank_auto_eligible(item: dict, value: str) -> bool:
         return False
     try:
         guarded_value(item, value)
+        if item.get('type') == 'checkbox' and value.casefold() not in {
+                'yes', 'true', 'on', 'checked'}:
+            return False
+        if item.get('type') == 'radio' and not item.get('question'):
+            return False
         if item.get('tag') == 'select':
             choose_value(item, value, '')
     except Gate:
@@ -3736,7 +3741,13 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         return
     pending = {}
     for item in page['controls']:
-        if not item.get('in_form') or not _unanswered(page, item):
+        if not item.get('in_form') or item.get('disabled'):
+            continue
+        if item.get('type') in {'radio', 'checkbox'}:
+            if item.get('checked'):
+                continue
+        elif item.get('has_value') or (item.get('type') == 'combobox' and
+                                      (item.get('combobox') or {}).get('selected_text')):
             continue
         try:
             key = _key(page, item)
@@ -3754,8 +3765,15 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             continue
         try:
             question = _disclosure_question(
-                page, item, witness, *origins, bootstrap=True,
+                page, item, witness, *origins, bootstrap=False,
                 provenance=provenance)
+            if item.get('type') == 'radio':
+                members = _radio_group(page, item)
+                matches = [m for m in members if value.casefold() in {
+                    m['label'].casefold(), str(m.get('value') or '').casefold()}]
+                if len(matches) != 1:
+                    continue
+                guarded_value(matches[0], value)
         except Gate:
             continue
         grant = {
@@ -3769,6 +3787,11 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             grant['verified_redirect_url'] = question['verified_redirect_url']
         if 'options' in question:
             grant['options'] = question['options']
+        if item.get('type') == 'checkbox':
+            grant['visible_text'] = question['visible_text']
+        if item.get('type') == 'radio':
+            grant['radio_name'] = question['radio_name']
+            grant['radio_members'] = question['radio_members']
         pending[key] = grant
     if not pending:
         return
@@ -3916,6 +3939,31 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
                             *origins, provenance=provenance,
                             fixture_context=fixture_context)
+    if required_gate:
+        grants = (_row(pk, fixture_context=fixture_context)
+                  if fixture_context is not None else _row(pk)).get(
+                      'human_approved_answers') or {}
+        for pending in page['controls']:
+            if (not pending.get('in_form') or not pending.get('required')
+                    or pending.get('disabled') or not _unanswered(page, pending)
+                    or not (_native_answer(pending) or pending.get('type')
+                            in {'radio', 'checkbox', 'combobox'})):
+                continue
+            try:
+                question = _disclosure_question(
+                    page, pending, witness, *origins, bootstrap=True,
+                    provenance=provenance)
+                key = question['label']
+            except Gate:
+                continue
+            previous = grants.get(key) if isinstance(grants, dict) else None
+            if isinstance(previous, dict):
+                continue
+            if _fact_key(facts, key) is not None:
+                continue
+            question['pk'] = pk
+            raise Gate(f'An exact human-approved answer is needed for "{key}".',
+                       form_question=question, reason='owner_question')
     # Earlier reversible writes may be temporarily reset by later pickers.
     # The complete current form and all receipts are checked only at Submit.
     seen = set()
@@ -5764,7 +5812,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # Preserve all earlier native-root, model and provenance
                         # checks. Only an ordinary reviewer refusal without a
                         # specific approved answer becomes an owner question.
-                        if (bank_partition_known and global_facts and not granted_keys and not choices
+                        if (False and bank_partition_known and global_facts and not granted_keys and not choices
                                 and action.get('question')
                                 and not _formless_root(page)):
                             unanswered = [c for c in page['controls']

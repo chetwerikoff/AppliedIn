@@ -754,10 +754,11 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     // Visible bframe precedence is independent of root proof/placement.
     if (visibleR==='visible-recaptcha') status=visibleR;
     else if (h) status=hidden ? 'H' : 'visible-hcaptcha';
-    else if (!e.hasAttribute('srcdoc') && ((r && hiddenROutside && hidden) ||
-             visibleR==='R' || (passiveEnterprise &&
-             (path==='/recaptcha/enterprise/anchor' ||
-              (path==='/recaptcha/enterprise/bframe' && hidden))))) status='R';
+    else if (!e.hasAttribute('srcdoc') && ((r && hiddenROutside && hidden &&
+             !(path==='/recaptcha/enterprise/bframe' &&
+               enterpriseAnchors.length===1 &&
+               enterpriseBadgeAnchor(enterpriseAnchors[0].closest('div.grecaptcha-badge')))) ||
+             visibleR==='R' || passiveEnterprise)) status='R';
     else if (widget) { status='W'; widget.forEach(n=>excluded.add(n)); }
     else if (x) status='X';
     else if (z) status='Z';

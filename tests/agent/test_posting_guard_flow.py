@@ -284,3 +284,89 @@ def test_short_flagged_ats_survives_browser_failure_and_revokes_clean_apply(
     assert "model_instruction" in updated["posting_guard"]["reasons"]
     assert not pg.authorised(updated)
     browser.assert_not_awaited()
+
+
+def test_infrastructure_failure_then_real_gate_clears_only_stale_attribution(
+    stores, monkeypatch,
+):
+    from tools import browser_apply
+    from tools.browser_runtime import configuration
+
+    async def gate(*args, **kwargs):
+        return {"status": "gate", "reason": "unknown_field",
+                "question": "Choose a synthetic answer"}
+
+    monkeypatch.setattr(browser_apply, "apply", gate)
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
+    monkeypatch.setattr("tools.browser_runtime.configuration",
+                        lambda: {"engine": "browser_skill"})
+    safe = pg.analyze(TEXT, html_variants=["<p>Safe job posting</p>"],
+                      source_required=True)
+    row = stores.tracking.get_current(PK)
+    assert stores.tracking.update_posting_guard(PK, row, safe, source_witness=True)
+    stores.tracking.set_status(
+        PK, Status.FAILED, fail_kind="unknown",
+        fail_reason="BrowserSkill operation unavailable: permission_denied")
+    async def safe_meta(row, yielding=False):
+        return {**safe, "source_kind": "ats_html", "source_url": URL}
+    monkeypatch.setattr(run, "_jd_meta", safe_meta)
+    stores.tracking.set_status(PK, Status.TAILORED)
+    monkeypatch.setattr("tools.browser_runtime.configuration",
+                        lambda: {"engine": "browser_skill"})
+    monkeypatch.setattr("core.rotation.ensure", lambda *a, **kw: None)
+    monkeypatch.setattr("core.profiles.resolve_for", lambda *a: None)
+    monkeypatch.setattr("tools.credentials.get_login", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_resume_pdf_path", lambda *a: "")
+    monkeypatch.setattr(run, "_github_context", lambda: "")
+    stores.answer_bank = SimpleNamespace(all_facts=lambda *a: {})
+    stores.secrets = None
+    result = asyncio.run(run._apply_direct(PK, stores))
+    current = stores.tracking.get_current(PK)
+    assert result["result"] == "gated"
+    assert current["status"] == "needs_human"
+    assert current["fail_kind"] == ""
+    assert current["fail_reason"] == ""
+    assert current["gate_reason"] == "unknown_field"
+    assert current["gate_pending"]["question"] == "Choose a synthetic answer"
+
+
+def test_infrastructure_failure_then_real_success_clears_attribution(stores, monkeypatch):
+    from tools import browser_apply
+
+    async def applied(*args, **kwargs):
+        return {"status": "applied", "confirmation": "synthetic-receipt"}
+
+    monkeypatch.setattr(browser_apply, "apply", applied)
+    monkeypatch.setattr(run, "seed_fingerprint", lambda: "synthetic-seed")
+    safe = pg.analyze(TEXT, html_variants=["<p>Safe job posting</p>"],
+                      source_required=True)
+    row = stores.tracking.get_current(PK)
+    assert stores.tracking.update_posting_guard(PK, row, safe, source_witness=True)
+    stores.tracking.set_status(
+        PK, Status.TAILORED, fail_kind="unknown",
+        fail_reason="BrowserSkill operation unavailable: permission_denied")
+    async def safe_meta(row, yielding=False):
+        return {**safe, "source_kind": "ats_html", "source_url": URL}
+    monkeypatch.setattr(run, "_jd_meta", safe_meta)
+    monkeypatch.setattr("core.rotation.ensure", lambda *a, **kw: None)
+    monkeypatch.setattr("core.profiles.resolve_for", lambda *a: None)
+    monkeypatch.setattr("tools.credentials.get_login", lambda *a, **kw: None)
+    monkeypatch.setattr(run, "_resume_pdf_path", lambda *a: "")
+    monkeypatch.setattr(run, "_github_context", lambda: "")
+    stores.answer_bank = SimpleNamespace(all_facts=lambda *a: {})
+    stores.secrets = None
+    result = asyncio.run(run._apply_direct(PK, stores))
+    current = stores.tracking.get_current(PK)
+    assert result["result"] == "done"
+    assert current["status"] == "applied"
+    assert current["confirmation_id"] == "synthetic-receipt"
+    assert current["fail_kind"] == ""
+    assert current["fail_reason"] == ""
+
+
+def test_noninfra_failure_is_never_laundered_by_settlement(stores):
+    stores.tracking.set_status(
+        PK, Status.FAILED, fail_kind="application_limit",
+        fail_reason="The board rejected the application")
+    assert run._clear_infra_failure(PK, stores) == {}
+    assert stores.tracking.get_current(PK)["fail_kind"] == "application_limit"

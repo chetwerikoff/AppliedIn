@@ -4316,7 +4316,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             _require_native_choice(target)
         else:
             _require_native_action(target, verb)
-        observed, witness = await _observe_controls(session, page, site='execute')
+        observed, witness = await _observe_controls(session, page)
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
                 or not _preparation_destination_allowed(observed.get('url', ''),
@@ -4429,8 +4429,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             else:
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _observe_controls(
-            session, page, site='execute')
+        latest, latest_witness = await _observe_controls(session, page)
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_native_choice(current)

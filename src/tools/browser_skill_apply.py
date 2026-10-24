@@ -2722,6 +2722,16 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
+_BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
+
+
+async def _bootstrap_observe_controls(session, page: dict, *, site: str):
+    """Preserve the two-argument observer seam while naming bootstrap gates."""
+    token = _BOOTSTRAP_OBSERVATION_SITE.set(site)
+    try:
+        return await _observe_controls(session, page)
+    finally:
+        _BOOTSTRAP_OBSERVATION_SITE.reset(token)
 
 
 async def _observe_controls(session, page: dict, *, readiness: bool = False,
@@ -2729,6 +2739,8 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                             _previous_identity=None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
+    if not site:
+        site = _BOOTSTRAP_OBSERVATION_SITE.get()
     if not site and _EXECUTE_OBSERVATION_SITE.get():
         site = 'execute'
     predicate, locator = 'unavailable', 'unavailable'
@@ -3730,7 +3742,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if getattr(session, '_application_controller', None) is not None:
                 return page  # Missing historic root proof cannot block preparation.
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
-        page, witness = await _observe_controls(session, page, site='bootstrap-formless')
+        page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)
         for observed in members:
             if observed['type'] == 'file':
@@ -3783,7 +3795,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             for c in page['controls']):
         return page
     try:
-        page, witness = await _observe_controls(session, page, site='bootstrap-material')
+        page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-material')
     except Gate as exc:
         # The independent DOM validator remains fail-closed. Its rejected
         # linked shape still has a safe, code-normalized owner diagnostic;

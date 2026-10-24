@@ -353,45 +353,52 @@ def _navigation_observed_step_url(page: dict | None, tracked: str) -> str:
 
 def _navigation_failed_predicate(destination: str, tracked: str,
                                  provenance: Provenance | None) -> str:
-    """Name the first failed *existing* route predicate; never grant authority."""
+    """Explain the branch rejected by preparation admission, not an idealized gate."""
     if not isinstance(destination, str) or not destination:
         return 'destination_observation_available'
     try:
-        if (any(ord(c) <= 32 or 127 <= ord(c) <= 159 or c == '\\'
-                for c in destination)):
+        if any(ord(c) < 33 or 127 <= ord(c) <= 159 or c == '\\'
+               for c in destination):
             return 'literal_safe_destination_url'
         part = urlsplit(destination)
-        source = urlsplit(tracked)
         if (part.scheme != 'https' or not part.hostname
-                or part.netloc != part.hostname or not bsk.web_url(destination)):
+                or part.netloc != part.hostname):
             return 'literal_https_destination_origin'
-        if ('%' in part.path or any(s in {'.', '..'} for s in part.path.split('/'))):
-            return 'literal_unencoded_destination_path'
+        # The verified alias/redirect branch can accept a different origin,
+        # but only after the ordinary tracked-origin check fails.
+        if _preparation_origin(destination, tracked):
+            return 'approved_preparation_origin'
         if isinstance(provenance, VendorRedirectProvenance):
-            proof = urlsplit(provenance.target_url)
             if destination == provenance.wrapper:
                 return 'destination_is_verified_redirect_not_vendor_wrapper'
+            proof = urlsplit(provenance.target_url)
             if part.netloc != proof.netloc:
                 return 'same_verified_redirect_host'
-            if (part.path != proof.path
-                    and not part.path.startswith(proof.path.rstrip('/') + '/')):
+            if (part.path != proof.path and
+                    not part.path.startswith(proof.path.rstrip('/') + '/')):
                 return 'same_verified_redirect_job_path'
-            if part.query != proof.query or ('?' in destination and not proof.query):
+            if part.query != proof.query:
                 return 'same_verified_redirect_query_identity'
-            if part.fragment:
-                return 'verified_redirect_has_no_fragment'
             return 'literal_verified_redirect_destination'
+        source = urlsplit(tracked)
         if isinstance(provenance, ApplicationEntryProvenance):
+            candidate = urlsplit(provenance.url)
+            if part.netloc not in {source.netloc, candidate.netloc}:
+                return 'same_tracked_employer_https_origin'
             return 'exact_tracked_ats_application_entry_url'
         if isinstance(provenance, GreenhouseJobAlias):
+            if part.netloc not in {source.netloc, 'job-boards.greenhouse.io'}:
+                return 'same_tracked_employer_https_origin'
             return 'verified_greenhouse_board_and_job_route'
         if (part.scheme, part.hostname, part.port) != (
                 source.scheme, source.hostname, source.port):
             return 'same_tracked_employer_https_origin'
+        if ('%' in part.path or any(segment in {'.', '..'}
+                                   for segment in part.path.split('/'))):
+            return 'literal_unencoded_destination_path'
         job_path = source.path.rstrip('/')
-        if (not job_path or
-                (part.path != job_path
-                 and not part.path.startswith(job_path + '/'))):
+        if (not job_path or (part.path != job_path
+                and not part.path.startswith(job_path + '/'))):
             return 'same_tracked_job_path'
         former = parse_qsl(source.query, keep_blank_values=True)
         current = parse_qsl(part.query, keep_blank_values=True)

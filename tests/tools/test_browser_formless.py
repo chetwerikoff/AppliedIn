@@ -1909,14 +1909,15 @@ def _issue174_reader(reader, *, shape=3, variant='ok', resolved=False):
         node('div',{},parent);
       return parent.children.filter(e=>e.tagName==='DIV')[count-1];
     };
-    const badge=node('div',{class:'grecaptcha-badge'},
-      node('div',{},at(body,BADGE_INDEX)));
+    const badgeParent=node('div',{},at(body,BADGE_INDEX));
+    const badge=node('div',{class:'grecaptcha-badge'},badgeParent);
     const badgeInner=node('div',{},badge);
     move(anchor,badgeInner);
     anchor.style.visibility='hidden';anchor.style.display='inline';
+    const bframeParent=node('div',{},at(body,BFRAME_INDEX));
     const bframe=node('iframe',{
       src:'https://www.google.com/recaptcha/enterprise/bframe'
-    },at(body,BFRAME_INDEX));
+    },bframeParent);
     bframe.style.visibility='hidden';bframe.style.display='inline';
     if(VARIANT==='visible-bframe')bframe.style.visibility='visible';
     if(VARIANT==='second-anchor'){

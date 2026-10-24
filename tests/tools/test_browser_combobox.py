@@ -473,7 +473,7 @@ async def test_unmatched_ambiguous_or_dangerous_option_never_clicks(monkeypatch,
     assert not any(call == ('click', '#country-example') for call in session.calls)
 
 @pytest.mark.parametrize('field', ['label', 'value'])
-def test_combobox_material_assent_options_require_human_review(field):
+def test_combobox_material_assent_options_require_bound_owner_answer(field):
     current = page()
     target = current['controls'][0]
     target['combobox']['options'] = [
@@ -484,8 +484,15 @@ def test_combobox_material_assent_options_require_human_review(field):
     witness = {'#country': {'visible': True, 'readonly': False,
                             'disabled': False, 'inert': False,
                             'combobox': target['combobox']}}
-    with pytest.raises(forms.Gate, match='Legal or material assent'):
-        forms._disclosure_question(current, target, witness, URL)
+    question = forms._disclosure_question(current, target, witness, URL)
+    assert question['label'] == 'What country?'
+    assert question['options'] == [{
+        'selector': '#yes',
+        'label': target['combobox']['options'][0]['label'],
+        'value': target['combobox']['options'][0]['value'],
+    }]
+    assert forms._missing_answer_reason(target) == 'owner_question'
+    assert forms._choice_prompt(target, question).startswith('Legal acknowledgement: ')
 
 
 def test_optional_empty_combobox_and_hidden_control_keep_native_availability():
@@ -796,3 +803,138 @@ async def test_unsafe_nested_option_effect_never_clicks(monkeypatch):
             resume_path='', company='example-co', jd_text='', resume_tex='',
             github='', pk=PK, job_url=URL)
     assert ('click', '#country-example') not in session.calls
+
+
+def material_page(*, selected=False):
+    target = control(selected_text='I agree' if selected else '',
+                     selected_value='YES' if selected else '',
+                     hidden_value='YES' if selected else '')
+    target.update(label='Processing choice', question='Data processing consent?')
+    target['combobox']['options'] = [
+        {'selector': '#country-example', 'unique': True,
+         'label': 'I agree', 'value': 'YES', 'safe': True},
+        {'selector': '#country-other', 'unique': True,
+         'label': 'I decline', 'value': 'NO', 'safe': True},
+    ]
+    if selected:
+        target.update(value='I agree', has_value=True)
+    return page(target)
+
+
+def test_material_combobox_reply_stores_original_option_identity(monkeypatch):
+    from agent import run
+    current = material_page()
+    target = current['controls'][0]
+    question = forms._disclosure_question(
+        current, target, {'#country': {
+            'visible': True, 'readonly': False, 'disabled': False, 'inert': False,
+            'combobox': target['combobox']}}, URL, bootstrap=True)
+    question['pk'] = PK
+    row = {
+        'pk': PK, 'company': 'example-co', 'jd_url': URL,
+        'status': 'needs_human', 'gate_source': 'applier',
+        'gate_call_id': 'direct', 'possible_submission': False,
+        'human_approved_answers': {},
+        'gate_pending': {'question': 'Exact synthetic option question',
+                         'form_question': question},
+    }
+    stored = {}
+    class Tracking:
+        def get(self, pk):
+            return deepcopy(row)
+        def set_status(self, pk, status, **changes):
+            row.update(status=status, **changes)
+    stores = SimpleNamespace(
+        tracking=Tracking(), answer_bank=SimpleNamespace(
+            put=lambda label, value, *args, **kw:
+            stored.update({label: value})))
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
+    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
+    assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
+    assert stored == {'Data processing consent?': 'I agree'}
+    approved = row['human_approved_answers']['Data processing consent?']
+    assert approved['options'] == question['options']
+    assert approved['selector'] == '#country'
+    monkeypatch.setattr(forms, '_row', lambda _pk: {
+        **row, 'status': 'submitting'})
+    forms.exact_approval(
+        PK, 'Data processing consent?', 'I agree', target=target, url=URL)
+    changed = deepcopy(target)
+    changed['combobox']['options'][0]['value'] = 'DIFFERENT'
+    with pytest.raises(forms.Gate):
+        forms.exact_approval(
+            PK, 'Data processing consent?', 'I agree', target=changed, url=URL)
+    changed = deepcopy(target)
+    changed['form_action'] = URL + '/other'
+    with pytest.raises(forms.Gate):
+        forms.exact_approval(
+            PK, 'Data processing consent?', 'I agree', target=changed, url=URL)
+
+
+async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_click(
+        monkeypatch):
+    current = material_page()
+    initial_target = current['controls'][0]
+    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    no_write = Session(current)
+    with pytest.raises(forms.MaterialAssentGate) as first:
+        await forms._bootstrap(
+            no_write, current, PK, {'Data processing consent?': 'I agree'}, URL)
+    assert first.value.reason == 'owner_question'
+    assert first.value.form_question['options'] == [
+        {key: option[key] for key in ('selector', 'label', 'value')}
+        for option in initial_target['combobox']['options']]
+    assert not any(call[0] != 'evaluate' for call in no_write.calls)
+
+    form_question = first.value.form_question
+    row['human_approved_answers'] = {
+        'Data processing consent?': {
+            'value': 'I agree', 'selector': '#country', 'url': URL,
+            'label': 'Processing choice', 'question': 'Data processing consent?',
+            'tag': 'input', 'type': 'combobox', 'form_selector': '#application',
+            'form_action': URL, 'options': form_question['options'],
+        }}
+    await forms._bootstrap(
+        no_write, current, PK, {'Data processing consent?': 'I agree'}, URL)
+    assert not any(call[0] != 'evaluate' for call in no_write.calls)
+
+    committed = material_page(selected=True)
+    browser = Session(current, committed)
+    filled = {}
+    receipt = await forms.execute(
+        browser, current, {'action': 'combobox', 'selector': '#country',
+                           'fact': 'Data processing consent?'},
+        facts={'Data processing consent?': 'I agree'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert ('click', '#country-example') in browser.calls
+    assert not any(call[0] == 'click' and call[1] == '#submit'
+                   for call in browser.calls)
+    assert receipt['committed_caption'] == 'I agree'
+    assert receipt['committed_value'] == 'YES'
+    assert filled == {'#country': 'I agree'}
+
+
+@pytest.mark.parametrize('problem', ['unlinked', 'ambiguous', 'invisible', 'unbound'])
+async def test_material_combobox_bad_witness_cannot_request_grant(monkeypatch, problem):
+    current = material_page()
+    combo = current['controls'][0]
+    if problem == 'unlinked':
+        combo['combobox'].update(linked=False, link_id='',
+                                 listbox_selector='', options=[])
+    elif problem == 'ambiguous':
+        combo['combobox']['options'][1]['label'] = 'I agree'
+    elif problem == 'unbound':
+        combo['in_form'] = False
+    independent = evidence(current)
+    if problem == 'invisible':
+        independent['controls'][0]['visible'] = False
+    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda _pk: row)
+    session = Session(current)
+    session.call = None  # Prohibit even simulated effects after a refused grant.
+    witness = {'#country': next(x for x in independent['controls']
+                                if x['selector'] == '#country')}
+    with pytest.raises(forms.Gate):
+        forms._disclosure_question(current, combo, witness, URL, bootstrap=True)

@@ -7,7 +7,6 @@ validated here before the browser acts. Unsupported controls become human gates.
 from __future__ import annotations
 
 import asyncio
-import logging
 from contextvars import ContextVar
 from functools import wraps
 import ipaddress
@@ -20,6 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from core.ids import normalize_label
+from core.logging import get_logger
 
 from tools import browser_skill as bsk
 from tools.lever_location import equivalent_location, parse_location, press_keys
@@ -34,7 +34,7 @@ from tools.browser_skill_dom import (
     scoped_identity_conflict, submission_like_transition,
 )
 
-_LOG = logging.getLogger(__name__)
+_LOG = get_logger(__name__)
 
 _SENSITIVE = re.compile(
     r'disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|'

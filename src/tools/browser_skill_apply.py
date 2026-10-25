@@ -4507,7 +4507,10 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
             return await _observe_controls(session, page, site='execute')
         # Existing offline guard-order tests replace this function with a
         # two-argument witness. Only that substituted seam uses positional args.
-        return await _observe_controls(session, page)
+        # Test doubles intentionally expose the historic two-argument seam;
+        # the real observer above carries the explicit named site.
+        substituted_observer = _observe_controls
+        return await substituted_observer(session, page)
     finally:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
@@ -5777,7 +5780,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance, filled=filled, history=history,
                         resume_path=resume_path, company=company, job_url=url,
-                        global_facts=global_facts,
+                        # Automatic bank grants require the production raw
+                        # controller to retain its exact job-bound guard.
+                        # An inspection-only synthetic Session must not mint
+                        # new authorization before direct owner triage.
+                        global_facts=(global_facts if producer_guard is not None
+                                      else {}),
                         **({'fixture_context': ctx} if ctx else {}))
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(

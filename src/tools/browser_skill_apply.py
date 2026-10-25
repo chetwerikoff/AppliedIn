@@ -5253,7 +5253,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                        ctx=ctx, provenance=provenance)
     if verb in {'fill', 'select', 'choose'}:
         if verb == 'choose':
-            _require_native_choice(target)
+            _require_guarded_choice(page, target)
         else:
             _require_native_action(target, verb)
         observed, witness = await _execute_observe_controls(session, page)
@@ -5264,7 +5264,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The same-job page or mapping changed before a field gate.')
         target = control(observed, action, 'execute-observe')
         if verb == 'choose':
-            _require_native_choice(target)
+            _require_guarded_choice(observed, target)
             if not _unanswered(observed, target):
                 raise Gate('Only required, unanswered native choices can be selected.')
         else:
@@ -5289,8 +5289,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # Missing safe answers still produce the original bound question.
             # Once granted, the model's fact is only a routing label.
             try:
-                approved = _approved_native_choice(
+                approved = (_approved_boolean_pair(
                     page, target, pk, provenance=provenance, fixture_context=ctx)
+                    if target.get('type') == 'button' else _approved_native_choice(
+                        page, target, pk, provenance=provenance, fixture_context=ctx))
             except Gate as exc:
                 if exc.reason == 'owner_question' and exc.form_question is None:
                     # Keep the independently observed question when the claim
@@ -5300,8 +5302,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 raise
             if approved is None:
                 raise Gate(gate_prompt, form_question=form_question,
-                           reason=_missing_answer_reason(target) if _unanswered(page, target)
-                           else 'unknown_field')
+                           reason=('owner_question' if target.get('type') == 'button'
+                                   else _missing_answer_reason(target))
+                           if _unanswered(page, target) else 'unknown_field')
             if (not isinstance(key, str)
                     or key not in {form_question['label'],
                                    _fact_key(facts, form_question['label'])}):
@@ -5351,6 +5354,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
                 guarded_value(target, value)
                 write_value = target.get('value') or target['label']
+            elif target['type'] == 'button':
+                members = _boolean_pair(page, target)
+                chosen = [c for c in members if _same(value, c['label'])]
+                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
+                    raise Gate('Selected Boolean member differs from the owner answer.',
+                               reason='defect_button')
+                guarded_value(target, value)
+                write_value = target['label'].casefold()
             else:
                 members = _radio_group(page, target)
                 chosen = [c for c in members
@@ -5374,7 +5385,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         latest, latest_witness = await _execute_observe_controls(session, page)
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
-            _require_native_choice(current)
+            _require_guarded_choice(latest, current)
             if not _unanswered(latest, current):
                 raise Gate('The required choice is no longer unanswered.')
         else:
@@ -5395,8 +5406,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
         if verb == 'choose':
-            fresh_choice = _approved_native_choice(
+            fresh_choice = (_approved_boolean_pair(
                 latest, current, pk, provenance=provenance, fixture_context=ctx)
+                if current.get('type') == 'button' else _approved_native_choice(
+                    latest, current, pk, provenance=provenance, fixture_context=ctx))
             if (fresh_choice is None or fresh_choice[0] != value
                     or fresh_choice[1]['selector'] != current['selector']):
                 raise Gate('The exact native choice grant changed before a browser write.')
@@ -5415,6 +5428,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if current['type'] == 'checkbox':
                 if not _same(value, 'yes'):
                     raise Gate('Checkbox grant no longer contains an explicit owner yes.')
+            elif current['type'] == 'button':
+                matches = [c for c in _boolean_pair(latest, current)
+                           if _same(value, c['label'])]
+                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
+                    raise Gate('The bound Boolean answer no longer matches this member.',
+                               reason='defect_button')
             else:
                 matches = [c for c in _radio_group(latest, current)
                            if (_same(value, c['label'])

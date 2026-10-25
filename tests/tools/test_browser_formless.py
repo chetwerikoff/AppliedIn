@@ -2225,6 +2225,8 @@ def bootstrap_caplog(caplog):
         yield caplog
     finally:
         forms._LOG.removeHandler(caplog.handler)
+
+
 def _issue184_reversible_session(monkeypatch):
     row, raw, _, provenance = root_world(monkeypatch, missingPane=True)
     assert forms._formless_root(raw.current)

@@ -4,6 +4,7 @@ The PAGE and fixed witness come from the same synthetic DOM readers used by
 test_browser_formless. No real browser, user profile, submission, or network.
 """
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,12 +13,12 @@ import pytest
 from agent import run
 from tools import browser_skill_apply as forms
 from tests.tools.test_browser_application_entry import COMPANY, PK, posting, entry
-from tests.tools.test_browser_formless import root_world
+from tests.tools.test_browser_formless import root_world, observed
 from tests.tools.test_browser_controller_support import install_controller_session
 
 
-def _fixture(monkeypatch, tmp_path):
-    row, endpoint, decision, _ = root_world(monkeypatch, missingPane=True)
+def _fixture(monkeypatch, tmp_path, **shape):
+    row, endpoint, decision, _ = root_world(monkeypatch, missingPane=True, **shape)
     assert forms._formless_root(endpoint.current)['root'] == ''
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     variants = (
@@ -165,6 +166,52 @@ async def test_reversible_required_questions_resume_in_observed_order(monkeypatc
     assert 'I certify that these synthetic statements are true' not in stores.answer_bank.values
     assert set(row['human_approved_answers']) == {
         'Location', 'Start date', 'I certify that these synthetic statements are true'}
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_root_wins_over_open_required_location(monkeypatch, tmp_path):
+    """A reversible fallback cannot ask for Location on two unsafe roots."""
+    _, endpoint, decision, _, pdf = _fixture(
+        monkeypatch, tmp_path, secondFormlessComplete=True)
+    assert endpoint.current['entry']['formless']['error'] == 'ambiguous application roots'
+    assert next(c for c in endpoint.current['controls']
+                if c['selector'] == '#location')['required']
+    file = next(c for c in endpoint.current['controls']
+                if c['type'] == 'file' and c['label'] == 'Resume')
+    submit = next(c for c in endpoint.current['controls']
+                  if c['label'] == 'Submit application')
+    original_call = endpoint.call
+
+    async def keep_both_roots_after_upload(method, *args, **kwargs):
+        if method != 'upload':
+            return await original_call(method, *args, **kwargs)
+        assert args[0] == file['selector'] and args[1] == '--file'
+        assert kwargs == {'timeout': 130}
+        endpoint.calls.append((method, *args))
+        refreshed = observed(
+            missingPane=True, secondFormlessComplete=True, attached=True,
+            files=[Path(args[2]).name], displayName=Path(args[2]).name)
+        for earlier, later in zip((endpoint.current, endpoint.fixed), refreshed):
+            later['controls'].extend(
+                deepcopy(c) for c in earlier['controls']
+                if c['selector'] in {'#location', '#start-date', '#boolean-yes',
+                                     '#boolean-no', '#certification'})
+        endpoint.current, endpoint.fixed = refreshed
+        return {}
+
+    endpoint.call = keep_both_roots_after_upload
+    decision.side_effect = [
+        {'action': 'upload', 'selector': file['selector']},
+        {'action': 'submit', 'selector': submit['selector']},
+    ]
+    result = await _apply(pdf)
+    assert result['status'] == 'gate', result
+    assert 'ambiguous application roots' in result['question'], result
+    assert result['reason'] != 'owner_question'
+    assert result['form_question'] is None
+    assert decision.await_count == 2
+    assert [c[0] for c in endpoint.calls
+            if c[0] in {'fill', 'click', 'upload', 'select'}] == ['upload']
 
 
 @pytest.mark.asyncio

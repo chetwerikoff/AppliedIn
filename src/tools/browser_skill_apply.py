@@ -4584,7 +4584,7 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                     or kind in {'radio', 'checkbox'} and item.get('tag') == 'input')
         if (not writable or (rootless and kind == 'radio')
                 or (rootless and _closed_material_combobox(item))):
-            return Gate('The guarded executor cannot write this required control; 
+            return Gate('The guarded executor cannot write this required control; '
                         'operator inspection is required.',
                         reason='defect_' + _required_owner_gate_type(item))
         # A currently bound grant is not a missing answer, even when bootstrap

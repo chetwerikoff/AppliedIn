@@ -1653,6 +1653,14 @@ def _material_form_choice(target: dict) -> bool:
                  or _material_select_options(target)))
 
 
+def _closed_material_combobox(target: dict) -> bool:
+    combo = target.get('combobox') or {}
+    return (target.get('type') == 'combobox'
+            and _material_form_choice(target)
+            and combo.get('linked') is False
+            and combo.get('options') in (None, []))
+
+
 def _material_exact_value(pk: str, page: dict, target: dict, question: dict,
                           *, provenance=None, fixture_context=None) -> str:
     """Use only the current control-bound owner grant, never generic bank consent."""
@@ -1665,8 +1673,16 @@ def _material_exact_value(pk: str, page: dict, target: dict, question: dict,
     if not isinstance(value, str) or not value.strip():
         raise Gate('A current material owner answer is not available.')
     value = value.strip()
+    witnessed_options = None
+    if _closed_material_combobox(target):
+        # The unopened listbox has no live options. Defer only its option
+        # comparison during bootstrap; write and Submit must witness them.
+        witnessed_options = grant.get('options')
+        if not isinstance(witnessed_options, list) or not witnessed_options:
+            raise Gate('A current material option grant is not available.')
     exact_approval(pk, question['label'], value, target=_bound_target(page, target),
                    url=page['url'], provenance=provenance,
+                   witnessed_options=witnessed_options,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
     return value
 
@@ -3631,6 +3647,10 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                                 exact_approval(
                                     pk, question['label'], grant['value'],
                                     target=_bound_target(page, c), url=page['url'],
+                                    witnessed_options=(witnessed_question['options']
+                                                       if witnessed_question is not None
+                                                       and c.get('type') == 'combobox'
+                                                       else None),
                                     provenance=provenance,
                                     **({'fixture_context': fixture_context}
                                        if fixture_context else {}))
@@ -3719,7 +3739,8 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
     elif item.get('tag') == 'select':
         expected['options'] = item.get('options')
     elif item.get('type') == 'combobox' and _material_form_choice(item):
-        expected['options'] = question.get('options')
+        if not _closed_material_combobox(item):
+            expected['options'] = question.get('options')
     if any(grant[key] != seen for key, seen in expected.items() if key in grant):
         return 'stale'
     if any(key not in grant for key in expected):
@@ -3739,9 +3760,11 @@ def _global_owner_facts(bank) -> dict:
     return {}  # Unknown backend is not authority.
 
 
-def _bank_auto_eligible(item: dict, value: str) -> bool:
+def _bank_auto_eligible(item: dict, value: str, *,
+                        formless_selectors: frozenset[str] = frozenset()) -> bool:
     subject = label(item)
-    if (not item.get('in_form') or item.get('disabled')
+    if ((not item.get('in_form')
+         and item.get('selector') not in formless_selectors) or item.get('disabled')
             or item.get('tag') == 'textarea'
             or item.get('type') == 'password'
             or not (_native_answer(item) or item.get('type') in {'combobox', 'radio', 'checkbox'})
@@ -3769,7 +3792,8 @@ def _bank_auto_eligible(item: dict, value: str) -> bool:
 
 def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             global_facts: dict, *origins: str,
-                            provenance=None, fixture_context=None) -> None:
+                            provenance=None, fixture_context=None,
+                            formless_selectors: frozenset[str] = frozenset()) -> None:
     if not global_facts or not pk:
         return
     row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
@@ -3782,7 +3806,9 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         return
     pending = {}
     for item in page['controls']:
-        if not item.get('in_form') or item.get('disabled'):
+        if ((not item.get('in_form')
+             and item.get('selector') not in formless_selectors)
+                or item.get('disabled')):
             continue
         if item.get('type') in {'radio', 'checkbox'}:
             if item.get('checked'):
@@ -3802,7 +3828,8 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             continue
         value = str(global_facts[global_key]).strip()
         if (not value or str(facts[fact_key]).strip() != value
-                or not _bank_auto_eligible(item, value)):
+                or not _bank_auto_eligible(
+                    item, value, formless_selectors=formless_selectors)):
             continue
         try:
             question = _disclosure_question(
@@ -3899,9 +3926,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
         page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)
-        _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
-                                *origins, provenance=provenance,
-                                fixture_context=fixture_context)
+        _auto_grant_from_global(
+            page, witness, pk, facts, global_facts or {}, *origins,
+            provenance=provenance, fixture_context=fixture_context,
+            formless_selectors=frozenset(c['selector'] for c in members))
         for observed in members:
             if observed['type'] == 'file':
                 continue
@@ -4049,6 +4077,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     raise Gate('The trusted alias is no longer current.')
                 question = _disclosure_question(
                     page, item, witness, *origins, bootstrap=True,
+                    closed_witness=_closed_material_combobox(item),
                     provenance=provenance)
             except Gate:
                 continue
@@ -4125,6 +4154,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                 raise Gate('The trusted same-job provenance is no longer current.')
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=True,
+                closed_witness=_closed_material_combobox(item),
                 provenance=provenance)
         except Gate:
             record('blocked')

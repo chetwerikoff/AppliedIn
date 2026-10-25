@@ -4522,6 +4522,34 @@ def _required_owner_gate_type(target: dict) -> str:
     return kind.lower().replace('-', '_')
 
 
+def _required_owner_gate_admitted(page: dict, provenance) -> bool:
+    """An unproven historic root permits preparation, not unsafe disclosure."""
+    structural = _formless_root(page)
+    if not structural:
+        return True
+    if structural.get('error') or structural.get('truncated'):
+        return False
+    if structural.get('root'):
+        try:
+            _formless_boundary(page, provenance)
+        except Gate:
+            return False
+        return True
+    if (_entry_not_ready(page) != 'no unique application root'
+            or page.get('inventory_verified') is not True
+            or page.get('truncated') or page.get('opaque_controls')
+            or page.get('shadow_roots') or page.get('unsupported_frames')
+            or not structural.get('container') or not structural.get('submit')):
+        return False
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    return not any(
+        isinstance(item, dict) and (item.get('type') == 'hidden'
+                                    or item.get('iti') or item.get('contenteditable'))
+        for item in evidence)
+
+
 async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                                provenance=None, fixture_context=None) -> Gate | None:
     """Bind the first still-required answer before delegating any planning to the model.
@@ -4548,14 +4576,13 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                 not _preparation_current(provenance, fixture_context=fixture_context))):
         raise Gate('The tracked job route changed before the owner question.',
                    reason='defect_provenance')
+    if isinstance(session, _ReversibleEntryReader):
+        _entry_safety(
+            current, lambda href: _preparation_destination_allowed(
+                href, *origins, provenance=provenance), provenance)
+    if not _required_owner_gate_admitted(current, provenance):
+        return None
     structural = _formless_root(current)
-    if structural and (structural.get('error') or structural.get('root')):
-        try:
-            _formless_boundary(current, provenance)
-        except Gate:
-            # A damaged structural root is a final-Submit defect, not a
-            # safe source for a newly bound owner answer.
-            return None
     rootless = bool(structural and not structural.get('root'))
     if rootless and not (
             isinstance(session, _ReversibleEntryReader)
@@ -6313,17 +6340,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         global_facts=(global_facts if producer_guard is not None
                                       else {}),
                         **({'fixture_context': ctx} if ctx else {}))
-                    # Native forms have their required-control wall in bootstrap.
-                    # Preserve the unverified-PDF Submit refusal until upload;
-                    # the new pre-model wall closes the reversible-route gap.
-                    if (isinstance(session, _ReversibleEntryReader)
-                            or (producer_guard is not None
-                                and producer_guard.upload_completed)):
-                        pending = await _required_owner_gate(
-                            session, page, pk, *trusted_origins,
-                            provenance=provenance, fixture_context=ctx)
-                        if pending is not None:
-                            raise pending
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
                                     r.get('selector') == c['selector'] and r['label'] == c['label']
@@ -6353,6 +6369,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     model_page = _guard_model_page(
                         model_page, pk, company, fixture_context=ctx)
                     model_page, model_history = _model_projection(model_page, history)
+                    # Independent choices and posting danger checks outrank
+                    # a new owner question, including on the reversible fallback.
+                    if (isinstance(session, _ReversibleEntryReader)
+                            or (producer_guard is not None
+                                and producer_guard.upload_completed)):
+                        if isinstance(session, _ReversibleEntryReader):
+                            _entry_safety(page, allowed, provenance)
+                        if _required_owner_gate_admitted(page, provenance):
+                            pending = await _required_owner_gate(
+                                session, page, pk, *trusted_origins,
+                                provenance=provenance, fixture_context=ctx)
+                            if pending is not None:
+                                raise pending
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, model_history, model=model)
                     verb = action.get('action')
@@ -6382,13 +6411,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
-                        # A late model refusal may follow newly hydrated required
-                        # fields that were not open at the pre-plan witness.
-                        pending = await _required_owner_gate(
-                            session, await session.page(), pk, *trusted_origins,
-                            provenance=provenance, fixture_context=ctx)
-                        if pending is not None:
-                            raise pending
+                        # Newly hydrated controls also need the original root
+                        # and entry safety checks before replacing model prose.
+                        fresh = await session.page()
+                        if isinstance(session, _ReversibleEntryReader):
+                            _entry_safety(fresh, allowed, provenance)
+                        if _required_owner_gate_admitted(fresh, provenance):
+                            pending = await _required_owner_gate(
+                                session, fresh, pk, *trusted_origins,
+                                provenance=provenance, fixture_context=ctx)
+                            if pending is not None:
+                                raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
                     if verb == 'finish':
                         raise Gate('The application has not been submitted; review the form.')

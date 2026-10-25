@@ -2205,3 +2205,217 @@ async def test_issue182_formless_existing_explicit_grant_is_not_overwritten(monk
             provenance=provenance, global_facts=facts)
     assert row['human_approved_answers']['Name'] == original
     no_mutations(raw)
+
+
+# Issue #184: a reversible raw session has no unique historical Ashby root.
+# The code-owned controller permits only freshly witnessed, form-free GLOBAL
+# facts to be granted; no root-based or final-Submit authority is inferred.
+def _issue184_reversible_session(monkeypatch):
+    row, raw, _, provenance = root_world(monkeypatch, missingPane=True)
+    assert forms._formless_root(raw.current)
+    assert not forms._formless_root(raw.current).get('root')
+    raw._application_controller = object()  # Synthetic producer prerequisite.
+
+    async def page():
+        return deepcopy(raw.current)
+
+    original_call = raw.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'evaluate' and args == (forms._FIXED_CONTROL_WITNESS,):
+            raw.calls.append((method, *args))
+            return {'value': deepcopy(raw.fixed)}
+        return await original_call(method, *args, **kwargs)
+
+    raw.page = page
+    raw.call = call
+    return row, raw, provenance
+
+
+def _issue184_add_name_phone_controls(raw):
+    for snapshot in (raw.current, raw.fixed):
+        first = next(c for c in snapshot['controls']
+                     if c['selector'] == '#_systemfield_name')
+        first.update(label='First Name', question='')
+        for selector, caption, kind in (
+                ('#synthetic-last', 'Last Name', 'text'),
+                ('#synthetic-phone', 'Phone', 'tel')):
+            extra = deepcopy(first)
+            extra.update(selector=selector, id=selector[1:],
+                         name=selector[1:], label=caption, question='',
+                         tag='input', type=kind, native_type=kind)
+            snapshot['controls'].append(extra)
+
+
+async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
+        monkeypatch, caplog):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    _issue184_add_name_phone_controls(raw)
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {'First Name': 'Test', 'Last Name': 'User',
+             'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
+    with caplog.at_level('INFO', logger=forms.__name__):
+        returned = await forms._bootstrap(
+            raw, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=dict(facts))
+    assert returned is raw.current
+    assert len(writes) == 1
+    grants = row['human_approved_answers']
+    assert set(grants) == set(facts)
+    assert set(forms._advertised_grant_keys(PK, facts)) == set(facts)
+    for key, value in facts.items():
+        grant = grants[key]
+        assert grant['source'] == 'bank-auto' and grant['value'] == value
+        assert grant['url'] == entry('ashby')
+        assert grant['form_selector'] == '' and grant['form_action'] == ''
+        assert grant['selector'] in {c['selector'] for c in raw.current['controls']
+                                     if c['label'] == key and c['in_form'] is False}
+    diagnostics = [r.getMessage() for r in caplog.records
+                   if 'bootstrap pk=' in r.getMessage()]
+    assert len(diagnostics) == 1
+    assert f'pk={PK} route=reversible' in diagnostics[0]
+    for key in facts:
+        assert key in diagnostics[0]
+    for value in facts.values():
+        assert value not in diagnostics[0]
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('label,kind,value', [
+    ('Desired salary', 'text', '500'),
+    ('I consent to processing', 'text', 'yes'),
+    ('I certify the information is true', 'text', 'yes'),
+    ('Sanctions or restricted country', 'text', 'No'),
+    ('Cover letter', 'textarea', 'Synthetic essay'),
+    ('Why do you want this job?', 'text', 'Synthetic motivation'),
+])
+async def test_issue184_reversible_exclusions_do_not_create_grants(
+        monkeypatch, label, kind, value):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    for snapshot in (raw.current, raw.fixed):
+        target = next(c for c in snapshot['controls']
+                      if c['selector'] == '#_systemfield_name')
+        target.update(label=label, question='', type=kind,
+                      native_type=kind, tag='textarea' if kind == 'textarea' else 'input')
+    _issue182_tracking(monkeypatch, row)
+    facts = {label: value, 'Email': 'synthetic@example.test'}
+    returned = await forms._bootstrap(
+        raw, raw.current, PK, facts, posting('ashby'),
+        company=COMPANY, provenance=provenance, global_facts=dict(facts))
+    assert returned is raw.current
+    assert label not in row['human_approved_answers']
+    assert set(row['human_approved_answers']) == {'Email'}
+    assert forms._advertised_grant_keys(PK, facts) == ['Email']
+    no_mutations(raw)
+
+
+async def test_issue184_reversible_existing_grant_and_overlay_still_win(monkeypatch):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    _issue184_add_name_phone_controls(raw)
+    owner_grant = {'source': 'owner', 'value': 'Explicit synthetic answer',
+                   'selector': '#old'}
+    row['human_approved_answers']['First Name'] = deepcopy(owner_grant)
+    _issue182_tracking(monkeypatch, row)
+    facts = {'First Name': 'Test', 'Last Name': 'User',
+             'Phone': 'company-only', 'Email': 'synthetic@example.test'}
+    global_facts = {**facts, 'Phone': 'global-only'}
+    returned = await forms._bootstrap(
+        raw, raw.current, PK, facts, posting('ashby'),
+        company=COMPANY, provenance=provenance, global_facts=global_facts)
+    assert returned is raw.current
+    assert row['human_approved_answers']['First Name'] == owner_grant
+    assert set(row['human_approved_answers']) == {'First Name', 'Last Name', 'Email'}
+    assert 'Phone' not in forms._advertised_grant_keys(PK, facts)
+    no_mutations(raw)
+
+
+async def test_issue184_reversible_native_owner_outside_scope(monkeypatch):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    for snapshot in (raw.current, raw.fixed):
+        target = next(c for c in snapshot['controls']
+                      if c['selector'] == '#_systemfield_name')
+        target.update(label='First Name', question='', in_form=True,
+                      form_selector='#foreign', form_action=entry('ashby'),
+                      native_form_owner_selector='#foreign')
+    _issue182_tracking(monkeypatch, row)
+    facts = {'First Name': 'Test', 'Email': 'synthetic@example.test'}
+    result = await forms._bootstrap(
+        raw, raw.current, PK, facts, posting('ashby'),
+        company=COMPANY, provenance=provenance, global_facts=facts)
+    assert result is raw.current
+    assert set(row['human_approved_answers']) == {'Email'}
+    no_mutations(raw)
+
+
+async def test_issue184_reversible_without_controller_mints_nothing(monkeypatch):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    del raw._application_controller
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    with pytest.raises(forms.Gate, match='application IPC controller'):
+        await forms._bootstrap(
+            raw, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=facts)
+    assert row['human_approved_answers'] == {}
+    assert writes == [] and raw.calls == []
+
+
+async def test_issue184_reversible_observation_gate_returns_original_page(
+        monkeypatch, caplog):
+    from unittest.mock import AsyncMock
+
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    observe = AsyncMock(side_effect=forms.Gate('Synthetic changed witness'))
+    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    with caplog.at_level('INFO', logger=forms.__name__):
+        result = await forms._bootstrap(
+            raw, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=facts)
+    assert result is raw.current and row['human_approved_answers'] == {}
+    observe.assert_awaited_once()
+    assert writes == []
+    messages = [r.getMessage() for r in caplog.records if 'bootstrap pk=' in r.getMessage()]
+    assert len(messages) == 1 and 'route=reversible' in messages[0]
+    assert 'bank-auto-granted=[]' in messages[0]
+    for value in facts.values():
+        assert value not in messages[0]
+    no_mutations(raw)
+
+
+async def test_issue184_reversible_disallowed_fresh_origin_returns_page(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    _issue182_tracking(monkeypatch, row)
+    foreign = deepcopy(raw.current)
+    foreign['url'] = 'https://unrelated.example.test/foreign'
+    observe = AsyncMock(return_value=(foreign, {}))
+    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    result = await forms._bootstrap(
+        raw, raw.current, PK, facts, posting('ashby'),
+        company=COMPANY, provenance=provenance, global_facts=facts)
+    assert result is raw.current and row['human_approved_answers'] == {}
+    observe.assert_awaited_once()
+    no_mutations(raw)
+
+
+async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, caplog):
+    row, raw, session, page, provenance = await admitted(monkeypatch)
+    with caplog.at_level('INFO', logger=forms.__name__):
+        with pytest.raises(forms.Gate):
+            await forms._bootstrap(session, page, PK, {},
+                                   posting('ashby'), provenance=provenance)
+        form_page = {'url': entry('ashby'), 'controls': [],
+                     'entry': {'root': {'selector': '#synthetic-form'}}}
+        assert await forms._bootstrap(
+            raw, form_page, PK, {}, posting('ashby'), provenance=provenance) is form_page
+    messages = [r.getMessage() for r in caplog.records
+                if 'bootstrap pk=' in r.getMessage()]
+    assert len(messages) == 2
+    assert f'pk={PK} route=entry' in messages[0]
+    assert f'pk={PK} route=form' in messages[1]
+    assert all('bank-auto-granted=[]' in message for message in messages)
+    no_mutations(raw)

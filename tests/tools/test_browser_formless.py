@@ -2676,3 +2676,144 @@ async def test_issue184_old_grant_never_authorizes_a_changed_raw_receiver(
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'select', 'click'}]
     assert set(row['human_approved_answers']) == set(facts)
     assert len(writes) == 1
+
+# Issue #188: trace only code-owned diagnostics through the real, non-propagating
+# production StreamHandler. Root caplog misses this logger by design.
+def _issue188_console_handler():
+    from core.logging import _ConsoleFormatter
+
+    logger = forms._LOG
+    assert logger.level == logging.INFO and logger.propagate is False
+    handlers = [
+        h for h in logger.handlers
+        if isinstance(h, logging.StreamHandler)
+        and isinstance(h.formatter, _ConsoleFormatter)
+    ]
+    assert len(handlers) == 1
+    return handlers[0]
+
+
+_ISSUE188_LONG_WITNESS = (
+    'The current DOM witness is unavailable or changed; '
+    'exception=ValueError; predicate=controls.length.equal; control='
+    + 'input:nth-of-type(1)' + ' > div:nth-of-type(1)' * 12
+    + '; site=bootstrap-formless'
+)
+
+
+@pytest.mark.parametrize('message,expected_text', [
+    ('The reversible observation left the preparation origin.',
+     'The reversible observation left the preparation origin.'),
+    (_ISSUE188_LONG_WITNESS, _ISSUE188_LONG_WITNESS[:200]),
+    ('Private page says Test User, synthetic@example.test; token=private-synthetic',
+     '[redacted]'),
+])
+async def test_issue188_swallowed_reversible_gate_uses_safe_production_stdout(
+        monkeypatch, capsys, message, expected_text):
+    from unittest.mock import AsyncMock
+
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    observer = AsyncMock(side_effect=forms.Gate(message, reason='defect_witness'))
+    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+
+    with monkeypatch.context() as capture:
+        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
+        result = await forms._bootstrap(
+            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=facts)
+        output = capsys.readouterr().out
+
+    assert result is raw.current
+    assert row['human_approved_answers'] == {} and writes == []
+    observer.assert_awaited_once()
+    lines = [line for line in output.splitlines()
+             if 'reversible bootstrap gate pk=' in line]
+    assert len(lines) == 1
+    message = (f'reversible bootstrap gate pk={PK} reason=defect_witness '
+               f'text={expected_text}')
+    assert re.fullmatch(
+        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
+        lines[0])
+    assert len(expected_text) <= 200
+    assert 'bank-auto-granted=[]' in output
+    for secret in ('Test User', 'synthetic@example.test', 'private-synthetic'):
+        assert secret not in output
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('case,reason,key', [
+    ('not_in_scope', 'not_in_scope', 'Name'),
+    ('has_value', 'has_value', 'Name'),
+    ('no_key', 'no_key', 'input:nth-of-type(2)'),
+    ('no_global', 'no_global', 'Name'),
+    ('no_global_empty', 'no_global', 'Name'),
+    ('value_mismatch', 'value_mismatch', 'Name'),
+    ('not_eligible', 'not_eligible', 'Name'),
+    ('disclosure_gate', 'disclosure_gate', 'Name'),
+    ('radio_mismatch', 'radio_mismatch', 'Name'),
+    ('already_granted', 'not_eligible', 'Name'),
+    ('opaque_label', 'has_value', '[redacted]'),
+])
+async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
+        monkeypatch, capsys, case, reason, key):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    page = deepcopy(raw.current)
+    target = next(item for item in page['controls']
+                  if item['selector'] == '#_systemfield_name')
+    page['controls'] = [target]
+    facts = {'Name': 'Test User'}
+    global_facts = dict(facts)
+    if case == 'not_in_scope':
+        target['in_form'] = True
+    elif case == 'has_value':
+        target.update(has_value=True, value='already-filled-synthetic')
+    elif case == 'no_key':
+        target.update(question='', label='', selector='input:nth-of-type(2)')
+    elif case == 'no_global':
+        global_facts = {'Email': 'synthetic@example.test'}
+    elif case == 'no_global_empty':
+        global_facts = {}
+    elif case == 'value_mismatch':
+        facts['Name'] = 'company-only'
+        global_facts['Name'] = 'global-only'
+    elif case == 'not_eligible':
+        target.update(tag='textarea', type='textarea')
+    elif case == 'radio_mismatch':
+        target.update(tag='input', type='radio', native_type='radio',
+                      question='Name', label='Option A', name='synthetic-radio')
+        # Isolate the post-disclosure radio-group branch; one member cannot
+        # satisfy the real _radio_group invariant and must stay unapproved.
+        monkeypatch.setattr(forms, '_disclosure_question',
+                            lambda *args, **kwargs: {'selector': target['selector']})
+    elif case == 'already_granted':
+        row['human_approved_answers']['Name'] = {
+            'source': 'owner', 'value': 'synthetic-explicit', 'selector': '#prior'}
+    elif case == 'opaque_label':
+        target.update(question='', label='Private Test User application text',
+                      selector='#private-Test-User', has_value=True,
+                      value='already-filled-synthetic')
+
+    prior = deepcopy(row['human_approved_answers'])
+    scope = frozenset({target['selector']})
+    with monkeypatch.context() as capture:
+        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
+        forms._auto_grant_from_global(
+            page, {}, PK, facts, global_facts, posting('ashby'),
+            provenance=provenance, formless_selectors=scope,
+            reversible_scope=scope)
+        output = capsys.readouterr().out
+
+    assert row['human_approved_answers'] == prior and writes == []
+    lines = [line for line in output.splitlines() if 'bank-auto skip pk=' in line]
+    assert len(lines) == 1
+    expected = f'bank-auto skip pk={PK} key={key} why={reason}'
+    assert re.fullmatch(
+        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(expected)}',
+        lines[0])
+    for secret in ('Test User', 'synthetic@example.test', 'company-only',
+                   'global-only', 'already-filled-synthetic', 'synthetic-explicit'):
+        assert secret not in output
+    no_mutations(raw)

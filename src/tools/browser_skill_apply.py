@@ -2783,7 +2783,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
         value = result.get('value') if isinstance(result, dict) else None
         require(isinstance(value, dict), 'witness.object')
-        if isinstance(session, _EntrySession):
+        if isinstance(session, (_EntrySession, _ReversibleEntryReader)):
             require(value.get('entry') == page.get('entry'), 'entry.equal')
         if isinstance(session, _GreenhouseSession):
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
@@ -4677,23 +4677,22 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
 
-def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
-                              pk: str, facts: dict, *, provenance=None,
-                              fixture_context=None) -> frozenset[str] | None:
-    """A fresh, approved ownerless receiver may use the reversible grant seam."""
+def _reversible_action_scope(page: dict, witness: dict, target: dict,
+                             pk: str, facts: dict, *, controller, origin: str,
+                             fixture_context=None) -> frozenset[str] | None:
+    """Build authorization from this action's independent, ownerless witness."""
     root = _formless_root(page)
-    if (not isinstance(session, _ReversibleEntryReader)
-            or not isinstance(provenance, ApplicationEntryProvenance)
-            or not root or root.get('root') or target.get('in_form') is not False):
-        return None
-    controller = getattr(session.raw, '_application_controller', None)
-    if (not isinstance(controller, ApplicationIPCController)
-            or controller.pk != pk or controller.company != provenance.company
-            or controller.url != provenance.wrapper or provenance.pk != pk
-            or not _preparation_current(provenance, fixture_context=fixture_context)
+    if (not root or root.get('root') or target.get('in_form') is not False
+            or not isinstance(controller, ApplicationIPCController)
+            or controller.pk != pk or not origin or controller.url != origin
             or not _preparation_destination_allowed(
-                page.get('url', ''), provenance=provenance, pk=pk,
-                company=provenance.company, fixture_context=fixture_context)):
+                page.get('url', ''), origin, pk=pk,
+                company=controller.company, fixture_context=fixture_context)
+            or any(target.get(field) for field in (
+                'native_form_owner_selector', 'form_selector', 'form_action',
+                'form_action_attr_present', 'form_action_raw', 'formaction',
+                'formaction_attr_present', 'formaction_raw', 'href',
+                'submit', 'navigates', 'commits_application'))):
         return None
     selector = target.get('selector')
     observed = witness.get(selector)
@@ -4721,6 +4720,25 @@ def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
                 target, value, formless_selectors=frozenset({selector}))):
         return None
     return frozenset({selector})
+
+
+def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
+                              pk: str, facts: dict, *, provenance=None,
+                              fixture_context=None) -> frozenset[str] | None:
+    if (not isinstance(session, _ReversibleEntryReader)
+            or not isinstance(provenance, ApplicationEntryProvenance)
+            or provenance.pk != pk
+            or not _preparation_current(provenance, fixture_context=fixture_context)
+            or not _preparation_destination_allowed(
+                page.get('url', ''), provenance=provenance)):
+        return None
+    controller = getattr(session.raw, '_application_controller', None)
+    if (not isinstance(controller, ApplicationIPCController)
+            or controller.company != provenance.company):
+        return None
+    return _reversible_action_scope(
+        page, witness, target, pk, facts, controller=controller,
+        origin=provenance.wrapper, fixture_context=fixture_context)
 
 
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
@@ -5360,6 +5378,25 @@ class ApplicationIPCController:
             raise Gate('Fresh application page observation is unavailable.')
         return page
 
+    async def _reversible_receiver(self, session, page: dict, target: dict):
+        # The raw producer independently rereads ENTRY_PAGE and its fixed
+        # witness. Neither bootstrap nor execute supplies this scope.
+        fresh, witness = await _observe_controls(
+            _ReversibleEntryReader(session), page, site='controller-reversible')
+        matches = [c for c in fresh['controls']
+                   if c.get('selector') == target.get('selector')]
+        if len(matches) != 1 or _identity(matches[0]) != _identity(target):
+            raise Gate('The reversible receiver changed before raw IPC.')
+        current = matches[0]
+        scope = _reversible_action_scope(
+            fresh, witness, current, self.pk, self.facts, controller=self,
+            origin=self.url, fixture_context=self.fixture_context)
+        if scope is None:
+            raise Gate('An exact human-approved reversible receiver is required.')
+        _disclosure_question(
+            fresh, current, witness, self.url, reversible_scope=scope)
+        return fresh, current
+
     def _approved(self, page, target, value):
         key = _key(page, target)
         fact_key = _fact_key(self.facts, key)
@@ -5518,6 +5555,9 @@ class ApplicationIPCController:
             if op == 'fill' and target.get('type') not in {
                     'text', 'email', 'tel', 'textarea', 'combobox'}:
                 raise Gate('A non-text receiver cannot be filled.')
+            if (_formless_root(page) and not _formless_root(page).get('root')
+                    and self._row().get('ats') in _APPLICATION_ENTRY):
+                page, target = await self._reversible_receiver(session, page, target)
             if op == 'select':
                 if target.get('tag') != 'select':
                     raise Gate('A native select is required.')

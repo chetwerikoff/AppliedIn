@@ -2491,9 +2491,13 @@ async def _issue184_prepare_producer(producer, provenance, facts):
     return session, page
 
 
+@pytest.mark.parametrize('key,selector,value', [
+    ('Name', '#_systemfield_name', 'Test User'),
+    ('Email', '#_systemfield_email', 'synthetic@example.test'),
+])
 async def test_issue184_bank_auto_fill_reaches_raw_controller_and_exact_readback(
-        monkeypatch):
-    """Review finding 1: grants must produce an approved, witnessed real fill."""
+        monkeypatch, key, selector, value):
+    """Review findings: granted facts reach the real producer and exact readback."""
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
     row, endpoint, producer, controller, provenance, writes = (
         _issue184_real_producer(monkeypatch, facts))
@@ -2506,22 +2510,26 @@ async def test_issue184_bank_auto_fill_reaches_raw_controller_and_exact_readback
         return await before_ipc(raw, args, kwargs)
 
     monkeypatch.setattr(controller, 'before_ipc', checked_before_ipc)
-    action = {'action': 'fill', 'selector': '#_systemfield_name', 'fact': 'Name'}
+    witnessed = sum(c == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)
+                    for c in endpoint.calls)
+    action = {'action': 'fill', 'selector': selector, 'fact': key}
     receipt = await forms.execute(
         session, page, action, facts=facts, filled=controller.filled,
         resume_path='', company=COMPANY, jd_text='', resume_tex='', github='',
         pk=PK, job_url=posting('ashby'), provenance=provenance)
     assert receipt['action'] == 'fill'
-    assert calls == [('fill', '#_systemfield_name', '--value', 'Test User')]
+    assert calls == [('fill', selector, '--value', value)]
     assert [call for call in endpoint.calls if call[0] == 'fill'] == [
-        ('fill', '#_systemfield_name', '--value', 'Test User')]
-    assert controller.filled == {'#_systemfield_name': 'Test User'}
+        ('fill', selector, '--value', value)]
+    assert controller.filled == {selector: value}
     after = await session.page()
-    name = next(c for c in after['controls']
-                if c['selector'] == '#_systemfield_name')
-    assert name['value'] == 'Test User' and name['has_value'] is True
-    assert forms._bound_target(after, name)['form_action'] == ''
-    assert ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS) in endpoint.calls
+    target = next(c for c in after['controls'] if c['selector'] == selector)
+    assert target['value'] == value and target['has_value'] is True
+    assert forms._bound_target(after, target)['form_action'] == ''
+    # Producer validation must have performed its OWN fresh ENTRY_PAGE/fixed
+    # witness pair, not relied on the two execute checks or bootstrap proof.
+    assert sum(c == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)
+               for c in endpoint.calls) >= witnessed + 2
     assert len(writes) == 1 and not controller.committed
     assert not any(call[0] == 'click' for call in endpoint.calls)
 
@@ -2553,3 +2561,49 @@ async def test_issue184_before_ipc_exact_ownerless_grant_rejects_forged_form_act
         row['human_approved_answers']['Name']['form_action'] = original
     assert not controller.committed and not any(
         call[0] == 'click' for call in endpoint.calls)
+
+
+@pytest.mark.parametrize('mutation', ['outside-fresh-scope', 'native-form-owner'])
+async def test_issue184_old_grant_never_authorizes_a_changed_raw_receiver(
+        monkeypatch, mutation):
+    """The persisted key is not a stale PAGE/scope authority at either IPC edge."""
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    row, endpoint, producer, controller, provenance, writes = (
+        _issue184_real_producer(monkeypatch, facts))
+    session, page = await _issue184_prepare_producer(producer, provenance, facts)
+    assert 'Email' in forms._advertised_grant_keys(PK, facts)
+
+    # The DOM changes AFTER bootstrap. Both real readers see the changed
+    # control; cached bootstrap membership would incorrectly authorize it.
+    for snapshot in (endpoint.current, endpoint.fixed):
+        email = next(c for c in snapshot['controls']
+                     if c['selector'] == '#_systemfield_email')
+        if mutation == 'outside-fresh-scope':
+            email['href'] = 'https://unrelated.example.test/foreign'
+        else:
+            email.update(in_form=True, form_selector='#foreign-native',
+                         form_action=entry('ashby'),
+                         native_form_owner_selector='#foreign-native')
+    current = await session.page()
+    assert forms._formless_root(current) and not forms._formless_root(current).get('root')
+    action = {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'}
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            session, current, action, facts=facts, filled=controller.filled,
+            resume_path='', company=COMPANY, jd_text='', resume_tex='', github='',
+            pk=PK, job_url=posting('ashby'), provenance=provenance)
+
+    # A direct raw producer request cannot borrow the previous successful
+    # bootstrap scope or bypass execute-time refusal.
+    observed_before = len([call for call in endpoint.calls
+                           if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)])
+    with pytest.raises(forms.Gate, match='exact human-approved reversible receiver'):
+        await controller.before_ipc(
+            producer, ('fill', '#_systemfield_email', '--value', facts['Email']), {})
+    observed_after = len([call for call in endpoint.calls
+                          if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)])
+    assert observed_after > observed_before
+    assert not controller.filled and not controller.committed
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'select', 'click'}]
+    assert set(row['human_approved_answers']) == set(facts)
+    assert len(writes) == 1

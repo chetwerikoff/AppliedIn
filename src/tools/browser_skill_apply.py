@@ -5135,10 +5135,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 pass
             error = type(exc).__name__
             error = error if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', error) else 'Exception'
-            reason = ('unsupported' if isinstance(exc, bsk.Unavailable)
-                      and exc.code == 'unsupported' else 'none')
-            _LOG.info('resume upload failure pk=%s step=%s exception=%s reason=%s attached=%s',
-                      pk, step, error, reason, attached)
+            reason = exc.code if isinstance(exc, bsk.Unavailable) and exc.code else 'none'
+            effect_state = exc.effect_state if isinstance(exc, bsk.Unavailable) else ''
+            effect = (effect_state if isinstance(effect_state, str)
+                      and re.fullmatch(r'[a-z_]{1,40}', effect_state) else 'none')
+            _LOG.info('resume upload failure pk=%s step=%s exception=%s reason=%s attached=%s effect=%s',
+                      pk, step, error, reason, attached, effect)
             if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
                            "dedicated profile; inspect the attachment before retrying.") from None

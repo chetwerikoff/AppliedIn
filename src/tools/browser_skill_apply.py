@@ -2999,7 +2999,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
             or e.get('visible') is not True
             or e.get('tag') != target.get('tag')
             or e.get('type') != target.get('type')
-            or e.get('required') != target.get('required')
+            or (not (custom or pair_member)
+                and e.get('required') != target.get('required'))
             or e.get('disabled') != target.get('disabled')
             or (not native_label and not (custom or pair_member))
             or target.get('in_form') is not False
@@ -3088,8 +3089,11 @@ def _boolean_pair(page: dict, target: dict) -> list[dict]:
             or len({c.get('selector') for c in members}) != 2
             or any(c.get('type') != 'button' or c.get('native_type') != 'button'
                    or c.get('in_form') is not False or c.get('disabled')
-                   or c.get('required') is not True or c.get('has_value')
-                   or c.get('checked') or c.get('value') not in ('', None)
+                   or c.get('required') is not True
+                   or ((c.get('has_value') or c.get('checked')
+                        or c.get('value') not in ('', None)) and not (
+                        c.get('checked') is True and c.get('has_value') is True
+                        and c.get('value') == str(c.get('label', '')).casefold()))
                    or any(c.get(k) for k in (
                        'submit', 'navigates', 'commits_application', 'href',
                        'form_selector', 'form_action', 'formaction',
@@ -3097,6 +3101,8 @@ def _boolean_pair(page: dict, target: dict) -> list[dict]:
                    for c in members)):
         raise Gate('The Boolean button pair is incomplete or unsafe.',
                    reason='defect_button')
+    if sum(bool(m.get('checked')) for m in members) > 1:
+        raise Gate('More than one Boolean answer is selected.', reason='defect_button')
     for member in members:
         _reversible_entry_recipient(page, member)
     return members
@@ -3235,6 +3241,13 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
 
 
 def _unanswered(page: dict, target: dict) -> bool:
+    if target.get('type') == 'button' and _formless_root(page):
+        try:
+            members = _boolean_pair(page, target)
+        except Gate:
+            members = [target]
+        return any(c.get('required') for c in members) and not any(
+            c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
         return bool(target.get('required')) and not target.get('checked')
     if target.get('type') == 'radio':
@@ -6148,6 +6161,9 @@ class ApplicationIPCController:
                 and _formless_root(page) and not _formless_root(page).get('root')
                 and self._row().get('ats') == 'ashby'):
             page, target = await self._reversible_receiver(session, page, target)
+            if not _unanswered(page, target):
+                raise Gate('The Boolean answer has already been selected.',
+                           reason='defect_button')
             approved = _approved_boolean_pair(page, target, self.pk,
                                               fixture_context=self.fixture_context)
             if not approved or approved[1].get('selector') != selector:

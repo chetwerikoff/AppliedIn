@@ -2630,6 +2630,30 @@ def _greenhouse_not_ready(page, *, witness=False):
 
 
 
+class _ReversibleEntryReader:
+    """ENTRY_PAGE observations on a reversible route; all IPC stays on raw."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getattr__(self, name):
+        # The production application_effect/controller are still owned by
+        # the original guarded raw Session, not by this read adapter.
+        return getattr(self.raw, name)
+
+    async def page(self):
+        result = await self.raw.call('evaluate', ENTRY_PAGE)
+        page = result.get('value') if isinstance(result, dict) else None
+        if not isinstance(page, dict) or not page.get('url'):
+            raise Gate('Reversible preparation page observation is unavailable.')
+        return page
+
+    async def call(self, *args, **kwargs):
+        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
+            args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+        return await self.raw.call(*args, **kwargs)
+
+
 async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                                     provenance, *, deadline: float):
     """Losing a historic shape certificate does not make an approved write a Submit.
@@ -2648,12 +2672,19 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 'truncated application inventory after bounded wait',
                 'unsupported custom control', 'no unique application root')):
             raise
-        if hasattr(raw_session, 'page'):
-            page = await raw_session.page()
+        if isinstance(provenance, ApplicationEntryProvenance):
+            # Raw Session.page() reads generic PAGE without entry.formless.
+            # Keep the raw controller/effects, but use ENTRY_PAGE and its
+            # matching fixed witness for every subsequent reversible read.
+            reversible = _ReversibleEntryReader(raw_session)
+            page = await reversible.page()
         else:
-            # Offline command spies still expose the existing fixed reader.
-            result = await raw_session.call('evaluate', ENTRY_PAGE)
-            page = result.get('value') if isinstance(result, dict) else None
+            reversible = raw_session
+            if hasattr(raw_session, 'page'):
+                page = await raw_session.page()
+            else:
+                result = await raw_session.call('evaluate', ENTRY_PAGE)
+                page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict):
             raise Gate('Reversible preparation page observation is unavailable.')
         if not allowed(page.get('url', '')):
@@ -2662,7 +2693,7 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 provenance.wrapper if provenance is not None else '',
                 page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
-        return raw_session, page
+        return reversible, page
 
 
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,

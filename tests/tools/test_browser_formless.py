@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from tools import browser_skill_apply as forms
+from tools.browser_skill import Session as ProductionBrowserSession
+from tools.browser_skill_dom import PAGE
 from tests.tools.test_browser_application_entry import (
     COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
 )
@@ -2216,19 +2218,21 @@ def _issue184_reversible_session(monkeypatch):
     assert not forms._formless_root(raw.current).get('root')
     raw._application_controller = object()  # Synthetic producer prerequisite.
 
-    async def page():
-        return deepcopy(raw.current)
-
     original_call = raw.call
 
     async def call(method, *args, **kwargs):
-        if method == 'evaluate' and args == (forms._FIXED_CONTROL_WITNESS,):
+        if method == 'evaluate' and args == (PAGE,):
+            # The real Session.page() evaluates generic PAGE. It has no
+            # entry.formless, even when ENTRY_PAGE sees a rootless Ashby form.
             raw.calls.append((method, *args))
-            return {'value': deepcopy(raw.fixed)}
+            generic = deepcopy(raw.current)
+            generic.pop('entry', None)
+            return {'value': generic}
         return await original_call(method, *args, **kwargs)
 
-    raw.page = page
     raw.call = call
+    raw.page = ProductionBrowserSession.page.__get__(raw, RootSession)
+    raw._reversible_session = forms._ReversibleEntryReader(raw)
     return row, raw, provenance
 
 
@@ -2251,14 +2255,37 @@ async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
         monkeypatch, caplog):
     row, raw, provenance = _issue184_reversible_session(monkeypatch)
     _issue184_add_name_phone_controls(raw)
+    # Exercise the real raw Session.page implementation. The generic PAGE
+    # lacks 'entry', so silently using it on the fallback must fail this test.
+    generic = await raw.page()
+    assert generic['url'] == entry('ashby') and 'entry' not in generic
+    allowed = lambda url: url == entry('ashby')
+    scoped = forms._EntrySession(raw, allowed, provenance, resume_path='Resume.pdf')
+    session, page = await forms._entry_or_reversible_page(
+        scoped, raw, allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 0.05)
+    assert isinstance(session, forms._ReversibleEntryReader)
+    assert session.raw is raw and forms._formless_root(page)
+    assert not forms._formless_root(page).get('root')
+    assert any(call == ('evaluate', forms.ENTRY_PAGE) for call in raw.calls)
     writes = _issue182_tracking(monkeypatch, row)
     facts = {'First Name': 'Test', 'Last Name': 'User',
              'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
     with caplog.at_level('INFO', logger=forms.__name__):
         returned = await forms._bootstrap(
-            raw, raw.current, PK, facts, posting('ashby'),
+            session, page, PK, facts, posting('ashby'),
             company=COMPANY, provenance=provenance, global_facts=dict(facts))
-    assert returned is raw.current
+    assert returned is page
+    # The same reader follows post-action reads, with matching fixed witness
+    # for parity. It never falls back to generic Session.page().
+    after = await session.page()
+    assert forms._formless_root(after)
+    reread, witness = await forms._bootstrap_observe_controls(
+        session, after, site='bootstrap-formless')
+    assert forms._formless_root(reread)
+    assert set(witness) == {c['selector'] for c in after['controls']}
+    assert ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS) in raw.calls
+    assert ('evaluate', forms._FIXED_CONTROL_WITNESS) not in raw.calls
     assert len(writes) == 1
     grants = row['human_approved_answers']
     assert set(grants) == set(facts)
@@ -2300,7 +2327,7 @@ async def test_issue184_reversible_exclusions_do_not_create_grants(
     _issue182_tracking(monkeypatch, row)
     facts = {label: value, 'Email': 'synthetic@example.test'}
     returned = await forms._bootstrap(
-        raw, raw.current, PK, facts, posting('ashby'),
+        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
         company=COMPANY, provenance=provenance, global_facts=dict(facts))
     assert returned is raw.current
     assert label not in row['human_approved_answers']
@@ -2320,7 +2347,7 @@ async def test_issue184_reversible_existing_grant_and_overlay_still_win(monkeypa
              'Phone': 'company-only', 'Email': 'synthetic@example.test'}
     global_facts = {**facts, 'Phone': 'global-only'}
     returned = await forms._bootstrap(
-        raw, raw.current, PK, facts, posting('ashby'),
+        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
         company=COMPANY, provenance=provenance, global_facts=global_facts)
     assert returned is raw.current
     assert row['human_approved_answers']['First Name'] == owner_grant
@@ -2340,7 +2367,7 @@ async def test_issue184_reversible_native_owner_outside_scope(monkeypatch):
     _issue182_tracking(monkeypatch, row)
     facts = {'First Name': 'Test', 'Email': 'synthetic@example.test'}
     result = await forms._bootstrap(
-        raw, raw.current, PK, facts, posting('ashby'),
+        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
         company=COMPANY, provenance=provenance, global_facts=facts)
     assert result is raw.current
     assert set(row['human_approved_answers']) == {'Email'}
@@ -2354,7 +2381,7 @@ async def test_issue184_reversible_without_controller_mints_nothing(monkeypatch)
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
     with pytest.raises(forms.Gate, match='application IPC controller'):
         await forms._bootstrap(
-            raw, raw.current, PK, facts, posting('ashby'),
+            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
             company=COMPANY, provenance=provenance, global_facts=facts)
     assert row['human_approved_answers'] == {}
     assert writes == [] and raw.calls == []
@@ -2371,7 +2398,7 @@ async def test_issue184_reversible_observation_gate_returns_original_page(
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
     with caplog.at_level('INFO', logger=forms.__name__):
         result = await forms._bootstrap(
-            raw, raw.current, PK, facts, posting('ashby'),
+            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
             company=COMPANY, provenance=provenance, global_facts=facts)
     assert result is raw.current and row['human_approved_answers'] == {}
     observe.assert_awaited_once()
@@ -2395,7 +2422,7 @@ async def test_issue184_reversible_disallowed_fresh_origin_returns_page(monkeypa
     monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
     result = await forms._bootstrap(
-        raw, raw.current, PK, facts, posting('ashby'),
+        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
         company=COMPANY, provenance=provenance, global_facts=facts)
     assert result is raw.current and row['human_approved_answers'] == {}
     observe.assert_awaited_once()

@@ -267,6 +267,12 @@ async def test_unwritable_multivalue_select_has_exact_defect_and_no_model(monkey
             if c['selector'] == '#certification':
                 c['type'] = 'MultiValueSelect'
                 c['combobox'] = None
+        # A real unsupported widget appears in both independent readers.
+        # A PAGE-only type change is a receiver-identity defect instead.
+        for evidence in snapshot['entry']['root_evidence']:
+            evidence['required'] = evidence['selector'] == '#certification'
+            if evidence['selector'] == '#certification':
+                evidence['type'] = 'MultiValueSelect'
     result = await _apply(pdf)
     assert result['status'] == 'gate'
     assert result['reason'] == 'defect_multivalueselect'

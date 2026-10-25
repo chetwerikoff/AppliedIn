@@ -2784,7 +2784,18 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         value = result.get('value') if isinstance(result, dict) else None
         require(isinstance(value, dict), 'witness.object')
         if isinstance(session, (_EntrySession, _ReversibleEntryReader)):
-            require(value.get('entry') == page.get('entry'), 'entry.equal')
+            expected_entry, witness_entry = page.get('entry'), value.get('entry')
+            if expected_entry != witness_entry:
+                # The object must still match exactly. Name only the first
+                # differing structural key, never its DOM-derived contents.
+                differing_key = 'other'
+                if isinstance(expected_entry, dict) and isinstance(witness_entry, dict):
+                    missing = object()
+                    differing_key = next((
+                        key for key in _REVERSIBLE_ENTRY_KEYS
+                        if expected_entry.get(key, missing) != witness_entry.get(key, missing)
+                    ), 'other')
+                require(False, f'entry.equal.{differing_key}')
         if isinstance(session, _GreenhouseSession):
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
@@ -2878,7 +2889,9 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
     except Gate:
         raise
     except (Exception, asyncio.CancelledError) as exc:
-        if (isinstance(exc, ValueError) and predicate == 'controls.length.equal'
+        if (isinstance(exc, ValueError)
+                and (predicate == 'controls.length.equal'
+                     or predicate.startswith('entry.equal.'))
                 and site in {'bootstrap-formless', 'bootstrap-material'}
                 and _identity_try < 4):
             await asyncio.sleep(0.25)
@@ -4011,6 +4024,12 @@ _REVERSIBLE_BOOTSTRAP_SAFE_GATES = frozenset({
     'Tracked row changed before automatic approval.',
     'Stored approval shape is invalid.',
 })
+_REVERSIBLE_ENTRY_KEYS = (
+    'frames', 'responses', 'response_error', 'root', 'native_candidates',
+    'formless', 'root_evidence', 'upload_tree', 'helper_challenge',
+)
+
+
 _REVERSIBLE_WITNESS_PREDICATES = frozenset({
     'witness.object', 'entry.equal', 'url.equal', 'controls.list',
     'controls.length.equal', 'control.object', 'selector.unique',
@@ -4019,7 +4038,9 @@ _REVERSIBLE_WITNESS_PREDICATES = frozenset({
     'visible_text.equal', 'options.equal', 'combobox.object',
     'combobox.PAGE.object', 'combobox.equal', 'combobox.linked.shape',
     'visible.bool', 'readonly.bool', 'inert.bool', 'inventory.identity.equal',
-}) | frozenset(f'{name}.equal' for name in (
+}) | frozenset(
+    f'entry.equal.{key}' for key in (*_REVERSIBLE_ENTRY_KEYS, 'other')
+) | frozenset(f'{name}.equal' for name in (
     'tag', 'type', 'native_type', 'in_form', 'form_selector', 'form_action',
     'formaction', 'disabled', 'native_form_owner_selector',
     'form_action_attr_present', 'form_action_raw', 'formaction_attr_present',

@@ -15,7 +15,79 @@ import pytest
 
 from tools import browser_skill_apply as forms
 from tools.browser_skill import Session as ProductionBrowserSession
-from tools.browser_skill_dom import PAGE
+from tools.browser_skill_dom import PAGE, _ENTRY_OBSERVATION
+
+def _entry_js_const(script, name):
+    """Extract a top-level JavaScript const without evaluating either reader."""
+    found = re.search(rf'(?m)^  const {re.escape(name)}\s*=', script)
+    assert found, f'Missing JS binding: {name}'
+    tail = script[found.start():]
+    if re.match(r'  const \w+ = \w+ => \{', tail):
+        end = tail.index('\n  };') + len('\n  };')
+    else:
+        end = tail.index(';') + 1
+    return tail[:end]
+
+
+def _entry_host_identifiers(script):
+    """Discover every injected entry reference bound by the host prefix."""
+    prefix, separator, _ = script.partition(_ENTRY_OBSERVATION)
+    assert separator and script.count(_ENTRY_OBSERVATION) == 1
+    host = set(re.findall(
+        r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', prefix))
+    # Ignore literal text, comments, property reads and object field names:
+    # those are not identifiers bound by the PAGE/fixed host.
+    code = re.sub(
+        r"""(?s)'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*""",
+        ' ', _ENTRY_OBSERVATION)
+    referenced = {
+        match.group(1)
+        for match in re.finditer(r'(?<![\w$.])([A-Za-z_$][\w$]*)', code)
+        if not re.match(r'\s*:', code[match.end():])
+    }
+    return {name: _entry_js_const(script, name) for name in host & referenced}
+
+
+def test_entry_readers_have_identical_host_bindings():
+    """No new host predicate may silently change the independently read entry."""
+    page = _entry_host_identifiers(forms.ENTRY_PAGE)
+    fixed = _entry_host_identifiers(forms._ENTRY_FIXED_CONTROL_WITNESS)
+    assert page == fixed
+    assert set(page) == {'clean', 'selector', 'query'}
+    # These other entry dependencies are defined inside the identical injected
+    # block, not borrowed from either host.
+    shared = {'rectOf', 'container', 'structuralRoot', 'exactSubmit', 'forms',
+              'containers', 'submitters', 'excluded', 'entryLabel',
+              'candidateVisible', 'entryVisible', 'entryEvidenceVisible'}
+    declarations = set(re.findall(
+        r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', _ENTRY_OBSERVATION))
+    assert shared <= declarations
+
+
+def test_entry_visibility_uses_exact_fixed_witness_predicate():
+    """Keep the root proof strict without altering ordinary host control reads."""
+    local = _entry_js_const(_ENTRY_OBSERVATION, 'entryEvidenceVisible')
+    fixed = _entry_js_const(forms._FIXED_CONTROL_WITNESS, 'visible')
+    assert local.replace('const entryEvidenceVisible', 'const visible', 1) == fixed
+    assert 'if (!entryEvidenceVisible(e)) return false;' in _ENTRY_OBSERVATION
+    assert 'visible:entryVisible(e)' in _ENTRY_OBSERVATION
+    assert 'visible:entryEvidenceVisible(e)' in _ENTRY_OBSERVATION
+    assert '!entryEvidenceVisible(drop)' in _ENTRY_OBSERVATION
+    assert not re.search(r'(?<![\w$.])visible\s*\(', _ENTRY_OBSERVATION)
+
+
+@pytest.mark.parametrize('case, clause', [
+    ('opacity:0 ancestor', '!(Number(style.opacity) > 0)'),
+    ('display:none ancestor', "style.display === 'none'"),
+])
+def test_root_evidence_visibility_rejects_hidden_ancestors(case, clause):
+    """Static ancestor proof: no browser or JavaScript execution is necessary."""
+    predicate = _entry_js_const(_ENTRY_OBSERVATION, 'entryEvidenceVisible')
+    assert 'for (let n=e; n && n.nodeType===1; n=n.parentElement)' in predicate
+    assert clause in predicate, case
+    assert 'return false;' in predicate
+    assert 'visible:entryVisible(e)' in _ENTRY_OBSERVATION
+
 from tests.tools.test_browser_application_entry import (
     COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
 )

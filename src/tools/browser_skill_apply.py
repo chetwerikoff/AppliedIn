@@ -2748,7 +2748,6 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
             session._readiness = prior_readiness
 
 
-
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
 _BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
@@ -6411,6 +6410,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
+                        # An unguarded producer cannot bind a controller question
+                        # from untrusted model prose; keep the model gate unbound.
+                        if producer_guard is None and ctx is None:
+                            raise Gate(str(action.get('question') or 'This form needs your input.'))
                         # Newly hydrated controls also need the original root
                         # and entry safety checks before replacing model prose.
                         fresh = await session.page()

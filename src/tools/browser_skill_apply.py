@@ -2748,12 +2748,6 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 
 
-_REVERSIBLE_ENTRY_KEYS = (
-    'frames', 'responses', 'response_error', 'root', 'native_candidates',
-    'formless', 'root_evidence', 'upload_tree', 'helper_challenge',
-)
-
-
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
 _BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
@@ -4030,6 +4024,12 @@ _REVERSIBLE_BOOTSTRAP_SAFE_GATES = frozenset({
     'Tracked row changed before automatic approval.',
     'Stored approval shape is invalid.',
 })
+_REVERSIBLE_ENTRY_KEYS = (
+    'frames', 'responses', 'response_error', 'root', 'native_candidates',
+    'formless', 'root_evidence', 'upload_tree', 'helper_challenge',
+)
+
+
 _REVERSIBLE_WITNESS_PREDICATES = frozenset({
     'witness.object', 'entry.equal', 'url.equal', 'controls.list',
     'controls.length.equal', 'control.object', 'selector.unique',

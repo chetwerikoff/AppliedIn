@@ -3841,12 +3841,34 @@ def _bank_auto_eligible(item: dict, value: str, *,
     return True
 
 
+_BANK_AUTO_LOG_KEYS = {
+    'name': 'Name', 'full name': 'Full Name',
+    'first name': 'First Name', 'last name': 'Last Name',
+    'email': 'Email', 'email address': 'Email',
+    'phone': 'Phone', 'phone number': 'Phone', 'telephone': 'Phone',
+    'country': 'Country', 'city': 'City', 'location city': 'Location City',
+}
+
+
+def _bank_auto_log_skip(pk: str, item: dict, why: str, key: str | None = None) -> None:
+    # Keep untrusted DOM questions, IDs and attributes out of the daemon log.
+    # Only whole known fact-key names or value-free structural selectors survive.
+    raw = key if key is not None else (item.get('question') or item.get('label'))
+    known = (_BANK_AUTO_LOG_KEYS.get(normalize_label(raw))
+             if isinstance(raw, str) else None)
+    name = known or _control_selector_display(item.get('selector'))
+    _LOG.info('bank-auto skip pk=%s key=%s why=%s', pk, name, why)
+
+
 def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             global_facts: dict, *origins: str,
                             provenance=None, fixture_context=None,
                             formless_selectors: frozenset[str] = frozenset(),
                             reversible_scope: frozenset[str] | None = None) -> None:
     if not global_facts or not pk:
+        if pk and not global_facts:
+            for item in page['controls']:
+                _bank_auto_log_skip(pk, item, 'no_global')
         return
     row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
            else _row(pk))
@@ -3861,45 +3883,65 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         if (reversible_scope is not None and (
                 item.get('in_form') is not False
                 or item.get('selector') not in reversible_scope)):
+            _bank_auto_log_skip(pk, item, 'not_in_scope')
             continue
         if ((not item.get('in_form')
              and item.get('selector') not in formless_selectors)
                 or item.get('disabled')):
+            _bank_auto_log_skip(pk, item, (
+                'not_eligible' if item.get('disabled') else 'not_in_scope'))
             continue
         if item.get('type') in {'radio', 'checkbox'}:
             if item.get('checked'):
+                _bank_auto_log_skip(pk, item, 'has_value')
                 continue
         elif item.get('has_value') or (item.get('type') == 'combobox' and
                                       (item.get('combobox') or {}).get('selected_text')):
+            _bank_auto_log_skip(pk, item, 'has_value')
             continue
         try:
             key = _key(page, item)
         except Gate:
+            _bank_auto_log_skip(pk, item, 'no_key')
             continue
         if key in grants or key in pending:
+            _bank_auto_log_skip(pk, item, 'not_eligible', key)
             continue
         global_key = _fact_key(global_facts, key)
         fact_key = _fact_key(facts, key)
         if global_key is None or fact_key is None:
+            _bank_auto_log_skip(pk, item, 'no_global', key)
             continue
         value = str(global_facts[global_key]).strip()
-        if (not value or str(facts[fact_key]).strip() != value
-                or not _bank_auto_eligible(
-                    item, value, formless_selectors=formless_selectors)):
+        if not value:
+            _bank_auto_log_skip(pk, item, 'not_eligible', key)
+            continue
+        if str(facts[fact_key]).strip() != value:
+            _bank_auto_log_skip(pk, item, 'value_mismatch', key)
+            continue
+        if not _bank_auto_eligible(
+                item, value, formless_selectors=formless_selectors):
+            _bank_auto_log_skip(pk, item, 'not_eligible', key)
             continue
         try:
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=False,
                 provenance=provenance, reversible_scope=reversible_scope)
-            if item.get('type') == 'radio':
+        except Gate:
+            _bank_auto_log_skip(pk, item, 'disclosure_gate', key)
+            continue
+        if item.get('type') == 'radio':
+            try:
                 members = _radio_group(page, item)
                 matches = [m for m in members if value.casefold() in {
                     m['label'].casefold(), str(m.get('value') or '').casefold()}]
                 if len(matches) != 1:
+                    _bank_auto_log_skip(pk, item, 'radio_mismatch', key)
                     continue
                 guarded_value(matches[0], value)
-        except Gate:
-            continue
+            except Gate:
+                _bank_auto_log_skip(pk, item, 'radio_mismatch', key)
+                continue
         grant = {
             'value': value, 'selector': question['selector'],
             'url': question['url'], 'label': question['control_label'],
@@ -3962,6 +4004,57 @@ def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> lis
     return result
 
 
+_REVERSIBLE_BOOTSTRAP_SAFE_GATES = frozenset({
+    'The reversible observation left the preparation origin.',
+    'Reversible preparation page observation is unavailable.',
+    'The current form control inventory is malformed.',
+    'Tracked row changed before automatic approval.',
+    'Stored approval shape is invalid.',
+})
+_REVERSIBLE_WITNESS_PREDICATES = frozenset({
+    'witness.object', 'entry.equal', 'url.equal', 'controls.list',
+    'controls.length.equal', 'control.object', 'selector.unique',
+    'selector.equal', 'unique.true', 'unique_form.true',
+    'visible_text.string', 'visible_text.required_nonempty',
+    'visible_text.equal', 'options.equal', 'combobox.object',
+    'combobox.PAGE.object', 'combobox.equal', 'combobox.linked.shape',
+    'visible.bool', 'readonly.bool', 'inert.bool', 'inventory.identity.equal',
+}) | frozenset(f'{name}.equal' for name in (
+    'tag', 'type', 'native_type', 'in_form', 'form_selector', 'form_action',
+    'formaction', 'disabled', 'native_form_owner_selector',
+    'form_action_attr_present', 'form_action_raw', 'formaction_attr_present',
+    'formaction_raw', 'commits_application',
+)) | frozenset(f'combobox.{name}.equal' for name in (
+    'link_id', 'linked', 'listbox_selector', 'options', 'selected_text',
+    'displayed_text', 'selected_value', 'hidden_selector', 'hidden_value',
+))
+_REVERSIBLE_WITNESS_TEXT = re.compile(
+    r'The current DOM witness is unavailable or changed; '
+    r'exception=([A-Za-z][A-Za-z0-9_]{0,79}); '
+    r'predicate=([a-z][a-z0-9_.]{0,79}); control=(.*?)'
+    r'(?:; site=bootstrap-formless)?\Z'
+)
+_REVERSIBLE_WITNESS_EXCEPTIONS = frozenset({
+    'ValueError', 'TypeError', 'AttributeError', 'KeyError', 'OSError',
+    'TimeoutError', 'CancelledError', 'Unavailable', 'Exception',
+})
+
+
+def _reversible_bootstrap_gate_text(gate: Gate) -> str:
+    # Gate messages are not uniformly safe: some contain observed page text.
+    # Preserve the code-owned witness diagnostic but fail closed for unknown text.
+    message = str(gate)
+    if message in _REVERSIBLE_BOOTSTRAP_SAFE_GATES:
+        return message[:200]
+    match = _REVERSIBLE_WITNESS_TEXT.fullmatch(message)
+    if (match and match[1] in _REVERSIBLE_WITNESS_EXCEPTIONS
+            and match[2] in _REVERSIBLE_WITNESS_PREDICATES
+            and (match[3] == 'unavailable'
+                 or _safe_diagnostic(match[3]) == match[3])):
+        return message[:200]
+    return '[redacted]'
+
+
 def _bootstrap_grant_diagnostics(fn):
     @wraps(fn)
     async def recorded(session, page: dict, pk: str, *args, **kwargs):
@@ -4014,7 +4107,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                         fresh, witness, pk, facts, global_facts or {}, *origins,
                         provenance=provenance, fixture_context=fixture_context,
                         formless_selectors=scope, reversible_scope=scope)
-                except Gate:
+                except Gate as gate:
+                    _LOG.info('reversible bootstrap gate pk=%s reason=%s text=%s',
+                              pk, gate.reason, _reversible_bootstrap_gate_text(gate))
                     pass  # A missing historic root still cannot block preparation.
                 return page
             raise Gate('Formless preparation requires the code-owned application IPC controller.')

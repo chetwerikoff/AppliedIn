@@ -6151,6 +6151,7 @@ class ApplicationIPCController:
                 raise Gate('The clicked radio/checkbox is not the exact approved answer.')
             return
         if (target.get('tag') == 'button' and target.get('type') == 'button'
+                and str(target.get('label') or '').casefold() in {'yes', 'no'}
                 and _formless_root(page) and not _formless_root(page).get('root')
                 and self._row().get('ats') == 'ashby'):
             page, target = await self._reversible_receiver(session, page, target)

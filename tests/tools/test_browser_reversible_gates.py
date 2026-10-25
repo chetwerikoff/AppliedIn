@@ -41,7 +41,8 @@ def _fixture(monkeypatch, tmp_path, **shape):
             control = deepcopy(sample)
             control.update(selector=selector, id=selector[1:], name=name,
                            label=label, question=label, tag=tag, type=kind,
-                           native_type=kind if tag in {'input', 'button'} else '',
+                           native_type=('text' if kind == 'combobox' and tag == 'input'
+                                        else kind if tag in {'input', 'button'} else ''),
                            value='', has_value=False, checked=False, required=True,
                            submit=False, commits_application=False,
                            in_form=False, native_form_owner_selector='',
@@ -65,6 +66,23 @@ def _fixture(monkeypatch, tmp_path, **shape):
             else:
                 control['combobox'] = None
             snapshot['controls'].append(control)
+            # The fixed reader must independently identify the same receiver
+            # INSIDE the application. A PAGE-only appended control has no grant
+            # authority regardless of its label and required flag.
+            evidence_sample = next(e for e in snapshot['entry']['root_evidence']
+                                   if e['selector'] == '#_systemfield_name')
+            evidence = deepcopy(evidence_sample)
+            evidence.update(
+                selector=selector, id=selector[1:],
+                tag=tag, type=kind, native_type=control['native_type'],
+                label=label if tag == 'input' else '',
+                associated=tag == 'input',
+                inside=True, in_container=True, unique=True,
+                native_owner='', declared_owner='', formaction=None,
+                submit=False, dropzone=False, iti=False, contenteditable=False,
+                visible=True, readonly=False, disabled=False, inert=False,
+                required=True, value='', files=[])
+            snapshot['entry']['root_evidence'].append(evidence)
 
     _session, tracking, pdf = install_controller_session(
         monkeypatch, row, endpoint, tmp_path)
@@ -122,6 +140,8 @@ def _answer(row, stores, gate, value):
         observed = grant['label'] if k == 'control_label' else grant[k]
         assert observed == expected
     assert grant['value'] == value
+    if q['type'] == 'button':
+        assert grant['boolean_members'] == q['boolean_members']
     return q
 
 
@@ -142,30 +162,26 @@ async def test_reversible_required_questions_resume_in_observed_order(monkeypatc
     assert not decision.await_count
     _answer(row, stores, second, '2026-11-10')
 
-    blocked = await _apply(pdf, {'Location': 'Remote', 'Start date': '2026-11-10'})
-    assert blocked['reason'] == 'defect_button'
-    assert blocked['review_route'] == 'hard_refusal'
-    assert blocked['form_question'] is None
-    assert 'agent_unavailable' not in str(blocked)
+    boolean = await _apply(pdf, {'Location': 'Remote', 'Start date': '2026-11-10'})
+    assert boolean['reason'] == 'owner_question'
+    assert boolean['form_question']['type'] == 'button'
+    assert boolean['form_question']['boolean_members'] == [
+        {'selector': '#boolean-yes', 'caption': 'Yes', 'value': 'yes'},
+        {'selector': '#boolean-no', 'caption': 'No', 'value': 'no'}]
     assert not decision.await_count
     assert set(row['human_approved_answers']) == {'Location', 'Start date'}
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
-
-    # Certification is still owned by the human. This synthetic Boolean
-    # button pair cannot be written and is therefore excluded from this
-    # independent *grant* check; it never becomes an automatic yes.
-    for snapshot in (endpoint.current, endpoint.fixed):
-        for c in snapshot['controls']:
-            if c['selector'] in {'#boolean-yes', '#boolean-no'}:
-                c['required'] = False
+    _answer(row, stores, boolean, 'No')
     certification = await _apply(
-        pdf, {'Location': 'Remote', 'Start date': '2026-11-10'})
+        pdf, {'Location': 'Remote', 'Start date': '2026-11-10',
+              'Work arrangement?': 'No'})
     assert certification['form_question']['type'] == 'combobox'
     assert 'certify' in certification['form_question']['label']
     _answer(row, stores, certification, 'I certify')
     assert 'I certify that these synthetic statements are true' not in stores.answer_bank.values
     assert set(row['human_approved_answers']) == {
-        'Location', 'Start date', 'I certify that these synthetic statements are true'}
+        'Location', 'Start date', 'Work arrangement?',
+        'I certify that these synthetic statements are true'}
 
 
 @pytest.mark.asyncio
@@ -271,3 +287,255 @@ async def test_no_required_question_keeps_original_model_gate(monkeypatch, tmp_p
     assert result['review_route'] == 'agent_unavailable'
     assert result['reason'] == 'unknown_field'
     assert result['form_question'] is None
+
+
+def _only_required(endpoint, selectors):
+    """Keep PAGE and independent ENTRY receiver requirements identical."""
+    for snapshot in (endpoint.current, endpoint.fixed):
+        for control in snapshot['controls']:
+            if control['selector'] != '#dropzone':
+                control['required'] = control['selector'] in selectors
+        for evidence in snapshot['entry']['root_evidence']:
+            if evidence['selector'] != '#dropzone':
+                evidence['required'] = evidence['selector'] in selectors
+
+
+def _witnessed_native(endpoint, *, selector, kind, label, question, name, value):
+    for snapshot in (endpoint.current, endpoint.fixed):
+        sample = next(c for c in snapshot['controls'] if c['selector'] == '#start-date')
+        control = deepcopy(sample)
+        control.update(
+            selector=selector, id=selector[1:], tag='input', type=kind,
+            native_type=kind, label=label, question=question, name=name,
+            value=value, has_value=False, required=True, checked=False,
+            disabled=False, visible=True, readonly=False, inert=False,
+            combobox=None, visible_text=label)
+        snapshot['controls'].append(control)
+        original = next(e for e in snapshot['entry']['root_evidence']
+                        if e['selector'] == '#start-date')
+        e = deepcopy(original)
+        e.update(selector=selector, id=selector[1:], tag='input', type=kind,
+                 native_type=kind, label=label, associated=True, value=value,
+                 required=True, unique=True, in_container=True, inside=True,
+                 visible=True, disabled=False, readonly=False, inert=False)
+        snapshot['entry']['root_evidence'].append(e)
+
+
+def _record_choice_click(endpoint, selector, value):
+    previous = endpoint.call
+
+    async def call(method, *args, **kwargs):
+        outcome = await previous(method, *args, **kwargs)
+        if method == 'click' and args == (selector,):
+            for snapshot in (endpoint.current, endpoint.fixed):
+                for control in (snapshot['controls'] +
+                                snapshot['entry']['root_evidence']):
+                    if control['selector'] == selector:
+                        control.update(value=value, has_value=True, checked=True)
+        return outcome
+
+    endpoint.call = call
+
+
+@pytest.mark.asyncio
+async def test_boolean_pair_grant_only_clicks_witnessed_selected_member(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    assert gate['reason'] == 'owner_question'
+    assert gate['form_question']['control_label'] == 'Yes'
+    assert not decision.await_count
+    assert not [call for call in endpoint.calls if call[0] == 'click']
+    _answer(row, stores, gate, 'No')
+    _record_choice_click(endpoint, '#boolean-no', 'no')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Work arrangement?': 'No'})
+    assert result['status'] == 'gate'
+    assert decision.await_count == 2
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [
+        ('click', '#boolean-no')]
+    assert row['human_approved_answers']['Work arrangement?']['value'] == 'No'
+
+
+@pytest.mark.asyncio
+async def test_boolean_pair_rejects_unapproved_member_before_click(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    _answer(row, stores, gate, 'Yes')
+    decision.return_value = {
+        'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'}
+    result = await _apply(pdf, {'Work arrangement?': 'Yes'})
+    assert result['status'] == 'gate'
+    assert [c for c in endpoint.calls if c[0] == 'click'] == []
+
+
+@pytest.mark.parametrize('untrusted', ['no-evidence', 'off-container', 'excluded'])
+@pytest.mark.asyncio
+async def test_foreign_required_ownerless_receiver_never_discloses_or_writes(
+        monkeypatch, tmp_path, untrusted):
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    for snapshot in (endpoint.current, endpoint.fixed):
+        original = next(c for c in snapshot['controls']
+                        if c['selector'] == '#start-date')
+        foreign = deepcopy(original)
+        foreign.update(selector='#foreign-required', id='foreign-required',
+                       name='foreign-required', label='Foreign required',
+                       question='Foreign required', type='text', native_type='text',
+                       value='', has_value=False, required=True, combobox=None)
+        index = next(i for i, c in enumerate(snapshot['controls'])
+                     if c['selector'] == '#location')
+        snapshot['controls'].insert(index, foreign)
+        if untrusted != 'no-evidence':
+            source = next(e for e in snapshot['entry']['root_evidence']
+                          if e['selector'] == '#start-date')
+            witness = deepcopy(source)
+            witness.update(selector='#foreign-required', id='foreign-required',
+                           label='Foreign required', type='text',
+                           native_type='text', required=True,
+                           associated=untrusted == 'excluded',
+                           in_container=untrusted == 'excluded',
+                           inside=untrusted == 'excluded',
+                           value='', files=[])
+            snapshot['entry']['root_evidence'].append(witness)
+        if untrusted == 'excluded':
+            snapshot['entry']['formless']['excluded'].append('#foreign-required')
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert result['reason'] == 'defect_receiver'
+    assert result['review_route'] == 'hard_refusal'
+    assert result['form_question'] is None
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls if c[0] in {
+        'fill', 'click', 'select', 'upload'}]
+    # Even the raw IPC producer, not only the planner, refuses the receiver.
+    raw = SimpleNamespace(call=endpoint.call)
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), pdf, {}, {}, [], {}, lambda: None)
+    foreign = next(c for c in endpoint.current['controls']
+                   if c['selector'] == '#foreign-required')
+    with pytest.raises(forms.Gate) as refusal:
+        await controller._reversible_receiver(raw, endpoint.current, foreign)
+    assert refusal.value.reason == 'defect_receiver'
+
+
+@pytest.mark.parametrize('relevant', [False, True])
+@pytest.mark.asyncio
+async def test_hidden_witness_only_blocks_application_receivers(
+        monkeypatch, tmp_path, relevant):
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    for snapshot in (endpoint.current, endpoint.fixed):
+        source = next(e for e in snapshot['entry']['root_evidence']
+                      if e['selector'] == '#start-date')
+        hidden = deepcopy(source)
+        hidden.update(selector='#unrelated-hidden', id='unrelated-hidden',
+                      type='hidden', native_type='hidden', label='', value='',
+                      required=False, associated=False,
+                      in_container=relevant, inside=relevant, visible=False)
+        snapshot['entry']['root_evidence'].append(hidden)
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert result['reason'] == ('defect_structural' if relevant else 'owner_question')
+    assert result['form_question'] is None if relevant else (
+        result['form_question']['selector'] == '#location')
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
+
+
+@pytest.mark.asyncio
+async def test_native_owner_checkbox_answer_and_guarded_choose(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, set())
+    _witnessed_native(endpoint, selector='#accept', kind='checkbox',
+                      label='I agree', question='I agree to the terms',
+                      name='accept', value='yes')
+    gate = await _apply(pdf)
+    assert gate['reason'] == 'owner_question'
+    assert gate['form_question']['type'] == 'checkbox'
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls if c[0] == 'click']
+    _answer(row, stores, gate, 'yes')
+    assert 'I agree to the terms' not in stores.answer_bank.values
+    _record_choice_click(endpoint, '#accept', 'yes')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#accept', 'fact': 'I agree to the terms'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert decision.await_count == 2
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [
+        ('click', '#accept')]
+
+
+@pytest.mark.asyncio
+async def test_witnessed_native_radio_owner_question_and_guarded_choose(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, set())
+    _witnessed_native(endpoint, selector='#radio-remote', kind='radio',
+                      label='Remote', question='Preferred setup?',
+                      name='setup', value='remote')
+    _witnessed_native(endpoint, selector='#radio-onsite', kind='radio',
+                      label='On site', question='Preferred setup?',
+                      name='setup', value='onsite')
+    gate = await _apply(pdf)
+    assert gate['reason'] == 'owner_question'
+    assert gate['form_question']['type'] == 'radio'
+    assert len(gate['form_question']['radio_members']) == 2
+    assert not decision.await_count
+    _answer(row, stores, gate, 'Remote')
+    _record_choice_click(endpoint, '#radio-remote', 'remote')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#radio-remote', 'fact': 'Preferred setup?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Preferred setup?': 'Remote'})
+    assert result['status'] == 'gate'
+    assert decision.await_count == 2
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [
+        ('click', '#radio-remote')]
+
+
+@pytest.mark.asyncio
+async def test_unwitnessed_native_radio_member_is_named_defect(monkeypatch, tmp_path):
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, set())
+    _witnessed_native(endpoint, selector='#radio-remote', kind='radio',
+                      label='Remote', question='Preferred setup?',
+                      name='setup', value='remote')
+    _witnessed_native(endpoint, selector='#radio-onsite', kind='radio',
+                      label='On site', question='Preferred setup?',
+                      name='setup', value='onsite')
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['root_evidence'] = [
+            e for e in snapshot['entry']['root_evidence']
+            if e['selector'] != '#radio-onsite']
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert result['reason'] == 'defect_radio'
+    assert result['form_question'] is None
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls if c[0] == 'click']
+
+
+@pytest.mark.asyncio
+async def test_date_only_populated_field_guards_opaque_continue_before_click(monkeypatch):
+    # All unrelated controls absent: the populated date alone is private data.
+    target = {'selector': '#continue', 'tag': 'button', 'type': 'button',
+              'native_type': 'button', 'label': 'Continue', 'disabled': False,
+              'submit': False, 'navigates': False, 'commits_application': False}
+    page = {'url': entry('ashby'), 'controls': [
+        {'selector': '#date', 'type': 'date',
+         'value': '2026-11-10', 'has_value': True},
+        target]}
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=page))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda url: None)
+    final_guard = AsyncMock(side_effect=forms.Gate(
+        'The final Submit guard must decide before a possibly committing click.'))
+    monkeypatch.setattr(controller, 'authorize_final_submit', final_guard)
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(SimpleNamespace(), ('click', '#continue'), {})
+    final_guard.assert_awaited_once()
+    assert controller.committed is False

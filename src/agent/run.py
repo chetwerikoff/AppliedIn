@@ -1022,12 +1022,16 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or field.get('tag') not in {'input', 'textarea', 'select', 'div'}
             or not isinstance(field.get('type'), str)
             or ((field['tag'] == 'input' and field['type'] not in {
-                    'text', 'email', 'tel', 'url', 'number', 'checkbox', 'radio', 'combobox'})
+                    'text', 'email', 'tel', 'url', 'number', 'date', 'checkbox', 'radio', 'combobox'})
                 or (field['tag'] == 'div' and field['type'] != 'combobox')
                 or (field['tag'] == 'textarea' and field['type'] != 'textarea')
                 or (field['tag'] == 'select' and field['type'] != 'select'))
-            or any(not isinstance(field.get(k), str) or not field[k].strip()
-                   for k in ('form_selector', 'form_action'))
+            or (field.get('owner_kind') == 'ashby-reversible-entry' and (
+                 row.get('ats') != 'ashby' or field.get('form_selector') != ''
+                 or field.get('form_action') != ''))
+            or (field.get('owner_kind') != 'ashby-reversible-entry' and
+                any(not isinstance(field.get(k), str) or not field[k].strip()
+                    for k in ('form_selector', 'form_action')))
             or (field['type'] == 'checkbox' and (
                  not isinstance(field.get('visible_text'), str)
                  or not field['visible_text'].strip()

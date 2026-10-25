@@ -2783,9 +2783,18 @@ async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
         target.update(tag='textarea', type='textarea')
     elif case == 'radio_mismatch':
         target.update(tag='input', type='radio', native_type='radio',
-                      question='Name', label='Option A', name='synthetic-radio')
-        # Isolate the post-disclosure radio-group branch; one member cannot
-        # satisfy the real _radio_group invariant and must stay unapproved.
+                      question='Name', label='Option A', name='synthetic-radio',
+                      value='choice-a')
+        sibling = deepcopy(target)
+        sibling.update(selector='#synthetic-radio-b', label='Option B',
+                       value='choice-b')
+        page['controls'].append(sibling)
+        # _key validates the group before disclosure; provide two independently
+        # identified synthetic members whose values cannot match the bank fact.
+        page['entry']['root_evidence'] = [
+            {'selector': member['selector'], 'in_container': True, 'associated': True}
+            for member in page['controls']
+        ]
         monkeypatch.setattr(forms, '_disclosure_question',
                             lambda *args, **kwargs: {'selector': target['selector']})
     elif case == 'already_granted':
@@ -2797,7 +2806,7 @@ async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
                       value='already-filled-synthetic')
 
     prior = deepcopy(row['human_approved_answers'])
-    scope = frozenset({target['selector']})
+    scope = frozenset(member['selector'] for member in page['controls'])
     with monkeypatch.context() as capture:
         capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
         forms._auto_grant_from_global(
@@ -2808,11 +2817,12 @@ async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
 
     assert row['human_approved_answers'] == prior and writes == []
     lines = [line for line in output.splitlines() if 'bank-auto skip pk=' in line]
-    assert len(lines) == 1
+    # Both radio members are skipped; each must have one production INFO line.
+    assert len(lines) == (2 if case == 'radio_mismatch' else 1)
     expected = f'bank-auto skip pk={PK} key={key} why={reason}'
-    assert re.fullmatch(
+    assert all(re.fullmatch(
         rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(expected)}',
-        lines[0])
+        line) for line in lines)
     for secret in ('Test User', 'synthetic@example.test', 'company-only',
                    'global-only', 'already-filled-synthetic', 'synthetic-explicit'):
         assert secret not in output

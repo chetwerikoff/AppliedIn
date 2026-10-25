@@ -4779,6 +4779,28 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                 or native_submit(item)):
             continue
         if rootless and item.get('selector') not in scope:
+            # A positively witnessed but unsupported application widget
+            # receives its type-specific defect, never a grant. An off-container,
+            # excluded, missing or contradictory receiver remains defect_receiver.
+            writable_kind = (_native_answer(item)
+                             or kind == 'combobox' and item.get('tag') in {'input', 'div'}
+                             or kind in {'radio', 'checkbox'} and item.get('tag') == 'input'
+                             or kind == 'button' and item.get('tag') == 'button')
+            evidence = current['entry'].get('root_evidence', [])
+            matches = [e for e in evidence
+                       if e.get('selector') == item.get('selector')]
+            if (not writable_kind and len(matches) == 1
+                    and matches[0].get('unique') is True
+                    and matches[0].get('in_container') is True
+                    and matches[0].get('tag') == item.get('tag')
+                    and matches[0].get('type') == kind
+                    and item.get('selector') not in (
+                        _formless_root(current).get('excluded') or [])
+                    and not any(matches[0].get(k) for k in (
+                        'native_owner', 'declared_owner', 'formaction',
+                        'iti', 'contenteditable', 'submit'))):
+                return Gate('The application widget is not writable by the guarded executor.',
+                            reason='defect_' + _required_owner_gate_type(item))
             return Gate('Required receiver lacks application association.',
                         reason='defect_receiver')
         # The existing native checkbox standing acknowledgement is not an
@@ -5453,7 +5475,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             actual = control(readback, action, 'execute-readback')
             if actual.get('value') != write_value or not actual.get('has_value'):
                 raise Gate('The approved structural field value did not read back exactly.')
-            exact_approval(pk, form_question['label'], write_value, target=_bound_target(readback, actual),
+            # The DOM readback uses the machine value (e.g. "remote"), while
+            # the row grant binds the owner's answer (e.g. "Remote").
+            exact_approval(pk, form_question['label'], value, target=_bound_target(readback, actual),
                            url=readback['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':

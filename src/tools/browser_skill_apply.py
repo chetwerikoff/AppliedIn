@@ -4932,7 +4932,7 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
     grant = grants.get(key) if isinstance(grants, dict) else None
     fact_key = _fact_key(facts, key)
     value = str(facts[fact_key]).strip() if fact_key is not None else ''
-    if isinstance(grant, dict) and grant.get('source') != 'bank-auto':
+    if isinstance(grant, dict) and grant.get('source') in (None, 'owner'):
         # Direct owner replies, unlike bank data, already authorize this exact
         # row and receiver. Recheck their full stored identity before any IPC.
         approved = grant.get('value')

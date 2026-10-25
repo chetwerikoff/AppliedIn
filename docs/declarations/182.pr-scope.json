@@ -1,0 +1,35 @@
+{
+  "schema_version": "orchestrator-pack/pr-scope-declaration/v1",
+  "issue_number": 182,
+  "declared_paths": [
+    "docs/declarations/182.pr-scope.json",
+    "src/tools/browser_skill_apply.py",
+    "tests/tools/test_browser_bootstrap.py",
+    "tests/tools/test_browser_formless.py"
+  ],
+  "denylist": [
+    ".env",
+    ".github/**",
+    ".local/**",
+    "config/**",
+    "output/**",
+    "packages/core/**",
+    "resume/**",
+    "src/agent/**",
+    "src/core/**",
+    "src/server.py",
+    "src/tools/browser_apply.py",
+    "src/tools/browser_runtime.py",
+    "src/tools/browser_skill_dom.py",
+    "src/tools/browser_skill_fixture.py",
+    "src/tools/claude_chrome.py",
+    "vendor/**",
+    "web/**"
+  ],
+  "allowed_roots": [
+    "docs/declarations/",
+    "src/tools/browser_skill_apply.py",
+    "tests/tools/test_browser_bootstrap.py",
+    "tests/tools/test_browser_formless.py"
+  ]
+}

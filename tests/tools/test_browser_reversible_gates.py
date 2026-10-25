@@ -438,8 +438,10 @@ async def test_hidden_witness_only_blocks_application_receivers(
     result = await _apply(pdf)
     assert result['status'] == 'gate'
     assert result['reason'] == ('defect_structural' if relevant else 'owner_question')
-    assert result['form_question'] is None if relevant else (
-        result['form_question']['selector'] == '#location')
+    if relevant:
+        assert result['form_question'] is None
+    else:
+        assert result['form_question']['selector'] == '#location'
     assert not decision.await_count
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
 
@@ -539,3 +541,29 @@ async def test_date_only_populated_field_guards_opaque_continue_before_click(mon
         await controller.before_ipc(SimpleNamespace(), ('click', '#continue'), {})
     final_guard.assert_awaited_once()
     assert controller.committed is False
+
+
+@pytest.mark.asyncio
+async def test_rootless_standard_privacy_checkbox_needs_exact_owner_grant(
+        monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, set())
+    _witnessed_native(
+        endpoint, selector='#privacy', kind='checkbox', label='I acknowledge',
+        question='I acknowledge processing of my application data',
+        name='privacy', value='yes')
+    gate = await _apply(pdf)
+    assert gate['reason'] == 'owner_question'
+    assert gate['form_question']['selector'] == '#privacy'
+    assert not [c for c in endpoint.calls if c[0] == 'click']
+    _answer(row, stores, gate, 'yes')
+    _record_choice_click(endpoint, '#privacy', 'yes')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#privacy',
+         'fact': 'I acknowledge processing of my application data'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert decision.await_count == 2
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [
+        ('click', '#privacy')]

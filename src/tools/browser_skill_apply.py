@@ -309,7 +309,8 @@ class Gate(ValueError):
                  reason: str = 'unknown_field'):
         super().__init__(message)
         self.form_question = form_question
-        self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
+        self.reason = (reason if reason in _GATE_DIAGNOSTICS or re.fullmatch(
+            r'defect_[a-z][a-z0-9_]{0,63}', reason) else 'unknown_field')
 
 
 class NavigationProvenanceGate(Gate):
@@ -1596,7 +1597,7 @@ _APP_SUBMIT_LABELS = frozenset({
     'submit application', 'send application', 'complete application',
     'finish application', 'apply now',
 })
-_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number'})
+_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number', 'date'})
 _ACCOUNT_PURPOSE = re.compile(
     r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
     r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
@@ -3408,6 +3409,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question.update(owner_kind='ashby-formless-root',
                         form_selector=structural['root'],
                         form_action=structural['submit'])
+    if reversible:
+        # A rootless field can bind a row grant without inventing a native form owner.
+        question['owner_kind'] = 'ashby-reversible-entry'
     if isinstance(provenance, GreenhouseJobAlias):
         question['origin_row'] = {
             'jd_url': provenance.wrapper, 'company': provenance.company,
@@ -3829,6 +3833,7 @@ def _bank_auto_eligible(item: dict, value: str, *,
     subject = label(item)
     if ((not item.get('in_form')
          and item.get('selector') not in formless_selectors) or item.get('disabled')
+            or item.get('type') == 'date'  # Issue #196: date is owner-only, not new bank scope.
             or item.get('tag') == 'textarea'
             or item.get('type') == 'password'
             or not (_native_answer(item) or item.get('type') in {'combobox', 'radio', 'checkbox'})
@@ -4508,6 +4513,97 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     return page
 
 
+
+def _required_owner_gate_type(target: dict) -> str:
+    """Only a normalized control KIND, never arbitrary DOM text, enters a defect code."""
+    kind = target.get('type')
+    if not isinstance(kind, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,48}', kind):
+        return 'unknown'
+    return kind.lower().replace('-', '_')
+
+
+async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
+                               provenance=None, fixture_context=None) -> Gate | None:
+    """Bind the first still-required answer before delegating any planning to the model.
+
+    The Ashby rootless path previously returned from bootstrap after bank grants;
+    the model then produced an unanswerable prose gate. A fresh independent
+    witness supplies this per-control question, never the model's description.
+    """
+    if not any(c.get('required') and _unanswered(page, c)
+               and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
+               for c in page['controls']):
+        return None
+    current, witness = await _observe_controls(
+        session, await session.page(), site='owner-required')
+    if (not _preparation_destination_allowed(current.get('url', ''), *origins,
+                                             provenance=provenance)
+            or (provenance is not None and
+                not _preparation_current(provenance, fixture_context=fixture_context))):
+        raise Gate('The tracked job route changed before the owner question.',
+                   reason='defect_provenance')
+    rootless = bool(_formless_root(current) and not _formless_root(current).get('root'))
+    if rootless and not (
+            isinstance(session, _ReversibleEntryReader)
+            and isinstance(provenance, ApplicationEntryProvenance)
+            and isinstance(getattr(session.raw, '_application_controller', None),
+                           ApplicationIPCController)):
+        raise Gate('The reversible owner question lacks a bound raw controller.',
+                   reason='defect_witness')
+    scope = (frozenset(c['selector'] for c in current['controls']
+                       if c.get('in_form') is False) if rootless else None)
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
+    grants = row.get('human_approved_answers') or {}
+    for item in current['controls']:
+        kind = item.get('type')
+        if (not item.get('required') or not _unanswered(current, item)
+                or kind in {'file', 'hidden', 'password', 'submit', 'image'}
+                or native_submit(item)
+                or (rootless and item.get('selector') not in scope)):
+            continue
+        # The existing native checkbox standing acknowledgement is not an
+        # owner attestation; the code-owned direct-delegation rule remains intact.
+        if kind == 'checkbox' and item.get('tag') == 'input' and (
+                _assent_scope(item) == 'standard_privacy'):
+            try:
+                if _approved_native_choice(
+                        current, item, pk, provenance=provenance,
+                        fixture_context=fixture_context) is not None:
+                    continue
+            except Gate:
+                pass
+        writable = (_native_answer(item)
+                    or kind == 'combobox' and item.get('tag') in {'input', 'div'}
+                    or kind in {'radio', 'checkbox'} and item.get('tag') == 'input')
+        if not writable or (rootless and kind == 'radio'):
+            return Gate('The guarded executor cannot write this required control; '
+                        'operator inspection is required.',
+                        reason='defect_' + _required_owner_gate_type(item))
+        # A currently bound grant is not a missing answer, even when bootstrap
+        # had no new global fact to settle. Stale grants never authorize a write.
+        key = _key(current, item)
+        prior = grants.get(key) if isinstance(grants, dict) else None
+        if isinstance(prior, dict) and isinstance(prior.get('value'), str):
+            try:
+                exact_approval(
+                    pk, key, prior['value'], target=_bound_target(current, item),
+                    url=current['url'], provenance=provenance,
+                    **({'fixture_context': fixture_context} if fixture_context else {}))
+            except Gate:
+                pass
+            else:
+                continue
+        question = _disclosure_question(
+            current, item, witness, *origins, bootstrap=True,
+            closed_witness=_closed_material_combobox(item),
+            reversible_scope=scope, provenance=provenance)
+        question['pk'] = pk
+        return Gate(_choice_prompt(item, question), form_question=question,
+                    reason='owner_question')
+    return None
+
+
 async def _current_approved_choices(session, page: dict, pk: str,
                                     *origins: str, fixture_context=None,
                                     provenance=None) -> list[dict]:
@@ -4595,7 +4691,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     closed_material = _closed_material_combobox(target)
     question = _disclosure_question(
         observed, target, witness, job_url or observed['url'],
-        closed_witness=closed_material, provenance=provenance)
+        closed_witness=closed_material, provenance=provenance,
+        reversible_scope=_execute_reversible_scope(
+            session, observed, witness, target, pk, facts,
+            provenance=provenance, fixture_context=ctx))
     question['pk'] = pk
     key = action.get('fact', '')
     if _material_form_choice(target):
@@ -4826,6 +4925,20 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
     grant = grants.get(key) if isinstance(grants, dict) else None
     fact_key = _fact_key(facts, key)
     value = str(facts[fact_key]).strip() if fact_key is not None else ''
+    if isinstance(grant, dict) and grant.get('source') != 'bank-auto':
+        # Direct owner replies, unlike bank data, already authorize this exact
+        # row and receiver. Recheck their full stored identity before any IPC.
+        approved = grant.get('value')
+        if not isinstance(approved, str) or not approved.strip():
+            return None
+        if not _material_form_choice(target) and (not value or approved != value):
+            return None
+        try:
+            exact_approval(pk, key, approved, target=_bound_target(page, target),
+                           url=page['url'], fixture_context=fixture_context)
+        except Gate:
+            return None
+        return frozenset({selector})
     if (not isinstance(grant, dict) or grant.get('source') != 'bank-auto'
             or not value or grant.get('value') != value
             or grant.get('url') != page['url']
@@ -5699,7 +5812,7 @@ class ApplicationIPCController:
                     or target.get('commits_application')):
                 raise Gate('A submission-capable data receiver is not reversible preparation.')
             if op == 'fill' and target.get('type') not in {
-                    'text', 'email', 'tel', 'textarea', 'combobox'}:
+                    'text', 'email', 'tel', 'date', 'textarea', 'combobox'}:
                 raise Gate('A non-text receiver cannot be filled.')
             if (_formless_root(page) and not _formless_root(page).get('root')
                     and self._row().get('ats') in _APPLICATION_ENTRY):
@@ -6185,6 +6298,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         global_facts=(global_facts if producer_guard is not None
                                       else {}),
                         **({'fixture_context': ctx} if ctx else {}))
+                    pending = await _required_owner_gate(
+                        session, page, pk, *trusted_origins,
+                        provenance=provenance, fixture_context=ctx)
+                    if pending is not None:
+                        raise pending
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
                                     r.get('selector') == c['selector'] and r['label'] == c['label']
@@ -6243,6 +6361,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
+                        pending = await _required_owner_gate(
+                            session, page, pk, *trusted_origins,
+                            provenance=provenance, fixture_context=ctx)
+                        if pending is not None:
+                            raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
                     if verb == 'finish':
                         raise Gate('The application has not been submitted; review the form.')
@@ -6382,9 +6505,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
                 else handoff(str(exc), step,
                              captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
-            hard = (isinstance(exc, CaptchaGate)
-                    or exc.reason in {'defect_tenant', 'defect_provenance',
-                                      'posting_guard_review_required'})
+            hard = (isinstance(exc, CaptchaGate) or exc.reason.startswith('defect_')
+                    or exc.reason == 'posting_guard_review_required')
             route = ('owner' if exc.reason == 'owner_question'
                      else 'hard_refusal' if hard else 'agent_unavailable')
             if route == 'agent_unavailable':

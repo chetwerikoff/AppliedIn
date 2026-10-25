@@ -32,23 +32,47 @@ def _entry_js_const(script, name):
     return tail[:end]
 
 
-def _entry_host_identifiers(script):
-    """Discover every injected entry reference bound by the host prefix."""
-    prefix, separator, _ = script.partition(_ENTRY_OBSERVATION)
-    assert separator and script.count(_ENTRY_OBSERVATION) == 1
+def _entry_host_identifiers(script, observation=_ENTRY_OBSERVATION):
+    """Discover host references without mistaking entry-local names for them."""
+    prefix, separator, _ = script.partition(observation)
+    assert separator and script.count(observation) == 1
     host = set(re.findall(
         r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', prefix))
-    # Ignore literal text, comments, property reads and object field names:
-    # those are not identifiers bound by the PAGE/fixed host.
+    # Preserve offsets and braces when masking strings/comments; lexical scopes
+    # matter because PAGE's nodes is shadowed inside entry's inertSibling.
     code = re.sub(
         r"""(?s)'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*""",
-        ' ', _ENTRY_OBSERVATION)
-    referenced = {
-        match.group(1)
-        for match in re.finditer(r'(?<![\w$.])([A-Za-z_$][\w$]*)', code)
-        if not re.match(r'\s*:', code[match.end():])
-    }
-    return {name: _entry_js_const(script, name) for name in host & referenced}
+        lambda match: re.sub(r'[^\n]', ' ', match.group()), observation)
+    parents, locals_by_scope, stack = [None], [set()], [0]
+    token_scopes, references = {}, []
+    for token in re.finditer(
+            r'(?P<brace>[{}])|(?P<name>(?<![\w$.])[A-Za-z_$][\w$]*)', code):
+        brace = token.group('brace')
+        if brace == '{':
+            parents.append(stack[-1])
+            locals_by_scope.append(set())
+            stack.append(len(parents) - 1)
+        elif brace == '}':
+            assert len(stack) > 1, 'Unbalanced entry JavaScript scope'
+            stack.pop()
+        else:
+            token_scopes[token.start('name')] = stack[-1]
+            if not re.match(r'\s*:', code[token.end():]):
+                references.append((token.group('name'), stack[-1]))
+    assert stack == [0], 'Unbalanced entry JavaScript scope'
+    for declaration in re.finditer(
+            r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?==|\bof\b|\bin\b|;)', code):
+        locals_by_scope[token_scopes[declaration.start(1)]].add(declaration.group(1))
+
+    def from_host(name, scope):
+        while scope is not None:
+            if name in locals_by_scope[scope]:
+                return False
+            scope = parents[scope]
+        return True
+
+    used = {name for name, scope in references if name in host and from_host(name, scope)}
+    return {name: _entry_js_const(script, name) for name in used}
 
 
 def test_entry_readers_have_identical_host_bindings():
@@ -65,6 +89,30 @@ def test_entry_readers_have_identical_host_bindings():
     declarations = set(re.findall(
         r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', _ENTRY_OBSERVATION))
     assert shared <= declarations
+
+
+def test_entry_host_audit_distinguishes_shadowed_and_real_host_reads():
+    """A local nodes is safe; using PAGE's nodes must fail parity."""
+    assert 'nodes' not in _entry_host_identifiers(forms.ENTRY_PAGE)
+    extra = _ENTRY_OBSERVATION.replace(
+        '  const reservedButtons = ',
+        '  const syntheticHostRead = nodes.length;\n  const reservedButtons = ', 1)
+    assert extra != _ENTRY_OBSERVATION
+    page = _entry_host_identifiers(
+        forms.ENTRY_PAGE.replace(_ENTRY_OBSERVATION, extra), extra)
+    fixed = _entry_host_identifiers(
+        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(_ENTRY_OBSERVATION, extra), extra)
+    assert 'nodes' in page and 'nodes' not in fixed
+    assert page != fixed
+
+
+def test_entry_host_audit_detects_changed_host_definitions():
+    """A real dependency with diverging definitions must break the parity test."""
+    changed_page = forms.ENTRY_PAGE.replace(
+        '  const clean = s =>', '  const clean = changed =>', 1)
+    assert changed_page != forms.ENTRY_PAGE
+    assert (_entry_host_identifiers(changed_page) !=
+            _entry_host_identifiers(forms._ENTRY_FIXED_CONTROL_WITNESS))
 
 
 def test_entry_visibility_uses_exact_fixed_witness_predicate():

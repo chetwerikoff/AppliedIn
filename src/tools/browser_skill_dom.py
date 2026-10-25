@@ -444,7 +444,7 @@ _ASHBY_ROOT = r"""
         file.querySelectorAll('input').length!==1 || !drop || drop.form ||
         structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload').length!==1 ||
         drop.hasAttribute('form') || drop.hasAttribute('formaction') ||
-        drop.disabled || drop.closest('[inert]') || !visible(drop)) throw Error('ambiguous file container');
+        drop.disabled || drop.closest('[inert]') || !entryEvidenceVisible(drop)) throw Error('ambiguous file container');
     uploadTree.input=source.indexOf(input); uploadTree.container=source.indexOf(file);
     uploadTree.dropzone=source.indexOf(drop);
     uploadTree.nodes[uploadTree.input].target_selector=selector(input);
@@ -494,7 +494,7 @@ _ASHBY_ROOT = r"""
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
     .filter(e=>!excluded.has(e));
   const entryVisible=e => {
-    if (!visible(e)) return false;
+    if (!entryEvidenceVisible(e)) return false;
     // Clipping can hide a text recipient despite a positive layout rectangle.
     // Unknown clipping geometry is not proof of an editable applicant target.
     for (let n=e;n;n=n.parentElement) {
@@ -570,7 +570,28 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
   const reservedButtons = Array.from(document.querySelectorAll('button'))
     .filter(e => e.id === 'hcaptchaSubmitBtn');
   const excluded = new Set([...responseNodes, ...reservedButtons]);
-""" + _APPLICATION_ROOT + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
+  // Entry-only evidence must not inherit PAGE's permissive visibility predicate.
+  const entryEvidenceVisible = e => {
+    const rects = e.getClientRects();
+    if (!rects.length) return false;
+    let fixed = false;
+    for (let n=e; n && n.nodeType===1; n=n.parentElement) {
+      const style = getComputedStyle(n);
+      if (!style || style.display === 'none' ||
+          style.visibility === 'hidden' || style.visibility === 'collapse' ||
+          !(Number(style.opacity) > 0))
+        return false;
+      if (style.position === 'fixed') fixed = true;
+    }
+    // Scroll offsets preserve ordinary below-fold controls, but a fixed control
+    // (including one inside a fixed ancestor) also needs viewport-positive edges.
+    return Array.from(rects).some(rect =>
+      rect.width > 0 && rect.height > 0 &&
+      rect.right + scrollX > 0 && rect.bottom + scrollY > 0 &&
+      (!fixed || (rect.right > 0 && rect.bottom > 0)));
+  };
+""" + _APPLICATION_ROOT.replace(
+    'visible:candidateVisible(e)', 'visible:entryEvidenceVisible(e)') + _ASHBY_ROOT + _VISIBLE_RECAPTCHA + r"""
   // W is a passive row, not permission to act on either widget node. All raw
   // audits are local to W; the canonical inventory and ordinary PAGE stay intact.
   let wUnreadable=false;

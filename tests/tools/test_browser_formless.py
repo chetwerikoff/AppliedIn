@@ -15,10 +15,130 @@ import pytest
 
 from tools import browser_skill_apply as forms
 from tools.browser_skill import Session as ProductionBrowserSession
-from tools.browser_skill_dom import PAGE
+from tools.browser_skill_dom import PAGE, _ENTRY_OBSERVATION
 from tests.tools.test_browser_application_entry import (
     COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
 )
+
+def _entry_js_const(script, name):
+    """Extract a top-level JavaScript const without evaluating either reader."""
+    found = re.search(rf'(?m)^  const {re.escape(name)}\s*=', script)
+    assert found, f'Missing JS binding: {name}'
+    tail = script[found.start():]
+    if re.match(r'  const \w+ = \w+ => \{', tail):
+        end = tail.index('\n  };') + len('\n  };')
+    else:
+        end = tail.index(';') + 1
+    return tail[:end]
+
+
+def _entry_host_identifiers(script, observation=_ENTRY_OBSERVATION):
+    """Discover host references without mistaking entry-local names for them."""
+    prefix, separator, _ = script.partition(observation)
+    assert separator and script.count(observation) == 1
+    host = set(re.findall(
+        r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', prefix))
+    # Preserve offsets and braces when masking strings/comments; lexical scopes
+    # matter because PAGE's nodes is shadowed inside entry's inertSibling.
+    code = re.sub(
+        r"""(?s)'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|/\*.*?\*/|//[^\n]*""",
+        lambda match: re.sub(r'[^\n]', ' ', match.group()), observation)
+    parents, locals_by_scope, stack = [None], [set()], [0]
+    token_scopes, references = {}, []
+    for token in re.finditer(
+            r'(?P<brace>[{}])|(?P<name>(?<![\w$.])[A-Za-z_$][\w$]*)', code):
+        brace = token.group('brace')
+        if brace == '{':
+            parents.append(stack[-1])
+            locals_by_scope.append(set())
+            stack.append(len(parents) - 1)
+        elif brace == '}':
+            assert len(stack) > 1, 'Unbalanced entry JavaScript scope'
+            stack.pop()
+        else:
+            token_scopes[token.start('name')] = stack[-1]
+            if not re.match(r'\s*:', code[token.end():]):
+                references.append((token.group('name'), stack[-1]))
+    assert stack == [0], 'Unbalanced entry JavaScript scope'
+    for declaration in re.finditer(
+            r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?==|\bof\b|\bin\b|;)', code):
+        locals_by_scope[token_scopes[declaration.start(1)]].add(declaration.group(1))
+
+    def from_host(name, scope):
+        while scope is not None:
+            if name in locals_by_scope[scope]:
+                return False
+            scope = parents[scope]
+        return True
+
+    used = {name for name, scope in references if name in host and from_host(name, scope)}
+    return {name: _entry_js_const(script, name) for name in used}
+
+
+def test_entry_readers_have_identical_host_bindings():
+    """No new host predicate may silently change the independently read entry."""
+    page = _entry_host_identifiers(forms.ENTRY_PAGE)
+    fixed = _entry_host_identifiers(forms._ENTRY_FIXED_CONTROL_WITNESS)
+    assert page == fixed
+    assert set(page) == {'clean', 'selector', 'query'}
+    # These other entry dependencies are defined inside the identical injected
+    # block, not borrowed from either host.
+    shared = {'rectOf', 'container', 'structuralRoot', 'exactSubmit', 'forms',
+              'containers', 'submitters', 'excluded', 'entryLabel',
+              'candidateVisible', 'entryVisible', 'entryEvidenceVisible'}
+    declarations = set(re.findall(
+        r'(?m)^  (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=', _ENTRY_OBSERVATION))
+    assert shared <= declarations
+
+
+def test_entry_host_audit_distinguishes_shadowed_and_real_host_reads():
+    """A local nodes is safe; using PAGE's nodes must fail parity."""
+    assert 'nodes' not in _entry_host_identifiers(forms.ENTRY_PAGE)
+    extra = _ENTRY_OBSERVATION.replace(
+        '  const reservedButtons = ',
+        '  const syntheticHostRead = nodes.length;\n  const reservedButtons = ', 1)
+    assert extra != _ENTRY_OBSERVATION
+    page = _entry_host_identifiers(
+        forms.ENTRY_PAGE.replace(_ENTRY_OBSERVATION, extra), extra)
+    fixed = _entry_host_identifiers(
+        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(_ENTRY_OBSERVATION, extra), extra)
+    assert 'nodes' in page and 'nodes' not in fixed
+    assert page != fixed
+
+
+def test_entry_host_audit_detects_changed_host_definitions():
+    """A real dependency with diverging definitions must break the parity test."""
+    changed_page = forms.ENTRY_PAGE.replace(
+        '  const clean = s =>', '  const clean = changed =>', 1)
+    assert changed_page != forms.ENTRY_PAGE
+    assert (_entry_host_identifiers(changed_page) !=
+            _entry_host_identifiers(forms._ENTRY_FIXED_CONTROL_WITNESS))
+
+
+def test_entry_visibility_uses_exact_fixed_witness_predicate():
+    """Keep the root proof strict without altering ordinary host control reads."""
+    local = _entry_js_const(_ENTRY_OBSERVATION, 'entryEvidenceVisible')
+    fixed = _entry_js_const(forms._FIXED_CONTROL_WITNESS, 'visible')
+    assert local.replace('const entryEvidenceVisible', 'const visible', 1) == fixed
+    assert 'if (!entryEvidenceVisible(e)) return false;' in _ENTRY_OBSERVATION
+    assert 'visible:entryVisible(e)' in _ENTRY_OBSERVATION
+    assert 'visible:entryEvidenceVisible(e)' in _ENTRY_OBSERVATION
+    assert '!entryEvidenceVisible(drop)' in _ENTRY_OBSERVATION
+    assert not re.search(r'(?<![\w$.])visible\s*\(', _ENTRY_OBSERVATION)
+
+
+@pytest.mark.parametrize('case, clause', [
+    ('opacity:0 ancestor', '!(Number(style.opacity) > 0)'),
+    ('display:none ancestor', "style.display === 'none'"),
+])
+def test_root_evidence_visibility_rejects_hidden_ancestors(case, clause):
+    """Static ancestor proof: no browser or JavaScript execution is necessary."""
+    predicate = _entry_js_const(_ENTRY_OBSERVATION, 'entryEvidenceVisible')
+    assert 'for (let n=e; n && n.nodeType===1; n=n.parentElement)' in predicate
+    assert clause in predicate, case
+    assert 'return false;' in predicate
+    assert 'visible:entryVisible(e)' in _ENTRY_OBSERVATION
+
 from tests.tools.test_browser_controller_support import install_controller_session
 
 

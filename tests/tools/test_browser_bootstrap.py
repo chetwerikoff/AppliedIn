@@ -5571,3 +5571,136 @@ async def test_issue182_closed_material_bootstrap_to_execute_checks_fresh_option
         assert receipt['approved_value'] == 'I agree'
         assert filled == {'#material': 'I agree'}
     assert row['status'] == 'submitting' and not row['possible_submission']
+
+    # No request or latched selector may outlive an action, including a rejected
+    # fresh listbox or a stale grant that fails before the reversible open.
+    for field_name in (
+            '_material_witness_request', '_material_witness_expected',
+            '_material_witness_selector', '_material_witness_target',
+            '_material_witness_close_request'):
+        assert getattr(controller, field_name) is None
+
+
+async def test_issue182_two_granted_closed_material_pickers_and_rebootstrap(monkeypatch):
+    """One guarded raw controller must handle sequential exact material picks.
+
+    An exact first choice must not poison the post-action bootstrap or block
+    the second distinct owner-granted picker on the same synthetic row.
+    """
+    from tools.browser_skill_dom import PAGE
+
+    row, closed, _opened, pk, origin, provenance = _issue182_material_picker(
+        monkeypatch, closed_options=[])
+    first = closed['controls'][0]
+    second = deepcopy(first)
+    second['selector'] = '#material-secondary'
+    second['label'] = 'Acknowledge second candidate privacy notice'
+    closed['controls'].insert(1, second)
+
+    first_grant = row['human_approved_answers'][first['label']]
+    second_grant = deepcopy(first_grant)
+    second_grant['selector'] = second['selector']
+    second_grant['label'] = second['label']
+    second_grant['options'] = [
+        {**option, 'selector': option['selector'] + '-secondary'}
+        for option in first_grant['options']]
+    row['human_approved_answers'][second['label']] = second_grant
+
+    state = {'page': deepcopy(closed)}
+    effects, filled = [], {}
+    selectors = {first['selector'], second['selector']}
+
+    async def offline_command(*args, **kwargs):
+        assert not kwargs and args[-2:] == ('--session', 'synthetic-offline')
+        request = args[:-2]
+        if request == ('evaluate', PAGE):
+            return {'value': deepcopy(state['page'])}
+        if request == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+            return {'value': witness(state['page'])}
+        effects.append(request)
+        if request[0] == 'click' and request[1] in selectors:
+            picker = next(item for item in state['page']['controls']
+                          if item['selector'] == request[1])
+            grant = row['human_approved_answers'][picker['label']]
+            picker['combobox'].update(
+                linked=True, link_id=picker['selector'][1:] + '-list',
+                listbox_selector=picker['selector'] + '-list',
+                options=[{**option, 'unique': True, 'safe': True}
+                         for option in grant['options']])
+        elif request == ('press', 'Escape'):
+            opened = [item for item in state['page']['controls']
+                      if (item.get('combobox') or {}).get('linked') is True]
+            assert len(opened) == 1
+            opened[0]['combobox'].update(
+                linked=False, link_id='', listbox_selector='', options=[])
+        elif (request[0] == 'fill' and request[1] in selectors
+              and request[2:] == ('--value', 'I agree')):
+            picker = next(item for item in state['page']['controls']
+                          if item['selector'] == request[1])
+            picker['value'] = 'I agree'
+        elif request[0] == 'click' and request[1] in {
+                '#accept', '#accept-secondary'}:
+            opened = [item for item in state['page']['controls']
+                      if any(option['selector'] == request[1]
+                             for option in (item.get('combobox') or {}).get('options') or [])]
+            assert len(opened) == 1
+            opened[0]['combobox'].update(
+                linked=False, link_id='', listbox_selector='', options=[],
+                selected_text='I agree', displayed_text='I agree', selected_value='yes')
+        else:
+            pytest.fail(f'Unexpected synthetic raw IPC: {request}')
+        return {}
+
+    controller = forms.ApplicationIPCController(
+        pk, 'example-co', origin, '', {}, filled, [], {},
+        lambda: pytest.fail('The synthetic picker may not Submit'))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(controller, '_page', AsyncMock(
+        side_effect=lambda _session: deepcopy(state['page'])))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(bsk, 'command', offline_command)
+    raw = REAL_BSK_SESSION('apply')
+    raw.id = 'synthetic-offline'
+    raw.bind_application_controller(controller)
+
+    prepared = await forms._bootstrap(
+        raw, deepcopy(state['page']), pk, {}, origin,
+        company='example-co', job_url=origin, provenance=provenance)
+    assert prepared['url'] == origin
+    receipts = []
+    for picker in (first, second):
+        receipt = await forms.execute(
+            raw, deepcopy(state['page']),
+            {'action': 'combobox', 'selector': picker['selector'],
+             'fact': picker['label']},
+            facts={}, filled=filled, pk=pk, job_url=origin,
+            company='example-co', resume_path='', jd_text='',
+            resume_tex='', github='', provenance=provenance)
+        receipts.append(receipt)
+        assert receipt['selected_option'] == (
+            row['human_approved_answers'][picker['label']]['options'][0])
+        assert receipt['witnessed_options'] == (
+            row['human_approved_answers'][picker['label']]['options'])
+        for field_name in (
+                '_material_witness_request', '_material_witness_expected',
+                '_material_witness_selector', '_material_witness_target',
+                '_material_witness_close_request'):
+            assert getattr(controller, field_name) is None
+
+        # apply() re-enters bootstrap after each model action; this may inspect
+        # the selected picker again and must never return to its owner gate.
+        prepared = await forms._bootstrap(
+            raw, deepcopy(state['page']), pk, {}, origin,
+            company='example-co', job_url=origin, provenance=provenance)
+        assert prepared['url'] == origin
+        assert all(getattr(controller, field_name) is None for field_name in (
+            '_material_witness_request', '_material_witness_expected',
+            '_material_witness_selector', '_material_witness_target'))
+
+    assert {r['selector'] for r in receipts} == selectors
+    assert filled == {first['selector']: 'I agree',
+                      second['selector']: 'I agree'}
+    assert effects.count(('click', '#accept')) == 1
+    assert effects.count(('click', '#accept-secondary')) == 1
+    assert not any(call[0] in {'upload', 'select'} for call in effects)
+    assert row['status'] == 'submitting' and not row['possible_submission']

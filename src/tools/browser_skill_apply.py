@@ -4436,6 +4436,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     except Gate:
         raise Gate('An exact human-approved answer is needed for this combobox.',
                    form_question=question) from None
+    controller = None
     if closed_material:
         # A bootstrap witness was Escape-closed. The guarded producer requires
         # a new code-owned exact-control request for this reversible open.
@@ -4450,107 +4451,117 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             controller._material_witness_request = target['selector']
             controller._material_witness_expected = {
                 k: v for k, v in target.items() if k != 'combobox'}
-    latest, latest_witness, current = observed, witness, target
-    combo = current.get('combobox') or {}
     try:
-        options = (_combobox_options(current)
-                   if combo.get('linked') is True and combo.get('options') else [])
-    except Gate:
-        options = []
-    if not options:
-        # Opening the picker and typing only the already-approved answer are
-        # reversible. A missing/mutating listbox is not a human Submit gate.
-        await _effect_call(session, 'click', current['selector'])
-        latest, latest_witness = await _observe_controls(session, await session.page(), site='combobox-open')
-        current = control(latest, action, 'combobox-open')
+        latest, latest_witness, current = observed, witness, target
+        combo = current.get('combobox') or {}
+        try:
+            options = (_combobox_options(current)
+                       if combo.get('linked') is True and combo.get('options') else [])
+        except Gate:
+            options = []
+        if not options:
+            # Opening the picker and typing only the already-approved answer are
+            # reversible. A missing/mutating listbox is not a human Submit gate.
+            await _effect_call(session, 'click', current['selector'])
+            latest, latest_witness = await _observe_controls(session, await session.page(), site='combobox-open')
+            current = control(latest, action, 'combobox-open')
+            if (not _preparation_destination_allowed(
+                    latest.get('url', ''), job_url or observed['url'],
+                    provenance=provenance)
+                    or (provenance is not None and not _preparation_current(
+                        provenance, fixture_context=ctx))):
+                raise Gate('The picker origin or current tracked posting changed.')
+            if current.get('tag') == 'input':
+                approve(current, latest)
+                await _effect_call(session, 'fill', current['selector'], '--value', answer)
+            for attempt in range(20):
+                try:
+                    refreshed, refreshed_witness = await _observe_controls(
+                        session, await session.page(), site='combobox-options')
+                    candidate = control(refreshed, action, 'combobox-options')
+                except Gate:
+                    candidate = None
+                if candidate is not None:
+                    if not _preparation_destination_allowed(
+                            refreshed.get('url', ''), job_url or observed['url'],
+                            provenance=provenance):
+                        raise Gate('The picker left the approved preparation origin.')
+                    combo = candidate.get('combobox') or {}
+                    if combo.get('linked') is True and combo.get('options'):
+                        try:
+                            options = _combobox_options(candidate)
+                        except Gate:
+                            options = []
+                        if options:
+                            latest, latest_witness, current = (
+                                refreshed, refreshed_witness, candidate)
+                            break
+                if attempt < 19:
+                    await asyncio.sleep(0.25)
+        if not options:
+            return unresolved()
+        matches = [option for option in options if _same(answer, option['label'])]
+        if len(matches) != 1:
+            return unresolved()
+        selected = matches[0]
+        # The latest independent observation, not an old C0/C1/C2 or widget-root
+        # identity, binds the one option that may be clicked during preparation.
+        try:
+            latest, latest_witness = await _observe_controls(
+                session, await session.page(), site='combobox-verify')
+            current = control(latest, action, 'combobox-verify')
+        except Gate:
+            return unresolved()
         if (not _preparation_destination_allowed(
                 latest.get('url', ''), job_url or observed['url'],
                 provenance=provenance)
                 or (provenance is not None and not _preparation_current(
                     provenance, fixture_context=ctx))):
-            raise Gate('The picker origin or current tracked posting changed.')
-        if current.get('tag') == 'input':
-            approve(current, latest)
-            await _effect_call(session, 'fill', current['selector'], '--value', answer)
-        for attempt in range(20):
-            try:
-                refreshed, refreshed_witness = await _observe_controls(
-                    session, await session.page(), site='combobox-options')
-                candidate = control(refreshed, action, 'combobox-options')
-            except Gate:
-                candidate = None
-            if candidate is not None:
-                if not _preparation_destination_allowed(
-                        refreshed.get('url', ''), job_url or observed['url'],
-                        provenance=provenance):
-                    raise Gate('The picker left the approved preparation origin.')
-                combo = candidate.get('combobox') or {}
-                if combo.get('linked') is True and combo.get('options'):
-                    try:
-                        options = _combobox_options(candidate)
-                    except Gate:
-                        options = []
-                    if options:
-                        latest, latest_witness, current = (
-                            refreshed, refreshed_witness, candidate)
-                        break
-            if attempt < 19:
-                await asyncio.sleep(0.25)
-    if not options:
-        return unresolved()
-    matches = [option for option in options if _same(answer, option['label'])]
-    if len(matches) != 1:
-        return unresolved()
-    selected = matches[0]
-    # The latest independent observation, not an old C0/C1/C2 or widget-root
-    # identity, binds the one option that may be clicked during preparation.
-    try:
-        latest, latest_witness = await _observe_controls(
-            session, await session.page(), site='combobox-verify')
-        current = control(latest, action, 'combobox-verify')
-    except Gate:
-        return unresolved()
-    if (not _preparation_destination_allowed(
-            latest.get('url', ''), job_url or observed['url'],
-            provenance=provenance)
-            or (provenance is not None and not _preparation_current(
-                provenance, fixture_context=ctx))):
-        raise Gate('The tracked preparation origin changed before option click.')
-    # Reconfirm the already-approved fact at the exact option-click edge.
-    approve(current, latest)
-    try:
-        candidates = [option for option in _combobox_options(current)
-                      if option.get('selector') == selected.get('selector')
-                      and option.get('label') == selected.get('label')
-                      and option.get('value') == selected.get('value')]
-    except Gate:
-        return unresolved()
-    if len(candidates) != 1:
-        return unresolved()
-    selected = candidates[0]
-    witnessed_options = ([
-        {key: option[key] for key in ('selector', 'label', 'value')}
-        for option in _combobox_options(current)]
-        if _material_form_choice(current) else None)
-    if (selected.get('submit') or selected.get('navigates')
-            or selected.get('safe') is not True):
-        raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
-    before = current.get('combobox') or {}
-    await _effect_call(session, 'click', selected['selector'])
-    # Receiver presence, current displayed caption and submitted bytes are
-    # checked at final Submit; an option click is not that authorization.
-    committed = selected.get('value') or selected['label']
-    filled[current['selector']] = selected['label']
-    return {'action': 'combobox', 'label': current['label'],
-            'selector': current['selector'], 'question': current.get('question', ''),
-            'url': latest['url'], 'fact': question['label'], 'approved_value': answer,
-            'committed_caption': selected['label'], 'committed_value': committed,
-            'hidden_selector': before.get('hidden_selector', ''),
-            'hidden_value_before': before.get('hidden_value', ''),
-            'hidden_value': committed if before.get('hidden_selector') else '',
-            **({'witnessed_options': witnessed_options,
-                'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
-               if witnessed_options is not None else {})}
+            raise Gate('The tracked preparation origin changed before option click.')
+        # Reconfirm the already-approved fact at the exact option-click edge.
+        approve(current, latest)
+        try:
+            candidates = [option for option in _combobox_options(current)
+                          if option.get('selector') == selected.get('selector')
+                          and option.get('label') == selected.get('label')
+                          and option.get('value') == selected.get('value')]
+        except Gate:
+            return unresolved()
+        if len(candidates) != 1:
+            return unresolved()
+        selected = candidates[0]
+        witnessed_options = ([
+            {key: option[key] for key in ('selector', 'label', 'value')}
+            for option in _combobox_options(current)]
+            if _material_form_choice(current) else None)
+        if (selected.get('submit') or selected.get('navigates')
+                or selected.get('safe') is not True):
+            raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
+        before = current.get('combobox') or {}
+        await _effect_call(session, 'click', selected['selector'])
+        # Receiver presence, current displayed caption and submitted bytes are
+        # checked at final Submit; an option click is not that authorization.
+        committed = selected.get('value') or selected['label']
+        filled[current['selector']] = selected['label']
+        return {'action': 'combobox', 'label': current['label'],
+                'selector': current['selector'], 'question': current.get('question', ''),
+                'url': latest['url'], 'fact': question['label'], 'approved_value': answer,
+                'committed_caption': selected['label'], 'committed_value': committed,
+                'hidden_selector': before.get('hidden_selector', ''),
+                'hidden_value_before': before.get('hidden_value', ''),
+                'hidden_value': committed if before.get('hidden_selector') else '',
+                **({'witnessed_options': witnessed_options,
+                    'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
+                   if witnessed_options is not None else {})}
+    finally:
+        if controller is not None:
+            # A guarded raw open belongs to this action, never the next one.
+            # Release the handshake on a choice, an unresolved list, or a gate.
+            controller._material_witness_request = None
+            controller._material_witness_expected = None
+            controller._material_witness_selector = None
+            controller._material_witness_target = None
+            controller._material_witness_close_request = None
 
 
 _PRODUCTION_OBSERVE_CONTROLS = _observe_controls

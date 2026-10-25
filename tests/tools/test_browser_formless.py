@@ -3132,7 +3132,7 @@ _ISSUE194_PRIVATE_FAILURE = 'SYNTHETIC_PRIVATE_UPLOAD_EXCEPTION_NOT_FOR_LOGS'
 ])
 async def test_issue194_reversible_upload_failure_production_info(
         monkeypatch, capsys, step, attached, reason, error_type, file_access):
-    _row, raw, provenance = root_world(monkeypatch)
+    _row, raw, _, provenance = root_world(monkeypatch)
     session = forms._ReversibleEntryReader(raw)
     filename = 'Resume.pdf'
     selector = next(c['selector'] for c in raw.current['controls']
@@ -3233,7 +3233,7 @@ async def test_issue194_reversible_upload_failure_production_info(
 
 async def test_issue194_existing_upload_gate_is_neither_logged_nor_retried(
         monkeypatch, capsys):
-    _row, raw, provenance = root_world(monkeypatch)
+    _row, raw, _, provenance = root_world(monkeypatch)
     session = forms._ReversibleEntryReader(raw)
     selector = next(c['selector'] for c in raw.current['controls']
                     if c.get('type') == 'file')

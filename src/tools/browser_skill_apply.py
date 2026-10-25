@@ -2630,30 +2630,6 @@ def _greenhouse_not_ready(page, *, witness=False):
 
 
 
-class _ReversibleEntryReader:
-    """ENTRY_PAGE observations on a reversible route; all IPC stays on raw."""
-
-    def __init__(self, raw):
-        self.raw = raw
-
-    def __getattr__(self, name):
-        # The production application_effect/controller are still owned by
-        # the original guarded raw Session, not by this read adapter.
-        return getattr(self.raw, name)
-
-    async def page(self):
-        result = await self.raw.call('evaluate', ENTRY_PAGE)
-        page = result.get('value') if isinstance(result, dict) else None
-        if not isinstance(page, dict) or not page.get('url'):
-            raise Gate('Reversible preparation page observation is unavailable.')
-        return page
-
-    async def call(self, *args, **kwargs):
-        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
-            args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-        return await self.raw.call(*args, **kwargs)
-
-
 async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                                     provenance, *, deadline: float):
     """Losing a historic shape certificate does not make an approved write a Submit.
@@ -2673,9 +2649,7 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 'unsupported custom control', 'no unique application root')):
             raise
         if isinstance(provenance, ApplicationEntryProvenance):
-            # Raw Session.page() reads generic PAGE without entry.formless.
-            # Keep the raw controller/effects, but use ENTRY_PAGE and its
-            # matching fixed witness for every subsequent reversible read.
+            # Generic PAGE omits entry.formless; keep raw IPC and read ENTRY_PAGE.
             reversible = _ReversibleEntryReader(raw_session)
             page = await reversible.page()
         else:
@@ -2932,6 +2906,30 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         raise Gate(prefix + 'The current DOM witness is unavailable or changed; '
                    f'exception={error}; predicate={predicate}; control={locator}'
                    + (f'; site={site}' if site else '')) from None
+
+
+class _ReversibleEntryReader:
+    """ENTRY_PAGE observations on a reversible route; all IPC stays on raw."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getattr__(self, name):
+        # The production application_effect/controller are still owned by
+        # the original guarded raw Session, not by this read adapter.
+        return getattr(self.raw, name)
+
+    async def page(self):
+        result = await self.raw.call('evaluate', ENTRY_PAGE)
+        page = result.get('value') if isinstance(result, dict) else None
+        if not isinstance(page, dict) or not page.get('url'):
+            raise Gate('Reversible preparation page observation is unavailable.')
+        return page
+
+    async def call(self, *args, **kwargs):
+        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
+            args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+        return await self.raw.call(*args, **kwargs)
 
 
 def _radio_group(page: dict, target: dict) -> list[dict]:

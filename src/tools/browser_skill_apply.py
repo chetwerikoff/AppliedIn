@@ -814,6 +814,11 @@ def exact_approval(pk: str, key: str, value: str, *,
             or (target.get('type') == 'checkbox'
                 and (grant.get('visible_text') != target.get('label')
                      or not _same(value, 'yes')))
+            or (target.get('type') == 'button' and (
+                not isinstance(target.get('boolean_members'), list)
+                or grant.get('boolean_members') != target['boolean_members']
+                or sum(_same(value, m['caption']) or _same(value, m['value'])
+                       for m in target['boolean_members']) != 1))
             or (target.get('type') == 'radio'
                 and (grant.get('radio_name') != target.get('name')
                      or not isinstance(grant.get('radio_members'), list)
@@ -866,6 +871,13 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 if target.get('type') == 'checkbox':
                     if not target.get('checked') or not _same(answer, 'yes'):
                         raise Gate('The approved checkbox is no longer checked.')
+                elif target.get('type') == 'button':
+                    members = _boolean_pair(page, target)
+                    matches = [m for m in members if _same(answer, m['label'])]
+                    if (len(matches) != 1 or matches[0]['selector'] != target['selector']
+                            or not target.get('checked')):
+                        raise Gate('The approved Boolean button is not selected.')
+                    guarded_value(target, answer)
                 elif target.get('type') == 'radio':
                     group = _radio_group(page, target)
                     matches = [c for c in group
@@ -2945,6 +2957,87 @@ class _ReversibleEntryReader:
         return await self.raw.call(*args, **kwargs)
 
 
+def _reversible_entry_recipient(page: dict, target: dict,
+                                witness: dict | None = None) -> None:
+    """Prove exact application membership using the independent ENTRY census."""
+    root = _formless_root(page)
+    entry = page.get('entry') or {}
+    evidence = entry.get('root_evidence')
+    excluded = root.get('excluded') if isinstance(root, dict) else None
+    selector = target.get('selector')
+    if (not isinstance(root, dict) or root.get('root') or root.get('error')
+            or root.get('truncated') or not root.get('container')
+            or not root.get('submit') or not isinstance(selector, str)
+            or not selector or not isinstance(excluded, list)
+            or any(not isinstance(s, str) for s in excluded)
+            or selector in excluded or not isinstance(evidence, list)
+            or not 1 <= len(evidence) <= 500
+            or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
+                   for e in evidence)
+            or len({e['selector'] for e in evidence}) != len(evidence)):
+        raise Gate('The reversible receiver has no exact application membership.',
+                   reason='defect_receiver')
+    matches = [e for e in evidence if e['selector'] == selector]
+    if len(matches) != 1:
+        raise Gate('The reversible receiver has no exact application membership.',
+                   reason='defect_receiver')
+    e = matches[0]
+    custom = (target.get('tag') == 'div' and target.get('type') == 'combobox'
+              and isinstance(target.get('combobox'), dict)
+              and bool(target.get('label')) and bool(target.get('question')))
+    pair_member = (target.get('tag') == 'button'
+                   and target.get('type') == 'button'
+                   and target.get('native_type') == 'button'
+                   and bool(target.get('question')))
+    native_label = e.get('associated') is True and e.get('label') == target.get('label')
+    if (e.get('unique') is not True or e.get('in_container') is not True
+            or e.get('native_owner') or e.get('declared_owner')
+            or e.get('formaction') is not None or e.get('submit')
+            or e.get('iti') or e.get('contenteditable')
+            or e.get('type') == 'hidden' or e.get('disabled')
+            or e.get('readonly') or e.get('inert')
+            or e.get('visible') is not True
+            or e.get('tag') != target.get('tag')
+            or e.get('type') != target.get('type')
+            or e.get('required') != target.get('required')
+            or e.get('disabled') != target.get('disabled')
+            or (not native_label and not (custom or pair_member))
+            or target.get('in_form') is not False
+            or any(target.get(k) for k in (
+                'native_form_owner_selector', 'form_selector', 'form_action',
+                'form_action_attr_present', 'form_action_raw', 'formaction',
+                'formaction_attr_present', 'formaction_raw', 'href',
+                'submit', 'navigates', 'commits_application'))):
+        raise Gate('The reversible receiver is not associated with the application.',
+                   reason='defect_receiver')
+    if not (custom or pair_member) and (
+            e.get('value') != target.get('value')
+            or e.get('files') != target.get('files')):
+        raise Gate('The independent application receiver value differs.',
+                   reason='defect_receiver')
+    if witness is not None:
+        dom = witness.get(selector)
+        if (not isinstance(dom, dict) or dom.get('visible') is not True
+                or dom.get('readonly') is not False
+                or dom.get('disabled') is not False
+                or dom.get('inert') is not False):
+            raise Gate('The reversible receiver witness is not editable.',
+                       reason='defect_witness')
+
+
+def _reversible_entry_scope(page: dict, witness: dict) -> frozenset[str]:
+    admitted = set()
+    for c in page['controls']:
+        if c.get('in_form') is not False:
+            continue
+        try:
+            _reversible_entry_recipient(page, c, witness)
+        except Gate:
+            continue
+        admitted.add(c['selector'])
+    return frozenset(admitted)
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')
@@ -2955,13 +3048,14 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
             or not isinstance(target.get('question'), str)
             or not target['question'].strip()):
         raise Gate('A native radio group needs a form, name and visible question.')
-    owned = ({c['selector'] for c in page['entry'].get('root_evidence', [])
-              if c.get('in_container') and c.get('associated')}
-             if structural else None)
     members = [c for c in page['controls']
                if c.get('type') == 'radio' and c.get('name') == name
-               and c.get('form_selector') == form
-               and (owned is None or c.get('selector') in owned)]
+               and c.get('form_selector') == form]
+    if structural and not structural.get('root'):
+        # The group is all its members: silently filtering a foreign member
+        # would change the meaning of the owner's approved choice.
+        for member in members:
+            _reversible_entry_recipient(page, member)
     if (len(members) < 2 or any(
             c.get('tag') != 'input' or (not structural and c.get('in_form') is not True)
             or c.get('question') != target['question']
@@ -2977,6 +3071,37 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
     return members
 
 
+def _boolean_pair(page: dict, target: dict) -> list[dict]:
+    """Only a complete, exact Yes/No application button group can be written."""
+    root = _formless_root(page)
+    name, question = target.get('name'), target.get('question')
+    if (not root or root.get('root') or target.get('tag') != 'button'
+            or target.get('type') != 'button'
+            or not isinstance(name, str) or not name.strip()
+            or not isinstance(question, str) or not question.strip()):
+        raise Gate('Unsupported Boolean receiver.', reason='defect_button')
+    members = [c for c in page['controls']
+               if c.get('tag') == 'button' and c.get('name') == name
+               and c.get('question') == question]
+    if (len(members) != 2
+            or {str(c.get('label', '')).casefold() for c in members} != {'yes', 'no'}
+            or len({c.get('selector') for c in members}) != 2
+            or any(c.get('type') != 'button' or c.get('native_type') != 'button'
+                   or c.get('in_form') is not False or c.get('disabled')
+                   or c.get('required') is not True or c.get('has_value')
+                   or c.get('checked') or c.get('value') not in ('', None)
+                   or any(c.get(k) for k in (
+                       'submit', 'navigates', 'commits_application', 'href',
+                       'form_selector', 'form_action', 'formaction',
+                       'native_form_owner_selector'))
+                   for c in members)):
+        raise Gate('The Boolean button pair is incomplete or unsafe.',
+                   reason='defect_button')
+    for member in members:
+        _reversible_entry_recipient(page, member)
+    return members
+
+
 def _bound_target(page: dict, target: dict) -> dict:
     """Grant identity for a radio is its entire group, never one model option."""
     structural = _formless_root(page)
@@ -2985,6 +3110,11 @@ def _bound_target(page: dict, target: dict) -> dict:
                 'form_selector': structural['root'], 'form_action': structural['submit']}
     # A reversible rootless field has no structural owner. Its exact identity
     # is the independently observed native receiver used by the raw producer.
+    if target.get('type') == 'button':
+        members = _boolean_pair(page, target)
+        return {**members[0], 'boolean_members': [
+            {'selector': c['selector'], 'caption': c['label'],
+             'value': c['label'].casefold()} for c in members]}
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -3148,6 +3278,9 @@ def _choice_prompt(target: dict, question: dict) -> str:
                     '\nOpen the linked picker to load available options.')
     elif question['type'] == 'checkbox':
         observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
+    elif question['type'] == 'button' and question.get('boolean_members'):
+        observed += '\nOptions:\n' + '\n'.join(
+            member['caption'] for member in question['boolean_members'])
     return prefix + observed
 
 
@@ -3162,6 +3295,13 @@ def _require_native_choice(target: dict) -> None:
             or target.get('type') not in {'checkbox', 'radio'}
             or target.get('disabled') or target.get('checked')):
         raise Gate('Only an unchecked, enabled native checkbox/radio can be chosen.')
+
+
+def _require_guarded_choice(page: dict, target: dict) -> None:
+    if target.get('type') == 'button':
+        _boolean_pair(page, target)
+    else:
+        _require_native_choice(target)
 
 
 def _guard_native_choice_answer(selected: dict, answer: str) -> None:
@@ -3222,6 +3362,27 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
     _guard_native_choice_answer(selected, answer)
     return answer, selected
+
+def _approved_boolean_pair(page: dict, target: dict, pk: str, *,
+                           provenance=None, fixture_context=None):
+    members = _boolean_pair(page, target)
+    key = _key(page, members[0])
+    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+    grants = row.get('human_approved_answers')
+    grant = grants.get(key) if isinstance(grants, dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('value'), str):
+        return None
+    answer = grant['value']
+    matching = [c for c in members if _same(answer, c['label'])]
+    if len(matching) != 1:
+        raise Gate('The approved Boolean button answer is ambiguous.',
+                   reason='defect_button')
+    exact_approval(pk, key, answer, target=_bound_target(page, members[0]),
+                   url=page['url'], provenance=provenance,
+                   **({'fixture_context': fixture_context} if fixture_context else {}))
+    guarded_value(matching[0], answer)
+    return answer, matching[0]
+
 
 def _require_native_action(target: dict, verb: str) -> None:
     """Never dispatch fill to a select or select to a text-entry field."""
@@ -3313,6 +3474,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     reversible = (reversible_scope is not None
                   and target.get('selector') in reversible_scope)
     if reversible:
+        _reversible_entry_recipient(page, target, witness)
         # No unique historic root exists on this raw-session route. Grant
         # disclosure only to an independently observed, ownerless receiver on
         # the already-authorized preparation origin; never borrow form authority.
@@ -3330,7 +3492,11 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
     choice = target.get('type') in {'radio', 'checkbox'}
-    if choice:
+    boolean_choice = reversible and target.get('type') == 'button'
+    if boolean_choice:
+        members = _boolean_pair(page, target)
+        target = members[0]
+    elif choice:
         if target.get('tag') != 'input':
             raise Gate('A grantable choice must be a native input.')
         members = (_radio_group(page, target)
@@ -3377,7 +3543,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if not choice and (_material_assent_match(subject) or _material_select_options(target)):
+    if not (choice or boolean_choice) and (
+            _material_assent_match(subject) or _material_select_options(target)):
         if not _material_form_choice(target):
             raise Gate('Legal or material assent requires direct human review.')
         # Unlinked or partly observed ARIA options cannot become an approval.
@@ -3438,6 +3605,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         bound = _bound_target(page, target)
         question['radio_name'] = bound['radio_name']
         question['radio_members'] = bound['radio_members']
+    if boolean_choice:
+        question['boolean_members'] = _bound_target(page, target)['boolean_members']
     return question
 
 

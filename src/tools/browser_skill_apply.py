@@ -3009,7 +3009,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
         if (not isinstance(dom, dict) or dom.get('visible') is not True
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
-                or dom.get('inert') is not False):
+                or dom.get('inert') is not False
+                or (pair_member and dom.get('label') != target.get('label'))):
             raise Gate('The reversible receiver witness is not editable.',
                        reason='defect_witness')
 
@@ -3060,7 +3061,8 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
     return members
 
 
-def _boolean_pair(page: dict, target: dict) -> list[dict]:
+def _boolean_pair(page: dict, target: dict, *,
+                  witness: dict | None = None) -> list[dict]:
     """Only a complete, exact Yes/No application button group can be written."""
     root = _formless_root(page)
     name, question = target.get('name'), target.get('question')
@@ -3092,7 +3094,7 @@ def _boolean_pair(page: dict, target: dict) -> list[dict]:
     if sum(bool(m.get('checked')) for m in members) > 1:
         raise Gate('More than one Boolean answer is selected.', reason='defect_button')
     for member in members:
-        _reversible_entry_recipient(page, member)
+        _reversible_entry_recipient(page, member, witness)
     return members
 
 
@@ -3498,7 +3500,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     choice = target.get('type') in {'radio', 'checkbox'}
     boolean_choice = reversible and target.get('type') == 'button'
     if boolean_choice:
-        members = _boolean_pair(page, target)
+        members = _boolean_pair(page, target, witness=witness)
         target = members[0]
     elif choice:
         if target.get('tag') != 'input':
@@ -4816,7 +4818,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                 pass
         if rootless and kind in {'radio', 'button'}:
             try:
-                _radio_group(current, item) if kind == 'radio' else _boolean_pair(current, item)
+                _radio_group(current, item) if kind == 'radio' else _boolean_pair(
+                    current, item, witness=witness)
             except Gate:
                 return Gate('Required choice group is not safely writable.',
                             reason='defect_' + kind)

@@ -6368,8 +6368,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
+                        # A late model refusal may follow newly hydrated required
+                        # fields that were not open at the pre-plan witness.
                         pending = await _required_owner_gate(
-                            session, page, pk, *trusted_origins,
+                            session, await session.page(), pk, *trusted_origins,
                             provenance=provenance, fixture_context=ctx)
                         if pending is not None:
                             raise pending
@@ -6505,3 +6507,40 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'Check the employer portal before retrying.', step,
                     captcha_artifact=isinstance(exc, CaptchaArtifactGate))
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+            context = (
+                {'text': str(exc), 'step': {'last_button': '(unavailable)',
+                                          'url': _navigation_observed_step_url(page, url)}}
+                if isinstance(exc, NavigationProvenanceGate)
+                else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
+                else handoff(str(exc), step,
+                             captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
+            hard = (isinstance(exc, CaptchaGate) or exc.reason.startswith('defect_')
+                    or exc.reason == 'posting_guard_review_required')
+            route = ('owner' if exc.reason == 'owner_question'
+                     else 'hard_refusal' if hard else 'agent_unavailable')
+            if route == 'agent_unavailable':
+                context['text'] += (
+                    ' Agent-first review is unavailable: a safe sanitized Luna '
+                    'transport and original-tab retention have not been verified. '
+                    'The operator must establish both before any same-session '
+                    'correction; do not requeue or submit automatically.')
+            report = {'status': 'gate',
+                      'reason': 'captcha' if isinstance(exc, CaptchaGate) else exc.reason,
+                      'review_route': route,
+                      'question': context['text'], 'step': context['step'],
+                      'form_question': exc.form_question}
+            if isinstance(exc, MaterialAssentGate) or _material_question(exc.form_question):
+                # An execute-time owner question is also page prose; never log it.
+                report['material_assent_diagnostic'] = True
+            if isinstance(exc, NavigationProvenanceGate):
+                report['navigation_provenance_diagnostic'] = True
+            if isinstance(exc, CaptchaArtifactGate):
+                report['captcha_artifact_diagnostic'] = True
+            return report
+        if submitted:
+            context = handoff(
+                'Submission outcome uncertain after a browser interruption. '
+                'Check the employer portal; no automatic retry.', step)
+            return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+        return {'status': 'unknown', 'detail': str(exc) if isinstance(exc, bsk.Unavailable)
+                else f'BrowserSkill operation unavailable: {type(exc).__name__}'}

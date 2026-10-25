@@ -3727,11 +3727,161 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
     return 'current'
 
 
+
+# The bank's public all_facts(company) deliberately overlays company facts.
+# Auto-approval must inspect the GLOBAL partition only, never that overlay.
+def _global_owner_facts(bank) -> dict:
+    if hasattr(bank, '_scope_facts'):
+        rows = bank._scope_facts('global')
+        return {raw: answer for raw, answer in rows.values()}
+    if hasattr(bank, '_load'):
+        return dict(bank._load().get('global', []))
+    return {}  # Unknown backend is not authority.
+
+
+def _bank_auto_eligible(item: dict, value: str) -> bool:
+    subject = label(item)
+    if (not item.get('in_form') or item.get('disabled')
+            or item.get('tag') == 'textarea'
+            or item.get('type') == 'password'
+            or not (_native_answer(item) or item.get('type') in {'combobox', 'radio', 'checkbox'})
+            or _SENSITIVE.search(subject) or _SANCTIONS_RX.search(subject)
+            or _assent_scope(item) != 'fact'
+            or _material_assent_match(subject) or _material_form_choice(item)
+            or re.search(r'\b(salary|compensation|pay|wage|remuneration|'
+                         r'consent|agree|privacy|certify|attest|declar|sanction|'
+                         r'restricted.country|why|essay|describe|explain|'
+                         r'motivation|cover letter)\b', subject, re.I)):
+        return False
+    try:
+        guarded_value(item, value)
+        if item.get('type') == 'checkbox' and value.casefold() not in {
+                'yes', 'true', 'on', 'checked'}:
+            return False
+        if item.get('type') == 'radio' and not item.get('question'):
+            return False
+        if item.get('tag') == 'select':
+            choose_value(item, value, '')
+    except Gate:
+        return False
+    return True
+
+
+def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
+                            global_facts: dict, *origins: str,
+                            provenance=None, fixture_context=None) -> None:
+    if not global_facts or not pk:
+        return
+    row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
+           else _row(pk))
+    if (row.get('pk') != pk or row.get('status') != 'submitting'
+            or row.get('possible_submission')):
+        return
+    grants = row.get('human_approved_answers') or {}
+    if not isinstance(grants, dict):
+        return
+    pending = {}
+    for item in page['controls']:
+        if not item.get('in_form') or item.get('disabled'):
+            continue
+        if item.get('type') in {'radio', 'checkbox'}:
+            if item.get('checked'):
+                continue
+        elif item.get('has_value') or (item.get('type') == 'combobox' and
+                                      (item.get('combobox') or {}).get('selected_text')):
+            continue
+        try:
+            key = _key(page, item)
+        except Gate:
+            continue
+        if key in grants or key in pending:
+            continue
+        global_key = _fact_key(global_facts, key)
+        fact_key = _fact_key(facts, key)
+        if global_key is None or fact_key is None:
+            continue
+        value = str(global_facts[global_key]).strip()
+        if (not value or str(facts[fact_key]).strip() != value
+                or not _bank_auto_eligible(item, value)):
+            continue
+        try:
+            question = _disclosure_question(
+                page, item, witness, *origins, bootstrap=False,
+                provenance=provenance)
+            if item.get('type') == 'radio':
+                members = _radio_group(page, item)
+                matches = [m for m in members if value.casefold() in {
+                    m['label'].casefold(), str(m.get('value') or '').casefold()}]
+                if len(matches) != 1:
+                    continue
+                guarded_value(matches[0], value)
+        except Gate:
+            continue
+        grant = {
+            'value': value, 'selector': question['selector'],
+            'url': question['url'], 'label': question['control_label'],
+            'question': question['question'], 'tag': question['tag'],
+            'type': question['type'], 'form_selector': question['form_selector'],
+            'form_action': question['form_action'], 'source': 'bank-auto',
+        }
+        if question.get('verified_redirect_url'):
+            grant['verified_redirect_url'] = question['verified_redirect_url']
+        if 'options' in question:
+            grant['options'] = question['options']
+        if item.get('type') == 'checkbox':
+            grant['visible_text'] = question['visible_text']
+        if item.get('type') == 'radio':
+            grant['radio_name'] = question['radio_name']
+            grant['radio_members'] = question['radio_members']
+        pending[key] = grant
+    if not pending:
+        return
+    # Re-read immediately before persistence. Existing explicit grants win.
+    row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
+           else _row(pk))
+    if (row.get('pk') != pk or row.get('status') != 'submitting'
+            or row.get('possible_submission')):
+        raise Gate('Tracked row changed before automatic approval.')
+    current = row.get('human_approved_answers') or {}
+    if not isinstance(current, dict):
+        raise Gate('Stored approval shape is invalid.')
+    additions = {k: v for k, v in pending.items() if k not in current}
+    if not additions:
+        return
+    if fixture_context is not None:
+        fixture_context.set_status(pk, 'submitting',
+                                   human_approved_answers={**current, **additions})
+    else:
+        from core.stores import make_stores
+        make_stores().tracking.set_status(
+            pk, 'submitting', human_approved_answers={**current, **additions})
+
+
+def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
+    grants = row.get('human_approved_answers') or {}
+    result, seen = [], set()
+    if isinstance(grants, dict):
+        for key, grant in grants.items():
+            if not isinstance(key, str) or not isinstance(grant, dict):
+                continue
+            fact_key = _fact_key(facts, key)
+            if fact_key is None or grant.get('value') != str(facts[fact_key]).strip():
+                continue
+            identity = (normalize_label(fact_key), grant['value'])
+            if identity not in seen:
+                seen.add(identity)
+                result.append(fact_key)
+    return result
+
+
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
                      provenance: Provenance | None = None,
                      filled: dict | None = None, history: list | None = None,
-                     resume_path: str = '', company: str = '', job_url: str = '') -> dict:
+                     resume_path: str = '', company: str = '', job_url: str = '',
+                     global_facts: dict | None = None) -> dict:
     if provenance is not None and (
             provenance.pk != pk
             or not _preparation_current(provenance, fixture_context=fixture_context)):
@@ -3749,6 +3899,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
         page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)
+        _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
+                                *origins, provenance=provenance,
+                                fixture_context=fixture_context)
         for observed in members:
             if observed['type'] == 'file':
                 continue
@@ -3793,7 +3946,12 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     candidate = [c for c in page['controls']
                  if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
                  and _unanswered(page, c)]
-    if not candidate and not (settlement_route and history) and not any(
+    optional_bank_candidate = bool(global_facts) and any(
+        c.get('in_form') and not c.get('required')
+        and not c.get('disabled') and not c.get('has_value')
+        and _fact_key(global_facts, c.get('question') or c.get('label') or '') is not None
+        for c in page['controls'])
+    if not candidate and not optional_bank_candidate and not (settlement_route and history) and not any(
             c.get('type') in {'radio', 'checkbox', 'password'}
             or (c.get('in_form') and _material_form_choice(c))
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
@@ -3823,6 +3981,13 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         raise Gate('The job/tenant mapping changed during native control inspection.')
     await _bootstrap_wall(session, page, witness, *origins, provenance=provenance,
                           pk=pk, fixture_context=fixture_context)
+    _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
+                            *origins, provenance=provenance,
+                            fixture_context=fixture_context)
+    # Native owner questions cannot supersede site/entry and controller
+    # prerequisite decisions merely because an input is empty. The model
+    # refusal fallback remains narrow until the independent route checks
+    # complete, and the final controller remains the submission authority.
     # Earlier reversible writes may be temporarily reset by later pickers.
     # The complete current form and all receipts are checked only at Submit.
     seen = set()
@@ -3935,6 +4100,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                           else f'An exact human-approved answer is needed for "{key}".')
                 record('needs-human')
                 raise Gate(prompt, form_question=question, reason='owner_question')
+            # Ordinary native controls retain their guarded model/submit
+            # sequencing; a prose refusal is converted to a structured owner
+            # question only at the decision boundary below.
             record('left-to-model')
             continue
 
@@ -4339,7 +4507,10 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
             return await _observe_controls(session, page, site='execute')
         # Existing offline guard-order tests replace this function with a
         # two-argument witness. Only that substituted seam uses positional args.
-        return await _observe_controls(session, page)
+        # Test doubles intentionally expose the historic two-argument seam;
+        # the real observer above carries the explicit named site.
+        substituted_observer = _observe_controls
+        return await substituted_observer(session, page)
     finally:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
@@ -5493,31 +5664,18 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}
-        approved = ((_row(pk, fixture_context=ctx) if ctx else _row(pk))
-                    .get('human_approved_answers') or {})
-        # Model-visible fact keys may be canonical while a per-control grant
-        # retains the decorated observed label. Matching only chooses fact
-        # DATA; exact_approval still requires the untouched raw grant identity.
-        approved_keys = []
-        advertised_facts = set()
-        if isinstance(approved, dict):
-            for grant_key, grant in approved.items():
-                if not isinstance(grant_key, str) or not isinstance(grant, dict):
-                    continue
-                fact_key = _fact_key(facts, grant_key)
-                if fact_key is None:
-                    continue
-                banked_value = str(facts[fact_key]).strip()
-                if grant.get('value') != banked_value:
-                    continue
-                # Separate raw grants can refer to the same approved fact data.
-                # Advertise that fact once without merging approval identities.
-                identity = (normalize_label(fact_key), banked_value)
-                if identity not in advertised_facts:
-                    advertised_facts.add(identity)
-                    approved_keys.append(fact_key)
+        if ctx is None:
+            from core.stores import make_stores
+            # Some read-only/fixture store adapters do not expose a bank.
+            # Lack of an independently inspectable GLOBAL partition grants
+            # nothing; it must not prevent unrelated guarded form actions.
+            global_bank = getattr(make_stores(), 'answer_bank', None)
+            global_facts = _global_owner_facts(global_bank)
+        else:
+            global_facts = {}  # Synthetic fixture never consults owner storage.
         task = (f'Prepare ONLY the approved application for {url}. Company: {company}. '
-                f'Exact human-authorized fact KEYS on this tracked job: {approved_keys}. '
+                'Exact human-authorized fact KEYS on this tracked job appear in the '
+                'current preparation update. '
                 'The server rechecks both exact value and current approval before writing. '
                 'For fill, select and other fact actions use an authorized bank fact key; '
                 'never invent a value or essay. Material-assent '
@@ -5622,12 +5780,20 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         session, page, pk, facts, *trusted_origins,
                         provenance=provenance, filled=filled, history=history,
                         resume_path=resume_path, company=company, job_url=url,
+                        # Automatic bank grants require the production raw
+                        # controller to retain its exact job-bound guard.
+                        # An inspection-only synthetic Session must not mint
+                        # new authorization before direct owner triage.
+                        global_facts=(global_facts if producer_guard is not None
+                                      else {}),
                         **({'fixture_context': ctx} if ctx else {}))
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
                                     r.get('selector') == c['selector'] and r['label'] == c['label']
                                     for r in history)]
-                    progress = (f'\nSERVER ACTION RECEIPTS: verified controls {verified}; '
+                    granted_keys = _advertised_grant_keys(pk, facts, fixture_context=ctx)
+                    progress = (f'\nExact human-authorized fact KEYS on this tracked job: {granted_keys}. '
+                                f'SERVER ACTION RECEIPTS: verified controls {verified}; '
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
                                 'values and attachment before submit.')

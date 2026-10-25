@@ -5115,3 +5115,200 @@ def test_issue179_owner_gate_does_not_render_unbounded_counts(field, bad_value):
     with pytest.raises(forms.CaptchaArtifactGate) as caught:
         forms._entry_safety(page, lambda url: url == SECURE_URL, None)
     assert f'{field}=other' in str(caught.value)
+
+# Issue #178: only fresh, independently witnessed GLOBAL facts may acquire a
+# row-bound grant. Every public fixture below is synthetic.
+async def test_bank_auto_grant_is_row_bound_and_exact(monkeypatch):
+    page = secure_inventory(field('Email', '#email'))
+    browser, _, row = secure_world(monkeypatch, page)
+    from core.ids import normalize_label
+    assert normalize_label(' EMAIL ') == normalize_label('Email')
+    global_facts = {' EMAIL ': 'synthetic@example.test'}
+    facts = {'Email': 'synthetic@example.test'}
+    writes = []
+
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            assert pk == PK and status == 'submitting'
+            writes.append(attrs)
+            row.update(attrs)
+
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    await forms._bootstrap(browser, page, PK, facts, SECURE_URL,
+                           company='example-co', global_facts=global_facts)
+    grant = row['human_approved_answers']['Email']
+    assert len(writes) == 1 and grant['source'] == 'bank-auto'
+    assert {k: grant[k] for k in ('selector', 'url', 'label', 'question',
+                                  'tag', 'type', 'form_selector',
+                                  'form_action', 'value')} == {
+        'selector': '#email', 'url': SECURE_URL, 'label': 'Email',
+        'question': '', 'tag': 'input', 'type': 'email',
+        'form_selector': '#application', 'form_action': SECURE_URL,
+        'value': 'synthetic@example.test'}
+    assert forms._advertised_grant_keys(PK, facts) == ['Email']
+    forms.exact_approval(PK, 'Email', 'synthetic@example.test',
+                         target=page['controls'][0], url=SECURE_URL)
+    with pytest.raises(forms.Gate, match='exact human-approved'):
+        forms.exact_approval(PK, 'Email', 'different@example.test',
+                             target=page['controls'][0], url=SECURE_URL)
+    assert not any(call[0] in {'fill', 'select', 'click'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('label,value,extra', [
+    ('I consent to processing', 'yes', {}),
+    ('Desired salary', '500', {}),
+    ('Expected compensation', '500', {}),
+    ('Gender', 'Decline to answer', {}),
+    ('Sanctions or restricted country', 'No', {}),
+    ('I attest the statements are true', 'yes', {}),
+    ('Why are you interested in this role?', 'Synthetic prose', {}),
+    ('Cover letter', 'Synthetic essay', {'tag': 'textarea', 'type': 'textarea'}),
+])
+async def test_bank_auto_exclusions_keep_owner_authority(
+        monkeypatch, label, value, extra):
+    page = secure_inventory(field(label, '#response', **extra))
+    browser, _, row = secure_world(monkeypatch, page)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: pytest.fail('Excluded field cannot write a grant'))
+    # The material assent wall may gate before bank settlement; neither
+    # branch can mint a row grant or browser mutation.
+    try:
+        await forms._bootstrap(browser, page, PK, {label: value}, SECURE_URL,
+                               global_facts={label: value},
+                               company='example-co')
+    except forms.Gate:
+        pass
+    assert row['human_approved_answers'] == {}
+    assert not any(c[0] in {'fill', 'select', 'click'} for c in browser.calls)
+
+
+async def test_bank_auto_does_not_use_company_only_facts_or_overwrite_owner(monkeypatch):
+    page = secure_inventory(field('Email', '#email'))
+    browser, _, row = secure_world(monkeypatch, page)
+    original = {'value': 'owner-choice', 'selector': '#old'}
+    row['human_approved_answers'] = {'Email': original.copy()}
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: pytest.fail('Existing owner grant must not be replaced'))
+    await forms._bootstrap(browser, page, PK, {'Email': 'company-only'}, SECURE_URL,
+                           global_facts={}, company='example-co')
+    assert row['human_approved_answers']['Email'] == original
+    await forms._bootstrap(browser, page, PK, {'Email': 'global-choice'}, SECURE_URL,
+                           global_facts={'Email': 'global-choice'},
+                           company='example-co')
+    assert row['human_approved_answers']['Email'] == original
+
+
+
+def test_bank_global_partition_only(monkeypatch):
+    class LocalBank:
+        def _load(self):
+            return {'global': [('Email', 'global@example.test')],
+                    'company#example-co': [('Company field', 'company-only')]}
+    class CloudBank:
+        def _scope_facts(self, scope):
+            assert scope == 'global'
+            return {'email': ('Email', 'global@example.test')}
+    for bank in (LocalBank(), CloudBank()):
+        assert forms._global_owner_facts(bank) == {
+            'Email': 'global@example.test'}
+    assert forms._global_owner_facts(object()) == {}
+
+
+async def test_bank_auto_optional_email_uses_independent_witness(monkeypatch):
+    page = secure_inventory(field('Email', '#optional', required=False))
+    browser, _, row = secure_world(monkeypatch, page)
+    writes = []
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            writes.append(attrs)
+            row.update(attrs)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    await forms._bootstrap(browser, page, PK, {'Email': 'synthetic@example.test'},
+                           SECURE_URL, global_facts={'Email': 'synthetic@example.test'},
+                           company='example-co')
+    assert row['human_approved_answers']['Email']['source'] == 'bank-auto'
+    assert writes
+    assert not any(c[0] in {'fill', 'select', 'click'} for c in browser.calls)
+
+
+async def test_bank_auto_optional_witness_refusal_does_not_grant(monkeypatch):
+    page = secure_inventory(field('Email', '#optional', required=False))
+    evidence = witness(page)
+    evidence['controls'][0]['visible'] = False
+    browser, _, row = world(monkeypatch, page, result=evidence)
+    observed = await forms._bootstrap(
+        browser, page, PK, {'Email': 'test@example.test'},
+        page['url'], global_facts={'Email': 'test@example.test'})
+    assert observed is page
+    assert row['human_approved_answers'] == {}
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
+
+
+async def test_bank_auto_company_shadow_never_elevates_company_fact(monkeypatch):
+    page = secure_inventory(field('Email', '#email'))
+    browser, _, row = secure_world(monkeypatch, page)
+    await forms._bootstrap(browser, page, PK, {'Email': 'company@example.test'},
+                           SECURE_URL, global_facts={'Email': 'global@example.test'})
+    assert row['human_approved_answers'] == {}
+    assert not any(c[0] in {'fill', 'select', 'click'} for c in browser.calls)
+
+
+async def test_bank_auto_native_checkbox_witnessed_grant(monkeypatch):
+    checkbox = field('Confirm details', '#confirm', type='checkbox',
+                     value='on', has_value=True, required=True)
+    page = secure_inventory(checkbox)
+    browser, _, row = secure_world(monkeypatch, page)
+    writes = []
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            writes.append(attrs)
+            row.update(attrs)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    await forms._bootstrap(browser, page, PK, {'Confirm details': 'yes'},
+                           SECURE_URL, global_facts={'Confirm details': 'yes'})
+    assert row['human_approved_answers']['Confirm details']['source'] == 'bank-auto'
+    assert row['human_approved_answers']['Confirm details']['visible_text'] == 'Confirm details'
+    assert writes
+
+
+
+
+async def test_issue178_radio_global_grant_is_bound_and_witnessed(monkeypatch):
+    yes = field('Yes', '#yes', type='radio', name='work_choice',
+                question='Work preference', value='yes', has_value=True)
+    no = field('No', '#no', type='radio', name='work_choice',
+               question='Work preference', value='no', has_value=True)
+    page = secure_inventory(yes, no)
+    browser, _, row = secure_world(monkeypatch, page)
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            row.update(attrs)
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    await forms._bootstrap(browser, page, PK, {'Work preference': 'Yes'},
+                           SECURE_URL, global_facts={'Work preference': 'Yes'})
+    grant = row['human_approved_answers']['Work preference']
+    assert grant['source'] == 'bank-auto'
+    assert grant['radio_name'] == 'work_choice'
+    assert len(grant['radio_members']) == 2
+    assert grant['selector'] == '#yes'
+    assert not any(x[0] in {'click', 'fill', 'select'} for x in browser.calls)
+
+
+async def test_issue178_radio_unmatched_global_choice_never_grants(monkeypatch):
+    yes = field('Yes', '#yes', type='radio', name='work_choice',
+                question='Work preference', value='yes', has_value=True)
+    no = field('No', '#no', type='radio', name='work_choice',
+               question='Work preference', value='no', has_value=True)
+    page = secure_inventory(yes, no)
+    browser, _, row = secure_world(monkeypatch, page)
+    await forms._bootstrap(browser, page, PK, {'Work preference': 'Unobserved'},
+                           SECURE_URL, global_facts={'Work preference': 'Unobserved'})
+    assert row['human_approved_answers'] == {}
+
+

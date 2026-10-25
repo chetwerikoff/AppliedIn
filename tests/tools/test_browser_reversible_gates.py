@@ -573,3 +573,21 @@ async def test_rootless_standard_privacy_checkbox_needs_exact_owner_grant(
     assert decision.await_count == 2
     assert [c for c in endpoint.calls if c[0] == 'click'] == [
         ('click', '#privacy')]
+
+
+@pytest.mark.asyncio
+async def test_boolean_pair_requires_both_independent_member_captions(monkeypatch, tmp_path):
+    """A PAGE-only Yes/No label cannot confer a selected-member grant."""
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    second = next(c for c in endpoint.fixed['controls']
+                  if c['selector'] == '#boolean-no')
+    second['label'] = 'Different option'
+    result = await _apply(pdf)
+    assert result['status'] == 'gate'
+    assert result['reason'] == 'defect_button'
+    assert result['review_route'] == 'hard_refusal'
+    assert result['form_question'] is None
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls
+                if c[0] in {'fill', 'click', 'select', 'upload'}]

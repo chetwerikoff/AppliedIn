@@ -4548,7 +4548,15 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                 not _preparation_current(provenance, fixture_context=fixture_context))):
         raise Gate('The tracked job route changed before the owner question.',
                    reason='defect_provenance')
-    rootless = bool(_formless_root(current) and not _formless_root(current).get('root'))
+    structural = _formless_root(current)
+    if structural and (structural.get('error') or structural.get('root')):
+        try:
+            _formless_boundary(current, provenance)
+        except Gate:
+            # A damaged structural root is a final-Submit defect, not a
+            # safe source for a newly bound owner answer.
+            return None
+    rootless = bool(structural and not structural.get('root'))
     if rootless and not (
             isinstance(session, _ReversibleEntryReader)
             and isinstance(provenance, ApplicationEntryProvenance)
@@ -6305,11 +6313,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         global_facts=(global_facts if producer_guard is not None
                                       else {}),
                         **({'fixture_context': ctx} if ctx else {}))
-                    pending = await _required_owner_gate(
-                        session, page, pk, *trusted_origins,
-                        provenance=provenance, fixture_context=ctx)
-                    if pending is not None:
-                        raise pending
+                    # Native forms have their required-control wall in bootstrap.
+                    # Preserve the unverified-PDF Submit refusal until upload;
+                    # the new pre-model wall closes the reversible-route gap.
+                    if (isinstance(session, _ReversibleEntryReader)
+                            or (producer_guard is not None
+                                and producer_guard.upload_completed)):
+                        pending = await _required_owner_gate(
+                            session, page, pk, *trusted_origins,
+                            provenance=provenance, fixture_context=ctx)
+                        if pending is not None:
+                            raise pending
                     verified = [c['selector'] for c in page['controls']
                                 if c['selector'] in filled and any(
                                     r.get('selector') == c['selector'] and r['label'] == c['label']

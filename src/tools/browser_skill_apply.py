@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextvars import ContextVar
+from functools import wraps
 import ipaddress
 import socket
 import re
@@ -2647,12 +2648,17 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 'truncated application inventory after bounded wait',
                 'unsupported custom control', 'no unique application root')):
             raise
-        if hasattr(raw_session, 'page'):
-            page = await raw_session.page()
+        if isinstance(provenance, ApplicationEntryProvenance):
+            # Generic PAGE omits entry.formless; keep raw IPC and read ENTRY_PAGE.
+            reversible = _ReversibleEntryReader(raw_session)
+            page = await reversible.page()
         else:
-            # Offline command spies still expose the existing fixed reader.
-            result = await raw_session.call('evaluate', ENTRY_PAGE)
-            page = result.get('value') if isinstance(result, dict) else None
+            reversible = raw_session
+            if hasattr(raw_session, 'page'):
+                page = await raw_session.page()
+            else:
+                result = await raw_session.call('evaluate', ENTRY_PAGE)
+                page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict):
             raise Gate('Reversible preparation page observation is unavailable.')
         if not allowed(page.get('url', '')):
@@ -2661,7 +2667,7 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 provenance.wrapper if provenance is not None else '',
                 page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
-        return raw_session, page
+        return reversible, page
 
 
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
@@ -2744,6 +2750,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
+_BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
 
 
 async def _bootstrap_observe_controls(session, page: dict, *, site: str):
@@ -2776,7 +2783,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
         result = await session.call('evaluate', _FIXED_CONTROL_WITNESS)
         value = result.get('value') if isinstance(result, dict) else None
         require(isinstance(value, dict), 'witness.object')
-        if isinstance(session, _EntrySession):
+        if isinstance(session, (_EntrySession, _ReversibleEntryReader)):
             require(value.get('entry') == page.get('entry'), 'entry.equal')
         if isinstance(session, _GreenhouseSession):
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
@@ -2901,6 +2908,30 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                    + (f'; site={site}' if site else '')) from None
 
 
+class _ReversibleEntryReader:
+    """ENTRY_PAGE observations on a reversible route; all IPC stays on raw."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __getattr__(self, name):
+        # The production application_effect/controller are still owned by
+        # the original guarded raw Session, not by this read adapter.
+        return getattr(self.raw, name)
+
+    async def page(self):
+        result = await self.raw.call('evaluate', ENTRY_PAGE)
+        page = result.get('value') if isinstance(result, dict) else None
+        if not isinstance(page, dict) or not page.get('url'):
+            raise Gate('Reversible preparation page observation is unavailable.')
+        return page
+
+    async def call(self, *args, **kwargs):
+        if args == ('evaluate', _FIXED_CONTROL_WITNESS):
+            args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+        return await self.raw.call(*args, **kwargs)
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')
@@ -2936,9 +2967,11 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
 def _bound_target(page: dict, target: dict) -> dict:
     """Grant identity for a radio is its entire group, never one model option."""
     structural = _formless_root(page)
-    if structural:
+    if structural and (structural.get('root') or target.get('in_form') is not False):
         return {**target, 'owner_kind': 'ashby-formless-root',
                 'form_selector': structural['root'], 'form_action': structural['submit']}
+    # A reversible rootless field has no structural owner. Its exact identity
+    # is the independently observed native receiver used by the raw producer.
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -3261,9 +3294,25 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None,
                          lever_location: bool = False,
-                         closed_witness: bool = False) -> dict:
+                         closed_witness: bool = False,
+                         reversible_scope: frozenset[str] | None = None) -> dict:
     structural = _formless_root(page)
-    if structural:
+    reversible = (reversible_scope is not None
+                  and target.get('selector') in reversible_scope)
+    if reversible:
+        # No unique historic root exists on this raw-session route. Grant
+        # disclosure only to an independently observed, ownerless receiver on
+        # the already-authorized preparation origin; never borrow form authority.
+        if (not structural or structural.get('root')
+                or target.get('in_form') is not False
+                or not _preparation_destination_allowed(
+                    page.get('url', ''), *origins, provenance=provenance)
+                or any(target.get(k) for k in (
+                    'native_form_owner_selector', 'form_selector', 'form_action',
+                    'formaction', 'href', 'submit', 'commits_application',
+                    'navigates'))):
+            raise Gate('The reversible receiver is not on the approved preparation origin.')
+    elif structural:
         members = _formless_boundary(page, provenance)
         if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
@@ -3322,14 +3371,16 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if target.get('type') == 'combobox' and not closed_witness:
             _combobox_options(target)
     key = _key(page, target)
-    siblings = _form_subject(page, target)
+    if not reversible:
+        _form_subject(page, target)
     if bootstrap and (not _unanswered(page, target)
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
-    # A positive Submit/file marker is final form evidence, not permission
-    # to disclose an exact-approved value on an allowed preparation origin.
-    check_form_destination(page, target, *origins, provenance=provenance)
+    # No root proof exists on the reversible raw route, but the fresh
+    # control witness and tracked preparation destination are still required.
+    if not reversible:
+        check_form_destination(page, target, *origins, provenance=provenance)
     question = {
         'pk': '', 'label': key, 'selector': target['selector'],
         'url': page['url'], 'control_label': target['label'],
@@ -3338,7 +3389,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
-    if structural:
+    if structural and not reversible:
         # These legacy envelope slots are opaque structural identities here.
         # They are never supplied to native receiver or navigation validation.
         question.update(owner_kind='ashby-formless-root',
@@ -3793,7 +3844,8 @@ def _bank_auto_eligible(item: dict, value: str, *,
 def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             global_facts: dict, *origins: str,
                             provenance=None, fixture_context=None,
-                            formless_selectors: frozenset[str] = frozenset()) -> None:
+                            formless_selectors: frozenset[str] = frozenset(),
+                            reversible_scope: frozenset[str] | None = None) -> None:
     if not global_facts or not pk:
         return
     row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
@@ -3806,6 +3858,10 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         return
     pending = {}
     for item in page['controls']:
+        if (reversible_scope is not None and (
+                item.get('in_form') is not False
+                or item.get('selector') not in reversible_scope)):
+            continue
         if ((not item.get('in_form')
              and item.get('selector') not in formless_selectors)
                 or item.get('disabled')):
@@ -3834,7 +3890,7 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         try:
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=False,
-                provenance=provenance)
+                provenance=provenance, reversible_scope=reversible_scope)
             if item.get('type') == 'radio':
                 members = _radio_group(page, item)
                 matches = [m for m in members if value.casefold() in {
@@ -3882,6 +3938,9 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         from core.stores import make_stores
         make_stores().tracking.set_status(
             pk, 'submitting', human_approved_answers={**current, **additions})
+    reported = _BOOTSTRAP_BANK_GRANTS.get()
+    if reported is not None:
+        reported.extend(additions)
 
 
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:
@@ -3903,6 +3962,23 @@ def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> lis
     return result
 
 
+def _bootstrap_grant_diagnostics(fn):
+    @wraps(fn)
+    async def recorded(session, page: dict, pk: str, *args, **kwargs):
+        route = ('entry' if isinstance(session, _EntrySession) else
+                 'reversible' if _formless_root(page) else 'form')
+        granted = []
+        token = _BOOTSTRAP_BANK_GRANTS.set(granted)
+        try:
+            return await fn(session, page, pk, *args, **kwargs)
+        finally:
+            _BOOTSTRAP_BANK_GRANTS.reset(token)
+            _LOG.info('bootstrap pk=%s route=%s bank-auto-granted=%s',
+                      pk, route, sorted(granted))
+    return recorded
+
+
+@_bootstrap_grant_diagnostics
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
                      provenance: Provenance | None = None,
@@ -3922,7 +3998,25 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if _formless_root(page):
         if not isinstance(session, _EntrySession):
             if getattr(session, '_application_controller', None) is not None:
-                return page  # Missing historic root proof cannot block preparation.
+                try:
+                    fresh, witness = await _bootstrap_observe_controls(
+                        session, page, site='bootstrap-formless')
+                    if (not _preparation_destination_allowed(
+                            fresh.get('url', ''), *origins, provenance=provenance,
+                            pk=pk, company=company, fixture_context=fixture_context)
+                            or (provenance is not None and
+                                not _preparation_current(
+                                    provenance, fixture_context=fixture_context))):
+                        raise Gate('The reversible observation left the preparation origin.')
+                    scope = frozenset(c['selector'] for c in fresh['controls']
+                                      if c.get('in_form') is False)
+                    _auto_grant_from_global(
+                        fresh, witness, pk, facts, global_facts or {}, *origins,
+                        provenance=provenance, fixture_context=fixture_context,
+                        formless_selectors=scope, reversible_scope=scope)
+                except Gate:
+                    pass  # A missing historic root still cannot block preparation.
+                return page
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
         page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)
@@ -4583,6 +4677,70 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
 
+def _reversible_action_scope(page: dict, witness: dict, target: dict,
+                             pk: str, facts: dict, *, controller, origin: str,
+                             fixture_context=None) -> frozenset[str] | None:
+    """Build authorization from this action's independent, ownerless witness."""
+    root = _formless_root(page)
+    if (not root or root.get('root') or target.get('in_form') is not False
+            or not isinstance(controller, ApplicationIPCController)
+            or controller.pk != pk or not origin or controller.url != origin
+            or not _preparation_destination_allowed(
+                page.get('url', ''), origin, pk=pk,
+                company=controller.company, fixture_context=fixture_context)
+            or any(target.get(field) for field in (
+                'native_form_owner_selector', 'form_selector', 'form_action',
+                'form_action_attr_present', 'form_action_raw', 'formaction',
+                'formaction_attr_present', 'formaction_raw', 'href',
+                'submit', 'navigates', 'commits_application'))):
+        return None
+    selector = target.get('selector')
+    observed = witness.get(selector)
+    if (not isinstance(selector, str) or not selector
+            or not isinstance(observed, dict)
+            or observed.get('visible') is not True
+            or observed.get('readonly') is not False
+            or observed.get('disabled') is not False
+            or observed.get('inert') is not False):
+        return None
+    key = _key(page, target)
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
+    grants = row.get('human_approved_answers') or {}
+    grant = grants.get(key) if isinstance(grants, dict) else None
+    fact_key = _fact_key(facts, key)
+    value = str(facts[fact_key]).strip() if fact_key is not None else ''
+    if (not isinstance(grant, dict) or grant.get('source') != 'bank-auto'
+            or not value or grant.get('value') != value
+            or grant.get('url') != page['url']
+            or any(grant.get(k) != target.get(k) for k in (
+                'selector', 'label', 'question', 'tag', 'type',
+                'form_selector', 'form_action'))
+            or not _bank_auto_eligible(
+                target, value, formless_selectors=frozenset({selector}))):
+        return None
+    return frozenset({selector})
+
+
+def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
+                              pk: str, facts: dict, *, provenance=None,
+                              fixture_context=None) -> frozenset[str] | None:
+    if (not isinstance(session, _ReversibleEntryReader)
+            or not isinstance(provenance, ApplicationEntryProvenance)
+            or provenance.pk != pk
+            or not _preparation_current(provenance, fixture_context=fixture_context)
+            or not _preparation_destination_allowed(
+                page.get('url', ''), provenance=provenance)):
+        return None
+    controller = getattr(session.raw, '_application_controller', None)
+    if (not isinstance(controller, ApplicationIPCController)
+            or controller.company != provenance.company):
+        return None
+    return _reversible_action_scope(
+        page, witness, target, pk, facts, controller=controller,
+        origin=provenance.wrapper, fixture_context=fixture_context)
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -4636,7 +4794,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         page = observed
         form_question = _disclosure_question(
             page, target, witness, job_url or page['url'],
-            provenance=provenance)
+            provenance=provenance, reversible_scope=_execute_reversible_scope(
+                session, page, witness, target, pk, facts,
+                provenance=provenance, fixture_context=ctx))
         form_question['pk'] = pk
         gate_prompt = (_choice_prompt(target, form_question)
                        if verb in {'choose', 'select'}
@@ -4748,7 +4908,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The same-job page or mapping changed before disclosure.')
         fresh_question = _disclosure_question(
             latest, current, latest_witness, job_url or latest['url'],
-            provenance=provenance)
+            provenance=provenance, reversible_scope=_execute_reversible_scope(
+                session, latest, latest_witness, current, pk, facts,
+                provenance=provenance, fixture_context=ctx))
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
@@ -5216,6 +5378,25 @@ class ApplicationIPCController:
             raise Gate('Fresh application page observation is unavailable.')
         return page
 
+    async def _reversible_receiver(self, session, page: dict, target: dict):
+        # The raw producer independently rereads ENTRY_PAGE and its fixed
+        # witness. Neither bootstrap nor execute supplies this scope.
+        fresh, witness = await _observe_controls(
+            _ReversibleEntryReader(session), page, site='controller-reversible')
+        matches = [c for c in fresh['controls']
+                   if c.get('selector') == target.get('selector')]
+        if len(matches) != 1 or _identity(matches[0]) != _identity(target):
+            raise Gate('The reversible receiver changed before raw IPC.')
+        current = matches[0]
+        scope = _reversible_action_scope(
+            fresh, witness, current, self.pk, self.facts, controller=self,
+            origin=self.url, fixture_context=self.fixture_context)
+        if scope is None:
+            raise Gate('An exact human-approved reversible receiver is required.')
+        _disclosure_question(
+            fresh, current, witness, self.url, reversible_scope=scope)
+        return fresh, current
+
     def _approved(self, page, target, value):
         key = _key(page, target)
         fact_key = _fact_key(self.facts, key)
@@ -5374,6 +5555,9 @@ class ApplicationIPCController:
             if op == 'fill' and target.get('type') not in {
                     'text', 'email', 'tel', 'textarea', 'combobox'}:
                 raise Gate('A non-text receiver cannot be filled.')
+            if (_formless_root(page) and not _formless_root(page).get('root')
+                    and self._row().get('ats') in _APPLICATION_ENTRY):
+                page, target = await self._reversible_receiver(session, page, target)
             if op == 'select':
                 if target.get('tag') != 'select':
                     raise Gate('A native select is required.')

@@ -4828,9 +4828,9 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
 
 async def _current_approved_choices(session, page: dict, pk: str,
                                     *origins: str, fixture_context=None,
-                                    provenance=None) -> list[dict]:
+                                    provenance=None, facts=None) -> list[dict]:
     """Expose only eligible choices independently witnessed on this decision PAGE."""
-    if not any(c.get('type') in {'radio', 'checkbox'} and _unanswered(page, c)
+    if not any(c.get('type') in {'radio', 'checkbox', 'button'} and _unanswered(page, c)
                for c in page['controls']):
         return []
     current, witness = await _observe_controls(session, page, site='bootstrap-native-readback')
@@ -4841,18 +4841,41 @@ async def _current_approved_choices(session, page: dict, pk: str,
         raise Gate('The same-job choice PAGE changed before model disclosure.')
     choices = []
     for item in current['controls']:
-        if (item.get('type') not in {'radio', 'checkbox'}
+        kind = item.get('type')
+        if (kind not in {'radio', 'checkbox', 'button'}
                 or item.get('disabled') or not _unanswered(current, item)):
             continue
-        if (item['type'] == 'radio'
-                and _radio_group(current, item)[0] is not item):
+        if kind == 'button':
+            if not isinstance(session, _ReversibleEntryReader):
+                continue
+            try:
+                if _boolean_pair(current, item)[0] is not item:
+                    continue
+            except Gate:
+                continue
+        if kind == 'radio':
+            try:
+                if _radio_group(current, item)[0] is not item:
+                    continue
+            except Gate:
+                if isinstance(session, _ReversibleEntryReader):
+                    continue  # The later owner gate returns a typed group defect.
+                raise
+        reversible_scope = (_execute_reversible_scope(
+            session, current, witness, item, pk, facts or {},
+            provenance=provenance, fixture_context=fixture_context)
+            if isinstance(session, _ReversibleEntryReader) else None)
+        if isinstance(session, _ReversibleEntryReader) and reversible_scope is None:
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
-            provenance=provenance)
-        approved = _approved_native_choice(
+            provenance=provenance, reversible_scope=reversible_scope)
+        approved = (_approved_boolean_pair(
             current, item, pk, provenance=provenance,
-            fixture_context=fixture_context)
+            fixture_context=fixture_context) if kind == 'button' else
+            _approved_native_choice(
+                current, item, pk, provenance=provenance,
+                fixture_context=fixture_context))
         if approved is None:
             continue
         answer, selected = approved
@@ -4864,13 +4887,18 @@ async def _current_approved_choices(session, page: dict, pk: str,
             'form_selector': question['form_selector'],
             'form_action': question['form_action'],
         }
-        if item['type'] == 'radio':
+        if kind == 'radio':
             entry.update(radio_name=question['radio_name'],
                          radio_members=question['radio_members'],
                          approved_answer={
                              'selector': selected['selector'],
                              'caption': selected['label'],
                              'value': selected['value']})
+        elif kind == 'button':
+            entry['boolean_members'] = question['boolean_members']
+            entry['approved_answer'] = {
+                'selector': selected['selector'], 'caption': selected['label'],
+                'value': selected['label'].casefold()}
         else:
             entry['approved_answer'] = {
                 'selector': selected['selector'], 'value': 'yes', 'checked': True}
@@ -6550,7 +6578,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     # Decision-only choice data comes from a fresh independent PAGE witness.
                     choices = await _current_approved_choices(
                         session, page, pk, *trusted_origins, provenance=provenance,
-                        fixture_context=ctx)
+                        fixture_context=ctx, facts=facts)
                     model_page = {**page, 'approved_choices': choices}
                     if (isinstance(session, _EntrySession)
                             and isinstance(provenance, ApplicationEntryProvenance)

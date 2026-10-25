@@ -2375,16 +2375,12 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
     # Receiver and approved-value evidence is refreshed for preparation;
     # completeness of the structural root is a final-Submit requirement.
 
-
 _ASHBY_WAIT_SECONDS = 90.0
-
 
 def _upload_clock():
     return asyncio.get_running_loop().time()
 
-
 _upload_sleep = asyncio.sleep
-
 
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
@@ -2515,7 +2511,6 @@ class _EntrySession:
         finally:
             self.upload_pending = False
 
-
     async def call(self, *args, **kwargs):
         if self.upload_pending and (kwargs or args not in {
                 ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
@@ -2600,7 +2595,6 @@ class _EntrySession:
                               readiness=self._readiness)
         return result
 
-
 def _entry_not_ready(page):
     for key in ('truncated', 'opaque_controls', 'shadow_roots'):
         if page.get(key):
@@ -2640,9 +2634,6 @@ def _greenhouse_not_ready(page, *, witness=False):
         return 'unverified application inventory'
     return 'no qualifying application form' if page['greenhouse']['root'] is None else ''
 
-
-
-
 async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                                     provenance, *, deadline: float):
     """Losing a historic shape certificate does not make an approved write a Submit.
@@ -2681,7 +2672,6 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
         return reversible, page
-
 
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
                                    initial=None) -> dict:
@@ -2759,11 +2749,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
         if greenhouse or entry_session:
             session._readiness = prior_readiness
 
-
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
 _BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
-
 
 async def _bootstrap_observe_controls(session, page: dict, *, site: str):
     """Preserve the two-argument observer seam while naming bootstrap gates."""
@@ -3501,6 +3489,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                     'navigates'))):
             raise Gate('The reversible receiver is not on the approved preparation origin.')
     elif structural:
+        if not structural.get('root'):
+            raise Gate('Unscoped reversible receiver is not an application member.',
+                       reason='defect_receiver')
         members = _formless_boundary(page, provenance)
         if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
@@ -5195,7 +5186,9 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
         approved = grant.get('value')
         if not isinstance(approved, str) or not approved.strip():
             return None
-        if not _material_form_choice(target) and (not value or approved != value):
+        if (not (_material_form_choice(target)
+                 or target.get('type') in {'radio', 'checkbox', 'button'})
+                and (not value or approved != value)):
             return None
         try:
             exact_approval(pk, key, approved, target=_bound_target(page, target),

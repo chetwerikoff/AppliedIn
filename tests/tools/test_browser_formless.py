@@ -2180,3 +2180,28 @@ def test_issue182_formless_selector_membership_does_not_open_outer_scope():
         formless_selectors=frozenset({'#outside'}))
     inside_native_form = field('Email', '#inside', in_form=True)
     assert forms._bank_auto_eligible(inside_native_form, 'synthetic@example.test')
+
+async def test_issue182_formless_partial_label_is_not_a_global_fact(monkeypatch):
+    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
+    _issue182_tracking(monkeypatch, row)
+    partial = {'Full Name': 'Test User'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, partial, posting('ashby'),
+            provenance=provenance, global_facts=partial)
+    assert row['human_approved_answers'] == {}
+    no_mutations(raw)
+
+
+async def test_issue182_formless_existing_explicit_grant_is_not_overwritten(monkeypatch):
+    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
+    original = {'value': 'Owner decision', 'selector': '#old'}
+    row['human_approved_answers'] = {'Name': original.copy()}
+    _issue182_tracking(monkeypatch, row)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, facts, posting('ashby'),
+            provenance=provenance, global_facts=facts)
+    assert row['human_approved_answers']['Name'] == original
+    no_mutations(raw)

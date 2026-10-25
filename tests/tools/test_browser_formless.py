@@ -3261,3 +3261,16 @@ async def test_issue194_existing_upload_gate_is_neither_logged_nor_retried(
     assert 'resume upload failure pk=' not in output
     assert [c for c in raw.calls if c[0] == 'upload'] == [
         ('upload', selector, '--file', 'Resume.pdf')]
+
+def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
+    """A newly owner-answerable date must not expand the prior GLOBAL grant scope."""
+    target = {
+        'selector': '#synthetic-date', 'tag': 'input', 'type': 'date',
+        'in_form': False, 'disabled': False, 'required': True,
+        'label': 'Start date', 'question': '', 'value': '', 'has_value': False,
+    }
+    assert forms._native_answer(target)
+    forms._require_native_action(target, 'fill')
+    assert not forms._bank_auto_eligible(
+        target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
+

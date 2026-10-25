@@ -2446,3 +2446,110 @@ async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, caplog
     assert f'pk={PK} route=form' in messages[1]
     assert all('bank-auto-granted=[]' in message for message in messages)
     no_mutations(raw)
+
+
+def _issue184_real_producer(monkeypatch, facts):
+    """Real raw Session/IPC guard, synthetic command transport and generic PAGE."""
+    row, endpoint, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda *args, **kwargs: False)
+
+    async def command(*args, **kwargs):
+        assert not kwargs and args[-2:] == ('--session', 'synthetic-session')
+        return await endpoint.call(*args[:-2])
+
+    monkeypatch.setattr(forms.bsk, 'command', command)
+    producer = ProductionBrowserSession('apply')
+    producer.id = 'synthetic-session'
+    filled, history = {}, []
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', facts, filled, history,
+        {'url': entry('ashby')}, lambda: None)
+    producer.bind_application_controller(controller)
+    return row, endpoint, producer, controller, provenance, writes
+
+
+async def _issue184_prepare_producer(producer, provenance, facts):
+    # Real raw Session.page() has no entry.formless; the scoped fallback must
+    # supply ENTRY_PAGE, while its raw application_effect stays in control.
+    generic = await producer.page()
+    assert generic['url'] == entry('ashby') and 'entry' not in generic
+    allowed = lambda url: url == entry('ashby')
+    scoped = forms._EntrySession(producer, allowed, provenance,
+                                 resume_path='Resume.pdf')
+    session, page = await forms._entry_or_reversible_page(
+        scoped, producer, allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 0.05)
+    assert isinstance(session, forms._ReversibleEntryReader)
+    assert session.raw is producer and forms._formless_root(page)
+    assert not forms._formless_root(page).get('root')
+    returned = await forms._bootstrap(
+        session, page, PK, facts, posting('ashby'), company=COMPANY,
+        provenance=provenance, global_facts=dict(facts))
+    assert returned is page
+    assert set(forms._advertised_grant_keys(PK, facts)) == set(facts)
+    return session, page
+
+
+async def test_issue184_bank_auto_fill_reaches_raw_controller_and_exact_readback(
+        monkeypatch):
+    """Review finding 1: grants must produce an approved, witnessed real fill."""
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    row, endpoint, producer, controller, provenance, writes = (
+        _issue184_real_producer(monkeypatch, facts))
+    session, page = await _issue184_prepare_producer(producer, provenance, facts)
+    before_ipc = controller.before_ipc
+    calls = []
+
+    async def checked_before_ipc(raw, args, kwargs):
+        calls.append(args)
+        return await before_ipc(raw, args, kwargs)
+
+    monkeypatch.setattr(controller, 'before_ipc', checked_before_ipc)
+    action = {'action': 'fill', 'selector': '#_systemfield_name', 'fact': 'Name'}
+    receipt = await forms.execute(
+        session, page, action, facts=facts, filled=controller.filled,
+        resume_path='', company=COMPANY, jd_text='', resume_tex='', github='',
+        pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    assert calls == [('fill', '#_systemfield_name', '--value', 'Test User')]
+    assert [call for call in endpoint.calls if call[0] == 'fill'] == [
+        ('fill', '#_systemfield_name', '--value', 'Test User')]
+    assert controller.filled == {'#_systemfield_name': 'Test User'}
+    after = await session.page()
+    name = next(c for c in after['controls']
+                if c['selector'] == '#_systemfield_name')
+    assert name['value'] == 'Test User' and name['has_value'] is True
+    assert forms._bound_target(after, name)['form_action'] == ''
+    assert ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS) in endpoint.calls
+    assert len(writes) == 1 and not controller.committed
+    assert not any(call[0] == 'click' for call in endpoint.calls)
+
+
+async def test_issue184_before_ipc_exact_ownerless_grant_rejects_forged_form_action(
+        monkeypatch):
+    """Review finding 2: the fresh producer checks native, not invented root, identity."""
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    row, endpoint, producer, controller, provenance, writes = (
+        _issue184_real_producer(monkeypatch, facts))
+    session, page = await _issue184_prepare_producer(producer, provenance, facts)
+    control = next(c for c in page['controls']
+                   if c['selector'] == '#_systemfield_name')
+    assert control['in_form'] is False and control['form_action'] == ''
+    assert forms._formless_root(page)['root'] == ''
+    assert forms._bound_target(page, control)['form_action'] == ''
+    request = ('fill', control['selector'], '--value', facts['Name'])
+    await controller.before_ipc(producer, request, {})
+    assert not [call for call in endpoint.calls if call[0] == 'fill']
+    assert len(writes) == 1
+    # Even the independently observed structural Submit selector is not
+    # permission to change the bank grant's native receiver identity.
+    original = row['human_approved_answers']['Name']['form_action']
+    row['human_approved_answers']['Name']['form_action'] = '#structural-submit'
+    try:
+        with pytest.raises(forms.Gate, match='exact human-approved'):
+            await controller.before_ipc(producer, request, {})
+    finally:
+        row['human_approved_answers']['Name']['form_action'] = original
+    assert not controller.committed and not any(
+        call[0] == 'click' for call in endpoint.calls)

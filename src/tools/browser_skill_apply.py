@@ -2967,9 +2967,11 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
 def _bound_target(page: dict, target: dict) -> dict:
     """Grant identity for a radio is its entire group, never one model option."""
     structural = _formless_root(page)
-    if structural:
+    if structural and (structural.get('root') or target.get('in_form') is not False):
         return {**target, 'owner_kind': 'ashby-formless-root',
                 'form_selector': structural['root'], 'form_action': structural['submit']}
+    # A reversible rootless field has no structural owner. Its exact identity
+    # is the independently observed native receiver used by the raw producer.
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -4675,6 +4677,52 @@ async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
         _EXECUTE_OBSERVATION_SITE.reset(token)
 
 
+def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
+                              pk: str, facts: dict, *, provenance=None,
+                              fixture_context=None) -> frozenset[str] | None:
+    """A fresh, approved ownerless receiver may use the reversible grant seam."""
+    root = _formless_root(page)
+    if (not isinstance(session, _ReversibleEntryReader)
+            or not isinstance(provenance, ApplicationEntryProvenance)
+            or not root or root.get('root') or target.get('in_form') is not False):
+        return None
+    controller = getattr(session.raw, '_application_controller', None)
+    if (not isinstance(controller, ApplicationIPCController)
+            or controller.pk != pk or controller.company != provenance.company
+            or controller.url != provenance.wrapper or provenance.pk != pk
+            or not _preparation_current(provenance, fixture_context=fixture_context)
+            or not _preparation_destination_allowed(
+                page.get('url', ''), provenance=provenance, pk=pk,
+                company=provenance.company, fixture_context=fixture_context)):
+        return None
+    selector = target.get('selector')
+    observed = witness.get(selector)
+    if (not isinstance(selector, str) or not selector
+            or not isinstance(observed, dict)
+            or observed.get('visible') is not True
+            or observed.get('readonly') is not False
+            or observed.get('disabled') is not False
+            or observed.get('inert') is not False):
+        return None
+    key = _key(page, target)
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
+    grants = row.get('human_approved_answers') or {}
+    grant = grants.get(key) if isinstance(grants, dict) else None
+    fact_key = _fact_key(facts, key)
+    value = str(facts[fact_key]).strip() if fact_key is not None else ''
+    if (not isinstance(grant, dict) or grant.get('source') != 'bank-auto'
+            or not value or grant.get('value') != value
+            or grant.get('url') != page['url']
+            or any(grant.get(k) != target.get(k) for k in (
+                'selector', 'label', 'question', 'tag', 'type',
+                'form_selector', 'form_action'))
+            or not _bank_auto_eligible(
+                target, value, formless_selectors=frozenset({selector}))):
+        return None
+    return frozenset({selector})
+
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
@@ -4728,7 +4776,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         page = observed
         form_question = _disclosure_question(
             page, target, witness, job_url or page['url'],
-            provenance=provenance)
+            provenance=provenance, reversible_scope=_execute_reversible_scope(
+                session, page, witness, target, pk, facts,
+                provenance=provenance, fixture_context=ctx))
         form_question['pk'] = pk
         gate_prompt = (_choice_prompt(target, form_question)
                        if verb in {'choose', 'select'}
@@ -4840,7 +4890,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The same-job page or mapping changed before disclosure.')
         fresh_question = _disclosure_question(
             latest, current, latest_witness, job_url or latest['url'],
-            provenance=provenance)
+            provenance=provenance, reversible_scope=_execute_reversible_scope(
+                session, latest, latest_witness, current, pk, facts,
+                provenance=provenance, fixture_context=ctx))
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')

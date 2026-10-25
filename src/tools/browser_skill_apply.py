@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextvars import ContextVar
+from functools import wraps
 import ipaddress
 import socket
 import re
@@ -2744,6 +2745,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
+_BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
 
 
 async def _bootstrap_observe_controls(session, page: dict, *, site: str):
@@ -3261,9 +3263,25 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None,
                          lever_location: bool = False,
-                         closed_witness: bool = False) -> dict:
+                         closed_witness: bool = False,
+                         reversible_scope: frozenset[str] | None = None) -> dict:
     structural = _formless_root(page)
-    if structural:
+    reversible = (reversible_scope is not None
+                  and target.get('selector') in reversible_scope)
+    if reversible:
+        # No unique historic root exists on this raw-session route. Grant
+        # disclosure only to an independently observed, ownerless receiver on
+        # the already-authorized preparation origin; never borrow form authority.
+        if (not structural or structural.get('root')
+                or target.get('in_form') is not False
+                or not _preparation_destination_allowed(
+                    page.get('url', ''), *origins, provenance=provenance)
+                or any(target.get(k) for k in (
+                    'native_form_owner_selector', 'form_selector', 'form_action',
+                    'formaction', 'href', 'submit', 'commits_application',
+                    'navigates'))):
+            raise Gate('The reversible receiver is not on the approved preparation origin.')
+    elif structural:
         members = _formless_boundary(page, provenance)
         if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
@@ -3322,14 +3340,16 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if target.get('type') == 'combobox' and not closed_witness:
             _combobox_options(target)
     key = _key(page, target)
-    siblings = _form_subject(page, target)
+    if not reversible:
+        _form_subject(page, target)
     if bootstrap and (not _unanswered(page, target)
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
-    # A positive Submit/file marker is final form evidence, not permission
-    # to disclose an exact-approved value on an allowed preparation origin.
-    check_form_destination(page, target, *origins, provenance=provenance)
+    # No root proof exists on the reversible raw route, but the fresh
+    # control witness and tracked preparation destination are still required.
+    if not reversible:
+        check_form_destination(page, target, *origins, provenance=provenance)
     question = {
         'pk': '', 'label': key, 'selector': target['selector'],
         'url': page['url'], 'control_label': target['label'],
@@ -3338,7 +3358,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
     }
-    if structural:
+    if structural and not reversible:
         # These legacy envelope slots are opaque structural identities here.
         # They are never supplied to native receiver or navigation validation.
         question.update(owner_kind='ashby-formless-root',
@@ -3793,7 +3813,8 @@ def _bank_auto_eligible(item: dict, value: str, *,
 def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             global_facts: dict, *origins: str,
                             provenance=None, fixture_context=None,
-                            formless_selectors: frozenset[str] = frozenset()) -> None:
+                            formless_selectors: frozenset[str] = frozenset(),
+                            reversible_scope: frozenset[str] | None = None) -> None:
     if not global_facts or not pk:
         return
     row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
@@ -3806,6 +3827,10 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         return
     pending = {}
     for item in page['controls']:
+        if (reversible_scope is not None and (
+                item.get('in_form') is not False
+                or item.get('selector') not in reversible_scope)):
+            continue
         if ((not item.get('in_form')
              and item.get('selector') not in formless_selectors)
                 or item.get('disabled')):
@@ -3834,7 +3859,7 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         try:
             question = _disclosure_question(
                 page, item, witness, *origins, bootstrap=False,
-                provenance=provenance)
+                provenance=provenance, reversible_scope=reversible_scope)
             if item.get('type') == 'radio':
                 members = _radio_group(page, item)
                 matches = [m for m in members if value.casefold() in {
@@ -3882,6 +3907,9 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         from core.stores import make_stores
         make_stores().tracking.set_status(
             pk, 'submitting', human_approved_answers={**current, **additions})
+    reported = _BOOTSTRAP_BANK_GRANTS.get()
+    if reported is not None:
+        reported.extend(additions)
 
 
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:
@@ -3903,6 +3931,23 @@ def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> lis
     return result
 
 
+def _bootstrap_grant_diagnostics(fn):
+    @wraps(fn)
+    async def recorded(session, page: dict, pk: str, *args, **kwargs):
+        route = ('entry' if isinstance(session, _EntrySession) else
+                 'reversible' if _formless_root(page) else 'form')
+        granted = []
+        token = _BOOTSTRAP_BANK_GRANTS.set(granted)
+        try:
+            return await fn(session, page, pk, *args, **kwargs)
+        finally:
+            _BOOTSTRAP_BANK_GRANTS.reset(token)
+            _LOG.info('bootstrap pk=%s route=%s bank-auto-granted=%s',
+                      pk, route, sorted(granted))
+    return recorded
+
+
+@_bootstrap_grant_diagnostics
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
                      provenance: Provenance | None = None,
@@ -3922,7 +3967,25 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     if _formless_root(page):
         if not isinstance(session, _EntrySession):
             if getattr(session, '_application_controller', None) is not None:
-                return page  # Missing historic root proof cannot block preparation.
+                try:
+                    fresh, witness = await _bootstrap_observe_controls(
+                        session, page, site='bootstrap-formless')
+                    if (not _preparation_destination_allowed(
+                            fresh.get('url', ''), *origins, provenance=provenance,
+                            pk=pk, company=company, fixture_context=fixture_context)
+                            or (provenance is not None and
+                                not _preparation_current(
+                                    provenance, fixture_context=fixture_context))):
+                        raise Gate('The reversible observation left the preparation origin.')
+                    scope = frozenset(c['selector'] for c in fresh['controls']
+                                      if c.get('in_form') is False)
+                    _auto_grant_from_global(
+                        fresh, witness, pk, facts, global_facts or {}, *origins,
+                        provenance=provenance, fixture_context=fixture_context,
+                        formless_selectors=scope, reversible_scope=scope)
+                except Gate:
+                    pass  # A missing historic root still cannot block preparation.
+                return page
             raise Gate('Formless preparation requires the code-owned application IPC controller.')
         page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
         members = _formless_boundary(page, provenance)

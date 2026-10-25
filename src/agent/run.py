@@ -1019,11 +1019,14 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                    for k in ('label', 'selector', 'url', 'control_label'))
             or not isinstance(field.get('question'), str)
             or field['label'] != (field['question'] or field['control_label'])
-            or field.get('tag') not in {'input', 'textarea', 'select', 'div'}
+            or field.get('tag') not in {'input', 'textarea', 'select', 'div', 'button'}
             or not isinstance(field.get('type'), str)
             or ((field['tag'] == 'input' and field['type'] not in {
                     'text', 'email', 'tel', 'url', 'number', 'date', 'checkbox', 'radio', 'combobox'})
                 or (field['tag'] == 'div' and field['type'] != 'combobox')
+                or (field['tag'] == 'button' and (
+                    field['type'] != 'button'
+                    or field.get('owner_kind') != 'ashby-reversible-entry'))
                 or (field['tag'] == 'textarea' and field['type'] != 'textarea')
                 or (field['tag'] == 'select' and field['type'] != 'select'))
             or (field.get('owner_kind') == 'ashby-reversible-entry' and (
@@ -1032,6 +1035,18 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or (field.get('owner_kind') != 'ashby-reversible-entry' and
                 any(not isinstance(field.get(k), str) or not field[k].strip()
                     for k in ('form_selector', 'form_action')))
+            or (field['type'] == 'button' and (
+                 not isinstance(field.get('boolean_members'), list)
+                 or len(field['boolean_members']) != 2
+                 or any(not isinstance(m, dict) or any(
+                     not isinstance(m.get(k), str) or not m[k].strip()
+                     for k in ('selector', 'caption', 'value'))
+                     for m in field['boolean_members'])
+                 or len({m['selector'] for m in field['boolean_members']}) != 2
+                 or {m['caption'].casefold() for m in field['boolean_members']} != {'yes', 'no'}
+                 or {m['value'] for m in field['boolean_members']} != {'yes', 'no'}
+                 or field['boolean_members'][0]['selector'] != field['selector']
+                 or field['boolean_members'][0]['caption'] != field['control_label']))
             or (field['type'] == 'checkbox' and (
                  not isinstance(field.get('visible_text'), str)
                  or not field['visible_text'].strip()
@@ -1339,6 +1354,13 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 if normalized != 'yes':
                     return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                             'detail': 'Answer yes or no for the exact checkbox question.'}
+            elif observed['type'] == 'button':
+                matching = [member for member in observed['boolean_members']
+                            if normalized in {
+                                member['caption'].casefold(), member['value'].casefold()}]
+                if len(matching) != 1:
+                    return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                            'detail': 'Choose exactly one witnessed Boolean caption.'}
             elif observed['type'] == 'radio':
                 matching = [member for member in observed['radio_members']
                             if normalized in {
@@ -1388,6 +1410,8 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 **({'radio_name': observed['radio_name'],
                     'radio_members': observed['radio_members']}
                    if observed['type'] == 'radio' else {}),
+                **({'boolean_members': observed['boolean_members']}
+                   if observed['type'] == 'button' else {}),
             }
             stores.tracking.set_status(
                 pk, row.get('status') or Status.NEEDS_HUMAN,

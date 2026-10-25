@@ -3331,7 +3331,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
             if not isinstance(grants, dict) or key not in grants:
                 raise Gate('The privacy scope or new legal attestation needs an owner decision.',
                            reason='owner_question')
-        if scope == 'standard_privacy':
+        if scope == 'standard_privacy' and target.get('in_form') is True:
             exact_approval(pk, key, 'yes', target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
                            **({'fixture_context': fixture_context} if fixture_context else {}))

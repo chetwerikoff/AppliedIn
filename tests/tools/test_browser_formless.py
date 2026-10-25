@@ -16,6 +16,9 @@ import pytest
 from tools import browser_skill_apply as forms
 from tools.browser_skill import Session as ProductionBrowserSession
 from tools.browser_skill_dom import PAGE, _ENTRY_OBSERVATION
+from tests.tools.test_browser_application_entry import (
+    COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
+)
 
 def _entry_js_const(script, name):
     """Extract a top-level JavaScript const without evaluating either reader."""
@@ -88,9 +91,6 @@ def test_root_evidence_visibility_rejects_hidden_ancestors(case, clause):
     assert 'return false;' in predicate
     assert 'visible:entryVisible(e)' in _ENTRY_OBSERVATION
 
-from tests.tools.test_browser_application_entry import (
-    COMPANY, PK, dom, entry, posting, world, attempt, no_mutations,
-)
 from tests.tools.test_browser_controller_support import install_controller_session
 
 

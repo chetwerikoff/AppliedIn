@@ -5312,3 +5312,158 @@ async def test_issue178_radio_unmatched_global_choice_never_grants(monkeypatch):
     assert row['human_approved_answers'] == {}
 
 
+# Issue #182: a closed material listbox has no mounted options at bootstrap.
+# Freshly witnessing the picker must still precede using an exact owner grant.
+def _issue182_material_picker(monkeypatch, route='custom', *, closed_options=None):
+    if route == 'lever':
+        from tests.tools.test_browser_application_entry import (
+            application, posting, world as entry_world)
+        row, configs, _, _ = entry_world(monkeypatch, 'lever')
+        page = application('lever')
+        origin, pk = posting('lever'), row['pk']
+        provenance = forms._application_entry(row, pk, 'example-co', origin, configs)
+        material = field(
+            'Acknowledge candidate privacy notice', '#material', type='combobox',
+            form_selector='#application-form-lever', form_action=page['url'])
+        page['controls'][0] = material
+    else:
+        page = secure_inventory(field(
+            'Acknowledge candidate privacy notice', '#material', type='combobox'))
+        _, _, row = secure_world(monkeypatch, page)
+        material = page['controls'][0]
+        origin, pk, provenance = SECURE_URL, PK, None
+
+    material['combobox'] = {
+        'linked': False, 'link_id': '', 'listbox_selector': '',
+        'options': closed_options, 'selected_text': '', 'displayed_text': '',
+        'selected_value': '', 'hidden_selector': '', 'hidden_value': '',
+    }
+    options = [
+        {'selector': '#accept', 'label': 'I agree', 'value': 'yes'},
+        {'selector': '#decline', 'label': 'I decline', 'value': 'no'},
+    ]
+    opened = deepcopy(page)
+    opened['controls'][0]['combobox'].update(
+        linked=True, link_id='material-list', listbox_selector='#material-list',
+        options=[{**option, 'unique': True} for option in options])
+    row['human_approved_answers'] = {
+        material['label']: {
+            'value': 'I agree', 'selector': material['selector'],
+            'url': page['url'], 'label': material['label'],
+            'question': material['question'], 'tag': material['tag'],
+            'type': material['type'], 'form_selector': material['form_selector'],
+            'form_action': material['form_action'], 'options': deepcopy(options),
+        },
+    }
+    return row, page, opened, pk, origin, provenance
+
+
+class _Issue182PickerBrowser(Browser):
+    """Only reversible open/Escape operations; no synthetic write or Submit."""
+    def __init__(self, closed, opened):
+        super().__init__(deepcopy(closed))
+        self.closed, self.opened = deepcopy(closed), deepcopy(opened)
+
+    async def call(self, *args, **kwargs):
+        if args in {('click', '#material'), ('press', 'Escape')}:
+            self.calls.append(args)
+            self.current = deepcopy(
+                self.opened if args[0] == 'click' else self.closed)
+            self.result = witness(self.current)
+            return {}
+        return await super().call(*args, **kwargs)
+
+
+@pytest.mark.parametrize('route', ['custom', 'lever'])
+@pytest.mark.parametrize('closed_options', [None, []], ids=['none', 'empty'])
+async def test_issue182_closed_material_grant_reaches_left_to_model(
+        monkeypatch, route, closed_options):
+    row, page, opened, pk, origin, provenance = _issue182_material_picker(
+        monkeypatch, route, closed_options=closed_options)
+    browser = _Issue182PickerBrowser(page, opened)
+    decisions = []
+    monkeypatch.setattr(forms, '_bootstrap_log',
+                        lambda _item, _ordinal, decision, **_kw:
+                        decisions.append(decision))
+    prepared = await forms._bootstrap(
+        browser, page, pk, {}, origin, provenance=provenance,
+        company='example-co', job_url=origin)
+    assert prepared['url'] == page['url']
+    assert decisions == ['left-to-model']
+    assert row['human_approved_answers'][page['controls'][0]['label']]['options'] == [
+        {'selector': '#accept', 'label': 'I agree', 'value': 'yes'},
+        {'selector': '#decline', 'label': 'I decline', 'value': 'no'}]
+    assert ('click', '#material') in browser.calls
+    assert ('press', 'Escape') in browser.calls
+    assert not any(call[0] in {'fill', 'select', 'upload'} for call in browser.calls)
+
+
+@pytest.mark.parametrize('drift', ['selector', 'label', 'opened-options'])
+async def test_issue182_closed_material_grant_drift_still_asks_owner(
+        monkeypatch, drift):
+    row, page, opened, pk, origin, provenance = _issue182_material_picker(
+        monkeypatch, closed_options=[])
+    grant = row['human_approved_answers'][page['controls'][0]['label']]
+    if drift in {'selector', 'label'}:
+        grant[drift] = 'changed'
+    else:
+        opened['controls'][0]['combobox']['options'][0]['label'] = 'Changed option'
+    browser = _Issue182PickerBrowser(page, opened)
+    with pytest.raises(forms.MaterialAssentGate) as caught:
+        await forms._bootstrap(browser, page, pk, {}, origin,
+                               provenance=provenance, company='example-co')
+    assert caught.value.reason == 'owner_question'
+    assert not any(call[0] in {'fill', 'select', 'upload'} for call in browser.calls)
+
+
+async def test_issue182_open_material_picker_still_compares_live_options(monkeypatch):
+    row, closed, opened, pk, origin, provenance = _issue182_material_picker(monkeypatch)
+    opened['controls'][0]['combobox']['options'][0]['label'] = 'Changed option'
+    browser = Browser(opened)
+    with pytest.raises(forms.MaterialAssentGate) as caught:
+        await forms._bootstrap(browser, opened, pk, {}, origin,
+                               provenance=provenance, company='example-co')
+    assert caught.value.reason == 'owner_question'
+    assert not any(call[0] in {'fill', 'select', 'click'} for call in browser.calls)
+
+
+@pytest.mark.parametrize('identity', [
+    'selector', 'url', 'label', 'question', 'tag', 'type',
+    'form_selector', 'form_action',
+])
+def test_issue182_closed_material_grant_preserves_every_identity_check(
+        monkeypatch, identity):
+    row, page, _, pk, _, _ = _issue182_material_picker(monkeypatch)
+    target = page['controls'][0]
+    grant = row['human_approved_answers'][target['label']]
+    grant[identity] = 'different'
+    with pytest.raises(forms.Gate, match='exact human-approved'):
+        forms._material_exact_value(pk, page, target, {'label': target['label']})
+
+
+def test_issue182_closed_material_value_mismatch_still_gates(monkeypatch):
+    row, page, _, pk, _, _ = _issue182_material_picker(monkeypatch)
+    target = page['controls'][0]
+    grant = row['human_approved_answers'][target['label']]
+    with pytest.raises(forms.Gate, match='exact human-approved'):
+        forms.exact_approval(
+            pk, target['label'], 'Not the approved value',
+            target=target, url=page['url'], witnessed_options=grant['options'])
+
+
+def test_issue182_submit_receipt_without_witnessed_options_still_gates(monkeypatch):
+    row, page, _, pk, _, _ = _issue182_material_picker(monkeypatch)
+    target = page['controls'][0]
+    target['combobox'].update(
+        selected_text='I agree', displayed_text='I agree', selected_value='yes',
+        hidden_selector='#hidden', hidden_value='yes')
+    receipt = {
+        'action': 'combobox', 'fact': target['label'], 'selector': target['selector'],
+        'url': page['url'], 'label': target['label'], 'question': target['question'],
+        'approved_value': 'I agree', 'committed_caption': 'I agree',
+        'committed_value': 'yes', 'hidden_selector': '#hidden',
+        'hidden_value': 'yes',
+        'selected_option': row['human_approved_answers'][target['label']]['options'][0],
+    }
+    with pytest.raises(forms.Gate, match='material option receipt'):
+        forms.check_approvals(pk, [receipt], page)

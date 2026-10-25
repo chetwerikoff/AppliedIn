@@ -5467,3 +5467,107 @@ def test_issue182_submit_receipt_without_witnessed_options_still_gates(monkeypat
     }
     with pytest.raises(forms.Gate, match='material option receipt'):
         forms.check_approvals(pk, [receipt], page)
+
+@pytest.mark.parametrize('fresh_state', [
+    'exact', 'changed-caption', 'missing-approved-option', 'stale-grant',
+])
+async def test_issue182_closed_material_bootstrap_to_execute_checks_fresh_options(
+        monkeypatch, fresh_state):
+    """An Escape-closed exact grant must reach the guarded picker write."""
+    from tools.browser_skill_dom import PAGE
+
+    row, closed, opened, pk, origin, provenance = _issue182_material_picker(
+        monkeypatch, closed_options=[])
+    for option in opened['controls'][0]['combobox']['options']:
+        option['safe'] = True
+    state = {'page': deepcopy(closed)}
+    effects, decisions, filled = [], [], {}
+
+    async def offline_command(*args, **kwargs):
+        assert not kwargs and args[-2:] == ('--session', 'synthetic-offline')
+        request = args[:-2]
+        if request == ('evaluate', PAGE):
+            return {'value': deepcopy(state['page'])}
+        if request == ('evaluate', forms._FIXED_CONTROL_WITNESS):
+            return {'value': witness(state['page'])}
+        effects.append(request)
+        if request == ('click', '#material'):
+            state['page'] = deepcopy(opened)
+        elif request == ('press', 'Escape'):
+            state['page'] = deepcopy(closed)
+        elif request == ('fill', '#material', '--value', 'I agree'):
+            state['page']['controls'][0]['value'] = 'I agree'
+        elif request == ('click', '#accept'):
+            state['page'] = deepcopy(closed)
+            state['page']['controls'][0]['combobox'].update(
+                selected_text='I agree', displayed_text='I agree',
+                selected_value='yes')
+        else:
+            pytest.fail(f'Unexpected synthetic raw IPC: {request[0]}')
+        return {}
+
+    controller = forms.ApplicationIPCController(
+        pk, 'example-co', origin, '', {}, filled, [], {},
+        lambda: pytest.fail('The synthetic picker may not Submit'))
+    monkeypatch.setattr(controller, '_row', lambda: row)
+    monkeypatch.setattr(controller, '_page', AsyncMock(
+        side_effect=lambda _session: deepcopy(state['page'])))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(bsk, 'command', offline_command)
+    monkeypatch.setattr(forms, '_bootstrap_log',
+                        lambda _item, _ordinal, decision, **_kw:
+                        decisions.append(decision))
+    raw = REAL_BSK_SESSION('apply')
+    raw.id = 'synthetic-offline'
+    raw.bind_application_controller(controller)
+
+    # The production raw producer still rejects an unrequested closed click.
+    with pytest.raises(forms.Gate, match='closed combobox linkage'):
+        await raw.application_effect('click', '#material')
+    assert effects == []
+
+    prepared = await forms._bootstrap(
+        raw, closed, pk, {}, origin, company='example-co', job_url=origin,
+        provenance=provenance)
+    assert prepared['url'] == origin
+    assert decisions == ['left-to-model']
+    assert effects == [('click', '#material'), ('press', 'Escape')]
+    assert state['page']['controls'][0]['combobox']['linked'] is False
+    assert controller._material_witness_request is None
+
+    grant = row['human_approved_answers'][closed['controls'][0]['label']]
+    if fresh_state == 'changed-caption':
+        opened['controls'][0]['combobox']['options'][0]['label'] = 'Changed approval'
+    elif fresh_state == 'missing-approved-option':
+        opened['controls'][0]['combobox']['options'].pop(0)
+    elif fresh_state == 'stale-grant':
+        grant['selector'] = '#wrong-control'
+
+    action = {'action': 'combobox', 'selector': '#material',
+              'fact': closed['controls'][0]['label']}
+
+    async def actuate():
+        return await forms.execute(
+            raw, prepared, action, facts={}, filled=filled, pk=pk,
+            job_url=origin, company='example-co', resume_path='',
+            jd_text='', resume_tex='', github='', provenance=provenance)
+
+    if fresh_state != 'exact':
+        with pytest.raises(forms.Gate):
+            await actuate()
+        assert ('click', '#accept') not in effects
+        assert effects[2:] == ([] if fresh_state == 'stale-grant'
+                              else [('click', '#material')])
+        assert filled == {}
+    else:
+        receipt = await actuate()
+        assert effects[2:] == [
+            ('click', '#material'),
+            ('fill', '#material', '--value', 'I agree'),
+            ('click', '#accept'),
+        ]
+        assert receipt['selected_option'] == grant['options'][0]
+        assert receipt['witnessed_options'] == grant['options']
+        assert receipt['approved_value'] == 'I agree'
+        assert filled == {'#material': 'I agree'}
+    assert row['status'] == 'submitting' and not row['possible_submission']

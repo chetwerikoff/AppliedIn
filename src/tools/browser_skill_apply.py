@@ -4382,8 +4382,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
             provenance, fixture_context=ctx):
         raise Gate('The tracked posting changed before combobox preparation.')
     target = control(observed, action, 'combobox-observe')
+    closed_material = _closed_material_combobox(target)
     question = _disclosure_question(
-        observed, target, witness, job_url or observed['url'], provenance=provenance)
+        observed, target, witness, job_url or observed['url'],
+        closed_witness=closed_material, provenance=provenance)
     question['pk'] = pk
     key = action.get('fact', '')
     if _material_form_choice(target):
@@ -4406,8 +4408,19 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                        and not answer else 'unknown_field')
 
     def approve(current, current_page):
+        witnessed_options = None
+        if _closed_material_combobox(current):
+            # Only the unopened picker may borrow its current owner's options;
+            # after opening the real witnessed listbox must match the grant.
+            row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
+            grants = row.get('human_approved_answers')
+            grant = grants.get(question['label']) if isinstance(grants, dict) else None
+            witnessed_options = grant.get('options') if isinstance(grant, dict) else None
+            if not isinstance(witnessed_options, list) or not witnessed_options:
+                raise Gate('A current material option grant is not available.')
         exact_approval(pk, question['label'], answer, target=current,
                        url=current_page['url'], provenance=provenance,
+                       witnessed_options=witnessed_options,
                        **({'fixture_context': ctx} if ctx else {}))
         guarded_value(current, answer)
 
@@ -4423,6 +4436,20 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     except Gate:
         raise Gate('An exact human-approved answer is needed for this combobox.',
                    form_question=question) from None
+    if closed_material:
+        # A bootstrap witness was Escape-closed. The guarded producer requires
+        # a new code-owned exact-control request for this reversible open.
+        controller = getattr(session, '_application_controller', None)
+        if controller is None:
+            controller = getattr(getattr(session, 'raw', None),
+                                 '_application_controller', None)
+        if controller is not None:
+            if (controller._material_witness_request is not None
+                    or controller._material_witness_selector is not None):
+                raise Gate('A prior material picker witness is still in progress.')
+            controller._material_witness_request = target['selector']
+            controller._material_witness_expected = {
+                k: v for k, v in target.items() if k != 'combobox'}
     latest, latest_witness, current = observed, witness, target
     combo = current.get('combobox') or {}
     try:

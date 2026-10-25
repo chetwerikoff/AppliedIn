@@ -3121,17 +3121,20 @@ async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
 _ISSUE194_PRIVATE_FAILURE = 'SYNTHETIC_PRIVATE_UPLOAD_EXCEPTION_NOT_FOR_LOGS'
 
 
-@pytest.mark.parametrize('step,attached,reason,error_type,file_access', [
-    ('effect', 'true', 'unsupported', 'Unavailable', False),
-    ('effect', 'false', 'none', 'Unavailable', False),
-    ('effect', 'unknown', 'none', 'Unavailable', False),
-    ('page', 'true', 'none', 'Exception', False),
-    ('observe', 'false', 'none', 'RuntimeError', False),
-    ('observe', 'unknown', 'none', 'RuntimeError', False),
-    ('effect', 'false', 'none', 'Unavailable', True),
+@pytest.mark.parametrize('step,attached,reason,effect_state,expected_effect,error_type,file_access', [
+    ('effect', 'true', 'unsupported', '', 'none', 'Unavailable', False),
+    ('effect', 'false', 'none', '', 'none', 'Unavailable', False),
+    ('effect', 'unknown', 'none', '', 'none', 'Unavailable', False),
+    ('page', 'true', 'none', '', 'none', 'Exception', False),
+    ('observe', 'false', 'none', '', 'none', 'RuntimeError', False),
+    ('observe', 'unknown', 'none', '', 'none', 'RuntimeError', False),
+    ('effect', 'false', 'none', '', 'none', 'Unavailable', True),
+    ('effect', 'true', 'upload_failed', 'partial', 'partial', 'Unavailable', False),
+    ('effect', 'false', 'none', 'invalid-state/private', 'none', 'Unavailable', False),
 ])
 async def test_issue194_reversible_upload_failure_production_info(
-        monkeypatch, capsys, step, attached, reason, error_type, file_access):
+        monkeypatch, capsys, step, attached, reason, effect_state,
+        expected_effect, error_type, file_access):
     _row, raw, _, provenance = root_world(monkeypatch)
     session = forms._ReversibleEntryReader(raw)
     filename = 'Resume.pdf'
@@ -3139,10 +3142,10 @@ async def test_issue194_reversible_upload_failure_production_info(
                     if c.get('type') == 'file')
     if step == 'effect':
         failure = forms.bsk.Unavailable(_ISSUE194_PRIVATE_FAILURE)
-        # Only the recognized code-owned literal may reach the diagnostic.
-        failure.code = ('unsupported' if reason == 'unsupported'
-                        else 'synthetic_private_reason' if not file_access
-                        else None)
+        # BSK supplies an independently validated code; only effect_state
+        # needs validation at this diagnostic log boundary.
+        failure.code = reason if reason != 'none' else None
+        failure.effect_state = effect_state
         failure.file_access_required = file_access
     elif step == 'page':
         # A dynamically created invalid type name must be sanitized.
@@ -3217,11 +3220,12 @@ async def test_issue194_reversible_upload_failure_production_info(
              if 'resume upload failure pk=' in line]
     assert len(lines) == 1
     message = (f'resume upload failure pk={PK} step={step} '
-               f'exception={error_type} reason={reason} attached={attached}')
+               f'exception={error_type} reason={reason} '
+               f'attached={attached} effect={expected_effect}')
     assert re.fullmatch(
         rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
         lines[0])
-    for private in (_ISSUE194_PRIVATE_FAILURE, 'synthetic_private_reason',
+    for private in (_ISSUE194_PRIVATE_FAILURE, 'invalid-state/private',
                     filename, 'Unexpected.pdf'):
         assert private not in output
     assert uploads == 1 and post_upload_pages == (1 if step == 'effect' else 2)

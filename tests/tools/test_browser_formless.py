@@ -3114,3 +3114,150 @@ async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
         await forms._observe_controls(
             raw._reversible_session, raw.current, site='execute')
     no_mutations(raw)
+
+
+# Issue #194: generic reversible upload failures retain the original Gate but
+# name their phase and single passive attachment read on production stdout.
+_ISSUE194_PRIVATE_FAILURE = 'SYNTHETIC_PRIVATE_UPLOAD_EXCEPTION_NOT_FOR_LOGS'
+
+
+@pytest.mark.parametrize('step,attached,reason,error_type,file_access', [
+    ('effect', 'true', 'unsupported', 'Unavailable', False),
+    ('effect', 'false', 'none', 'Unavailable', False),
+    ('effect', 'unknown', 'none', 'Unavailable', False),
+    ('page', 'true', 'none', 'Exception', False),
+    ('observe', 'false', 'none', 'RuntimeError', False),
+    ('observe', 'unknown', 'none', 'RuntimeError', False),
+    ('effect', 'false', 'none', 'Unavailable', True),
+    ('effect', 'true', 'upload_failed', 'Unavailable', False),
+])
+async def test_issue194_reversible_upload_failure_production_info(
+        monkeypatch, capsys, step, attached, reason, error_type, file_access):
+    _row, raw, _, provenance = root_world(monkeypatch)
+    session = forms._ReversibleEntryReader(raw)
+    filename = 'Resume.pdf'
+    selector = next(c['selector'] for c in raw.current['controls']
+                    if c.get('type') == 'file')
+    if step == 'effect':
+        failure = forms.bsk.Unavailable(_ISSUE194_PRIVATE_FAILURE)
+        failure.code = reason if reason != 'none' else None
+        failure.file_access_required = file_access
+    elif step == 'page':
+        # A dynamically created invalid type name must be sanitized.
+        failure = type('9PrivateSyntheticError', (RuntimeError,), {})(
+            _ISSUE194_PRIVATE_FAILURE)
+    else:
+        failure = RuntimeError(_ISSUE194_PRIVATE_FAILURE)
+
+    original_call = raw.call
+    uploads = 0
+    post_upload_pages = 0
+
+    async def call(method, *args, **kwargs):
+        nonlocal uploads, post_upload_pages
+        if method == 'upload':
+            uploads += 1
+            assert args == (selector, '--file', filename)
+            assert kwargs == {'timeout': 130}
+            raw.calls.append((method, *args))
+            if not (step == 'effect' and attached == 'false'):
+                # Synthetic CLI failure may occur after the picker took effect.
+                files = ([filename, 'Unexpected.pdf'] if attached == 'false'
+                         else [filename])
+                raw.current, raw.fixed = observed(
+                    attached=True, files=files, displayName=filename)
+            if step == 'effect':
+                raise failure
+            return {}
+        if method == 'evaluate' and args == (forms.ENTRY_PAGE,) and uploads:
+            post_upload_pages += 1
+            if step == 'page' and post_upload_pages == 1:
+                raw.calls.append((method, *args))
+                raise failure
+            # The second read is diagnostics-only after page/observe failure;
+            # effect failure has no prior PAGE read.
+            diagnostic_read = 1 if step == 'effect' else 2
+            if attached == 'unknown' and post_upload_pages == diagnostic_read:
+                raw.calls.append((method, *args))
+                raise RuntimeError(_ISSUE194_PRIVATE_FAILURE)
+        return await original_call(method, *args, **kwargs)
+
+    raw.call = call
+    if step == 'observe':
+        original_observer = forms._observe_controls
+
+        async def observe(session, page, **kwargs):
+            if kwargs.get('site') == 'execute-formless-upload':
+                raise failure
+            return await original_observer(session, page, **kwargs)
+
+        monkeypatch.setattr(forms, '_observe_controls', observe)
+
+    expected_gate = (
+        "Enable BrowserSkill's Allow access to file URLs permission in the "
+        "dedicated profile; inspect the attachment before retrying."
+        if file_access else
+        'The résumé upload outcome is unclear; inspect the attachment '
+        'before retrying. No automatic repeat was attempted.'
+    )
+    with monkeypatch.context() as capture:
+        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
+        with pytest.raises(forms.Gate) as caught:
+            await forms.execute(
+                session, raw.current, dict(action='upload', selector=selector),
+                facts={}, filled={}, resume_path=filename, company=COMPANY,
+                jd_text='', resume_tex='', github='', pk=PK,
+                job_url=posting('ashby'), provenance=provenance)
+        output = capsys.readouterr().out
+
+    assert str(caught.value) == expected_gate
+    lines = [line for line in output.splitlines()
+             if 'resume upload failure pk=' in line]
+    assert len(lines) == 1
+    message = (f'resume upload failure pk={PK} step={step} '
+               f'exception={error_type} reason={reason} '
+               f'attached={attached}')
+    assert re.fullmatch(
+        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
+        lines[0])
+    for private in (_ISSUE194_PRIVATE_FAILURE,
+                    filename, 'Unexpected.pdf'):
+        assert private not in output
+    assert uploads == 1 and post_upload_pages == (1 if step == 'effect' else 2)
+    assert [c for c in raw.calls if c[0] == 'upload'] == [
+        ('upload', selector, '--file', filename)]
+    assert not [c for c in raw.calls
+                if c[0] in {'click', 'select', 'fill', 'submit'}]
+
+
+async def test_issue194_existing_upload_gate_is_neither_logged_nor_retried(
+        monkeypatch, capsys):
+    _row, raw, _, provenance = root_world(monkeypatch)
+    session = forms._ReversibleEntryReader(raw)
+    selector = next(c['selector'] for c in raw.current['controls']
+                    if c.get('type') == 'file')
+    original_call = raw.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            raw.calls.append((method, *args))
+            raise forms.Gate('Synthetic pre-existing upload Gate',
+                             reason='owner_question')
+        return await original_call(method, *args, **kwargs)
+
+    raw.call = call
+    with monkeypatch.context() as capture:
+        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
+        with pytest.raises(forms.Gate) as caught:
+            await forms.execute(
+                session, raw.current, dict(action='upload', selector=selector),
+                facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
+                jd_text='', resume_tex='', github='', pk=PK,
+                job_url=posting('ashby'), provenance=provenance)
+        output = capsys.readouterr().out
+
+    assert str(caught.value) == 'Synthetic pre-existing upload Gate'
+    assert caught.value.reason == 'owner_question'
+    assert 'resume upload failure pk=' not in output
+    assert [c for c in raw.calls if c[0] == 'upload'] == [
+        ('upload', selector, '--file', 'Resume.pdf')]

@@ -5100,14 +5100,44 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 filled.pop(old['selector'], None)
             filled.update(rebound)
             return {'action': verb, 'label': target['label'], 'uploaded': True}
+        step = 'effect'
         try:
             await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
+            step = 'page'
             observed = await session.page()
             if _formless_root(page):
+                step = 'observe'
                 observed, _ = await _observe_controls(session, observed, site='execute-formless-upload')
         except (Exception, asyncio.CancelledError) as exc:
             if isinstance(exc, Gate):
                 raise
+            # One passive read can distinguish an attached file from an uncertain
+            # outcome without replaying the effect or exposing exception text.
+            attached = 'unknown'
+            try:
+                reread = await session.page()
+                filename = Path(resume_path).name
+                tree_data = (reread.get('entry') or {}).get('upload_tree')
+                if _formless_root(reread) and tree_data is not None:
+                    tree = _upload_tree(reread)
+                    file_input = _upload_input(reread, tree)
+                    confirmed = (tree.get('attached') is True
+                                 and tree.get('filename') == filename
+                                 and file_input.get('files') == [filename])
+                else:
+                    file_inputs = [item for item in reread.get('controls', [])
+                                   if item.get('selector') == target['selector']
+                                   and item.get('type') == 'file']
+                    confirmed = (len(file_inputs) == 1
+                                 and file_inputs[0].get('files') == [filename])
+                attached = 'true' if confirmed else 'false'
+            except (Exception, asyncio.CancelledError):
+                pass
+            error = type(exc).__name__
+            error = error if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', error) else 'Exception'
+            reason = exc.code if isinstance(exc, bsk.Unavailable) and exc.code else 'none'
+            _LOG.info('resume upload failure pk=%s step=%s exception=%s reason=%s attached=%s',
+                      pk, step, error, reason, attached)
             if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
                 raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
                            "dedicated profile; inspect the attachment before retrying.") from None

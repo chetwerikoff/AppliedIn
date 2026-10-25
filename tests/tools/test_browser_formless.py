@@ -2827,3 +2827,170 @@ async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
                    'global-only', 'already-filled-synthetic', 'synthetic-explicit'):
         assert secret not in output
     no_mutations(raw)
+
+# Issue #190: a strict entry mismatch may settle only at bootstrap. The
+# production PAGE+witness handler owns the reread budget and safe diagnostic.
+_ISSUE190_PRIVATE_ENTRY = 'SYNTHETIC_ENTRY_VALUE_NOT_FOR_LOGS'
+
+
+def _issue190_entry_witness_reads(raw, *, unstable):
+    original_call = raw.call
+    reads = []
+
+    async def call(method, *args, **kwargs):
+        if method == 'evaluate' and args == (forms._ENTRY_FIXED_CONTROL_WITNESS,):
+            reads.append(len(reads) + 1)
+            fixed = deepcopy(raw.fixed)
+            if len(reads) in unstable:
+                fixed['entry']['frames'] = [_ISSUE190_PRIVATE_ENTRY]
+            return {'value': fixed}
+        return await original_call(method, *args, **kwargs)
+
+    raw.call = call
+    return reads
+
+
+async def test_issue190_reversible_bootstrap_recovers_after_first_entry_mismatch(monkeypatch):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    reads = _issue190_entry_witness_reads(raw, unstable={1})
+    reached_auto_grant = []
+    real_auto_grant = forms._auto_grant_from_global
+
+    def auto_grant(*args, **kwargs):
+        reached_auto_grant.append(True)
+        return real_auto_grant(*args, **kwargs)
+
+    monkeypatch.setattr(forms, '_auto_grant_from_global', auto_grant)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    returned = await forms._bootstrap(
+        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
+        company=COMPANY, provenance=provenance, global_facts=dict(facts))
+
+    assert returned is raw.current
+    assert reads == [1, 2, 3]  # Read 1 differs; complete reads 2 and 3 agree.
+    assert reached_auto_grant == [True]
+    assert len(writes) == 1
+    assert set(row['human_approved_answers']) == set(facts)
+    no_mutations(raw)
+
+
+async def test_issue190_persistent_frames_gate_names_key_on_production_stdout(
+        monkeypatch, capsys):
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    writes = _issue182_tracking(monkeypatch, row)
+    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4, 5})
+    original_observe = forms._bootstrap_observe_controls
+    gates = []
+
+    async def record_gate(*args, **kwargs):
+        try:
+            return await original_observe(*args, **kwargs)
+        except forms.Gate as gate:
+            gates.append(str(gate))
+            raise
+
+    monkeypatch.setattr(forms, '_bootstrap_observe_controls', record_gate)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    with monkeypatch.context() as capture:
+        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
+        returned = await forms._bootstrap(
+            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=dict(facts))
+        output = capsys.readouterr().out
+
+    assert returned is raw.current and reads == [1, 2, 3, 4]
+    assert len(gates) == 1
+    predicate = 'predicate=entry.equal.frames; control=unavailable; site=bootstrap-formless'
+    assert predicate in gates[0]
+    lines = [line for line in output.splitlines() if 'reversible bootstrap gate pk=' in line]
+    assert len(lines) == 1
+    assert predicate in lines[0] and '[redacted]' not in lines[0]
+    assert _ISSUE190_PRIVATE_ENTRY not in gates[0] + output
+    assert all(value not in output for value in facts.values())
+    assert row['human_approved_answers'] == {} and writes == []
+    no_mutations(raw)
+
+
+async def test_issue190_execute_entry_mismatch_gates_on_first_read(monkeypatch):
+    _row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4})
+    with pytest.raises(forms.Gate, match=r'predicate=entry\.equal\.frames; control=unavailable; site=execute'):
+        await forms.execute(
+            raw._reversible_session, raw.current,
+            dict(action='fill', selector='#_systemfield_name', fact='Name'),
+            facts={'Name': 'Test User'}, filled={}, resume_path='',
+            company=COMPANY, jd_text='', resume_tex='', github='',
+            pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert reads == [1]
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
+@pytest.mark.parametrize('unstable,success,failed_predicate', [
+    ({1, 2, 3, 4}, False, 'entry.equal.frames'),
+    ({1, 3}, False, 'inventory.identity.equal'),
+    ({1, 2}, True, ''),
+])
+async def test_issue190_bootstrap_entry_retry_cap_and_consecutive_complete_reads(
+        monkeypatch, site, unstable, success, failed_predicate):
+    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
+    reads = _issue190_entry_witness_reads(raw, unstable=unstable)
+    if success:
+        page, witness = await forms._bootstrap_observe_controls(
+            raw._reversible_session, raw.current, site=site)
+        assert page['entry'] == raw.current['entry']
+        assert set(witness) == {c['selector'] for c in raw.current['controls']}
+    else:
+        with pytest.raises(forms.Gate, match='predicate=' + re.escape(failed_predicate)):
+            await forms._bootstrap_observe_controls(
+                raw._reversible_session, raw.current, site=site)
+    assert reads == [1, 2, 3, 4]  # Never a fifth PAGE/witness evaluation.
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('key', [
+    'frames', 'responses', 'response_error', 'root', 'native_candidates',
+    'formless', 'root_evidence', 'upload_tree', 'helper_challenge', 'other',
+])
+async def test_issue190_diagnostic_names_only_top_level_entry_key(monkeypatch, key):
+    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
+    if key == 'other':
+        raw.fixed['entry']['synthetic_unlisted_key'] = _ISSUE190_PRIVATE_ENTRY
+    else:
+        raw.fixed['entry'][key] = _ISSUE190_PRIVATE_ENTRY
+    with pytest.raises(forms.Gate) as failure:
+        await forms._observe_controls(
+            raw._reversible_session, raw.current, site='execute')
+    text = str(failure.value)
+    assert f'predicate=entry.equal.{key}; control=unavailable; site=execute' in text
+    assert _ISSUE190_PRIVATE_ENTRY not in text
+    assert _ISSUE190_PRIVATE_ENTRY not in forms._reversible_bootstrap_gate_text(
+        failure.value)
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('different_keys,expected', [
+    (('root', 'frames'), 'frames'),
+    (('upload_tree', 'root_evidence'), 'root_evidence'),
+    (('synthetic_unlisted_key', 'responses'), 'responses'),
+])
+async def test_issue190_diagnostic_uses_fixed_priority_not_object_order(
+        monkeypatch, different_keys, expected):
+    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
+    for key in different_keys:
+        raw.fixed['entry'][key] = _ISSUE190_PRIVATE_ENTRY
+    with pytest.raises(forms.Gate, match=f'predicate=entry.equal.{expected}'):
+        await forms._observe_controls(
+            raw._reversible_session, raw.current, site='execute')
+    no_mutations(raw)
+
+
+async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
+    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
+    assert 'root' in raw.fixed['entry']
+    raw.fixed['entry'].pop('root')
+    with pytest.raises(forms.Gate, match='predicate=entry.equal.root'):
+        await forms._observe_controls(
+            raw._reversible_session, raw.current, site='execute')
+    no_mutations(raw)

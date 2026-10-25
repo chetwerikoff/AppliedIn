@@ -2060,3 +2060,148 @@ def test_issue174_non_ashby_hidden_pair_cannot_borrow_ashby_exception(reader):
     assert [f['status'] for f in page['entry']['frames']]==['unknown','unknown']
     with pytest.raises(forms.Gate,match='unknown/untrusted application frame'):
         forms._entry_safety(page,lambda u:u==entry('lever'),None)
+
+# Issue #182: form-free root members may reuse exact GLOBAL bank facts, but
+# never company-only facts, unbound selectors or sensitive fields.
+async def _issue182_formless_page(monkeypatch, *, label='Name', kind='text'):
+    row, raw, _, provenance = root_world(monkeypatch)
+    for snapshot in (raw.current, raw.fixed):
+        for item in snapshot['controls'] + snapshot['entry']['root_evidence']:
+            if item['selector'] == '#_systemfield_name':
+                item['label'] = label
+                item['tag'] = 'textarea' if kind == 'textarea' else 'input'
+                item['type'] = kind
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    return row, raw, session, page, provenance
+
+
+def _issue182_tracking(monkeypatch, row):
+    writes = []
+
+    class Tracking:
+        def set_status(self, pk, status, **attrs):
+            assert pk == PK and status == 'submitting'
+            writes.append(deepcopy(attrs))
+            row.update(attrs)
+
+    monkeypatch.setattr(
+        'core.stores.make_stores',
+        lambda: type('Stores', (), {'tracking': Tracking()})())
+    return writes
+
+
+@pytest.mark.parametrize('label,kind,value', [
+    ('Name', 'text', 'Test User'),
+    ('Phone', 'tel', '+12025550123'),
+    ('First Name', 'text', 'Test'),
+    ('Last Name', 'text', 'User'),
+])
+async def test_issue182_formless_global_grants_are_advertised_and_exact(
+        monkeypatch, label, kind, value):
+    row, raw, session, page, provenance = await _issue182_formless_page(
+        monkeypatch, label=label, kind=kind)
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {label: value, 'Email': 'synthetic@example.test'}
+    prepared = await forms._bootstrap(
+        session, page, PK, facts, posting('ashby'), provenance=provenance,
+        global_facts=dict(facts))
+    assert prepared['url'] == page['url']
+    assert len(writes) == 1
+    grants = row['human_approved_answers']
+    assert set(grants) == {label, 'Email'}
+    assert set(forms._advertised_grant_keys(PK, facts)) == {label, 'Email'}
+    for control in page['controls']:
+        if control['label'] not in facts:
+            continue
+        grant = grants[control['label']]
+        assert grant['source'] == 'bank-auto'
+        assert grant['selector'] == control['selector']
+        assert grant['value'] == facts[control['label']]
+        assert grant['form_selector'] == '#application-root'
+        assert grant['form_action'] == '#structural-submit'
+        bound = forms._bound_target(page, control)
+        forms.exact_approval(
+            PK, control['label'], grant['value'],
+            target=bound, url=page['url'], provenance=provenance)
+        with pytest.raises(forms.Gate, match='exact human-approved'):
+            forms.exact_approval(
+                PK, control['label'], 'different',
+                target=bound, url=page['url'], provenance=provenance)
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('label,kind,value', [
+    ('Desired salary', 'text', '500'),
+    ('I consent to privacy terms', 'text', 'yes'),
+    ('Sanctions or restricted country', 'text', 'No'),
+    ('Cover letter', 'textarea', 'Synthetic essay'),
+])
+async def test_issue182_formless_auto_grant_exclusions(
+        monkeypatch, label, kind, value):
+    row, raw, session, page, provenance = await _issue182_formless_page(
+        monkeypatch, label=label, kind=kind)
+    _issue182_tracking(monkeypatch, row)
+    facts = {label: value, 'Email': 'synthetic@example.test'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, facts, posting('ashby'), provenance=provenance,
+            global_facts=dict(facts))
+    assert label not in row['human_approved_answers']
+    assert set(row['human_approved_answers']) <= {'Email'}
+    no_mutations(raw)
+
+
+async def test_issue182_formless_company_overlay_mismatch_never_grants(monkeypatch):
+    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
+    _issue182_tracking(monkeypatch, row)
+    facts = {'Name': 'company-only', 'Email': 'synthetic@example.test'}
+    global_facts = {'Name': 'global-only', 'Email': 'synthetic@example.test'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, facts, posting('ashby'), provenance=provenance,
+            global_facts=global_facts)
+    assert 'Name' not in row['human_approved_answers']
+    no_mutations(raw)
+
+
+def test_issue182_formless_selector_membership_does_not_open_outer_scope():
+    from tests.tools.test_browser_bootstrap import field
+
+    outside = field('Email', '#outside', in_form=False)
+    assert not forms._bank_auto_eligible(
+        outside, 'synthetic@example.test',
+        formless_selectors=frozenset({'#inside'}))
+    assert forms._bank_auto_eligible(
+        outside, 'synthetic@example.test',
+        formless_selectors=frozenset({'#outside'}))
+    inside_native_form = field('Email', '#inside', in_form=True)
+    assert forms._bank_auto_eligible(inside_native_form, 'synthetic@example.test')
+
+async def test_issue182_formless_partial_label_is_not_a_global_fact(monkeypatch):
+    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
+    _issue182_tracking(monkeypatch, row)
+    partial = {'Full Name': 'Test User'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, partial, posting('ashby'),
+            provenance=provenance, global_facts=partial)
+    assert row['human_approved_answers'] == {}
+    no_mutations(raw)
+
+
+async def test_issue182_formless_existing_explicit_grant_is_not_overwritten(monkeypatch):
+    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
+    original = {'value': 'Owner decision', 'selector': '#old'}
+    row['human_approved_answers'] = {'Name': original.copy()}
+    _issue182_tracking(monkeypatch, row)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    with pytest.raises(forms.Gate):
+        await forms._bootstrap(
+            session, page, PK, facts, posting('ashby'),
+            provenance=provenance, global_facts=facts)
+    assert row['human_approved_answers']['Name'] == original
+    no_mutations(raw)

@@ -4534,6 +4534,12 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
         return None
+    # Synthetic read-only sessions and unguarded legacy routes cannot supply
+    # a safely executable direct question. Production writes own this guard.
+    raw = getattr(session, 'raw', session)
+    if not isinstance(getattr(raw, '_application_controller', None),
+                      ApplicationIPCController):
+        return None
     current, witness = await _observe_controls(
         session, await session.page(), site='owner-required')
     if (not _preparation_destination_allowed(current.get('url', ''), *origins,
@@ -4576,8 +4582,9 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         writable = (_native_answer(item)
                     or kind == 'combobox' and item.get('tag') in {'input', 'div'}
                     or kind in {'radio', 'checkbox'} and item.get('tag') == 'input')
-        if not writable or (rootless and kind == 'radio'):
-            return Gate('The guarded executor cannot write this required control; '
+        if (not writable or (rootless and kind == 'radio')
+                or (rootless and _closed_material_combobox(item))):
+            return Gate('The guarded executor cannot write this required control; 
                         'operator inspection is required.',
                         reason='defect_' + _required_owner_gate_type(item))
         # A currently bound grant is not a missing answer, even when bootstrap
@@ -6498,40 +6505,3 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'Check the employer portal before retrying.', step,
                     captcha_artifact=isinstance(exc, CaptchaArtifactGate))
                 return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-            context = (
-                {'text': str(exc), 'step': {'last_button': '(unavailable)',
-                                          'url': _navigation_observed_step_url(page, url)}}
-                if isinstance(exc, NavigationProvenanceGate)
-                else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
-                else handoff(str(exc), step,
-                             captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
-            hard = (isinstance(exc, CaptchaGate) or exc.reason.startswith('defect_')
-                    or exc.reason == 'posting_guard_review_required')
-            route = ('owner' if exc.reason == 'owner_question'
-                     else 'hard_refusal' if hard else 'agent_unavailable')
-            if route == 'agent_unavailable':
-                context['text'] += (
-                    ' Agent-first review is unavailable: a safe sanitized Luna '
-                    'transport and original-tab retention have not been verified. '
-                    'The operator must establish both before any same-session '
-                    'correction; do not requeue or submit automatically.')
-            report = {'status': 'gate',
-                      'reason': 'captcha' if isinstance(exc, CaptchaGate) else exc.reason,
-                      'review_route': route,
-                      'question': context['text'], 'step': context['step'],
-                      'form_question': exc.form_question}
-            if isinstance(exc, MaterialAssentGate) or _material_question(exc.form_question):
-                # An execute-time owner question is also page prose; never log it.
-                report['material_assent_diagnostic'] = True
-            if isinstance(exc, NavigationProvenanceGate):
-                report['navigation_provenance_diagnostic'] = True
-            if isinstance(exc, CaptchaArtifactGate):
-                report['captcha_artifact_diagnostic'] = True
-            return report
-        if submitted:
-            context = handoff(
-                'Submission outcome uncertain after a browser interruption. '
-                'Check the employer portal; no automatic retry.', step)
-            return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-        return {'status': 'unknown', 'detail': str(exc) if isinstance(exc, bsk.Unavailable)
-                else f'BrowserSkill operation unavailable: {type(exc).__name__}'}

@@ -5,6 +5,9 @@ independent complete observations before the direct human question is reachable.
 """
 from copy import deepcopy
 import asyncio
+import logging
+import re
+import sys
 import time
 from pathlib import Path
 
@@ -2212,6 +2215,16 @@ async def test_issue182_formless_existing_explicit_grant_is_not_overwritten(monk
 # Issue #184: a reversible raw session has no unique historical Ashby root.
 # The code-owned controller permits only freshly witnessed, form-free GLOBAL
 # facts to be granted; no root-based or final-Submit authority is inferred.
+
+
+@pytest.fixture
+def bootstrap_caplog(caplog):
+    # Production logging is logger-local and never propagates to root caplog.
+    forms._LOG.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        forms._LOG.removeHandler(caplog.handler)
 def _issue184_reversible_session(monkeypatch):
     row, raw, _, provenance = root_world(monkeypatch, missingPane=True)
     assert forms._formless_root(raw.current)
@@ -2252,7 +2265,7 @@ def _issue184_add_name_phone_controls(raw):
 
 
 async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
-        monkeypatch, caplog):
+        monkeypatch, bootstrap_caplog):
     row, raw, provenance = _issue184_reversible_session(monkeypatch)
     _issue184_add_name_phone_controls(raw)
     # Exercise the real raw Session.page implementation. The generic PAGE
@@ -2271,7 +2284,7 @@ async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
     writes = _issue182_tracking(monkeypatch, row)
     facts = {'First Name': 'Test', 'Last Name': 'User',
              'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
-    with caplog.at_level('INFO', logger=forms.__name__):
+    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
         returned = await forms._bootstrap(
             session, page, PK, facts, posting('ashby'),
             company=COMPANY, provenance=provenance, global_facts=dict(facts))
@@ -2297,7 +2310,7 @@ async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
         assert grant['form_selector'] == '' and grant['form_action'] == ''
         assert grant['selector'] in {c['selector'] for c in raw.current['controls']
                                      if c['label'] == key and c['in_form'] is False}
-    diagnostics = [r.getMessage() for r in caplog.records
+    diagnostics = [r.getMessage() for r in bootstrap_caplog.records
                    if 'bootstrap pk=' in r.getMessage()]
     assert len(diagnostics) == 1
     assert f'pk={PK} route=reversible' in diagnostics[0]
@@ -2305,6 +2318,60 @@ async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
         assert key in diagnostics[0]
     for value in facts.values():
         assert value not in diagnostics[0]
+    no_mutations(raw)
+
+
+async def test_issue186_bootstrap_info_uses_production_console_stdout(monkeypatch, capsys):
+    from core.logging import _ConsoleFormatter
+
+    # Do not call get_logger here: doing so would fix the broken module
+    # logger inside the regression instead of testing its import-time setup.
+    logger = forms._LOG
+    assert logger.level == logging.INFO
+    assert logger.propagate is False
+    handlers = [
+        handler for handler in logger.handlers
+        if (isinstance(handler, logging.StreamHandler)
+            and isinstance(handler.formatter, _ConsoleFormatter))
+    ]
+    assert len(handlers) == 1
+
+    row, raw, provenance = _issue184_reversible_session(monkeypatch)
+    _issue184_add_name_phone_controls(raw)
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {'First Name': 'Test', 'Last Name': 'User',
+             'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
+
+    # The real production-installed StreamHandler must write to stdout;
+    # give it the test's currently captured stdout without replacing its formatter.
+    with monkeypatch.context() as capture:
+        capture.setattr(handlers[0], 'stream', sys.stdout)
+        result = await forms._bootstrap(
+            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
+            company=COMPANY, provenance=provenance, global_facts=dict(facts))
+        forms._bootstrap_log(
+            {'label': 'Phone', 'type': 'tel', 'value': facts['Phone']},
+            0, 'bank-auto', required=True)
+        stdout = capsys.readouterr().out
+
+    assert result is raw.current
+    assert len(writes) == 1
+    assert set(row['human_approved_answers']) == set(facts)
+    bootstrap = [line for line in stdout.splitlines() if 'bootstrap pk=' in line]
+    assert len(bootstrap) == 1
+    expected = (f'bootstrap pk={PK} route=reversible '
+                f'bank-auto-granted={sorted(facts)}')
+    assert re.fullmatch(
+        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(expected)}',
+        bootstrap[0])
+    decisions = [line for line in stdout.splitlines()
+                 if 'bootstrap field decision ' in line]
+    assert len(decisions) == 1
+    assert re.match(r'^\d{2}:\d{2}:\d{2} INFO\s+tools\s+bootstrap field decision ',
+                    decisions[0])
+    assert "'label': 'phone'" in decisions[0]
+    for value in facts.values():
+        assert value not in stdout
     no_mutations(raw)
 
 
@@ -2388,7 +2455,7 @@ async def test_issue184_reversible_without_controller_mints_nothing(monkeypatch)
 
 
 async def test_issue184_reversible_observation_gate_returns_original_page(
-        monkeypatch, caplog):
+        monkeypatch, bootstrap_caplog):
     from unittest.mock import AsyncMock
 
     row, raw, provenance = _issue184_reversible_session(monkeypatch)
@@ -2396,14 +2463,14 @@ async def test_issue184_reversible_observation_gate_returns_original_page(
     observe = AsyncMock(side_effect=forms.Gate('Synthetic changed witness'))
     monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with caplog.at_level('INFO', logger=forms.__name__):
+    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
         result = await forms._bootstrap(
             raw._reversible_session, raw.current, PK, facts, posting('ashby'),
             company=COMPANY, provenance=provenance, global_facts=facts)
     assert result is raw.current and row['human_approved_answers'] == {}
     observe.assert_awaited_once()
     assert writes == []
-    messages = [r.getMessage() for r in caplog.records if 'bootstrap pk=' in r.getMessage()]
+    messages = [r.getMessage() for r in bootstrap_caplog.records if 'bootstrap pk=' in r.getMessage()]
     assert len(messages) == 1 and 'route=reversible' in messages[0]
     assert 'bank-auto-granted=[]' in messages[0]
     for value in facts.values():
@@ -2429,9 +2496,9 @@ async def test_issue184_reversible_disallowed_fresh_origin_returns_page(monkeypa
     no_mutations(raw)
 
 
-async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, caplog):
+async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, bootstrap_caplog):
     row, raw, session, page, provenance = await admitted(monkeypatch)
-    with caplog.at_level('INFO', logger=forms.__name__):
+    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
         with pytest.raises(forms.Gate):
             await forms._bootstrap(session, page, PK, {},
                                    posting('ashby'), provenance=provenance)
@@ -2439,7 +2506,7 @@ async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, caplog
                      'entry': {'root': {'selector': '#synthetic-form'}}}
         assert await forms._bootstrap(
             raw, form_page, PK, {}, posting('ashby'), provenance=provenance) is form_page
-    messages = [r.getMessage() for r in caplog.records
+    messages = [r.getMessage() for r in bootstrap_caplog.records
                 if 'bootstrap pk=' in r.getMessage()]
     assert len(messages) == 2
     assert f'pk={PK} route=entry' in messages[0]

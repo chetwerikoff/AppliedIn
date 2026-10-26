@@ -435,7 +435,7 @@ def test_hidden_retention_remains_non_benign_after_merge():
                               "posting_guard": merged["posting_guard"]})
 
 
-def test_drop_subtrees_are_not_retention_evidence_but_script_urls_stay_flagged():
+def test_drop_subtrees_are_neither_retention_nor_hidden_url_evidence():
     description = "Build reliable platforms for example-co engineering teams."
     # Repetition inside machine-only roots is not hidden text retained in a JD.
     html = (
@@ -457,15 +457,15 @@ def test_drop_subtrees_are_not_retention_evidence_but_script_urls_stay_flagged()
     parser.close()
     assert not parser.hidden_text
     assert not parser.hidden_attrs
-    # Existing URL flagging applies even when the URL occurs in JSON-LD.
-    assert "hidden_url" in parser.reasons
+    # A URL in JSON-LD never enters the parsed posting text (#211).
+    assert "hidden_url" not in parser.reasons
 
     inspected = pg.analyze(
         description, html_variants=[html], source_required=True)
     guard = inspected["posting_guard"]
     assert inspected["text"] == description
-    assert guard["status"] == "flagged"
-    assert "hidden_url" in guard["reasons"]
+    assert guard["status"] == "clean"
+    assert "hidden_url" not in guard["reasons"]
     assert "hidden_text_retained" not in guard["reasons"]
     row = {"jd_text": inspected["text"], "posting_guard": guard}
     assert pg.valid(row["jd_text"], guard)

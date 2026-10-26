@@ -309,7 +309,8 @@ class Gate(ValueError):
                  reason: str = 'unknown_field'):
         super().__init__(message)
         self.form_question = form_question
-        self.reason = reason if reason in _GATE_DIAGNOSTICS else 'unknown_field'
+        self.reason = (reason if reason in _GATE_DIAGNOSTICS or re.fullmatch(
+            r'defect_[a-z][a-z0-9_]{0,63}', reason) else 'unknown_field')
 
 
 class NavigationProvenanceGate(Gate):
@@ -813,6 +814,11 @@ def exact_approval(pk: str, key: str, value: str, *,
             or (target.get('type') == 'checkbox'
                 and (grant.get('visible_text') != target.get('label')
                      or not _same(value, 'yes')))
+            or (target.get('type') == 'button' and (
+                not isinstance(target.get('boolean_members'), list)
+                or grant.get('boolean_members') != target['boolean_members']
+                or sum(_same(value, m['caption']) or _same(value, m['value'])
+                       for m in target['boolean_members']) != 1))
             or (target.get('type') == 'radio'
                 and (grant.get('radio_name') != target.get('name')
                      or not isinstance(grant.get('radio_members'), list)
@@ -865,6 +871,13 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                 if target.get('type') == 'checkbox':
                     if not target.get('checked') or not _same(answer, 'yes'):
                         raise Gate('The approved checkbox is no longer checked.')
+                elif target.get('type') == 'button':
+                    members = _boolean_pair(page, target)
+                    matches = [m for m in members if _same(answer, m['label'])]
+                    if (len(matches) != 1 or matches[0]['selector'] != target['selector']
+                            or not target.get('checked')):
+                        raise Gate('The approved Boolean button is not selected.')
+                    guarded_value(target, answer)
                 elif target.get('type') == 'radio':
                     group = _radio_group(page, target)
                     matches = [c for c in group
@@ -1596,7 +1609,7 @@ _APP_SUBMIT_LABELS = frozenset({
     'submit application', 'send application', 'complete application',
     'finish application', 'apply now',
 })
-_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number'})
+_TEXT_TYPES = frozenset({'text', 'email', 'tel', 'url', 'number', 'date'})
 _ACCOUNT_PURPOSE = re.compile(
     r'\b(?:sign[\s-]*in|log[\s-]*in|sign[\s-]*up|create account|'
     r'account access|register|subscribe|subscription|password|forgot password)\b', re.I)
@@ -2362,16 +2375,12 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
     # Receiver and approved-value evidence is refreshed for preparation;
     # completeness of the structural root is a final-Submit requirement.
 
-
 _ASHBY_WAIT_SECONDS = 90.0
-
 
 def _upload_clock():
     return asyncio.get_running_loop().time()
 
-
 _upload_sleep = asyncio.sleep
-
 
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
@@ -2502,7 +2511,6 @@ class _EntrySession:
         finally:
             self.upload_pending = False
 
-
     async def call(self, *args, **kwargs):
         if self.upload_pending and (kwargs or args not in {
                 ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
@@ -2587,7 +2595,6 @@ class _EntrySession:
                               readiness=self._readiness)
         return result
 
-
 def _entry_not_ready(page):
     for key in ('truncated', 'opaque_controls', 'shadow_roots'):
         if page.get(key):
@@ -2627,9 +2634,6 @@ def _greenhouse_not_ready(page, *, witness=False):
         return 'unverified application inventory'
     return 'no qualifying application form' if page['greenhouse']['root'] is None else ''
 
-
-
-
 async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                                     provenance, *, deadline: float):
     """Losing a historic shape certificate does not make an approved write a Submit.
@@ -2668,7 +2672,6 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                 page.get('url'), provenance=provenance)
         _inventory_ok(page, complete=False)
         return reversible, page
-
 
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
                                    initial=None) -> dict:
@@ -2746,12 +2749,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
         if greenhouse or entry_session:
             session._readiness = prior_readiness
 
-
-
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
 _BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
-
 
 async def _bootstrap_observe_controls(session, page: dict, *, site: str):
     """Preserve the two-argument observer seam while naming bootstrap gates."""
@@ -2945,6 +2945,89 @@ class _ReversibleEntryReader:
         return await self.raw.call(*args, **kwargs)
 
 
+def _reversible_entry_recipient(page: dict, target: dict,
+                                witness: dict | None = None) -> None:
+    """Prove exact application membership using the independent ENTRY census."""
+    root = _formless_root(page)
+    entry = page.get('entry') or {}
+    evidence = entry.get('root_evidence')
+    excluded = root.get('excluded') if isinstance(root, dict) else None
+    selector = target.get('selector')
+    if (not isinstance(root, dict) or root.get('root') or root.get('error')
+            or root.get('truncated') or not root.get('container')
+            or not root.get('submit') or not isinstance(selector, str)
+            or not selector or not isinstance(excluded, list)
+            or any(not isinstance(s, str) for s in excluded)
+            or selector in excluded or not isinstance(evidence, list)
+            or not 1 <= len(evidence) <= 500
+            or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
+                   for e in evidence)
+            or len({e['selector'] for e in evidence}) != len(evidence)):
+        raise Gate('The reversible receiver has no exact application membership.',
+                   reason='defect_receiver')
+    matches = [e for e in evidence if e['selector'] == selector]
+    if len(matches) != 1:
+        raise Gate('The reversible receiver has no exact application membership.',
+                   reason='defect_receiver')
+    e = matches[0]
+    custom = (target.get('tag') == 'div' and target.get('type') == 'combobox'
+              and isinstance(target.get('combobox'), dict)
+              and bool(target.get('label')) and bool(target.get('question')))
+    pair_member = (target.get('tag') == 'button'
+                   and target.get('type') == 'button'
+                   and target.get('native_type') == 'button'
+                   and bool(target.get('question')))
+    native_label = e.get('associated') is True and e.get('label') == target.get('label')
+    if (e.get('unique') is not True or e.get('in_container') is not True
+            or e.get('native_owner') or e.get('declared_owner')
+            or e.get('formaction') is not None or e.get('submit')
+            or e.get('iti') or e.get('contenteditable')
+            or e.get('type') == 'hidden' or e.get('disabled')
+            or e.get('readonly') or e.get('inert')
+            or e.get('visible') is not True
+            or e.get('tag') != target.get('tag')
+            or e.get('type') != target.get('type')
+            or (not (custom or pair_member)
+                and e.get('required') != target.get('required'))
+            or e.get('disabled') != target.get('disabled')
+            or (not native_label and not (custom or pair_member))
+            or target.get('in_form') is not False
+            or any(target.get(k) for k in (
+                'native_form_owner_selector', 'form_selector', 'form_action',
+                'form_action_attr_present', 'form_action_raw', 'formaction',
+                'formaction_attr_present', 'formaction_raw', 'href',
+                'submit', 'navigates', 'commits_application'))):
+        raise Gate('The reversible receiver is not associated with the application.',
+                   reason='defect_receiver')
+    if not (custom or pair_member) and (
+            e.get('value') != target.get('value')
+            or e.get('files') != target.get('files')):
+        raise Gate('The independent application receiver value differs.',
+                   reason='defect_receiver')
+    if witness is not None:
+        dom = witness.get(selector)
+        if (not isinstance(dom, dict) or dom.get('visible') is not True
+                or dom.get('readonly') is not False
+                or dom.get('disabled') is not False
+                or dom.get('inert') is not False
+                or (pair_member and dom.get('label') != target.get('label'))):
+            raise Gate('The reversible receiver witness is not editable.',
+                       reason='defect_witness')
+
+
+def _reversible_entry_scope(page: dict, witness: dict) -> frozenset[str]:
+    admitted = set()
+    for c in page['controls']:
+        if c.get('in_form') is not False:
+            continue
+        try:
+            _reversible_entry_recipient(page, c, witness)
+        except Gate:
+            continue
+        admitted.add(c['selector'])
+    return frozenset(admitted)
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')
@@ -2955,13 +3038,14 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
             or not isinstance(target.get('question'), str)
             or not target['question'].strip()):
         raise Gate('A native radio group needs a form, name and visible question.')
-    owned = ({c['selector'] for c in page['entry'].get('root_evidence', [])
-              if c.get('in_container') and c.get('associated')}
-             if structural else None)
     members = [c for c in page['controls']
                if c.get('type') == 'radio' and c.get('name') == name
-               and c.get('form_selector') == form
-               and (owned is None or c.get('selector') in owned)]
+               and c.get('form_selector') == form]
+    if structural and not structural.get('root'):
+        # The group is all its members: silently filtering a foreign member
+        # would change the meaning of the owner's approved choice.
+        for member in members:
+            _reversible_entry_recipient(page, member)
     if (len(members) < 2 or any(
             c.get('tag') != 'input' or (not structural and c.get('in_form') is not True)
             or c.get('question') != target['question']
@@ -2977,6 +3061,43 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
     return members
 
 
+def _boolean_pair(page: dict, target: dict, *,
+                  witness: dict | None = None) -> list[dict]:
+    """Only a complete, exact Yes/No application button group can be written."""
+    root = _formless_root(page)
+    name, question = target.get('name'), target.get('question')
+    if (not root or root.get('root') or target.get('tag') != 'button'
+            or target.get('type') != 'button'
+            or not isinstance(name, str) or not name.strip()
+            or not isinstance(question, str) or not question.strip()):
+        raise Gate('Unsupported Boolean receiver.', reason='defect_button')
+    members = [c for c in page['controls']
+               if c.get('tag') == 'button' and c.get('name') == name
+               and c.get('question') == question]
+    if (len(members) != 2
+            or {str(c.get('label', '')).casefold() for c in members} != {'yes', 'no'}
+            or len({c.get('selector') for c in members}) != 2
+            or any(c.get('type') != 'button' or c.get('native_type') != 'button'
+                   or c.get('in_form') is not False or c.get('disabled')
+                   or c.get('required') is not True
+                   or ((c.get('has_value') or c.get('checked')
+                        or c.get('value') not in ('', None)) and not (
+                        c.get('checked') is True and c.get('has_value') is True
+                        and c.get('value') == str(c.get('label', '')).casefold()))
+                   or any(c.get(k) for k in (
+                       'submit', 'navigates', 'commits_application', 'href',
+                       'form_selector', 'form_action', 'formaction',
+                       'native_form_owner_selector'))
+                   for c in members)):
+        raise Gate('The Boolean button pair is incomplete or unsafe.',
+                   reason='defect_button')
+    if sum(bool(m.get('checked')) for m in members) > 1:
+        raise Gate('More than one Boolean answer is selected.', reason='defect_button')
+    for member in members:
+        _reversible_entry_recipient(page, member, witness)
+    return members
+
+
 def _bound_target(page: dict, target: dict) -> dict:
     """Grant identity for a radio is its entire group, never one model option."""
     structural = _formless_root(page)
@@ -2985,6 +3106,11 @@ def _bound_target(page: dict, target: dict) -> dict:
                 'form_selector': structural['root'], 'form_action': structural['submit']}
     # A reversible rootless field has no structural owner. Its exact identity
     # is the independently observed native receiver used by the raw producer.
+    if target.get('type') == 'button':
+        members = _boolean_pair(page, target)
+        return {**members[0], 'boolean_members': [
+            {'selector': c['selector'], 'caption': c['label'],
+             'value': c['label'].casefold()} for c in members]}
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -3105,6 +3231,13 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
 
 
 def _unanswered(page: dict, target: dict) -> bool:
+    if target.get('type') == 'button' and _formless_root(page):
+        try:
+            members = _boolean_pair(page, target)
+        except Gate:
+            members = [target]
+        return any(c.get('required') for c in members) and not any(
+            c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
         return bool(target.get('required')) and not target.get('checked')
     if target.get('type') == 'radio':
@@ -3148,6 +3281,9 @@ def _choice_prompt(target: dict, question: dict) -> str:
                     '\nOpen the linked picker to load available options.')
     elif question['type'] == 'checkbox':
         observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
+    elif question['type'] == 'button' and question.get('boolean_members'):
+        observed += '\nOptions:\n' + '\n'.join(
+            member['caption'] for member in question['boolean_members'])
     return prefix + observed
 
 
@@ -3162,6 +3298,13 @@ def _require_native_choice(target: dict) -> None:
             or target.get('type') not in {'checkbox', 'radio'}
             or target.get('disabled') or target.get('checked')):
         raise Gate('Only an unchecked, enabled native checkbox/radio can be chosen.')
+
+
+def _require_guarded_choice(page: dict, target: dict) -> None:
+    if target.get('type') == 'button':
+        _boolean_pair(page, target)
+    else:
+        _require_native_choice(target)
 
 
 def _guard_native_choice_answer(selected: dict, answer: str) -> None:
@@ -3190,7 +3333,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
             if not isinstance(grants, dict) or key not in grants:
                 raise Gate('The privacy scope or new legal attestation needs an owner decision.',
                            reason='owner_question')
-        if scope == 'standard_privacy':
+        if scope == 'standard_privacy' and target.get('in_form') is True:
             exact_approval(pk, key, 'yes', target=_bound_target(page, target),
                            url=page['url'], provenance=provenance,
                            **({'fixture_context': fixture_context} if fixture_context else {}))
@@ -3222,6 +3365,27 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
     _guard_native_choice_answer(selected, answer)
     return answer, selected
+
+def _approved_boolean_pair(page: dict, target: dict, pk: str, *,
+                           provenance=None, fixture_context=None):
+    members = _boolean_pair(page, target)
+    key = _key(page, members[0])
+    row = _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+    grants = row.get('human_approved_answers')
+    grant = grants.get(key) if isinstance(grants, dict) else None
+    if not isinstance(grant, dict) or not isinstance(grant.get('value'), str):
+        return None
+    answer = grant['value']
+    matching = [c for c in members if _same(answer, c['label'])]
+    if len(matching) != 1:
+        raise Gate('The approved Boolean button answer is ambiguous.',
+                   reason='defect_button')
+    exact_approval(pk, key, answer, target=_bound_target(page, members[0]),
+                   url=page['url'], provenance=provenance,
+                   **({'fixture_context': fixture_context} if fixture_context else {}))
+    guarded_value(matching[0], answer)
+    return answer, matching[0]
+
 
 def _require_native_action(target: dict, verb: str) -> None:
     """Never dispatch fill to a select or select to a text-entry field."""
@@ -3313,6 +3477,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     reversible = (reversible_scope is not None
                   and target.get('selector') in reversible_scope)
     if reversible:
+        _reversible_entry_recipient(page, target, witness)
         # No unique historic root exists on this raw-session route. Grant
         # disclosure only to an independently observed, ownerless receiver on
         # the already-authorized preparation origin; never borrow form authority.
@@ -3326,11 +3491,18 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                     'navigates'))):
             raise Gate('The reversible receiver is not on the approved preparation origin.')
     elif structural:
+        if not structural.get('root'):
+            raise Gate('Unscoped reversible receiver is not an application member.',
+                       reason='defect_receiver')
         members = _formless_boundary(page, provenance)
         if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
     choice = target.get('type') in {'radio', 'checkbox'}
-    if choice:
+    boolean_choice = reversible and target.get('type') == 'button'
+    if boolean_choice:
+        members = _boolean_pair(page, target, witness=witness)
+        target = members[0]
+    elif choice:
         if target.get('tag') != 'input':
             raise Gate('A grantable choice must be a native input.')
         members = (_radio_group(page, target)
@@ -3377,7 +3549,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     subject = label(target)
     if _ACCOUNT_PURPOSE.search(subject) or _LOGIN.search(subject):
         raise Gate('This control requires human sign-in or account review.')
-    if not choice and (_material_assent_match(subject) or _material_select_options(target)):
+    if not (choice or boolean_choice) and (
+            _material_assent_match(subject) or _material_select_options(target)):
         if not _material_form_choice(target):
             raise Gate('Legal or material assent requires direct human review.')
         # Unlinked or partly observed ARIA options cannot become an approval.
@@ -3408,6 +3581,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question.update(owner_kind='ashby-formless-root',
                         form_selector=structural['root'],
                         form_action=structural['submit'])
+    if reversible:
+        # A rootless field can bind a row grant without inventing a native form owner.
+        question['owner_kind'] = 'ashby-reversible-entry'
     if isinstance(provenance, GreenhouseJobAlias):
         question['origin_row'] = {
             'jd_url': provenance.wrapper, 'company': provenance.company,
@@ -3435,6 +3611,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         bound = _bound_target(page, target)
         question['radio_name'] = bound['radio_name']
         question['radio_members'] = bound['radio_members']
+    if boolean_choice:
+        question['boolean_members'] = _bound_target(page, target)['boolean_members']
     return question
 
 
@@ -3829,6 +4007,7 @@ def _bank_auto_eligible(item: dict, value: str, *,
     subject = label(item)
     if ((not item.get('in_form')
          and item.get('selector') not in formless_selectors) or item.get('disabled')
+            or item.get('type') == 'date'  # Issue #196: date is owner-only, not new bank scope.
             or item.get('tag') == 'textarea'
             or item.get('type') == 'password'
             or not (_native_answer(item) or item.get('type') in {'combobox', 'radio', 'checkbox'})
@@ -4122,8 +4301,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                                 not _preparation_current(
                                     provenance, fixture_context=fixture_context))):
                         raise Gate('The reversible observation left the preparation origin.')
-                    scope = frozenset(c['selector'] for c in fresh['controls']
-                                      if c.get('in_form') is False)
+                    scope = _reversible_entry_scope(fresh, witness)
                     _auto_grant_from_global(
                         fresh, witness, pk, facts, global_facts or {}, *origins,
                         provenance=provenance, fixture_context=fixture_context,
@@ -4508,11 +4686,180 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     return page
 
 
+
+def _required_owner_gate_type(target: dict) -> str:
+    """Only a normalized control KIND, never arbitrary DOM text, enters a defect code."""
+    kind = target.get('type')
+    if not isinstance(kind, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,48}', kind):
+        return 'unknown'
+    return kind.lower().replace('-', '_')
+
+
+def _required_owner_gate_admitted(page: dict, provenance) -> bool:
+    """An unproven historic root permits preparation, not unsafe disclosure."""
+    structural = _formless_root(page)
+    if not structural:
+        return True
+    if structural.get('error') or structural.get('truncated'):
+        return False
+    if structural.get('root'):
+        try:
+            _formless_boundary(page, provenance)
+        except Gate:
+            return False
+        return True
+    if (_entry_not_ready(page) != 'no unique application root'
+            or page.get('inventory_verified') is not True
+            or page.get('truncated') or page.get('opaque_controls')
+            or page.get('shadow_roots') or page.get('unsupported_frames')
+            or not structural.get('container') or not structural.get('submit')):
+        return False
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not isinstance(evidence, list) or not evidence:
+        return False
+    return len(evidence) <= 500 and all(isinstance(item, dict) for item in evidence)
+
+
+async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
+                               provenance=None, fixture_context=None) -> Gate | None:
+    """Bind the first still-required answer before delegating any planning to the model.
+
+    The Ashby rootless path previously returned from bootstrap after bank grants;
+    the model then produced an unanswerable prose gate. A fresh independent
+    witness supplies this per-control question, never the model's description.
+    """
+    if not any(c.get('required') and _unanswered(page, c)
+               and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
+               for c in page['controls']):
+        return None
+    # Synthetic read-only sessions and unguarded legacy routes cannot supply
+    # a safely executable direct question. Production writes own this guard.
+    raw = getattr(session, 'raw', session)
+    if not isinstance(getattr(raw, '_application_controller', None),
+                      ApplicationIPCController):
+        return None
+    current, witness = await _observe_controls(
+        session, await session.page(), site='owner-required')
+    if (not _preparation_destination_allowed(current.get('url', ''), *origins,
+                                             provenance=provenance)
+            or (provenance is not None and
+                not _preparation_current(provenance, fixture_context=fixture_context))):
+        raise Gate('The tracked job route changed before the owner question.',
+                   reason='defect_provenance')
+    if isinstance(session, _ReversibleEntryReader):
+        _entry_safety(
+            current, lambda href: _preparation_destination_allowed(
+                href, *origins, provenance=provenance), provenance)
+    if not _required_owner_gate_admitted(current, provenance):
+        return None
+    structural = _formless_root(current)
+    rootless = bool(structural and not structural.get('root'))
+    if rootless and not (
+            isinstance(session, _ReversibleEntryReader)
+            and isinstance(provenance, ApplicationEntryProvenance)
+            and isinstance(getattr(session.raw, '_application_controller', None),
+                           ApplicationIPCController)):
+        raise Gate('The reversible owner question lacks a bound raw controller.',
+                   reason='defect_witness')
+    if rootless:
+        # Relevant unsafe receivers need a typed defect. An unrelated hidden
+        # input outside the container cannot suppress a safe owner question.
+        for candidate in current['entry'].get('root_evidence', []):
+            if candidate.get('in_container') is True and (
+                    candidate.get('type') == 'hidden'
+                    or candidate.get('iti') or candidate.get('contenteditable')):
+                return Gate('Unsafe application receiver needs operator inspection.',
+                            reason='defect_structural')
+    scope = _reversible_entry_scope(current, witness) if rootless else None
+    row = (_row(pk, fixture_context=fixture_context)
+           if fixture_context is not None else _row(pk))
+    grants = row.get('human_approved_answers') or {}
+    for item in current['controls']:
+        kind = item.get('type')
+        if (not item.get('required') or not _unanswered(current, item)
+                or kind in {'file', 'hidden', 'password', 'submit', 'image'}
+                or native_submit(item)):
+            continue
+        if rootless and item.get('selector') not in scope:
+            # A positively witnessed but unsupported application widget
+            # receives its type-specific defect, never a grant. An off-container,
+            # excluded, missing or contradictory receiver remains defect_receiver.
+            writable_kind = (_native_answer(item)
+                             or kind == 'combobox' and item.get('tag') in {'input', 'div'}
+                             or kind in {'radio', 'checkbox'} and item.get('tag') == 'input'
+                             or kind == 'button' and item.get('tag') == 'button')
+            evidence = current['entry'].get('root_evidence', [])
+            matches = [e for e in evidence
+                       if e.get('selector') == item.get('selector')]
+            if (not writable_kind and len(matches) == 1
+                    and matches[0].get('unique') is True
+                    and matches[0].get('in_container') is True
+                    and matches[0].get('tag') == item.get('tag')
+                    and matches[0].get('type') == kind
+                    and item.get('selector') not in (
+                        _formless_root(current).get('excluded') or [])
+                    and not any(matches[0].get(k) for k in (
+                        'native_owner', 'declared_owner', 'formaction',
+                        'iti', 'contenteditable', 'submit'))):
+                return Gate('The application widget is not writable by the guarded executor.',
+                            reason='defect_' + _required_owner_gate_type(item))
+            return Gate('Required receiver lacks application association.',
+                        reason='defect_receiver')
+        # The existing native checkbox standing acknowledgement is not an
+        # owner attestation; the code-owned direct-delegation rule remains intact.
+        if kind == 'checkbox' and item.get('tag') == 'input' and (
+                _assent_scope(item) == 'standard_privacy'):
+            try:
+                if _approved_native_choice(
+                        current, item, pk, provenance=provenance,
+                        fixture_context=fixture_context) is not None:
+                    continue
+            except Gate:
+                pass
+        if rootless and kind in {'radio', 'button'}:
+            try:
+                _radio_group(current, item) if kind == 'radio' else _boolean_pair(
+                    current, item, witness=witness)
+            except Gate:
+                return Gate('Required choice group is not safely writable.',
+                            reason='defect_' + kind)
+        writable = (_native_answer(item)
+                    or kind == 'combobox' and item.get('tag') in {'input', 'div'}
+                    or kind in {'radio', 'checkbox'} and item.get('tag') == 'input'
+                    or rootless and kind == 'button' and item.get('tag') == 'button')
+        if not writable or (rootless and _closed_material_combobox(item)):
+            return Gate('The guarded executor cannot write this required control; '
+                        'operator inspection is required.',
+                        reason='defect_' + _required_owner_gate_type(item))
+        # A currently bound grant is not a missing answer, even when bootstrap
+        # had no new global fact to settle. Stale grants never authorize a write.
+        key = _key(current, item)
+        prior = grants.get(key) if isinstance(grants, dict) else None
+        if isinstance(prior, dict) and isinstance(prior.get('value'), str):
+            try:
+                exact_approval(
+                    pk, key, prior['value'], target=_bound_target(current, item),
+                    url=current['url'], provenance=provenance,
+                    **({'fixture_context': fixture_context} if fixture_context else {}))
+            except Gate:
+                pass
+            else:
+                continue
+        question = _disclosure_question(
+            current, item, witness, *origins, bootstrap=True,
+            closed_witness=_closed_material_combobox(item),
+            reversible_scope=scope, provenance=provenance)
+        question['pk'] = pk
+        return Gate(_choice_prompt(item, question), form_question=question,
+                    reason='owner_question')
+    return None
+
+
 async def _current_approved_choices(session, page: dict, pk: str,
                                     *origins: str, fixture_context=None,
-                                    provenance=None) -> list[dict]:
+                                    provenance=None, facts=None) -> list[dict]:
     """Expose only eligible choices independently witnessed on this decision PAGE."""
-    if not any(c.get('type') in {'radio', 'checkbox'} and _unanswered(page, c)
+    if not any(c.get('type') in {'radio', 'checkbox', 'button'} and _unanswered(page, c)
                for c in page['controls']):
         return []
     current, witness = await _observe_controls(session, page, site='bootstrap-native-readback')
@@ -4523,18 +4870,41 @@ async def _current_approved_choices(session, page: dict, pk: str,
         raise Gate('The same-job choice PAGE changed before model disclosure.')
     choices = []
     for item in current['controls']:
-        if (item.get('type') not in {'radio', 'checkbox'}
+        kind = item.get('type')
+        if (kind not in {'radio', 'checkbox', 'button'}
                 or item.get('disabled') or not _unanswered(current, item)):
             continue
-        if (item['type'] == 'radio'
-                and _radio_group(current, item)[0] is not item):
+        if kind == 'button':
+            if not isinstance(session, _ReversibleEntryReader):
+                continue
+            try:
+                if _boolean_pair(current, item)[0] is not item:
+                    continue
+            except Gate:
+                continue
+        if kind == 'radio':
+            try:
+                if _radio_group(current, item)[0] is not item:
+                    continue
+            except Gate:
+                if isinstance(session, _ReversibleEntryReader):
+                    continue  # The later owner gate returns a typed group defect.
+                raise
+        reversible_scope = (_execute_reversible_scope(
+            session, current, witness, item, pk, facts or {},
+            provenance=provenance, fixture_context=fixture_context)
+            if isinstance(session, _ReversibleEntryReader) else None)
+        if isinstance(session, _ReversibleEntryReader) and reversible_scope is None:
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
-            provenance=provenance)
-        approved = _approved_native_choice(
+            provenance=provenance, reversible_scope=reversible_scope)
+        approved = (_approved_boolean_pair(
             current, item, pk, provenance=provenance,
-            fixture_context=fixture_context)
+            fixture_context=fixture_context) if kind == 'button' else
+            _approved_native_choice(
+                current, item, pk, provenance=provenance,
+                fixture_context=fixture_context))
         if approved is None:
             continue
         answer, selected = approved
@@ -4546,13 +4916,18 @@ async def _current_approved_choices(session, page: dict, pk: str,
             'form_selector': question['form_selector'],
             'form_action': question['form_action'],
         }
-        if item['type'] == 'radio':
+        if kind == 'radio':
             entry.update(radio_name=question['radio_name'],
                          radio_members=question['radio_members'],
                          approved_answer={
                              'selector': selected['selector'],
                              'caption': selected['label'],
                              'value': selected['value']})
+        elif kind == 'button':
+            entry['boolean_members'] = question['boolean_members']
+            entry['approved_answer'] = {
+                'selector': selected['selector'], 'caption': selected['label'],
+                'value': selected['label'].casefold()}
         else:
             entry['approved_answer'] = {
                 'selector': selected['selector'], 'value': 'yes', 'checked': True}
@@ -4595,7 +4970,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
     closed_material = _closed_material_combobox(target)
     question = _disclosure_question(
         observed, target, witness, job_url or observed['url'],
-        closed_witness=closed_material, provenance=provenance)
+        closed_witness=closed_material, provenance=provenance,
+        reversible_scope=_execute_reversible_scope(
+            session, observed, witness, target, pk, facts,
+            provenance=provenance, fixture_context=ctx))
     question['pk'] = pk
     key = action.get('fact', '')
     if _material_form_choice(target):
@@ -4810,6 +5188,7 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
                 'formaction_attr_present', 'formaction_raw', 'href',
                 'submit', 'navigates', 'commits_application'))):
         return None
+    _reversible_entry_recipient(page, target, witness)
     selector = target.get('selector')
     observed = witness.get(selector)
     if (not isinstance(selector, str) or not selector
@@ -4826,6 +5205,22 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
     grant = grants.get(key) if isinstance(grants, dict) else None
     fact_key = _fact_key(facts, key)
     value = str(facts[fact_key]).strip() if fact_key is not None else ''
+    if isinstance(grant, dict) and grant.get('source') in (None, 'owner'):
+        # Direct owner replies, unlike bank data, already authorize this exact
+        # row and receiver. Recheck their full stored identity before any IPC.
+        approved = grant.get('value')
+        if not isinstance(approved, str) or not approved.strip():
+            return None
+        if (not (_material_form_choice(target)
+                 or target.get('type') in {'radio', 'checkbox', 'button'})
+                and (not value or approved != value)):
+            return None
+        try:
+            exact_approval(pk, key, approved, target=_bound_target(page, target),
+                           url=page['url'], fixture_context=fixture_context)
+        except Gate:
+            return None
+        return frozenset({selector})
     if (not isinstance(grant, dict) or grant.get('source') != 'bank-auto'
             or not value or grant.get('value') != value
             or grant.get('url') != page['url']
@@ -4889,7 +5284,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                        ctx=ctx, provenance=provenance)
     if verb in {'fill', 'select', 'choose'}:
         if verb == 'choose':
-            _require_native_choice(target)
+            _require_guarded_choice(page, target)
         else:
             _require_native_action(target, verb)
         observed, witness = await _execute_observe_controls(session, page)
@@ -4900,7 +5295,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             raise Gate('The same-job page or mapping changed before a field gate.')
         target = control(observed, action, 'execute-observe')
         if verb == 'choose':
-            _require_native_choice(target)
+            _require_guarded_choice(observed, target)
             if not _unanswered(observed, target):
                 raise Gate('Only required, unanswered native choices can be selected.')
         else:
@@ -4925,8 +5320,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # Missing safe answers still produce the original bound question.
             # Once granted, the model's fact is only a routing label.
             try:
-                approved = _approved_native_choice(
+                approved = (_approved_boolean_pair(
                     page, target, pk, provenance=provenance, fixture_context=ctx)
+                    if target.get('type') == 'button' else _approved_native_choice(
+                        page, target, pk, provenance=provenance, fixture_context=ctx))
             except Gate as exc:
                 if exc.reason == 'owner_question' and exc.form_question is None:
                     # Keep the independently observed question when the claim
@@ -4936,8 +5333,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 raise
             if approved is None:
                 raise Gate(gate_prompt, form_question=form_question,
-                           reason=_missing_answer_reason(target) if _unanswered(page, target)
-                           else 'unknown_field')
+                           reason=('owner_question' if target.get('type') == 'button'
+                                   else _missing_answer_reason(target))
+                           if _unanswered(page, target) else 'unknown_field')
             if (not isinstance(key, str)
                     or key not in {form_question['label'],
                                    _fact_key(facts, form_question['label'])}):
@@ -4987,6 +5385,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
                 guarded_value(target, value)
                 write_value = target.get('value') or target['label']
+            elif target['type'] == 'button':
+                members = _boolean_pair(page, target)
+                chosen = [c for c in members if _same(value, c['label'])]
+                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
+                    raise Gate('Selected Boolean member differs from the owner answer.',
+                               reason='defect_button')
+                guarded_value(target, value)
+                write_value = target['label'].casefold()
             else:
                 members = _radio_group(page, target)
                 chosen = [c for c in members
@@ -5010,7 +5416,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         latest, latest_witness = await _execute_observe_controls(session, page)
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
-            _require_native_choice(current)
+            _require_guarded_choice(latest, current)
             if not _unanswered(latest, current):
                 raise Gate('The required choice is no longer unanswered.')
         else:
@@ -5031,8 +5437,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
         if verb == 'choose':
-            fresh_choice = _approved_native_choice(
+            fresh_choice = (_approved_boolean_pair(
                 latest, current, pk, provenance=provenance, fixture_context=ctx)
+                if current.get('type') == 'button' else _approved_native_choice(
+                    latest, current, pk, provenance=provenance, fixture_context=ctx))
             if (fresh_choice is None or fresh_choice[0] != value
                     or fresh_choice[1]['selector'] != current['selector']):
                 raise Gate('The exact native choice grant changed before a browser write.')
@@ -5051,6 +5459,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if current['type'] == 'checkbox':
                 if not _same(value, 'yes'):
                     raise Gate('Checkbox grant no longer contains an explicit owner yes.')
+            elif current['type'] == 'button':
+                matches = [c for c in _boolean_pair(latest, current)
+                           if _same(value, c['label'])]
+                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
+                    raise Gate('The bound Boolean answer no longer matches this member.',
+                               reason='defect_button')
             else:
                 matches = [c for c in _radio_group(latest, current)
                            if (_same(value, c['label'])
@@ -5064,7 +5478,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             actual = control(readback, action, 'execute-readback')
             if actual.get('value') != write_value or not actual.get('has_value'):
                 raise Gate('The approved structural field value did not read back exactly.')
-            exact_approval(pk, form_question['label'], write_value, target=_bound_target(readback, actual),
+            # The DOM readback uses the machine value (e.g. "remote"), while
+            # the row grant binds the owner's answer (e.g. "Remote").
+            exact_approval(pk, form_question['label'], value, target=_bound_target(readback, actual),
                            url=readback['url'], provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
         if current.get('type') == 'tel':
@@ -5538,7 +5954,8 @@ class ApplicationIPCController:
             fresh, witness, current, self.pk, self.facts, controller=self,
             origin=self.url, fixture_context=self.fixture_context)
         if scope is None:
-            raise Gate('An exact human-approved reversible receiver is required.')
+            raise Gate('An exact human-approved reversible receiver is required.',
+                       reason='defect_receiver')
         _disclosure_question(
             fresh, current, witness, self.url, reversible_scope=scope)
         return fresh, current
@@ -5617,8 +6034,8 @@ class ApplicationIPCController:
         for field in page.get('controls', []):
             if field.get('files'):
                 return True
-            if field.get('type') in {'text', 'email', 'tel', 'textarea', 'combobox',
-                                     'select', 'radio', 'checkbox'}:
+            if field.get('type') in (_TEXT_TYPES | {'textarea', 'combobox',
+                                                 'select', 'radio', 'checkbox'}):
                 if field.get('has_value') or field.get('checked'):
                     return True
                 combo = field.get('combobox') or {}
@@ -5699,7 +6116,7 @@ class ApplicationIPCController:
                     or target.get('commits_application')):
                 raise Gate('A submission-capable data receiver is not reversible preparation.')
             if op == 'fill' and target.get('type') not in {
-                    'text', 'email', 'tel', 'textarea', 'combobox'}:
+                    'text', 'email', 'tel', 'date', 'textarea', 'combobox'}:
                 raise Gate('A non-text receiver cannot be filled.')
             if (_formless_root(page) and not _formless_root(page).get('root')
                     and self._row().get('ats') in _APPLICATION_ENTRY):
@@ -5752,10 +6169,27 @@ class ApplicationIPCController:
             self.mark_click_started()
             return
         if target.get('type') in {'radio', 'checkbox'}:
+            if (_formless_root(page) and not _formless_root(page).get('root')
+                    and self._row().get('ats') in _APPLICATION_ENTRY):
+                page, target = await self._reversible_receiver(session, page, target)
             approved = _approved_native_choice(page, target, self.pk,
                                                fixture_context=self.fixture_context)
             if not approved or approved[1].get('selector') != selector:
                 raise Gate('The clicked radio/checkbox is not the exact approved answer.')
+            return
+        if (target.get('tag') == 'button' and target.get('type') == 'button'
+                and str(target.get('label') or '').casefold() in {'yes', 'no'}
+                and _formless_root(page) and not _formless_root(page).get('root')
+                and self._row().get('ats') == 'ashby'):
+            page, target = await self._reversible_receiver(session, page, target)
+            if not _unanswered(page, target):
+                raise Gate('The Boolean answer has already been selected.',
+                           reason='defect_button')
+            approved = _approved_boolean_pair(page, target, self.pk,
+                                              fixture_context=self.fixture_context)
+            if not approved or approved[1].get('selector') != selector:
+                raise Gate('The clicked Boolean is not the witnessed owner choice.',
+                           reason='defect_button')
             return
         if target.get('type') == 'combobox':
             # The preceding sole commit classification owns submit/form overrides.
@@ -5820,7 +6254,9 @@ class ApplicationIPCController:
                         or target.get('submit') is True
                         or bool(re.search(r'\bsubmit(?: application)?\b|send application|'
                                           r'finish application|complete application', text, re.I)))
-        if known_submit or self._private_content(page):
+        if (known_submit or self._private_content(page)
+                or any(r.get('action') == 'choose' and r.get('type') == 'button'
+                       for r in self.history)):
             await self.authorize_final_submit(session, page, target)
             self.committed = True
             self.mark_click_started()
@@ -6198,7 +6634,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     # Decision-only choice data comes from a fresh independent PAGE witness.
                     choices = await _current_approved_choices(
                         session, page, pk, *trusted_origins, provenance=provenance,
-                        fixture_context=ctx)
+                        fixture_context=ctx, facts=facts)
                     model_page = {**page, 'approved_choices': choices}
                     if (isinstance(session, _EntrySession)
                             and isinstance(provenance, ApplicationEntryProvenance)
@@ -6214,6 +6650,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     model_page = _guard_model_page(
                         model_page, pk, company, fixture_context=ctx)
                     model_page, model_history = _model_projection(model_page, history)
+                    # Independent choices and posting danger checks outrank
+                    # a new owner question, including on the reversible fallback.
+                    if (isinstance(session, _ReversibleEntryReader)
+                            or (producer_guard is not None
+                                and producer_guard.upload_completed)):
+                        if isinstance(session, _ReversibleEntryReader):
+                            _entry_safety(page, allowed, provenance)
+                        if _required_owner_gate_admitted(page, provenance):
+                            pending = await _required_owner_gate(
+                                session, page, pk, *trusted_origins,
+                                provenance=provenance, fixture_context=ctx)
+                            if pending is not None:
+                                raise pending
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, model_history, model=model)
                     verb = action.get('action')
@@ -6243,6 +6692,21 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     if verb == 'gate':
+                        # An unguarded producer cannot bind a controller question
+                        # from untrusted model prose; keep the model gate unbound.
+                        if producer_guard is None and ctx is None:
+                            raise Gate(str(action.get('question') or 'This form needs your input.'))
+                        # Newly hydrated controls also need the original root
+                        # and entry safety checks before replacing model prose.
+                        fresh = await session.page()
+                        if isinstance(session, _ReversibleEntryReader):
+                            _entry_safety(fresh, allowed, provenance)
+                        if _required_owner_gate_admitted(fresh, provenance):
+                            pending = await _required_owner_gate(
+                                session, fresh, pk, *trusted_origins,
+                                provenance=provenance, fixture_context=ctx)
+                            if pending is not None:
+                                raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
                     if verb == 'finish':
                         raise Gate('The application has not been submitted; review the form.')
@@ -6382,9 +6846,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 else _control_gate_handoff(exc, step) if isinstance(exc, ControlGate)
                 else handoff(str(exc), step,
                              captcha_artifact=isinstance(exc, CaptchaArtifactGate)))
-            hard = (isinstance(exc, CaptchaGate)
-                    or exc.reason in {'defect_tenant', 'defect_provenance',
-                                      'posting_guard_review_required'})
+            hard = (isinstance(exc, CaptchaGate) or exc.reason.startswith('defect_')
+                    or exc.reason == 'posting_guard_review_required')
             route = ('owner' if exc.reason == 'owner_question'
                      else 'hard_refusal' if hard else 'agent_unavailable')
             if route == 'agent_unavailable':

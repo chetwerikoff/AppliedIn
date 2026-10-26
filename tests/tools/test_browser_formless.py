@@ -2376,6 +2376,12 @@ def _issue184_add_name_phone_controls(raw):
         first = next(c for c in snapshot['controls']
                      if c['selector'] == '#_systemfield_name')
         first.update(label='First Name', question='')
+        # Bank grants now require the independent application-recipient census.
+        # These synthetic extra fields belong to the same witnessed container;
+        # PAGE-only appended fields would be intentionally unauthorized.
+        original = next(e for e in snapshot['entry']['root_evidence']
+                        if e['selector'] == '#_systemfield_name')
+        original.update(label='First Name')
         for selector, caption, kind in (
                 ('#synthetic-last', 'Last Name', 'text'),
                 ('#synthetic-phone', 'Phone', 'tel')):
@@ -2384,6 +2390,14 @@ def _issue184_add_name_phone_controls(raw):
                          name=selector[1:], label=caption, question='',
                          tag='input', type=kind, native_type=kind)
             snapshot['controls'].append(extra)
+            evidence = deepcopy(original)
+            evidence.update(selector=selector, id=selector[1:],
+                            label=caption, tag='input', type=kind,
+                            native_type=kind, associated=True, unique=True,
+                            inside=True, in_container=True,
+                            required=extra['required'],
+                            value=extra['value'], files=extra['files'])
+            snapshot['entry']['root_evidence'].append(evidence)
 
 
 async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
@@ -2909,12 +2923,21 @@ async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
         sibling.update(selector='#synthetic-radio-b', label='Option B',
                        value='choice-b')
         page['controls'].append(sibling)
-        # _key validates the group before disclosure; provide two independently
-        # identified synthetic members whose values cannot match the bank fact.
-        page['entry']['root_evidence'] = [
-            {'selector': member['selector'], 'in_container': True, 'associated': True}
-            for member in page['controls']
-        ]
+        # _key validates the group before disclosure. Keep the independently
+        # witnessed receiver identities complete and inside the application,
+        # while their option values deliberately do not match the bank fact.
+        root_member = next(e for e in page['entry']['root_evidence']
+                           if e['selector'] == '#_systemfield_name')
+        evidence = []
+        for member in page['controls']:
+            bound = deepcopy(root_member)
+            bound.update(selector=member['selector'], label=member['label'],
+                         tag='input', type='radio', native_type='radio',
+                         associated=True, in_container=True, inside=True,
+                         unique=True, required=member['required'],
+                         value=member['value'], files=member['files'])
+            evidence.append(bound)
+        page['entry']['root_evidence'] = evidence
         monkeypatch.setattr(forms, '_disclosure_question',
                             lambda *args, **kwargs: {'selector': target['selector']})
     elif case == 'already_granted':
@@ -3261,3 +3284,16 @@ async def test_issue194_existing_upload_gate_is_neither_logged_nor_retried(
     assert 'resume upload failure pk=' not in output
     assert [c for c in raw.calls if c[0] == 'upload'] == [
         ('upload', selector, '--file', 'Resume.pdf')]
+
+def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
+    """A newly owner-answerable date must not expand the prior GLOBAL grant scope."""
+    target = {
+        'selector': '#synthetic-date', 'tag': 'input', 'type': 'date',
+        'in_form': False, 'disabled': False, 'required': True,
+        'label': 'Start date', 'question': '', 'value': '', 'has_value': False,
+    }
+    assert forms._native_answer(target)
+    forms._require_native_action(target, 'fill')
+    assert not forms._bank_auto_eligible(
+        target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
+

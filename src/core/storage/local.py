@@ -299,7 +299,7 @@ class RedisTracking(AbstractTracking):
                         return False
                     previous = row.get("status")
                     row.update(patch)
-                    if not row.get("tailored_at"):
+                    if row["status"] == "tailored" and not row.get("tailored_at"):
                         from datetime import datetime
                         row["tailored_at"] = datetime.now(UTC).isoformat()
                     pipe.multi()

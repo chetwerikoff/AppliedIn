@@ -3249,9 +3249,12 @@ def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
         return []
     key = target.get('question') or target.get('label')
     own = {target.get('selector')}
-    if target.get('type') == 'button':
+    if target.get('type') in {'button', 'radio'}:
+        # One validated choice group is one logical receiver, not a twin.
         try:
-            own |= {m.get('selector') for m in _boolean_pair(page, target)}
+            own |= {m.get('selector') for m in (
+                _boolean_pair(page, target) if target['type'] == 'button'
+                else _radio_group(page, target))}
         except Gate:
             pass
     return [c for c in page.get('controls', [])
@@ -4844,8 +4847,9 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         # Ashby entry can carry one into a later root-proven page.
         ashby = (isinstance(provenance, ApplicationEntryProvenance)
                  and provenance.ats == 'ashby')
+        # A skipped field stays blank-relevant without a native required flag.
         blanks = [] if every or not ashby else [
-            c for c in page['controls'] if _unanswered(page, c)
+            c for c in page['controls'] if _unanswered(page, c, owner_all=True)
             and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
         if not blanks:
             return None
@@ -4995,7 +4999,7 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         for item in current['controls']:
             if (item.get('type') in {'file', 'hidden', 'password', 'submit', 'image'}
                     or native_submit(item)
-                    or not _unanswered(current, item)
+                    or not _unanswered(current, item, owner_all=True)
                     or not _skipped_label(row, item)):
                 continue
             question = _disclosure_question(
@@ -7145,9 +7149,8 @@ class _WaitDiagnostics:
         self.state[key] = _UNKNOWN if value is None else ('true' if value else 'false')
 
     def sample(self, deadline_remaining: bool) -> None:
-        stable = self.state['pair.stable']
+        # pair.stable too: only this sample's own completed pair may set it.
         self.state = dict.fromkeys(WAIT_PREDICATES, _UNKNOWN)
-        self.state['pair.stable'] = stable
         self.set('deadline.remaining', deadline_remaining)
 
     def page(self, page) -> None:
@@ -7222,8 +7225,8 @@ class _WaitDiagnostics:
             return exc
         if phase == 'safety' or (phase == 'page' and classified):
             self.safety_failed(page or {}, exc)
-        elif phase == 'witness':
-            self.witness(False)
+        # A witness-phase Gate returned no complete witness to compare, so
+        # its availability and agreement stay unknown rather than "false".
         return self.attach(exc, 'wait')
 
     def render(self) -> str:

@@ -327,3 +327,56 @@ def test_skip_records_clear_on_root_gate_and_on_regeneration_of_that_question(wo
     assert run._owner_skip_retention(PK, stores, None) == {"owner_gate_skips": {}}
     assert identity == forms.owner_question_identity(PK, _question())
     assert json.dumps(skipped)  # plain, storable record
+
+
+def _checkbox(stores):
+    return _gate(stores, _question(
+        type="checkbox", label="Synthetic acknowledgement", question="Synthetic acknowledgement",
+        control_label="Synthetic acknowledgement", visible_text="Synthetic acknowledgement",
+        requiredness="required"))
+
+
+@pytest.mark.parametrize("winner", ["yes", "no"])
+def test_checkbox_yes_and_no_for_one_generation_have_one_winner(world, winner):
+    stores, queue = world
+    row = _checkbox(stores)
+    tokens = _tokens(row)
+    loser = "no" if winner == "yes" else "yes"
+    first = run.resume_job(PK, winner, stores, disposition="answer", **tokens)
+    won = deepcopy(stores.tracking.get(PK))
+    second = run.resume_job(PK, loser, stores, disposition="answer", **tokens)
+    assert first["result"] == ("queued" if winner == "yes" else "gated")
+    assert second["result"] == "gated" and second["reason"] == "invalid_answer"
+    # The losing reply leaves the winner's row exactly as it committed.
+    assert stores.tracking.get(PK) == won
+    if winner == "yes":
+        assert won["status"] == "tailored" and _queued(queue) == [PK]
+        assert "Synthetic acknowledgement" in won["human_approved_answers"]
+    else:
+        assert first["reason"] == "cannot_proceed"
+        assert won["status"] == "needs_human" and won["gate_reason"] == "cannot_proceed"
+        assert won["gate_call_id"] is None and won["gate_disposition"]["kind"] == "refuse"
+        assert "human_approved_answers" not in won and _queued(queue) == []
+    assert stores.answer_bank.puts == []
+
+
+def test_checkbox_no_that_loses_the_consume_has_no_row_effect(world, monkeypatch):
+    stores, queue = world
+    row = _checkbox(stores)
+    tokens = _tokens(row)
+    original = stores.tracking.consume_direct_form_gate
+
+    def racing(pk, **kwargs):
+        # A competing "yes" commits after this "no" passed validation.
+        assert original(pk, expected_pending=kwargs["expected_pending"],
+                        disposition={**kwargs["disposition"], "kind": "answer"},
+                        grant=("Synthetic acknowledgement", {"value": "yes"}))
+        return original(pk, **kwargs)
+
+    monkeypatch.setattr(stores.tracking, "consume_direct_form_gate", racing)
+    won_status = []
+    result = run.resume_job(PK, "no", stores, disposition="answer", **tokens)
+    after = stores.tracking.get(PK)
+    assert result["reason"] == "invalid_answer", won_status
+    assert after["status"] == "tailored" and after["gate_disposition"]["kind"] == "answer"
+    assert after["human_approved_answers"] == {"Synthetic acknowledgement": {"value": "yes"}}

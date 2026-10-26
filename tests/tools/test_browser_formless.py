@@ -3344,3 +3344,56 @@ async def test_rooted_untyped_yes_no_pair_refuses_unproven_requiredness(monkeypa
     # Without the group the same root-proven form still qualifies.
     _, plain, _, provenance = root_world(monkeypatch)
     assert forms._formless_boundary(plain.current, provenance)
+
+
+@pytest.mark.asyncio
+async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_rooted(
+        monkeypatch, tmp_path):
+    """Issue #202 AC2: a SKIP taken while requiredness was unknown is not an
+    OPTIONAL answer. Once the root is proven, the still-blank field is asked
+    again even though it carries no native required flag, before the final
+    Submit decision and with no write to that field."""
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 2)
+    row, raw, decide, _ = root_world(monkeypatch)
+    extra = next(c for c in raw.current['controls'] if c['label'] == 'Additional information')
+    assert extra['required'] is False and not extra.get('has_value')
+    row['owner_gate_skips'] = {'q1_synthetic': {
+        'identity': 'q1_synthetic', 'route': 'ashby-sibling-mismatch', 'kind': 'textarea',
+        'label': 'Additional information', 'generation': 'synthetic-generation'}}
+    # Name/Email carry exact owner grants, so only the skipped field is left.
+    row['human_approved_answers'] = {}
+    for c in raw.current['controls']:
+        value = {'text': 'Synthetic Name', 'email': 'synthetic@example.com'}.get(c['type'])
+        if value:
+            t = forms._bound_target(raw.current, c)
+            row['human_approved_answers'][forms._key(raw.current, c)] = {
+                'value': value, 'url': raw.current['url'],
+                **{k: t.get(k, '' if k == 'question' else None) for k in (
+                    'selector', 'label', 'question', 'tag', 'type',
+                    'form_selector', 'form_action')}}
+    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    file = next(c for c in raw.current['controls']
+                if c['type'] == 'file' and c['label'] == 'Resume')
+    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
+    original_call = raw.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            raw.calls.append((method, *args))
+            name = Path(args[2]).name
+            raw.current, raw.fixed = observed(attached=True, files=[name], displayName=name)
+            return {}
+        return await original_call(method, *args, **kwargs)
+    raw.call = call
+    decide.side_effect = [dict(action='upload', selector=file['selector']),
+                          dict(action='submit', selector=button['selector'])]
+    facts = {'Name': 'Synthetic Name', 'Email': 'synthetic@example.com'}
+    result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert result['reason'] == 'owner_question', (row.get('status'), result['question'][:200])
+    assert result['form_question']['selector'] == extra['selector']
+    assert decide.await_count == 1  # asked before the Submit decision
+    assert not [c for c in raw.calls if extra['selector'] in c[1:2]]
+    assert not [c for c in raw.calls if c[0] == 'click']
+    assert not transport._application_controller.committed

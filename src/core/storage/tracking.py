@@ -241,10 +241,11 @@ class TrackingStore(AbstractTracking):
             names[name] = field
             values[token] = value
             sets.append(f"{name} = {token}")
-        names["#date"] = "tailored_at"
-        from datetime import datetime, timezone
-        values[":date"] = datetime.now(timezone.utc).isoformat()
-        sets.append("#date = if_not_exists(#date, :date)")
+        if patch["status"] == "tailored":
+            names["#date"] = "tailored_at"
+            from datetime import datetime, timezone
+            values[":date"] = datetime.now(timezone.utc).isoformat()
+            sets.append("#date = if_not_exists(#date, :date)")
         try:
             self._table.update_item(
                 Key={"pk": pk}, UpdateExpression="SET " + ", ".join(sets),

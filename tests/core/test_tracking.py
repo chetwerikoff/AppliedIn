@@ -1264,3 +1264,22 @@ def test_dynamo_consume_storage_fault_propagates(aws, monkeypatch):
         store.consume_direct_form_gate(
             job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
             skip=_skip_record(row))
+
+
+def test_direct_gate_refusal_spends_the_gate_into_an_unbound_terminal_question(repair_backend):
+    store = repair_backend
+    job, row = _gate_seed(store)
+    refuse = {**_answer(row), "kind": "refuse", "detail": "Synthetic cannot proceed"}
+    assert store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=refuse)
+    after = store.get(job.pk)
+    assert after["status"] == "needs_human" and after["gate_reason"] == "cannot_proceed"
+    assert after["gate_pending"] == {"question": "Synthetic cannot proceed",
+                                     "form_question": None}
+    assert after["gate_call_id"] is None and after["gate_disposition"]["kind"] == "refuse"
+    assert "human_approved_answers" not in after and not after.get("tailored_at")
+    # A refusal carries no grant, and a spent gate admits no later answer.
+    assert not store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_answer(row),
+        grant=("Synthetic display name", {"value": "synthetic"}))
+    assert store.get(job.pk) == after

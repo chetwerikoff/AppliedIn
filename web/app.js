@@ -364,10 +364,13 @@ function resumeBody(pk, act, value) {
 }
 const STALE_OWNER_GATE = "This question is out of date. It is asked again on the next pass.";
 // The resume endpoint only accepts work; the row itself shows the outcome.
-function sendResume(pk, body) {
+// "Sent" is shown only once the request was accepted, never before.
+function sendResume(pk, body, accepted) {
   return post(`/actions/resume/${encodeURIComponent(pk)}`, body).then((d) => {
-    if (d && d.ok === false) toast(d.error === "invalid_answer"
+    // post() already reported a network failure (null) in its own toast.
+    if (d && (d.ok === false || d.error)) toast(d.error === "invalid_answer"
       ? "That reply was refused. Refresh and answer the current question." : (d.error || "Refused."));
+    else if (d && accepted) toast(accepted);
     loadApps();
     loadQueue();
     return d;
@@ -4491,8 +4494,8 @@ function paneAction(act, pk, el) {
     // Reload the rows and queue once the reply lands, so the card shows its real
     // outcome. The immediate response only means "accepted for processing".
     markBusy(pk, "sending…");
-    sendResume(pk, body);
-    toast(act === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
+    toast("Sending…");
+    sendResume(pk, body, act === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
   } else if (act === "queue-apply") {
     markBusy(pk, "queued…");
     post(`/actions/queue-apply/${encodeURIComponent(pk)}`).then(() => loadQueue());
@@ -6858,8 +6861,8 @@ function wire() {
       const body = resumeBody(pk, kind, $("#gate-answer")?.value);
       if (body === null) { toast("Enter an answer to the verified question before continuing."); return; }
       if (body === "stale") { toast(STALE_OWNER_GATE); return; }
-      sendResume(pk, body);
-      toast(kind === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
+      toast("Sending…");
+      sendResume(pk, body, kind === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
     } else if (kind === "retailor") {
       const note = ($("#rt-note")?.value || "").trim();
       rtBegin(pk);

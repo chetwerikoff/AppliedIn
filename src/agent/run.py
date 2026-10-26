@@ -1290,7 +1290,8 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
 
 def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
                          grant: tuple[str, dict] | None = None,
-                         bank: tuple | None = None) -> dict:
+                         bank: tuple | None = None,
+                         refusal: str | None = None) -> dict:
     """Spend the exact pending gate, then (winner only) bank and continue.
 
     The atomic commit moves the row to ``tailored`` with the gate cleared, so a
@@ -1301,9 +1302,10 @@ def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
     pending = row['gate_pending']
     observed = pending['form_question']
     identity = owner_question_identity(pk, observed)
-    disposition = {'kind': 'skip' if skip else 'answer', 'identity': identity,
-                   'generation': pending['generation'],
-                   'at': datetime.now(UTC).isoformat()}
+    disposition = {'kind': 'skip' if skip else 'refuse' if refusal else 'answer',
+                   'identity': identity, 'generation': pending['generation'],
+                   'at': datetime.now(UTC).isoformat(),
+                   **({'detail': refusal} if refusal else {})}
     record = None
     if skip:
         record = (identity, {'identity': identity, 'route': observed.get('route'),
@@ -1316,6 +1318,8 @@ def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
         return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                 'detail': 'This owner question was already answered or changed; '
                           'refresh and answer the current question.'}
+    if refusal:
+        return {'result': 'gated', 'pk': pk, 'reason': 'cannot_proceed', 'detail': refusal}
     if bank is not None:
         label, answer, scope, company = bank
         stores.answer_bank.put(label, answer, scope, company=company, source="dashboard")
@@ -1470,12 +1474,7 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
                 if normalized == 'no':
                     detail = ('Cannot proceed with this application without the required '
                               'acknowledgement: ' + observed['control_label'])
-                    stores.tracking.set_status(
-                        pk, Status.NEEDS_HUMAN, gate_reason='cannot_proceed',
-                        gate_pending={'question': detail, 'form_question': None},
-                        gate_call_id=None)
-                    return {'result': 'gated', 'pk': pk,
-                            'reason': 'cannot_proceed', 'detail': detail}
+                    return _consume_direct_gate(pk, row, stores, refusal=detail)
                 if normalized != 'yes':
                     return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                             'detail': 'Answer yes or no for the exact checkbox question.'}

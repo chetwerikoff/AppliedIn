@@ -731,3 +731,31 @@ test('legacy approval keeps its request shape and cannot SKIP', async () => {
   assert.deepEqual(h.context.sent.map((s) => JSON.parse(JSON.stringify(s.body))),
     [{answer: 'approved'}, {answer: 'approved'}]);
 });
+
+test('an owner reply says Sent only after the request was accepted', async () => {
+  const h = harness();
+  vm.runInContext(`
+    globalThis.toasts = []; toast = (m) => globalThis.toasts.push(m);
+    loadApps = () => {}; loadQueue = () => {};
+    globalThis.replies = []; post = () => Promise.resolve(globalThis.replies.shift());`, h.context);
+  const send = h.fn('sendResume');
+  const toasts = () => JSON.parse(vm.runInContext(
+    'JSON.stringify(globalThis.toasts.splice(0))', h.context));
+  const reply = (d) => vm.runInContext(`globalThis.replies.push(${JSON.stringify(d)})`, h.context);
+  reply({ ok: true, status: 'resuming' });
+  const pending = send('pk-1', {}, 'Sent — checking the result.');
+  assert.deepEqual(toasts(), [], 'nothing claims Sent before the response');
+  await pending;
+  assert.deepEqual(toasts(), ['Sent — checking the result.']);
+  for (const refused of [{ ok: false, error: 'invalid_answer' }, { error: 'The server returned 500.' }]) {
+    reply(refused);
+    await send('pk-1', {}, 'Sent — checking the result.');
+    const shown = toasts();
+    assert.equal(shown.length, 1);
+    assert.ok(!shown[0].startsWith('Sent'), shown[0]);
+  }
+  // A network failure (post() resolves null after its own toast) is never Sent.
+  reply(null);
+  await send('pk-1', {}, 'Sent — checking the result.');
+  assert.deepEqual(toasts(), []);
+});

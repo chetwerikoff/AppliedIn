@@ -2176,7 +2176,10 @@ async def test_wait_witness_escape_keeps_its_message_with_the_same_map(monkeypat
     state = _wait_map(report['question'])
     assert state['read.page_available'] == 'true'
     assert state['read.origin_allowed'] == 'true'
-    assert (state['witness.available'], state['witness.agrees']) == ('true', 'false')
+    # The Gate returned no complete witness: nothing was compared, so neither
+    # availability nor agreement is reported as an observed "false".
+    assert (state['witness.available'], state['witness.agrees']) == (
+        'unknown/unavailable', 'unknown/unavailable')
     assert state['pair.stable'] == 'unknown/unavailable'
     assert _logged_map(caplog) == state
     assert not decide.await_count
@@ -2215,3 +2218,19 @@ async def test_wait_unknown_frame_captcha_exit_keeps_reason_and_frame_failure(
     assert _logged_map(caplog) == state
     assert not decide.await_count
     no_mutations(session)
+
+
+def test_wait_unstable_pair_never_survives_into_a_later_failed_sample():
+    diagnostics = forms._WaitDiagnostics()
+    diagnostics.sample(True)
+    diagnostics.set('pair.stable', False)
+    assert diagnostics.state['pair.stable'] == 'false'
+    # The next bounded sample loses PAGE before any fresh pair exists.
+    diagnostics.sample(True)
+    diagnostics.read_failed('page')
+    assert diagnostics.state['pair.stable'] == 'unknown/unavailable'
+    assert diagnostics.state['read.page_available'] == 'false'
+    # Same for a deadline exit that ran no comparison in its own sample.
+    diagnostics.set('pair.stable', True)
+    diagnostics.sample(False)
+    assert diagnostics.state['pair.stable'] == 'unknown/unavailable'

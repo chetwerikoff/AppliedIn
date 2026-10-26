@@ -249,8 +249,10 @@ def direct_gate_patch(current: dict | None, expected_pending: dict, disposition:
             or not expected_pending["generation"]
             or not isinstance(expected_pending.get("form_question"), dict)
             or (grant is not None and skip is not None)
-            or disposition.get("kind") not in {"answer", "skip"}
-            or (disposition["kind"] == "skip") != (skip is not None)):
+            or disposition.get("kind") not in {"answer", "skip", "refuse"}
+            or (disposition["kind"] == "skip") != (skip is not None)
+            or (disposition["kind"] == "refuse"
+                and (grant is not None or not isinstance(disposition.get("detail"), str)))):
         return None
     if (current.get("status") != Status.NEEDS_HUMAN.value
             or current.get("gate_call_id") != "direct"
@@ -259,6 +261,12 @@ def direct_gate_patch(current: dict | None, expected_pending: dict, disposition:
             or current.get("confirmation_id")
             or current.get("possible_submission") is True):
         return None
+    if disposition["kind"] == "refuse":
+        # An owner "no" to a required acknowledgement spends the same gate, but
+        # leaves an unbound terminal question instead of a continuation.
+        return {"status": Status.NEEDS_HUMAN.value, "gate_reason": "cannot_proceed",
+                "gate_pending": {"question": disposition["detail"], "form_question": None},
+                "gate_call_id": None, "gate_disposition": disposition}
     patch: dict = {
         "status": Status.TAILORED.value, "gate_pending": {}, "gate_call_id": None,
         "gate_source": None, "gate_reason": "", "gate_disposition": disposition,
@@ -387,7 +395,8 @@ class AbstractTracking(ABC):
         ENTIRE original ``gate_pending`` (generation included), no confirmation
         and no durable submit hold may win. The same patch moves the row to
         ``tailored``, clears the gate and records the winner's disposition, its
-        one field grant or its one skip record. Missing rows and conditional
+        one field grant or its one skip record; a ``refuse`` disposition instead
+        leaves the row at an unbound ``cannot_proceed`` question. Missing rows and conditional
         conflicts return False; storage errors propagate.
         """
 

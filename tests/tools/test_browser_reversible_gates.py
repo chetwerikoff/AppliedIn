@@ -1084,3 +1084,89 @@ def test_location_toggle_shares_its_title_but_is_no_collision():
     assert forms._mismatch_question_twins(page, location) == []
     yes = _by_locator(page, _YES)
     assert forms._mismatch_question_twins(page, yes) == []
+
+
+def test_one_radio_group_is_one_receiver_but_two_groups_on_one_question_collide(
+        monkeypatch):
+    """Issue #202 AC7: members of one validated radio group are one logical
+    receiver; a second group sharing that question key still fails closed."""
+    monkeypatch.setattr(forms, '_owner_asks_every_receiver', lambda page: True)
+    monkeypatch.setattr(forms, '_formless_root', lambda page: {})
+
+    def radio(selector, name, value):
+        return dict(selector=selector, tag='input', type='radio', name=name,
+                    form_selector='#synthetic-form', form_action='', in_form=True,
+                    question='Synthetic choice', label=value.title(), value=value)
+
+    one = [radio('#a-yes', 'a', 'yes'), radio('#a-no', 'a', 'no')]
+    page = {'controls': one}
+    assert forms._mismatch_question_twins(page, one[0]) == []
+    assert forms._key(page, one[0]) == 'Synthetic choice'
+    other = [radio('#b-yes', 'b', 'yes'), radio('#b-no', 'b', 'no')]
+    page = {'controls': one + other}
+    assert {c['selector'] for c in forms._mismatch_question_twins(page, one[0])} == {
+        '#b-yes', '#b-no'}
+    with pytest.raises(forms.Gate) as refused:
+        forms._key(page, one[0])
+    assert refused.value.reason == 'defect_receiver'
+
+
+# Issue #202 r08 / ARCH19:48 AC8 bounds on the rootless sibling-mismatch route,
+# where final Submit always refuses. A reload replaces every element and the
+# id-less layout has no real non-positional discriminator, so an exact same
+# question and shape reuses the owner's grant; any changed caption or question
+# text voids it and re-asks. Same-key twins (two candidates) are covered by
+# test_same_question_key_entries_refuse_answer_skip_and_bank.
+
+# Swapped captions keep a proven Yes/No pair but change which member is "No".
+_CAPTION = ("group.children[0].setAttribute('text','No');"
+            "group.children[1].setAttribute('text','Yes');")
+_QUESTION = ("group.parentElement.children[0]"
+             ".setAttribute('text','Synthetic changed question');")
+
+
+async def _boolean_granted(row, endpoint, stores, pdf):
+    yes = _by_locator(endpoint.current, _YES)['selector']
+    facts = {}
+    while True:
+        gate = await _apply(pdf, dict(facts))
+        assert gate.get('reason') == 'owner_question', gate
+        q = gate['form_question']
+        kind = next(c['type'] for c in endpoint.current['controls']
+                    if c['selector'] == q['selector'])
+        answer = {'button': 'No', 'combobox': 'Remote'}.get(kind, 'Synthetic answer')
+        _answer(row, stores, gate, answer)
+        facts[q['label']] = answer
+        if q['selector'] == yes:
+            return facts, q
+        assert len(facts) < 12
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mutate', ['', _CAPTION, _QUESTION], ids=['same', 'captions', 'question'])
+async def test_rootless_grant_reuse_is_exact_shape_only_after_a_reload(
+        monkeypatch, tmp_path, mutate):
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    facts, asked = await _boolean_granted(row, endpoint, stores, pdf)
+    granted = deepcopy(row['human_approved_answers'][asked['label']])
+    # A fresh real-reader census: every element is new, coordinates unchanged.
+    endpoint.current, endpoint.fixed = _live_dom(mutate=mutate)
+    before = len(endpoint.calls)
+    gate = await _apply(pdf, dict(facts))
+    again = (gate.get('reason') == 'owner_question'
+             and gate['form_question']['selector'] in {
+                 _by_locator(endpoint.current, s)['selector'] for s in (_YES, _NO)})
+    if not mutate:
+        # Exact URL, question, tag, type and Boolean members: the same answer.
+        assert not again, gate
+    else:
+        # A changed caption or question voids the old grant: ask again.
+        assert again, gate
+        assert gate['form_question']['question'] != asked['question'] or [
+            m['caption'] for m in gate['form_question']['boolean_members']] != [
+            m['caption'] for m in granted['boolean_members']]
+        assert not [c for c in endpoint.calls[before:] if c[0] == 'click']
+    # The final Submit guard is never reached through a reused grant.
+    assert gate.get('status') == 'gate'
+    assert not [c for c in endpoint.calls if c[0] == 'click'
+                and c[1] == '#structural-submit']

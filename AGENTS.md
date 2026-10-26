@@ -325,9 +325,12 @@ invariants, the rules above or "The rule that outranks the rest" in `CLAUDE.md`.
   `CI / checks` on the exact PR head.
 - `upstream` (`sayantan94/AppliedIn`) is read-only: no Issues, PRs or pushes.
   Upstream sync is its own task: `./appliedin update` on a clean tree here.
-- Worktrees (`orca/workspaces/AppliedIn/`) never get `.local/`, `.env`,
-  `resume/*.tex` or `config/*.local.yaml`, never start a daemon, write the
-  owner's Redis or drive the application browser. Tests need none of them.
+- Worktrees (`orca/workspaces/AppliedIn/`) never get `.local/`,
+  `resume/*.tex` or `config/*.local.yaml`. Orca setup replaces one ignored,
+  disposable worktree `.env` with only `APPLIEDIN_WEB_PORT=<port>`; it never
+  copies the primary `.env`, credentials or operator settings. Worktrees never
+  start a daemon, write the owner's Redis or drive the application browser.
+  Tests use synthetic fixtures without owner data.
 - Live checks (daemon, owner's data, ChatGPT subscription, application browser)
   run only in this checkout, by the firefighter or the operator.
 - No agent submits, approves or queues a real application in a task, smoke or

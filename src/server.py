@@ -2970,7 +2970,7 @@ def create_app() -> FastAPI:
         """Freeze/unfreeze the worker + discovery without stopping the daemon."""
         from core import flags
         on = bool(body.get("paused"))
-        flags.set_flag("paused", "yes" if on else "no")
+        flags.set_manual_pause(on)
         # Pausing also means "and stop what is going right now". That is the half
         # the pause flag cannot express on its own, because a run already inside
         # a loop needs to know the Stop came AFTER it started — otherwise a board

@@ -1919,9 +1919,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         from core import flags
 
         _requeue_untouched(pk, stores)
-        if not flags.paused():
-            flags.set_flag("paused", "yes")
-            flags.set_flag("paused_reason", "the selected browser profile is disconnected")
+        if flags.auto_pause(releasable=_is_browser_skill_disconnect(reason)):
             log.warning("PAUSED applying: the browser extension is not connected")
         emit("gate", pk=pk, agent="applier", url=jd_url, detail=reason)
         return {"result": "requeued", "pk": pk, "reason": "extension_disconnected"}
@@ -1964,6 +1962,18 @@ def _clear_infra_failure(pk: str, stores: Any) -> dict:
     if kind in {"unknown", "failed"} and is_infrastructure(str(row.get("fail_reason") or "")):
         return {"fail_kind": "", "fail_reason": ""}
     return {}
+
+
+def _is_browser_skill_disconnect(reason: str) -> bool:
+    """Whether this disconnect came from BrowserSkill, judged by the error that
+    was returned and not by the configuration file, which is re-read on every
+    backend selection and can already name a different engine than the one that
+    ran. The legacy extension wording, a reason matching both, or anything else
+    is unknown origin: the pause is left to the owner and never auto-released."""
+    from tools import claude_chrome
+
+    return ((reason or "").startswith("BrowserSkill unavailable:")
+            and not claude_chrome.is_disconnected(reason))
 
 
 def _requeue_untouched(pk: str, stores: Any) -> None:

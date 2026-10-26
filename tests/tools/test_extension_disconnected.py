@@ -91,4 +91,4 @@ def test_the_apply_path_pauses_the_board_like_a_signed_out_cli():
     assert "is_disconnected(reason)" in src
     i, j = src.index("is_signed_out(reason)"), src.index("is_disconnected(reason)")
     assert abs(i - j) < 2500, "the two faults should be handled together"
-    assert 'flags.set_flag("paused_reason"' in src[j:j + 1500]
+    assert 'flags.auto_pause(' in src[j:j + 1500]

@@ -668,22 +668,9 @@ def _greenhouse_id_query_attempt(url: str) -> bool:
     This classifier only blocks attempts at the tenant-bearing query key;
     unrelated custom-careers query parameters stay on their ordinary route.
     """
-    from urllib.parse import unquote_plus
+    from discovery.canonical_job_url import claim_greenhouse_query
 
-    if not isinstance(url, str) or '?' not in url:
-        return False
-    query = url.partition('?')[2].partition('#')[0]
-    # Follow stacked escapes to a fixed point; nested query keys must not bypass
-    # the pre-browser tenant gate. A hostile over-depth query fails closed.
-    key_attempt = re.compile(r'(?i)(?:^|[&;=])gh_jid(?:=|[&;]|$)')
-    for _ in range(32):
-        if key_attempt.search(query):
-            return True
-        decoded = unquote_plus(query)
-        if decoded == query:
-            return False
-        query = decoded
-    return True
+    return claim_greenhouse_query(url)
 
 
 def _configured_alias(pk: str, company: str, url: str, *,

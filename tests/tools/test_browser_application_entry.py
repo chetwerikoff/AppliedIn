@@ -2238,37 +2238,45 @@ def test_wait_unstable_pair_never_survives_into_a_later_failed_sample():
 
 
 # main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
-# Hash the *entire* protected producer/consumer sources, excluding only the
-# pre-browser query-attempt classifier whose implementation #201 may change.
-# This covers nested _authorized, final Submit, source/board/job proof literals
-# and helpers, not just the named entry functions or decoded characters.
+# The four supporting files stay pinned whole. browser_skill_apply.py is pinned
+# per protected function (ARCH20:47 ruling D): the exact ast source segment of
+# each Submit, hidden-value and posting-safety function must keep its ffaa410
+# bytes, so other #202 owner-gate edits in that file do not trip the pin.
+# Re-pinning any of these needs ARCH approval.
 _ISSUE201_MAIN_SHA256 = {
-    "src/tools/browser_skill_apply.py": "fb5504e1a20439d994841a31001a1d67752c2f5553a1b7b71be2265d194e3223",
     "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
     "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
     "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
     "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
 }
 
+_ISSUE201_PROTECTED_FUNCTION_SHA256 = {
+    "is_submission": "c3fd3b93495139b1d45f1588082bc044d1440fa932cca855ec45c0db0f1d590a",
+    "native_submit": "1fd4c3e94009536eda5228945ca26796a6a380ea6a3823561f79879536f7574c",
+    "check_form": "a44b97d3c8906338737447f8c82594edc2ce2ada15d5afe76c73b99e5c93a247",
+    "check_form_destination": "64c47cf1d8891eb3cc2c97a670d8f8c80077dcb1fc722019f56770998aff893f",
+    "_submitter_texts": "df04be15cc339c2dcfef7bdb0878ea98ac43ea61daf02e4301e4bdf1e6dca79b",
+    "_greenhouse_safety": "4bead246accd2c97d6894d60d659993cac9669da9dee717825f22620329f1e38",
+    "ApplicationIPCController.authorize_final_submit": "daa7ef578abb064728e7e101e7df2185b333a2a5edb3779353ff6126188848e5",
+}
 
-def _issue201_without_prebrowser_classifier(source: bytes) -> bytes:
-    """Remove only the allowed top-level predicate; preserve all other bytes."""
-    lines = source.split(b"\n")
-    starts = [i for i, line in enumerate(lines)
-              if line.startswith(b"def _greenhouse_id_query_attempt(")]
-    assert len(starts) == 1
-    start = starts[0]
-    cursor = start + 1
-    while (cursor < len(lines)
-           and (not lines[cursor].strip()
-                or lines[cursor].startswith((b" ", b"\t")))):
-        cursor += 1
-    # No extra top-level helper/proof change may be hidden in the exception.
-    assert cursor < len(lines) and lines[cursor].startswith(b"def _configured_alias(")
-    end = cursor
-    while end > start + 1 and not lines[end - 1].strip():
-        end -= 1
-    return b"\n".join(lines[:start] + lines[end:])
+
+def _issue201_function_segments(source: str) -> dict[str, list[str]]:
+    """Every function/class source segment by qualified name, duplicates kept."""
+    import ast
+
+    found: dict[str, list[str]] = {}
+
+    def walk(body, prefix):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + node.name
+                found.setdefault(name, []).append(ast.get_source_segment(source, node))
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, name + ".")
+
+    walk(ast.parse(source).body, "")
+    return found
 
 
 def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
@@ -2277,11 +2285,15 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
 
     root = Path(__file__).resolve().parents[2]
     for filename, baseline in _ISSUE201_MAIN_SHA256.items():
-        source = (root / filename).read_bytes()
-        if filename == "src/tools/browser_skill_apply.py":
-            source = _issue201_without_prebrowser_classifier(source)
-        actual = hashlib.sha256(source).hexdigest()
+        actual = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         assert actual == baseline, (filename, actual, baseline)
+
+    source = (root / "src/tools/browser_skill_apply.py").read_text(encoding="utf-8")
+    segments = _issue201_function_segments(source)
+    for name, baseline in _ISSUE201_PROTECTED_FUNCTION_SHA256.items():
+        assert len(segments.get(name, [])) == 1, (name, "must be defined exactly once")
+        actual = hashlib.sha256(segments[name][0].encode("utf-8")).hexdigest()
+        assert actual == baseline, (name, actual, baseline)
 
 
 def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():

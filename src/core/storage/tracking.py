@@ -18,6 +18,7 @@ from .base import (
     legacy_repair_row_allowed, tenant_pin_row_allowed,
     tenant_pin_witness_fields, tenant_pin_same_witness,
     guard_observation_matches, guard_patch, _GUARD_COMPARE,
+    DIRECT_GATE_COMPARE, direct_gate_patch,
     canonical_repair_row_allowed, canonical_repair_same_witness,
     canonical_repair_witness_fields, canonical_repair_patch,
 )
@@ -203,6 +204,53 @@ class TrackingStore(AbstractTracking):
             self._table.update_item(
                 Key={"pk": pk},
                 UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def consume_direct_form_gate(
+        self, pk: str, *, expected_pending: dict, disposition: dict,
+        grant: tuple[str, dict] | None = None,
+        skip: tuple[str, dict] | None = None,
+    ) -> bool:
+        """One conditional partial UpdateItem pinned to the consistent read.
+
+        Every compared attribute must still hold its read value (or still be
+        absent), so the merged grant/skip map cannot drop a concurrent write.
+        """
+        current = self.get_current(pk)
+        patch = direct_gate_patch(current, expected_pending, disposition, grant, skip)
+        if patch is None:
+            return False
+        names, values, conditions = {"#pk": "pk"}, {}, ["attribute_exists(#pk)"]
+        for i, field in enumerate(DIRECT_GATE_COMPARE):
+            name, token = f"#c{i}", f":c{i}"
+            names[name] = field
+            if field in current:
+                values[token] = current[field]
+                conditions.append(f"{name} = {token}")
+            else:
+                conditions.append(f"attribute_not_exists({name})")
+        sets = []
+        for i, (field, value) in enumerate(patch.items()):
+            name, token = f"#u{i}", f":u{i}"
+            names[name] = field
+            values[token] = value
+            sets.append(f"{name} = {token}")
+        if patch["status"] == "tailored":
+            names["#date"] = "tailored_at"
+            from datetime import datetime, timezone
+            values[":date"] = datetime.now(timezone.utc).isoformat()
+            sets.append("#date = if_not_exists(#date, :date)")
+        try:
+            self._table.update_item(
+                Key={"pk": pk}, UpdateExpression="SET " + ", ".join(sets),
                 ConditionExpression=" AND ".join(conditions),
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,

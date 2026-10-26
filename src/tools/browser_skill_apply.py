@@ -1952,6 +1952,11 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             continue
         if not c.get('in_container'):
             raise Gate('candidate control outside application container; inspect manually.')
+        if c.get('boolean_group') is not False:
+            # Issue #202: a rooted Ashby Yes/No has no readable requiredness and
+            # check_form skips buttons, so admitting it would let an unanswered
+            # (or unknown-requiredness) pair pass the final decision silently.
+            raise Gate('unproven rooted Yes/No requiredness; inspect the application manually.')
         typ = c.get('type')
         if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
                 'listbox', 'option', 'button'}:
@@ -2578,8 +2583,14 @@ class _EntrySession:
                                             fixture_context=self.fixture_context):
                     raise Gate('Application entry route or current row/config changed; inspect manually.',
                                reason='defect_provenance')
-                _entry_safety(page, self.allowed, self.provenance,
-                              readiness=self._readiness)
+                try:
+                    _entry_safety(page, self.allowed, self.provenance,
+                                  readiness=self._readiness)
+                except Gate as refusal:
+                    # Name only the stage this read saw fail; no value or selector.
+                    if isinstance(page, dict):
+                        refusal.safety_stage = _safety_stage(page, refusal)
+                    raise
         return result
 
 def _entry_not_ready(page):
@@ -2621,45 +2632,6 @@ def _greenhouse_not_ready(page, *, witness=False):
         return 'unverified application inventory'
     return 'no qualifying application form' if page['greenhouse']['root'] is None else ''
 
-async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
-                                    provenance, *, deadline: float):
-    """Losing a historic shape certificate does not make an approved write a Submit.
-
-    Continue via the same fixed raw reader; every effect still passes the
-    application IPC producer. The unchanged final guard needs full inventory.
-    """
-    try:
-        return scoped_session, await _stable_application_form(
-            scoped_session, allowed, provenance, deadline=deadline)
-    except Gate as exc:
-        reason = str(exc).lower()
-        if not any(reason.startswith(message) for message in (
-                'ambiguous application roots',
-                'application root sibling identity mismatch',
-                'truncated application inventory after bounded wait',
-                'unsupported custom control', 'no unique application root')):
-            raise
-        if isinstance(provenance, ApplicationEntryProvenance):
-            # Generic PAGE omits entry.formless; keep raw IPC and read ENTRY_PAGE.
-            reversible = _ReversibleEntryReader(raw_session)
-            page = await reversible.page()
-        else:
-            reversible = raw_session
-            if hasattr(raw_session, 'page'):
-                page = await raw_session.page()
-            else:
-                result = await raw_session.call('evaluate', ENTRY_PAGE)
-                page = result.get('value') if isinstance(result, dict) else None
-        if not isinstance(page, dict):
-            raise Gate('Reversible preparation page observation is unavailable.')
-        if not allowed(page.get('url', '')):
-            raise _navigation_gate(
-                'Reversible preparation must remain on an approved origin.',
-                provenance.wrapper if provenance is not None else '',
-                page.get('url'), provenance=provenance)
-        _inventory_ok(page, complete=False)
-        return reversible, page
-
 async def _stable_application_form(session, allowed, provenance, *, deadline: float,
                                    initial=None) -> dict:
     """Two fresh complete PAGE+witness pairs inside one navigation budget."""
@@ -2672,14 +2644,21 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
     prior_readiness = session._readiness if (greenhouse or entry_session) else False
     if greenhouse or entry_session:
         session._readiness = True
+    diagnostics = _WaitDiagnostics()
+    phase = 'page'
     try:
         while loop.time() < deadline:
+            diagnostics.sample(True)
+            phase = 'page'
             try:
                 async with asyncio.timeout_at(deadline):
                     fresh_session_read = page is None
                     page = await session.page() if fresh_session_read else page
+                    diagnostics.page(page)
+                    phase = 'safety'
                     if greenhouse:
                         _greenhouse_safety(page, allowed, provenance, readiness=True)
+                        diagnostics.safety_passed()
                         reason = _greenhouse_not_ready(page)
                     else:
                         # _EntrySession.page() already classified the complete raw
@@ -2689,13 +2668,22 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         # inputs must still pass the full admission gate.
                         if not (fresh_session_read and entry_session):
                             _entry_safety(page, allowed, provenance, readiness=entry_session)
+                        diagnostics.safety_passed()
+                        phase = 'structure'
                         reason = _entry_not_ready(page)
+                        _wait_root(diagnostics, page)
                     if reason:
                         raise _EntryNotReady(reason)
+                    phase = 'witness'
                     page, witness = await _observe_controls(session, page, readiness=True, site='readiness-witness')
+                    diagnostics.witness(True)
+                    diagnostics.page(page)
+                    phase = 'structure'
                     if loop.time() >= deadline:
                         raise TimeoutError
                     reason = _greenhouse_not_ready(page) if greenhouse else _entry_not_ready(page)
+                    if not greenhouse:
+                        _wait_root(diagnostics, page)
                     if reason:
                         raise _EntryNotReady(reason)
                     qualifying = any(
@@ -2708,8 +2696,12 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         and witness[c['selector']].get('inert') is False
                         and not c.get('disabled') for c in page['controls'])
                     if _formless_root(page) and provenance.ats == 'ashby':
-                        qualifying = bool(_formless_boundary(page, provenance))
+                        qualifying = _wait_boundary(diagnostics, page, provenance)
+                    diagnostics.set('receiver.qualifies', qualifying)
                     identity = (_page_identity(page), repr(witness)) if qualifying else None
+                    if qualifying and previous is not None:
+                        # Only two complete fresh pairs can be (in)stable.
+                        diagnostics.set('pair.stable', identity == previous)
                     if qualifying:
                         seen = True
                         if identity == previous and loop.time() < deadline:
@@ -2720,18 +2712,28 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                                    'no qualifying application form')
                     previous = identity
             except _EntryNotReady as exc:
+                if phase == 'safety' or (phase == 'page' and entry_session):
+                    diagnostics.safety_failed(page or {}, exc)
                 last_reason, previous = str(exc), None
+                diagnostics.set('pair.stable', None)
             except TimeoutError:
                 last_reason = 'application form inventory read timed out/unavailable'
+                diagnostics.set('deadline.remaining', False)
                 break
             except (OSError, bsk.Unavailable):
                 last_reason, previous = 'application form inventory read timed out/unavailable', None
+                diagnostics.read_failed(phase)
             page = None
             await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
+        if loop.time() >= deadline:
+            diagnostics.set('deadline.remaining', False)
         if (entry_session and last_reason.startswith(
                 'unknown/untrusted application frame; inspect manually. Non-admitted frames: ')):
-            raise CaptchaArtifactGate(last_reason)
-        raise Gate(last_reason + ' after bounded wait; inspect the application manually.')
+            raise diagnostics.attach(CaptchaArtifactGate(last_reason), 'wait')
+        raise diagnostics.attach(
+            Gate(last_reason + ' after bounded wait; inspect the application manually.'), 'wait')
+    except Gate as exc:
+        raise diagnostics.escape(exc, phase, page, classified=entry_session)
     finally:
         if greenhouse or entry_session:
             session._readiness = prior_readiness
@@ -3228,10 +3230,40 @@ def _approval_question_collisions(page: dict, target: dict) -> list[dict]:
             and _same(key, c.get('question') or c.get('label') or '')]
 
 
+def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
+    """Every other mismatch-route receiver sharing this question key.
+
+    Grants, the answer bank and SKIP records are question-keyed, not
+    entry-keyed. Two same-title entries (two Yes/No pairs included, which the
+    ordinary collision census ignores as buttons) are indistinguishable there,
+    so neither DOM order nor a copied value may pick one.
+    """
+    if not _owner_asks_every_receiver(page):
+        return []
+    key = target.get('question') or target.get('label')
+    own = {target.get('selector')}
+    if target.get('type') in {'button', 'radio'}:
+        # One validated choice group is one logical receiver, not a twin.
+        try:
+            own |= {m.get('selector') for m in (
+                _boolean_pair(page, target) if target['type'] == 'button'
+                else _radio_group(page, target))}
+        except Gate:
+            pass
+    return [c for c in page.get('controls', [])
+            if c.get('selector') not in own
+            and c.get('type') not in {'hidden', 'submit', 'image'}
+            and isinstance(key, str)
+            and _same(key, c.get('question') or c.get('label') or '')]
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
         raise Gate('The observed field has no distinct approval question.')
+    if _mismatch_question_twins(page, target):
+        raise Gate('Several application receivers share this question; '
+                   'inspect the application manually.', reason='defect_receiver')
     # Hidden machine-value inputs cannot receive a separate human grant.
     conflicts = [c for c in _approval_question_collisions(page, target)
                  if c.get('type') != 'hidden']
@@ -3640,6 +3672,12 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     if reversible:
         # A rootless field can bind a row grant without inventing a native form owner.
         question['owner_kind'] = 'ashby-reversible-entry'
+        if _owner_asks_every_receiver(page):
+            # Native required is a known REQUIRED; its absence proves nothing
+            # on this route, so the dashboard may offer SKIP only for unknown.
+            question['route'] = _MISMATCH_ROUTE
+            question['requiredness'] = ('required' if target.get('required') is True
+                                        else 'unknown')
     if isinstance(provenance, GreenhouseJobAlias):
         question['origin_row'] = {
             'jd_url': provenance.wrapper, 'company': provenance.company,
@@ -4798,7 +4836,22 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     if not any((every or c.get('required')) and _unanswered(page, c, owner_all=every)
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
-        return None
+        # Skip records only originate on the Ashby mismatch route, so only an
+        # Ashby entry can carry one into a later root-proven page.
+        ashby = (isinstance(provenance, ApplicationEntryProvenance)
+                 and provenance.ats == 'ashby')
+        if every or not ashby:
+            return None
+        # A skipped field stays blank-relevant without a native required flag.
+        blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
+                  and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
+        try:
+            early = (_row(pk, fixture_context=fixture_context)
+                     if fixture_context is not None else _row(pk))
+        except Exception:
+            return None
+        if not (blanks and _rootless_skips(early)):
+            return None
     # Synthetic read-only sessions and unguarded legacy routes cannot supply
     # a safely executable direct question. Production writes own this guard.
     raw = getattr(session, 'raw', session)
@@ -4911,26 +4964,82 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                         reason='defect_' + _required_owner_gate_type(item))
         # A currently bound grant is not a missing answer, even when bootstrap
         # had no new global fact to settle. Stale grants never authorize a write.
-        key = _key(current, item)
-        prior = grants.get(key) if isinstance(grants, dict) else None
-        if isinstance(prior, dict) and isinstance(prior.get('value'), str):
-            try:
-                exact_approval(
-                    pk, key, prior['value'], target=_bound_target(current, item),
-                    url=current['url'], provenance=provenance,
-                    **({'fixture_context': fixture_context} if fixture_context else {}))
-            except Gate:
-                pass
-            else:
-                continue
+        if _currently_granted(current, item, grants, pk, provenance, fixture_context):
+            continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
             closed_witness=_closed_material_combobox(item),
             reversible_scope=scope, provenance=provenance)
         question['pk'] = pk
+        if every and _owner_skip_applies(row, pk, question, current, item):
+            continue
         return Gate(_choice_prompt(item, question), form_question=question,
                     reason='owner_question')
+    if not every and _rootless_skips(row):
+        # A proven root voids every rootless SKIP on this job (ARCH21:26): its
+        # field may have re-rendered under another caption, so each blank field
+        # of the kind a SKIP can cover is asked again as a normal owner
+        # question, with no SKIP offered.
+        for item in current['controls']:
+            if (item.get('type') in {'file', 'hidden', 'password', 'submit', 'image',
+                                     'checkbox', 'radio', 'button'}
+                    or item.get('tag') not in {'input', 'textarea', 'select', 'div'}
+                    or native_submit(item)
+                    or not _unanswered(current, item, owner_all=True)
+                    or _currently_granted(current, item, grants, pk, provenance,
+                                          fixture_context)):
+                continue
+            question = _disclosure_question(
+                current, item, witness, *origins, bootstrap=False,
+                closed_witness=_closed_material_combobox(item),
+                reversible_scope=scope, provenance=provenance)
+            question['pk'] = pk
+            return Gate(_choice_prompt(item, question), form_question=question,
+                        reason='owner_question')
     return None
+
+
+def _currently_granted(page: dict, item: dict, grants, pk: str, provenance,
+                       fixture_context) -> bool:
+    key = _key(page, item)
+    prior = grants.get(key) if isinstance(grants, dict) else None
+    if not (isinstance(prior, dict) and isinstance(prior.get('value'), str)):
+        return False
+    try:
+        exact_approval(
+            pk, key, prior['value'], target=_bound_target(page, item),
+            url=page['url'], provenance=provenance,
+            **({'fixture_context': fixture_context} if fixture_context else {}))
+    except Gate:
+        return False
+    return True
+
+
+def _rootless_skips(row: dict) -> bool:
+    """Whether this job carries any SKIP taken on the rootless mismatch route."""
+    skips = row.get('owner_gate_skips')
+    return isinstance(skips, dict) and any(
+        isinstance(r, dict) and r.get('route') == _MISMATCH_ROUTE for r in skips.values())
+
+
+def _owner_skip_applies(row: dict, pk: str, question: dict, page: dict,
+                        item: dict) -> bool:
+    """Suppress only the exact receiver the owner skipped, on this route.
+
+    The record must name this question's opaque identity, the mismatch route,
+    the same receiver kind and the generation it consumed. A selector shift,
+    reissue, route change or question-key twin yields a different identity or
+    a refusal, and the field is asked again.
+    """
+    skips = row.get('owner_gate_skips')
+    identity = owner_question_identity(pk, question)
+    record = skips.get(identity) if isinstance(skips, dict) else None
+    return (isinstance(record, dict) and owner_skip_eligible(question)
+            and record.get('identity') == identity
+            and record.get('route') == _MISMATCH_ROUTE
+            and record.get('kind') == question.get('type')
+            and isinstance(record.get('generation'), str) and bool(record['generation'])
+            and not _mismatch_question_twins(page, item))
 
 
 async def _current_approved_choices(session, page: dict, pk: str,
@@ -6956,3 +7065,265 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
         return {'status': 'unknown', 'detail': str(exc) if isinstance(exc, bsk.Unavailable)
                 else f'BrowserSkill operation unavailable: {type(exc).__name__}'}
+
+
+# Issue #202 helpers live after the established seams so earlier code keeps
+# its line positions.
+
+_MISMATCH_ROUTE = 'ashby-sibling-mismatch'
+
+
+def _canonical(value):
+    """Dynamo returns integral numbers as Decimal; the token must not change."""
+    from decimal import Decimal
+    if isinstance(value, dict):
+        return {str(k): _canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else str(value)
+    return value
+
+
+def owner_question_identity(pk: str, question: dict) -> str:
+    """Opaque token for one exact bound owner field question.
+
+    The dashboard round-trips it so an answer or SKIP names the stored
+    question, not just the row. It is a one-way digest: no label, selector or
+    URL is recoverable from it, and any change to the bound question changes it.
+    """
+    import hashlib
+    import json
+    if not isinstance(question, dict):
+        return ''
+    canonical = json.dumps(_canonical({
+        'pk': pk, 'source': 'applier', 'call': 'direct',
+        'route': question.get('route') or '',
+        'question': {k: v for k, v in question.items() if k != 'pk'},
+    }), sort_keys=True, separators=(',', ':'), default=str)
+    return 'q1_' + hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
+
+
+def owner_skip_eligible(question) -> bool:
+    """Only an unknown-requiredness field on the rootless mismatch route.
+
+    SKIP is a reversible "leave it empty" choice, never an omission waiver: a
+    known REQUIRED field, an assent/checkbox, a choice group or any root-proven
+    page (whose final checks would have to accept the blank) is refused.
+    """
+    return (isinstance(question, dict)
+            and question.get('owner_kind') == 'ashby-reversible-entry'
+            and question.get('route') == _MISMATCH_ROUTE
+            and question.get('requiredness') == 'unknown'
+            and question.get('tag') in {'input', 'textarea', 'select', 'div'}
+            and question.get('type') not in {
+                'checkbox', 'radio', 'button', 'file', 'hidden', 'password',
+                'submit', 'image'}
+            and not _material_question(question))
+
+
+WAIT_PREDICATES = (
+    'read.page_available', 'read.entry_valid', 'read.controls_valid',
+    'read.origin_allowed', 'read.frames_admitted', 'read.responses_admitted',
+    'inventory_verified', 'truncated', 'opaque_controls', 'shadow_roots',
+    'unsupported_frames', 'root.owner_proven', 'receiver.qualifies',
+    'witness.available', 'witness.agrees', 'pair.stable', 'deadline.remaining',
+)
+_UNKNOWN = 'unknown/unavailable'
+# _entry_safety checks these in this order; an exception at one means every
+# earlier stage held and every later one was never evaluated.
+_SAFETY_STAGES = ('read.origin_allowed', 'read.controls_valid', 'read.entry_valid',
+                  'read.frames_admitted', 'read.responses_admitted')
+
+
+def _safety_stage(page: dict, exc: BaseException) -> str | None:
+    """The _entry_safety stage an exception on this observed PAGE failed, if any."""
+    message = str(exc)
+    if isinstance(exc, NavigationProvenanceGate):
+        return 'read.origin_allowed'
+    if message.startswith('The current form control inventory is malformed'):
+        controls = page.get('controls')
+        return ('read.controls_valid' if not isinstance(controls, list)
+                or any(not isinstance(c, dict) for c in controls)
+                or any(not isinstance(c.get('selector'), str) or not c['selector']
+                       or not isinstance(c.get('tag'), str)
+                       or not isinstance(c.get('type'), str)
+                       or not isinstance(c.get('in_form'), bool)
+                       or (c['in_form'] and not c.get('form_selector'))
+                       for c in controls)
+                else 'read.entry_valid')
+    if (message.startswith('untrusted captcha response control')
+            or message.startswith('visible hCaptcha challenge control')):
+        return 'read.responses_admitted'
+    if isinstance(exc, (CaptchaGate, CaptchaArtifactGate, _EntryNotReady)):
+        return 'read.frames_admitted'
+    return None
+
+
+class _WaitDiagnostics:
+    """Issue #202: finite, value-free predicate map for one wait/readiness exit.
+
+    Each sample starts fully unknown, so an older observation is never
+    promoted to a current fact. It aggregates already-observed structure only:
+    no read, retry or selector/value text is added.
+    """
+
+    def __init__(self):
+        self.state = dict.fromkeys(WAIT_PREDICATES, _UNKNOWN)
+
+    def set(self, key: str, value) -> None:
+        self.state[key] = _UNKNOWN if value is None else ('true' if value else 'false')
+
+    def sample(self, deadline_remaining: bool) -> None:
+        # pair.stable too: only this sample's own completed pair may set it.
+        self.state = dict.fromkeys(WAIT_PREDICATES, _UNKNOWN)
+        self.set('deadline.remaining', deadline_remaining)
+
+    def page(self, page) -> None:
+        self.set('read.page_available', isinstance(page, dict))
+        if not isinstance(page, dict):
+            return
+        flag = page.get('inventory_verified')
+        self.set('inventory_verified', flag if type(flag) is bool else None)
+        for key in ('truncated', 'opaque_controls', 'shadow_roots', 'unsupported_frames'):
+            value = page.get(key)
+            self.set(key, bool(value) if type(value) in (bool, list) else None)
+
+    def safety_passed(self) -> None:
+        for key in _SAFETY_STAGES:
+            self.set(key, True)
+
+    def safety_failed(self, page, exc: BaseException) -> None:
+        """Locate the failing _entry_safety stage from the exception and page."""
+        if not isinstance(page, dict):
+            self.set('read.page_available', False)
+            return
+        self.set('read.page_available', True)
+        failed = _safety_stage(page, exc)
+        if failed is None:
+            # A destination/owner check after every reader stage held.
+            self.safety_passed()
+            return
+        index = _SAFETY_STAGES.index(failed)
+        for key in _SAFETY_STAGES[:index]:
+            self.set(key, True)
+        self.set(failed, False)
+
+    def witness(self, agrees: bool) -> None:
+        self.set('witness.available', True)
+        self.set('witness.agrees', agrees)
+
+    def read_failed(self, phase: str) -> None:
+        if phase == 'page':
+            self.set('read.page_available', False)
+        elif phase == 'witness':
+            self.set('witness.available', False)
+        self.set('pair.stable', None)
+
+    def escape(self, exc: BaseException, phase: str, page, *,
+               classified: bool = False) -> BaseException:
+        """Early escapes (_entry_safety, witness, boundary, CAPTCHA) keep their
+        own message and gain the same-exit predicate map.
+
+        An _EntrySession PAGE read classifies its own census, so a Gate it
+        raises is a safety failure of a page that was read.
+        """
+        if getattr(exc, 'wait_predicates', None) is not None:
+            return exc
+        if phase == 'safety' or (phase == 'page' and classified):
+            observed = getattr(exc, 'safety_stage', None)
+            if isinstance(page, dict):
+                self.safety_failed(page, exc)
+            elif observed in _SAFETY_STAGES:
+                # _EntrySession.call named the one stage _entry_safety saw fail
+                # on the PAGE it read (ARCH22:31); every other stage stays unknown.
+                self.set('read.page_available', True)
+                self.set(observed, False)
+            else:
+                # Any other Gate without a PAGE (a null read, a route check
+                # before safety) ran no stage we can name: they stay unknown.
+                self.set('read.page_available', False)
+        # A witness-phase Gate returned no complete witness to compare, so
+        # its availability and agreement stay unknown rather than "false".
+        return self.attach(exc, 'wait')
+
+    def render(self) -> str:
+        return ' [wait: ' + ', '.join(f'{k}={self.state[k]}' for k in WAIT_PREDICATES) + ']'
+
+    def attach(self, exc: BaseException, phase: str) -> BaseException:
+        """One matching sanitized Gate suffix and one log line per exit."""
+        if getattr(exc, 'wait_predicates', None) is not None or not exc.args:
+            return exc
+        rendered = self.render()
+        exc.args = (str(exc.args[0]) + rendered,) + exc.args[1:]
+        exc.wait_predicates = dict(self.state)
+        _LOG.info('application wait exit (%s):%s', phase, rendered)
+        return exc
+
+
+async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
+                                    provenance, *, deadline: float):
+    """Losing a historic shape certificate does not make an approved write a Submit.
+
+    Continue via the same fixed raw reader; every effect still passes the
+    application IPC producer. The unchanged final guard needs full inventory.
+    """
+    try:
+        return scoped_session, await _stable_application_form(
+            scoped_session, allowed, provenance, deadline=deadline)
+    except Gate as exc:
+        reason = str(exc).lower()
+        if not any(reason.startswith(message) for message in (
+                'ambiguous application roots',
+                'application root sibling identity mismatch',
+                'truncated application inventory after bounded wait',
+                'unsupported custom control', 'no unique application root')):
+            raise
+        diagnostics = _WaitDiagnostics()
+        diagnostics.set('deadline.remaining', None)
+        page = None
+        try:
+            if isinstance(provenance, ApplicationEntryProvenance):
+                # Generic PAGE omits entry.formless; keep raw IPC and read ENTRY_PAGE.
+                reversible = _ReversibleEntryReader(raw_session)
+                page = await reversible.page()
+            else:
+                reversible = raw_session
+                if hasattr(raw_session, 'page'):
+                    page = await raw_session.page()
+                else:
+                    result = await raw_session.call('evaluate', ENTRY_PAGE)
+                    page = result.get('value') if isinstance(result, dict) else None
+            diagnostics.page(page)
+            if not isinstance(page, dict):
+                raise Gate('Reversible preparation page observation is unavailable.')
+            if not allowed(page.get('url', '')):
+                diagnostics.set('read.origin_allowed', False)
+                raise _navigation_gate(
+                    'Reversible preparation must remain on an approved origin.',
+                    provenance.wrapper if provenance is not None else '',
+                    page.get('url'), provenance=provenance)
+            diagnostics.set('read.origin_allowed', True)
+            _inventory_ok(page, complete=False)
+        except Gate as fallback:
+            raise diagnostics.attach(fallback, 'reversible-fallback')
+        return reversible, page
+
+
+def _wait_root(diagnostics: _WaitDiagnostics, page: dict) -> None:
+    """Root ownership only where its source graph was actually observed."""
+    root = _formless_root(page)
+    if root:
+        diagnostics.set('root.owner_proven', bool(root.get('root')) and not root.get('error'))
+    elif isinstance(page.get('entry'), dict) and 'root' in page['entry']:
+        diagnostics.set('root.owner_proven', bool(page['entry'].get('root')))
+
+
+def _wait_boundary(diagnostics: _WaitDiagnostics, page: dict, provenance) -> bool:
+    try:
+        return bool(_formless_boundary(page, provenance))
+    except _EntryNotReady:
+        raise
+    except Gate:
+        diagnostics.set('receiver.qualifies', False)
+        raise

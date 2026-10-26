@@ -318,7 +318,7 @@ test('blank owner text never turns into approved in Needs-you or drawer', () => 
     row('tailored',{status:'tailored',gate_reason:''})];
   h.context.sent=[];
   vm.runInContext('post = async (path, body) => { globalThis.sent.push({path,body}); return {ok:true}; };'
-    + 'markBusy=()=>{}; loadQueue=()=>{}; renderPane=()=>{};'
+    + 'markBusy=()=>{}; loadQueue=()=>{}; loadApps=()=>{}; renderPane=()=>{};'
     + 'toast=()=>{}; closeDrawer=()=>{}; loadAgentLog=()=>{};',h.context);
   const field=h.node('#pane textarea[data-answer-for="q"]');
   field.value='   ';
@@ -614,4 +614,148 @@ test('drawer delegates only eligible structural Requeue through the existing act
   invoke(withCall.pk);
   assert.equal(h.context.drawerDelegations.length, 1, 'stored call IDs deny stale drawer clicks');
   assert.equal(h.requests.length, requestsBefore, 'no network or queue mutations in the VM');
+});
+
+// Issue #202: exact owner Answer and explicit SKIP from both dashboard entry points.
+function exactOwner(pk, fields = {}) {
+  return row(pk, { gate_has_form_question: true, gate_has_call_id: true,
+    gate_generation: 'gen-synthetic', gate_question_identity: 'q1_synthetic',
+    gate_skip_eligible: true, ...fields });
+}
+function capture(h, reply = {ok: true, status: 'resuming'}) {
+  h.context.sent = []; h.context.toasts = []; h.context.refreshed = [];
+  h.context.reply = reply;
+  vm.runInContext('post = async (path, body) => { globalThis.sent.push({path, body}); return globalThis.reply; };'
+    + 'markBusy=()=>{}; renderPane=()=>{}; closeDrawer=()=>{}; loadAgentLog=()=>{};'
+    + 'loadQueue=()=>{ globalThis.refreshed.push("queue"); };'
+    + 'loadApps=()=>{ globalThis.refreshed.push("apps"); };'
+    + 'toast=(m)=>{ globalThis.toasts.push(m); };', h.context);
+}
+function drawerInvoke(h, act, pk) {
+  h.fn('wire')();
+  const click = h.node('#drawer').listeners.click.at(-1);
+  click({target: {closest: (s) => s === '[data-act]' ? {dataset: {act, pk}} : null}});
+}
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('SKIP renders only for an eligible exact owner field, in Needs-you and drawer', () => {
+  const h = harness();
+  const eligible = exactOwner('eligible');
+  const hidden = [exactOwner('not-eligible', {gate_skip_eligible: false}),
+    exactOwner('no-generation', {gate_generation: ''}),
+    exactOwner('no-identity', {gate_question_identity: ''}),
+    exactOwner('approval', {gate_reason: 'approval'}),
+    exactOwner('held', {submit_hold_state: 'blocked'})];
+  h.state.apps = [eligible, ...hidden];
+  capture(h);
+  assert.match(h.fn('needsCard')(eligible), /data-act="skip-field" data-pk="eligible"/);
+  assert.match(h.fn('needsCard')(eligible), /data-act="answer"/, 'Answer stays available');
+  assert.match(h.fn('needsCard')(eligible), /data-act="skip"[^-]/, 'Skip job stays available');
+  assert.equal(h.fn('rowActionAllowed')('eligible', 'skip-field'), true);
+  h.fn('openDrawer')('eligible');
+  assert.match(h.node('#drawer-body').innerHTML, /data-act="skip-field"/);
+  for (const r of hidden) {
+    assert.doesNotMatch(h.fn('needsCard')(r), /data-act="skip-field"/, r.pk);
+    assert.equal(h.fn('rowActionAllowed')(r.pk, 'skip-field'), false, r.pk);
+    h.fn('openDrawer')(r.pk);
+    assert.doesNotMatch(h.node('#drawer-body').innerHTML, /data-act="skip-field"/, r.pk);
+  }
+});
+
+test('pane and drawer send identical exact Answer and SKIP bodies and refresh', async () => {
+  const h = harness();
+  h.state.apps = [exactOwner('q')];
+  capture(h);
+  const exact = {expected_gate_generation: 'gen-synthetic', expected_question_identity: 'q1_synthetic'};
+  h.node('#pane textarea[data-answer-for="q"]').value = '  synthetic name  ';
+  h.fn('paneAction')('answer', 'q');
+  h.fn('paneAction')('skip-field', 'q');
+  h.node('#gate-answer').value = ' synthetic name ';
+  drawerInvoke(h, 'answer', 'q');
+  drawerInvoke(h, 'skip-field', 'q');
+  await settle();
+  const bodies = h.context.sent.map((s) => JSON.parse(JSON.stringify(s.body)));
+  assert.deepEqual(bodies, [
+    {disposition: 'answer', answer: 'synthetic name', ...exact},
+    {disposition: 'skip', ...exact},
+    {disposition: 'answer', answer: 'synthetic name', ...exact},
+    {disposition: 'skip', ...exact},
+  ]);
+  assert.ok(h.context.sent.every((s) => s.path === '/actions/resume/q'));
+  assert.ok(h.context.refreshed.includes('apps') && h.context.refreshed.includes('queue'),
+    'the outcome is read back from the rows, not the acknowledgement');
+  assert.ok(h.context.toasts.every((m) => !/^Queued/.test(m)),
+    'the immediate acknowledgement is never reported as queued');
+});
+
+test('blank, literal skip, stale and generationless replies never become SKIP', async () => {
+  const h = harness();
+  const legacy = row('legacy', {gate_has_form_question: true, gate_has_call_id: true});
+  h.state.apps = [exactOwner('q'), legacy];
+  capture(h);
+  h.node('#pane textarea[data-answer-for="q"]').value = '   ';
+  h.fn('paneAction')('answer', 'q');
+  h.node('#gate-answer').value = '';
+  drawerInvoke(h, 'answer', 'q');
+  assert.equal(h.context.sent.length, 0, 'blank answers do not POST');
+  h.node('#pane textarea[data-answer-for="q"]').value = 'skip';
+  h.fn('paneAction')('answer', 'q');
+  await settle();
+  assert.equal(h.context.sent.at(-1).body.disposition, 'answer', 'literal "skip" is an answer');
+  // A bound field question without a generation is refused in the UI.
+  const before = h.context.sent.length;
+  h.node('#pane textarea[data-answer-for="legacy"]').value = 'synthetic';
+  h.fn('paneAction')('answer', 'legacy');
+  h.node('#gate-answer').value = 'synthetic';
+  drawerInvoke(h, 'answer', 'legacy');
+  h.fn('paneAction')('skip-field', 'legacy');
+  assert.equal(h.context.sent.length, before, 'generationless gates do not POST');
+  assert.match(h.context.toasts.join('\n'), /out of date/);
+  // A server refusal is surfaced, and the rows are refreshed.
+  capture(h, {ok: false, error: 'invalid_answer'});
+  h.fn('paneAction')('skip-field', 'q');
+  await settle();
+  assert.match(h.context.toasts.join('\n'), /refused/);
+  assert.ok(h.context.refreshed.includes('apps'));
+});
+
+test('legacy approval keeps its request shape and cannot SKIP', async () => {
+  const h = harness();
+  h.state.apps = [row('approval', {gate_reason: 'approval'}),
+    row('tailored', {status: 'tailored', gate_reason: ''})];
+  capture(h);
+  h.fn('paneAction')('answer', 'approval');
+  h.fn('paneAction')('answer', 'tailored');
+  h.fn('paneAction')('skip-field', 'approval');
+  await settle();
+  assert.deepEqual(h.context.sent.map((s) => JSON.parse(JSON.stringify(s.body))),
+    [{answer: 'approved'}, {answer: 'approved'}]);
+});
+
+test('an owner reply says Sent only after the request was accepted', async () => {
+  const h = harness();
+  vm.runInContext(`
+    globalThis.toasts = []; toast = (m) => globalThis.toasts.push(m);
+    loadApps = () => {}; loadQueue = () => {};
+    globalThis.replies = []; post = () => Promise.resolve(globalThis.replies.shift());`, h.context);
+  const send = h.fn('sendResume');
+  const toasts = () => JSON.parse(vm.runInContext(
+    'JSON.stringify(globalThis.toasts.splice(0))', h.context));
+  const reply = (d) => vm.runInContext(`globalThis.replies.push(${JSON.stringify(d)})`, h.context);
+  reply({ ok: true, status: 'resuming' });
+  const pending = send('pk-1', {}, 'Sent — checking the result.');
+  assert.deepEqual(toasts(), [], 'nothing claims Sent before the response');
+  await pending;
+  assert.deepEqual(toasts(), ['Sent — checking the result.']);
+  for (const refused of [{ ok: false, error: 'invalid_answer' }, { error: 'The server returned 500.' }]) {
+    reply(refused);
+    await send('pk-1', {}, 'Sent — checking the result.');
+    const shown = toasts();
+    assert.equal(shown.length, 1);
+    assert.ok(!shown[0].startsWith('Sent'), shown[0]);
+  }
+  // A network failure (post() resolves null after its own toast) is never Sent.
+  reply(null);
+  await send('pk-1', {}, 'Sent — checking the result.');
+  assert.deepEqual(toasts(), []);
 });

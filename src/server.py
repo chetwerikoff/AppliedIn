@@ -238,6 +238,26 @@ def _project_submit_hold(pk: str, raw_row: dict, tracking, *, no_independent_key
         return "unknown"
 
 
+def _owner_gate_tokens(row: dict) -> dict:
+    """Opaque exact-question identity and generation for a bound direct gate.
+
+    Neither leaks the field label, selector, URL or any value; the identity is
+    a one-way digest and the generation is random.
+    """
+    from tools.browser_skill_apply import owner_question_identity, owner_skip_eligible
+    pending = row.get("gate_pending") or {}
+    question = pending.get("form_question")
+    generation = pending.get("generation")
+    if (row.get("status") != "needs_human" or row.get("gate_call_id") != "direct"
+            or row.get("gate_source") != "applier" or not isinstance(question, dict)
+            or not isinstance(generation, str) or not generation):
+        return {"gate_question_identity": "", "gate_generation": "",
+                "gate_skip_eligible": False}
+    return {"gate_question_identity": owner_question_identity(row.get("pk") or "", question),
+            "gate_generation": generation,
+            "gate_skip_eligible": owner_skip_eligible(question)}
+
+
 def _to_ui(row: dict, artifacts) -> dict:
     """Map a tracking row to the shape the dashboard expects."""
     def link(key):
@@ -281,6 +301,7 @@ def _to_ui(row: dict, artifacts) -> dict:
         "gate_has_form_question": isinstance(
             (row.get("gate_pending") or {}).get("form_question"), dict),
         "gate_has_call_id": bool(row.get("gate_call_id")),
+        **_owner_gate_tokens(row),
         "possible_submission": row.get("possible_submission") is True,
         "fail_kind": row.get("fail_kind") or "",
         "fail_reason": row.get("fail_reason") or "",
@@ -1867,7 +1888,23 @@ def create_app() -> FastAPI:
         stores = make_stores(settings)
         if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
-        background.add_task(resume_job, pk, body.get("answer", ""))
+        disposition = body.get("disposition")
+        generation = body.get("expected_gate_generation")
+        identity = body.get("expected_question_identity")
+        answer = body.get("answer", "")
+        # Syntactic refusal before scheduling: the exact-question match itself
+        # runs in resume_job against the current row, before any effect.
+        if (not isinstance(answer, str)
+                or disposition not in (None, "answer", "skip")
+                or (disposition is not None and (
+                    not isinstance(generation, str) or not 0 < len(generation) <= 128
+                    or not isinstance(identity, str) or not 0 < len(identity) <= 128))
+                or (disposition == "answer" and not answer.strip())):
+            return {"ok": False, "error": "invalid_answer"}
+        background.add_task(resume_job, pk, answer, disposition=disposition,
+                            expected_gate_generation=generation,
+                            expected_question_identity=identity)
+        # Accepted for processing only; the dashboard reads the eventual row.
         return {"ok": True, "status": "resuming"}
 
     def stopped_application_attempt(pk: str, tracking) -> str:

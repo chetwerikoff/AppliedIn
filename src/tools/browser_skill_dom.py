@@ -548,6 +548,8 @@ _ASHBY_ROOT = r"""
         entry_label:field?.title ? clean(field.title.innerText) : '',
         entry_label_selector:field?.title ? selector(field.title) : '',
         caption:e.tagName==='BUTTON' ? clean(e.innerText) : '',yes_no:ashbyYesNo(e),
+        // Membership only: a rooted Yes/No group has no proven requiredness.
+        boolean_group:!!e.closest('div.ashby-application-form-input-yesno'),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
         id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
         associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),

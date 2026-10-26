@@ -2099,39 +2099,241 @@ def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
         refused, tracked, pk=pk, company=company)
 
 
+# Issue #202 AC3: one closed, finite, phase-aware predicate map per failed exit
+# of the bounded post-navigation application wait. Synthetic readers only.
+
+import logging
+import re
+
+_WAIT_VALUES = {'true', 'false', 'unknown/unavailable'}
+
+
+def _wait_map(text):
+    found = re.findall(r' \[wait: ([^\]]*)\]', text)
+    assert len(found) == 1, text
+    pairs = dict(item.split('=', 1) for item in found[0].split(', '))
+    assert tuple(pairs) == forms.WAIT_PREDICATES
+    assert set(pairs.values()) <= _WAIT_VALUES
+    # Structure only: never a URL, selector, value or question text.
+    for private in ('https://', 'example-co', '#', 'Email', JOB):
+        assert private not in found[0]
+    return pairs
+
+
+def _logged_map(caplog):
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith('application wait exit')]
+    assert len(lines) == 1, lines
+    return _wait_map(lines[0])
+
+
+async def test_wait_deadline_exit_names_unexecuted_pair_unknown(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    fake_clock(monkeypatch)
+    _, _, session, decide = world(monkeypatch, pages=[application('ashby', controls=[])])
+    report = await attempt()
+    assert 'no qualifying application form after bounded wait' in report['question']
+    state = _wait_map(report['question'])
+    assert state['deadline.remaining'] == 'false'
+    assert state['read.page_available'] == 'true'
+    # No two complete fresh pairs ever existed: never a fictitious agreement.
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert state['witness.agrees'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_wait_missing_page_is_false_and_downstream_unknown(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    _, _, session, decide = world(monkeypatch)
+
+    async def fail(s):
+        raise OSError('synthetic failed read')
+    session.on_page = fail
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    report = await asyncio.wait_for(attempt(), timeout=0.5)
+    assert 'application form inventory read timed out/unavailable' in report['question']
+    state = _wait_map(report['question'])
+    assert state['read.page_available'] == 'false'
+    # A failed current sample never promotes an older observation.
+    for key in ('read.entry_valid', 'root.owner_proven', 'receiver.qualifies',
+                'witness.available', 'witness.agrees', 'pair.stable'):
+        assert state[key] == 'unknown/unavailable', key
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_wait_witness_escape_keeps_its_message_with_the_same_map(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    _, _, session, decide = world(monkeypatch)
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.5)
+    monkeypatch.setattr(forms, '_observe_controls', AsyncMock(
+        side_effect=forms.Gate('synthetic contradictory fixed reader')))
+    report = await attempt()
+    assert report['question'].startswith('synthetic contradictory fixed reader')
+    state = _wait_map(report['question'])
+    assert state['read.page_available'] == 'true'
+    assert state['read.origin_allowed'] == 'true'
+    # The Gate returned no complete witness: nothing was compared, so neither
+    # availability nor agreement is reported as an observed "false".
+    assert (state['witness.available'], state['witness.agrees']) == (
+        'unknown/unavailable', 'unknown/unavailable')
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+
+
+async def test_wait_unknown_frame_captcha_exit_keeps_reason_and_frame_failure(
+        monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    page = application('ashby', entry={
+        'root': {'selector': '#application-form', 'action': entry('ashby')},
+        'frames': [{'status': 'unknown', 'origin': 'https://[redacted].test',
+                    'path': '/frame/[redacted]'}],
+        'responses': [], 'response_error': False, 'helper_challenge': False})
+    _, _, session, decide = world(monkeypatch, pages=[page])
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    with pytest.raises(forms.CaptchaArtifactGate) as raised:
+        await forms._stable_application_form(
+            forms._EntrySession(session, lambda url: url == entry('ashby'),
+                                forms._application_entry(
+                                    forms._row(PK), PK, COMPANY, posting('ashby'),
+                                    [CompanyConfig(name=COMPANY, ats='ashby',
+                                                   board='example-co')]),
+                                resume_path='Resume.pdf'),
+            lambda url: url == entry('ashby'), forms._application_entry(
+                forms._row(PK), PK, COMPANY, posting('ashby'),
+                [CompanyConfig(name=COMPANY, ats='ashby', board='example-co')]),
+            deadline=asyncio.get_running_loop().time() + 0.05)
+    text = str(raised.value)
+    # The existing sanitized artifact reason stays, alongside the map.
+    assert text.startswith('unknown/untrusted application frame; inspect manually.')
+    state = raised.value.wait_predicates
+    assert state['read.frames_admitted'] == 'false'
+    assert state['witness.available'] == 'unknown/unavailable'
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert set(state.values()) <= _WAIT_VALUES and tuple(state) == forms.WAIT_PREDICATES
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)
+
+
+def test_wait_unstable_pair_never_survives_into_a_later_failed_sample():
+    diagnostics = forms._WaitDiagnostics()
+    diagnostics.sample(True)
+    diagnostics.set('pair.stable', False)
+    assert diagnostics.state['pair.stable'] == 'false'
+    # The next bounded sample loses PAGE before any fresh pair exists.
+    diagnostics.sample(True)
+    diagnostics.read_failed('page')
+    assert diagnostics.state['pair.stable'] == 'unknown/unavailable'
+    assert diagnostics.state['read.page_available'] == 'false'
+    # Same for a deadline exit that ran no comparison in its own sample.
+    diagnostics.set('pair.stable', True)
+    diagnostics.sample(False)
+    assert diagnostics.state['pair.stable'] == 'unknown/unavailable'
+
+
+@pytest.mark.parametrize('message', [
+    'The tracked job route changed before the application read.',
+    'The current form control inventory is malformed; inspect manually.',
+], ids=['before-safety', 'malformed-null-page'])
+def test_wait_page_gate_without_a_page_never_invents_safety_stages(message):
+    """A PAGE-phase Gate that returned no PAGE ran no reader stage on one:
+    PAGE is unavailable and every safety stage stays unknown, not true/false."""
+    diagnostics = forms._WaitDiagnostics()
+    diagnostics.sample(True)
+    gate = diagnostics.escape(forms.Gate(message), 'page', None, classified=True)
+    predicates = gate.wait_predicates
+    assert predicates['read.page_available'] == 'false'
+    for stage in forms._SAFETY_STAGES:
+        assert predicates[stage] == 'unknown/unavailable', stage
+    assert _wait_map(str(gate)) == predicates
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('break_page,stage', [
+    ('controls', 'read.controls_valid'),
+    ('origin', 'read.origin_allowed'),
+])
+async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
+        monkeypatch, caplog, break_page, stage):
+    """ARCH22:31: _EntrySession.call read a PAGE and _entry_safety refused it
+    before the PAGE reached the waiter. The Gate carries that one observed
+    stage; every other safety stage stays unknown, and no value or selector
+    reaches the map or the log."""
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    page = application('ashby')
+    if break_page == 'controls':
+        page['controls'][0]['tag'] = None
+    else:
+        page['url'] = 'https://elsewhere.example.test/application'
+    _, _, session, _ = world(monkeypatch, pages=[page])
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    provenance = forms._application_entry(
+        forms._row(PK), PK, COMPANY, posting('ashby'),
+        [CompanyConfig(name=COMPANY, ats='ashby', board='example-co')])
+    with pytest.raises(forms.Gate) as raised:
+        await forms._stable_application_form(
+            forms._EntrySession(session, lambda url: url == entry('ashby'), provenance,
+                                resume_path='Resume.pdf'),
+            lambda url: url == entry('ashby'), provenance,
+            deadline=asyncio.get_running_loop().time() + 0.05)
+    state = raised.value.wait_predicates
+    assert state['read.page_available'] == 'true'
+    assert state[stage] == 'false'
+    for other in forms._SAFETY_STAGES:
+        if other != stage:
+            assert state[other] == 'unknown/unavailable', other
+    text = str(raised.value)
+    assert _wait_map(text) == state
+    logged = [r.getMessage() for r in caplog.records if 'application wait exit' in r.getMessage()]
+    assert logged and all('elsewhere' not in line and 'https://' not in line for line in logged)
+
 
 # main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
-# Hash the *entire* protected producer/consumer sources, excluding only the
-# pre-browser query-attempt classifier whose implementation #201 may change.
-# This covers nested _authorized, final Submit, source/board/job proof literals
-# and helpers, not just the named entry functions or decoded characters.
+# The four supporting files stay pinned whole. browser_skill_apply.py is pinned
+# per protected function (ARCH20:47 ruling D): the exact ast source segment of
+# each Submit, hidden-value and posting-safety function must keep its ffaa410
+# bytes, so other #202 owner-gate edits in that file do not trip the pin.
+# Re-pinning any of these needs ARCH approval.
 _ISSUE201_MAIN_SHA256 = {
-    "src/tools/browser_skill_apply.py": "fb5504e1a20439d994841a31001a1d67752c2f5553a1b7b71be2265d194e3223",
     "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
     "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
     "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
     "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
 }
 
+_ISSUE201_PROTECTED_FUNCTION_SHA256 = {
+    "is_submission": "c3fd3b93495139b1d45f1588082bc044d1440fa932cca855ec45c0db0f1d590a",
+    "native_submit": "1fd4c3e94009536eda5228945ca26796a6a380ea6a3823561f79879536f7574c",
+    "check_form": "a44b97d3c8906338737447f8c82594edc2ce2ada15d5afe76c73b99e5c93a247",
+    "check_form_destination": "64c47cf1d8891eb3cc2c97a670d8f8c80077dcb1fc722019f56770998aff893f",
+    "_submitter_texts": "df04be15cc339c2dcfef7bdb0878ea98ac43ea61daf02e4301e4bdf1e6dca79b",
+    "_greenhouse_safety": "4bead246accd2c97d6894d60d659993cac9669da9dee717825f22620329f1e38",
+    "ApplicationIPCController.authorize_final_submit": "daa7ef578abb064728e7e101e7df2185b333a2a5edb3779353ff6126188848e5",
+}
 
-def _issue201_without_prebrowser_classifier(source: bytes) -> bytes:
-    """Remove only the allowed top-level predicate; preserve all other bytes."""
-    lines = source.split(b"\n")
-    starts = [i for i, line in enumerate(lines)
-              if line.startswith(b"def _greenhouse_id_query_attempt(")]
-    assert len(starts) == 1
-    start = starts[0]
-    cursor = start + 1
-    while (cursor < len(lines)
-           and (not lines[cursor].strip()
-                or lines[cursor].startswith((b" ", b"\t")))):
-        cursor += 1
-    # No extra top-level helper/proof change may be hidden in the exception.
-    assert cursor < len(lines) and lines[cursor].startswith(b"def _configured_alias(")
-    end = cursor
-    while end > start + 1 and not lines[end - 1].strip():
-        end -= 1
-    return b"\n".join(lines[:start] + lines[end:])
+
+def _issue201_function_segments(source: str) -> dict[str, list[str]]:
+    """Every function/class source segment by qualified name, duplicates kept."""
+    import ast
+
+    found: dict[str, list[str]] = {}
+
+    def walk(body, prefix):
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + node.name
+                found.setdefault(name, []).append(ast.get_source_segment(source, node))
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, name + ".")
+
+    walk(ast.parse(source).body, "")
+    return found
 
 
 def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
@@ -2140,11 +2342,15 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
 
     root = Path(__file__).resolve().parents[2]
     for filename, baseline in _ISSUE201_MAIN_SHA256.items():
-        source = (root / filename).read_bytes()
-        if filename == "src/tools/browser_skill_apply.py":
-            source = _issue201_without_prebrowser_classifier(source)
-        actual = hashlib.sha256(source).hexdigest()
+        actual = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         assert actual == baseline, (filename, actual, baseline)
+
+    source = (root / "src/tools/browser_skill_apply.py").read_text(encoding="utf-8")
+    segments = _issue201_function_segments(source)
+    for name, baseline in _ISSUE201_PROTECTED_FUNCTION_SHA256.items():
+        assert len(segments.get(name, [])) == 1, (name, "must be defined exactly once")
+        actual = hashlib.sha256(segments[name][0].encode("utf-8")).hexdigest()
+        assert actual == baseline, (name, actual, baseline)
 
 
 def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():

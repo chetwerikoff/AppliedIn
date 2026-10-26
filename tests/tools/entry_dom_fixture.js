@@ -209,7 +209,15 @@ if(spec.formless) {
   if(spec.adjacentText) node('p',{id:'adjacent',text:'Unexpected structure'},container);
   if(spec.changedDrop)drop.setAttribute('title','Changed dropzone');
   if(spec.secondDrop)node('button',{id:'second-drop',type:'button',class:'ashby-application-form-input-file-dropzone-upload'},file);
-  field('textarea','additional','textarea','Additional information');
+  if(spec.yesNo) {
+    // Issue #202 AC2: an untyped Ashby Yes/No pair on a root-proven form.
+    const entry=node('div',{class:'ashby-application-form-field-entry'},container);
+    node('label',{class:'ashby-application-form-question-title',text:'Synthetic Boolean question'},entry);
+    const group=node('div',{class:'ashby-application-form-input-yesno'},entry);
+    for(const text of ['Yes','No']) {const b=node('button',{text},group); b.type='submit'; delete b.required;}
+  }
+  field('textarea','additional','textarea',spec.additionalCaption || 'Additional information',
+    spec.additionalRequired === true);
   const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),
     class:'ashby-application-form-submit-button',text:'Submit application',
     ...(spec.submitAttrs || {})},wrapper);

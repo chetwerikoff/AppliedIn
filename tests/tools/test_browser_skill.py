@@ -1549,9 +1549,11 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
     from core.models import Status
     stores.tracking.set_status(
         pk, Status.NEEDS_HUMAN, gate_source='applier', gate_call_id='direct',
-        gate_pending={'question': 'Synthetic post-triage owner answer',
-                      'form_question': question, 'review_route': 'owner'})
-    run.resume_job(pk, value, stores)
+        gate_pending=run._direct_gate_pending(
+            'Synthetic post-triage owner answer', question, 'owner'))
+    run.resume_job(pk, value, stores, disposition='answer',
+                   expected_gate_generation=stores.tracking.get(pk)['gate_pending']['generation'],
+                   expected_question_identity=forms.owner_question_identity(pk, question))
     assert stores.tracking.get(pk)['human_approved_answers'] == {
         field: grant(field, value)}
     await run._apply_direct(pk, stores)

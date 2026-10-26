@@ -596,7 +596,8 @@ def test_only_actual_direct_owner_reply_persists_complete_identity(monkeypatch):
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank)
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *args, **kwargs: {'result': 'queued'})
-    assert run.resume_job(PK, answer, stores)['result'] == 'queued'
+    assert run.resume_job(PK, answer, stores, **_owner_reply(tracking, tracking.row))[
+        'result'] == 'queued'
     grant = tracking.row['human_approved_answers']['Email']
     assert all(grant[k] == question[original] for k, original in (
         ('selector', 'selector'), ('url', 'url'), ('label', 'control_label'),
@@ -648,7 +649,8 @@ async def test_radio_approved_caption_creates_exact_owner_grant(monkeypatch):
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply',
                         lambda *a, **kw: (queued.append(kw) or {'result': 'queued'}))
-    assert run.resume_job(PK, 'Approved', stores)['result'] == 'queued'
+    assert run.resume_job(PK, 'Approved', stores,
+                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
     grant = row['human_approved_answers']['Review status']
     assert grant['value'] == 'Approved'
     assert grant['radio_name'] == 'review_status'
@@ -1485,7 +1487,8 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
                        gate_call_id='direct',
                        gate_pending={'question': forms._choice_prompt(target, question),
                                      'form_question': question})
-            assert run.resume_job(PK, answer, stores)['result'] == 'queued'
+            assert run.resume_job(PK, answer, stores, **_owner_reply(stores.tracking, row))[
+                'result'] == 'queued'
             assert row['human_approved_answers'][key]['value'] == answer
             row['status'] = 'submitting'
         else:
@@ -1556,7 +1559,7 @@ async def test_required_checkbox_owner_no_terminates_without_retry_or_bank(
     row.update(status='needs_human', gate_source='applier',
                gate_call_id='direct',
                gate_pending={'question': prompt, 'form_question': question})
-    refused = run.resume_job(PK, 'no', stores)
+    refused = run.resume_job(PK, 'no', stores, **_owner_reply(stores.tracking, row))
     assert refused['result'] == 'gated'
     assert refused['reason'] == 'cannot_proceed'
     assert 'Cannot proceed' in refused['detail']
@@ -2390,7 +2393,8 @@ async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_wi
         answer_bank=SimpleNamespace(put=lambda *args, **kwargs: None))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *args, **kwargs: {'result': 'queued'})
-    assert run.resume_job(pk, 'approved synthetic answer', stores)['result'] == 'queued'
+    assert run.resume_job(pk, 'approved synthetic answer', stores,
+                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
     assert row['human_approved_answers'][question['label']][
         'verified_redirect_url'] == target
 
@@ -3927,7 +3931,8 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
                                  saved.update({name: value})))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
-    assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
+    assert run.resume_job(PK, 'I agree', stores,
+                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
     # The exact per-job grant is the only consent store: not the fact bank.
     assert saved == {}
     grant = row['human_approved_answers']['Processing consent?']
@@ -5704,3 +5709,27 @@ async def test_issue182_two_granted_closed_material_pickers_and_rebootstrap(monk
     assert effects.count(('click', '#accept-secondary')) == 1
     assert not any(call[0] in {'upload', 'select'} for call in effects)
     assert row['status'] == 'submitting' and not row['possible_submission']
+
+
+def _owner_reply(tracking, row):
+    """Issue #202 r07: reissue the hand-built direct gate with a fresh
+    generation, give the row stub the storage contract's own consume, and
+    return the exact current-gate tokens the dashboard sends."""
+    from agent import run
+    from core.storage.base import direct_gate_patch
+    pending = row['gate_pending']
+    row['gate_pending'] = run._direct_gate_pending(
+        pending.get('question'), pending['form_question'], 'owner')
+
+    def consume(pk, *, expected_pending, disposition, grant=None, skip=None):
+        patch = direct_gate_patch(row, expected_pending, disposition, grant, skip)
+        if patch is None:
+            return False
+        row.update(deepcopy(patch))
+        return True
+
+    tracking.consume_direct_form_gate = consume
+    return {'disposition': 'answer',
+            'expected_gate_generation': row['gate_pending']['generation'],
+            'expected_question_identity': forms.owner_question_identity(
+                row['pk'], row['gate_pending']['form_question'])}

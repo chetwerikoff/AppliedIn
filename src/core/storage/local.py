@@ -29,7 +29,7 @@ from .base import (
     guard_observation_matches,
     guard_patch,
     canonical_repair_row_allowed, canonical_repair_same_witness,
-    canonical_repair_patch,
+    canonical_repair_patch, direct_gate_patch,
 )
 
 
@@ -272,6 +272,48 @@ class RedisTracking(AbstractTracking):
                 # Keep the caller's ORIGINAL expected status and witness.
                 continue
         raise RuntimeError("Tracking row could not be updated after WATCH contention")
+
+    def consume_direct_form_gate(
+        self, pk: str, *, expected_pending: dict, disposition: dict,
+        grant: tuple[str, dict] | None = None,
+        skip: tuple[str, dict] | None = None,
+    ) -> bool:
+        """WATCH the row and its durable hold; spend the gate in one MULTI.
+
+        A concurrent reply that commits first changes the row, so the loser's
+        WATCH fires and its retry sees a cleared gate and returns False.
+        """
+        key, hold = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold)
+                    raw = pipe.get(key)
+                    if raw is None or pipe.get(hold) is not None:
+                        pipe.unwatch()
+                        return False
+                    row = json.loads(raw)
+                    patch = direct_gate_patch(row, expected_pending, disposition,
+                                              grant, skip)
+                    if patch is None:
+                        pipe.unwatch()
+                        return False
+                    previous = row.get("status")
+                    row.update(patch)
+                    if row["status"] == "tailored" and not row.get("tailored_at"):
+                        from datetime import datetime
+                        row["tailored_at"] = datetime.now(UTC).isoformat()
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if not is_internal_pk(pk):
+                        if previous and previous != row["status"]:
+                            pipe.srem(f"status:{previous}", pk)
+                        pipe.sadd(f"status:{row['status']}", pk)
+                    pipe.execute()
+                    return True
+            except WatchError:
+                continue
+        raise RuntimeError("Direct owner gate could not be consumed after WATCH contention")
 
     def repair_legacy_jd_url(
         self, pk: str, company: str, job_id: str, old_url: str,

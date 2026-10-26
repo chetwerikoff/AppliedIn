@@ -3294,16 +3294,18 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
     return None
 
 
-def _unanswered(page: dict, target: dict) -> bool:
+def _unanswered(page: dict, target: dict, *, owner_all: bool = False) -> bool:
+    """owner_all treats every receiver as owner-required (sibling-mismatch route)."""
+    required = (lambda c: True) if owner_all else (lambda c: bool(c.get('required')))
     if target.get('type') == 'button' and _formless_root(page):
         try:
             members = _boolean_pair(page, target)
         except Gate:
             members = [target]
-        return any(c.get('required') for c in members) and not any(
+        return any(required(c) for c in members) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
-        return bool(target.get('required')) and not target.get('checked')
+        return required(target) and not target.get('checked')
     if target.get('type') == 'radio':
         try:
             members = _radio_group(page, target)
@@ -3313,12 +3315,14 @@ def _unanswered(page: dict, target: dict) -> bool:
             # requires _bound_target/_radio_group; final Submit independently
             # checks every required choice and its approved readback.
             members = [target]
-        return any(c.get('required') for c in members) and not any(
+        return any(required(c) for c in members) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
-        return bool(target.get('required')) and not combo.get('selected_text')
-    return bool(target.get('required')) and not target.get('has_value')
+        # On the owner-asks-every route a typed value is never overwritten.
+        return required(target) and not combo.get('selected_text') and not (
+            owner_all and target.get('has_value'))
+    return required(target) and not target.get('has_value')
 
 
 def _choice_prompt(target: dict, question: dict) -> str:
@@ -3383,7 +3387,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
                             provenance=None, fixture_context=None):
     """Resolve a PAGE-bound native choice from the existing exact grant, not facts."""
     _require_native_choice(target)
-    if not _unanswered(page, target):
+    if not _unanswered(page, target, owner_all=_owner_asks_every_receiver(page)):
         raise Gate('Only required, unanswered native choices can use a grant.')
     key = _key(page, target)
     if target.get('type') == 'checkbox':
@@ -3623,7 +3627,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     key = _key(page, target)
     if not reversible:
         _form_subject(page, target)
-    if bootstrap and (not _unanswered(page, target)
+    if bootstrap and (not _unanswered(page, target,
+                                      owner_all=_owner_asks_every_receiver(page))
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
@@ -4759,6 +4764,16 @@ def _required_owner_gate_type(target: dict) -> str:
     return kind.lower().replace('-', '_')
 
 
+def _owner_asks_every_receiver(page: dict) -> bool:
+    """ARCH14:39: on the reversible route admitted despite a sibling-identity
+    mismatch, Ashby's own requiredness (a per-build title class) is not
+    readable, so every admitted unanswered receiver is owner-asked in field
+    order. A root-verified page keeps native-required semantics."""
+    structural = _formless_root(page)
+    return bool(structural and not structural.get('root')
+                and structural.get('error') == 'application root sibling identity mismatch')
+
+
 def _required_owner_gate_admitted(page: dict, provenance) -> bool:
     """An unproven historic root permits preparation, not unsafe disclosure."""
     structural = _formless_root(page)
@@ -4792,7 +4807,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     the model then produced an unanswerable prose gate. A fresh independent
     witness supplies this per-control question, never the model's description.
     """
-    if not any(c.get('required') and _unanswered(page, c)
+    every = _owner_asks_every_receiver(page)
+    if not any((every or c.get('required')) and _unanswered(page, c, owner_all=every)
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
         return None
@@ -4838,9 +4854,14 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}
+    every = _owner_asks_every_receiver(current)
     for item in current['controls']:
         kind = item.get('type')
-        if (not item.get('required') or not _unanswered(current, item)
+        # On that route an optional receiver outside the admitted scope (a
+        # toggle, the dropzone, a hidden proxy) is skipped, never a defect.
+        owner_needed = item.get('required') or (
+            every and item.get('selector') in scope)
+        if (not owner_needed or not _unanswered(current, item, owner_all=every)
                 or kind in {'file', 'hidden', 'password', 'submit', 'image'}
                 or native_submit(item)):
             continue
@@ -5366,7 +5387,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         target = control(observed, action, 'execute-observe')
         if verb == 'choose':
             _require_guarded_choice(observed, target)
-            if not _unanswered(observed, target):
+            if not _unanswered(observed, target,
+                               owner_all=_owner_asks_every_receiver(observed)):
                 raise Gate('Only required, unanswered native choices can be selected.')
         else:
             _require_native_action(target, verb)
@@ -5487,7 +5509,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_guarded_choice(latest, current)
-            if not _unanswered(latest, current):
+            if not _unanswered(latest, current,
+                               owner_all=_owner_asks_every_receiver(latest)):
                 raise Gate('The required choice is no longer unanswered.')
         else:
             _require_native_action(current, verb)

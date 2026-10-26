@@ -621,10 +621,10 @@ _LIVE_ENTRIES = r"""
   const location=node('div',{},entry('Synthetic location','synthetic-unbound-location'));
   // A typeless input still reports type text, and the live picker is closed
   // (an unlinked open combobox would make the whole inventory opaque).
-  node('input',{role:'combobox',required:__REQUIRED__,'aria-autocomplete':'list',
+  node('input',{role:'combobox','aria-autocomplete':'list',
     'aria-expanded':'false',placeholder:'Start typing'},location).type='text';
   untyped(location,{'aria-label':'Toggle'});
-  node('input',{type:'text',required:__REQUIRED__,placeholder:'Pick date'},
+  node('input',{type:'text',required:true,placeholder:'Pick date'},
     node('div',{},node('div',{},entry('Synthetic start date','synthetic-unbound-date'))));
   const group=node('div',{class:'ashby-application-form-input-yesno'},
     entry('Synthetic Boolean question','synthetic-unbound-boolean'));
@@ -731,25 +731,6 @@ def test_title_marker_never_makes_a_receiver_required():
     assert location['required'] is False
     assert evidence[location['selector']]['required'] is False
 
-
-@pytest.mark.asyncio
-async def test_unmarked_yes_no_pair_still_gets_bound_owner_question(monkeypatch, tmp_path):
-    row, endpoint, decision, stores, pdf = _live_census(
-        monkeypatch, tmp_path, required=False)
-    page = endpoint.current
-    facts, asked = {}, []
-    for answer in ('Synthetic User', 'synthetic@example-co.test', 'No'):
-        gate = await _apply(pdf, dict(facts))
-        q = _answer(row, stores, gate, answer)
-        asked.append(q['selector'])
-        facts[q['label']] = answer
-    assert asked == ['#_systemfield_name', '#_systemfield_email',
-                     _by_locator(page, _YES)['selector']]
-    assert [m['caption'] for m in row['gate_pending']['form_question']['boolean_members']] == [
-        'Yes', 'No']
-    assert not decision.await_count
-    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
-
 def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_path):
     """Every live control was refused by the root error, not by its own evidence."""
     _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
@@ -764,25 +745,61 @@ def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_pat
     assert toggle['selector'] not in scope
 
 
-@pytest.mark.asyncio
-async def test_live_census_owner_questions_follow_field_order(monkeypatch, tmp_path):
-    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
-    page = endpoint.current
+async def _owner_order(row, endpoint, stores, pdf):
     facts, asked = {}, []
-    for answer in ('Synthetic User', 'synthetic@example-co.test', 'Remote',
-                   '2026-11-10', 'No'):
+    while True:
         gate = await _apply(pdf, dict(facts))
-        q = _answer(row, stores, gate, answer)
+        if gate.get('reason') != 'owner_question':
+            return asked, gate
+        q = gate['form_question']
+        kind = next(c['type'] for c in endpoint.current['controls']
+                    if c['selector'] == q['selector'])
+        answer = {'button': 'No', 'combobox': 'Remote'}.get(kind, 'Synthetic answer')
+        _answer(row, stores, gate, answer)
         asked.append(q['selector'])
         facts[q['label']] = answer
+        assert len(asked) < 12
+
+
+@pytest.mark.asyncio
+async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, tmp_path):
+    """ARCH14:39: on the sibling-mismatch route every admitted unanswered
+    receiver is owner-asked in field order, natively required or not."""
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    page = endpoint.current
+    model_calls = []
+    decision.side_effect = lambda *a, **k: model_calls.append(len(row.get(
+        'human_approved_answers') or {})) or forms.Gate('synthetic model stop')
+    asked, _ = await _owner_order(row, endpoint, stores, pdf)
     assert asked == ['#_systemfield_name', '#_systemfield_email',
-                     *(_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES))]
-    boolean = row['gate_pending']['form_question']
-    assert boolean['label'] == 'Synthetic Boolean question'
-    assert [m['caption'] for m in boolean['boolean_members']] == ['Yes', 'No']
-    assert not decision.await_count
+                     *(_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES)),
+                     '#additional']
+    # Location and the textarea are optional on the live page; both were asked.
+    assert not _by_locator(page, _LOCATION)['required']
+    boolean = row['human_approved_answers']['Synthetic Boolean question']
+    assert boolean
+    # The model is reached only once every owner question is answered.
+    assert model_calls and all(n == len(asked) for n in model_calls)
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
 
+
+@pytest.mark.asyncio
+async def test_prevalued_receiver_is_never_owner_asked(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(
+        monkeypatch, tmp_path, mutate="location.children[0].value='Synthetic city';")
+    asked, _ = await _owner_order(row, endpoint, stores, pdf)
+    assert _by_locator(endpoint.current, _LOCATION)['selector'] not in asked
+    assert _by_locator(endpoint.current, _DATE)['selector'] in asked
+
+
+def test_only_the_sibling_mismatch_route_asks_every_receiver():
+    page, _ = _live_dom()
+    assert forms._owner_asks_every_receiver(page)
+    for change in ({'error': 'ambiguous application roots'},
+                   {'root': '#application-root'}):
+        changed = deepcopy(page)
+        changed['entry']['formless'].update(change)
+        assert not forms._owner_asks_every_receiver(changed)
 
 @pytest.mark.parametrize('error', [
     'ambiguous application roots', 'unsupported custom control', 'other'])
@@ -881,14 +898,18 @@ def test_receiver_defect_names_structure_never_ids_or_values(monkeypatch, tmp_pa
     {'movePane': True}, {'moveSubmit': True},
 ])
 @pytest.mark.asyncio
-async def test_tolerated_mismatch_without_required_receiver_keeps_final_guard(
+async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_guard(
         monkeypatch, tmp_path, spec):
-    """With nothing left for the owner, the sibling mismatch still blocks Submit."""
+    """With every receiver valued, the sibling mismatch still blocks Submit."""
     def optional(snapshots):
+        # Already-valued receivers are never re-asked, so nothing is left for
+        # the owner on this route and preparation reaches the final guard.
         for snapshot in snapshots:
             for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                if c.get('type') not in {'file', 'submit'}:
-                    c['required'] = False
+                if c.get('type') not in {'file', 'submit'} and c.get('tag') != 'button':
+                    c['value'] = 'Synthetic value'
+                    if 'has_value' in c:
+                        c['has_value'] = True
 
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     row, raw, decide, _ = root_world(monkeypatch, **spec)

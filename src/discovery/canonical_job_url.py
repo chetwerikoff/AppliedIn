@@ -118,7 +118,10 @@ def source_bound(company: CompanyConfig, raw: CompanyConfig) -> bool:
     p = _literal(raw.careers_url.rstrip("/"))
     if p and company.ats in _HOSTS and p.netloc in _HOSTS[company.ats]:
         return p.path == f"/{company.board}" and bool(company.board)
-    # The deployed raw tuple must contain explicit ats, board, mode and source.
+    # If the raw entry did not explicitly claim *this exact* ATS and board,
+    # no deployed-tuple search may upgrade a resolver guess to proof.
+    if raw.ats != company.ats or raw.board != company.board:
+        return False
     from .tenant_pin import reviewed_tuple
     return reviewed_tuple(company.name, expected=company) is not None
 

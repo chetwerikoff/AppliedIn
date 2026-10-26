@@ -2234,3 +2234,82 @@ def test_wait_unstable_pair_never_survives_into_a_later_failed_sample():
     diagnostics.set('pair.stable', True)
     diagnostics.sample(False)
     assert diagnostics.state['pair.stable'] == 'unknown/unavailable'
+
+
+
+# main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
+# Hash the *entire* protected producer/consumer sources, excluding only the
+# pre-browser query-attempt classifier whose implementation #201 may change.
+# This covers nested _authorized, final Submit, source/board/job proof literals
+# and helpers, not just the named entry functions or decoded characters.
+_ISSUE201_MAIN_SHA256 = {
+    "src/tools/browser_skill_apply.py": "fb5504e1a20439d994841a31001a1d67752c2f5553a1b7b71be2265d194e3223",
+    "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
+    "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
+    "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
+    "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
+}
+
+
+def _issue201_without_prebrowser_classifier(source: bytes) -> bytes:
+    """Remove only the allowed top-level predicate; preserve all other bytes."""
+    lines = source.split(b"\n")
+    starts = [i for i, line in enumerate(lines)
+              if line.startswith(b"def _greenhouse_id_query_attempt(")]
+    assert len(starts) == 1
+    start = starts[0]
+    cursor = start + 1
+    while (cursor < len(lines)
+           and (not lines[cursor].strip()
+                or lines[cursor].startswith((b" ", b"\t")))):
+        cursor += 1
+    # No extra top-level helper/proof change may be hidden in the exception.
+    assert cursor < len(lines) and lines[cursor].startswith(b"def _configured_alias(")
+    end = cursor
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return b"\n".join(lines[:start] + lines[end:])
+
+
+def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
+    import hashlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for filename, baseline in _ISSUE201_MAIN_SHA256.items():
+        source = (root / filename).read_bytes()
+        if filename == "src/tools/browser_skill_apply.py":
+            source = _issue201_without_prebrowser_classifier(source)
+        actual = hashlib.sha256(source).hexdigest()
+        assert actual == baseline, (filename, actual, baseline)
+
+
+def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():
+    from discovery.watchlist import CompanyConfig
+
+    company = "example-co"
+    cfg = CompanyConfig(
+        name=company, ats="greenhouse", board="example-board",
+        careers_url="https://careers.example-co.test/openings")
+    for host in ("job-boards.greenhouse.io", "boards.greenhouse.io"):
+        url = f"https://{host}/example-board/jobs/731205"
+        pk = "example-co#731205"
+        row = {"pk": pk, "company": company, "job_id": "731205",
+               "ats": "greenhouse", "jd_url": url,
+               "greenhouse_board": "example-board"}
+        assert forms.verified_greenhouse_alias(
+            row, pk=pk, company=company, url=url, configs=[cfg]) is None
+
+    jid = "123e4567-e89b-42d3-a456-426614174000"
+    pk = f"example-co#{jid}"
+    for ats, host in (("ashby", "jobs.ashbyhq.com"),
+                      ("lever", "jobs.lever.co")):
+        for board, admitted in (("example-board", True), ("example.co", False)):
+            url = f"https://{host}/{board}/{jid}"
+            cfg = CompanyConfig(
+                name=company, ats=ats, board=board,
+                careers_url=f"https://{host}/{board}")
+            row = {"pk": pk, "company": company, "job_id": jid,
+                   "ats": ats, "jd_url": url}
+            actual = forms._application_entry(row, pk, company, url, [cfg])
+            assert (actual is not None) is admitted

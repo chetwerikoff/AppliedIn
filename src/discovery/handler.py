@@ -23,6 +23,7 @@ from core.models import DiscoveryMode, Status
 from core.stores import make_stores
 
 from .adapters import ADAPTERS
+from .canonical_job_url import admit_feed
 from . import progress
 from .relevance import relevant
 from .resolver import BROWSER_HEADERS, resolve
@@ -87,6 +88,7 @@ def discover_company(
     client: httpx.Client,
     tailor_queue_url: str,
     profile_id: str = "",
+    *, raw_source: CompanyConfig | None = None,
 ) -> int:
     """Discover one company; returns the number of jobs newly enqueued."""
     from core.events import emit
@@ -106,7 +108,19 @@ def discover_company(
         progress.record(note="Could not read the job feed. Check the careers URL and retry.")
         return 0
 
-    progress.record(found=len(fetched), stage="Matching preferences")
+    # Before preference screening (and especially before seen/put/queue), prove
+    # the *raw* employer source instead of trusting an effective resolver board.
+    observed_count = len(fetched)
+    fetched, rejected = admit_feed(company, raw_source or company, fetched)
+    if rejected:
+        for diagnostic in rejected:
+            log.warning("%s: %s at %s; %s", company.name,
+                        diagnostic["status"], diagnostic["pk"],
+                        diagnostic["next_action"])
+        progress.record(note=(f"{len(rejected)} posting(s) refused: "
+                              f"{rejected[0]['status']}. "
+                              f"{rejected[0]['next_action']}")[:160])
+    progress.record(found=observed_count, stage="Matching preferences")
     from core import flags as _flags
 
     # Per-company preference OVERRIDES first (dashboard): the same fields as the
@@ -526,7 +540,8 @@ def _run_discovery(only: list[str] | None, profile_id: str,
                         if company.discovery is DiscoveryMode.FEED:
                             n = discover_company(company, prefs, stores.tracking,
                                                  stores.queue, client,
-                                                 stores.tailor_queue, profile_id)
+                                                 stores.tailor_queue, profile_id,
+                                                 raw_source=raw)
                             total += n
                         else:
                             n = crawl_company(company, prefs, stores)

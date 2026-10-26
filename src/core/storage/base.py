@@ -345,6 +345,116 @@ def guard_patch(current: dict, inspected: dict | None,
     merged = pg.merge(cleaned, meta, old_meta, source_witness=source_witness)
     return {"jd_text": merged["text"], "posting_guard": merged["posting_guard"]}
 
+
+
+# A separate, stricter one-PK URL replacement may not reuse the legacy #22
+# relative recrawl guard. Its frozen observation compares identity, reader,
+# guard/review, known browser/submit evidence and even absent named attributes.
+CANONICAL_REPAIR_FIELDS = tuple(dict.fromkeys((
+    "pk", "company", "job_id", "ats", "jd_url", "greenhouse_board",
+    "status", "fail_kind", "attempts", "apply_requested_at",
+    "posting_guard", "reviewed_guard_generation", "gate_reason",
+) + REPAIR_READER_FIELDS + REPAIR_PROTECTED_FIELDS + PIN_WITNESS_FIELDS
+    + _GUARD_COMPARE))
+
+
+def canonical_repair_witness_fields(original: dict) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        CANONICAL_REPAIR_FIELDS + tuple(
+            key for key in original if isinstance(key, str)
+            and key.startswith(_PIN_WITNESS_PREFIXES)
+        )
+    ))
+
+
+def canonical_repair_same_witness(current: dict | None, original: dict) -> bool:
+    if not isinstance(current, dict) or not isinstance(original, dict):
+        return False
+    keys = set(canonical_repair_witness_fields(original))
+    keys.update(canonical_repair_witness_fields(current))
+    return all(
+        (field in current) == (field in original)
+        and (field not in current or (
+            type(current[field]) is type(original[field])
+            and current[field] == original[field]
+        ))
+        for field in keys
+    )
+
+
+def canonical_repair_row_allowed(row: dict | None, pk: str) -> bool:
+    """One dormant, unreviewed source whose prior JD can be invalidated."""
+    if (not isinstance(row, dict) or row.get("pk") != pk
+            or not isinstance(row.get("company"), str)
+            or not isinstance(row.get("job_id"), str)
+            or not row["company"] or not row["job_id"]
+            or make_pk(row["company"], row["job_id"]) != pk
+            or row.get("ats") not in ("greenhouse", "ashby", "lever")
+            or not isinstance(row.get("jd_url"), str)):
+        return False
+    status = row.get("status")
+    if (status == "found" and row.get("fail_kind") not in (None, "")):
+        return False
+    if (status == "error" and row.get("fail_kind") != "jd_reader_exhausted"):
+        return False
+    if status not in ("found", "error"):
+        return False
+    if row.get("apply_requested_at", "") != "":
+        return False
+    # Presence of a hold, review, gate, or browser/session record is itself
+    # history, including empty/NULL/false values.
+    if any(k in row for k in (
+        "reviewed_guard_generation", "submit_hold", "submit_hold_at",
+        "submit_hold_reason", "fields", "screenshot_s3_key",
+        "gate_pending", "gate_call_id", "gate_source", "gate_reason",
+        "approval", "approved", "approved_at", "approval_at",
+        "approval_status", "human_approved", "human_approved_answers",
+        "last_button", "last_url", "notes",
+    )):
+        return False
+    if any(k in row for k in REPAIR_PROTECTED_FIELDS
+           if k != "apply_requested_at"):
+        return False
+    if any(isinstance(k, str) and k.startswith((
+            "approval_", "approved_", "human_approved_", "gate_",
+            "browser_", "session_", "form_", "submit_", "submission_",
+            "confirmation_", "application_session", "last_",
+            "apply_started_", "application_attempted_", "application_submitted_"))
+           for k in row):
+        return False
+    revision = row.get("jd_read_revision", 0)
+    if (isinstance(revision, bool) or not isinstance(revision, (int, Decimal))
+            or revision < 0 or revision != int(revision)):
+        return False
+    retry = row.get("jd_read_retry_at")
+    if retry not in (None, ""):
+        try:
+            until = datetime.fromisoformat(str(retry).replace("Z", "+00:00"))
+            if until.tzinfo is None or until > datetime.now(UTC):
+                return False
+        except (ValueError, TypeError, OverflowError):
+            return False
+    return True
+
+
+def canonical_repair_patch(row: dict, new_url: str) -> tuple[dict, tuple[str, ...]]:
+    """Rebind no trust: the next read must fetch the *new* URL's source HTML."""
+    from tools import posting_guard as pg
+
+    if not isinstance(new_url, str) or not new_url.startswith("https://"):
+        raise ValueError("Expected an independently proven literal hosted URL")
+    patch = {
+        "jd_url": new_url, "status": Status.FOUND.value,
+        "jd_read_attempts": 0,
+        "jd_read_revision": int(row.get("jd_read_revision", 0)) + 1,
+        "jd_text": "",
+        "posting_guard": pg.analyze("", source_required=True)["posting_guard"],
+    }
+    removes = ["jd_read_retry_at", "reviewed_guard_generation"]
+    if row["status"] == Status.ERROR.value:
+        removes.append("fail_kind")
+    return patch, tuple(removes)
+
 class AbstractTracking(ABC):
     """The application tracking store (cloud: DynamoDB `applications`)."""
 
@@ -412,6 +522,17 @@ class AbstractTracking(ABC):
         refuse submission evidence, and advance the reader generation once.
         Missing rows and conditional conflicts return False; other errors raise.
         """
+
+    def replace_noncanonical_jd_url(
+        self, pk: str, new_url: str, *, expected_row: dict,
+    ) -> bool:
+        """Exact-PK, guarded, partial/no-upsert rebind after external preflight.
+
+        The caller must independently prove old retained source, current feed
+        and admission by unchanged Submit route *immediately* before this call.
+        No existing current R1/R2/R3 Greenhouse class grants that authority.
+        """
+        raise NotImplementedError
 
     def add_missing_greenhouse_pin(
         self, pk: str, board: str, *, expected_row: dict,

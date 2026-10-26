@@ -19,6 +19,8 @@ from .base import (
     tenant_pin_witness_fields, tenant_pin_same_witness,
     guard_observation_matches, guard_patch, _GUARD_COMPARE,
     DIRECT_GATE_COMPARE, direct_gate_patch,
+    canonical_repair_row_allowed, canonical_repair_same_witness,
+    canonical_repair_witness_fields, canonical_repair_patch,
 )
 from ..ids import is_internal_pk
 
@@ -323,6 +325,57 @@ class TrackingStore(AbstractTracking):
             self._table.update_item(
                 Key={"pk": pk},
                 UpdateExpression=updates,
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def replace_noncanonical_jd_url(
+        self, pk: str, new_url: str, *, expected_row: dict,
+    ) -> bool:
+        """Strong read then partial, no-upsert, presence-sensitive UpdateItem.
+
+        A conditional expression can see row-local holds and reviewed guard
+        changes, never the Redis submit_hold:<pk> key in the other backend.
+        """
+        if not canonical_repair_row_allowed(expected_row, pk):
+            return False
+        row = self._table.get_item(
+            Key={"pk": pk}, ConsistentRead=True).get("Item")
+        if (not canonical_repair_same_witness(row, expected_row)
+                or not canonical_repair_row_allowed(row, pk)):
+            return False
+        patch, removes = canonical_repair_patch(row, new_url)
+        names, values = {"#pk": "pk"}, {}
+        conditions = ["attribute_exists(#pk)"]
+        for i, field in enumerate(canonical_repair_witness_fields(expected_row)):
+            attr, val = f"#w{i}", f":w{i}"
+            names[attr] = field
+            if field in expected_row:
+                values[val] = expected_row[field]
+                conditions.append(f"{attr} = {val}")
+            else:
+                conditions.append(f"attribute_not_exists({attr})")
+        sets = []
+        for i, (field, value) in enumerate(patch.items()):
+            attr, val = f"#s{i}", f":s{i}"
+            names[attr], values[val] = field, value
+            sets.append(f"{attr} = {val}")
+        remove_attrs = []
+        for i, field in enumerate(removes):
+            attr = f"#d{i}"
+            names[attr] = field
+            remove_attrs.append(attr)
+        try:
+            self._table.update_item(
+                Key={"pk": pk},
+                UpdateExpression=("SET " + ", ".join(sets) + " REMOVE "
+                                  + ", ".join(remove_attrs)),
                 ConditionExpression=" AND ".join(conditions),
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,

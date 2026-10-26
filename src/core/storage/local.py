@@ -28,7 +28,8 @@ from .base import (
     tenant_pin_same_witness,
     guard_observation_matches,
     guard_patch,
-    direct_gate_patch,
+    canonical_repair_row_allowed, canonical_repair_same_witness,
+    canonical_repair_patch, direct_gate_patch,
 )
 
 
@@ -360,6 +361,42 @@ class RedisTracking(AbstractTracking):
                 # Retry against current data, never a new expected witness.
                 continue
         raise RuntimeError("Legacy URL repair exhausted Redis WATCH contention")
+
+    def replace_noncanonical_jd_url(
+        self, pk: str, new_url: str, *, expected_row: dict,
+    ) -> bool:
+        """Watch original job and independent durable hold; never rebase proof."""
+        if not canonical_repair_row_allowed(expected_row, pk):
+            return False
+        key, hold_key = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold_key)
+                    raw, hold = pipe.get(key), pipe.get(hold_key)
+                    if raw is None or hold is not None:
+                        pipe.unwatch()
+                        return False
+                    row = json.loads(raw)
+                    if (not canonical_repair_same_witness(row, expected_row)
+                            or not canonical_repair_row_allowed(row, pk)):
+                        pipe.unwatch()
+                        return False
+                    patch, removes = canonical_repair_patch(row, new_url)
+                    previous = row["status"]
+                    row.update(patch)
+                    for field in removes:
+                        row.pop(field, None)
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    if previous != "found" and not is_internal_pk(pk):
+                        pipe.srem(f"status:{previous}", pk)
+                        pipe.sadd("status:found", pk)
+                    pipe.execute()
+                    return True
+            except WatchError:
+                continue
+        raise RuntimeError("Canonical URL repair exhausted Redis WATCH contention")
 
     def add_missing_greenhouse_pin(
         self, pk: str, board: str, *, expected_row: dict,

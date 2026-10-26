@@ -190,9 +190,21 @@ def employer_gh_claim(company: CompanyConfig, job: JobRecord) -> bool:
                        p.hostname and p.hostname == c.hostname)
     except ValueError:
         return False
-    return bool(same_source and company.ats == "greenhouse"
-                and job.discovery_source == "sitemap_greenhouse_suffix"
-                and _SUFFIX.search(p.path) is not None)
+    if not (same_source and company.ats == "greenhouse"
+            and _SUFFIX.search(p.path) is not None):
+        return False
+    if job.discovery_source == "sitemap_greenhouse_suffix":
+        return True
+    if job.ats != "sitemap":
+        return False
+    # sitemap_jobs() labels the actual raw XML observation even when the
+    # separate board feed cannot supply a promoted GH record. Treat the exact
+    # #138 reviewed source suffix as a claim BEFORE any fallback row/queue.
+    from .tenant_pin import greenhouse_suffix_id, reviewed_tuple
+
+    cfg = reviewed_tuple(company.name, expected=company, crawl_only=True)
+    return bool(cfg is not None
+                and greenhouse_suffix_id(job.jd_url, cfg.careers_url) is not None)
 
 
 def diagnostic(job: JobRecord, reason: str) -> dict:

@@ -2100,59 +2100,51 @@ def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
 
 
 
-# Issue #201 changes ONLY the pre-browser malformed gh_jid attempt predicate.
-# Keep the raw irreversible click and every existing provenance-producer byte
-# identical to the pre-Issue main baseline, not just behaviourally similar.
-_ISSUE201_MAIN_PROOF_SOURCE = {
-    "src/tools/browser_skill_apply.py": {
-        ("authorize_final_submit", 4): "bb753bea8db66920",
-        ("_configured_alias", 0): "03d59736830eef59",
-        ("_alias_current", 0): "bb974e0e4bcd0218",
-        ("navigation_allowed", 0): "b5e75c92d0d7edc3",
-        ("_tracked_preparation_job", 0): "b027300e2b063e7c",
-        ("_application_entry", 0): "d7be7dd4729aac62",
-        ("_BOARD_TOKEN", 0): "e423624619eb1acd",
-        ("_APPLICATION_ENTRY", 0): "57c4df9f30743723",
-        ("_JOB_UUID", 0): "4b8c646ba6e51e60",
-    },
-    "src/tools/claude_chrome.py": {
-        ("verified_greenhouse_alias", 0): "6b87ea37d14a3c6b",
-        ("greenhouse_alias_candidate", 0): "3eec2b113f70ad02",
-        ("_alias_https_parts", 0): "584f21e17bc6b9e3",
-        ("direct_board_url", 0): "4b1df432ee6ad6f0",
-    },
+# main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
+# Hash the *entire* protected producer/consumer sources, excluding only the
+# pre-browser query-attempt classifier whose implementation #201 may change.
+# This covers nested _authorized, final Submit, source/board/job proof literals
+# and helpers, not just the named entry functions or decoded characters.
+_ISSUE201_MAIN_SHA256 = {
+    "src/tools/browser_skill_apply.py": "fb5504e1a20439d994841a31001a1d67752c2f5553a1b7b71be2265d194e3223",
+    "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
+    "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
+    "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
+    "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
 }
 
 
-def _issue201_definition_source(content, name, indent):
-    """Extract raw definition bytes without AST formatting/normalization."""
-    lines = content.split("\n")
-    leader = " " * indent
-    starts = (f"def {name}(", f"async def {name}(", f"{name} = ")
-    for pos, line in enumerate(lines):
-        if line.startswith(leader) and line[indent:].startswith(starts):
-            for end in range(pos + 1, len(lines)):
-                other = lines[end]
-                if (other.strip() and
-                        len(other) - len(other.lstrip()) <= indent):
-                    return "\n".join(lines[pos:end]).rstrip()
-            return "\n".join(lines[pos:]).rstrip()
-    raise AssertionError(f"Missing protected raw-Submit symbol: {name}")
+def _issue201_without_prebrowser_classifier(source: bytes) -> bytes:
+    """Remove only the allowed top-level predicate; preserve all other bytes."""
+    lines = source.split(b"\n")
+    starts = [i for i, line in enumerate(lines)
+              if line.startswith(b"def _greenhouse_id_query_attempt(")]
+    assert len(starts) == 1
+    start = starts[0]
+    cursor = start + 1
+    while (cursor < len(lines)
+           and (not lines[cursor].strip()
+                or lines[cursor].startswith((b" ", b"\t")))):
+        cursor += 1
+    # No extra top-level helper/proof change may be hidden in the exception.
+    assert cursor < len(lines) and lines[cursor].startswith(b"def _configured_alias(")
+    end = cursor
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return b"\n".join(lines[:start] + lines[end:])
 
 
 def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
+    import hashlib
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    for filename, witnesses in _ISSUE201_MAIN_PROOF_SOURCE.items():
-        content = (root / filename).read_text()
-        for (name, indent), baseline in witnesses.items():
-            segment = _issue201_definition_source(content, name, indent)
-            value = 0xcbf29ce484222325
-            for char in segment:
-                value = (value ^ ord(char)) * 0x100000001b3 & ((1 << 64) - 1)
-            assert f"{value:016x}" == baseline, (filename, name)
-
+    for filename, baseline in _ISSUE201_MAIN_SHA256.items():
+        source = (root / filename).read_bytes()
+        if filename == "src/tools/browser_skill_apply.py":
+            source = _issue201_without_prebrowser_classifier(source)
+        actual = hashlib.sha256(source).hexdigest()
+        assert actual == baseline, (filename, actual, baseline)
 
 
 def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():

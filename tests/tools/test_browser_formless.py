@@ -3347,16 +3347,24 @@ async def test_rooted_untyped_yes_no_pair_refuses_unproven_requiredness(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('render', [
+    {},
+    {'additionalCaption': 'Synthetic re-rendered caption'},
+    {'additionalCaption': 'Synthetic re-rendered caption', 'additionalRequired': True},
+], ids=['same-caption', 'changed-caption', 'changed-caption-now-required'])
 async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_rooted(
-        monkeypatch, tmp_path):
-    """Issue #202 AC2: a SKIP taken while requiredness was unknown is not an
-    OPTIONAL answer. Once the root is proven, the still-blank field is asked
-    again even though it carries no native required flag, before the final
-    Submit decision and with no write to that field."""
+        monkeypatch, tmp_path, render):
+    """Issue #202 AC2 (ARCH21:26): a SKIP taken while requiredness was unknown
+    is not an OPTIONAL answer. Once the root is proven every rootless SKIP is
+    void, so the still-blank field is asked again as a normal owner question,
+    before the final Submit decision and with no write to that field. This
+    holds when a conditional render changed its caption, and when it also made
+    the field required."""
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 2)
-    row, raw, decide, _ = root_world(monkeypatch)
-    extra = next(c for c in raw.current['controls'] if c['label'] == 'Additional information')
-    assert extra['required'] is False and not extra.get('has_value')
+    row, raw, decide, _ = root_world(monkeypatch, **render)
+    extra = next(c for c in raw.current['controls'] if c['selector'] == '#additional')
+    assert extra['required'] is render.get('additionalRequired', False)
+    assert not extra.get('has_value')
     row['owner_gate_skips'] = {'q1_synthetic': {
         'identity': 'q1_synthetic', 'route': 'ashby-sibling-mismatch', 'kind': 'textarea',
         'label': 'Additional information', 'generation': 'synthetic-generation'}}
@@ -3381,7 +3389,8 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
         if method == 'upload':
             raw.calls.append((method, *args))
             name = Path(args[2]).name
-            raw.current, raw.fixed = observed(attached=True, files=[name], displayName=name)
+            raw.current, raw.fixed = observed(attached=True, files=[name], displayName=name,
+                                              **render)
             return {}
         return await original_call(method, *args, **kwargs)
     raw.call = call
@@ -3391,9 +3400,13 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert result['reason'] == 'owner_question', (row.get('status'), result['question'][:200])
+    # A now-required blank is the existing required-field owner question.
+    reason = ('agent_review_unavailable' if render.get('additionalRequired')
+              else 'owner_question')
+    assert result['reason'] == reason, (row.get('status'), result['question'][:200])
     assert result['form_question']['selector'] == extra['selector']
-    assert decide.await_count == 1  # asked before the Submit decision
+    assert result['form_question'].get('route') != 'ashby-sibling-mismatch'  # no SKIP offered
+    assert decide.await_count <= 1  # asked before the Submit decision
     assert not [c for c in raw.calls if extra['selector'] in c[1:2]]
     assert not [c for c in raw.calls if c[0] == 'click']
     assert not transport._application_controller.committed

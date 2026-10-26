@@ -2236,6 +2236,23 @@ def test_wait_unstable_pair_never_survives_into_a_later_failed_sample():
     assert diagnostics.state['pair.stable'] == 'unknown/unavailable'
 
 
+@pytest.mark.parametrize('message', [
+    'The tracked job route changed before the application read.',
+    'The current form control inventory is malformed; inspect manually.',
+], ids=['before-safety', 'malformed-null-page'])
+def test_wait_page_gate_without_a_page_never_invents_safety_stages(message):
+    """A PAGE-phase Gate that returned no PAGE ran no reader stage on one:
+    PAGE is unavailable and every safety stage stays unknown, not true/false."""
+    diagnostics = forms._WaitDiagnostics()
+    diagnostics.sample(True)
+    gate = diagnostics.escape(forms.Gate(message), 'page', None, classified=True)
+    predicates = gate.wait_predicates
+    assert predicates['read.page_available'] == 'false'
+    for stage in forms._SAFETY_STAGES:
+        assert predicates[stage] == 'unknown/unavailable', stage
+    assert _wait_map(str(gate)) == predicates
+
+
 
 # main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
 # The four supporting files stay pinned whole. browser_skill_apply.py is pinned

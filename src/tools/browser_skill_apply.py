@@ -4834,18 +4834,17 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         # Ashby entry can carry one into a later root-proven page.
         ashby = (isinstance(provenance, ApplicationEntryProvenance)
                  and provenance.ats == 'ashby')
-        # A skipped field stays blank-relevant without a native required flag.
-        blanks = [] if every or not ashby else [
-            c for c in page['controls'] if _unanswered(page, c, owner_all=True)
-            and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
-        if not blanks:
+        if every or not ashby:
             return None
+        # A skipped field stays blank-relevant without a native required flag.
+        blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
+                  and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
         try:
             early = (_row(pk, fixture_context=fixture_context)
                      if fixture_context is not None else _row(pk))
         except Exception:
             return None
-        if not any(_skipped_label(early, c) for c in blanks):
+        if not (blanks and _rootless_skips(early)):
             return None
     # Synthetic read-only sessions and unguarded legacy routes cannot supply
     # a safely executable direct question. Production writes own this guard.
@@ -4959,18 +4958,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                         reason='defect_' + _required_owner_gate_type(item))
         # A currently bound grant is not a missing answer, even when bootstrap
         # had no new global fact to settle. Stale grants never authorize a write.
-        key = _key(current, item)
-        prior = grants.get(key) if isinstance(grants, dict) else None
-        if isinstance(prior, dict) and isinstance(prior.get('value'), str):
-            try:
-                exact_approval(
-                    pk, key, prior['value'], target=_bound_target(current, item),
-                    url=current['url'], provenance=provenance,
-                    **({'fixture_context': fixture_context} if fixture_context else {}))
-            except Gate:
-                pass
-            else:
-                continue
+        if _currently_granted(current, item, grants, pk, provenance, fixture_context):
+            continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
             closed_witness=_closed_material_combobox(item),
@@ -4980,14 +4969,19 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
             continue
         return Gate(_choice_prompt(item, question), form_question=question,
                     reason='owner_question')
-    if not every:
-        # A field the owner skipped on the rootless route is not optional
-        # once a root is proven: its blank cannot reach the final decision.
+    if not every and _rootless_skips(row):
+        # A proven root voids every rootless SKIP on this job (ARCH21:26): its
+        # field may have re-rendered under another caption, so each blank field
+        # of the kind a SKIP can cover is asked again as a normal owner
+        # question, with no SKIP offered.
         for item in current['controls']:
-            if (item.get('type') in {'file', 'hidden', 'password', 'submit', 'image'}
+            if (item.get('type') in {'file', 'hidden', 'password', 'submit', 'image',
+                                     'checkbox', 'radio', 'button'}
+                    or item.get('tag') not in {'input', 'textarea', 'select', 'div'}
                     or native_submit(item)
                     or not _unanswered(current, item, owner_all=True)
-                    or not _skipped_label(row, item)):
+                    or _currently_granted(current, item, grants, pk, provenance,
+                                          fixture_context)):
                 continue
             question = _disclosure_question(
                 current, item, witness, *origins, bootstrap=False,
@@ -4999,12 +4993,27 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     return None
 
 
-def _skipped_label(row: dict, item: dict) -> bool:
+def _currently_granted(page: dict, item: dict, grants, pk: str, provenance,
+                       fixture_context) -> bool:
+    key = _key(page, item)
+    prior = grants.get(key) if isinstance(grants, dict) else None
+    if not (isinstance(prior, dict) and isinstance(prior.get('value'), str)):
+        return False
+    try:
+        exact_approval(
+            pk, key, prior['value'], target=_bound_target(page, item),
+            url=page['url'], provenance=provenance,
+            **({'fixture_context': fixture_context} if fixture_context else {}))
+    except Gate:
+        return False
+    return True
+
+
+def _rootless_skips(row: dict) -> bool:
+    """Whether this job carries any SKIP taken on the rootless mismatch route."""
     skips = row.get('owner_gate_skips')
-    key = item.get('question') or item.get('label')
-    return (isinstance(skips, dict) and isinstance(key, str) and bool(key.strip())
-            and any(isinstance(r, dict) and isinstance(r.get('label'), str)
-                    and _same(r['label'], key) for r in skips.values()))
+    return isinstance(skips, dict) and any(
+        isinstance(r, dict) and r.get('route') == _MISMATCH_ROUTE for r in skips.values())
 
 
 def _owner_skip_applies(row: dict, pk: str, question: dict, page: dict,
@@ -7211,7 +7220,19 @@ class _WaitDiagnostics:
         if getattr(exc, 'wait_predicates', None) is not None:
             return exc
         if phase == 'safety' or (phase == 'page' and classified):
-            self.safety_failed(page or {}, exc)
+            message = str(exc)
+            if isinstance(page, dict):
+                self.safety_failed(page, exc)
+            elif (isinstance(exc, (CaptchaGate, CaptchaArtifactGate, _EntryNotReady))
+                  or message.startswith('untrusted captcha response control')
+                  or message.startswith('visible hCaptcha challenge control')):
+                # Only _entry_safety's frame/response stages raise these, on a
+                # PAGE it read, after every earlier stage held.
+                self.safety_failed({}, exc)
+            else:
+                # Any other Gate without a PAGE (a null read, a route check
+                # before safety) ran no stage we can name: they stay unknown.
+                self.set('read.page_available', False)
         # A witness-phase Gate returned no complete witness to compare, so
         # its availability and agreement stay unknown rather than "false".
         return self.attach(exc, 'wait')

@@ -216,7 +216,8 @@ if(spec.formless) {
     const group=node('div',{class:'ashby-application-form-input-yesno'},entry);
     for(const text of ['Yes','No']) {const b=node('button',{text},group); b.type='submit'; delete b.required;}
   }
-  field('textarea','additional','textarea','Additional information');
+  field('textarea','additional','textarea',spec.additionalCaption || 'Additional information',
+    spec.additionalRequired === true);
   const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),
     class:'ashby-application-form-submit-button',text:'Submit application',
     ...(spec.submitAttrs || {})},wrapper);

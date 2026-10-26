@@ -116,3 +116,36 @@ def test_reserved_redis_db_slot_is_skipped(tmp_path: Path) -> None:
     _assert_port_only_env(worktree)
     assert _selected_port(worktree) == base + 1
     assert 1 + (_selected_port(worktree) % 15) != 14
+
+
+def test_missing_worktree_fails_without_changing_fake_root_env(tmp_path: Path) -> None:
+    root = tmp_path / "synthetic-root"
+    root.mkdir()
+    root_env = root / ".env"
+    root_env.write_bytes(ROOT_SENTINEL)
+    worktree = tmp_path / "missing worktree"
+
+    home = tmp_path / "isolated-home"
+    shims = home / ".local" / "share" / "mise" / "shims"
+    shims.mkdir(parents=True, exist_ok=True)
+    stub = shims / "uv"
+    stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub.chmod(0o700)
+
+    script = yaml.safe_load(ORCA_YAML.read_text(encoding="utf-8"))["scripts"]["setup"]
+    result = subprocess.run(
+        ["/bin/sh", "-c", script],
+        cwd=root,
+        env={
+            "HOME": str(home),
+            "PATH": os.defpath,
+            "ORCA_ROOT_PATH": str(root),
+            "ORCA_WORKTREE_PATH": str(worktree),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0, result.stderr
+    assert root_env.read_bytes() == ROOT_SENTINEL

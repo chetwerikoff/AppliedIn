@@ -6,7 +6,7 @@ scripts:
   setup: |
     export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:$PATH"
     set -u
-    cd "$ORCA_WORKTREE_PATH"
+    cd "$ORCA_WORKTREE_PATH" || exit 1
 
     # Python env for the worktree (uv shares its download cache, so this is fast).
     uv sync --all-groups

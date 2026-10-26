@@ -599,8 +599,9 @@ async def test_boolean_pair_requires_both_independent_member_captions(monkeypatc
 # Location, Date and the Yes/No pair have no id: their title's for= resolves to
 # nothing, and the pair members are untyped (DOM submit) nameless buttons with
 # a hidden checkbox. Tags, types, classes and nesting are copied; every caption
-# is synthetic. Ashby signals these questions' requiredness in the title, not
-# the DOM, so the synthetic required flags only exercise the owner gates.
+# is synthetic. A real button has no required property, so the pair carries
+# none here; only its title's _required_ class makes it required. The native
+# required inputs exercise the owner gates (live Location was optional).
 _LIVE_ENTRIES = r"""
 (() => {
   const c=document.querySelector('.ashby-application-form-container');
@@ -609,11 +610,12 @@ _LIVE_ENTRIES = r"""
   const entry=(title, owner)=>{
     const e=node('div',{class:'ashby-application-form-field-entry'},c);
     c.children.splice(c.children.indexOf(e),1); c.children.splice(at++,0,e);
-    node('label',{'for':owner,class:'ashby-application-form-question-title',
-      text:title},e);
+    node('label',{'for':owner,class:'ashby-application-form-question-title'+
+      (__REQUIRED__ ? ' _required_x1y2z_9' : ''),text:title},e);
     return e;
   };
-  const untyped=(parent,attrs)=>{const b=node('button',attrs,parent); b.type='submit'; return b;};
+  const untyped=(parent,attrs)=>{
+    const b=node('button',attrs,parent); b.type='submit'; delete b.required; return b;};
   const location=node('div',{},entry('Synthetic location','synthetic-unbound-location'));
   // A typeless input still reports type text, and the live picker is closed
   // (an unlinked open combobox would make the whole inventory opaque).
@@ -624,8 +626,8 @@ _LIVE_ENTRIES = r"""
     node('div',{},node('div',{},entry('Synthetic start date','synthetic-unbound-date'))));
   const group=node('div',{class:'ashby-application-form-input-yesno'},
     entry('Synthetic Boolean question','synthetic-unbound-boolean'));
-  untyped(group,{text:'Yes',required:__REQUIRED__});
-  untyped(group,{text:'No',required:__REQUIRED__});
+  untyped(group,{text:'Yes'});
+  untyped(group,{text:'No'});
   node('input',{type:'checkbox',style:{display:'none'},rect:null},group);
   __MUTATE__
   // Readers enumerate in tree order, as a browser does.
@@ -702,6 +704,33 @@ def test_live_census_reports_the_sibling_mismatch_and_titled_idless_receivers():
     toggle = _by_locator(page, 'div:nth-of-type(4) > div:nth-of-type(1) > button:nth-of-type(1)')
     assert toggle['type'] == 'submit' and evidence[toggle['selector']]['yes_no'] is False
 
+
+
+@pytest.mark.parametrize('required,mutate,expected', [
+    (True, '', True),
+    (False, '', False),
+    # aria-required on the buttons is no substitute for the title marker.
+    (False, "group.children.forEach(b=>b.setAttribute('aria-required','true'));", False),
+])
+def test_yes_no_requiredness_is_only_its_title_marker(required, mutate, expected):
+    """A real button has no required property; only the pair's title can say."""
+    for page in _live_dom(required=required, mutate=mutate):
+        evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+        for suffix in (_YES, _NO):
+            member = _by_locator(page, suffix)
+            assert member['required'] is expected
+            assert evidence[member['selector']]['required'] is expected
+            assert evidence[member['selector']]['title_required'] is expected
+
+
+def test_title_marker_never_makes_other_idless_receivers_required():
+    mutate = "location.children[0].required=false;"
+    page, _ = _live_dom(mutate=mutate)
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    location = _by_locator(page, _LOCATION)
+    assert evidence[location['selector']]['title_required'] is True
+    assert location['required'] is False
+    assert evidence[location['selector']]['required'] is False
 
 def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_path):
     """Every live control was refused by the root error, not by its own evidence."""
@@ -827,3 +856,48 @@ def test_receiver_defect_names_structure_never_ids_or_values(monkeypatch, tmp_pa
     assert f"predicate=value.equal; control={email['diagnostic_locator']}" in text
     assert 'tag=input; type=email.' in text
     assert 'PRIVATE_SYNTHETIC_VALUE' not in text and '_systemfield' not in text
+
+
+@pytest.mark.parametrize('spec', [
+    {'wrapperTag': 'section'}, {'wrapperClass': 'generic'}, {'paneTag': 'section'},
+    {'movePane': True}, {'moveSubmit': True},
+])
+@pytest.mark.asyncio
+async def test_tolerated_mismatch_without_required_receiver_keeps_final_guard(
+        monkeypatch, tmp_path, spec):
+    """With nothing left for the owner, the sibling mismatch still blocks Submit."""
+    def optional(snapshots):
+        for snapshot in snapshots:
+            for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                if c.get('type') not in {'file', 'submit'}:
+                    c['required'] = False
+
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    row, raw, decide, _ = root_world(monkeypatch, **spec)
+    optional((raw.current, raw.fixed))
+    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    file = next(c for c in raw.current['controls']
+                if c['type'] == 'file' and c['label'] == 'Resume')
+    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
+    original_call = raw.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            raw.calls.append((method, *args))
+            name = Path(args[2]).name
+            raw.current, raw.fixed = observed(
+                **spec, attached=True, files=[name], displayName=name)
+            optional((raw.current, raw.fixed))
+            return {}
+        return await original_call(method, *args, **kwargs)
+    raw.call = call
+    decide.side_effect = [dict(action='upload', selector=file['selector']),
+                          dict(action='submit', selector=button['selector'])]
+    result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert 'sibling identity mismatch' in result['question'], result
+    assert decide.await_count == 2
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+        ('upload', file['selector'], '--file', transport._application_controller.resume_path)]
+    assert not transport._application_controller.committed

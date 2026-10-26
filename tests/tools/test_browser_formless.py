@@ -249,22 +249,11 @@ async def admitted(monkeypatch):
     return row, raw, session, page, provenance
 
 
-def _optional_text_fields(raw):
-    """Issue #198: a sibling mismatch still binds owner questions first."""
-    for snapshot in (raw.current, raw.fixed):
-        for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-            if c.get('type') not in {'file', 'submit'}:
-                c['required'] = False
-
-
-async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause,
-                                 optional_fields=False):
+async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     """ARCH21:18 / AC2/AC9: obsolete root proof is final evidence only."""
     # Production permits late hydration up to 90s; this fake never changes shape.
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     row, raw, decide, provenance = root_world(monkeypatch, **changes)
-    if optional_fields:
-        _optional_text_fields(raw)
     transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     file = next(c for c in raw.current['controls']
                 if c['type'] == 'file' and c['label'] == 'Resume')
@@ -280,8 +269,6 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause,
             name = Path(args[2]).name
             raw.current, raw.fixed = observed(
                 **changes, attached=True, files=[name], displayName=name)
-            if optional_fields:
-                _optional_text_fields(raw)
             return {}
         return await original_call(method, *args, **kwargs)
     raw.call = call
@@ -954,11 +941,27 @@ def test_exact_submit_guard_local_cause(monkeypatch, member, value):
     ({'submitAttrs': {'role': 'button'}}, 'exact structural submit changed'),
 ])
 async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
-    if cause in {'sibling identity mismatch', 'ambiguous application roots'}:
-        # The tolerated mismatch admits owner questions; with every text field
-        # answered or optional, it still blocks the final Submit unchanged.
-        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause,
-                                     optional_fields=cause == 'sibling identity mismatch')
+    if cause == 'sibling identity mismatch':
+        # Issue #198 r03: the tolerated mismatch still admits the required,
+        # unanswered Name receiver, so the owner is asked before any model turn.
+        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+        row, raw, decide, _ = root_world(monkeypatch, **spec)
+        transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+        result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                                   pk=PK, resume_path=pdf)
+        assert result['status'] == 'gate', result
+        assert result['reason'] == 'owner_question', result
+        assert result['review_route'] == 'owner', result
+        question = result['form_question']
+        assert question['selector'] == '#_systemfield_name', result
+        assert question['owner_kind'] == 'ashby-reversible-entry', result
+        assert not decide.await_count
+        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
+        assert not transport._application_controller.upload_completed
+        assert not transport._application_controller.committed
+        return
+    if cause == 'ambiguous application roots':
+        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
         return
     _, raw, decide, provenance = root_world(monkeypatch, **spec)
     result = await attempt()

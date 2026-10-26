@@ -133,37 +133,38 @@ def world(monkeypatch, tmp_path):
     return state
 
 
-def test_exact_browser_listing_feed_to_fresh_persisted_alias(world):
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
+def _no_new_gh_application_effects(world):
+    assert world.tracking.put_calls == []
+    assert world.tracking.rows == {}
+    assert world.queue.calls == []
+    assert world.marked == []
+    assert world.seen_urls == set()
+
+
+def test_exact_browser_wrapper_and_fresh_feed_are_observation_not_new_submit_authority(world):
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
     assert len(world.browser_calls) == 1
     assert world.browser_calls[0]["kind"] == "crawl"
     assert world.browser_calls[0]["urls"] == [CAREERS]
     assert world.feed_calls == [BOARD]
-    row = world.tracking.rows[f"{COMPANY}#731205"]
-    assert (row["pk"], row["job_id"], row["jd_url"], row["ats"],
-            row["greenhouse_board"]) == (
-                f"{COMPANY}#731205", "731205", WRAPPER, "greenhouse", BOARD)
-    assert world.queue.calls == [("synthetic-queue", {"pk": row["pk"]})]
-    assert world.marked == [[WRAPPER]]
-    proof = forms._configured_alias(row["pk"], COMPANY, WRAPPER)
+    _no_new_gh_application_effects(world)
+
+
+def test_original_historic_wrapper_can_keep_existing_submit_alias_without_new_discovery(world):
+    # Existing historic rows are not migrated or retagged. Only *new* GH URLs
+    # are refused because the unchanged consumer needs the old wrapper+pin.
+    pk = f"{COMPANY}#731205"
+    existing = dict(pk=pk, company=COMPANY, job_id="731205",
+                    jd_url=WRAPPER, ats="greenhouse",
+                    greenhouse_board=BOARD, status="found")
+    world.tracking.rows[pk] = deepcopy(existing)
+    proof = forms._configured_alias(pk, COMPANY, WRAPPER)
     assert isinstance(proof, forms.GreenhouseJobAlias)
     assert proof.url == HOSTED
     assert forms._alias_current(proof)
-    assert forms.navigation_allowed(HOSTED, WRAPPER, provenance=proof)
-    assert world.tracking.alias_reads == [row["pk"], row["pk"]]
-
-
-def test_employer_origin_feed_url_keeps_configured_board_alias_target(world):
-    world.feed = [board_job(url=WRAPPER)]
-
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    row = world.tracking.rows[f"{COMPANY}#731205"]
-    assert row["greenhouse_board"] == BOARD
-
-    proof = forms._configured_alias(row["pk"], COMPANY, WRAPPER)
-    assert isinstance(proof, forms.GreenhouseJobAlias)
-    assert proof.url == HOSTED
-    assert proof.url != world.feed[0].jd_url
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    assert world.tracking.rows[pk] == existing
+    assert not world.tracking.put_calls and not world.queue.calls
 
 
 @pytest.mark.parametrize("feed", [
@@ -173,38 +174,28 @@ def test_employer_origin_feed_url_keeps_configured_board_alias_target(world):
     [board_job(url="http://job-boards.greenhouse.io/example-board/jobs/731205")],
     [board_job(url="https://foreign.test/example-board/jobs/731205")],
 ])
-def test_feed_witness_missing_duplicate_or_contradictory_stays_crawl(world, feed):
+def test_missing_duplicate_or_contradictory_feed_never_falls_back_to_generic_crawl(world, feed):
     world.feed = feed
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    assert len(world.tracking.rows) == 1
-    row = next(iter(world.tracking.rows.values()))
-    assert row["ats"] == "crawl"
-    assert row["job_id"] == "platform-engineer?gh_jid=731205"
-    assert "greenhouse_board" not in row
-    assert forms._configured_alias(row["pk"], COMPANY, WRAPPER) is None
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_unreadable_feed_stays_ordinary_and_queues(world):
+def test_unreadable_greenhouse_feed_is_not_permission_for_custom_crawl(world):
     world.feed_error = True
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    assert next(iter(world.tracking.rows.values()))["ats"] == "crawl"
-    assert len(world.queue.calls) == 1
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_only_matching_posting_promoted_when_second_is_missing_from_board(world):
+def test_second_unproved_gh_job_still_cannot_fall_back_to_crawl(world):
     world.browser_rows.append(listing("/openings/another?gh_jid=731206"))
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 2
-    by_url = {r["jd_url"]: r for r in world.tracking.rows.values()}
-    assert by_url[WRAPPER]["greenhouse_board"] == BOARD
-    other = by_url[CAREERS + "/another?gh_jid=731206"]
-    assert other["ats"] == "crawl"
-    assert "greenhouse_board" not in other
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_ambiguous_duplicate_wrapper_witness_does_not_pick_first(world):
+def test_duplicate_same_id_query_wrappers_do_not_pick_a_winner(world):
     world.browser_rows.append(listing("/openings/other?gh_jid=731205"))
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 2
-    assert all(r["ats"] == "crawl" for r in world.tracking.rows.values())
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
 @pytest.mark.parametrize("url", [
@@ -213,81 +204,84 @@ def test_ambiguous_duplicate_wrapper_witness_does_not_pick_first(world):
     "http://careers.example-co.test/openings/engineer?gh_jid=731205",
     "https://careers.example-co.test/openings/engineer?board=example-board&gh_jid=731205",
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&x=1",
+    "https://careers.example-co.test/openings/engineer?gh%255Fjid=731205",
+    "https://careers.example-co.test/openings/engineer?gh%25255Fjid=731205",
+    "https://careers.example-co.test/openings/engineer?gh%252525255Fjid=731205",
 ])
-def test_wrong_scope_or_noncanonical_query_is_not_promoted(world, url):
+def test_wrong_scope_or_encoded_and_duplicate_gh_claims_never_fallback(world, url):
     world.browser_rows = [listing(url)]
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    assert next(iter(world.tracking.rows.values()))["ats"] == "crawl"
-    assert not world.feed_calls
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_missing_deployed_authority_keeps_browser_crawl_not_greenhouse(world):
+def test_unreviewed_configured_tuple_cannot_make_gh_wrapper_crawl_safe(world):
     world.write("companies:\n  - name: example-co\n    careers_url: " +
                 CAREERS + "\n    discovery: browser\n")
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    row = next(iter(world.tracking.rows.values()))
-    assert row["ats"] == "crawl"
-    assert "greenhouse_board" not in row
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
     assert not world.feed_calls
 
 
-def test_duplicate_watchlist_company_cannot_authorize_wrapper(world):
+def test_duplicate_raw_watchlist_cannot_grant_gh_source(world):
     data = (world.root / "watchlist.yaml").read_text()
     world.write(data + "\n  - name: EXAMPLE-CO\n    ats: greenhouse\n"
                 "    board: example-board\n    discovery: browser\n"
                 f"    careers_url: {CAREERS}\n")
-    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 1
-    assert next(iter(world.tracking.rows.values()))["ats"] == "crawl"
+    assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
     assert not world.feed_calls
 
 
-def test_sitemap_early_return_never_promotes_matching_gh_jid(world, monkeypatch):
+def test_sitemap_early_return_never_enqueues_gh_query_as_generic(world, monkeypatch):
     monkeypatch.setattr(crawler, "_render_page", lambda *_: "")
     monkeypatch.setattr(crawler, "sitemap_jobs", lambda *a: [
         JobRecord(company=COMPANY, job_id="sitemap-platform-engineer",
-                  title="Platform Engineer", jd_url=WRAPPER, jd_text="sitemap",
-                  ats="sitemap")])
+                  title="Platform Engineer", jd_url=WRAPPER,
+                  jd_text="Synthetic sitemap text", ats="sitemap")])
     monkeypatch.setattr(crawler, "_browser_extract",
                         lambda *a: pytest.fail("sitemap did not early-return"))
-    company = config(discovery=DiscoveryMode.CRAWL)
-    assert crawler.crawl_company(company, Preferences(), world.stores) == 1
-    row = next(iter(world.tracking.rows.values()))
-    assert (row["ats"], row["job_id"]) == ("sitemap", "sitemap-platform-engineer")
-    assert "greenhouse_board" not in row
-    assert world.feed_calls == []
+    assert crawler.crawl_company(
+        config(discovery=DiscoveryMode.CRAWL), Preferences(), world.stores) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_crawl_mode_browser_fallback_never_promotes(world, monkeypatch):
+def test_crawl_mode_browser_fallback_cannot_enque_gh_claim(world, monkeypatch):
     monkeypatch.setattr(crawler, "_render_page", lambda *_: "<html>static</html>")
     monkeypatch.setattr(crawler, "_default_extractor", lambda *a: [])
     monkeypatch.setattr(crawler, "sitemap_jobs", lambda *a: [])
-    company = config(discovery=DiscoveryMode.CRAWL)
-    assert crawler.crawl_company(company, Preferences(), world.stores) == 1
-    row = next(iter(world.tracking.rows.values()))
-    assert row["ats"] == "crawl"
-    assert "greenhouse_board" not in row
+    assert crawler.crawl_company(
+        config(discovery=DiscoveryMode.CRAWL), Preferences(), world.stores) == 0
     assert len(world.browser_calls) == 1
-    assert world.feed_calls == []
+    _no_new_gh_application_effects(world)
 
 
-def test_injected_extractor_never_promotes_even_in_browser_mode(world, monkeypatch):
+def test_injected_extractor_claimed_gh_query_never_enqueues_as_custom(world, monkeypatch):
     monkeypatch.setattr(crawler, "_render_page", lambda *_: "<html>static</html>")
     fake = lambda *a: [JobRecord(company=COMPANY, job_id="plain-slug",
                                  title="Platform Engineer", jd_url=WRAPPER,
-                                 jd_text="plain extraction", ats="custom")]
-    assert crawler.crawl_company(world.config, Preferences(), world.stores,
-                                 extractor=fake) == 1
-    row = next(iter(world.tracking.rows.values()))
-    assert row["ats"] == "custom" and "greenhouse_board" not in row
-    assert world.feed_calls == []
+                                 jd_text="Synthetic extraction", ats="custom")]
+    assert crawler.crawl_company(
+        world.config, Preferences(), world.stores, extractor=fake) == 0
+    _no_new_gh_application_effects(world)
 
 
-def test_new_identity_does_not_backfill_or_overwrite_existing_crawl_row(world):
-    # Same exact pk as the promoted candidate already exists from an older scan.
+def test_new_identity_does_not_overwrite_an_existing_old_crawl_row(world):
     pk = f"{COMPANY}#731205"
     old = dict(pk=pk, company=COMPANY, job_id="731205", ats="crawl",
                jd_url=WRAPPER, status="found")
     world.tracking.rows[pk] = deepcopy(old)
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
     assert world.tracking.rows[pk] == old
-    assert world.queue.calls == []
+    assert not world.queue.calls and not world.tracking.put_calls
+
+
+def test_marker_free_custom_posting_keeps_ordinary_crawl_path(world, monkeypatch):
+    monkeypatch.setattr(crawler, "_render_page", lambda *_: "<html>static</html>")
+    fake = lambda *a: [JobRecord(company=COMPANY, job_id="normal-slug",
+                                 title="Test Engineer",
+                                 jd_url=CAREERS + "/normal-slug",
+                                 jd_text="Synthetic page", ats="custom")]
+    assert crawler.crawl_company(
+        world.config, Preferences(), world.stores, extractor=fake) == 1
+    assert len(world.tracking.rows) == 1
+    assert world.queue.calls and world.marked

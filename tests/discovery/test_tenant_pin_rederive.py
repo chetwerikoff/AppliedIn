@@ -11,6 +11,12 @@ from discovery import tenant_pin
 from discovery.adapters.ashby import AshbyAdapter
 from discovery.adapters.greenhouse import GreenhouseAdapter
 from discovery.adapters.lever import LeverAdapter
+from core.ids import make_pk
+from core.models import DiscoveryMode
+from discovery.tenant_pin import greenhouse_query_id, greenhouse_suffix_id, reviewed_tuple
+from discovery.watchlist import CompanyConfig
+from tools.browser_skill_apply import _application_entry
+from tools.claude_chrome import verified_greenhouse_alias
 
 PK = "example-co#731205"
 CAREERS = "https://careers.example-co.test/openings"
@@ -272,3 +278,99 @@ def test_pristine_unrequested_row_keeps_data_only_eligibility(world):
     assert report["would_pin"] and not report["committed"]
     assert world.tracking.row == unchanged
     assert world.tracking.writes == 0
+
+
+# Issue #201 AC2/AC5: additional read-only grammar and consumer regressions.
+# Keep the pre-existing single-PK pin, dry-run, history and CAS suite intact.
+GH201_NAME = "example-co"
+GH201_JID = "731205"
+GH201_CAREERS = "https://careers.example-co.test/openings"
+GH201_POSTING = "https://job-boards.greenhouse.io/example-board/jobs/731205"
+GH201_UUID = "123e4567-e89b-42d3-a456-426614174000"
+
+
+@pytest.mark.parametrize("url,query_id,suffix_id", [
+    (GH201_CAREERS + "?gh_jid=" + GH201_JID, None, None),
+    (GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID, GH201_JID, None),
+    (GH201_CAREERS + "/staff-platform/job/" + GH201_JID, None, GH201_JID),
+    (GH201_CAREERS + "/job/" + GH201_JID, None, GH201_JID),
+    (GH201_CAREERS + "/job/" + GH201_JID + "?ref=1", None, None),
+    (GH201_CAREERS + "/staff-platform?GH_JID=" + GH201_JID, None, None),
+    ("https://careers.example-co.test/openings-archive/job/" + GH201_JID, None, None),
+    ("http://careers.example-co.test/openings/job/" + GH201_JID, None, None),
+    ("https://careers.example-co.test:443/openings/job/" + GH201_JID, None, None),
+    ("https://careers.example-co.test/openings/job/%3731205", None, None),
+    ("https://careers.example-co.test/openings/job/" + GH201_JID + "/extra", None, None),
+])
+def test_original_tenant_pin_query_and_suffix_grammars_remain_distinct(
+    url, query_id, suffix_id,
+):
+    assert greenhouse_query_id(url, GH201_CAREERS) == query_id
+    assert greenhouse_suffix_id(url, GH201_CAREERS) == suffix_id
+
+
+def test_tenant_pin_pathless_source_never_becomes_a_reviewed_proof():
+    root = "https://careers.example-co.test"
+    assert greenhouse_query_id(root + "/?gh_jid=" + GH201_JID, root) is None
+    assert greenhouse_suffix_id(root + "/job/" + GH201_JID, root) is None
+
+
+@pytest.mark.parametrize("source,allowed", [
+    (GH201_CAREERS, True),
+    ("https://careers.example-co.test", False),
+    (GH201_CAREERS + "/", False),
+])
+def test_original_deployed_tuple_requires_exact_nonpathless_source(
+    tmp_path, source, allowed,
+):
+    manifest = tmp_path / "watchlist.yaml"
+    manifest.write_text(
+        "companies:\n"
+        "  - name: example-co\n"
+        f"    careers_url: {source}\n"
+        "    ats: greenhouse\n"
+        "    board: example-board\n"
+        "    discovery: crawl\n"
+        "    mode: gated\n"
+    )
+    cfg = CompanyConfig(
+        name=GH201_NAME, careers_url=source, ats="greenhouse",
+        board="example-board", discovery=DiscoveryMode.CRAWL)
+    proof = reviewed_tuple(GH201_NAME, path=manifest, expected=cfg, crawl_only=True)
+    assert (proof is not None) is allowed
+
+
+@pytest.mark.parametrize("careers,wrapper", [
+    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID),
+    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID),
+    ("https://careers.example-co.test",
+     "https://careers.example-co.test/?gh_jid=" + GH201_JID),
+])
+def test_existing_greenhouse_guard_keeps_old_pinned_wrapper_but_refuses_canonical_start(
+    careers, wrapper,
+):
+    cfg = CompanyConfig(name=GH201_NAME, careers_url=careers,
+                        ats="greenhouse", board="example-board")
+    pk = make_pk(GH201_NAME, GH201_JID)
+    old = dict(pk=pk, company=GH201_NAME, job_id=GH201_JID, ats="greenhouse",
+               greenhouse_board="example-board", jd_url=wrapper)
+    proof = verified_greenhouse_alias(
+        old, pk=pk, company=GH201_NAME, url=wrapper, configs=[cfg])
+    assert proof is not None and proof.url == GH201_POSTING
+    canonical = dict(old, jd_url=GH201_POSTING)
+    assert verified_greenhouse_alias(
+        canonical, pk=pk, company=GH201_NAME, url=GH201_POSTING, configs=[cfg]) is None
+
+
+def test_current_application_entry_refuses_dotted_ashby_without_widening_board_token():
+    pk = make_pk(GH201_NAME, GH201_UUID)
+    url = f"https://jobs.ashbyhq.com/example.co/{GH201_UUID}"
+    cfg = CompanyConfig(name=GH201_NAME, ats="ashby", board="example.co",
+                        careers_url="https://jobs.ashbyhq.com/example.co")
+    row = dict(pk=pk, company=GH201_NAME, ats="ashby", job_id=GH201_UUID, jd_url=url)
+    assert _application_entry(row, pk, GH201_NAME, url, [cfg]) is None
+    allowed_url = f"https://jobs.ashbyhq.com/example-co/{GH201_UUID}"
+    accepted = CompanyConfig(name=GH201_NAME, ats="ashby", board="example-co",
+                             careers_url="https://jobs.ashbyhq.com/example-co")
+    assert _application_entry(
+        dict(row, jd_url=allowed_url), pk, GH201_NAME, allowed_url, [accepted]) is not None

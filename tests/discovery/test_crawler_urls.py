@@ -667,15 +667,15 @@ def test_verified_greenhouse_suffix_from_xml_survives_partial_html_and_screens(
             company, Preferences(), stores, client=client,
             extractor=lambda html, company: [_job("/openings/job/222", "222")],
         )
-    assert count == 2
-    assert len(stores.queue.calls) == 2
-    exact = next(j for j in stores.tracking.put_calls if j.job_id == "731205")
-    assert (exact.pk, exact.jd_url, exact.ats, exact.greenhouse_board) == (
-        "example-co#731205", _GH_SUFFIX, "greenhouse", "example-board")
-    assert (exact.title, exact.location, exact.posted_at) == (
-        "Staff Platform Engineer", "Remote", "2026-10-18T00:00:00Z")
+    # The suffix is still observed, feed-verified and screened, but the
+    # canonical GH destination cannot be stored under today's unchanged gate.
+    # Only the unrelated ordinary custom role may reach the row/queue.
+    assert count == 1
+    assert len(stores.queue.calls) == 1
+    assert [j.job_id for j in stores.tracking.put_calls] == ["222"]
     assert _GH_SUFFIX in offline_pipeline.screened
-    assert _GH_SUFFIX in offline_pipeline.urls
+    assert _GH_SUFFIX not in offline_pipeline.urls
+    assert not any(j.job_id == "731205" for j in stores.tracking.put_calls)
     assert any("sitemap.xml" in call for call in state.calls)
     assert any("boards-api.greenhouse.io" in call for call in state.calls)
 
@@ -933,3 +933,51 @@ def test_already_seen_crawler_snippet_merges_flags_without_replacing_full_jd(
     assert updated["posting_guard"]["generation"] != before["posting_guard"]["generation"]
     assert pg.valid(updated["jd_text"], updated["posting_guard"])
     assert not pg.authorised(updated)
+
+@pytest.mark.parametrize("feed_state", ["unavailable", "duplicate"])
+@pytest.mark.parametrize("include_unrelated", [False, True])
+def test_failed_greenhouse_sitemap_feed_never_queues_unproved_numeric_claim(
+    offline_pipeline, monkeypatch, tmp_path, feed_state, include_unrelated,
+):
+    """A real title-bearing XML entry must not become generic sitemap on feed failure."""
+    numeric = _GH_CAREERS + "/staff-platform-engineer/job/731205"
+    unrelated = _GH_CAREERS + "/jobs/synthetic-staff-engineer"
+    urls = [numeric, unrelated] if include_unrelated else [numeric]
+    company, state, client = _gh_fixture(monkeypatch, tmp_path, urls=urls)
+    observed = sitemap.job_from_url(company.name, numeric)
+    assert observed is not None and observed.title and observed.ats == "sitemap"
+    assert not observed.discovery_source
+
+    # Both sitemap readers use only the synthetic XML HTTP transport; a failed
+    # board API may not fall through to any real browser/session/network work.
+    monkeypatch.setattr(crawler, "_render_page", lambda *_: "")
+    monkeypatch.setattr(
+        crawler, "sitemap_jobs",
+        lambda source, name: sitemap.sitemap_jobs(source, name, client=client))
+    monkeypatch.setattr(
+        crawler, "_browser_extract",
+        lambda *_: pytest.fail("Observed sitemap must finish without browser"))
+
+    if feed_state == "unavailable":
+        def broken_feed(*_args, **_kwargs):
+            raise httpx.ConnectError("synthetic Greenhouse feed unavailable")
+        monkeypatch.setattr(crawler, "current_feed", broken_feed)
+    else:
+        witness = JobRecord(
+            company=company.name, ats="greenhouse", job_id="731205",
+            title="Staff Platform Engineer", jd_url=_GH_HOSTED,
+            jd_text="Synthetic feed")
+        monkeypatch.setattr(crawler, "current_feed",
+                            lambda *_args, **_kwargs: [witness, witness.model_copy()])
+
+    stores = _Stores()
+    with client:
+        count = crawler.crawl_company(company, Preferences(), stores, client=client)
+    expected = [unrelated] if include_unrelated else []
+    assert count == len(expected)
+    assert [j.jd_url for j in stores.tracking.put_calls] == expected
+    assert len(stores.queue.calls) == len(expected)
+    assert offline_pipeline.marks == ([expected] if expected else [])
+    assert offline_pipeline.urls == set(expected)
+    assert stores.tracking.repair_calls == []
+    assert any("/sitemap.xml" in request for request in state.calls)

@@ -1027,3 +1027,152 @@ def test_storage_pin_rejects_requestless_browser_gates_on_both_backends(
         job.pk, "example-board", expected_row=original)
     assert store.get(job.pk) == original
     assert _indexes(store, job) == indexes
+
+
+
+# #201's URL replacement is separate from #22's relative recrawl. The
+# coordinator currently refuses all historic GH targets at the unchanged
+# Submit boundary; these synthetic backend tests check CAS mechanics only.
+def _canonical_seed(store, *, status="found", long_text=False):
+    job = JobRecord(
+        company="example-co", job_id="123e4567-e89b-42d3-a456-426614174000",
+        ats="ashby", title="Synthetic Engineer",
+        jd_url="https://example.test/legacy-wrapper",
+        jd_text=("long synthetic JD " * 40 if long_text else "Synthetic JD"),
+    )
+    assert store.put_new(job)
+    if status == "error":
+        store.set_status(job.pk, Status.ERROR, fail_kind="jd_reader_exhausted",
+                         jd_read_retry_at=None, jd_read_revision=4,
+                         jd_read_attempts=3, jd_read_prepare_only=False)
+    else:
+        store.set_status(job.pk, Status.FOUND, jd_read_revision=4,
+                         jd_read_attempts=1, jd_read_retry_at=None,
+                         jd_read_prepare_only=False)
+    return job, deepcopy(store.get(job.pk))
+
+
+_CANONICAL_NEW = (
+    "https://jobs.ashbyhq.com/example-board/"
+    "123e4567-e89b-42d3-a456-426614174000"
+)
+
+
+@pytest.mark.parametrize("status", ["found", "error"])
+def test_canonical_backend_only_partial_patch_fences_stale_jd_guard_and_indexes(
+    repair_backend, status,
+):
+    from tools import posting_guard as pg
+
+    store = repair_backend
+    job, original = _canonical_seed(store, status=status, long_text=True)
+    before_hash = store.find_by_jd_hash(job.jd_hash)
+    assert len(original["jd_text"]) > 400
+    assert store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=original)
+    after = store.get_current(job.pk)
+    assert after["jd_url"] == _CANONICAL_NEW and after["status"] == "found"
+    assert after["jd_text"] == ""
+    assert after["posting_guard"] == pg.analyze(
+        "", source_required=True)["posting_guard"]
+    assert after["posting_guard"]["source_verified"] is False
+    assert after["jd_read_revision"] == 5
+    assert after["jd_read_attempts"] == 0
+    assert "jd_read_retry_at" not in after
+    assert "reviewed_guard_generation" not in after
+    assert after["jd_read_prepare_only"] is False
+    assert after["jd_hash"] == original["jd_hash"]
+    assert after["attempts"] == original["attempts"]
+    assert after["apply_requested_at"] == ""
+    assert store.find_by_jd_hash(job.jd_hash) == before_hash == job.pk
+    assert [r["pk"] for r in store.query_status(Status.FOUND)] == [job.pk]
+    if status == "error":
+        assert "fail_kind" not in after
+    else:
+        assert after.get("fail_kind") == original.get("fail_kind")
+    assert not pg.authorised(after)
+    # An old reader generation cannot overwrite the new source's contents.
+    assert not store.update_if_status(
+        job.pk, Status.FOUND, {"jd_read_attempts": 1},
+        expected_reader={"jd_text": "", "jd_read_revision": 4})
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=original)
+
+
+@pytest.mark.parametrize("change", [
+    {"reviewed_guard_generation": ""},
+    {"reviewed_guard_generation": None},
+    {"posting_guard": {"status": "clean", "generation": "different"}},
+    {"jd_read_revision": 17},
+    {"jd_read_attempts": 4},
+    {"jd_read_retry_at": "2026-10-22T00:00:00+00:00"},
+    {"jd_text": "a newer guard-bound source"},
+    {"jd_read_prepare_only": True},
+    {"greenhouse_board": "other-board"},
+    {"status": "tailoring"},
+    {"apply_requested_at": "2026-10-25T00:00:00Z"},
+    {"submit_hold": ""},
+    {"gate_pending": {}},
+    {"fields": []},
+    {"approval_status": ""},
+    {"gate_reason": ""},
+])
+def test_canonical_backend_rejects_interleaved_protected_and_reader_changes(
+    repair_backend, change,
+):
+    store = repair_backend
+    job, observed = _canonical_seed(store)
+    _write_competing_row(store, job.pk, change)
+    actual = deepcopy(store.get(job.pk))
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=observed)
+    assert store.get(job.pk) == actual
+
+
+def test_canonical_backend_reviewed_row_is_never_eligible(repair_backend):
+    store = repair_backend
+    job, observed = _canonical_seed(store)
+    _write_competing_row(store, job.pk, {
+        "reviewed_guard_generation": "old-reviewed-generation"})
+    before = deepcopy(store.get(job.pk))
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=before)
+    assert store.get(job.pk) == before
+
+
+def test_canonical_redis_independent_empty_hold_blocks_and_never_upserts():
+    from core.storage.local import RedisTracking
+
+    store = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    job, observed = _canonical_seed(store)
+    store.r.set(f"submit_hold:{job.pk}", "")
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=observed)
+    assert store.get(job.pk) == observed
+    store.r.delete(f"submit_hold:{job.pk}")
+    store.r.delete(f"app:{job.pk}")
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=observed)
+    assert store.get(job.pk) is None
+
+
+def test_canonical_dynamo_condition_catches_guard_change_after_strong_read(
+    aws, monkeypatch,
+):
+    make_applications_table()
+    store = TrackingStore("applications")
+    job, observed = _canonical_seed(store)
+    update = store._table.update_item
+    changed = [False]
+
+    def competing_update(**kwargs):
+        if not changed[0]:
+            changed[0] = True
+            _write_competing_row(store, job.pk, {"reviewed_guard_generation": "new-review"})
+        return update(**kwargs)
+
+    monkeypatch.setattr(store._table, "update_item", competing_update)
+    assert not store.replace_noncanonical_jd_url(
+        job.pk, _CANONICAL_NEW, expected_row=observed)
+    assert changed[0]
+    assert store.get_current(job.pk)["reviewed_guard_generation"] == "new-review"

@@ -36,6 +36,7 @@ from core.steering import messages
 from . import progress
 from .relevance import relevant
 from .resolver import detect_from_page
+from .canonical_job_url import employer_gh_claim, canonical_shape, diagnostic
 from .sitemap import raw_sitemap_entries, sitemap_jobs
 from .tenant_pin import current_feed, exact_feed_match, greenhouse_suffix_id, reviewed_tuple
 from .watchlist import CompanyConfig, Preferences
@@ -572,6 +573,29 @@ def _enqueue(
                              f"{undated} role(s) cannot show under Fresh. They are "
                              f"on the Pipeline board under Found."))
 
+    # A configured employer's GH query/sitemap claim is not an ordinary
+    # ats=crawl fallback. Even perfect same-ID hosted GH proof cannot grant
+    # the existing final Submit a newly canonical starting route.
+    safe_jobs = []
+    for job in jobs:
+        gh_claim = employer_gh_claim(company, job)
+        gh_target = (company.ats == "greenhouse" and
+                     canonical_shape(job, company.board, "greenhouse"))
+        if gh_claim or gh_target:
+            reason = ("canonical_target_not_supported_by_current_guard"
+                      if (job.ats == "greenhouse" and job.greenhouse_board
+                          and gh_claim and (
+                              job.discovery_source == _SUFFIX_SOURCE or
+                              job.jd_url.endswith("?gh_jid=" + job.job_id)))
+                      or gh_target else "greenhouse_claim_unproved_or_malformed")
+            refusal = diagnostic(job, reason)
+            log.warning("%s: %s at %s; %s", company.name,
+                        refusal["status"], refusal["pk"], refusal["next_action"])
+            progress.record(note=(refusal["status"] + ": " +
+                                  refusal["next_action"])[:160])
+            continue
+        safe_jobs.append(job)
+    jobs = safe_jobs
     progress.record(relevant=len(jobs))
     if not jobs or progress.cancelled():
         return 0

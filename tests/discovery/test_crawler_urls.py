@@ -667,15 +667,15 @@ def test_verified_greenhouse_suffix_from_xml_survives_partial_html_and_screens(
             company, Preferences(), stores, client=client,
             extractor=lambda html, company: [_job("/openings/job/222", "222")],
         )
-    assert count == 2
-    assert len(stores.queue.calls) == 2
-    exact = next(j for j in stores.tracking.put_calls if j.job_id == "731205")
-    assert (exact.pk, exact.jd_url, exact.ats, exact.greenhouse_board) == (
-        "example-co#731205", _GH_SUFFIX, "greenhouse", "example-board")
-    assert (exact.title, exact.location, exact.posted_at) == (
-        "Staff Platform Engineer", "Remote", "2026-10-18T00:00:00Z")
+    # The suffix is still observed, feed-verified and screened, but the
+    # canonical GH destination cannot be stored under today's unchanged gate.
+    # Only the unrelated ordinary custom role may reach the row/queue.
+    assert count == 1
+    assert len(stores.queue.calls) == 1
+    assert [j.job_id for j in stores.tracking.put_calls] == ["222"]
     assert _GH_SUFFIX in offline_pipeline.screened
-    assert _GH_SUFFIX in offline_pipeline.urls
+    assert _GH_SUFFIX not in offline_pipeline.urls
+    assert not any(j.job_id == "731205" for j in stores.tracking.put_calls)
     assert any("sitemap.xml" in call for call in state.calls)
     assert any("boards-api.greenhouse.io" in call for call in state.calls)
 

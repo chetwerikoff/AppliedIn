@@ -11,16 +11,16 @@ scripts:
     # Python env for the worktree (uv shares its download cache, so this is fast).
     uv sync --all-groups
 
-    # Operator-local configuration exists only in the root checkout (.env is gitignored).
-    cp "$ORCA_ROOT_PATH/.env" .env 2>/dev/null || true
+    port=$((9000 + $(printf '%s' "$ORCA_WORKTREE_PATH" | cksum | cut -d' ' -f1) % 900))
+    # Redis db is 1 + port % 15; the operator instance on 8788 uses db 14 — skip that slot.
+    [ $((port % 15)) -eq 13 ] && port=$((port + 1))
 
-    # A non-default port is its own instance (.local-<port>, own Redis db), so a
-    # daemon started from this worktree cannot see or dispatch the real applications.
-    if [ -f .env ]; then
-      port=$((9000 + $(printf '%s' "$ORCA_WORKTREE_PATH" | cksum | cut -d' ' -f1) % 900))
-      # Redis db is 1 + port % 15; the operator instance on 8788 uses db 14 — skip that slot.
-      [ $((port % 15)) -eq 13 ] && port=$((port + 1))
-      sed -i "s/^APPLIEDIN_WEB_PORT=.*/APPLIEDIN_WEB_PORT=${port}/" .env
+    # Never copy primary-checkout settings or follow a stale worktree .env symlink.
+    env_tmp=$(mktemp .env.XXXXXXXX) || exit 1
+    if ! printf 'APPLIEDIN_WEB_PORT=%s\n' "$port" > "$env_tmp" ||
+       ! mv -fT -- "$env_tmp" .env; then
+      rm -f -- "$env_tmp"
+      exit 1
     fi
   archive: |
     # Stop anything still running from this worktree (a forgotten daemon or redis-cli).

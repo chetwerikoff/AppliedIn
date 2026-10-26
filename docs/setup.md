@@ -57,6 +57,13 @@ individual stage at an Anthropic model through LiteLLM, which is optional.
 **Ask the human for the key. Never invent one, and never paste one into a file
 you did not read first.**
 
+The `.env.example` → `.env` instructions above apply only to the operator's
+primary checkout. Orca task-worktree setup instead creates or replaces an
+ignored, disposable `.env` containing only `APPLIEDIN_WEB_PORT=<port>`,
+derived from the worktree path. It never reads or copies the primary `.env`,
+credentials, or operator settings. Do not add private data to worktrees or
+start an application daemon there.
+
 ### 4. The résumé
 
 `resume/base.tex`, in LaTeX, because tailoring edits the source and Tectonic

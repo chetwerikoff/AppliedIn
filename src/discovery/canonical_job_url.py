@@ -233,14 +233,24 @@ def repair_one(pk: str, *, commit: bool = False, operator_authorized: bool = Fal
     if cfg is None or cfg.ats != ats:
         return {**out, "status": "unproved_original_source"}
     if ats == "greenhouse":
+        from .tenant_pin import greenhouse_suffix_id
         pin = row.get("greenhouse_board")
         if not isinstance(pin, str) or not pin or pin != cfg.board:
             return {**out, "status": "missing_or_conflicting_original_pin"}
-        if literal_gh_id(url) == jid:
+        # Do not accept a raw gh_jid at *any* employer origin/path merely
+        # because a later feed has the same numeric ID. Bound recognition
+        # strictly to the retained literal old URL and reviewed source scope.
+        current_source = _literal(cfg.careers_url.rstrip("/"))
+        old_parts = _literal(url.partition("?")[0])
+        scoped_query = bool(
+            current_source and old_parts
+            and old_parts.netloc == current_source.netloc
+            and (old_parts.path == current_source.path
+                 or old_parts.path.startswith(current_source.path.rstrip("/") + "/")))
+        if literal_gh_id(url) == jid and scoped_query:
             out["old_evidence_class"] = "R1_literal_gh_jid"
         elif (row.get("discovery_source") == "sitemap_greenhouse_suffix"
-              and _literal(url) is not None and _SUFFIX.search(url)
-              and _SUFFIX.search(url).group(1) == jid):
+              and greenhouse_suffix_id(url, cfg.careers_url) == jid):
             out["old_evidence_class"] = "R2_retained_sitemap_suffix"
         else:
             return {**out, "status": "historic_identity_unproved"}

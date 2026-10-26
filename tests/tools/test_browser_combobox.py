@@ -169,7 +169,8 @@ def test_resume_job_mints_the_exact_combobox_grant_from_direct_gate(monkeypatch)
         put=lambda *args, **kwargs: None))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
-    assert run.resume_job(PK, 'Example Country', stores)['result'] == 'queued'
+    assert run.resume_job(PK, 'Example Country', stores,
+                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
     saved = row['human_approved_answers']['What country?']
     assert saved['value'] == 'Example Country'
     assert saved['selector'] == '#country' and saved['form_selector'] == '#application'
@@ -850,7 +851,8 @@ def test_material_combobox_reply_stores_original_option_identity(monkeypatch):
             stored.update({label: value})))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
     monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
-    assert run.resume_job(PK, 'I agree', stores)['result'] == 'queued'
+    assert run.resume_job(PK, 'I agree', stores,
+                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
     # No material owner assent may be written to the reusable fact bank.
     assert stored == {}
     approved = row['human_approved_answers']['Data processing consent?']
@@ -1286,3 +1288,27 @@ async def test_closed_material_witness_failure_disclosed_without_changing_gate(
     assert 'PRIVATE_GATE_TOKEN_SENTINEL' not in detail
     assert '#selector' not in detail
     assert exc.value.form_question is None
+
+
+def _owner_reply(tracking, row):
+    """Issue #202 r07: reissue the hand-built direct gate with a fresh
+    generation, give the row stub the storage contract's own consume, and
+    return the exact current-gate tokens the dashboard sends."""
+    from agent import run
+    from core.storage.base import direct_gate_patch
+    pending = row['gate_pending']
+    row['gate_pending'] = run._direct_gate_pending(
+        pending.get('question'), pending['form_question'], 'owner')
+
+    def consume(pk, *, expected_pending, disposition, grant=None, skip=None):
+        patch = direct_gate_patch(row, expected_pending, disposition, grant, skip)
+        if patch is None:
+            return False
+        row.update(deepcopy(patch))
+        return True
+
+    tracking.consume_direct_form_gate = consume
+    return {'disposition': 'answer',
+            'expected_gate_generation': row['gate_pending']['generation'],
+            'expected_question_identity': forms.owner_question_identity(
+                row['pk'], row['gate_pending']['form_question'])}

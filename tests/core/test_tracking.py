@@ -1027,3 +1027,240 @@ def test_storage_pin_rejects_requestless_browser_gates_on_both_backends(
         job.pk, "example-board", expected_row=original)
     assert store.get(job.pk) == original
     assert _indexes(store, job) == indexes
+
+
+# Issue #202: exact direct owner gate compare-and-consume on both backends.
+
+def _gate_seed(store, *, generation="gen-synthetic-1", **extra):
+    job = _synthetic_job("job-202")
+    store.put_new(job)
+    pending = {"question": "Synthetic display name?", "review_route": "owner",
+               "form_question": {"pk": job.pk, "label": "Synthetic display name",
+                                 "type": "text", "tag": "input",
+                                 "route": "ashby-sibling-mismatch",
+                                 "requiredness": "unknown"}}
+    if generation is not None:
+        pending["generation"] = generation
+    store.set_status(job.pk, Status.NEEDS_HUMAN, gate_reason="owner_question",
+                     gate_call_id="direct", gate_source="applier",
+                     gate_pending=pending, note="unrelated", **extra)
+    return job, store.get(job.pk)
+
+
+def _answer(row, value="synthetic"):
+    return {"kind": "answer", "identity": "q1_synthetic",
+            "generation": row["gate_pending"].get("generation"), "at": "t"}
+
+
+def _skip(row):
+    return {"kind": "skip", "identity": "q1_synthetic",
+            "generation": row["gate_pending"].get("generation"), "at": "t"}
+
+
+def _skip_record(row):
+    return ("q1_synthetic", {"identity": "q1_synthetic", "route": "ashby-sibling-mismatch",
+                             "kind": "text", "label": "Synthetic display name",
+                             "generation": row["gate_pending"]["generation"]})
+
+
+def test_direct_gate_answer_consumes_once_and_moves_to_tailored(repair_backend):
+    store = repair_backend
+    job, row = _gate_seed(store)
+    grant = ("Synthetic display name", {"value": "synthetic"})
+    assert store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_answer(row), grant=grant)
+    after = store.get(job.pk)
+    assert after["status"] == "tailored"
+    assert after["gate_pending"] == {} and after["gate_call_id"] is None
+    assert after["gate_source"] is None and after["gate_reason"] == ""
+    assert after["gate_disposition"]["kind"] == "answer"
+    assert after["human_approved_answers"] == {"Synthetic display name": {"value": "synthetic"}}
+    assert after["note"] == "unrelated" and after.get("tailored_at")
+    assert "owner_gate_skips" not in after
+    assert store.query_status(Status.NEEDS_HUMAN) == []
+    assert [r["pk"] for r in store.query_status(Status.TAILORED)] == [job.pk]
+    # The same request (and a competing SKIP) can never win a spent gate.
+    assert not store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_answer(row), grant=grant)
+    assert not store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+        skip=_skip_record(row))
+    assert store.get(job.pk) == after
+
+
+def test_direct_gate_skip_records_only_skip_and_no_grant(repair_backend):
+    store = repair_backend
+    job, row = _gate_seed(store, human_approved_answers={"Other": {"value": "kept"}})
+    assert store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+        skip=_skip_record(row))
+    after = store.get(job.pk)
+    assert after["status"] == "tailored" and after["gate_disposition"]["kind"] == "skip"
+    assert after["owner_gate_skips"] == {"q1_synthetic": _skip_record(row)[1]}
+    assert after["human_approved_answers"] == {"Other": {"value": "kept"}}
+
+
+@pytest.mark.parametrize("drift", [
+    "generation", "pending_value", "status", "call", "source", "confirmation",
+    "possible_submission", "generationless", "missing_row",
+])
+def test_direct_gate_consume_refuses_any_non_exact_gate(repair_backend, drift):
+    store = repair_backend
+    job, row = _gate_seed(store, generation=None if drift == "generationless" else "gen-1")
+    expected = deepcopy(row["gate_pending"])
+    pk = job.pk
+    if drift == "generation":
+        expected["generation"] = "gen-older"
+    elif drift == "pending_value":
+        expected["form_question"]["label"] = "Other synthetic question"
+    elif drift == "status":
+        store.set_status(pk, Status.TAILORED)
+    elif drift == "call":
+        store.set_status(pk, Status.NEEDS_HUMAN, gate_call_id="adk-call")
+    elif drift == "source":
+        store.set_status(pk, Status.NEEDS_HUMAN, gate_source="tailor")
+    elif drift == "confirmation":
+        store.set_status(pk, Status.NEEDS_HUMAN, confirmation_id="synthetic-confirmation")
+    elif drift == "possible_submission":
+        store.set_status(pk, Status.NEEDS_HUMAN, possible_submission=True)
+    elif drift == "missing_row":
+        pk = "example-co#missing"
+    before = store.get(pk)
+    indexes = _indexes(store, job)
+    for disposition, kwargs in ((_answer(row), {"grant": ("Synthetic display name", {})}),
+                                (_skip(row), {"skip": ("q1_synthetic", {})})):
+        if drift == "generationless":
+            disposition = {**disposition, "generation": None}
+        assert not store.consume_direct_form_gate(
+            pk, expected_pending=expected, disposition=disposition, **kwargs)
+    assert store.get(pk) == before
+    assert _indexes(store, job) == indexes
+    if drift == "missing_row":
+        assert store.get(pk) is None
+
+
+def test_reissued_identical_looking_gate_rejects_stale_generation(repair_backend):
+    store = repair_backend
+    job, first = _gate_seed(store, generation="gen-first")
+    reissued = {**deepcopy(first["gate_pending"]), "generation": "gen-second"}
+    store.set_status(job.pk, Status.NEEDS_HUMAN, gate_pending=reissued)
+    assert not store.consume_direct_form_gate(
+        job.pk, expected_pending=first["gate_pending"], disposition=_answer(first),
+        grant=("Synthetic display name", {"value": "stale"}))
+    current = store.get(job.pk)
+    assert current["status"] == "needs_human" and "human_approved_answers" not in current
+    assert store.consume_direct_form_gate(
+        job.pk, expected_pending=reissued, disposition=_answer(current),
+        grant=("Synthetic display name", {"value": "fresh"}))
+    assert store.get(job.pk)["human_approved_answers"]["Synthetic display name"] == {
+        "value": "fresh"}
+
+
+def test_redis_consume_refuses_durable_hold_and_retries_unrelated_watch_collision(monkeypatch):
+    client = fakeredis.FakeRedis(decode_responses=True)
+    tracking = RedisTracking(client)
+    job, row = _gate_seed(tracking)
+    client.set(f"submit_hold:{job.pk}", "synthetic")
+    assert not tracking.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+        skip=_skip_record(row))
+    client.delete(f"submit_hold:{job.pk}")
+    original_pipeline = client.pipeline
+    injected = []
+
+    def concurrent_pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        original_execute = pipe.execute
+
+        def execute(*a, **kw):
+            if not injected:
+                injected.append(True)
+                current = tracking.get(job.pk)
+                current["note"] = "concurrent unrelated edit"
+                client.set(f"app:{job.pk}", json.dumps(current))
+            return original_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(client, "pipeline", concurrent_pipeline)
+    assert tracking.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+        skip=_skip_record(row))
+    after = tracking.get(job.pk)
+    assert injected and after["note"] == "concurrent unrelated edit"
+    assert after["status"] == "tailored"
+
+
+def test_redis_concurrent_answer_and_skip_have_exactly_one_winner(monkeypatch):
+    client = fakeredis.FakeRedis(decode_responses=True)
+    tracking = RedisTracking(client)
+    job, row = _gate_seed(tracking)
+    original_pipeline = client.pipeline
+    results = []
+
+    def racing_pipeline(*args, **kwargs):
+        pipe = original_pipeline(*args, **kwargs)
+        original_execute = pipe.execute
+
+        def execute(*a, **kw):
+            if not results:
+                # The competing SKIP commits between this answer's read and
+                # EXEC; the marker keeps its own EXEC from racing again.
+                results.append(None)
+                results[0] = RedisTracking(client).consume_direct_form_gate(
+                    job.pk, expected_pending=row["gate_pending"],
+                    disposition=_skip(row), skip=_skip_record(row))
+            return original_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    monkeypatch.setattr(client, "pipeline", racing_pipeline)
+    won = tracking.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_answer(row),
+        grant=("Synthetic display name", {"value": "loser"}))
+    assert results == [True] and won is False
+    after = tracking.get(job.pk)
+    assert after["gate_disposition"]["kind"] == "skip"
+    assert "human_approved_answers" not in after
+
+
+def test_dynamo_concurrent_write_fails_consume_without_overwrite(aws, monkeypatch):
+    make_applications_table()
+    store = TrackingStore("applications")
+    job, row = _gate_seed(store)
+    original_update = store._table.update_item
+    injected = []
+
+    def compete(**kwargs):
+        if not injected:
+            injected.append(True)
+            assert store.consume_direct_form_gate(
+                job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+                skip=_skip_record(row))
+        return original_update(**kwargs)
+
+    monkeypatch.setattr(store._table, "update_item", compete)
+    assert not store.consume_direct_form_gate(
+        job.pk, expected_pending=row["gate_pending"], disposition=_answer(row),
+        grant=("Synthetic display name", {"value": "loser"}))
+    after = store.get(job.pk)
+    assert after["gate_disposition"]["kind"] == "skip"
+    assert "human_approved_answers" not in after
+
+
+def test_dynamo_consume_storage_fault_propagates(aws, monkeypatch):
+    make_applications_table()
+    store = TrackingStore("applications")
+    job, row = _gate_seed(store)
+
+    def fail(**kwargs):
+        raise ClientError({"Error": {"Code": "ProvisionedThroughputExceededException",
+                                     "Message": "synthetic outage"}}, "UpdateItem")
+
+    monkeypatch.setattr(store._table, "update_item", fail)
+    with pytest.raises(ClientError, match="ProvisionedThroughputExceededException"):
+        store.consume_direct_form_gate(
+            job.pk, expected_pending=row["gate_pending"], disposition=_skip(row),
+            skip=_skip_record(row))

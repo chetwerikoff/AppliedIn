@@ -1288,7 +1288,113 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
             "note": state["tailor_note"]}
 
 
-def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
+def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
+                         grant: tuple[str, dict] | None = None,
+                         bank: tuple | None = None) -> dict:
+    """Spend the exact pending gate, then (winner only) bank and continue.
+
+    The atomic commit moves the row to ``tailored`` with the gate cleared, so a
+    later enqueue failure leaves a recoverable tailored row with no live gate:
+    its actual result is returned, never a claimed ``queued``.
+    """
+    from tools.browser_skill_apply import owner_question_identity
+    pending = row['gate_pending']
+    observed = pending['form_question']
+    identity = owner_question_identity(pk, observed)
+    disposition = {'kind': 'skip' if skip else 'answer', 'identity': identity,
+                   'generation': pending['generation'],
+                   'at': datetime.now(UTC).isoformat()}
+    record = None
+    if skip:
+        record = (identity, {'identity': identity, 'route': observed.get('route'),
+                             'kind': observed.get('type'), 'label': observed.get('label'),
+                             'generation': pending['generation']})
+    won = stores.tracking.consume_direct_form_gate(
+        pk, expected_pending=pending, disposition=disposition,
+        grant=grant, skip=record)
+    if not won:
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'This owner question was already answered or changed; '
+                          'refresh and answer the current question.'}
+    if bank is not None:
+        label, answer, scope, company = bank
+        stores.answer_bank.put(label, answer, scope, company=company, source="dashboard")
+    return _enqueue_apply(pk, stores, priority=True, require_request=False)
+
+
+def _direct_gate_pending(question: str, form_question: Any, review_route: Any) -> dict:
+    """The stored pending map for one newly issued applier gate.
+
+    Issue #202: every newly issued direct field gate gets a fresh,
+    unpredictable generation, even when its text and bound field repeat an
+    earlier one, so a stale reply can never consume it.
+    """
+    import secrets
+    pending = {"question": question, 'form_question': form_question,
+               "review_route": review_route or "hard_refusal"}
+    if review_route == "owner" and isinstance(form_question, dict):
+        pending['generation'] = secrets.token_urlsafe(24)
+    return pending
+
+
+def _owner_skip_retention(pk: str, stores: Any, form_question: Any) -> dict:
+    """Which SKIP records survive a newly issued gate.
+
+    A root-proven (non-mismatch) gate clears them all: a skip never carries
+    across the mismatch-to-root transition. A regenerated gate for the very
+    question a record names clears that record, since the owner is being
+    asked again.
+    """
+    from tools.browser_skill_apply import _MISMATCH_ROUTE, owner_question_identity
+    skips = (stores.tracking.get(pk) or {}).get('owner_gate_skips')
+    if not isinstance(skips, dict) or not skips:
+        return {}
+    if not isinstance(form_question, dict) or form_question.get('route') != _MISMATCH_ROUTE:
+        return {'owner_gate_skips': {}}
+    identity = owner_question_identity(pk, form_question)
+    if identity not in skips:
+        return {}
+    return {'owner_gate_skips': {k: v for k, v in skips.items() if k != identity}}
+
+
+_DISPOSITIONS = frozenset({'answer', 'skip'})
+
+
+def _direct_form_refusal(pk: str, row: dict, form_label: str | None, answer: str,
+                         disposition: Any, generation: Any, identity: Any) -> dict | None:
+    """Exact-request validation for a bound direct field gate, before any effect.
+
+    A gate stored before per-gate generations existed cannot be consumed by any
+    caller: only a later bounded pass may reissue it with a fresh generation.
+    """
+    from tools.browser_skill_apply import owner_question_identity, owner_skip_eligible
+    pending = row.get('gate_pending') or {}
+    stored = pending.get('generation')
+    stale = {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+             'detail': 'This owner question is no longer the pending one; '
+                       'refresh and answer the current question.'}
+    if not isinstance(stored, str) or not stored or form_label is None:
+        return stale
+    if (disposition not in _DISPOSITIONS or not isinstance(generation, str)
+            or not isinstance(identity, str)):
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'Answer or skip the exact current owner question.'}
+    if (generation != stored
+            or identity != owner_question_identity(pk, pending['form_question'])):
+        return stale
+    if disposition == 'answer' and not answer.strip():
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'Answer the exact observed field question.'}
+    if disposition == 'skip' and not owner_skip_eligible(pending['form_question']):
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'This field cannot be skipped; answer it or apply manually.'}
+    return None
+
+
+def resume_job(pk: str, answer: str, stores: Any = None, *,
+               disposition: str | None = None,
+               expected_gate_generation: str | None = None,
+               expected_question_identity: str | None = None) -> dict:
     """Human answered the gate: SAVE the answer as a reusable fact, then continue.
 
     APPLIER gates (the "Ready to apply?" approval, or a field the browser needed)
@@ -1304,6 +1410,12 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": "possible submission; check the employer portal before retrying"}
     call_id = row.get("gate_call_id")
+    if not call_id and disposition is not None:
+        # An exact owner reply names one pending gate. Once spent, it is not a
+        # one-click Apply for the tailored row it left behind.
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'This owner question is no longer the pending one; '
+                          'refresh and answer the current question.'}
     if not call_id:
         # Ungated TAILORED rows (tailored before approval gates kept status, or
         # re-queued items) still take the one-click ▶ Apply: approving one means
@@ -1323,6 +1435,19 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         if _material_question(bound_field):
             return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                     'detail': 'The observed material form question is no longer current.'}
+    direct_form = (call_id == 'direct' and row.get('gate_source') == 'applier'
+                   and isinstance(bound_field, dict))
+    if direct_form:
+        refusal = _direct_form_refusal(
+            pk, row, form_label, answer, disposition,
+            expected_gate_generation, expected_question_identity)
+        if refusal is not None:
+            return refusal
+        if disposition == 'skip':
+            return _consume_direct_gate(pk, row, stores, skip=True)
+    elif disposition == 'skip':
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'Only a bound owner field question can be skipped.'}
     approval = form_label is None and question.startswith("Ready to apply")
     if (form_label is not None
             or (question and not approval
@@ -1385,15 +1510,14 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
         if form_label:
             from tools.browser_skill_apply import _material_question
             material_form = _material_question(row['gate_pending']['form_question'])
-        if not material_form:
+        if not form_label:
             stores.answer_bank.put(label, answer, scope,
                                    company=company or None, source="dashboard")
         # Internal answers stay reusable bank facts, not employer disclosure
         # grants. The exact observed direct form question owns the latter.
         if form_label:
-            grants = dict(row.get('human_approved_answers') or {})
             observed = row['gate_pending']['form_question']
-            grants[form_label] = {
+            grant = {
                 'value': answer.strip(), 'selector': observed['selector'],
                 'url': observed['url'], 'label': observed['control_label'],
                 'question': observed['question'], 'tag': observed['tag'],
@@ -1413,9 +1537,12 @@ def resume_job(pk: str, answer: str, stores: Any = None) -> dict:
                 **({'boolean_members': observed['boolean_members']}
                    if observed['type'] == 'button' else {}),
             }
-            stores.tracking.set_status(
-                pk, row.get('status') or Status.NEEDS_HUMAN,
-                human_approved_answers=grants)
+            # The winner's grant rides inside the one consume commit; only
+            # then may it bank a non-material answer and continue.
+            bank = (None if material_form else
+                    (label, answer, scope, company or None))
+            return _consume_direct_gate(pk, row, stores, grant=(form_label, grant),
+                                        bank=bank)
 
     if approval or row.get("gate_source") == "applier" or call_id == "direct":
         # An answered QUESTION resumes an application that is already under way:
@@ -1708,12 +1835,14 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         # durable named gate, never a fabricated reviewer session/approval.
         review_route = (result.get("review_route") if configuration()['engine'] == 'browser_skill'
                         else "owner")
+        form_question = (result.get('form_question')
+                         if configuration()['engine'] == 'browser_skill' else None)
+        pending = _direct_gate_pending(q, form_question, review_route)
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
                                    **_clear_infra_failure(pk, stores),
+                                   **_owner_skip_retention(pk, stores, form_question),
                                    gate_reason=result.get("reason") or "unknown_field",
-                                   gate_pending={"question": q, 'form_question':
-                                       result.get('form_question') if configuration()['engine'] == 'browser_skill' else None,
-                                       "review_route": review_route or "hard_refusal"},
+                                   gate_pending=pending,
                                    gate_call_id="direct" if review_route == "owner" else None,
                                    gate_source="applier")
         # Keep full details in the owner row/reply only, never INFO/queued/event.

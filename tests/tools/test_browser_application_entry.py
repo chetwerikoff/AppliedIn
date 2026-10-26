@@ -2097,3 +2097,121 @@ def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
     assert not forms._preparation_origin(refused, tracked)
     assert not forms._preparation_destination_allowed(
         refused, tracked, pk=pk, company=company)
+
+
+# Issue #202 AC3: one closed, finite, phase-aware predicate map per failed exit
+# of the bounded post-navigation application wait. Synthetic readers only.
+
+import logging
+import re
+
+_WAIT_VALUES = {'true', 'false', 'unknown/unavailable'}
+
+
+def _wait_map(text):
+    found = re.findall(r' \[wait: ([^\]]*)\]', text)
+    assert len(found) == 1, text
+    pairs = dict(item.split('=', 1) for item in found[0].split(', '))
+    assert tuple(pairs) == forms.WAIT_PREDICATES
+    assert set(pairs.values()) <= _WAIT_VALUES
+    # Structure only: never a URL, selector, value or question text.
+    for private in ('https://', 'example-co', '#', 'Email', JOB):
+        assert private not in found[0]
+    return pairs
+
+
+def _logged_map(caplog):
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith('application wait exit')]
+    assert len(lines) == 1, lines
+    return _wait_map(lines[0])
+
+
+async def test_wait_deadline_exit_names_unexecuted_pair_unknown(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    fake_clock(monkeypatch)
+    _, _, session, decide = world(monkeypatch, pages=[application('ashby', controls=[])])
+    report = await attempt()
+    assert 'no qualifying application form after bounded wait' in report['question']
+    state = _wait_map(report['question'])
+    assert state['deadline.remaining'] == 'false'
+    assert state['read.page_available'] == 'true'
+    # No two complete fresh pairs ever existed: never a fictitious agreement.
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert state['witness.agrees'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_wait_missing_page_is_false_and_downstream_unknown(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    _, _, session, decide = world(monkeypatch)
+
+    async def fail(s):
+        raise OSError('synthetic failed read')
+    session.on_page = fail
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    report = await asyncio.wait_for(attempt(), timeout=0.5)
+    assert 'application form inventory read timed out/unavailable' in report['question']
+    state = _wait_map(report['question'])
+    assert state['read.page_available'] == 'false'
+    # A failed current sample never promotes an older observation.
+    for key in ('read.entry_valid', 'root.owner_proven', 'receiver.qualifies',
+                'witness.available', 'witness.agrees', 'pair.stable'):
+        assert state[key] == 'unknown/unavailable', key
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_wait_witness_escape_keeps_its_message_with_the_same_map(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    _, _, session, decide = world(monkeypatch)
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.5)
+    monkeypatch.setattr(forms, '_observe_controls', AsyncMock(
+        side_effect=forms.Gate('synthetic contradictory fixed reader')))
+    report = await attempt()
+    assert report['question'].startswith('synthetic contradictory fixed reader')
+    state = _wait_map(report['question'])
+    assert state['read.page_available'] == 'true'
+    assert state['read.origin_allowed'] == 'true'
+    assert (state['witness.available'], state['witness.agrees']) == ('true', 'false')
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+
+
+async def test_wait_unknown_frame_captcha_exit_keeps_reason_and_frame_failure(
+        monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    page = application('ashby', entry={
+        'root': {'selector': '#application-form', 'action': entry('ashby')},
+        'frames': [{'status': 'unknown', 'origin': 'https://[redacted].test',
+                    'path': '/frame/[redacted]'}],
+        'responses': [], 'response_error': False, 'helper_challenge': False})
+    _, _, session, decide = world(monkeypatch, pages=[page])
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    with pytest.raises(forms.CaptchaArtifactGate) as raised:
+        await forms._stable_application_form(
+            forms._EntrySession(session, lambda url: url == entry('ashby'),
+                                forms._application_entry(
+                                    forms._row(PK), PK, COMPANY, posting('ashby'),
+                                    [CompanyConfig(name=COMPANY, ats='ashby',
+                                                   board='example-co')]),
+                                resume_path='Resume.pdf'),
+            lambda url: url == entry('ashby'), forms._application_entry(
+                forms._row(PK), PK, COMPANY, posting('ashby'),
+                [CompanyConfig(name=COMPANY, ats='ashby', board='example-co')]),
+            deadline=asyncio.get_running_loop().time() + 0.05)
+    text = str(raised.value)
+    # The existing sanitized artifact reason stays, alongside the map.
+    assert text.startswith('unknown/untrusted application frame; inspect manually.')
+    state = raised.value.wait_predicates
+    assert state['read.frames_admitted'] == 'false'
+    assert state['witness.available'] == 'unknown/unavailable'
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert set(state.values()) <= _WAIT_VALUES and tuple(state) == forms.WAIT_PREDICATES
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)

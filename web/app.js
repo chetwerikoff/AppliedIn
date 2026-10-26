@@ -321,6 +321,7 @@ function rowActionAllowed(pk, act) {
   if (act === "queue-apply" && canRequeueStructuralGate(r)) return true;
   if (READ_ONLY_ROUTES.has(kind)) return false;
   if (act === "answer") return ["owner_question", "approval", "low_confidence", "tailored"].includes(kind);
+  if (act === "skip-field") return kind === "owner_question" && ownerSkipOffered(r);
   if (act === "run-now") return kind === "found";
   if (act === "apply-now") return canApply(r);
   if (act === "force-apply") return kind === "skipped" && r.skip_reason === "low_score" && !r.confirmation_id;
@@ -336,6 +337,41 @@ function resumeAnswer(pk, value) {
   const kind = routeOf(state.apps.find((r) => r.pk === pk));
   if (kind !== "owner_question") return "approved";
   return (value || "").trim() || null;
+}
+// Issue #202: SKIP is offered only where the server projected an eligible,
+// exactly identified pending field. It is a separate action, never an answer.
+function ownerSkipOffered(r) {
+  return !!r && r.gate_skip_eligible === true
+    && typeof r.gate_generation === "string" && r.gate_generation !== ""
+    && typeof r.gate_question_identity === "string" && r.gate_question_identity !== "";
+}
+// The request body for an owner reply, from the row as currently projected.
+// "stale" means a bound field question without a generation: no caller can
+// consume it, the next bounded pass re-asks it with a fresh one.
+function resumeBody(pk, act, value) {
+  const r = state.apps.find((item) => item.pk === pk);
+  const kind = routeOf(r);
+  const exact = kind === "owner_question" && !!r.gate_generation && !!r.gate_question_identity;
+  const tokens = exact ? { expected_gate_generation: r.gate_generation,
+    expected_question_identity: r.gate_question_identity } : null;
+  if (act === "skip-field")
+    return ownerSkipOffered(r) && tokens ? { disposition: "skip", ...tokens } : null;
+  const answer = resumeAnswer(pk, value);
+  if (answer === null) return null;
+  if (tokens) return { disposition: "answer", answer, ...tokens };
+  if (kind === "owner_question" && r.gate_has_form_question && r.gate_has_call_id) return "stale";
+  return { answer };
+}
+const STALE_OWNER_GATE = "This question is out of date. It is asked again on the next pass.";
+// The resume endpoint only accepts work; the row itself shows the outcome.
+function sendResume(pk, body) {
+  return post(`/actions/resume/${encodeURIComponent(pk)}`, body).then((d) => {
+    if (d && d.ok === false) toast(d.error === "invalid_answer"
+      ? "That reply was refused. Refresh and answer the current question." : (d.error || "Refused."));
+    loadApps();
+    loadQueue();
+    return d;
+  });
 }
 function companyActionAllowed(co) {
   const key = String(co || "").trim().toLowerCase();
@@ -2445,6 +2481,8 @@ function needsCard(r) {
                ${owner ? "Answer &amp; continue" : kind === "approval" ? "Approve &amp; continue" : "Review &amp; approve"}</button>`
           : `<button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
                title="Only after verifying the employer portal confirms submission">✓ Already applied</button>`}
+        ${owner && ownerSkipOffered(r) ? `<button class="btn btn-ghost" data-act="skip-field" data-pk="${esc(r.pk)}"
+               title="Leave this field empty. It never allows the final Submit.">Skip field</button>` : ""}
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip job</button>
         ${r.jd_url ? `<a class="gc-jd" href="${esc(r.jd_url)}" target="_blank" rel="noopener">view posting ↗</a>` : ""}
       </div></div>
@@ -4445,17 +4483,16 @@ function paneAction(act, pk, el) {
     return;
   }
   if (act === "force-apply") { forceApply(pk); return; }
-  if (act === "answer") {
+  if (act === "answer" || act === "skip-field") {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
-    const answer = resumeAnswer(pk, t?.value);
-    if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
-    // Reload the queue as soon as the approve lands, so the card LEAVES "Ready to
-    // apply" and reappears under Queued with its position. Without that refresh the
-    // row sits exactly where it was until the next poll and the click reads as dead.
-    markBusy(pk, "queued…");
-    post(`/actions/resume/${encodeURIComponent(pk)}`, { answer })
-      .then(() => loadQueue());
-    toast("Queued — it starts when this company is free.");
+    const body = resumeBody(pk, act, t?.value);
+    if (body === null) { toast("Enter an answer to the verified question before continuing."); return; }
+    if (body === "stale") { toast(STALE_OWNER_GATE); return; }
+    // Reload the rows and queue once the reply lands, so the card shows its real
+    // outcome. The immediate response only means "accepted for processing".
+    markBusy(pk, "sending…");
+    sendResume(pk, body);
+    toast(act === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
   } else if (act === "queue-apply") {
     markBusy(pk, "queued…");
     post(`/actions/queue-apply/${encodeURIComponent(pk)}`).then(() => loadQueue());
@@ -4736,6 +4773,8 @@ function openDrawer(pk) {
           ? `<button class="btn btn-primary" data-act="answer" data-pk="${esc(r.pk)}">${ownerQuestion
               ? "Answer &amp; continue" : kind === "low_confidence"
                 ? "Review &amp; approve" : "Approve &amp; continue"}</button>` : ""}
+        ${ownerQuestion && ownerSkipOffered(r) ? `<button class="btn btn-ghost" data-act="skip-field" data-pk="${esc(r.pk)}"
+          title="Leave this field empty. It never allows the final Submit.">Skip field</button>` : ""}
         <button class="btn btn-ghost" data-act="mark-applied" data-pk="${esc(r.pk)}"
           title="Only after verifying the employer portal confirms submission">✓ Already applied</button>
         <button class="btn btn-ghost" data-act="skip" data-pk="${esc(r.pk)}">Skip</button>
@@ -6815,11 +6854,12 @@ function wire() {
     if (kind === "force-apply") {
       return forceApply(pk).then((started) => { if (started) closeDrawer(); });
     }
-    if (kind === "answer") {
-      const answer = resumeAnswer(pk, $("#gate-answer")?.value);
-      if (answer === null) { toast("Enter an answer to the verified question before continuing."); return; }
-      post(`/actions/resume/${encodeURIComponent(pk)}`, { answer });
-      toast("Sent — pipeline resuming.");
+    if (kind === "answer" || kind === "skip-field") {
+      const body = resumeBody(pk, kind, $("#gate-answer")?.value);
+      if (body === null) { toast("Enter an answer to the verified question before continuing."); return; }
+      if (body === "stale") { toast(STALE_OWNER_GATE); return; }
+      sendResume(pk, body);
+      toast(kind === "skip-field" ? "Skip sent — checking the result." : "Sent — checking the result.");
     } else if (kind === "retailor") {
       const note = ($("#rt-note")?.value || "").trim();
       rtBegin(pk);

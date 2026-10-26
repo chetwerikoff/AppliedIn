@@ -672,17 +672,19 @@ async def test_exact_structural_grant_permits_only_matching_fill_with_readback(m
     q = gate.value.form_question
     # Exercise the unchanged real consumer/persistence and only its offline
     # stores: the structural envelope must survive the same human-answer path.
-    from agent.run import resume_job
+    from agent.run import _direct_gate_pending, resume_job
     from tests.agent.test_resume_starts_now import _Stores, _queued
     stores = _Stores({**row, 'status': 'needs_human', 'gate_source': 'applier',
                       'gate_call_id': 'direct', 'gate_reason': 'unknown_field',
-                      'gate_pending': {'form_question': q, 'question': str(gate.value)}})
+                      'gate_pending': _direct_gate_pending(str(gate.value), q, 'owner')})
     from core.storage.local import RedisTracking
     pending = stores.tracking.row
     pending.pop('pk')
     stores.tracking = RedisTracking(stores.tracking.r)
     stores.tracking.set_status(PK, pending.pop('status'), **pending)
-    resume_job(PK, 'Test User', stores=stores)
+    resume_job(PK, 'Test User', stores=stores, disposition='answer',
+               expected_gate_generation=pending['gate_pending']['generation'],
+               expected_question_identity=forms.owner_question_identity(PK, q))
     grant = stores.tracking.get(PK)['human_approved_answers']['Name']
     assert grant['form_selector'] == '#application-root'
     assert grant['form_action'] == '#structural-submit'
@@ -3316,3 +3318,29 @@ def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
     assert not forms._bank_auto_eligible(
         target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
 
+
+
+async def test_rooted_untyped_yes_no_pair_refuses_unproven_requiredness(monkeypatch):
+    """Issue #202 AC2: on a truly root-proven Ashby form, an untyped Yes/No
+    group has no reader-backed requiredness signal, so unknown is never
+    OPTIONAL: the bounded wait refuses before any model or IPC effect."""
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _, raw, decision, provenance = root_world(monkeypatch, yesNo=True)
+    assert forms._formless_root(raw.current)['root'] == '#application-root'
+    group = [e for e in raw.current['entry']['root_evidence'] if e.get('boolean_group')]
+    assert len(group) == 2 and all(e['in_container'] for e in group)
+    with pytest.raises(forms.Gate, match='unproven rooted Yes/No requiredness') as refusal:
+        forms._formless_boundary(raw.current, provenance)
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
+    with pytest.raises(forms.Gate, match='unproven rooted Yes/No requiredness') as waited:
+        await forms._stable_application_form(
+            session, session.allowed, provenance,
+            deadline=asyncio.get_running_loop().time() + 1)
+    assert waited.value.wait_predicates['receiver.qualifies'] == 'false'
+    assert waited.value.wait_predicates['root.owner_proven'] == 'true'
+    assert not decision.await_count
+    no_mutations(raw)
+    # Without the group the same root-proven form still qualifies.
+    _, plain, _, provenance = root_world(monkeypatch)
+    assert forms._formless_boundary(plain.current, provenance)

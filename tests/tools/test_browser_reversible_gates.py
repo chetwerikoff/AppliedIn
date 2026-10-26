@@ -119,6 +119,35 @@ async def _apply(pdf, facts=None):
                              pk=PK, resume_path=pdf)
 
 
+def _bind_consume(stores, row):
+    """The shared row-stub tracking gains the production consume semantics.
+
+    The patch itself is the storage contract's own ``direct_gate_patch``; only
+    the persistence is this file's synthetic row.
+    """
+    from core.storage.base import direct_gate_patch
+
+    def consume(pk, *, expected_pending, disposition, grant=None, skip=None):
+        assert pk == row['pk']
+        patch = direct_gate_patch(row, expected_pending, disposition, grant, skip)
+        if patch is None:
+            return False
+        row.update(deepcopy(patch))
+        return True
+
+    stores.tracking.consume_direct_form_gate = consume
+
+
+def _issue(row, gate):
+    """Persist the gate exactly as run._apply_direct does: fresh generation."""
+    q = gate['form_question']
+    row.update(status='needs_human', gate_source='applier',
+               gate_call_id='direct', gate_reason='owner_question',
+               gate_pending=run._direct_gate_pending(gate['question'], deepcopy(q), 'owner'))
+    return {'expected_gate_generation': row['gate_pending']['generation'],
+            'expected_question_identity': forms.owner_question_identity(PK, q)}
+
+
 def _answer(row, stores, gate, value):
     assert gate['status'] == 'gate'
     assert gate['reason'] == 'owner_question'
@@ -127,12 +156,11 @@ def _answer(row, stores, gate, value):
     assert q['pk'] == PK and q['url'] == entry('ashby')
     assert q['owner_kind'] == 'ashby-reversible-entry'
     assert q['form_selector'] == '' and q['form_action'] == ''
-    row.update(status='needs_human', gate_source='applier',
-               gate_call_id='direct', gate_reason='owner_question',
-               gate_pending={'question': gate['question'],
-                             'form_question': deepcopy(q)})
+    _bind_consume(stores, row)
+    tokens = _issue(row, gate)
     assert run._direct_form_label(PK, row) == q['label']
-    assert run.resume_job(PK, value, stores)['result'] == 'queued'
+    assert run.resume_job(PK, value, stores, disposition='answer', **tokens)[
+        'result'] == 'queued'
     grant = row['human_approved_answers'][q['label']]
     for k in ('selector', 'url', 'control_label', 'question',
               'tag', 'type', 'form_selector', 'form_action'):
@@ -940,3 +968,119 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_guard(
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('upload', file['selector'], '--file', transport._application_controller.resume_path)]
     assert not transport._application_controller.committed
+
+
+# Issue #202 AC6/AC8: exact SKIP suppression and question-key collisions on the
+# live-shaped rootless sibling-mismatch census (real PAGE and fixed readers).
+
+def _skip(row, stores, gate):
+    q = gate['form_question']
+    assert forms.owner_skip_eligible(q), q
+    _bind_consume(stores, row)
+    tokens = _issue(row, gate)
+    assert run.resume_job(PK, '', stores, disposition='skip', **tokens)['result'] == 'queued'
+    return tokens['expected_question_identity']
+
+
+@pytest.mark.asyncio
+async def test_exact_skip_suppresses_only_that_receiver_then_asks_the_next(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    page = endpoint.current
+    location = _by_locator(page, _LOCATION)['selector']
+    facts, gate = {}, None
+    while True:
+        gate = await _apply(pdf, dict(facts))
+        assert gate['reason'] == 'owner_question', gate
+        q = gate['form_question']
+        if q['selector'] == location:
+            break
+        _answer(row, stores, gate, 'Synthetic answer')
+        facts[q['label']] = 'Synthetic answer'
+    q = gate['form_question']
+    # Natively optional on this rootless route means UNKNOWN, never optional.
+    assert (q['route'], q['requiredness']) == ('ashby-sibling-mismatch', 'unknown')
+    identity = _skip(row, stores, gate)
+    assert row['owner_gate_skips'][identity]['route'] == 'ashby-sibling-mismatch'
+    assert q['label'] not in (row.get('human_approved_answers') or {})
+    assert stores.answer_bank.values.get(q['label']) is None
+    nxt = await _apply(pdf, dict(facts))
+    assert nxt['reason'] == 'owner_question'
+    assert nxt['form_question']['selector'] == _by_locator(page, _DATE)['selector']
+    # A known REQUIRED field is never skippable.
+    assert nxt['form_question']['requiredness'] == 'required'
+    assert not forms.owner_skip_eligible(nxt['form_question'])
+    # The skipped receiver was never written: a SKIP is not a value.
+    assert not [c for c in endpoint.calls
+                if c[0] in {'fill', 'click', 'upload', 'select'} and location in c]
+
+
+@pytest.mark.asyncio
+async def test_skip_record_for_another_identity_or_generation_never_suppresses(
+        monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    location = _by_locator(endpoint.current, _LOCATION)['selector']
+    facts = {}
+    while True:
+        gate = await _apply(pdf, dict(facts))
+        if gate['form_question']['selector'] == location:
+            break
+        _answer(row, stores, gate, 'Synthetic answer')
+        facts[gate['form_question']['label']] = 'Synthetic answer'
+    identity = forms.owner_question_identity(PK, gate['form_question'])
+    good = {'identity': identity, 'route': 'ashby-sibling-mismatch', 'kind': 'combobox',
+            'label': gate['form_question']['label'], 'generation': 'gen-synthetic'}
+    for record in ({**good, 'identity': 'q1_other'}, {**good, 'route': ''},
+                   {**good, 'kind': 'text'}, {**good, 'generation': ''}):
+        row['owner_gate_skips'] = {identity: record}
+        again = await _apply(pdf, dict(facts))
+        assert again['form_question']['selector'] == location, record
+    # A record under a different identity key names a different question.
+    row['owner_gate_skips'] = {'q1_other': {**good, 'identity': 'q1_other'}}
+    assert (await _apply(pdf, dict(facts)))['form_question']['selector'] == location
+
+
+_TWIN_TEXT = (
+    "node('input',{type:'text',placeholder:'Twin'},"
+    "node('div',{},entry('Synthetic location','synthetic-twin')));")
+_TWIN_BOOLEAN = (
+    "const twin=node('div',{class:'ashby-application-form-input-yesno'},"
+    "entry('Synthetic Boolean question','synthetic-twin-boolean'));"
+    "untyped(twin,{text:'Yes'}); untyped(twin,{text:'No'});")
+
+
+@pytest.mark.parametrize('mutate,twin', [
+    (_TWIN_TEXT, 'Synthetic location'), (_TWIN_BOOLEAN, 'Synthetic Boolean question'),
+])
+@pytest.mark.asyncio
+async def test_same_question_key_entries_refuse_answer_skip_and_bank(
+        monkeypatch, tmp_path, mutate, twin):
+    """Grants, bank and SKIP records are question-keyed: two same-title entries
+    (two Yes/No pairs included) are indistinguishable there, so both refuse."""
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path, mutate=mutate)
+    twins = [c for c in endpoint.current['controls'] if c.get('question') == twin
+             and c.get('type') != 'submit']
+    assert len(twins) >= 2
+    with pytest.raises(forms.Gate, match='share this question') as refusal:
+        forms._key(endpoint.current, twins[0])
+    assert refusal.value.reason == 'defect_receiver'
+    facts = {}
+    for _ in range(12):
+        gate = await _apply(pdf, dict(facts))
+        if gate.get('reason') != 'owner_question':
+            break
+        q = gate['form_question']
+        assert q['question'] != twin, 'a colliding key must never be owner-asked'
+        _answer(row, stores, gate, 'No' if q['type'] == 'button' else 'Synthetic answer')
+        facts[q['label']] = 'Synthetic answer'
+    assert gate['reason'] == 'defect_receiver', gate
+    assert twin not in (row.get('human_approved_answers') or {})
+    assert twin not in stores.answer_bank.values
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
+
+
+def test_location_toggle_shares_its_title_but_is_no_collision():
+    page, _ = _live_dom()
+    location = _by_locator(page, _LOCATION)
+    assert forms._mismatch_question_twins(page, location) == []
+    yes = _by_locator(page, _YES)
+    assert forms._mismatch_question_twins(page, yes) == []

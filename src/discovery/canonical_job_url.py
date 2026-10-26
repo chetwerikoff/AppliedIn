@@ -173,20 +173,23 @@ def admit_feed(company: CompanyConfig, raw: CompanyConfig,
 
 
 def employer_gh_claim(company: CompanyConfig, job: JobRecord) -> bool:
-    """Keep #118 GH attempts off the generic crawl queue, even if malformed."""
+    """Classify ATS claims observed *within* this employer discovery listing.
+
+    A listing link to a foreign host with a gh_jid marker is still a claimed
+    ATS identity; foreign-origin failure is no excuse to queue it as custom.
+    Numeric path suffix recognition remains limited to the original source.
+    """
+    if claim_greenhouse_query(job.jd_url):
+        return True
     try:
         c, p = urlsplit(company.careers_url), urlsplit(job.jd_url)
         same_source = (p.scheme in ("http", "https") and
                        p.hostname and p.hostname == c.hostname)
     except ValueError:
         return False
-    if not same_source:
-        return False
-    if claim_greenhouse_query(job.jd_url):
-        return True
-    return (company.ats == "greenhouse"
-            and job.discovery_source == "sitemap_greenhouse_suffix"
-            and _SUFFIX.search(p.path) is not None)
+    return bool(same_source and company.ats == "greenhouse"
+                and job.discovery_source == "sitemap_greenhouse_suffix"
+                and _SUFFIX.search(p.path) is not None)
 
 
 def diagnostic(job: JobRecord, reason: str) -> dict:

@@ -2097,3 +2097,58 @@ def test_greenhouse_pre_submit_route_rejects_wrong_board_even_without_pin(
     assert not forms._preparation_origin(refused, tracked)
     assert not forms._preparation_destination_allowed(
         refused, tracked, pk=pk, company=company)
+
+
+
+# Issue #201 changes ONLY the pre-browser malformed gh_jid attempt predicate.
+# Keep the raw irreversible click and every existing provenance-producer byte
+# identical to the pre-Issue main baseline, not just behaviourally similar.
+_ISSUE201_MAIN_PROOF_SOURCE = {
+    "src/tools/browser_skill_apply.py": {
+        ("authorize_final_submit", 4): "bb753bea8db66920",
+        ("_configured_alias", 0): "03d59736830eef59",
+        ("_alias_current", 0): "bb974e0e4bcd0218",
+        ("navigation_allowed", 0): "b5e75c92d0d7edc3",
+        ("_tracked_preparation_job", 0): "b027300e2b063e7c",
+        ("_application_entry", 0): "d7be7dd4729aac62",
+        ("_BOARD_TOKEN", 0): "e423624619eb1acd",
+        ("_APPLICATION_ENTRY", 0): "57c4df9f30743723",
+        ("_JOB_UUID", 0): "4b8c646ba6e51e60",
+    },
+    "src/tools/claude_chrome.py": {
+        ("verified_greenhouse_alias", 0): "6b87ea37d14a3c6b",
+        ("greenhouse_alias_candidate", 0): "3eec2b113f70ad02",
+        ("_alias_https_parts", 0): "584f21e17bc6b9e3",
+        ("direct_board_url", 0): "4b1df432ee6ad6f0",
+    },
+}
+
+
+def _issue201_definition_source(content, name, indent):
+    """Extract raw definition bytes without AST formatting/normalization."""
+    lines = content.split("\n")
+    leader = " " * indent
+    starts = (f"def {name}(", f"async def {name}(", f"{name} = ")
+    for pos, line in enumerate(lines):
+        if line.startswith(leader) and line[indent:].startswith(starts):
+            for end in range(pos + 1, len(lines)):
+                other = lines[end]
+                if (other.strip() and
+                        len(other) - len(other.lstrip()) <= indent):
+                    return "\n".join(lines[pos:end]).rstrip()
+            return "\n".join(lines[pos:]).rstrip()
+    raise AssertionError(f"Missing protected raw-Submit symbol: {name}")
+
+
+def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for filename, witnesses in _ISSUE201_MAIN_PROOF_SOURCE.items():
+        content = (root / filename).read_text()
+        for (name, indent), baseline in witnesses.items():
+            segment = _issue201_definition_source(content, name, indent)
+            value = 0xcbf29ce484222325
+            for char in segment:
+                value = (value ^ ord(char)) * 0x100000001b3 & ((1 << 64) - 1)
+            assert f"{value:016x}" == baseline, (filename, name)

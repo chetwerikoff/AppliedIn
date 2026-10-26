@@ -311,6 +311,96 @@ def paused() -> bool:
     return get_flag("paused", "no") == "yes"
 
 
+# The system's own pause for a disconnected browser, and the marker that proves
+# the system (not the owner) set it. `paused_reason` alone cannot prove that: the
+# signed-out pause leaves a reason too, and older code never cleared one, so a
+# stale reason can sit beside a later manual pause. Only a marked pause may be
+# released automatically.
+DISCONNECT_PAUSE_REASON = "the selected browser profile is disconnected"
+AUTO_PAUSE_MARKER = "browser_disconnected"
+_AUTO_PAUSE_ATTEMPTS = 3
+
+
+def auto_pause(releasable: bool = False) -> bool:
+    """Pause applying because the browser is disconnected, unless already paused.
+
+    `releasable` marks the pause as the system's own (see above). Without it the
+    pause is the plain fault pause: reason and `paused`, no marker, so nothing
+    ever releases it but the owner. The check and the write are one WATCHed
+    transaction, retried a few times on an unrelated write to the shared hash
+    (the heartbeat lives there too). True when this call set the pause."""
+    try:
+        from redis.exceptions import WatchError
+
+        r = _redis()
+        for _ in range(_AUTO_PAUSE_ATTEMPTS):
+            with r.pipeline() as pipe:
+                try:
+                    pipe.watch(_KEY)
+                    if pipe.hget(_KEY, "paused") == "yes":
+                        return False
+                    pipe.multi()
+                    if releasable:
+                        pipe.hset(_KEY, "paused_auto", AUTO_PAUSE_MARKER)
+                    else:
+                        pipe.hdel(_KEY, "paused_auto")
+                    pipe.hset(_KEY, "paused_reason", DISCONNECT_PAUSE_REASON)
+                    pipe.hset(_KEY, "paused", "yes")
+                    pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+    except Exception:
+        log.debug("auto_pause failed", exc_info=True)
+    return False
+
+
+def set_manual_pause(on: bool) -> None:
+    """The owner's pause or unpause: one unconditional transaction, no WATCH, so
+    an unrelated write to the hash can never drop the owner's choice.
+
+    Pausing removes the auto marker, so the pause can never be released by the
+    system, but KEEPS an existing reason: `paused_dispatchable` lets an
+    owner-requested job through a pause only when no reason is set, and a pause
+    pressed over a disconnect fault must not reopen that door. Unpausing clears
+    both."""
+    try:
+        with _redis().pipeline(transaction=True) as pipe:
+            pipe.hdel(_KEY, "paused_auto")
+            if on:
+                pipe.hset(_KEY, "paused", "yes")
+            else:
+                pipe.hdel(_KEY, "paused_reason")
+                pipe.hset(_KEY, "paused", "no")
+            pipe.execute()
+    except Exception:
+        log.debug("set_manual_pause failed", exc_info=True)
+
+
+def release_auto_pause() -> bool:
+    """Lift a pause the system set for a disconnected browser. True when released.
+
+    Releases only a pause that carries BOTH the marker and the disconnect reason,
+    and fails closed: any other state, a write that raced this one (WatchError) or
+    a Redis fault releases nothing."""
+    try:
+        r = _redis()
+        with r.pipeline() as pipe:
+            pipe.watch(_KEY)
+            state, marker, reason = pipe.hmget(_KEY, ["paused", "paused_auto", "paused_reason"])
+            if (state != "yes" or marker != AUTO_PAUSE_MARKER
+                    or reason != DISCONNECT_PAUSE_REASON):
+                return False
+            pipe.multi()
+            pipe.hdel(_KEY, "paused_auto", "paused_reason")
+            pipe.hset(_KEY, "paused", "no")
+            pipe.execute()
+            return True
+    except Exception:  # includes WatchError: a racing write wins
+        log.debug("release_auto_pause did not release", exc_info=True)
+        return False
+
+
 def stop_epoch() -> int:
     """How many times the owner has asserted Stop, as a counter.
 

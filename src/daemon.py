@@ -14,6 +14,7 @@ then open http://127.0.0.1:8787
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -58,33 +59,53 @@ POLL_INTERVAL = int(os.environ.get("APPLIEDIN_POLL_INTERVAL_SEC", "5"))
 WEB_PORT = int(os.environ.get("APPLIEDIN_WEB_PORT", "8787"))
 
 
+def _discovery_due(last_raw: str, now: float) -> float:
+    """Wall-clock time the next scheduled discovery cycle is due.
+
+    One interval after the persisted cycle start, so an overdue cycle is due at
+    once and a recent one waits only for the remainder. An absent, unparsable or
+    non-finite value counts as absent (one interval after `now`, the behavior
+    before persistence existed); a value in the future is clamped to `now`."""
+    try:
+        last = float(last_raw)
+    except (TypeError, ValueError):
+        return now + DISCOVER_INTERVAL
+    if not math.isfinite(last):
+        return now + DISCOVER_INTERVAL
+    return min(last, now) + DISCOVER_INTERVAL
+
+
 def _discovery_loop() -> None:
     """The 'cron' — find + enqueue jobs on a schedule. Runs in its OWN thread so a
     long/expensive discovery cycle (many crawls) never blocks job processing."""
     from core import flags
     from discovery.handler import run_discovery
 
-    # Start the clock now, not at zero. A zero here means the first tick is
-    # already overdue, so every restart swept the whole watchlist immediately —
-    # eight restarts in an afternoon meant eight full sweeps, racing whatever
-    # single-company run the owner had actually asked for and burying the board
-    # in jobs nobody requested. The schedule is a schedule, not a boot action.
-    last_discover = time.monotonic()
-    log.info("first scheduled discovery in %dh — use Discover to run one now",
-             DISCOVER_INTERVAL // 3600)
+    # Resume the persisted schedule, never a boot action. Starting the clock at
+    # zero made every restart sweep the whole watchlist at once — eight restarts
+    # in an afternoon meant eight full sweeps, racing whatever single-company run
+    # the owner had actually asked for. Starting it at boot instead made the
+    # opposite error: a daemon restarted every few hours never reached the
+    # interval, so the scheduled cycle never ran. The due time is read ONCE into
+    # memory and advanced in memory, so a failed persistence write cannot make
+    # the cycle repeat every tick.
+    next_due = _discovery_due(flags.get_flag("last_discovery_at"), time.time())
+    log.info("next scheduled discovery in %dm — use Discover to run one now",
+             max(0, int(next_due - time.time())) // 60)
     while True:
-        now = time.monotonic()
+        now = time.time()
         try:
             from discovery.career_ops import scheduled_tick
             scheduled_tick()
         except Exception:
             log.exception("Career Ops schedule check failed")
-        if not flags.paused() and now - last_discover >= DISCOVER_INTERVAL:
+        if not flags.paused() and now >= next_due:
+            next_due = now + DISCOVER_INTERVAL
+            flags.set_flag("last_discovery_at", repr(now))
             try:
                 log.info("discovery cycle: %s", run_discovery())
             except Exception:
                 log.exception("discovery cycle failed")
-            last_discover = now
         time.sleep(min(POLL_INTERVAL, 60))
 
 
@@ -291,6 +312,36 @@ def next_dispatchable(q: Any, mode: str) -> dict | None:
     return q.next(priority_only=not auto_dispatch_allowed(mode))
 
 
+_RELEASE_CHECK_SECONDS = 30.0
+
+
+def _release_auto_pause_if_connected() -> bool:
+    """Lift the system's own browser-disconnect pause once the browser is back.
+
+    Read-only toward the browser (`connection_status` never launches anything) and
+    limited to a pause the system marked as its own while the configured engine is
+    BrowserSkill, the only engine with a connection witness. Anything else, or any
+    fault while checking, releases nothing; a manual pause carries no marker."""
+    from core import flags
+
+    if flags.get_flag("paused_auto") != flags.AUTO_PAUSE_MARKER:
+        return False
+    try:
+        from tools import browser_profile, browser_runtime
+
+        if browser_runtime.configuration()["engine"] != "browser_skill":
+            return False
+        if browser_profile.connection_status().get("state") != "connected":
+            return False
+    except Exception:
+        log.debug("auto-pause release check failed", exc_info=True)
+        return False
+    if flags.release_auto_pause():
+        log.info("RESUMED applying: the browser is connected again")
+        return True
+    return False
+
+
 def paused_dispatchable(q: Any, reason: str) -> dict | None:
     """What may start while applying is paused: only roles the owner pressed Apply on.
 
@@ -340,6 +391,7 @@ def _apply_loop() -> None:
     # needing a restart.
     with ThreadPoolExecutor(max_workers=6, thread_name_prefix="apply") as pool:
         running: set = set()
+        last_release_check = float("-inf")
         while True:
             running = {f for f in running if not f.done()}
             # Fold in anything the old flat queue still holds, so an upgrade never
@@ -352,6 +404,10 @@ def _apply_loop() -> None:
                     q.put(pk, row.get("company", ""),
                           requested=bool(row.get("apply_requested_at")))
             if flags.paused():
+                if time.monotonic() - last_release_check >= _RELEASE_CHECK_SECONDS:
+                    last_release_check = time.monotonic()
+                    if _release_auto_pause_if_connected():
+                        continue
                 item = None
                 if len(running) < flags.apply_concurrency():
                     item = paused_dispatchable(q, flags.get_flag("paused_reason"))

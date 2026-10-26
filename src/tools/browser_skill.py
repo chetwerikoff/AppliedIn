@@ -119,6 +119,25 @@ def available(settings=None) -> tuple[bool, str]:
         return False, "BrowserSkill unavailable: " + detail
 
 
+def _recorded_daemon_is_dead(record: Path) -> bool:
+    """True only when `daemon.json` names a process that provably does not exist.
+
+    Signal 0 checks existence and delivers nothing. A live process, a permission
+    error (the process exists), a missing or malformed pid, or an unreadable file
+    all return False: when liveness cannot be proven the daemon is treated as
+    alive and never touched."""
+    try:
+        pid = json.loads(record.read_text()).get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, AttributeError, OverflowError):
+        return False
+    return False
+
+
 def ensure_daemon() -> tuple[bool, str]:
     """Reuse a reachable daemon; launch only when the default home has none.
 
@@ -130,9 +149,19 @@ def ensure_daemon() -> tuple[bool, str]:
         return True, ""
     except Unavailable:
         home = Path(os.environ.get("BSK_HOME") or Path.home() / ".bsk")
-        if (home / "daemon.json").exists():
-            return False, ("BrowserSkill unavailable: existing daemon cannot be reached; "
-                           "run bsk doctor.")
+        record = home / "daemon.json"
+        if record.exists():
+            if not _recorded_daemon_is_dead(record):
+                return False, ("BrowserSkill unavailable: existing daemon cannot be reached; "
+                               "run bsk doctor.")
+            # The recorded process is gone, so the file is stale. Probe once more
+            # before launching: another session may have started a daemon since
+            # the first probe, and a second one must not be spawned beside it.
+            try:
+                _sync("status")
+                return True, ""
+            except Unavailable:
+                pass
     try:
         local = Path(get_settings().local_dir)
         local.mkdir(parents=True, exist_ok=True)

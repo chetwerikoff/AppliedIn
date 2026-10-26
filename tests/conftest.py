@@ -49,6 +49,58 @@ def _isolate_owner_config(monkeypatch, tmp_path):
         pass
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Leave ``APPLIEDIN_LOCAL_DIR`` as the run found it once a test is fully torn down.
+
+    A test may set that variable through the shared ``monkeypatch`` after
+    ``_isolate_local_dir`` has set it; the shared fixture is torn down after this
+    one and would restore the isolation value it saw, leaving a stale temporary
+    path in ``os.environ`` for the next test to inherit.
+    """
+    import os
+
+    before = os.environ.get("APPLIEDIN_LOCAL_DIR")
+    try:
+        return (yield)
+    finally:
+        if before is None:
+            os.environ.pop("APPLIEDIN_LOCAL_DIR", None)
+        else:
+            os.environ["APPLIEDIN_LOCAL_DIR"] = before
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_dir(_isolate_owner_config, tmp_path):
+    """Point ``Settings.local_dir`` at a per-test temporary directory.
+
+    ``local_dir`` defaults to ``.local`` relative to the current directory, so any
+    offline test that reaches ``core.stores.make_stores()`` used to create
+    ``.local/facts.md``, ``secrets.json`` and ``artifacts/`` in the checkout.
+    In a disposable task worktree those empty copies were later refused as owner
+    data. The directory is not created here; only code that writes it does.
+
+    The patch uses its own ``MonkeyPatch`` rather than the shared ``monkeypatch``
+    fixture: a test that calls ``monkeypatch.undo()`` mid-test must not lose the
+    isolation for the rest of that test. A test that sets ``APPLIEDIN_LOCAL_DIR``
+    itself, or builds ``Settings(local_dir=...)``, still wins.
+    """
+
+    def _clear_settings_cache():
+        try:
+            from core.config import get_settings
+
+            get_settings.cache_clear()
+        except Exception:  # noqa: BLE001 — a test may have replaced get_settings
+            pass
+
+    with pytest.MonkeyPatch.context() as private:
+        private.setenv("APPLIEDIN_LOCAL_DIR", str(tmp_path / "local"))
+        _clear_settings_cache()
+        yield
+    _clear_settings_cache()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_owner_state(tmp_path, monkeypatch):
     # 1) Activity feed — emit() publishes to Redis and appends to the history the

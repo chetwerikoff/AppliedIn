@@ -599,9 +599,10 @@ async def test_boolean_pair_requires_both_independent_member_captions(monkeypatc
 # Location, Date and the Yes/No pair have no id: their title's for= resolves to
 # nothing, and the pair members are untyped (DOM submit) nameless buttons with
 # a hidden checkbox. Tags, types, classes and nesting are copied; every caption
-# is synthetic. A real button has no required property, so the pair carries
-# none here; only its title's _required_ class makes it required. The native
-# required inputs exercise the owner gates (live Location was optional).
+# is synthetic. Titles copy the live class structure (heading, label and, when
+# marked, a required token) with synthetic module hashes. A real button has no
+# required property, so the pair carries none; the native required inputs
+# exercise the owner gates (live Location was optional).
 _LIVE_ENTRIES = r"""
 (() => {
   const c=document.querySelector('.ashby-application-form-container');
@@ -610,8 +611,9 @@ _LIVE_ENTRIES = r"""
   const entry=(title, owner)=>{
     const e=node('div',{class:'ashby-application-form-field-entry'},c);
     c.children.splice(c.children.indexOf(e),1); c.children.splice(at++,0,e);
-    node('label',{'for':owner,class:'ashby-application-form-question-title'+
-      (__REQUIRED__ ? ' _required_x1y2z_9' : ''),text:title},e);
+    node('label',{'for':owner,class:'_heading_x1y2z_52 '+
+      (__REQUIRED__ ? '_required_x1y2z_91 ' : '')+
+      '_label_a1b2c_42 ashby-application-form-question-title',text:title},e);
     return e;
   };
   const untyped=(parent,attrs)=>{
@@ -706,31 +708,47 @@ def test_live_census_reports_the_sibling_mismatch_and_titled_idless_receivers():
 
 
 
-@pytest.mark.parametrize('required,mutate,expected', [
-    (True, '', True),
-    (False, '', False),
-    # aria-required on the buttons is no substitute for the title marker.
-    (False, "group.children.forEach(b=>b.setAttribute('aria-required','true'));", False),
+@pytest.mark.parametrize('marked,mutate', [
+    (True, ''),
+    (False, ''),
+    (False, "group.children.forEach(b=>b.setAttribute('aria-required','true'));"),
 ])
-def test_yes_no_requiredness_is_only_its_title_marker(required, mutate, expected):
-    """A real button has no required property; only the pair's title can say."""
-    for page in _live_dom(required=required, mutate=mutate):
+def test_every_proven_yes_no_pair_is_owner_required(marked, mutate):
+    """Ashby's title marker is a per-build hash and a button has no required
+    property, so an optional pair is asked rather than a required one skipped."""
+    for page in _live_dom(required=marked, mutate=mutate):
         evidence = {e['selector']: e for e in page['entry']['root_evidence']}
         for suffix in (_YES, _NO):
             member = _by_locator(page, suffix)
-            assert member['required'] is expected
-            assert evidence[member['selector']]['required'] is expected
-            assert evidence[member['selector']]['title_required'] is expected
+            assert member['required'] is True
+            assert evidence[member['selector']]['required'] is True
 
 
-def test_title_marker_never_makes_other_idless_receivers_required():
-    mutate = "location.children[0].required=false;"
-    page, _ = _live_dom(mutate=mutate)
+def test_title_marker_never_makes_a_receiver_required():
+    page, _ = _live_dom(mutate="location.children[0].required=false;")
     evidence = {e['selector']: e for e in page['entry']['root_evidence']}
     location = _by_locator(page, _LOCATION)
-    assert evidence[location['selector']]['title_required'] is True
     assert location['required'] is False
     assert evidence[location['selector']]['required'] is False
+
+
+@pytest.mark.asyncio
+async def test_unmarked_yes_no_pair_still_gets_bound_owner_question(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(
+        monkeypatch, tmp_path, required=False)
+    page = endpoint.current
+    facts, asked = {}, []
+    for answer in ('Synthetic User', 'synthetic@example-co.test', 'No'):
+        gate = await _apply(pdf, dict(facts))
+        q = _answer(row, stores, gate, answer)
+        asked.append(q['selector'])
+        facts[q['label']] = answer
+    assert asked == ['#_systemfield_name', '#_systemfield_email',
+                     _by_locator(page, _YES)['selector']]
+    assert [m['caption'] for m in row['gate_pending']['form_question']['boolean_members']] == [
+        'Yes', 'No']
+    assert not decision.await_count
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
 
 def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_path):
     """Every live control was refused by the root error, not by its own evidence."""

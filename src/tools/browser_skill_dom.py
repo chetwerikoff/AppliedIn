@@ -516,12 +516,6 @@ _ASHBY_ROOT = r"""
     return buttons.length===2 && buttons.every(b=>b.parentElement===group && free(b)) &&
       buttons.map(b=>clean(b.innerText)).sort().join('|')==='No|Yes';
   };
-  // A button has no required property, so a Yes/No pair's requiredness is the
-  // structural _required_ marker on its single field-entry title, and nothing
-  // else: no marker means not required.
-  const titleRequired = t => !!t &&
-    (t.getAttribute('class') || '').split(/\s+/).some(c => c.startsWith('_required_'));
-  const yesNoRequired = e => ashbyYesNo(e) && titleRequired(fieldEntry(e).title);
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
     .filter(e=>!excluded.has(e));
@@ -554,7 +548,6 @@ _ASHBY_ROOT = r"""
         entry_label:field?.title ? clean(field.title.innerText) : '',
         entry_label_selector:field?.title ? selector(field.title) : '',
         caption:e.tagName==='BUTTON' ? clean(e.innerText) : '',yes_no:ashbyYesNo(e),
-        title_required:titleRequired(field?.title),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
         id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
         associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
@@ -563,7 +556,7 @@ _ASHBY_ROOT = r"""
         declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
         submit:e===exactSubmit,untyped:e.getAttribute('type')===null,
         dropzone:e.matches('button.ashby-application-form-input-file-dropzone-upload'),
-        required:ashbyYesNo(e) ? yesNoRequired(e) : !!e.required,
+        required:ashbyYesNo(e) || !!e.required,
         disabled:!!e.disabled || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),inert:!!e.closest('[inert]'),
         visible:entryVisible(e),value:e.type==='password' ? '' : (e.value || ''),
@@ -997,7 +990,10 @@ def entry_reader(script: str) -> str:
     assert script.count(_CONTROL_TYPE) == 1
     script = script.replace(_CONTROL_TYPE, _CONTROL_TYPE.replace(
         'const type=', "const type=ashbyYesNo(e) ? 'button' : "))
-    yes_no_required = 'required:ashbyYesNo(e) ? yesNoRequired(e) : '
+    # A button has no required property and Ashby's title marker is a per-build
+    # CSS-module hash, so no stable signal says whether a Yes/No pair is
+    # optional. Every proven pair is owner-asked rather than silently skipped.
+    yes_no_required = 'required:ashbyYesNo(e) || '
     assert script.count(_CONTROL_REQUIRED) + script.count(_WITNESS_REQUIRED) == 1
     script = script.replace(_CONTROL_REQUIRED,
                             _CONTROL_REQUIRED.replace('required:', yes_no_required))
@@ -1015,7 +1011,7 @@ def entry_reader(script: str) -> str:
     script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
                             "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
                             "submit:['submit','image'].includes(e.type), "
-                            "required:ashbyYesNo(e) ? yesNoRequired(e) : !!e.required,"
+                            "required:ashbyYesNo(e) || !!e.required,"
                             "files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
                             'selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')

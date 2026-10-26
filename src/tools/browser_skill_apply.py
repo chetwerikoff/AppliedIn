@@ -2945,6 +2945,24 @@ class _ReversibleEntryReader:
         return await self.raw.call(*args, **kwargs)
 
 
+# Live Ashby renders the autofill pane outside the container/Submit wrapper, so
+# the historic root certificate fails while the container and Submit stay
+# unique. Membership is container containment; every other root error, above
+# all ambiguous roots, still has no exact receiver.
+_REVERSIBLE_ROOT_ERRORS = frozenset({'', 'application root sibling identity mismatch'})
+
+
+def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
+    """Name the failing structural predicate; never a selector ID or a value."""
+    def shape(value):
+        return (value if isinstance(value, str)
+                and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,39}', value) else 'unavailable')
+    return Gate(f'{message[:-1]}; predicate={predicate}; '
+                f'control={_safe_diagnostic(target.get("diagnostic_locator"))}; '
+                f'tag={shape(target.get("tag"))}; type={shape(target.get("type"))}.',
+                reason='defect_receiver')
+
+
 def _reversible_entry_recipient(page: dict, target: dict,
                                 witness: dict | None = None) -> None:
     """Prove exact application membership using the independent ENTRY census."""
@@ -2953,23 +2971,30 @@ def _reversible_entry_recipient(page: dict, target: dict,
     evidence = entry.get('root_evidence')
     excluded = root.get('excluded') if isinstance(root, dict) else None
     selector = target.get('selector')
-    if (not isinstance(root, dict) or root.get('root') or root.get('error')
-            or root.get('truncated') or not root.get('container')
-            or not root.get('submit') or not isinstance(selector, str)
-            or not selector or not isinstance(excluded, list)
-            or any(not isinstance(s, str) for s in excluded)
-            or selector in excluded or not isinstance(evidence, list)
-            or not 1 <= len(evidence) <= 500
-            or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
-                   for e in evidence)
-            or len({e['selector'] for e in evidence}) != len(evidence)):
-        raise Gate('The reversible receiver has no exact application membership.',
-                   reason='defect_receiver')
-    matches = [e for e in evidence if e['selector'] == selector]
-    if len(matches) != 1:
-        raise Gate('The reversible receiver has no exact application membership.',
-                   reason='defect_receiver')
-    e = matches[0]
+    for predicate, failed in (
+            ('formless.object', lambda: not isinstance(root, dict)),
+            ('formless.root', lambda: root.get('root')),
+            ('formless.error', lambda: root.get('error') not in _REVERSIBLE_ROOT_ERRORS),
+            ('formless.truncated', lambda: root.get('truncated')),
+            ('formless.container', lambda: not root.get('container')),
+            ('formless.submit', lambda: not root.get('submit')),
+            ('selector', lambda: not isinstance(selector, str) or not selector),
+            ('formless.excluded', lambda: not isinstance(excluded, list)
+             or any(not isinstance(s, str) for s in excluded)),
+            ('excluded', lambda: selector in excluded),
+            ('root_evidence.list', lambda: not isinstance(evidence, list)
+             or not 1 <= len(evidence) <= 500
+             or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
+                    for e in evidence)),
+            ('root_evidence.unique',
+             lambda: len({e['selector'] for e in evidence}) != len(evidence)),
+            ('root_evidence.match',
+             lambda: sum(e['selector'] == selector for e in evidence) != 1)):
+        if failed():
+            raise _receiver_defect(
+                'The reversible receiver has no exact application membership.',
+                predicate, target)
+    e = next(e for e in evidence if e['selector'] == selector)
     custom = (target.get('tag') == 'div' and target.get('type') == 'combobox'
               and isinstance(target.get('combobox'), dict)
               and bool(target.get('label')) and bool(target.get('question')))
@@ -2978,32 +3003,44 @@ def _reversible_entry_recipient(page: dict, target: dict,
                    and target.get('native_type') == 'button'
                    and bool(target.get('question')))
     native_label = e.get('associated') is True and e.get('label') == target.get('label')
-    if (e.get('unique') is not True or e.get('in_container') is not True
-            or e.get('native_owner') or e.get('declared_owner')
-            or e.get('formaction') is not None or e.get('submit')
-            or e.get('iti') or e.get('contenteditable')
-            or e.get('type') == 'hidden' or e.get('disabled')
-            or e.get('readonly') or e.get('inert')
-            or e.get('visible') is not True
-            or e.get('tag') != target.get('tag')
-            or e.get('type') != target.get('type')
-            or (not (custom or pair_member)
-                and e.get('required') != target.get('required'))
-            or e.get('disabled') != target.get('disabled')
-            or (not native_label and not (custom or pair_member))
-            or target.get('in_form') is not False
-            or any(target.get(k) for k in (
+    for predicate, failed in (
+            ('evidence.unique', e.get('unique') is not True),
+            ('evidence.in_container', e.get('in_container') is not True),
+            ('evidence.native_owner', e.get('native_owner')),
+            ('evidence.declared_owner', e.get('declared_owner')),
+            ('evidence.formaction', e.get('formaction') is not None),
+            ('evidence.submit', e.get('submit')),
+            ('evidence.iti', e.get('iti')),
+            ('evidence.contenteditable', e.get('contenteditable')),
+            ('evidence.hidden', e.get('type') == 'hidden'),
+            ('evidence.disabled', e.get('disabled')),
+            ('evidence.readonly', e.get('readonly')),
+            ('evidence.inert', e.get('inert')),
+            ('evidence.visible', e.get('visible') is not True),
+            ('tag.equal', e.get('tag') != target.get('tag')),
+            ('type.equal', e.get('type') != target.get('type')),
+            ('required.equal', not (custom or pair_member)
+             and e.get('required') != target.get('required')),
+            ('disabled.equal', e.get('disabled') != target.get('disabled')),
+            ('label.associated', not native_label and not (custom or pair_member)),
+            ('in_form', target.get('in_form') is not False),
+            *((f'target.{k}', target.get(k)) for k in (
                 'native_form_owner_selector', 'form_selector', 'form_action',
                 'form_action_attr_present', 'form_action_raw', 'formaction',
                 'formaction_attr_present', 'formaction_raw', 'href',
                 'submit', 'navigates', 'commits_application'))):
-        raise Gate('The reversible receiver is not associated with the application.',
-                   reason='defect_receiver')
-    if not (custom or pair_member) and (
-            e.get('value') != target.get('value')
-            or e.get('files') != target.get('files')):
-        raise Gate('The independent application receiver value differs.',
-                   reason='defect_receiver')
+        if failed:
+            raise _receiver_defect(
+                'The reversible receiver is not associated with the application.',
+                predicate, target)
+    if not (custom or pair_member):
+        for predicate, failed in (
+                ('value.equal', e.get('value') != target.get('value')),
+                ('files.equal', e.get('files') != target.get('files'))):
+            if failed:
+                raise _receiver_defect(
+                    'The independent application receiver value differs.',
+                    predicate, target)
     if witness is not None:
         dom = witness.get(selector)
         if (not isinstance(dom, dict) or dom.get('visible') is not True
@@ -4700,7 +4737,7 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
     structural = _formless_root(page)
     if not structural:
         return True
-    if structural.get('error') or structural.get('truncated'):
+    if structural.get('error') not in _REVERSIBLE_ROOT_ERRORS or structural.get('truncated'):
         return False
     if structural.get('root'):
         try:
@@ -4708,7 +4745,7 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
         except Gate:
             return False
         return True
-    if (_entry_not_ready(page) != 'no unique application root'
+    if (_entry_not_ready(page) != (structural['error'] or 'no unique application root')
             or page.get('inventory_verified') is not True
             or page.get('truncated') or page.get('opaque_controls')
             or page.get('shadow_roots') or page.get('unsupported_frames')
@@ -4803,6 +4840,12 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                         'iti', 'contenteditable', 'submit'))):
                 return Gate('The application widget is not writable by the guarded executor.',
                             reason='defect_' + _required_owner_gate_type(item))
+            try:
+                _reversible_entry_recipient(current, item, witness)
+            except Gate as refusal:
+                if refusal.reason == 'defect_receiver':
+                    return Gate('Required receiver lacks application association: '
+                                + str(refusal), reason='defect_receiver')
             return Gate('Required receiver lacks application association.',
                         reason='defect_receiver')
         # The existing native checkbox standing acknowledgement is not an

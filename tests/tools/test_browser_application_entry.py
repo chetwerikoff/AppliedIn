@@ -2152,3 +2152,35 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
             for char in segment:
                 value = (value ^ ord(char)) * 0x100000001b3 & ((1 << 64) - 1)
             assert f"{value:016x}" == baseline, (filename, name)
+
+
+
+def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():
+    from discovery.watchlist import CompanyConfig
+
+    company = "example-co"
+    cfg = CompanyConfig(
+        name=company, ats="greenhouse", board="example-board",
+        careers_url="https://careers.example-co.test/openings")
+    for host in ("job-boards.greenhouse.io", "boards.greenhouse.io"):
+        url = f"https://{host}/example-board/jobs/731205"
+        pk = "example-co#731205"
+        row = {"pk": pk, "company": company, "job_id": "731205",
+               "ats": "greenhouse", "jd_url": url,
+               "greenhouse_board": "example-board"}
+        assert forms.verified_greenhouse_alias(
+            row, pk=pk, company=company, url=url, configs=[cfg]) is None
+
+    jid = "123e4567-e89b-42d3-a456-426614174000"
+    pk = f"example-co#{jid}"
+    for ats, host in (("ashby", "jobs.ashbyhq.com"),
+                      ("lever", "jobs.lever.co")):
+        for board, admitted in (("example-board", True), ("example.co", False)):
+            url = f"https://{host}/{board}/{jid}"
+            cfg = CompanyConfig(
+                name=company, ats=ats, board=board,
+                careers_url=f"https://{host}/{board}")
+            row = {"pk": pk, "company": company, "job_id": jid,
+                   "ats": ats, "jd_url": url}
+            actual = forms._application_entry(row, pk, company, url, [cfg])
+            assert (actual is not None) is admitted

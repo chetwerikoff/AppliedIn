@@ -249,11 +249,22 @@ async def admitted(monkeypatch):
     return row, raw, session, page, provenance
 
 
-async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
+def _optional_text_fields(raw):
+    """Issue #198: a sibling mismatch still binds owner questions first."""
+    for snapshot in (raw.current, raw.fixed):
+        for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+            if c.get('type') not in {'file', 'submit'}:
+                c['required'] = False
+
+
+async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause,
+                                 optional_fields=False):
     """ARCH21:18 / AC2/AC9: obsolete root proof is final evidence only."""
     # Production permits late hydration up to 90s; this fake never changes shape.
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     row, raw, decide, provenance = root_world(monkeypatch, **changes)
+    if optional_fields:
+        _optional_text_fields(raw)
     transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     file = next(c for c in raw.current['controls']
                 if c['type'] == 'file' and c['label'] == 'Resume')
@@ -269,6 +280,8 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
             name = Path(args[2]).name
             raw.current, raw.fixed = observed(
                 **changes, attached=True, files=[name], displayName=name)
+            if optional_fields:
+                _optional_text_fields(raw)
             return {}
         return await original_call(method, *args, **kwargs)
     raw.call = call
@@ -942,7 +955,10 @@ def test_exact_submit_guard_local_cause(monkeypatch, member, value):
 ])
 async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
     if cause in {'sibling identity mismatch', 'ambiguous application roots'}:
-        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
+        # The tolerated mismatch admits owner questions; with every text field
+        # answered or optional, it still blocks the final Submit unchanged.
+        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause,
+                                     optional_fields=cause == 'sibling identity mismatch')
         return
     _, raw, decide, provenance = root_world(monkeypatch, **spec)
     result = await attempt()

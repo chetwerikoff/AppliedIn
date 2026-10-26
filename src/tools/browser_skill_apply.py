@@ -2975,6 +2975,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
             ('formless.object', lambda: not isinstance(root, dict)),
             ('formless.root', lambda: root.get('root')),
             ('formless.error', lambda: root.get('error') not in _REVERSIBLE_ROOT_ERRORS),
+            ('formless.pane', lambda: root.get('error') and not root.get('pane')),
             ('formless.truncated', lambda: root.get('truncated')),
             ('formless.container', lambda: not root.get('container')),
             ('formless.submit', lambda: not root.get('submit')),
@@ -2998,11 +2999,20 @@ def _reversible_entry_recipient(page: dict, target: dict,
     custom = (target.get('tag') == 'div' and target.get('type') == 'combobox'
               and isinstance(target.get('combobox'), dict)
               and bool(target.get('label')) and bool(target.get('question')))
-    pair_member = (target.get('tag') == 'button'
-                   and target.get('type') == 'button'
-                   and target.get('native_type') == 'button'
-                   and bool(target.get('question')))
-    native_label = e.get('associated') is True and e.get('label') == target.get('label')
+    entry_label = (e.get('id') == '' and e.get('entry_titles') == 1
+                   and isinstance(e.get('field_entry'), str) and bool(e['field_entry'])
+                   and isinstance(e.get('entry_label'), str) and bool(e['entry_label'].strip())
+                   and target.get('question') == e['entry_label'])
+    yes_no = (target.get('tag') == 'button' and target.get('type') == 'button'
+              and target.get('native_type') == 'submit' and e.get('yes_no') is True
+              and e.get('untyped') is True and entry_label
+              and e.get('caption') in ('Yes', 'No') and target.get('label') == e['caption'])
+    pair_member = yes_no or (target.get('tag') == 'button'
+                             and target.get('type') == 'button'
+                             and target.get('native_type') == 'button'
+                             and bool(target.get('question')))
+    native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
+                    or (entry_label and target.get('tag') == 'input'))
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3098,23 +3108,40 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
     return members
 
 
+def _yes_no_entry(page: dict, target: dict) -> str:
+    """The census field entry of an untyped Ashby Yes/No member, else ''."""
+    evidence = (page.get('entry') or {}).get('root_evidence') or []
+    matches = [e for e in evidence if isinstance(e, dict)
+               and e.get('selector') == target.get('selector')]
+    if (len(matches) != 1 or matches[0].get('yes_no') is not True
+            or not isinstance(matches[0].get('field_entry'), str)):
+        return ''
+    return matches[0]['field_entry']
+
+
 def _boolean_pair(page: dict, target: dict, *,
                   witness: dict | None = None) -> list[dict]:
     """Only a complete, exact Yes/No application button group can be written."""
     root = _formless_root(page)
     name, question = target.get('name'), target.get('question')
+    # Live Ashby Yes/No buttons are untyped (DOM submit) and nameless; their
+    # group identity is the census field entry under its single question title.
+    native = target.get('native_type')
+    entry = _yes_no_entry(page, target) if native == 'submit' else ''
     if (not root or root.get('root') or target.get('tag') != 'button'
             or target.get('type') != 'button'
-            or not isinstance(name, str) or not name.strip()
+            or (native == 'submit' and not entry)
+            or (native != 'submit' and (not isinstance(name, str) or not name.strip()))
             or not isinstance(question, str) or not question.strip()):
         raise Gate('Unsupported Boolean receiver.', reason='defect_button')
     members = [c for c in page['controls']
-               if c.get('tag') == 'button' and c.get('name') == name
-               and c.get('question') == question]
+               if c.get('tag') == 'button' and c.get('question') == question
+               and (_yes_no_entry(page, c) == entry if entry else c.get('name') == name)]
     if (len(members) != 2
             or {str(c.get('label', '')).casefold() for c in members} != {'yes', 'no'}
             or len({c.get('selector') for c in members}) != 2
-            or any(c.get('type') != 'button' or c.get('native_type') != 'button'
+            or any(c.get('type') != 'button'
+                   or c.get('native_type') != ('submit' if entry else 'button')
                    or c.get('in_form') is not False or c.get('disabled')
                    or c.get('required') is not True
                    or ((c.get('has_value') or c.get('checked')

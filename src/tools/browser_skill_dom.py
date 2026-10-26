@@ -490,6 +490,32 @@ _ASHBY_ROOT = r"""
   // Description links remain in the original PAGE inventory; they are not
   // input/receiver candidates. Role-button links still enter this census and
   // no link acquires action authority through the structural branch.
+  // Live rootless Ashby renders Location, Date and Yes/No receivers without an
+  // id, so their title's for= resolves to nothing. The only caption proof is
+  // the single question title of the receiver's own field entry; zero or
+  // several titles, or a title owned by another live control, prove nothing.
+  const fieldEntry = e => {
+    if (forms.length || structuralRoot || !container || !container.contains(e) || e.id) return null;
+    const entry=e.closest('div.ashby-application-form-field-entry');
+    if (!entry || !container.contains(entry)) return null;
+    const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
+    const owner=titles.length===1 ? titles[0].getAttribute('for') : null;
+    return {entry,titles:titles.length,
+      title:titles.length===1 && !(owner && document.getElementById(owner)) ? titles[0] : null};
+  };
+  // An untyped button defaults to submit. It is a Boolean member only with no
+  // form owner or override, not the exact Submit, as one of exactly two Yes/No
+  // buttons forming its titled field entry's only buttons.
+  const ashbyYesNo = e => {
+    const free = b => b.tagName==='BUTTON' && b.getAttribute('type')===null && !b.form &&
+      !b.hasAttribute('form') && !b.hasAttribute('formaction') && b!==exactSubmit;
+    const field=free(e) ? fieldEntry(e) : null, group=e.parentElement;
+    if (!field?.title || !group?.matches('div.ashby-application-form-input-yesno') ||
+        !field.entry.contains(group)) return false;
+    const buttons=Array.from(field.entry.querySelectorAll('button'));
+    return buttons.length===2 && buttons.every(b=>b.parentElement===group && free(b)) &&
+      buttons.map(b=>clean(b.innerText)).sort().join('|')==='No|Yes';
+  };
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
     .filter(e=>!excluded.has(e));
@@ -514,8 +540,14 @@ _ASHBY_ROOT = r"""
         !!container && container.contains(labels[0]) && container.contains(e) &&
         document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
         document.getElementById(labels[0].getAttribute('for'))===e;
+      const field=fieldEntry(e);
       return {selector:sel,unique:document.querySelectorAll(sel).length===1,
-        tag:e.tagName.toLowerCase(),type:e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
+        tag:e.tagName.toLowerCase(),
+        type:ashbyYesNo(e) ? 'button' : e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
+        field_entry:field ? selector(field.entry) : '',entry_titles:field ? field.titles : 0,
+        entry_label:field?.title ? clean(field.title.innerText) : '',
+        entry_label_selector:field?.title ? selector(field.title) : '',
+        caption:e.tagName==='BUTTON' ? clean(e.innerText) : '',yes_no:ashbyYesNo(e),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
         id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
         associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
@@ -940,13 +972,26 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
 """
 
 
+_CONTROL_TYPE = ("const type=e.getAttribute('role') || nativeType || "
+                 "e.getAttribute('type') || e.tagName.toLowerCase();")
+
+
 def entry_reader(script: str) -> str:
     """Scope the two code-owned readers without changing ordinary PAGE/graphs.
 
     All exclusions precede the shared graph; no protected value is read even
     transiently. The fixed witness observes provider identities independently.
     """
+    # Both readers classify a proven Yes/No member identically. native_type
+    # stays submit, so any click on it still reaches the final Submit guard.
+    assert script.count(_CONTROL_TYPE) == 1
+    script = script.replace(_CONTROL_TYPE, _CONTROL_TYPE.replace(
+        'const type=', "const type=ashbyYesNo(e) ? 'button' : "))
     script = script.replace(_WIDGET_GRAPH, _ENTRY_OBSERVATION + _WIDGET_GRAPH)
+    script = script.replace(
+        'question:question.slice(0,1200)',
+        'question:(fieldEntry(e)?.title ? clean(fieldEntry(e).title.innerText) : question)'
+        '.slice(0,1200)')
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")

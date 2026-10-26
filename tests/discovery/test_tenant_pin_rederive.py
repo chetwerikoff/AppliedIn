@@ -1,58 +1,324 @@
-"""Unchanged #118/#138 tenant pin and application-entry scopes (Issue #201).
+"""Offline single-key Greenhouse tenant data proof; no application path is called."""
 
-Synthetic tests only: successful feed discovery may not rewrite these consumers.
-"""
-from __future__ import annotations
+from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
+from core.models import JobRecord
+from core.storage.base import tenant_pin_row_allowed, tenant_pin_same_witness
+from discovery import tenant_pin
+from discovery.adapters.ashby import AshbyAdapter
+from discovery.adapters.greenhouse import GreenhouseAdapter
+from discovery.adapters.lever import LeverAdapter
 from core.ids import make_pk
 from core.models import DiscoveryMode
-from discovery.tenant_pin import (
-    greenhouse_query_id, greenhouse_suffix_id, reviewed_tuple,
-)
+from discovery.tenant_pin import greenhouse_query_id, greenhouse_suffix_id, reviewed_tuple
 from discovery.watchlist import CompanyConfig
 from tools.browser_skill_apply import _application_entry
 from tools.claude_chrome import verified_greenhouse_alias
 
-
-NAME = "example-co"
-JID = "731205"
+PK = "example-co#731205"
 CAREERS = "https://careers.example-co.test/openings"
-POSTING = "https://job-boards.greenhouse.io/example-board/jobs/731205"
-UUID = "123e4567-e89b-42d3-a456-426614174000"
+WRAPPER = CAREERS + "/platform-engineer?gh_jid=731205"
+HOSTED = "https://job-boards.greenhouse.io/example-board/jobs/731205"
+UUID = "01234567-89ab-cdef-0123-456789abcdef"
+
+
+class _Tracking:
+    def __init__(self, row):
+        self.row = deepcopy(row)
+        self.writes = 0
+
+    def get(self, pk):
+        return deepcopy(self.row) if self.row and self.row.get("pk") == pk else None
+
+    def add_missing_greenhouse_pin(self, pk, board, *, expected_row):
+        if (not tenant_pin_row_allowed(self.row, pk, board)
+                or not tenant_pin_same_witness(self.row, expected_row)):
+            return False
+        self.row["greenhouse_board"] = board
+        self.writes += 1
+        return True
+
+
+def _row(**overrides):
+    record = dict(
+        pk=PK, company="example-co", job_id="731205", ats="greenhouse",
+        jd_url=WRAPPER, status="error", fail_kind="defect_greenhouse_tenant_alias",
+        gate_reason="defect_greenhouse_tenant_alias",
+        apply_requested_at="2026-10-20T01:00:00Z", attempts=3,
+        approval_status="pending", approved_at=None,
+        jd_read_attempts=1, jd_read_revision=7,
+        note="Synthetic pre-browser tenant failure",
+    )
+    record.update(overrides)
+    return record
+
+
+def _feed(ats="greenhouse", job_id="731205", url=HOSTED):
+    return JobRecord(company="example-co", job_id=job_id,
+                     title="Staff Platform Engineer", jd_url=url,
+                     jd_text="Synthetic JD", location="Remote",
+                     posted_at="2026-10-18T00:00:00Z", ats=ats)
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    path = tmp_path / "watchlist.yaml"
+    path.write_text("""companies:
+  - name: example-co
+    careers_url: https://careers.example-co.test/openings
+    ats: greenhouse
+    board: example-board
+    discovery: crawl
+    mode: gated
+""")
+    state = SimpleNamespace(path=path, rows=[_feed()], tracking=_Tracking(_row()))
+    monkeypatch.setattr(GreenhouseAdapter, "fetch",
+                        lambda self, cfg, client: deepcopy(state.rows))
+    return state
+
+
+def _once(world, **kwargs):
+    return tenant_pin.rederive_one(
+        PK, tracking=world.tracking, watchlist_path=world.path, **kwargs)
+
+
+def test_original_request_only_gate_failure_is_eligible_but_no_approval(world):
+    original = deepcopy(world.tracking.row)
+    preview = _once(world)
+    assert preview["status"] == "dry_run_eligible"
+    assert preview["would_pin"] and not preview["committed"]
+    assert world.tracking.row == original and world.tracking.writes == 0
+    assert _once(world, commit=True)["status"] == "authorization_required"
+    assert world.tracking.row == original
+    committed = _once(world, commit=True, operator_authorized=True)
+    assert committed["status"] == "committed" and committed["committed"]
+    assert world.tracking.row == {**original, "greenhouse_board": "example-board"}
+    assert world.tracking.writes == 1
+    assert _once(world)["status"] == "already_pinned"
+    assert world.tracking.writes == 1
+
+
+@pytest.mark.parametrize("value", ["", None, "wrong-board"])
+def test_present_board_is_not_a_missing_board(world, value):
+    world.tracking.row["greenhouse_board"] = value
+    original = deepcopy(world.tracking.row)
+    assert _once(world)["status"] == "conflicting_pin"
+    assert world.tracking.row == original and world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("changed", [
+    {"status": "submitting"}, {"status": "applied_manual"},
+    {"possible_submission": True}, {"submit_hold": ""},
+    {"browser_session_id": "synthetic-browser-session"},
+    {"submission_attempted_at": "2026-10-20"},
+    {"gate_reason": "submit_uncertain"},
+    {"gate_reason": "owner_question"},
+    {"last_button": "Submit"},
+    {"browser_started_at": ""},
+    {"gate_pending": {"question": "synthetic form question"}},
+    {"apply_requested_at": "2026-10-21", "gate_reason": "owner_question",
+     "fail_kind": "other"},
+])
+def test_unsafe_original_history_is_never_patched(world, changed):
+    world.tracking.row.update(changed)
+    original = deepcopy(world.tracking.row)
+    assert _once(world)["status"] == "unsafe_history"
+    assert world.tracking.row == original and world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("url", [
+    "https://careers.example-co.test/openings/engineer?gh_jid=731205&x=1",
+    "https://careers.example-co.test/openings/engineer?gh_jid=731205&gh_jid=731205",
+    "https://careers.example-co.test/openings/engineer?gh_jid=%37%33",
+    "https://careers.example-co.test/openings/job/731205",
+    "http://careers.example-co.test/openings/engineer?gh_jid=731205",
+    "https://careers.example-co.test/other/engineer?gh_jid=731205",
+])
+def test_noncanonical_original_url_needs_manual_identity_review(world, url):
+    world.tracking.row["jd_url"] = url
+    assert _once(world)["status"] == "noncanonical_wrapper"
+    assert world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("target", [
+    "", WRAPPER,
+    "https://boards.greenhouse.io/other-board/jobs/731205",
+    "https://job-boards.greenhouse.io/example-board/jobs/731206",
+    "https://job-boards.greenhouse.io:443/example-board/jobs/731205",
+    "https://user@job-boards.greenhouse.io/example-board/jobs/731205",
+    "https://job-boards.greenhouse.io/example-board/jobs/731205?x=1",
+    "https://fake-job-boards.greenhouse.io/example-board/jobs/731205",
+])
+def test_missing_or_noncanonical_feed_target_cannot_pin(world, target):
+    world.rows = [_feed(url=target)]
+    assert _once(world)["status"] == "feed_not_proved"
+    assert world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("jobs", [[], [_feed(job_id="731206")],
+                                  [_feed(), _feed()]])
+def test_missing_duplicate_or_wrong_feed_identity_fails_closed(world, jobs):
+    world.rows = jobs
+    assert _once(world)["status"] == "feed_not_proved"
+    assert world.tracking.writes == 0
+
+
+def test_deployed_tuple_must_be_explicit_unique_and_unchanged(world):
+    data = world.path.read_text()
+    world.path.write_text(data + """
+  - name: EXAMPLE-CO
+    careers_url: https://careers.example-co.test/openings
+    ats: greenhouse
+    board: example-board
+    discovery: crawl
+    mode: gated
+""")
+    assert _once(world)["status"] == "unproved_tuple"
+    assert world.tracking.writes == 0
+    world.path.write_text(data.replace("    board: example-board\n", ""))
+    assert _once(world)["status"] == "unproved_tuple"
+
+
+@pytest.mark.parametrize("ats,url", [
+    ("ashby", "https://jobs.ashbyhq.com/example-board/" + UUID),
+    ("lever", "https://jobs.lever.co/example-board/" + UUID),
+])
+def test_canonical_ashby_and_lever_are_read_only(world, monkeypatch, ats, url):
+    world.path.write_text(world.path.read_text().replace("greenhouse", ats))
+    provider = {"ashby": AshbyAdapter, "lever": LeverAdapter}[ats]
+    monkeypatch.setattr(provider, "fetch",
+                        lambda self, cfg, client: [_feed(ats=ats, job_id=UUID, url=url)])
+    pk = "example-co#" + UUID
+    original = dict(pk=pk, company="example-co", job_id=UUID, status="found",
+                    jd_url=url, ats=ats, attempts=9, approval_status="unanswered")
+    tracking = _Tracking(original)
+    report = tenant_pin.rederive_one(
+        pk, tracking=tracking, watchlist_path=world.path)
+    assert report["status"] == "verified_read_only"
+    assert tracking.row == original and tracking.writes == 0
+
+
+def test_provider_identity_and_url_drift_fail_without_writes(world):
+    world.tracking.row["pk"] = "example-co#old-slug"
+    assert _once(world)["status"] == "missing_row"
+    assert world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("field,prior,changed", [
+    ("attempts", 0, False),
+    ("approved", False, 0),
+    ("jd_read_revision", 1, True),
+])
+def test_protected_witness_type_drift_is_not_an_equal_original(
+    world, field, prior, changed,
+):
+    """JSON boolean/number drift must not pass the exact original-row CAS.
+
+    Python considers True == 1 and False == 0, but these are distinct
+    persisted witness values, including for request/approval/reader history.
+    """
+    original = _row(**{field: prior})
+    world.tracking.row = deepcopy(original)
+    world.tracking.row[field] = changed
+    assert prior == changed
+    assert type(prior) is not type(changed)
+    assert not tenant_pin_same_witness(world.tracking.row, original)
+    assert not world.tracking.add_missing_greenhouse_pin(
+        PK, "example-board", expected_row=original)
+    assert world.tracking.writes == 0
+
+
+@pytest.mark.parametrize("history", [
+    # A requestless _apply_direct browser-form gate is still browser history.
+    {"apply_requested_at": "", "status": "needs_human",
+     "gate_reason": "unknown_field", "fail_kind": "",
+     "gate_call_id": "direct", "gate_source": "applier",
+     "gate_pending": {"form_question": {"pk": PK, "label": "Synthetic question"}},
+     "fields": [{"label": "Synthetic field", "value": "synthetic"}],
+     "screenshot_s3_key": "synthetic/example-screen.png"},
+    {"apply_requested_at": "", "status": "failed",
+     "gate_reason": "unknown_field", "fail_kind": ""},
+    # A matching pre-browser tenant denial does not cancel an earlier browser
+    # artifact, even if the later request, approval and attempts are unchanged.
+    {"fields": [{"label": "Synthetic field", "value": "synthetic"}]},
+    {"screenshot_s3_key": "synthetic/example-screen.png"},
+    {"fields": []},  # Presence is not proof of an untouched browser.
+    {"screenshot_s3_key": ""},
+    # Neither a non-tenant reason nor a form gate depends on a request timestamp.
+    {"apply_requested_at": "", "gate_reason": "unknown_field", "fail_kind": ""},
+    {"apply_requested_at": "", "gate_pending": {"question": "Synthetic form gate"}},
+    {"apply_requested_at": "", "gate_call_id": "direct", "gate_source": "applier"},
+    {"apply_requested_at": "", "status": "failed", "gate_reason": "",
+     "fail_kind": ""},
+    # A tenant-denial reason without the corresponding request is not
+    # independently proved pre-browser request history.
+    {"apply_requested_at": ""},
+])
+def test_requestless_or_browser_touched_history_is_never_pinned(world, history):
+    """#6301207727 / #6301512360: no historical browser state may be pinned."""
+    world.tracking.row.update(deepcopy(history))
+    original = deepcopy(world.tracking.row)
+    assert _once(world)["status"] == "unsafe_history"
+    assert _once(world, commit=True, operator_authorized=True)["status"] == "unsafe_history"
+    assert world.tracking.row == original and world.tracking.writes == 0
+
+
+def test_pristine_unrequested_row_keeps_data_only_eligibility(world):
+    """No request or browser/gate evidence remains safe to re-derive read-only."""
+    world.tracking.row.update(
+        status="found", apply_requested_at="", attempts=0,
+        gate_reason="", fail_kind="", approval_status="unanswered",
+    )
+    unchanged = deepcopy(world.tracking.row)
+    report = _once(world)
+    assert report["status"] == "dry_run_eligible"
+    assert report["would_pin"] and not report["committed"]
+    assert world.tracking.row == unchanged
+    assert world.tracking.writes == 0
+
+
+# Issue #201 AC2/AC5: additional read-only grammar and consumer regressions.
+# Keep the pre-existing single-PK pin, dry-run, history and CAS suite intact.
+GH201_NAME = "example-co"
+GH201_JID = "731205"
+GH201_CAREERS = "https://careers.example-co.test/openings"
+GH201_POSTING = "https://job-boards.greenhouse.io/example-board/jobs/731205"
+GH201_UUID = "123e4567-e89b-42d3-a456-426614174000"
 
 
 @pytest.mark.parametrize("url,query_id,suffix_id", [
-    (CAREERS + "?gh_jid=" + JID, None, None),
-    (CAREERS + "/staff-platform?gh_jid=" + JID, JID, None),
-    (CAREERS + "/staff-platform/job/" + JID, None, JID),
-    (CAREERS + "/job/" + JID, None, JID),
-    (CAREERS + "/job/" + JID + "?ref=1", None, None),
-    (CAREERS + "/staff-platform?GH_JID=" + JID, None, None),
-    ("https://careers.example-co.test/openings-archive/job/" + JID, None, None),
-    ("http://careers.example-co.test/openings/job/" + JID, None, None),
-    ("https://careers.example-co.test:443/openings/job/" + JID, None, None),
+    (GH201_CAREERS + "?gh_jid=" + GH201_JID, None, None),
+    (GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID, GH201_JID, None),
+    (GH201_CAREERS + "/staff-platform/job/" + GH201_JID, None, GH201_JID),
+    (GH201_CAREERS + "/job/" + GH201_JID, None, GH201_JID),
+    (GH201_CAREERS + "/job/" + GH201_JID + "?ref=1", None, None),
+    (GH201_CAREERS + "/staff-platform?GH_JID=" + GH201_JID, None, None),
+    ("https://careers.example-co.test/openings-archive/job/" + GH201_JID, None, None),
+    ("http://careers.example-co.test/openings/job/" + GH201_JID, None, None),
+    ("https://careers.example-co.test:443/openings/job/" + GH201_JID, None, None),
     ("https://careers.example-co.test/openings/job/%3731205", None, None),
-    ("https://careers.example-co.test/openings/job/" + JID + "/extra", None, None),
+    ("https://careers.example-co.test/openings/job/" + GH201_JID + "/extra", None, None),
 ])
 def test_original_tenant_pin_query_and_suffix_grammars_remain_distinct(
     url, query_id, suffix_id,
 ):
-    assert greenhouse_query_id(url, CAREERS) == query_id
-    assert greenhouse_suffix_id(url, CAREERS) == suffix_id
+    assert greenhouse_query_id(url, GH201_CAREERS) == query_id
+    assert greenhouse_suffix_id(url, GH201_CAREERS) == suffix_id
 
 
 def test_tenant_pin_pathless_source_never_becomes_a_reviewed_proof():
     root = "https://careers.example-co.test"
-    assert greenhouse_query_id(root + "/?gh_jid=" + JID, root) is None
-    assert greenhouse_suffix_id(root + "/job/" + JID, root) is None
+    assert greenhouse_query_id(root + "/?gh_jid=" + GH201_JID, root) is None
+    assert greenhouse_suffix_id(root + "/job/" + GH201_JID, root) is None
 
 
 @pytest.mark.parametrize("source,allowed", [
-    (CAREERS, True),
+    (GH201_CAREERS, True),
     ("https://careers.example-co.test", False),
-    (CAREERS + "/", False),
+    (GH201_CAREERS + "/", False),
 ])
 def test_original_deployed_tuple_requires_exact_nonpathless_source(
     tmp_path, source, allowed,
@@ -68,43 +334,43 @@ def test_original_deployed_tuple_requires_exact_nonpathless_source(
         "    mode: gated\n"
     )
     cfg = CompanyConfig(
-        name=NAME, careers_url=source, ats="greenhouse",
+        name=GH201_NAME, careers_url=source, ats="greenhouse",
         board="example-board", discovery=DiscoveryMode.CRAWL)
-    proof = reviewed_tuple(NAME, path=manifest, expected=cfg, crawl_only=True)
+    proof = reviewed_tuple(GH201_NAME, path=manifest, expected=cfg, crawl_only=True)
     assert (proof is not None) is allowed
 
 
 @pytest.mark.parametrize("careers,wrapper", [
-    (CAREERS, CAREERS + "?gh_jid=" + JID),
-    (CAREERS, CAREERS + "/staff-platform?gh_jid=" + JID),
+    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID),
+    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID),
     ("https://careers.example-co.test",
-     "https://careers.example-co.test/?gh_jid=" + JID),
+     "https://careers.example-co.test/?gh_jid=" + GH201_JID),
 ])
 def test_existing_greenhouse_guard_keeps_old_pinned_wrapper_but_refuses_canonical_start(
     careers, wrapper,
 ):
-    cfg = CompanyConfig(name=NAME, careers_url=careers,
+    cfg = CompanyConfig(name=GH201_NAME, careers_url=careers,
                         ats="greenhouse", board="example-board")
-    pk = make_pk(NAME, JID)
-    old = dict(pk=pk, company=NAME, job_id=JID, ats="greenhouse",
+    pk = make_pk(GH201_NAME, GH201_JID)
+    old = dict(pk=pk, company=GH201_NAME, job_id=GH201_JID, ats="greenhouse",
                greenhouse_board="example-board", jd_url=wrapper)
     proof = verified_greenhouse_alias(
-        old, pk=pk, company=NAME, url=wrapper, configs=[cfg])
-    assert proof is not None and proof.url == POSTING
-    canonical = dict(old, jd_url=POSTING)
+        old, pk=pk, company=GH201_NAME, url=wrapper, configs=[cfg])
+    assert proof is not None and proof.url == GH201_POSTING
+    canonical = dict(old, jd_url=GH201_POSTING)
     assert verified_greenhouse_alias(
-        canonical, pk=pk, company=NAME, url=POSTING, configs=[cfg]) is None
+        canonical, pk=pk, company=GH201_NAME, url=GH201_POSTING, configs=[cfg]) is None
 
 
 def test_current_application_entry_refuses_dotted_ashby_without_widening_board_token():
-    pk = make_pk(NAME, UUID)
-    url = f"https://jobs.ashbyhq.com/example.co/{UUID}"
-    cfg = CompanyConfig(name=NAME, ats="ashby", board="example.co",
+    pk = make_pk(GH201_NAME, GH201_UUID)
+    url = f"https://jobs.ashbyhq.com/example.co/{GH201_UUID}"
+    cfg = CompanyConfig(name=GH201_NAME, ats="ashby", board="example.co",
                         careers_url="https://jobs.ashbyhq.com/example.co")
-    row = dict(pk=pk, company=NAME, ats="ashby", job_id=UUID, jd_url=url)
-    assert _application_entry(row, pk, NAME, url, [cfg]) is None
-    allowed_url = f"https://jobs.ashbyhq.com/example-co/{UUID}"
-    accepted = CompanyConfig(name=NAME, ats="ashby", board="example-co",
+    row = dict(pk=pk, company=GH201_NAME, ats="ashby", job_id=GH201_UUID, jd_url=url)
+    assert _application_entry(row, pk, GH201_NAME, url, [cfg]) is None
+    allowed_url = f"https://jobs.ashbyhq.com/example-co/{GH201_UUID}"
+    accepted = CompanyConfig(name=GH201_NAME, ats="ashby", board="example-co",
                              careers_url="https://jobs.ashbyhq.com/example-co")
     assert _application_entry(
-        dict(row, jd_url=allowed_url), pk, NAME, allowed_url, [accepted]) is not None
+        dict(row, jd_url=allowed_url), pk, GH201_NAME, allowed_url, [accepted]) is not None

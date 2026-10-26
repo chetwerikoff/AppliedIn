@@ -2254,6 +2254,46 @@ def test_wait_page_gate_without_a_page_never_invents_safety_stages(message):
 
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('break_page,stage', [
+    ('controls', 'read.controls_valid'),
+    ('origin', 'read.origin_allowed'),
+])
+async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
+        monkeypatch, caplog, break_page, stage):
+    """ARCH22:31: _EntrySession.call read a PAGE and _entry_safety refused it
+    before the PAGE reached the waiter. The Gate carries that one observed
+    stage; every other safety stage stays unknown, and no value or selector
+    reaches the map or the log."""
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    page = application('ashby')
+    if break_page == 'controls':
+        page['controls'][0]['tag'] = None
+    else:
+        page['url'] = 'https://elsewhere.example.test/application'
+    _, _, session, _ = world(monkeypatch, pages=[page])
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    provenance = forms._application_entry(
+        forms._row(PK), PK, COMPANY, posting('ashby'),
+        [CompanyConfig(name=COMPANY, ats='ashby', board='example-co')])
+    with pytest.raises(forms.Gate) as raised:
+        await forms._stable_application_form(
+            forms._EntrySession(session, lambda url: url == entry('ashby'), provenance,
+                                resume_path='Resume.pdf'),
+            lambda url: url == entry('ashby'), provenance,
+            deadline=asyncio.get_running_loop().time() + 0.05)
+    state = raised.value.wait_predicates
+    assert state['read.page_available'] == 'true'
+    assert state[stage] == 'false'
+    for other in forms._SAFETY_STAGES:
+        if other != stage:
+            assert state[other] == 'unknown/unavailable', other
+    text = str(raised.value)
+    assert _wait_map(text) == state
+    logged = [r.getMessage() for r in caplog.records if 'application wait exit' in r.getMessage()]
+    assert logged and all('elsewhere' not in line and 'https://' not in line for line in logged)
+
+
 # main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
 # The four supporting files stay pinned whole. browser_skill_apply.py is pinned
 # per protected function (ARCH20:47 ruling D): the exact ast source segment of

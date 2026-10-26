@@ -380,3 +380,48 @@ def test_checkbox_no_that_loses_the_consume_has_no_row_effect(world, monkeypatch
     assert result["reason"] == "invalid_answer", won_status
     assert after["status"] == "tailored" and after["gate_disposition"]["kind"] == "answer"
     assert after["human_approved_answers"] == {"Synthetic acknowledgement": {"value": "yes"}}
+
+
+def test_tokened_answer_never_approves_a_now_current_non_form_gate(world, monkeypatch):
+    """Issue #202 AC6: a formerly valid tokened Answer that arrives after the
+    pending gate became a non-form "Ready to apply?" approval names a question
+    that no longer exists. It never approves, banks or enqueues."""
+    stores, queue = world
+    row = _gate(stores)
+    tokens = _tokens(row)
+    stores.tracking.set_status(PK, Status.NEEDS_HUMAN, gate_reason="approval",
+                               gate_call_id="call_x", gate_source="applier",
+                               gate_pending={"question": "Ready to apply? Synthetic."})
+    before = deepcopy(stores.tracking.get(PK))
+    enqueued = []
+    monkeypatch.setattr(run, "_enqueue_apply", lambda *a, **k: enqueued.append(a) or {})
+    for kwargs in ({"disposition": "answer", **tokens}, tokens):
+        result = run.resume_job(PK, "Synthetic Name", stores, **kwargs)
+        assert result["result"] == "gated" and result["reason"] == "invalid_answer"
+    assert stores.tracking.get(PK) == before
+    assert stores.answer_bank.puts == [] and enqueued == [] and _queued(queue) == []
+    # The ordinary untokened approval still works.
+    monkeypatch.undo()
+    monkeypatch.setattr(run, "make_stores", lambda *a, **kw: stores)
+    assert run.resume_job(PK, "approved", stores)["result"] == "queued"
+
+
+def test_a_skip_does_not_survive_its_question_being_reasked_at_another_selector(world):
+    """Issue #202 AC6: SKIP at selector A, the same question moves to B and is
+    asked again, then returns to A. The old SKIP(A) record was spent by the
+    re-ask at B and never suppresses the field at A."""
+    stores, _ = world
+    at_a = _question()
+    at_b = _question(selector="body > div:nth-of-type(2) > input:nth-of-type(1)")
+    row = _gate(stores, at_a)
+    assert run.resume_job(PK, "", stores, disposition="skip", **_tokens(row))[
+        "result"] == "queued"
+    old = forms.owner_question_identity(PK, at_a)
+    assert old in stores.tracking.get(PK)["owner_gate_skips"]
+    assert forms.owner_question_identity(PK, at_b) != old
+    assert run._owner_skip_retention(PK, stores, at_b) == {"owner_gate_skips": {}}
+    # Another question, or the same text as another kind, keeps the record.
+    assert run._owner_skip_retention(
+        PK, stores, _question(label="Other synthetic", question="Other synthetic")) == {}
+    assert run._owner_skip_retention(PK, stores, _question(
+        selector="body > textarea", tag="textarea", type="textarea")) == {}

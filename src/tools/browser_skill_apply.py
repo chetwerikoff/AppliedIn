@@ -2583,8 +2583,14 @@ class _EntrySession:
                                             fixture_context=self.fixture_context):
                     raise Gate('Application entry route or current row/config changed; inspect manually.',
                                reason='defect_provenance')
-                _entry_safety(page, self.allowed, self.provenance,
-                              readiness=self._readiness)
+                try:
+                    _entry_safety(page, self.allowed, self.provenance,
+                                  readiness=self._readiness)
+                except Gate as refusal:
+                    # Name only the stage this read saw fail; no value or selector.
+                    if isinstance(page, dict):
+                        refusal.safety_stage = _safety_stage(page, refusal)
+                    raise
         return result
 
 def _entry_not_ready(page):
@@ -7130,6 +7136,30 @@ _SAFETY_STAGES = ('read.origin_allowed', 'read.controls_valid', 'read.entry_vali
                   'read.frames_admitted', 'read.responses_admitted')
 
 
+def _safety_stage(page: dict, exc: BaseException) -> str | None:
+    """The _entry_safety stage an exception on this observed PAGE failed, if any."""
+    message = str(exc)
+    if isinstance(exc, NavigationProvenanceGate):
+        return 'read.origin_allowed'
+    if message.startswith('The current form control inventory is malformed'):
+        controls = page.get('controls')
+        return ('read.controls_valid' if not isinstance(controls, list)
+                or any(not isinstance(c, dict) for c in controls)
+                or any(not isinstance(c.get('selector'), str) or not c['selector']
+                       or not isinstance(c.get('tag'), str)
+                       or not isinstance(c.get('type'), str)
+                       or not isinstance(c.get('in_form'), bool)
+                       or (c['in_form'] and not c.get('form_selector'))
+                       for c in controls)
+                else 'read.entry_valid')
+    if (message.startswith('untrusted captcha response control')
+            or message.startswith('visible hCaptcha challenge control')):
+        return 'read.responses_admitted'
+    if isinstance(exc, (CaptchaGate, CaptchaArtifactGate, _EntryNotReady)):
+        return 'read.frames_admitted'
+    return None
+
+
 class _WaitDiagnostics:
     """Issue #202: finite, value-free predicate map for one wait/readiness exit.
 
@@ -7165,31 +7195,12 @@ class _WaitDiagnostics:
 
     def safety_failed(self, page, exc: BaseException) -> None:
         """Locate the failing _entry_safety stage from the exception and page."""
-        message = str(exc)
-        if isinstance(page, dict):
-            self.set('read.page_available', True)
-        if isinstance(exc, NavigationProvenanceGate) or not isinstance(page, dict):
-            failed = 'read.origin_allowed' if isinstance(page, dict) else None
-            if failed is None:
-                self.set('read.page_available', False)
-                return
-        elif message.startswith('The current form control inventory is malformed'):
-            controls = page.get('controls')
-            failed = ('read.controls_valid' if not isinstance(controls, list)
-                      or any(not isinstance(c, dict) for c in controls)
-                      or any(not isinstance(c.get('selector'), str) or not c['selector']
-                             or not isinstance(c.get('tag'), str)
-                             or not isinstance(c.get('type'), str)
-                             or not isinstance(c.get('in_form'), bool)
-                             or (c['in_form'] and not c.get('form_selector'))
-                             for c in controls)
-                      else 'read.entry_valid')
-        elif (message.startswith('untrusted captcha response control')
-              or message.startswith('visible hCaptcha challenge control')):
-            failed = 'read.responses_admitted'
-        elif isinstance(exc, (CaptchaGate, CaptchaArtifactGate, _EntryNotReady)):
-            failed = 'read.frames_admitted'
-        else:
+        if not isinstance(page, dict):
+            self.set('read.page_available', False)
+            return
+        self.set('read.page_available', True)
+        failed = _safety_stage(page, exc)
+        if failed is None:
             # A destination/owner check after every reader stage held.
             self.safety_passed()
             return
@@ -7220,15 +7231,14 @@ class _WaitDiagnostics:
         if getattr(exc, 'wait_predicates', None) is not None:
             return exc
         if phase == 'safety' or (phase == 'page' and classified):
-            message = str(exc)
+            observed = getattr(exc, 'safety_stage', None)
             if isinstance(page, dict):
                 self.safety_failed(page, exc)
-            elif (isinstance(exc, (CaptchaGate, CaptchaArtifactGate, _EntryNotReady))
-                  or message.startswith('untrusted captcha response control')
-                  or message.startswith('visible hCaptcha challenge control')):
-                # Only _entry_safety's frame/response stages raise these, on a
-                # PAGE it read, after every earlier stage held.
-                self.safety_failed({}, exc)
+            elif observed in _SAFETY_STAGES:
+                # _EntrySession.call named the one stage _entry_safety saw fail
+                # on the PAGE it read (ARCH22:31); every other stage stays unknown.
+                self.set('read.page_available', True)
+                self.set(observed, False)
             else:
                 # Any other Gate without a PAGE (a null read, a route check
                 # before safety) ran no stage we can name: they stay unknown.

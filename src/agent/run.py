@@ -1347,18 +1347,27 @@ def _owner_skip_retention(pk: str, stores: Any, form_question: Any) -> dict:
     A root-proven (non-mismatch) gate clears them all: a skip never carries
     across the mismatch-to-root transition. A regenerated gate for the very
     question a record names clears that record, since the owner is being
-    asked again.
+    asked again. So does a gate for the same question and kind at another
+    selector: the owner is asked again there, and a later return to the old
+    selector must not revive the old SKIP.
     """
-    from tools.browser_skill_apply import _MISMATCH_ROUTE, owner_question_identity
+    from tools.browser_skill_apply import _MISMATCH_ROUTE, _same, owner_question_identity
     skips = (stores.tracking.get(pk) or {}).get('owner_gate_skips')
     if not isinstance(skips, dict) or not skips:
         return {}
     if not isinstance(form_question, dict) or form_question.get('route') != _MISMATCH_ROUTE:
         return {'owner_gate_skips': {}}
     identity = owner_question_identity(pk, form_question)
-    if identity not in skips:
-        return {}
-    return {'owner_gate_skips': {k: v for k, v in skips.items() if k != identity}}
+    label, kind = form_question.get('label'), form_question.get('type')
+
+    def reasked(key, record):
+        return key == identity or (
+            isinstance(record, dict) and isinstance(label, str) and label.strip()
+            and isinstance(record.get('label'), str) and _same(record['label'], label)
+            and record.get('kind') == kind)
+
+    kept = {k: v for k, v in skips.items() if not reasked(k, v)}
+    return {} if len(kept) == len(skips) else {'owner_gate_skips': kept}
 
 
 _DISPOSITIONS = frozenset({'answer', 'skip'})
@@ -1452,6 +1461,13 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
     elif disposition == 'skip':
         return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                 'detail': 'Only a bound owner field question can be skipped.'}
+    elif (disposition is not None or expected_gate_generation is not None
+          or expected_question_identity is not None):
+        # A tokened reply names one exact field question. The current gate is
+        # not one (an approval, another stage), so it never approves or banks.
+        return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                'detail': 'This owner question is no longer the pending one; '
+                          'refresh and answer the current question.'}
     approval = form_label is None and question.startswith("Ready to apply")
     if (form_label is not None
             or (question and not approval

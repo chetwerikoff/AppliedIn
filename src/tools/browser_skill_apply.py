@@ -2945,6 +2945,24 @@ class _ReversibleEntryReader:
         return await self.raw.call(*args, **kwargs)
 
 
+# Live Ashby renders the autofill pane outside the container/Submit wrapper, so
+# the historic root certificate fails while the container and Submit stay
+# unique. Membership is container containment; every other root error, above
+# all ambiguous roots, still has no exact receiver.
+_REVERSIBLE_ROOT_ERRORS = frozenset({'', 'application root sibling identity mismatch'})
+
+
+def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
+    """Name the failing structural predicate; never a selector ID or a value."""
+    def shape(value):
+        return (value if isinstance(value, str)
+                and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,39}', value) else 'unavailable')
+    return Gate(f'{message[:-1]}; predicate={predicate}; '
+                f'control={_safe_diagnostic(target.get("diagnostic_locator"))}; '
+                f'tag={shape(target.get("tag"))}; type={shape(target.get("type"))}.',
+                reason='defect_receiver')
+
+
 def _reversible_entry_recipient(page: dict, target: dict,
                                 witness: dict | None = None) -> None:
     """Prove exact application membership using the independent ENTRY census."""
@@ -2953,57 +2971,86 @@ def _reversible_entry_recipient(page: dict, target: dict,
     evidence = entry.get('root_evidence')
     excluded = root.get('excluded') if isinstance(root, dict) else None
     selector = target.get('selector')
-    if (not isinstance(root, dict) or root.get('root') or root.get('error')
-            or root.get('truncated') or not root.get('container')
-            or not root.get('submit') or not isinstance(selector, str)
-            or not selector or not isinstance(excluded, list)
-            or any(not isinstance(s, str) for s in excluded)
-            or selector in excluded or not isinstance(evidence, list)
-            or not 1 <= len(evidence) <= 500
-            or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
-                   for e in evidence)
-            or len({e['selector'] for e in evidence}) != len(evidence)):
-        raise Gate('The reversible receiver has no exact application membership.',
-                   reason='defect_receiver')
-    matches = [e for e in evidence if e['selector'] == selector]
-    if len(matches) != 1:
-        raise Gate('The reversible receiver has no exact application membership.',
-                   reason='defect_receiver')
-    e = matches[0]
+    for predicate, failed in (
+            ('formless.object', lambda: not isinstance(root, dict)),
+            ('formless.root', lambda: root.get('root')),
+            ('formless.error', lambda: root.get('error') not in _REVERSIBLE_ROOT_ERRORS),
+            ('formless.pane', lambda: root.get('error') and not root.get('pane')),
+            ('formless.truncated', lambda: root.get('truncated')),
+            ('formless.container', lambda: not root.get('container')),
+            ('formless.submit', lambda: not root.get('submit')),
+            ('selector', lambda: not isinstance(selector, str) or not selector),
+            ('formless.excluded', lambda: not isinstance(excluded, list)
+             or any(not isinstance(s, str) for s in excluded)),
+            ('excluded', lambda: selector in excluded),
+            ('root_evidence.list', lambda: not isinstance(evidence, list)
+             or not 1 <= len(evidence) <= 500
+             or any(not isinstance(e, dict) or not isinstance(e.get('selector'), str)
+                    for e in evidence)),
+            ('root_evidence.unique',
+             lambda: len({e['selector'] for e in evidence}) != len(evidence)),
+            ('root_evidence.match',
+             lambda: sum(e['selector'] == selector for e in evidence) != 1)):
+        if failed():
+            raise _receiver_defect(
+                'The reversible receiver has no exact application membership.',
+                predicate, target)
+    e = next(e for e in evidence if e['selector'] == selector)
     custom = (target.get('tag') == 'div' and target.get('type') == 'combobox'
               and isinstance(target.get('combobox'), dict)
               and bool(target.get('label')) and bool(target.get('question')))
-    pair_member = (target.get('tag') == 'button'
-                   and target.get('type') == 'button'
-                   and target.get('native_type') == 'button'
-                   and bool(target.get('question')))
-    native_label = e.get('associated') is True and e.get('label') == target.get('label')
-    if (e.get('unique') is not True or e.get('in_container') is not True
-            or e.get('native_owner') or e.get('declared_owner')
-            or e.get('formaction') is not None or e.get('submit')
-            or e.get('iti') or e.get('contenteditable')
-            or e.get('type') == 'hidden' or e.get('disabled')
-            or e.get('readonly') or e.get('inert')
-            or e.get('visible') is not True
-            or e.get('tag') != target.get('tag')
-            or e.get('type') != target.get('type')
-            or (not (custom or pair_member)
-                and e.get('required') != target.get('required'))
-            or e.get('disabled') != target.get('disabled')
-            or (not native_label and not (custom or pair_member))
-            or target.get('in_form') is not False
-            or any(target.get(k) for k in (
+    entry_label = (e.get('id') == '' and e.get('entry_titles') == 1
+                   and isinstance(e.get('field_entry'), str) and bool(e['field_entry'])
+                   and isinstance(e.get('entry_label'), str) and bool(e['entry_label'].strip())
+                   and target.get('question') == e['entry_label'])
+    yes_no = (target.get('tag') == 'button' and target.get('type') == 'button'
+              and target.get('native_type') == 'submit' and e.get('yes_no') is True
+              and e.get('untyped') is True and entry_label
+              and e.get('caption') in ('Yes', 'No') and target.get('label') == e['caption'])
+    pair_member = yes_no or (target.get('tag') == 'button'
+                             and target.get('type') == 'button'
+                             and target.get('native_type') == 'button'
+                             and bool(target.get('question')))
+    native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
+                    or (entry_label and target.get('tag') == 'input'))
+    for predicate, failed in (
+            ('evidence.unique', e.get('unique') is not True),
+            ('evidence.in_container', e.get('in_container') is not True),
+            ('evidence.native_owner', e.get('native_owner')),
+            ('evidence.declared_owner', e.get('declared_owner')),
+            ('evidence.formaction', e.get('formaction') is not None),
+            ('evidence.submit', e.get('submit')),
+            ('evidence.iti', e.get('iti')),
+            ('evidence.contenteditable', e.get('contenteditable')),
+            ('evidence.hidden', e.get('type') == 'hidden'),
+            ('evidence.disabled', e.get('disabled')),
+            ('evidence.readonly', e.get('readonly')),
+            ('evidence.inert', e.get('inert')),
+            ('evidence.visible', e.get('visible') is not True),
+            ('tag.equal', e.get('tag') != target.get('tag')),
+            ('type.equal', e.get('type') != target.get('type')),
+            ('required.equal', not (custom or pair_member)
+             and e.get('required') != target.get('required')),
+            ('disabled.equal', e.get('disabled') != target.get('disabled')),
+            ('label.associated', not native_label and not (custom or pair_member)),
+            ('in_form', target.get('in_form') is not False),
+            *((f'target.{k}', target.get(k)) for k in (
                 'native_form_owner_selector', 'form_selector', 'form_action',
                 'form_action_attr_present', 'form_action_raw', 'formaction',
                 'formaction_attr_present', 'formaction_raw', 'href',
                 'submit', 'navigates', 'commits_application'))):
-        raise Gate('The reversible receiver is not associated with the application.',
-                   reason='defect_receiver')
-    if not (custom or pair_member) and (
-            e.get('value') != target.get('value')
-            or e.get('files') != target.get('files')):
-        raise Gate('The independent application receiver value differs.',
-                   reason='defect_receiver')
+        if failed:
+            raise _receiver_defect(
+                'The reversible receiver is not associated with the application.',
+                predicate, target)
+    if not (custom or pair_member):
+        for predicate, failed in (
+                ('value.equal', e.get('value') != target.get('value')),
+                ('files.equal', e.get('files') != target.get('files'))):
+            if failed:
+                raise _receiver_defect(
+                    'The independent application receiver value differs.',
+                    predicate, target)
     if witness is not None:
         dom = witness.get(selector)
         if (not isinstance(dom, dict) or dom.get('visible') is not True
@@ -3061,23 +3108,40 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
     return members
 
 
+def _yes_no_entry(page: dict, target: dict) -> str:
+    """The census field entry of an untyped Ashby Yes/No member, else ''."""
+    evidence = (page.get('entry') or {}).get('root_evidence') or []
+    matches = [e for e in evidence if isinstance(e, dict)
+               and e.get('selector') == target.get('selector')]
+    if (len(matches) != 1 or matches[0].get('yes_no') is not True
+            or not isinstance(matches[0].get('field_entry'), str)):
+        return ''
+    return matches[0]['field_entry']
+
+
 def _boolean_pair(page: dict, target: dict, *,
                   witness: dict | None = None) -> list[dict]:
     """Only a complete, exact Yes/No application button group can be written."""
     root = _formless_root(page)
     name, question = target.get('name'), target.get('question')
+    # Live Ashby Yes/No buttons are untyped (DOM submit) and nameless; their
+    # group identity is the census field entry under its single question title.
+    native = target.get('native_type')
+    entry = _yes_no_entry(page, target) if native == 'submit' else ''
     if (not root or root.get('root') or target.get('tag') != 'button'
             or target.get('type') != 'button'
-            or not isinstance(name, str) or not name.strip()
+            or (native == 'submit' and not entry)
+            or (native != 'submit' and (not isinstance(name, str) or not name.strip()))
             or not isinstance(question, str) or not question.strip()):
         raise Gate('Unsupported Boolean receiver.', reason='defect_button')
     members = [c for c in page['controls']
-               if c.get('tag') == 'button' and c.get('name') == name
-               and c.get('question') == question]
+               if c.get('tag') == 'button' and c.get('question') == question
+               and (_yes_no_entry(page, c) == entry if entry else c.get('name') == name)]
     if (len(members) != 2
             or {str(c.get('label', '')).casefold() for c in members} != {'yes', 'no'}
             or len({c.get('selector') for c in members}) != 2
-            or any(c.get('type') != 'button' or c.get('native_type') != 'button'
+            or any(c.get('type') != 'button'
+                   or c.get('native_type') != ('submit' if entry else 'button')
                    or c.get('in_form') is not False or c.get('disabled')
                    or c.get('required') is not True
                    or ((c.get('has_value') or c.get('checked')
@@ -3230,16 +3294,18 @@ def _fact_key(facts: dict, observed_label: str) -> str | None:
     return None
 
 
-def _unanswered(page: dict, target: dict) -> bool:
+def _unanswered(page: dict, target: dict, *, owner_all: bool = False) -> bool:
+    """owner_all treats every receiver as owner-required (sibling-mismatch route)."""
+    required = (lambda c: True) if owner_all else (lambda c: bool(c.get('required')))
     if target.get('type') == 'button' and _formless_root(page):
         try:
             members = _boolean_pair(page, target)
         except Gate:
             members = [target]
-        return any(c.get('required') for c in members) and not any(
+        return any(required(c) for c in members) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
-        return bool(target.get('required')) and not target.get('checked')
+        return required(target) and not target.get('checked')
     if target.get('type') == 'radio':
         try:
             members = _radio_group(page, target)
@@ -3249,12 +3315,14 @@ def _unanswered(page: dict, target: dict) -> bool:
             # requires _bound_target/_radio_group; final Submit independently
             # checks every required choice and its approved readback.
             members = [target]
-        return any(c.get('required') for c in members) and not any(
+        return any(required(c) for c in members) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
-        return bool(target.get('required')) and not combo.get('selected_text')
-    return bool(target.get('required')) and not target.get('has_value')
+        # On the owner-asks-every route a typed value is never overwritten.
+        return required(target) and not combo.get('selected_text') and not (
+            owner_all and target.get('has_value'))
+    return required(target) and not target.get('has_value')
 
 
 def _choice_prompt(target: dict, question: dict) -> str:
@@ -3319,7 +3387,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
                             provenance=None, fixture_context=None):
     """Resolve a PAGE-bound native choice from the existing exact grant, not facts."""
     _require_native_choice(target)
-    if not _unanswered(page, target):
+    if not _unanswered(page, target, owner_all=_owner_asks_every_receiver(page)):
         raise Gate('Only required, unanswered native choices can use a grant.')
     key = _key(page, target)
     if target.get('type') == 'checkbox':
@@ -3559,7 +3627,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     key = _key(page, target)
     if not reversible:
         _form_subject(page, target)
-    if bootstrap and (not _unanswered(page, target)
+    if bootstrap and (not _unanswered(page, target,
+                                      owner_all=_owner_asks_every_receiver(page))
                       or (not choice and target.get('type') != 'combobox'
                           and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
@@ -4695,12 +4764,22 @@ def _required_owner_gate_type(target: dict) -> str:
     return kind.lower().replace('-', '_')
 
 
+def _owner_asks_every_receiver(page: dict) -> bool:
+    """ARCH14:39: on the reversible route admitted despite a sibling-identity
+    mismatch, Ashby's own requiredness (a per-build title class) is not
+    readable, so every admitted unanswered receiver is owner-asked in field
+    order. A root-verified page keeps native-required semantics."""
+    structural = _formless_root(page)
+    return bool(structural and not structural.get('root')
+                and structural.get('error') == 'application root sibling identity mismatch')
+
+
 def _required_owner_gate_admitted(page: dict, provenance) -> bool:
     """An unproven historic root permits preparation, not unsafe disclosure."""
     structural = _formless_root(page)
     if not structural:
         return True
-    if structural.get('error') or structural.get('truncated'):
+    if structural.get('error') not in _REVERSIBLE_ROOT_ERRORS or structural.get('truncated'):
         return False
     if structural.get('root'):
         try:
@@ -4708,7 +4787,7 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
         except Gate:
             return False
         return True
-    if (_entry_not_ready(page) != 'no unique application root'
+    if (_entry_not_ready(page) != (structural['error'] or 'no unique application root')
             or page.get('inventory_verified') is not True
             or page.get('truncated') or page.get('opaque_controls')
             or page.get('shadow_roots') or page.get('unsupported_frames')
@@ -4728,7 +4807,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     the model then produced an unanswerable prose gate. A fresh independent
     witness supplies this per-control question, never the model's description.
     """
-    if not any(c.get('required') and _unanswered(page, c)
+    every = _owner_asks_every_receiver(page)
+    if not any((every or c.get('required')) and _unanswered(page, c, owner_all=every)
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
         return None
@@ -4774,9 +4854,14 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}
+    every = _owner_asks_every_receiver(current)
     for item in current['controls']:
         kind = item.get('type')
-        if (not item.get('required') or not _unanswered(current, item)
+        # On that route an optional receiver outside the admitted scope (a
+        # toggle, the dropzone, a hidden proxy) is skipped, never a defect.
+        owner_needed = item.get('required') or (
+            every and item.get('selector') in scope)
+        if (not owner_needed or not _unanswered(current, item, owner_all=every)
                 or kind in {'file', 'hidden', 'password', 'submit', 'image'}
                 or native_submit(item)):
             continue
@@ -4803,6 +4888,12 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                         'iti', 'contenteditable', 'submit'))):
                 return Gate('The application widget is not writable by the guarded executor.',
                             reason='defect_' + _required_owner_gate_type(item))
+            try:
+                _reversible_entry_recipient(current, item, witness)
+            except Gate as refusal:
+                if refusal.reason == 'defect_receiver':
+                    return Gate('Required receiver lacks application association: '
+                                + str(refusal), reason='defect_receiver')
             return Gate('Required receiver lacks application association.',
                         reason='defect_receiver')
         # The existing native checkbox standing acknowledgement is not an
@@ -5296,7 +5387,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         target = control(observed, action, 'execute-observe')
         if verb == 'choose':
             _require_guarded_choice(observed, target)
-            if not _unanswered(observed, target):
+            if not _unanswered(observed, target,
+                               owner_all=_owner_asks_every_receiver(observed)):
                 raise Gate('Only required, unanswered native choices can be selected.')
         else:
             _require_native_action(target, verb)
@@ -5417,7 +5509,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_guarded_choice(latest, current)
-            if not _unanswered(latest, current):
+            if not _unanswered(latest, current,
+                               owner_all=_owner_asks_every_receiver(latest)):
                 raise Gate('The required choice is no longer unanswered.')
         else:
             _require_native_action(current, verb)

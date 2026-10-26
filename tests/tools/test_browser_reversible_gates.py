@@ -12,7 +12,7 @@ import pytest
 
 from agent import run
 from tools import browser_skill_apply as forms
-from tests.tools.test_browser_application_entry import COMPANY, PK, posting, entry
+from tests.tools.test_browser_application_entry import COMPANY, PK, dom, posting, entry
 from tests.tools.test_browser_formless import root_world, observed
 from tests.tools.test_browser_controller_support import install_controller_session
 
@@ -591,3 +591,352 @@ async def test_boolean_pair_requires_both_independent_member_captions(monkeypatc
     assert not decision.await_count
     assert not [c for c in endpoint.calls
                 if c[0] in {'fill', 'click', 'select', 'upload'}]
+
+
+# Issue #198: the live Ashby census structure, replayed through both real ENTRY
+# readers. The autofill pane sits outside the container/Submit wrapper, so the
+# root certificate reports a sibling-identity mismatch with an empty root.
+# Location, Date and the Yes/No pair have no id: their title's for= resolves to
+# nothing, and the pair members are untyped (DOM submit) nameless buttons with
+# a hidden checkbox. Tags, types, classes and nesting are copied; every caption
+# is synthetic. Titles copy the live class structure (heading, label and, when
+# marked, a required token) with synthetic module hashes. A real button has no
+# required property, so the pair carries none; the native required inputs
+# exercise the owner gates (live Location was optional).
+_LIVE_ENTRIES = r"""
+(() => {
+  const c=document.querySelector('.ashby-application-form-container');
+  const resume=c.children.findIndex(n=>!!n.querySelector('#_systemfield_resume'));
+  let at=resume+1;
+  const entry=(title, owner)=>{
+    const e=node('div',{class:'ashby-application-form-field-entry'},c);
+    c.children.splice(c.children.indexOf(e),1); c.children.splice(at++,0,e);
+    node('label',{'for':owner,class:'_heading_x1y2z_52 '+
+      (__REQUIRED__ ? '_required_x1y2z_91 ' : '')+
+      '_label_a1b2c_42 ashby-application-form-question-title',text:title},e);
+    return e;
+  };
+  const untyped=(parent,attrs)=>{
+    const b=node('button',attrs,parent); b.type='submit'; delete b.required; return b;};
+  const location=node('div',{},entry('Synthetic location','synthetic-unbound-location'));
+  // A typeless input still reports type text, and the live picker is closed
+  // (an unlinked open combobox would make the whole inventory opaque).
+  node('input',{role:'combobox','aria-autocomplete':'list',
+    'aria-expanded':'false',placeholder:'Start typing'},location).type='text';
+  untyped(location,{'aria-label':'Toggle'});
+  node('input',{type:'text',required:true,placeholder:'Pick date'},
+    node('div',{},node('div',{},entry('Synthetic start date','synthetic-unbound-date'))));
+  const group=node('div',{class:'ashby-application-form-input-yesno'},
+    entry('Synthetic Boolean question','synthetic-unbound-boolean'));
+  untyped(group,{text:'Yes'});
+  untyped(group,{text:'No'});
+  node('input',{type:'checkbox',style:{display:'none'},rect:null},group);
+  __MUTATE__
+  // Readers enumerate in tree order, as a browser does.
+  const ordered=[]; const visit=e=>{ordered.push(e); e.children.forEach(visit);};
+  visit(document.body); nodes.splice(0,nodes.length,...ordered);
+})();
+"""
+_LOCATION = 'div:nth-of-type(4) > div:nth-of-type(1) > input:nth-of-type(1)'
+_DATE = 'div:nth-of-type(5) > div:nth-of-type(1) > div:nth-of-type(1) > input:nth-of-type(1)'
+_YES = 'div:nth-of-type(6) > div:nth-of-type(1) > button:nth-of-type(1)'
+_NO = 'div:nth-of-type(6) > div:nth-of-type(1) > button:nth-of-type(2)'
+
+
+def _live_dom(required=True, mutate='', **shape):
+    prefix = (_LIVE_ENTRIES.replace('__REQUIRED__', 'true' if required else 'false')
+              .replace('__MUTATE__', mutate))
+    spec = dict(root=False, formless=True, movePane=True, domOrder=True,
+                url=entry('ashby'), **shape)
+    return (dom(spec, prefix + forms.ENTRY_PAGE),
+            dom(spec, prefix + forms._ENTRY_FIXED_CONTROL_WITNESS))
+
+
+def _by_locator(page, suffix):
+    matches = [c for c in page['controls']
+               if suffix.endswith(c['diagnostic_locator'])
+               and c['selector'].endswith(suffix)]
+    assert len(matches) == 1, suffix
+    return matches[0]
+
+
+def _live_census(monkeypatch, tmp_path, **dom_shape):
+    row, endpoint, decision, _ = root_world(monkeypatch, movePane=True)
+    endpoint.current, endpoint.fixed = _live_dom(**dom_shape)
+    formless = endpoint.current['entry']['formless']
+    assert formless['root'] == '' and formless['pane'] and formless['container']
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _session, tracking, pdf = install_controller_session(
+        monkeypatch, row, endpoint, tmp_path)
+    session_class = type(_session)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *args: session_class('apply'))
+    bank = SimpleNamespace(values={}, put=lambda *args, **kwargs: None)
+    stores = SimpleNamespace(tracking=tracking, answer_bank=bank)
+    monkeypatch.setattr('core.stores.make_stores', lambda: stores)
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
+    monkeypatch.setattr(run, '_enqueue_apply', lambda pk, s, **kwargs: (
+        row.update(status='submitting'), {'result': 'queued', 'pk': pk})[1])
+    return row, endpoint, decision, stores, pdf
+
+
+def _scope(endpoint):
+    witness = {c['selector']: c for c in endpoint.fixed['controls']}
+    return forms._reversible_entry_scope(endpoint.current, witness)
+
+
+def test_live_census_reports_the_sibling_mismatch_and_titled_idless_receivers():
+    page, _ = _live_dom()
+    assert page['entry']['formless']['error'] == 'application root sibling identity mismatch'
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    for suffix, question in ((_LOCATION, 'Synthetic location'),
+                             (_DATE, 'Synthetic start date'),
+                             (_YES, 'Synthetic Boolean question')):
+        control = _by_locator(page, suffix)
+        e = evidence[control['selector']]
+        assert (e['id'], e['associated'], e['entry_titles']) == ('', False, 1)
+        assert e['entry_label'] == control['question'] == question
+    yes, no = _by_locator(page, _YES), _by_locator(page, _NO)
+    for member, caption in ((yes, 'Yes'), (no, 'No')):
+        e = evidence[member['selector']]
+        assert (member['tag'], member['type'], member['native_type']) == (
+            'button', 'button', 'submit')
+        assert member['submit'] is False and member['in_form'] is False
+        assert (e['yes_no'], e['untyped'], e['caption']) == (True, True, caption)
+    # The Location toggle is untyped too, but it is no Yes/No member.
+    toggle = _by_locator(page, 'div:nth-of-type(4) > div:nth-of-type(1) > button:nth-of-type(1)')
+    assert toggle['type'] == 'submit' and evidence[toggle['selector']]['yes_no'] is False
+
+
+
+@pytest.mark.parametrize('marked,mutate', [
+    (True, ''),
+    (False, ''),
+    (False, "group.children.forEach(b=>b.setAttribute('aria-required','true'));"),
+])
+def test_every_proven_yes_no_pair_is_owner_required(marked, mutate):
+    """Ashby's title marker is a per-build hash and a button has no required
+    property, so an optional pair is asked rather than a required one skipped."""
+    for page in _live_dom(required=marked, mutate=mutate):
+        evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+        for suffix in (_YES, _NO):
+            member = _by_locator(page, suffix)
+            assert member['required'] is True
+            assert evidence[member['selector']]['required'] is True
+
+
+def test_title_marker_never_makes_a_receiver_required():
+    page, _ = _live_dom(mutate="location.children[0].required=false;")
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    location = _by_locator(page, _LOCATION)
+    assert location['required'] is False
+    assert evidence[location['selector']]['required'] is False
+
+def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_path):
+    """Every live control was refused by the root error, not by its own evidence."""
+    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
+    page = endpoint.current
+    scope = _scope(endpoint)
+    admitted = {_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES, _NO)}
+    assert admitted | {'#_systemfield_email'} <= scope
+    # The pane, the real Submit and the untitled toggle are never receivers.
+    assert '#structural-submit' not in scope
+    assert not scope & set(page['entry']['formless']['excluded'])
+    toggle = _by_locator(page, 'div:nth-of-type(4) > div:nth-of-type(1) > button:nth-of-type(1)')
+    assert toggle['selector'] not in scope
+
+
+async def _owner_order(row, endpoint, stores, pdf):
+    facts, asked = {}, []
+    while True:
+        gate = await _apply(pdf, dict(facts))
+        if gate.get('reason') != 'owner_question':
+            return asked, gate
+        q = gate['form_question']
+        kind = next(c['type'] for c in endpoint.current['controls']
+                    if c['selector'] == q['selector'])
+        answer = {'button': 'No', 'combobox': 'Remote'}.get(kind, 'Synthetic answer')
+        _answer(row, stores, gate, answer)
+        asked.append(q['selector'])
+        facts[q['label']] = answer
+        assert len(asked) < 12
+
+
+@pytest.mark.asyncio
+async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, tmp_path):
+    """ARCH14:39: on the sibling-mismatch route every admitted unanswered
+    receiver is owner-asked in field order, natively required or not."""
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    page = endpoint.current
+    model_calls = []
+    decision.side_effect = lambda *a, **k: model_calls.append(len(row.get(
+        'human_approved_answers') or {})) or forms.Gate('synthetic model stop')
+    asked, _ = await _owner_order(row, endpoint, stores, pdf)
+    assert asked == ['#_systemfield_name', '#_systemfield_email',
+                     *(_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES)),
+                     '#additional']
+    # Location and the textarea are optional on the live page; both were asked.
+    assert not _by_locator(page, _LOCATION)['required']
+    boolean = row['human_approved_answers']['Synthetic Boolean question']
+    assert boolean
+    # The model is reached only once every owner question is answered.
+    assert model_calls and all(n == len(asked) for n in model_calls)
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
+
+
+@pytest.mark.asyncio
+async def test_prevalued_receiver_is_never_owner_asked(monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(
+        monkeypatch, tmp_path, mutate="location.children[0].value='Synthetic city';")
+    asked, _ = await _owner_order(row, endpoint, stores, pdf)
+    assert _by_locator(endpoint.current, _LOCATION)['selector'] not in asked
+    assert _by_locator(endpoint.current, _DATE)['selector'] in asked
+
+
+def test_only_the_sibling_mismatch_route_asks_every_receiver():
+    page, _ = _live_dom()
+    assert forms._owner_asks_every_receiver(page)
+    for change in ({'error': 'ambiguous application roots'},
+                   {'root': '#application-root'}):
+        changed = deepcopy(page)
+        changed['entry']['formless'].update(change)
+        assert not forms._owner_asks_every_receiver(changed)
+
+@pytest.mark.parametrize('error', [
+    'ambiguous application roots', 'unsupported custom control', 'other'])
+def test_any_other_root_error_admits_no_live_receiver(monkeypatch, tmp_path, error):
+    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
+    endpoint.current['entry']['formless']['error'] = error
+    assert not _scope(endpoint)
+    email = next(c for c in endpoint.current['controls']
+                 if c['selector'] == '#_systemfield_email')
+    with pytest.raises(forms.Gate) as refusal:
+        forms._reversible_entry_recipient(endpoint.current, email)
+    assert refusal.value.reason == 'defect_receiver'
+    assert 'predicate=formless.error;' in str(refusal.value)
+
+
+@pytest.mark.parametrize('damage,predicate', [
+    ('pane', 'formless.pane'), ('container', 'formless.container'),
+    ('submit', 'formless.submit'), ('truncated', 'formless.truncated')])
+def test_tolerated_mismatch_still_needs_complete_structure(
+        monkeypatch, tmp_path, damage, predicate):
+    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
+    endpoint.current['entry']['formless'][damage] = damage == 'truncated'
+    assert not _scope(endpoint)
+    with pytest.raises(forms.Gate, match=f'predicate={predicate};'):
+        forms._reversible_entry_recipient(
+            endpoint.current, _by_locator(endpoint.current, _DATE))
+
+
+@pytest.mark.parametrize('mutate,suffix,predicate', [
+    # A second title in the entry leaves the caption unproven.
+    ("node('label',{class:'ashby-application-form-question-title',text:'Other'},"
+     "c.children[4]);", _DATE, 'label.associated'),
+    # A title owned by a different live control cannot caption this one.
+    ("c.children[4].children[0].setAttribute('for','_systemfield_name');",
+     _DATE, 'label.associated'),
+    # A third button makes the group no exact Yes/No pair.
+    ("untyped(group,{text:'Maybe'});", _YES, 'label.associated'),
+    # A form owner or override can submit: never a Boolean member.
+    ("group.children[0].setAttribute('formaction','/synthetic');", _YES, 'evidence.formaction'),
+])
+def test_unproven_idless_receivers_fail_closed_by_name(
+        monkeypatch, tmp_path, mutate, suffix, predicate):
+    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path, mutate=mutate)
+    target = _by_locator(endpoint.current, suffix)
+    assert target['selector'] not in _scope(endpoint)
+    with pytest.raises(forms.Gate) as refusal:
+        forms._reversible_entry_recipient(endpoint.current, target)
+    assert refusal.value.reason == 'defect_receiver'
+    assert (f"predicate={predicate}; control={target['diagnostic_locator']}; tag="
+            in str(refusal.value))
+
+
+def test_submit_text_or_exact_submit_is_never_a_boolean_member():
+    page, _ = _live_dom(mutate=(
+        "Object.defineProperty(group.children[0],'innerText',"
+        "{get:()=>'Submit application'});"))
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    assert not any(e['yes_no'] for e in evidence.values())
+    submit = next(e for e in evidence.values() if e['submit'])
+    assert submit['yes_no'] is False and submit['type'] == 'submit'
+
+
+@pytest.mark.asyncio
+async def test_boolean_click_after_choose_reaches_final_submit_guard(monkeypatch, tmp_path):
+    """An untyped Yes/No is DOM submit: the raw producer never treats it as a write."""
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), pdf, {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=endpoint.current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda url: None)
+    final_guard = AsyncMock(side_effect=forms.Gate('final guard decided'))
+    monkeypatch.setattr(controller, 'authorize_final_submit', final_guard)
+    with pytest.raises(forms.Gate, match='final guard decided'):
+        await controller.before_ipc(
+            SimpleNamespace(), ('click', _by_locator(endpoint.current, _NO)['selector']), {})
+    final_guard.assert_awaited_once()
+    assert controller.committed is False
+
+
+def test_receiver_defect_names_structure_never_ids_or_values(monkeypatch, tmp_path):
+    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
+    page = deepcopy(endpoint.current)
+    email = next(c for c in page['controls'] if c['selector'] == '#_systemfield_email')
+    email['value'] = 'PRIVATE_SYNTHETIC_VALUE'
+    with pytest.raises(forms.Gate) as refusal:
+        forms._reversible_entry_recipient(page, email)
+    text = str(refusal.value)
+    assert refusal.value.reason == 'defect_receiver'
+    assert f"predicate=value.equal; control={email['diagnostic_locator']}" in text
+    assert 'tag=input; type=email.' in text
+    assert 'PRIVATE_SYNTHETIC_VALUE' not in text and '_systemfield' not in text
+
+
+@pytest.mark.parametrize('spec', [
+    {'wrapperTag': 'section'}, {'wrapperClass': 'generic'}, {'paneTag': 'section'},
+    {'movePane': True}, {'moveSubmit': True},
+])
+@pytest.mark.asyncio
+async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_guard(
+        monkeypatch, tmp_path, spec):
+    """With every receiver valued, the sibling mismatch still blocks Submit."""
+    def optional(snapshots):
+        # Already-valued receivers are never re-asked, so nothing is left for
+        # the owner on this route and preparation reaches the final guard.
+        for snapshot in snapshots:
+            for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                if c.get('type') not in {'file', 'submit'} and c.get('tag') != 'button':
+                    c['value'] = 'Synthetic value'
+                    if 'has_value' in c:
+                        c['has_value'] = True
+
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    row, raw, decide, _ = root_world(monkeypatch, **spec)
+    optional((raw.current, raw.fixed))
+    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    file = next(c for c in raw.current['controls']
+                if c['type'] == 'file' and c['label'] == 'Resume')
+    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
+    original_call = raw.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            raw.calls.append((method, *args))
+            name = Path(args[2]).name
+            raw.current, raw.fixed = observed(
+                **spec, attached=True, files=[name], displayName=name)
+            optional((raw.current, raw.fixed))
+            return {}
+        return await original_call(method, *args, **kwargs)
+    raw.call = call
+    decide.side_effect = [dict(action='upload', selector=file['selector']),
+                          dict(action='submit', selector=button['selector'])]
+    result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                               pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert 'sibling identity mismatch' in result['question'], result
+    assert decide.await_count == 2
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+        ('upload', file['selector'], '--file', transport._application_controller.resume_path)]
+    assert not transport._application_controller.committed

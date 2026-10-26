@@ -941,7 +941,26 @@ def test_exact_submit_guard_local_cause(monkeypatch, member, value):
     ({'submitAttrs': {'role': 'button'}}, 'exact structural submit changed'),
 ])
 async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
-    if cause in {'sibling identity mismatch', 'ambiguous application roots'}:
+    if cause == 'sibling identity mismatch':
+        # Issue #198 r03: the tolerated mismatch still admits the required,
+        # unanswered Name receiver, so the owner is asked before any model turn.
+        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+        row, raw, decide, _ = root_world(monkeypatch, **spec)
+        transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+        result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                                   pk=PK, resume_path=pdf)
+        assert result['status'] == 'gate', result
+        assert result['reason'] == 'owner_question', result
+        assert result['review_route'] == 'owner', result
+        question = result['form_question']
+        assert question['selector'] == '#_systemfield_name', result
+        assert question['owner_kind'] == 'ashby-reversible-entry', result
+        assert not decide.await_count
+        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
+        assert not transport._application_controller.upload_completed
+        assert not transport._application_controller.committed
+        return
+    if cause == 'ambiguous application roots':
         await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
         return
     _, raw, decide, provenance = root_world(monkeypatch, **spec)

@@ -214,3 +214,24 @@ def test_guard_compatible_already_canonical_is_read_only(tmp_path, monkeypatch):
     result = repair_one(row.pk, tracking=store, watchlist_path=path)
     assert result["status"] == "already_canonical_noop"
     assert result["guard_compatible"] and not store.writes
+
+
+@pytest.mark.parametrize("old_url,source", [
+    ("https://different.test/careers/jobs?gh_jid=731205", ""),
+    ("https://example.test/careers-archive/jobs?gh_jid=731205", ""),
+    ("https://different.test/careers/job/731205", "sitemap_greenhouse_suffix"),
+    ("https://example.test/careers/job/731205?x=1", "sitemap_greenhouse_suffix"),
+])
+def test_historic_wrong_origin_or_scope_cannot_borrow_new_feed_as_proof(
+    raw_gh_watchlist, old_url, source,
+):
+    record = {"pk": "example-co#731205", "company": "example-co",
+              "job_id": GH_ID, "ats": "greenhouse",
+              "jd_url": old_url, "greenhouse_board": "example-board",
+              "discovery_source": source, "status": "found"}
+    store = NeverWrite(record)
+    result = repair_one(record["pk"], tracking=store,
+                        watchlist_path=raw_gh_watchlist)
+    assert result["status"] == "historic_identity_unproved"
+    assert "old_evidence_class" not in result
+    assert not store.writes and not result["committed"]

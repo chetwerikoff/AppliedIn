@@ -736,6 +736,12 @@ def _preparation_destination_allowed(href: str, *origins: str,
         fixture_context=fixture_context)
 
 
+_PROMOTIONAL_OPT_IN = re.compile(
+    r'\b(?:(?:agree|consent)\s+to\s+(?:receive|receiving|get|getting)|'
+    r'opt[\s-]?in|subscribe\s+to|sign me up)\b[^.;]{0,60}?'
+    r'\b(?:promotional|promotions?|marketing|newsletters?|advertis\w*)\b')
+
+
 def _assent_scope(target: dict) -> str:
     """One claim/scope classifier, independent of ATS or widget implementation."""
     text = label(target).lower()
@@ -744,11 +750,9 @@ def _assent_scope(target: dict) -> str:
     if re.search(r'\b(certify|attest|swear|under penalty|legal declaration|'
                  r'legally binding|undertake|arbitrat\w*|waiv(?:e|er))\b', text):
         return 'owner'
-    # Issue #208: explicit promotional opt-in is the owner's even without
-    # privacy vocabulary.
-    if (re.search(r'\b(agree|consent|opt[\s-]?in|subscribe|sign me up|receive)\b', text)
-            and re.search(r'\b(promotional|promotion|marketing|newsletter|'
-                          r'advertis\w*)\b', text)):
+    # Issue #208: an explicit promotional opt-in checkbox is the owner's even
+    # without privacy vocabulary.
+    if target.get('type') == 'checkbox' and _PROMOTIONAL_OPT_IN.search(text):
         return 'owner'
     if _FACT_ASSERTION.search(text):
         return 'fact'
@@ -3532,19 +3536,19 @@ _OPTION_LINKAGE_PREDICATES = frozenset({
     'option.unique', 'option.selector', 'option.label', 'option.value',
     'options.selector_unique', 'options.label_unique',
     'hidden.selector', 'hidden.value', 'witness.never_linked',
+    'combobox.linked.shape',
 })
 
 
-class _OptionLinkageGate(Gate):
-    """The unchanged linkage message plus the first failing predicate name."""
-
-    def __init__(self, predicate: str):
-        super().__init__(_OPTION_LINKAGE_MESSAGE)
-        self.predicate = predicate
+def _option_linkage_gate(predicate: str) -> Gate:
+    """The unchanged linkage Gate, annotated with its first failing predicate."""
+    exc = Gate(_OPTION_LINKAGE_MESSAGE)
+    exc.option_predicate = predicate
+    return exc
 
 
 def _option_linkage_predicate(exc: Exception) -> str | None:
-    predicate = getattr(exc, 'predicate', None) if isinstance(exc, _OptionLinkageGate) else None
+    predicate = getattr(exc, 'option_predicate', None)
     if predicate is None:
         return None
     return predicate if predicate in _OPTION_LINKAGE_PREDICATES else 'unspecified'
@@ -3553,36 +3557,54 @@ def _option_linkage_predicate(exc: Exception) -> str | None:
 def _combobox_options(target: dict) -> list:
     combo = target.get('combobox') or {}
     options = combo.get('options')
-    for predicate, failed in (
-            ('combobox.type', lambda: target.get('type') != 'combobox'),
-            ('combobox.linked', lambda: combo.get('linked') is not True),
-            ('combobox.link_id', lambda: not isinstance(combo.get('link_id'), str)
-             or not combo['link_id']),
-            ('combobox.listbox_selector',
-             lambda: not isinstance(combo.get('listbox_selector'), str)
-             or not combo['listbox_selector']),
-            ('options.list', lambda: not isinstance(options, list) or not options),
-            ('option.object', lambda: any(not isinstance(o, dict) for o in options)),
-            ('option.unique', lambda: any(o.get('unique') is not True for o in options)),
-            ('option.selector', lambda: any(
-                not isinstance(o.get('selector'), str) or not o['selector'].strip()
-                for o in options)),
-            ('option.label', lambda: any(
-                not isinstance(o.get('label'), str) or not o['label'].strip()
-                for o in options)),
-            ('option.value', lambda: any(not isinstance(o.get('value'), str)
-                                         for o in options)),
-            ('options.selector_unique',
-             lambda: len({o['selector'] for o in options}) != len(options)),
-            ('options.label_unique',
-             lambda: len({_same_key(o['label']) for o in options}) != len(options)),
-            ('hidden.selector', lambda: combo.get('hidden_selector')
-             and not isinstance(combo.get('hidden_selector'), str)),
-            ('hidden.value', lambda: combo.get('hidden_selector')
-             and not isinstance(combo.get('hidden_value'), str))):
-        if failed():
-            raise _OptionLinkageGate(predicate)
+    if (target.get('type') != 'combobox' or combo.get('linked') is not True
+            or not isinstance(combo.get('link_id'), str) or not combo['link_id']
+            or not isinstance(combo.get('listbox_selector'), str)
+            or not combo['listbox_selector'] or not isinstance(options, list) or not options
+            or any(not isinstance(o, dict) or o.get('unique') is not True
+                   or not all(isinstance(o.get(k), str) and o[k].strip()
+                              for k in ('selector', 'label'))
+                   or not isinstance(o.get('value'), str) for o in options)
+            or len({o['selector'] for o in options}) != len(options)
+            or len({_same_key(o['label']) for o in options}) != len(options)
+            or (combo.get('hidden_selector') and (
+                not isinstance(combo.get('hidden_selector'), str)
+                or not isinstance(combo.get('hidden_value'), str)))):
+        raise _option_linkage_gate(_combobox_failed_predicate(target))
     return options
+
+
+def _combobox_failed_predicate(target: dict) -> str:
+    """Diagnostic only: the first condition _combobox_options rejected."""
+    combo = target.get('combobox') or {}
+    options = combo.get('options')
+    if target.get('type') != 'combobox':
+        return 'combobox.type'
+    if combo.get('linked') is not True:
+        return 'combobox.linked'
+    if not isinstance(combo.get('link_id'), str) or not combo['link_id']:
+        return 'combobox.link_id'
+    if not isinstance(combo.get('listbox_selector'), str) or not combo['listbox_selector']:
+        return 'combobox.listbox_selector'
+    if not isinstance(options, list) or not options:
+        return 'options.list'
+    for o in options:
+        if not isinstance(o, dict):
+            return 'option.object'
+        if o.get('unique') is not True:
+            return 'option.unique'
+        for key in ('selector', 'label'):
+            if not isinstance(o.get(key), str) or not o[key].strip():
+                return 'option.' + key
+        if not isinstance(o.get('value'), str):
+            return 'option.value'
+    if len({o['selector'] for o in options}) != len(options):
+        return 'options.selector_unique'
+    if len({_same_key(o['label']) for o in options}) != len(options):
+        return 'options.label_unique'
+    if not isinstance(combo.get('hidden_selector'), str):
+        return 'hidden.selector'
+    return 'hidden.value'
 
 def _native_options(target: dict) -> list:
     options = target.get('options')
@@ -3911,7 +3933,7 @@ async def _witness_material_combobox(session, page: dict, witness: dict,
             if attempt < 19:
                 await asyncio.sleep(0.25)
         if witnessed is None:
-            raise _OptionLinkageGate('witness.never_linked')
+            raise _option_linkage_gate('witness.never_linked')
     finally:
         try:
             if attempted:
@@ -4007,7 +4029,10 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                                     fixture_context=fixture_context))
                         except Gate as exc:
                             witness_failure = str(exc)
-                            option_predicate = _option_linkage_predicate(exc)
+                            option_predicate = (
+                                'combobox.linked.shape'
+                                if 'predicate=combobox.linked.shape;' in witness_failure
+                                else _option_linkage_predicate(exc))
                             witnessed_question = None  # Inspection only.
                     # An optional, unselected assent is still an owner decision;
                     # a preselected value must instead prove an existing grant.
@@ -4026,8 +4051,11 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                         # Keep the same inspection-only decision; reveal only
                         # literal code-owned diagnostics, never arbitrary text.
                         disclosure_failure = _disclosure_failure_detail(str(exc))
-                        option_predicate = (_option_linkage_predicate(exc)
-                                            or option_predicate)
+                        # After a witness only the inspected picker's own
+                        # predicate is reported; the closed original's
+                        # combobox.linked would misattribute the failure.
+                        if not witness_attempted:
+                            option_predicate = _option_linkage_predicate(exc)
                     else:
                         question['pk'] = pk
                         grants = ((_row(pk, fixture_context=fixture_context)
@@ -4543,7 +4571,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             'Control type: combobox; tag: unavailable; '
             "visible label: 'unavailable'; matched: select options."
             ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
-            + _material_witness_disclosure_detail(material, attempted=False) + '.') from None
+            + _material_witness_disclosure_detail(
+                material, attempted=False,
+                option_predicate='combobox.linked.shape') + '.') from None
     if provenance is not None and (
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):

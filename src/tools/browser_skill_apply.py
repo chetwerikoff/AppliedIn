@@ -2323,36 +2323,7 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
             or (c['in_form'] and not c.get('form_selector')) for c in controls)):
         raise Gate('The current form control inventory is malformed.')
     entry = page.get('entry')
-    if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
-        raise Gate('The current form control inventory is malformed.')
-    pending_hidden_r = False
-    # Reader-proven visible challenges outrank an earlier unknown frame.
-    for frame in entry['frames']:
-        status = frame.get('status') if isinstance(frame, dict) else None
-        if status == 'visible-recaptcha':
-            raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
-        if status == 'visible-hcaptcha':
-            raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
-    for frame in entry['frames']:
-        status = frame.get('status') if isinstance(frame, dict) else None
-        if status not in {'H', 'R', 'W', 'X'} and not (
-                status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)):
-            # Only the bounded Ashby waiter retries this exact reader-proven
-            # rootless hidden Enterprise frame. Any other unknown gates now.
-            if (readiness and isinstance(provenance, ApplicationEntryProvenance)
-                    and provenance.ats == 'ashby' and status == 'unknown'
-                    and frame.get('root') == ''
-                    and frame.get('rootless_hidden_r') is True):
-                pending_hidden_r = True
-                continue
-            raise CaptchaArtifactGate('unknown/untrusted application frame; inspect manually. '
-                       'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance)
-                       + _captcha_frame_missing_evidence(entry['frames']))
-    if entry.get('response_error'):
-        raise CaptchaArtifactGate('untrusted captcha response control; ambiguous owner or provider. '
-                                 + _captcha_response_details(entry.get('responses')))
-    if entry.get('helper_challenge'):
-        raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
+    pending_hidden_r = _entry_artifacts(entry, provenance, readiness)
     if (isinstance(provenance, ApplicationEntryProvenance)
             and provenance.ats == 'ashby' and entry.get('formless') is None):
         _ashby_native_classify(page, provenance)
@@ -2726,12 +2697,12 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                     diagnostics.safety_failed(page or {}, exc)
                 last_reason, previous = str(exc), None
                 diagnostics.set('pair.stable', None)
-            except TimeoutError:
-                last_reason = 'application form inventory read timed out/unavailable'
+            except TimeoutError as exc:
+                last_reason = _read_failure_reason(exc, entry_session)
                 diagnostics.set('deadline.remaining', False)
                 break
-            except (OSError, bsk.Unavailable):
-                last_reason, previous = 'application form inventory read timed out/unavailable', None
+            except (OSError, bsk.Unavailable) as exc:
+                last_reason, previous = _read_failure_reason(exc, entry_session), None
                 diagnostics.read_failed(phase)
             page = None
             await asyncio.sleep(min(0.25, max(0, deadline - loop.time())))
@@ -6129,7 +6100,7 @@ class ApplicationIPCController:
     def __init__(self, pk: str, company: str, url: str, resume_path: str,
                  facts: dict, filled: dict, history: list, step: dict,
                  mark_click_started, *, fixture_context=None, seal_stage=False,
-                 verified_redirect=None):
+                 verified_redirect=None, entry_provenance=None):
         import hashlib
         self.pk, self.company, self.url = pk, company, url
         self.protected_snapshot = bool(seal_stage)
@@ -6139,6 +6110,8 @@ class ApplicationIPCController:
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
         self.verified_redirect = verified_redirect
+        self.entry_provenance = (entry_provenance if isinstance(
+            entry_provenance, ApplicationEntryProvenance) else None)
         self.upload_completed = False
         self.upload_attempted = False
         self.upload_identity = None
@@ -6348,6 +6321,10 @@ class ApplicationIPCController:
                     'visible-recaptcha', 'visible-hcaptcha'}
                 for frame in observed.get('frames', []))):
             raise CaptchaGate('Visible application challenge requires manual authentication.')
+        if 'entry' in page and self._row().get('ats') in _APPLICATION_ENTRY:
+            # Issue #214: this fresh ENTRY_PAGE passes the same frame/response
+            # admission as every scoped read before any reversible effect.
+            _entry_artifacts(page['entry'], self.entry_provenance)
         if any(c.get('type') == 'password' for c in page.get('controls', [])):
             raise Gate('Sign in yourself in the dedicated profile before private preparation.')
         selector = args[1] if len(args) > 1 else None
@@ -6829,7 +6806,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         pk, company, url, resume_path, facts, filled, history,
                         step, mark_click_started, seal_stage=True,
                         verified_redirect=(provenance if isinstance(
-                            provenance, VendorRedirectProvenance) else None))
+                            provenance, VendorRedirectProvenance) else None),
+                        entry_provenance=provenance)
                     try:
                         raw_session.bind_application_controller(controller)
                         if getattr(raw_session, '_application_controller', None) is not controller:
@@ -7394,6 +7372,15 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
                     page.get('url'), provenance=provenance)
             diagnostics.set('read.origin_allowed', True)
             _inventory_ok(page, complete=False)
+            if isinstance(provenance, ApplicationEntryProvenance):
+                # Issue #214: inventory shape is not admission. The same entry
+                # frame/response rule precedes bootstrap's first fallback effect.
+                try:
+                    _entry_safety(page, allowed, provenance)
+                except Gate as refusal:
+                    diagnostics.safety_failed(page, refusal)
+                    raise
+                diagnostics.safety_passed()
         except Gate as fallback:
             raise diagnostics.attach(fallback, 'reversible-fallback')
         return reversible, page
@@ -7416,3 +7403,92 @@ def _wait_boundary(diagnostics: _WaitDiagnostics, page: dict, provenance) -> boo
     except Gate:
         diagnostics.set('receiver.qualifies', False)
         raise
+
+
+_PASSIVE_RECAPTCHA_ORIGINS = frozenset({'https://www.recaptcha.net', 'https://www.google.com'})
+_PASSIVE_RECAPTCHA_PATHS = ('/recaptcha/enterprise/', '/recaptcha/api2/')
+_FRAME_READABILITY = frozenset({'readable', 'unreadable', 'unavailable', 'unknown'})
+
+
+def _passive_unknown_frame(frame, provenance) -> bool:
+    """Issue #214: frame-only tolerance for two exact parent-proven shapes.
+
+    Ashby application entry only. Neither shape is an R/H/Z admission: it
+    proves no response provider, owner root or receiver, so a reserved
+    response still needs the reader's own R frame or badge proof. Missing or
+    malformed metadata is never defaulted.
+    """
+    if (not isinstance(provenance, ApplicationEntryProvenance) or provenance.ats != 'ashby'
+            or not isinstance(frame, dict) or frame.get('status') != 'unknown'
+            or frame.get('form_controls') not in {'no', 'unknown'}
+            or frame.get('srcdoc') != 'absent'
+            or frame.get('document_readability') not in _FRAME_READABILITY):
+        return False
+    path = frame.get('path')
+    if frame.get('source') == 'url':
+        # (a) A hidden exact-origin reCAPTCHA provider frame.
+        return (frame.get('origin') in _PASSIVE_RECAPTCHA_ORIGINS
+                and type(path) is str and path.startswith(_PASSIVE_RECAPTCHA_PATHS)
+                and (frame.get('visibility') == 'hidden' or frame.get('display') == 'none'))
+    if frame.get('source') != 'absent':
+        return False
+    # (b) A source-less companion the parent proves is not rendered. A null
+    # box (no client rect) is not a zero box, and bounds never substitutes.
+    box = frame.get('box')
+    zero_box = (isinstance(box, dict) and all(
+        type(box.get(k)) in (int, float) and box[k] == 0 for k in ('width', 'height')))
+    return frame.get('display') == 'none' or zero_box
+
+
+def _read_failure_reason(exc: BaseException, entry_session: bool) -> str:
+    """Issue #214 AC4: the closed class of the read that set this reason.
+
+    Only the normalized class is named, never its message, code or URL. A
+    later successful or not-ready attempt replaces it. Greenhouse keeps its
+    existing reason; only the application-entry wait is in scope.
+    """
+    if not entry_session:
+        return 'application form inventory read timed out/unavailable'
+    kind = ('TimeoutError' if isinstance(exc, TimeoutError)
+            else 'Unavailable' if isinstance(exc, bsk.Unavailable) else 'OSError')
+    return f'application form inventory read failed (exception={kind})'
+
+
+def _entry_artifacts(entry, provenance, readiness=False) -> bool:
+    """_entry_safety's reader frame/response admission, in its original order.
+
+    Issue #214: the raw application IPC producer applies this same rule to its
+    fresh ENTRY_PAGE. True means only the Ashby waiter's pending hidden R.
+    """
+    if not isinstance(entry, dict) or not isinstance(entry.get('frames'), list):
+        raise Gate('The current form control inventory is malformed.')
+    pending_hidden_r = False
+    # Reader-proven visible challenges outrank an earlier unknown frame.
+    for frame in entry['frames']:
+        status = frame.get('status') if isinstance(frame, dict) else None
+        if status == 'visible-recaptcha':
+            raise CaptchaGate('visible reCAPTCHA Enterprise challenge; inspect manually.')
+        if status == 'visible-hcaptcha':
+            raise CaptchaGate('visible hCaptcha challenge; inspect manually.')
+    for frame in entry['frames']:
+        status = frame.get('status') if isinstance(frame, dict) else None
+        if status not in {'H', 'R', 'W', 'X'} and not (
+                status == 'Z' and isinstance(provenance, ApplicationEntryProvenance)
+                ) and not _passive_unknown_frame(frame, provenance):  # Issue #214 frame-only
+            # Only the bounded Ashby waiter retries this exact reader-proven
+            # rootless hidden Enterprise frame. Any other unknown gates now.
+            if (readiness and isinstance(provenance, ApplicationEntryProvenance)
+                    and provenance.ats == 'ashby' and status == 'unknown'
+                    and frame.get('root') == ''
+                    and frame.get('rootless_hidden_r') is True):
+                pending_hidden_r = True
+                continue
+            raise CaptchaArtifactGate('unknown/untrusted application frame; inspect manually. '
+                       'Non-admitted frames: ' + _unknown_frame_details(entry['frames'], provenance)
+                       + _captcha_frame_missing_evidence(entry['frames']))
+    if entry.get('response_error'):
+        raise CaptchaArtifactGate('untrusted captcha response control; ambiguous owner or provider. '
+                                 + _captcha_response_details(entry.get('responses')))
+    if entry.get('helper_challenge'):
+        raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
+    return pending_hidden_r

@@ -477,14 +477,15 @@ async def test_rootless_hidden_enterprise_expiry_keeps_original_gate_details(mon
     first = _synthetic_enterprise_pair(missing_root=True)
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
     start = clock[0]
-    with pytest.raises(forms.Gate, match='unknown/untrusted application frame') as raised:
+    # Issue #214 category (a): the hidden exact-origin Enterprise frame is
+    # frame-only admitted, so expiry reports the still-missing root instead.
+    with pytest.raises(forms.Gate, match='no unique application root after bounded wait') as raised:
         await forms._stable_application_form(
             session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
     detail = str(raised.value)
-    assert not isinstance(raised.value, forms._EntryNotReady)
-    assert 'frame[1] origin=https://www.recaptcha.net' in detail
-    assert 'path=/recaptcha/enterprise/anchor source_kind=url box=256x60' in detail
-    assert 'outside_root=unknown visibility=hidden display=inline form_controls=unknown' in detail
+    assert not isinstance(raised.value, (forms._EntryNotReady, forms.CaptchaArtifactGate))
+    assert 'read.frames_admitted=true' in detail
+    assert 'root.owner_proven=false' in detail
     assert clock[0] - start == pytest.approx(forms._ASHBY_WAIT_SECONDS)
     assert reads[0] > 1 and session._readiness is False
     assert not decision.await_count
@@ -500,10 +501,13 @@ async def test_root_appears_around_hidden_enterprise_anchor_and_immediately_gate
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(
         monkeypatch, first, second)
     start = clock[0]
-    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
-        await forms._stable_application_form(
-            session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
-    assert reads[0] == 2 and clock[0] - start < 1
+    # Issue #214 category (a): the hidden exact-origin Enterprise frame inside
+    # the hydrated root is frame-only admitted; it stays reader-status unknown.
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+    assert page['entry']['formless']['root'] == '#application-root'
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    assert clock[0] - start < forms._ASHBY_WAIT_SECONDS
     assert session._readiness is False and not decision.await_count
     no_mutations(raw)
 
@@ -535,6 +539,16 @@ async def test_rootless_enterprise_lookalikes_cannot_use_readiness_deferral(monk
     assert first[0]['entry']['frames'][0].get('rootless_hidden_r') is not True
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(monkeypatch, first)
     start = clock[0]
+    if edit == {'src': 'https://www.recaptcha.net/recaptcha/api2/anchor'}:
+        # Issue #214 category (a): hidden exact-origin api2 is frame-only
+        # admitted without readiness deferral; the missing root still gates.
+        with pytest.raises(forms.Gate, match='no unique application root after bounded wait'):
+            await forms._stable_application_form(
+                session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
+        assert session._readiness is False
+        assert not decision.await_count
+        no_mutations(raw)
+        return
     with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
         await forms._stable_application_form(
             session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
@@ -580,8 +594,9 @@ async def test_unknown_frames_gate_after_readiness_and_on_every_post_commit_read
         session, session.allowed, provenance, deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
     assert session._readiness is False
     raw.current, raw.fixed = deepcopy(first)
-    with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
-        await session.page()
+    # Issue #214 category (a): the hidden exact-origin frame is frame-only
+    # admitted before commit; the untouched post-commit branch still refuses it.
+    assert (await session.page())['entry']['frames'][0]['status'] == 'unknown'
     session.committing = True
     for _ in range(2):
         with pytest.raises(forms.Gate, match='Untrusted frame after a committing click'):
@@ -1373,8 +1388,18 @@ async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatc
 ])
 def test_each_ac_z_signature_condition_is_required(monkeypatch, changes):
     _, raw, _, provenance = root_world(monkeypatch, frames=['Z'], **changes)
+    # Issue #214 category (b): a source-less frame still display:none is
+    # frame-only admitted on Ashby although it is not the AC Z signature.
+    edit = changes.get('edit', {})
+    nonrendered = 'src' not in edit and 'style' not in edit
     for snapshot in (raw.current, raw.fixed):
         assert snapshot['entry']['frames'][0]['status'] == 'unknown'
+        if nonrendered:
+            frame = snapshot['entry']['frames'][0]
+            assert (frame['source'], frame['srcdoc'], frame['display'], frame['form_controls']) == (
+                'absent', 'absent', 'none', 'unknown')
+            forms._entry_safety(snapshot, lambda url: True, provenance)
+            continue
         with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
             forms._entry_safety(snapshot, lambda url: True, provenance)
 
@@ -1772,10 +1797,15 @@ async def test_source_less_companion_does_not_inherit_rootless_r_readiness(monke
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(
         monkeypatch, first)
     start = clock[0]
-    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+    # Issue #214: the hidden anchor is category (a) and the source-less
+    # display:none companion is category (b). Neither defers on readiness;
+    # with both frames admitted only the unproven root gates.
+    with pytest.raises(forms.Gate, match='no unique application root after bounded wait') as raised:
         await forms._stable_application_form(
             session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
-    assert reads[0] == 1 and clock[0] == start
+    assert not isinstance(raised.value, forms.CaptchaArtifactGate)
+    assert 'read.frames_admitted=true' in str(raised.value)
+    assert session._readiness is False
     assert not decision.await_count
     no_mutations(raw)
 

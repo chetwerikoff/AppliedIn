@@ -2743,11 +2743,11 @@ async def test_issue214_early_reader_timeout_marks_its_failed_read(monkeypatch, 
     no_mutations(session)
 
 
-def _issue214_native_passive_world(monkeypatch):
+def _issue214_native_passive_world(monkeypatch, *, pair=True):
     # Real ENTRY_PAGE/fixed reader output: a native Ashby form plus a hidden
     # category (a) provider frame and a source-less display:none (b) frame.
     row, raw, decide, provenance = native_real_world(
-        monkeypatch, nativePair=True, frames=['R', 'Z'], inside=True,
+        monkeypatch, nativePair=pair, frames=['R', 'Z'], inside=True,
         zParentAttrs={'id': 'foreign'})
     for snapshot in (raw.current, raw.fixed):
         assert [f['status'] for f in snapshot['entry']['frames']] == ['unknown', 'unknown']
@@ -2840,31 +2840,52 @@ async def test_issue214_raw_producer_fill_with_passive_frames_then_drift_refuses
     assert not controller.committed and not any(c[0] == 'click' for c in endpoint.calls)
 
 
-async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_click(monkeypatch):
-    """Passive frames admitted, parent Email prefilled, the existing final
-    refusal fires with no click, and the unchanged run caller persists it."""
+async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_click(
+        monkeypatch, tmp_path):
+    """Passive frames admitted, parent Email prefilled through the bound raw
+    producer, then the tenant witness drifts: the real final guard refuses with
+    no click, and the unchanged run caller persists the refusal."""
     from types import SimpleNamespace
     from agent import run
     from core import events, profiles, rotation
     from tools import browser_apply, browser_runtime, credentials
     from tools import posting_guard as pg
+    from tests.tools.test_browser_controller_support import install_controller_session
 
-    row, raw, decide, provenance = _issue214_native_passive_world(monkeypatch)
+    row, raw, decide, provenance = _issue214_native_passive_world(monkeypatch, pair=False)
     scoped = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
     admitted = await forms._stable_application_form(
         scoped, scoped.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
     _issue214_approve_email(row, admitted, raw, provenance)
+    _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     monkeypatch.setattr(forms, '_bootstrap',
                         AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
-    decide.side_effect = [
-        {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'submit', 'selector': '#submit'},
-    ]
+    authorized = []
+    final_guard = forms.ApplicationIPCController.authorize_final_submit
+
+    async def drift_then_final_guard(self, *args, **kwargs):
+        # Every earlier check has passed. The tenant witness drifts
+        # immediately before the unchanged final guard's own fresh check.
+        authorized.append(args[-1]['selector'])
+        monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: False)
+        return await final_guard(self, *args, **kwargs)
+
+    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit',
+                        drift_then_final_guard)
+
+    async def decisions(*args, **kwargs):
+        if decide.await_count == 1:
+            return {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
+        return {'action': 'submit', 'selector': '#submit'}
+
+    decide.side_effect = decisions
     result = await forms.apply(posting('ashby'), COMPANY, {'Email': 'test@example-co.test'},
-                               'synthetic', pk=PK, resume_path='Resume.pdf')
+                               'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert 'no click is safe' in result['question']
+    assert authorized == ['#submit']
+    assert result['review_route'] == 'hard_refusal', result
+    assert result['reason'] == 'defect_tenant', result
     assert [c for c in raw.calls if c[0] == 'fill'] == [
         ('fill', '#email', '--value', 'test@example-co.test')]
     assert not [c for c in raw.calls if c[0] == 'click']
@@ -2923,3 +2944,65 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     assert consumed['result'] == 'gated' and consumed['question'] == result['question']
     assert tracked['status'] == 'needs_human'
     assert tracked['gate_pending']['question'] == result['question']
+    assert tracked['gate_pending']['review_route'] == 'hard_refusal'
+    assert tracked['gate_reason'] == result['reason'] == 'defect_tenant'
+
+
+@pytest.mark.parametrize('spec', [
+    dict(frames=['R', 'Z'], tokens=['g-recaptcha-response']),
+    dict(frames=['R', 'Z'], tokens=['g-recaptcha-response'], tokenOutside=True, textarea=True),
+    dict(frames=['H', 'Z'], tokens=['h-captcha-response']),
+    dict(frames=['H', 'Z'], tokens=['h-captcha-response'], tokenOutside=True),
+    dict(frames=['H', 'R', 'Z'], inside=True, tokens=['h-captcha-response'], tokenOutside=True),
+], ids=['R-form', 'R-outside', 'H-form', 'H-outside', 'H-outside-with-passive-R'])
+async def test_issue214_protected_response_survives_parent_fill_and_fresh_readback(
+        monkeypatch, spec):
+    """A reader-proven response with throwing value getters, passive (a)/(b)
+    siblings and the approved parent Email: the effect path and its fresh
+    real-reader read-back never read the token or touch a frame."""
+    import json
+    full = {'url': entry('ashby'), 'nativePair': False,
+            'zParentAttrs': {'id': 'foreign'}, **spec}
+    row, raw, _, provenance = native_real_world(
+        monkeypatch, nativePair=False, zParentAttrs={'id': 'foreign'}, **spec)
+    name = spec['tokens'][0]
+    passive = [f for f in raw.current['entry']['frames'] if f['status'] == 'unknown']
+    assert [f['source'] for f in passive][-1] == 'absent'
+    replay = raw.call
+
+    async def fresh_dom(method, *args, **kwargs):
+        if method != 'fill':
+            return await replay(method, *args, **kwargs)
+        raw.calls.append((method, *args))
+        # Re-run both unchanged real readers on the filled DOM; the reserved
+        # response getters still throw on any value read.
+        prefix = (f"document.querySelector({json.dumps('#' + args[0][1:])})"
+                  f".value={json.dumps(args[2])};\n")
+        raw.current = dom(full, prefix + forms.ENTRY_PAGE)
+        raw.fixed = dom(full, prefix + forms._ENTRY_FIXED_CONTROL_WITNESS)
+        return {}
+
+    raw.call = fresh_dom
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    assert [c['selector'] for c in page['controls']] == ['#email', '#submit']
+    _issue214_approve_email(row, page, raw, provenance)
+    filled = {}
+    receipt = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example-co.test'}, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    after = await session.page()
+    email = next(c for c in after['controls'] if c['selector'] == '#email')
+    assert email['value'] == 'test@example-co.test' and email['has_value'] is True
+    for snapshot in (after, raw.current, raw.fixed):
+        assert not snapshot['entry']['response_error']
+        assert [r['name'] for r in snapshot['entry']['responses']] == [name]
+        assert all(c['selector'] != '#token-0' for c in snapshot['controls'])
+        assert 'PROTECTED' not in repr(snapshot)
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]

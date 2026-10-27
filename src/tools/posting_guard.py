@@ -121,9 +121,14 @@ class _VisibleHTML(HTMLParser):
         # Group hidden descendants so split HTML text is checked as one payload.
         hidden_group = self.stack[-1][4] if parent_hidden else None
         # A closed dialog or details element is not rendered, so a link in it
-        # never witnesses that a hidden link is a copy of a visible one.
+        # never witnesses that a hidden link is a copy of a visible one. A
+        # datalist never renders, a popover's open state is not observable
+        # statically, and textarea or title content is literal text that this
+        # parser still reports as tags; none of them witnesses a visible link.
         closed = (bool(self.stack and self.stack[-1][6])
-                  or (tag in {"dialog", "details"} and "open" not in attrs))
+                  or (tag in {"dialog", "details"} and "open" not in attrs)
+                  or tag in {"datalist", "textarea", "title"}
+                  or "popover" in attrs)
         if invisible and not parent_hidden and not dropped:
             hidden_group = len(self.hidden_text)
             self.hidden_text.append([])
@@ -271,7 +276,9 @@ def _hidden_material_retained(text: str, hidden_text: list[str],
     # the complete-value match, and token runs also catch punctuation drift.
     normalized = " ".join(text.casefold().split())
     words_seen = set(selected)
-    runs: dict[int, set[tuple[str, ...]]] = {}
+    # Tokens never contain a space, so a space-delimited join finds an exact
+    # token run in linear space whatever the attribute length.
+    joined = f" {' '.join(selected)} "
     for value in hidden_attrs:
         words = tuple(_TOKEN.findall(value.casefold()))
         if not words:
@@ -284,12 +291,7 @@ def _hidden_material_retained(text: str, hidden_text: list[str],
             continue
         if complete in normalized:
             return True
-        if len(words) not in runs:
-            runs[len(words)] = {
-                tuple(selected[i:i + len(words)])
-                for i in range(len(selected) - len(words) + 1)
-            }
-        if words in runs[len(words)]:
+        if f" {' '.join(words)} " in joined:
             return True
     return False
 

@@ -1,6 +1,8 @@
 """Synthetic, offline regressions for C6 posting-guard over-flags (#211)."""
 from __future__ import annotations
 
+import tracemalloc
+
 import pytest
 
 from tools import posting_guard as pg
@@ -217,6 +219,44 @@ def test_unrendered_link_is_not_a_visible_witness(container):
     html = ('<p>Build APIs.</p>' + container.format(link)
             + f'<a hidden href="#x">{INJECTION}</a>')
     result = _inspect("Build APIs. " + INJECTION, html)
+    assert "hidden_text_retained" in result["posting_guard"]["reasons"]
+    assert _review_required(result)
+
+
+# A datalist or a statically unverified popover never renders a witness, and
+# textarea content is literal text even though the parser reports tags in it.
+@pytest.mark.parametrize("container", [
+    "<datalist>{}</datalist>",
+    "<div popover>{}</div>",
+    '<div popover="manual"><span>{}</span></div>',
+    "<textarea>{}</textarea>",
+])
+def test_nonrendered_or_literal_link_is_not_a_visible_witness(container):
+    link = f'<a href="#x">{INJECTION}</a>'
+    html = ('<p>Build APIs.</p>' + container.format(link)
+            + f'<a hidden href="#x">{INJECTION}</a>')
+    result = _inspect("Build APIs. " + INJECTION, html)
+    assert "hidden_text_retained" in result["posting_guard"]["reasons"]
+    assert _review_required(result)
+
+
+# A long nonmatching attribute is checked in bounded space; a long matching
+# run, and the complete normalized substring fallback, still match.
+def test_long_attribute_values_match_exact_runs_only():
+    tokens = [f"w{i}" for i in range(7000)]
+    plain = JD + " ".join(tokens)
+    misses = ['<img hidden alt="{}">'.format(" ".join(f"x{i}" for i in range(n)))
+              for n in (700, 1000, 1500)]
+    tracemalloc.start()
+    try:
+        result = _inspect(plain, f"<p>{JD}</p>" + "".join(misses))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert "hidden_text_retained" not in result["posting_guard"]["reasons"]
+    assert peak < 32 * 1024 * 1024
+    hit = '<img hidden alt="{}">'.format(", ".join(tokens[2000:3500]))
+    result = _inspect(plain, f"<p>{JD}</p>" + "".join(misses) + hit)
     assert "hidden_text_retained" in result["posting_guard"]["reasons"]
     assert _review_required(result)
 

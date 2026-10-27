@@ -6321,9 +6321,10 @@ class ApplicationIPCController:
                     'visible-recaptcha', 'visible-hcaptcha'}
                 for frame in observed.get('frames', []))):
             raise CaptchaGate('Visible application challenge requires manual authentication.')
-        if 'entry' in page and self._row().get('ats') in _APPLICATION_ENTRY:
-            # Issue #214: this fresh ENTRY_PAGE passes the same frame/response
-            # admission as every scoped read before any reversible effect.
+        if self.entry_provenance is not None and 'entry' in page:
+            # Issue #214: an entry-admitted producer's fresh ENTRY_PAGE passes
+            # the same frame/response admission as every scoped read before
+            # any reversible effect.
             _entry_artifacts(page['entry'], self.entry_provenance)
         if any(c.get('type') == 'password' for c in page.get('controls', [])):
             raise Gate('Sign in yourself in the dedicated profile before private preparation.')

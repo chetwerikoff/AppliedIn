@@ -2643,20 +2643,20 @@ async def test_issue214_reversible_fallback_applies_entry_admission_first(
     no_mutations(raw)
 
 
-@pytest.mark.parametrize('frame,proven,admitted', [
-    (_ISSUE214_B, True, True), (_ISSUE214_A, True, True),
-    (_ISSUE214_B, False, False),
-    ({**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}, True, False),
-], ids=['b', 'a', 'no-provenance', 'unknown'])
+@pytest.mark.parametrize('frame,admitted', [
+    (_ISSUE214_B, True), (_ISSUE214_A, True),
+    ({**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}, False),
+    ({**_ISSUE214_B, 'form_controls': 'yes'}, False),
+], ids=['b', 'a', 'unknown', 'form-controls'])
 async def test_issue214_raw_producer_applies_entry_admission_before_ipc(
-        monkeypatch, frame, proven, admitted):
+        monkeypatch, frame, admitted):
     from tests.tools.test_browser_formless import (
         _issue184_prepare_producer, _issue184_real_producer)
     facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
     _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
         monkeypatch, facts)
     await _issue184_prepare_producer(producer, provenance, facts)
-    controller.entry_provenance = provenance if proven else None
+    controller.entry_provenance = provenance
     for snapshot in (endpoint.current, endpoint.fixed):
         snapshot['entry']['frames'].append({**deepcopy(frame), 'root': ''})
     request = ('fill', '#_systemfield_name', '--value', facts['Name'])

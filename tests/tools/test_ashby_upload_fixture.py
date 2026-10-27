@@ -618,7 +618,9 @@ async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
                 for c in page['controls'] + page['entry']['root_evidence']:
                     if c['selector'] == '#_systemfield_resume':
                         if kind == 'wrong-label':
-                            c['label'] = 'Supporting document'
+                            # The independently observed question may still say
+                            # Resume; change both semantic captions to be wrong.
+                            c['label'] = c['question'] = 'Supporting document'
                         elif kind == 'disabled':
                             c['disabled'] = True
                         else:

@@ -32,6 +32,11 @@ _ZERO_WIDTH = re.compile("[\u200b-\u200f\u2060\ufeff]")
 _BIDI = re.compile("[\u202a-\u202e\u2066-\u2069]")
 _URL = re.compile(r"https?://[^\s<>'\"]+", re.I)
 _TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+# Scripts written without spaces between words: Thai, Lao, Myanmar, Khmer,
+# kana and CJK ideographs.
+_UNSPACED = re.compile(
+    "[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u3040-\u30ff"
+    "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 _INSTRUCTION = re.compile(
     r"(?i)(?:\bignore (?:all |any |the )?(?:previous|prior|above) instructions\b|"
     r"\bif you are (?:an? )?(?:ai|llm|language model|assistant|bot)\b|"
@@ -94,11 +99,13 @@ class _VisibleHTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.links: list[tuple[str, str]] = []
-        self.stack: list[tuple[str, bool, str, str, int | None, bool]] = []
+        self.stack: list[tuple[str, bool, str, str, int | None, bool, bool]] = []
         self.hidden_text: list[list[str]] = []
         self.hidden_attrs: list[str] = []
         self.anchor: list[dict] = []
         self.reasons: set[str] = set()
+        self.visible_pairs: set[tuple[str, str]] = set()
+        self.hidden_pairs: list[tuple[tuple[str, str], int, dict[int, str]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs = dict(attrs)
@@ -113,12 +120,26 @@ class _VisibleHTML(HTMLParser):
         dropped = tag in _DROP or bool(self.stack and self.stack[-1][5])
         # Group hidden descendants so split HTML text is checked as one payload.
         hidden_group = self.stack[-1][4] if parent_hidden else None
+        # A closed dialog or details element is not rendered, so a link in it
+        # never witnesses that a hidden link is a copy of a visible one. A
+        # datalist or rp never renders, canvas, video and audio children are
+        # fallback content a modern browser does not render, a browser drops
+        # links inside select, a popover's open state is not observable
+        # statically, and textarea or title content is literal text that this
+        # parser still reports as tags; none of them witnesses a visible link.
+        closed = (bool(self.stack and self.stack[-1][6])
+                  or (tag in {"dialog", "details"} and "open" not in attrs)
+                  or tag in {"datalist", "rp", "select", "textarea", "title",
+                             "canvas", "video", "audio"}
+                  or "popover" in attrs)
         if invisible and not parent_hidden and not dropped:
             hidden_group = len(self.hidden_text)
             self.hidden_text.append([])
+        own: dict[int, str] = {}
         if invisible and not dropped:
             for key in ("href", "title", "alt", "aria-label"):
                 if attrs.get(key):
+                    own[len(self.hidden_attrs)] = key
                     self.hidden_attrs.append(attrs[key])
         if same:
             self.reasons.add("same_color")
@@ -130,14 +151,38 @@ class _VisibleHTML(HTMLParser):
                 self.reasons.add("hidden_url")
         if tag == "a":
             href = attrs.get("href") or ""
+            # A hidden anchor rooting its own hidden group may be a responsive
+            # copy of a visible link; record its own evidence for that check.
+            root = (hidden_group if invisible and not parent_hidden
+                    and not dropped else None)
             self.anchor.append({"href": href, "title": attrs.get("title") or "",
-                                "text": [], "hidden": invisible})
+                                "text": [], "hidden": invisible, "group": root,
+                                "attrs": own, "closed": closed})
         if tag in _BLOCK and not invisible:
             self.parts.append("\n")
         # Raw event handlers and arbitrary attribute values never enter parts.
-        self.stack.append((tag, invisible, fg, bg, hidden_group, dropped))
+        self.stack.append((tag, invisible, fg, bg, hidden_group, dropped, closed))
         if tag in {"br", "img", "input", "hr", "meta", "link", "source", "wbr"}:
             self.handle_endtag(tag)
+
+    def evidence(self) -> tuple[list[str], list[str]]:
+        """Hidden text groups and attributes, minus exact visible link copies.
+
+        Only a hidden anchor whose label and href equal a visible anchor in
+        the same document is excused; nested element attributes still count.
+        """
+        text = ["".join(parts) for parts in self.hidden_text]
+        attrs = list(self.hidden_attrs)
+        for pair, group, own in self.hidden_pairs:
+            if pair not in self.visible_pairs:
+                continue
+            text[group] = ""
+            # The copy's href is the paired href; any other own attribute is
+            # excused only when it repeats the paired label.
+            for index, key in own.items():
+                if key == "href" or " ".join(attrs[index].split()) == pair[0]:
+                    attrs[index] = ""
+        return text, attrs
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         self.handle_starttag(tag, attrs)
@@ -152,6 +197,16 @@ class _VisibleHTML(HTMLParser):
                 break
         if tag == "a" and self.anchor:
             link = self.anchor.pop()
+            # Visible labels are rendered text only, never a title fallback;
+            # a hidden copy's label is all the text of its hidden group.
+            label = "".join(self.hidden_text[link["group"]]
+                            if link["group"] is not None else link["text"])
+            pair = (" ".join(label.split()), link["href"])
+            if pair[0] and pair[1]:
+                if not link["hidden"] and not link["closed"]:
+                    self.visible_pairs.add(pair)
+                elif link["group"] is not None:
+                    self.hidden_pairs.append((pair, link["group"], link["attrs"]))
             if not link["hidden"]:
                 label = " ".join("".join(link["text"]).split()) or link["title"]
                 if label and link["href"]:
@@ -162,7 +217,9 @@ class _VisibleHTML(HTMLParser):
             group = self.stack[-1][4]
             if group is not None and not self.stack[-1][5]:
                 self.hidden_text[group].append(data)
-            if _URL.search(data):
+            # Script, style and head data never enter the parsed posting
+            # text, so a URL there is not a removed hidden URL.
+            if _URL.search(data) and not self.stack[-1][5]:
                 self.reasons.add("hidden_url")
             return
         self.parts.append(data)
@@ -199,7 +256,7 @@ def _text(raw: str, reasons: set[str], *, strip_trailing: bool = False) -> str:
 
 def _hidden_material_retained(text: str, hidden_text: list[str],
                               hidden_attrs: list[str]) -> bool:
-    """Hidden text needs word windows; attributes need complete-value matches."""
+    """Hidden text needs word windows; attributes need complete values."""
     selected = _TOKEN.findall(text.casefold())
     windows: dict[int, set[tuple[str, ...]]] = {}
     for fragment in hidden_text:
@@ -217,10 +274,27 @@ def _hidden_material_retained(text: str, hidden_text: list[str],
             return True
     # A job-title slug can share four words with the visible title without
     # the hidden href (or another attribute value) being present in the JD.
+    # A one-word value must be a whole selected word, so a short label never
+    # matches part of a longer word; longer values and unspaced scripts keep
+    # the complete-value match, and token runs also catch punctuation drift.
     normalized = " ".join(text.casefold().split())
+    words_seen = set(selected)
+    # Tokens never contain a space, so a space-delimited join finds an exact
+    # token run in linear space whatever the attribute length.
+    joined = f" {' '.join(selected)} "
     for value in hidden_attrs:
+        words = tuple(_TOKEN.findall(value.casefold()))
+        if not words:
+            continue
         complete = " ".join(value.casefold().split())
-        if complete and complete in normalized:
+        if len(words) == 1:
+            if words[0] in words_seen or (
+                    _UNSPACED.search(words[0]) and complete in normalized):
+                return True
+            continue
+        if complete in normalized:
+            return True
+        if f" {' '.join(words)} " in joined:
             return True
     return False
 
@@ -276,8 +350,9 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(source)
             parser.close()
             reasons.update(parser.reasons)
-            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
-            hidden_attrs.extend(parser.hidden_attrs)
+            evidence_text, evidence_attrs = parser.evidence()
+            hidden_text.extend(evidence_text)
+            hidden_attrs.extend(evidence_attrs)
             html_text = "".join(parser.parts)
             # A nonselected HTML variant can expose model-directed instructions
             # and suspicious Unicode absent from the preferred plain JD.
@@ -290,8 +365,9 @@ def analyze(text: str | None, *, html_variants=(), source_required: bool = False
             parser.feed(selected)
             parser.close()
             reasons.update(parser.reasons)
-            hidden_text.extend("".join(parts) for parts in parser.hidden_text)
-            hidden_attrs.extend(parser.hidden_attrs)
+            evidence_text, evidence_attrs = parser.evidence()
+            hidden_text.extend(evidence_text)
+            hidden_attrs.extend(evidence_attrs)
             selected = "".join(parser.parts)
         clean = _text(selected, reasons, strip_trailing=strip_trailing)
         # The selected ATS plaintext may still contain content removed only

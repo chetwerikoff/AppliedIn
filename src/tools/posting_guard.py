@@ -122,12 +122,15 @@ class _VisibleHTML(HTMLParser):
         hidden_group = self.stack[-1][4] if parent_hidden else None
         # A closed dialog or details element is not rendered, so a link in it
         # never witnesses that a hidden link is a copy of a visible one. A
-        # datalist never renders, a popover's open state is not observable
+        # datalist or rp never renders, canvas, video and audio children are
+        # fallback content a modern browser does not render, a browser drops
+        # links inside select, a popover's open state is not observable
         # statically, and textarea or title content is literal text that this
         # parser still reports as tags; none of them witnesses a visible link.
         closed = (bool(self.stack and self.stack[-1][6])
                   or (tag in {"dialog", "details"} and "open" not in attrs)
-                  or tag in {"datalist", "textarea", "title"}
+                  or tag in {"datalist", "rp", "select", "textarea", "title",
+                             "canvas", "video", "audio"}
                   or "popover" in attrs)
         if invisible and not parent_hidden and not dropped:
             hidden_group = len(self.hidden_text)

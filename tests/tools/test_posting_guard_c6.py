@@ -223,13 +223,19 @@ def test_unrendered_link_is_not_a_visible_witness(container):
     assert _review_required(result)
 
 
-# A datalist or a statically unverified popover never renders a witness, and
+# A datalist, rp, select, media fallback content or a statically unverified
+# popover never renders a witness, and
 # textarea content is literal text even though the parser reports tags in it.
 @pytest.mark.parametrize("container", [
     "<datalist>{}</datalist>",
     "<div popover>{}</div>",
     '<div popover="manual"><span>{}</span></div>',
     "<textarea>{}</textarea>",
+    "<canvas>{}</canvas>",
+    "<video>{}</video>",
+    '<audio controls><source src="a.ogg">{}</audio>',
+    "<ruby>x<rp>{}</rp><rt>y</rt></ruby>",
+    "<select><option>{}</option></select>",
 ])
 def test_nonrendered_or_literal_link_is_not_a_visible_witness(container):
     link = f'<a href="#x">{INJECTION}</a>'

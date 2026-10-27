@@ -6992,6 +6992,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if (isinstance(provenance, ApplicationEntryProvenance)
                                 and provenance.ats == 'ashby'
                                 and isinstance(session, _EntrySession)
+                                and _formless_root(page)
                                 and not uploaded and not session.upload_attempted
                                 and (producer_guard is None or (
                                     not producer_guard.upload_attempted
@@ -7008,7 +7009,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     {c['selector'] for c in members if c.get('type') == 'file'}):
                                 raise Gate('missing unique labelled resume receiver; inspect manually.')
                             upload_action = {'action': 'upload', 'selector': receivers[0]['selector']}
-                            receiver = control(page, upload_action, 'decision-action')
+                            receiver = receivers[0]  # Already unique; execute revalidates it.
                             tree = _upload_tree(page)
                             original = _upload_input(page, tree)
                             if (receiver['selector'] != original['selector']

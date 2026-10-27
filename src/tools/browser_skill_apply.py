@@ -6989,38 +6989,77 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if (ctx is None and (producer_guard is None or
                                 getattr(raw_session, '_application_controller', None) is not producer_guard)):
                             raise Gate('Application Submit lacks a bound raw IPC guard; no click is safe.')
-                        before = page
-                        step['last_button'] = target.get('label', '')
-                        if ctx is not None:
-                            # The offline facade has a fake raw producer, so its
-                            # authoritative verdict is invoked directly here.
-                            offline_guard = ApplicationIPCController(
-                                pk, company, url, resume_path, facts, filled, history,
-                                step, mark_click_started, fixture_context=ctx)
-                            offline_guard.upload_completed = uploaded
-                            offline_guard.upload_identity = offline_guard._row_pdf()
-                            await offline_guard.authorize_final_submit(session, page, target)
-                            mark_click_started()
-                            await session.call('click', target['selector'])
+                        if (isinstance(provenance, ApplicationEntryProvenance)
+                                and provenance.ats == 'ashby'
+                                and isinstance(session, _EntrySession)
+                                and not uploaded and not session.upload_attempted
+                                and (producer_guard is None or (
+                                    not producer_guard.upload_attempted
+                                    and not producer_guard.upload_completed))):
+                            # An old displayed filename cannot stand in for this run's
+                            # guarded chooser transfer. Only an empty original receiver
+                            # may be repaired before entering any Submit state.
+                            verify_dispatch()
+                            members = _formless_boundary(page, provenance)
+                            receivers = [c for c in page['controls']
+                                         if c.get('type') == 'file'
+                                         and re.search(r'resume|résumé|cv', label(c), re.I)]
+                            if (len(receivers) != 1 or receivers[0]['selector'] not in
+                                    {c['selector'] for c in members if c.get('type') == 'file'}):
+                                raise Gate('missing unique labelled resume receiver; inspect manually.')
+                            upload_action = {'action': 'upload', 'selector': receivers[0]['selector']}
+                            receiver = control(page, upload_action, 'decision-action')
+                            tree = _upload_tree(page)
+                            original = _upload_input(page, tree)
+                            if (receiver['selector'] != original['selector']
+                                    or receiver.get('files') != [] or original.get('files') != []
+                                    or tree.get('items') != [] or tree.get('attached') is not False
+                                    or tree.get('filename') not in (None, '')):
+                                raise Gate('The original empty résumé input changed before upload.')
+                            result = await execute(
+                                session, page, upload_action, facts=facts, filled=filled,
+                                resume_path=resume_path, company=company, jd_text=jd_text,
+                                resume_tex=resume_tex, github=github, pk=pk,
+                                job_url=url, on_committing_click=mark_click_started,
+                                provenance=provenance,
+                                **({'fixture_context': ctx} if ctx else {}))
+                            if not result.get('uploaded'):
+                                raise Gate('The exact passive résumé attachment did not remain proven.')
+                            uploaded = True
+                            history.append(result)
                         else:
-                            # The real raw producer independently reads, validates,
-                            # holds and authorizes this exact click. No early hold.
-                            await _effect_call(session, 'click', target['selector'])
-                        for _ in range(30):
-                            await asyncio.sleep(1)
-                            after = await session.page()
-                            if _formless_root(after):
-                                after, _ = await _observe_controls(session, after, site='confirmation-formless-readback')
-                            step['url'] = after['url']
-                            if (phrase := await _fresh_confirmed_outcome(
-                                    session, before, after, provenance, url)):
-                                return {'status': 'applied', 'confirmation': phrase,
-                                        'fields': _fields_report(history, filled)}
-                        context = handoff(
-                            'Submission clicked, but no new employer confirmation was observed. '
-                            'Check the employer portal before retrying.', step)
-                        return {'status': 'uncertain', 'detail': context['text'],
-                                'step': context['step']}
+                            before = page
+                            step['last_button'] = target.get('label', '')
+                            if ctx is not None:
+                                # The offline facade has a fake raw producer, so its
+                                # authoritative verdict is invoked directly here.
+                                offline_guard = ApplicationIPCController(
+                                    pk, company, url, resume_path, facts, filled, history,
+                                    step, mark_click_started, fixture_context=ctx)
+                                offline_guard.upload_completed = uploaded
+                                offline_guard.upload_identity = offline_guard._row_pdf()
+                                await offline_guard.authorize_final_submit(session, page, target)
+                                mark_click_started()
+                                await session.call('click', target['selector'])
+                            else:
+                                # The real raw producer independently reads, validates,
+                                # holds and authorizes this exact click. No early hold.
+                                await _effect_call(session, 'click', target['selector'])
+                            for _ in range(30):
+                                await asyncio.sleep(1)
+                                after = await session.page()
+                                if _formless_root(after):
+                                    after, _ = await _observe_controls(session, after, site='confirmation-formless-readback')
+                                step['url'] = after['url']
+                                if (phrase := await _fresh_confirmed_outcome(
+                                        session, before, after, provenance, url)):
+                                    return {'status': 'applied', 'confirmation': phrase,
+                                            'fields': _fields_report(history, filled)}
+                            context = handoff(
+                                'Submission clicked, but no new employer confirmation was observed. '
+                                'Check the employer portal before retrying.', step)
+                            return {'status': 'uncertain', 'detail': context['text'],
+                                    'step': context['step']}
                     else:
                         target = control(page, action, 'decision-action')
                         if verb == 'click':

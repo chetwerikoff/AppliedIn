@@ -476,7 +476,12 @@ async def test_hung_and_failed_reads_share_single_post_navigation_deadline(monke
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await asyncio.wait_for(attempt(), timeout=0.3)
     assert report['status'] == 'gate'
-    assert 'application form inventory read timed out/unavailable' in report['question']
+    # Issue #214 AC4: the class of the read that set the reason, no message.
+    kind = 'OSError' if ipc == 'failed-page' else 'TimeoutError'
+    assert (f'application form inventory read failed (exception={kind}) after bounded wait'
+            in report['question'])
+    assert 'timed out/unavailable' not in report['question']
+    assert 'synthetic failed read' not in report['question']
     assert not decide.await_count
     no_mutations(session)
 
@@ -662,7 +667,7 @@ async def test_one_monotonic_budget_includes_reads_and_sleeps_not_navigation(mon
     monkeypatch.setattr(forms.asyncio, 'sleep', elapsed_sleep)
     report = await attempt()
     assert report['status'] == 'gate'
-    assert 'read timed out/unavailable' in report['question']
+    assert 'read failed (exception=TimeoutError) after bounded wait' in report['question']
     # 40s navigation is excluded; four reads exhaust the single 15s wait,
     # whereas a restarted deadline would wrongly allow bootstrap.
     assert session.pages == 4
@@ -1325,7 +1330,8 @@ async def test_read_unavailable_uses_remaining_single_budget(monkeypatch, start)
         raise OSError('synthetic inventory read unavailable')
     session.on_page = unavailable
     result = await attempt('lever')
-    assert 'read timed out/unavailable after bounded wait' in result['question']
+    assert 'read failed (exception=OSError) after bounded wait' in result['question']
+    assert 'synthetic inventory read unavailable' not in result['question']
     # Compare absolute deadlines: subtracting a fractional origin can round
     # even when the controller stopped at exactly the intended deadline.
     assert clock[0] == start + 15
@@ -2153,7 +2159,7 @@ async def test_wait_missing_page_is_false_and_downstream_unknown(monkeypatch, ca
     session.on_page = fail
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     report = await asyncio.wait_for(attempt(), timeout=0.5)
-    assert 'application form inventory read timed out/unavailable' in report['question']
+    assert 'application form inventory read failed (exception=OSError)' in report['question']
     state = _wait_map(report['question'])
     assert state['read.page_available'] == 'false'
     # A failed current sample never promotes an older observation.
@@ -2382,3 +2388,621 @@ def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():
                    "ats": ats, "jd_url": url}
             actual = forms._application_entry(row, pk, company, url, [cfg])
             assert (actual is not None) is admitted
+
+
+# Issue #214: two exact frame-only shapes are tolerated on Ashby application
+# entry; every other unknown frame, response and challenge keeps its gate.
+
+def _issue214_proof(monkeypatch, ats='ashby'):
+    row, configs, _, _ = world(monkeypatch, ats)
+    return forms._application_entry(row, PK, COMPANY, posting(ats), configs)
+
+
+def _issue214_entry(*frames, **extra):
+    return {'frames': [deepcopy(f) for f in frames], 'responses': [],
+            'response_error': False, 'helper_challenge': False, **extra}
+
+
+_ISSUE214_A = dict(status='unknown', origin='https://www.recaptcha.net',
+                   path='/recaptcha/enterprise/anchor', source='url', srcdoc='absent',
+                   visibility='hidden', display='inline', box={'width': 256, 'height': 60},
+                   form_controls='unknown', document_readability='unreadable',
+                   root='#application-form', outside=False)
+_ISSUE214_B = dict(status='unknown', origin='', path='', source='absent', srcdoc='absent',
+                   visibility='visible', display='none', box=None,
+                   form_controls='unknown', document_readability='unreadable',
+                   root='#application-form', outside=False)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('origin', ['https://www.recaptcha.net', 'https://www.google.com'])
+@pytest.mark.parametrize('path', ['/recaptcha/enterprise/anchor', '/recaptcha/api2/anchor'])
+@pytest.mark.parametrize('style', [None, {'visibility': 'visible', 'display': 'none'}])
+def test_issue214_category_a_hidden_provider_frame_is_frame_only(
+        monkeypatch, reader, origin, path, style):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    edit = {'src': origin + path, **({'style': style} if style else {})}
+    page = dom(dict(frames=['R'], inside=True, edit=edit), script)
+    frame = page['entry']['frames'][0]
+    # The reader still refuses to call it R: admission is not reclassification.
+    assert frame['status'] == 'unknown'
+    assert (frame['origin'], frame['path'], frame['source'], frame['srcdoc']) == (
+        origin, path, 'url', 'absent')
+    assert frame['form_controls'] != 'yes'
+    assert forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch)) is False
+    # Only Ashby application-entry provenance tolerates it.
+    for other in (None, _issue214_proof(monkeypatch, 'lever')):
+        with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+            forms._entry_artifacts(page['entry'], other)
+
+
+@pytest.mark.parametrize('edit', [
+    {'src': 'https://recaptcha.example-co.test/recaptcha/enterprise/anchor'},
+    {'src': 'http://www.recaptcha.net/recaptcha/enterprise/anchor'},
+    {'src': 'https://www.google.com.example-co.test/recaptcha/api2/anchor'},
+    {'src': 'https://www.recaptcha.net/recaptcha/api/anchor'},
+    {'src': 'https://www.google.com/recaptcha/enterprisex/anchor'},
+    {'src': '/recaptcha/enterprise/anchor'},
+    {'style': {'visibility': 'visible', 'display': 'inline'}},
+], ids=['foreign-origin', 'http', 'suffix-host', 'api-path', 'prefix-path', 'relative',
+        'visible'])
+def test_issue214_category_a_lookalikes_keep_their_gate(monkeypatch, edit):
+    page = dom(dict(frames=['R'], inside=True, edit=edit))
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+        forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_issue214_category_a_with_current_child_controls_keeps_its_gate(monkeypatch, reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    url = 'https://www.recaptcha.net/recaptcha/enterprise/anchor'
+    page = _dom_with_readable_child(
+        {'frames': ['R'], 'inside': True, 'edit': {'src': url},
+         'child': {'url': url, 'readyState': 'complete', 'control': 'button'}}, script)
+    assert page['entry']['frames'][0]['form_controls'] == 'yes'
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+        forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+@pytest.mark.parametrize('spec,box', [
+    (dict(zParentAttrs={'id': 'foreign'}), None),
+    (dict(zNested=True), None),
+    (dict(zParentAttrs={'id': 'foreign'}, edit={'style': {'display': 'block'},
+                                                 'rect': {'width': 0, 'height': 0}}),
+     {'width': 0, 'height': 0}),
+], ids=['display-none', 'display-none-nested', 'zero-box'])
+def test_issue214_category_b_sourceless_nonrendered_frame_is_frame_only(
+        monkeypatch, reader, spec, box):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(frames=['Z'], **spec), script)
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'unknown'
+    assert (frame['source'], frame['srcdoc']) == ('absent', 'absent')
+    assert frame['document_readability'] == 'unreadable'
+    assert frame['form_controls'] == 'unknown'
+    if box is not None:
+        assert frame['display'] != 'none' and frame['box'] == box
+    assert forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch)) is False
+    for other in (None, _issue214_proof(monkeypatch, 'lever')):
+        with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+            forms._entry_artifacts(page['entry'], other)
+
+
+@pytest.mark.parametrize('edit', [
+    {'style': {'display': 'block'}},
+    {'style': {'display': 'block'}, 'bounds': {'width': 0, 'height': 0}},
+    {'style': {'display': 'block'}, 'rect': {'width': 0, 'height': 1}},
+    {'src': 'about:blank'},
+    {'src': 'https://www.recaptcha.net/recaptcha/enterprise/anchor',
+     'style': {'display': 'block'}},
+], ids=['null-box', 'bounds-only', 'nonzero-box', 'blank-source', 'url-source-rendered'])
+def test_issue214_category_b_lookalikes_keep_their_gate(monkeypatch, edit):
+    page = dom(dict(frames=['Z'], zParentAttrs={'id': 'foreign'}, edit=edit))
+    frame = page['entry']['frames'][0]
+    assert frame['status'] == 'unknown'
+    if 'bounds' in edit:
+        assert frame['box'] is None  # bounds never substitutes for a client rect
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+        forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch))
+
+
+@pytest.mark.parametrize('base,change', [
+    (_ISSUE214_A, {'form_controls': 'yes'}), (_ISSUE214_B, {'form_controls': 'yes'}),
+    (_ISSUE214_A, {'srcdoc': 'present'}), (_ISSUE214_B, {'srcdoc': 'present'}),
+    (_ISSUE214_A, {'form_controls': None}), (_ISSUE214_B, {'document_readability': None}),
+    (_ISSUE214_A, {'source': 'blank'}), (_ISSUE214_A, {'path': None}),
+    (_ISSUE214_A, {'origin': 'https://www.recaptcha.net:443'}),
+    (_ISSUE214_A, {'visibility': 'visible'}),
+    (_ISSUE214_B, {'display': 'block'}),
+    (_ISSUE214_B, {'display': 'block', 'box': {'width': 0, 'height': 0.5}}),
+    (_ISSUE214_B, {'display': 'block', 'box': {'width': 0, 'height': float('nan')}}),
+    (_ISSUE214_B, {'display': 'block', 'box': {'width': False, 'height': 0}}),
+    (_ISSUE214_B, {'display': 'block', 'box': None, 'bounds': {'width': 0, 'height': 0}}),
+    (_ISSUE214_B, {'display': 'block', 'box': [0, 0]}),
+    (_ISSUE214_B, {'status': 'Z?'}),
+])
+def test_issue214_every_missing_or_malformed_predicate_fails_closed(monkeypatch, base, change):
+    proof = _issue214_proof(monkeypatch)
+    assert forms._entry_artifacts(_issue214_entry(base), proof) is False
+    frame = {**base, **change}
+    with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+        forms._entry_artifacts(_issue214_entry(frame), proof)
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_issue214_passive_frame_never_proves_a_recaptcha_response(monkeypatch, reader):
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(frames=['R'], inside=True, tokens=['g-recaptcha-response']), script)
+    assert page['entry']['frames'][0]['status'] == 'unknown'
+    assert page['entry']['response_error']
+    assert all(c['selector'] != '#token-0' for c in page['controls'])
+    with pytest.raises(forms.CaptchaArtifactGate, match='untrusted captcha response control'):
+        forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch))
+
+
+@pytest.mark.parametrize('reader', ['page', 'witness'])
+def test_issue214_no_native_root_hcaptcha_response_stays_fail_closed(monkeypatch, reader):
+    # ARCH15:40 Option 1: only a response outside an already admitted native
+    # form is the rootless shape; one with no native root at all stays gated.
+    script = forms.ENTRY_PAGE if reader == 'page' else forms._ENTRY_FIXED_CONTROL_WITNESS
+    page = dom(dict(frames=[], root=False, tokens=['h-captcha-response']), script)
+    assert page['entry']['root'] is None and page['entry']['response_error']
+    assert page['controls'] == []
+    with pytest.raises(forms.CaptchaArtifactGate, match='untrusted captcha response control'):
+        forms._entry_artifacts(page['entry'], _issue214_proof(monkeypatch))
+
+
+@pytest.mark.parametrize('visible,message', [
+    ('visible-recaptcha', 'visible reCAPTCHA Enterprise challenge'),
+    ('visible-hcaptcha', 'visible hCaptcha challenge'),
+])
+def test_issue214_visible_challenge_outranks_passive_and_unknown_frames(
+        monkeypatch, visible, message):
+    proof = _issue214_proof(monkeypatch)
+    unknown = {**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}
+    for frames in ((_ISSUE214_A, {'status': visible}), (unknown, {'status': visible}),
+                   (_ISSUE214_B, {'status': visible})):
+        with pytest.raises(forms.CaptchaGate, match=message):
+            forms._entry_artifacts(_issue214_entry(*frames), proof)
+    with pytest.raises(forms.CaptchaGate, match='visible hCaptcha challenge control'):
+        forms._entry_artifacts(_issue214_entry(_ISSUE214_A, helper_challenge=True), proof)
+
+
+@pytest.mark.parametrize('frames', [['R'], ['Z']])
+def test_issue214_generic_page_safe_baseline_is_unchanged_parent_contract(frames):
+    # Generic PAGE is not a protected-value reader: only its safe parent
+    # baseline is asserted, and entry admission never reads it as entry.
+    from tools.browser_skill_dom import PAGE
+    spec = dict(frames=frames, inside=True) if frames == ['R'] else dict(
+        frames=frames, zParentAttrs={'id': 'foreign'})
+    page = dom(spec, PAGE)
+    assert 'entry' not in page
+    assert [c['selector'] for c in page['controls']] == ['#email', '#submit']
+    entry_page = dom(spec)
+    assert [c['selector'] for c in entry_page['controls']] == ['#email', '#submit']
+    assert entry_page['entry']['frames'][0]['status'] == 'unknown'
+
+
+async def _issue214_apply(monkeypatch, frame):
+    page = application('ashby')
+    page['entry'] = _issue214_entry(
+        frame, root={'selector': '#application-form', 'action': entry('ashby')})
+    _, _, session, decide = world(monkeypatch, pages=[page])
+    fake_clock(monkeypatch)
+    bootstrap = AsyncMock(side_effect=forms.Gate('ready for human review'))
+    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    return await attempt(), session, decide, bootstrap
+
+
+@pytest.mark.parametrize('frame', [_ISSUE214_A, _ISSUE214_B], ids=['a', 'b'])
+async def test_issue214_passive_frame_reaches_existing_owner_gate_without_click(
+        monkeypatch, frame):
+    report, session, decide, bootstrap = await _issue214_apply(monkeypatch, frame)
+    assert report['status'] == 'gate'
+    assert 'ready for human review' in report['question']
+    bootstrap.assert_awaited_once()
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_issue214_unknown_frame_gates_apply_before_bootstrap(monkeypatch):
+    frame = {**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}
+    report, session, decide, bootstrap = await _issue214_apply(monkeypatch, frame)
+    assert report['status'] == 'gate'
+    assert report['question'].startswith('unknown/untrusted application frame')
+    assert not bootstrap.await_count and not decide.await_count
+    no_mutations(session)
+
+
+@pytest.mark.parametrize('change,admitted', [
+    ({'zParentAttrs': {'id': 'foreign'}}, True),
+    ({'edit': {'src': 'https://widgets.example-co.test/frame'}}, False),
+])
+async def test_issue214_reversible_fallback_applies_entry_admission_first(
+        monkeypatch, change, admitted):
+    from tests.tools.test_browser_formless import root_world
+    _, raw, _, provenance = root_world(monkeypatch, missingPane=True, frames=['Z'], **change)
+    assert raw.current['entry']['frames'][0]['status'] == 'unknown'
+    monkeypatch.setattr(forms, '_stable_application_form', AsyncMock(
+        side_effect=forms.Gate('no unique application root after bounded wait')))
+    allowed = lambda url: url == entry('ashby')
+    scoped = forms._EntrySession(raw, allowed, provenance, resume_path='Resume.pdf')
+    if admitted:
+        session, page = await forms._entry_or_reversible_page(
+            scoped, raw, allowed, provenance, deadline=0)
+        assert isinstance(session, forms._ReversibleEntryReader)
+        assert page['entry']['frames'][0]['status'] == 'unknown'
+    else:
+        with pytest.raises(forms.CaptchaArtifactGate,
+                           match='unknown/untrusted application frame') as raised:
+            await forms._entry_or_reversible_page(
+                scoped, raw, allowed, provenance, deadline=0)
+        assert raised.value.wait_predicates['read.frames_admitted'] == 'false'
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('frame,admitted', [
+    (_ISSUE214_B, True), (_ISSUE214_A, True),
+    ({**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}, False),
+    ({**_ISSUE214_B, 'form_controls': 'yes'}, False),
+], ids=['b', 'a', 'unknown', 'form-controls'])
+async def test_issue214_raw_producer_applies_entry_admission_before_ipc(
+        monkeypatch, frame, admitted):
+    from tests.tools.test_browser_formless import (
+        _issue184_prepare_producer, _issue184_real_producer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
+        monkeypatch, facts)
+    await _issue184_prepare_producer(producer, provenance, facts)
+    controller.entry_provenance = provenance
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['frames'].append({**deepcopy(frame), 'root': ''})
+    request = ('fill', '#_systemfield_name', '--value', facts['Name'])
+    if admitted:
+        await controller.before_ipc(producer, request, {})
+    else:
+        with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
+            await controller.before_ipc(producer, request, {})
+    assert not [call for call in endpoint.calls if call[0] in {'fill', 'click'}]
+    assert not controller.committed
+
+
+@pytest.mark.parametrize('failure', [OSError, bsk.Unavailable])
+async def test_issue214_later_attempt_clears_stale_exception_class(monkeypatch, failure):
+    fake_clock(monkeypatch)
+    _, _, session, decide = world(monkeypatch, pages=[application('ashby', controls=[])])
+
+    async def fail_once(s):
+        if s.pages == 1:
+            raise failure('synthetic failed read')
+    session.on_page = fail_once
+    report = await attempt()
+    assert 'no qualifying application form after bounded wait' in report['question']
+    assert 'exception=' not in report['question']
+    assert 'synthetic failed read' not in report['question']
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_issue214_unavailable_read_names_its_class_only(monkeypatch):
+    clock = fake_clock(monkeypatch)
+    start = clock[0]
+    _, _, session, decide = world(monkeypatch)
+
+    async def unavailable(s):
+        raise bsk.Unavailable('synthetic browser unavailable detail')
+    session.on_page = unavailable
+    report = await attempt()
+    assert ('application form inventory read failed (exception=Unavailable) after bounded wait'
+            in report['question'])
+    assert 'synthetic browser unavailable detail' not in report['question']
+    assert _wait_map(report['question'])['read.page_available'] == 'false'
+    assert clock[0] == start + forms._ASHBY_WAIT_SECONDS
+    assert not decide.await_count
+    no_mutations(session)
+
+
+async def test_issue214_raw_producer_refuses_a_missing_entry_census(monkeypatch):
+    from tests.tools.test_browser_formless import (
+        _issue184_prepare_producer, _issue184_real_producer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
+        monkeypatch, facts)
+    await _issue184_prepare_producer(producer, provenance, facts)
+    controller.entry_provenance = provenance
+    for snapshot in (endpoint.current, endpoint.fixed):
+        del snapshot['entry']
+    with pytest.raises(forms.Gate, match='inventory is malformed'):
+        await controller.before_ipc(
+            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
+    assert not [call for call in endpoint.calls if call[0] in {'fill', 'click'}]
+
+
+async def test_issue214_early_reader_timeout_marks_its_failed_read(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    clock = fake_clock(monkeypatch)
+    start = clock[0]
+    _, _, session, decide = world(monkeypatch)
+
+    async def early(s):
+        raise TimeoutError
+    session.on_page = early
+    report = await attempt()
+    assert ('application form inventory read failed (exception=TimeoutError) after bounded wait'
+            in report['question'])
+    state = _wait_map(report['question'])
+    # The reader failed before the deadline: PAGE is unavailable and time remains.
+    assert state['read.page_available'] == 'false'
+    assert state['deadline.remaining'] == 'true'
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert clock[0] == start
+    assert not decide.await_count
+    no_mutations(session)
+
+
+def _issue214_native_passive_world(monkeypatch, *, pair=True):
+    # Real ENTRY_PAGE/fixed reader output: a native Ashby form plus a hidden
+    # category (a) provider frame and a source-less display:none (b) frame.
+    row, raw, decide, provenance = native_real_world(
+        monkeypatch, nativePair=pair, frames=['R', 'Z'], inside=True,
+        zParentAttrs={'id': 'foreign'})
+    for snapshot in (raw.current, raw.fixed):
+        assert [f['status'] for f in snapshot['entry']['frames']] == ['unknown', 'unknown']
+        assert [f['source'] for f in snapshot['entry']['frames']] == ['url', 'absent']
+    return row, raw, decide, provenance
+
+
+def _issue214_approve_email(row, page, raw, provenance):
+    item = next(c for c in page['controls'] if c['selector'] == '#email')
+    fresh = {c['selector']: c for c in raw.fixed['controls']}
+    question = forms._disclosure_question(
+        page, item, fresh, posting('ashby'), provenance=provenance)
+    row['human_approved_answers'][question['label']] = {
+        'value': 'test@example-co.test', 'label': question['control_label'],
+        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
+                                    'type', 'form_selector', 'form_action')}}
+
+
+@pytest.mark.parametrize('drift', ['unknown-frame', 'response-error', 'visible-challenge'])
+async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift_refuses(
+        monkeypatch, drift):
+    row, raw, _, provenance = _issue214_native_passive_world(monkeypatch)
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    _issue214_approve_email(row, page, raw, provenance)
+    filled = {}
+    receipt = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example-co.test'}, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    assert filled == {'#email': 'test@example-co.test'}
+    after = await session.page()
+    email = next(c for c in after['controls'] if c['selector'] == '#email')
+    assert email['value'] == 'test@example-co.test' and email['has_value'] is True
+    assert after['entry']['frames'] == raw.current['entry']['frames']
+    for snapshot in (raw.current, raw.fixed):
+        if drift == 'unknown-frame':
+            snapshot['entry']['frames'].append(
+                {**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'})
+        elif drift == 'response-error':
+            snapshot['entry']['response_error'] = True
+        else:
+            snapshot['entry']['frames'].append({'status': 'visible-recaptcha'})
+    with pytest.raises(forms.Gate):
+        await session.call('fill', '#email', '--value', 'another@example-co.test')
+    with pytest.raises(forms.Gate):
+        await session.call('click', '#submit')
+    assert [c for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]
+    assert not [c for c in raw.calls if c[0] in {'click', 'upload', 'select'}]
+
+
+@pytest.mark.parametrize('drift', ['unknown-frame', 'response-error'])
+async def test_issue214_raw_producer_fill_with_passive_frames_then_drift_refuses(
+        monkeypatch, drift):
+    from tests.tools.test_browser_formless import (
+        _issue184_prepare_producer, _issue184_real_producer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
+        monkeypatch, facts)
+    controller.entry_provenance = provenance
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['frames'] += [{**_ISSUE214_A, 'root': ''}, {**_ISSUE214_B, 'root': ''}]
+    session, page = await _issue184_prepare_producer(producer, provenance, facts)
+    action = {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'}
+    kwargs = dict(facts=facts, filled=controller.filled, resume_path='', company=COMPANY,
+                  jd_text='', resume_tex='', github='', pk=PK, job_url=posting('ashby'),
+                  provenance=provenance)
+    receipt = await forms.execute(session, page, action, **kwargs)
+    assert receipt['action'] == 'fill'
+    fills = [call for call in endpoint.calls if call[0] == 'fill']
+    assert fills == [('fill', '#_systemfield_email', '--value', facts['Email'])]
+    after = await session.page()
+    target = next(c for c in after['controls'] if c['selector'] == '#_systemfield_email')
+    assert target['value'] == facts['Email'] and target['has_value'] is True
+    for snapshot in (endpoint.current, endpoint.fixed):
+        if drift == 'unknown-frame':
+            snapshot['entry']['frames'].append(
+                {**_ISSUE214_A, 'root': '', 'origin': 'https://widgets.example-co.test'})
+        else:
+            snapshot['entry']['response_error'] = True
+    with pytest.raises(forms.CaptchaArtifactGate):
+        await controller.before_ipc(
+            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
+    assert [call for call in endpoint.calls if call[0] == 'fill'] == fills
+    assert not controller.committed and not any(c[0] == 'click' for c in endpoint.calls)
+
+
+async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_click(
+        monkeypatch, tmp_path):
+    """Passive frames admitted, parent Email prefilled through the bound raw
+    producer, then the tenant witness drifts: the real final guard refuses with
+    no click, and the unchanged run caller persists the refusal."""
+    from types import SimpleNamespace
+    from agent import run
+    from core import events, profiles, rotation
+    from tools import browser_apply, browser_runtime, credentials
+    from tools import posting_guard as pg
+    from tests.tools.test_browser_controller_support import install_controller_session
+
+    row, raw, decide, provenance = _issue214_native_passive_world(monkeypatch, pair=False)
+    scoped = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    admitted = await forms._stable_application_form(
+        scoped, scoped.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    _issue214_approve_email(row, admitted, raw, provenance)
+    _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    authorized = []
+    final_guard = forms.ApplicationIPCController.authorize_final_submit
+
+    async def drift_then_final_guard(self, *args, **kwargs):
+        # Every earlier check has passed. The tenant witness drifts
+        # immediately before the unchanged final guard's own fresh check.
+        authorized.append(args[-1]['selector'])
+        monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: False)
+        return await final_guard(self, *args, **kwargs)
+
+    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit',
+                        drift_then_final_guard)
+
+    async def decisions(*args, **kwargs):
+        if decide.await_count == 1:
+            return {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
+        return {'action': 'submit', 'selector': '#submit'}
+
+    decide.side_effect = decisions
+    result = await forms.apply(posting('ashby'), COMPANY, {'Email': 'test@example-co.test'},
+                               'synthetic', pk=PK, resume_path=pdf)
+    assert result['status'] == 'gate', result
+    assert authorized == ['#submit']
+    assert result['review_route'] == 'hard_refusal', result
+    assert result['reason'] == 'defect_tenant', result
+    assert [c for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]
+    assert not [c for c in raw.calls if c[0] == 'click']
+
+    checked = pg.analyze('Synthetic engineering job. ' * 40)
+    tracked = {'pk': PK, 'status': 'tailored', 'company': COMPANY,
+               'jd_url': posting('ashby'), 'jd_text': checked['text'],
+               'posting_guard': checked['posting_guard']}
+    writes = []
+
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return dict(tracked)
+
+        get_current = get
+
+        def update_posting_guard(self, pk, observed, inspected=None, *,
+                                 reviewed_generation=None, source_witness=False,
+                                 settle_refusal=False):
+            from core.storage.base import guard_observation_matches, guard_patch
+            if not guard_observation_matches(self.get(pk), observed):
+                return False
+            patch = guard_patch(self.get(pk), inspected,
+                                reviewed_generation=reviewed_generation,
+                                source_witness=source_witness, settle_refusal=settle_refusal)
+            if patch is None:
+                return False
+            tracked.update(patch)
+            return True
+
+        def set_status(self, pk, status, **kwargs):
+            writes.append(status)
+            tracked.update(status=getattr(status, 'value', status), **kwargs)
+
+    stores = SimpleNamespace(tracking=Tracking(), secrets=None,
+                             answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+
+    async def forward(*args, **kwargs):
+        return deepcopy(result)
+
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **k: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(return_value=checked))
+    monkeypatch.setattr(run, '_no_sponsorship', lambda *a, **k: False)
+    monkeypatch.setattr(run, 'get_settings', lambda: SimpleNamespace(browser_model='synthetic'))
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: '/synthetic/resume.pdf')
+    monkeypatch.setattr(rotation, 'ensure', lambda *a, **k: None)
+    monkeypatch.setattr(profiles, 'resolve_for', lambda row: None)
+    monkeypatch.setattr(profiles, 'expand_all', lambda original: original)
+    monkeypatch.setattr(credentials, 'get_login', lambda *a: None)
+    monkeypatch.setattr(browser_runtime, 'configuration', lambda: {'engine': 'browser_skill'})
+    monkeypatch.setattr(browser_apply, 'apply', forward)
+    monkeypatch.setattr(events, 'emit', lambda kind, **kw: None)
+    consumed = await run._apply_direct(PK, stores)
+    assert consumed['result'] == 'gated' and consumed['question'] == result['question']
+    assert tracked['status'] == 'needs_human'
+    assert tracked['gate_pending']['question'] == result['question']
+    assert tracked['gate_pending']['review_route'] == 'hard_refusal'
+    assert tracked['gate_reason'] == result['reason'] == 'defect_tenant'
+
+
+@pytest.mark.parametrize('spec', [
+    dict(frames=['R', 'Z'], tokens=['g-recaptcha-response']),
+    dict(frames=['R', 'Z'], tokens=['g-recaptcha-response'], tokenOutside=True, textarea=True),
+    dict(frames=['H', 'Z'], tokens=['h-captcha-response']),
+    dict(frames=['H', 'Z'], tokens=['h-captcha-response'], tokenOutside=True),
+    dict(frames=['H', 'R', 'Z'], inside=True, tokens=['h-captcha-response'], tokenOutside=True),
+], ids=['R-form', 'R-outside', 'H-form', 'H-outside', 'H-outside-with-passive-R'])
+async def test_issue214_protected_response_survives_parent_fill_and_fresh_readback(
+        monkeypatch, spec):
+    """A reader-proven response with throwing value getters, passive (a)/(b)
+    siblings and the approved parent Email: the effect path and its fresh
+    real-reader read-back never read the token or touch a frame."""
+    import json
+    full = {'url': entry('ashby'), 'nativePair': False,
+            'zParentAttrs': {'id': 'foreign'}, **spec}
+    row, raw, _, provenance = native_real_world(
+        monkeypatch, nativePair=False, zParentAttrs={'id': 'foreign'}, **spec)
+    name = spec['tokens'][0]
+    passive = [f for f in raw.current['entry']['frames'] if f['status'] == 'unknown']
+    assert [f['source'] for f in passive][-1] == 'absent'
+    replay = raw.call
+
+    async def fresh_dom(method, *args, **kwargs):
+        if method != 'fill':
+            return await replay(method, *args, **kwargs)
+        raw.calls.append((method, *args))
+        # Re-run both unchanged real readers on the filled DOM; the reserved
+        # response getters still throw on any value read.
+        prefix = (f"document.querySelector({json.dumps('#' + args[0][1:])})"
+                  f".value={json.dumps(args[2])};\n")
+        raw.current = dom(full, prefix + forms.ENTRY_PAGE)
+        raw.fixed = dom(full, prefix + forms._ENTRY_FIXED_CONTROL_WITNESS)
+        return {}
+
+    raw.call = fresh_dom
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    assert [c['selector'] for c in page['controls']] == ['#email', '#submit']
+    _issue214_approve_email(row, page, raw, provenance)
+    filled = {}
+    receipt = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example-co.test'}, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    after = await session.page()
+    email = next(c for c in after['controls'] if c['selector'] == '#email')
+    assert email['value'] == 'test@example-co.test' and email['has_value'] is True
+    for snapshot in (after, raw.current, raw.fixed):
+        assert not snapshot['entry']['response_error']
+        assert [r['name'] for r in snapshot['entry']['responses']] == [name]
+        assert all(c['selector'] != '#token-0' for c in snapshot['controls'])
+        assert 'PROTECTED' not in repr(snapshot)
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]

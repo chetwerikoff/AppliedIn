@@ -246,7 +246,7 @@ async def test_definitive_no_effect_refusal_keeps_its_gate_reason(authority, mon
     assert len(raw.uploads) == 1
 
 
-async def _timed_upload(authority, monkeypatch, *, settles):
+async def _timed_upload(authority, monkeypatch, *, settles, recovery=False):
     from copy import deepcopy
     from tests.tools.test_ashby_upload import UploadClock
     from core.apply_queue import is_retryable
@@ -307,7 +307,14 @@ async def _timed_upload(authority, monkeypatch, *, settles):
     assert all(step == 0.25 for step in clock.steps)
     if settles:
         assert result['status'] == 'gate', result
-        assert result['form_question']['selector'] == '#additional', result
+        if recovery:
+            # With ctx there is no producer-side owner gate after upload. The
+            # synthetic second decision intentionally requests a non-click Gate.
+            assert result['form_question'] is None, result
+            assert 'Synthetic inspection without a second click' in result['question']
+            assert authority.decisions == 4
+        else:
+            assert result['form_question']['selector'] == '#additional', result
         assert 1.8 <= clock.now < 2.25
         assert len(promotions) == 1
         assert sessions[0].upload_result['entry']['upload_tree']['attached']
@@ -323,14 +330,14 @@ async def _timed_upload(authority, monkeypatch, *, settles):
 async def test_ashby_upload_disabled_dropzone_1_8s_settles_one_ipc(authority, monkeypatch, recovery):
     if recovery:
         _script_recovery_decisions(monkeypatch)
-    await _timed_upload(authority, monkeypatch, settles=True)
+    await _timed_upload(authority, monkeypatch, settles=True, recovery=recovery)
 
 
 @pytest.mark.parametrize('recovery', [False, True])
 async def test_ashby_upload_never_settles_8s_terminal_one_ipc(authority, monkeypatch, recovery):
     if recovery:
         _script_recovery_decisions(monkeypatch)
-    await _timed_upload(authority, monkeypatch, settles=False)
+    await _timed_upload(authority, monkeypatch, settles=False, recovery=recovery)
 
 
 def _update_read_values(raw, pair):
@@ -596,20 +603,20 @@ async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
     def late_receiver_change():
         for page in (raw.current, raw.fixed):
             file_input = next(c for c in page['controls']
-                              if c.get('id') == '_systemfield_resume')
+                              if c['selector'] == '#_systemfield_resume')
             if kind == 'duplicate':
                 duplicate = deepcopy(file_input)
                 duplicate['selector'] = '#other-resume'
                 page['controls'].append(duplicate)
             elif kind == 'missing':
                 for key in ('controls',):
-                    page[key] = [c for c in page[key] if c.get('id') != '_systemfield_resume']
+                    page[key] = [c for c in page[key] if c['selector'] != '#_systemfield_resume']
                 page['entry']['root_evidence'] = [
                     c for c in page['entry']['root_evidence']
-                    if c.get('id') != '_systemfield_resume']
+                    if c['selector'] != '#_systemfield_resume']
             else:
                 for c in page['controls'] + page['entry']['root_evidence']:
-                    if c.get('id') == '_systemfield_resume':
+                    if c['selector'] == '#_systemfield_resume':
                         if kind == 'wrong-label':
                             c['label'] = 'Supporting document'
                         elif kind == 'disabled':

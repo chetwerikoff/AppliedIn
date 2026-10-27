@@ -478,6 +478,9 @@ def _script_recovery_decisions(monkeypatch, *, first='submit',
             assert self.ipc_index == 2 and not self.uploaded
             if on_submit:
                 on_submit()
+        if index == 3 and first == 'submit':
+            assert any(item.get('action') == 'upload' and item.get('uploaded') is True
+                       for item in history)
         seen.append((action['action'], self.upload_ipc,
                      'résumé attachment verified=True' in task))
         if timeline is not None:
@@ -543,8 +546,9 @@ async def test_submit_without_current_run_upload_recovers_one_empty_ashby_receiv
     assert timeline.index('page-after-proof') < timeline.index('decision3')
     assert seen == [('fill', 0, False), ('fill', 0, False),
                     ('submit', 0, False), ('gate', 1, True)]
-    assert receipts == [{'action': 'upload', 'label': receipts[0]['label'],
-                         'uploaded': True}]
+    assert len(receipts) == 1
+    assert receipts[0]['action'] == 'upload' and receipts[0]['uploaded'] is True
+    assert re.search(r'resume|résumé|cv', receipts[0]['label'], re.I)
     assert raw.uploads == [(('upload', '#ashby-upload-dropzone', '--file',
                             authority.resume_path), {'timeout': 130})]
     assert authority.fills == 2 and authority.ipc_index == 3
@@ -581,6 +585,9 @@ async def test_resumed_retained_attachment_never_replaces_or_retries(
 @pytest.mark.parametrize('kind,refusal', [
     ('duplicate', 'missing unique labelled resume receiver'),
     ('wrong-label', 'missing unique labelled resume receiver'),
+    ('disabled', 'application label/control association or editability changed'),
+    ('wrong-type', 'missing unique labelled resume receiver'),
+    ('missing', 'missing unique labelled resume receiver'),
 ])
 async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
         authority, monkeypatch, kind, refusal):
@@ -594,10 +601,21 @@ async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
                 duplicate = deepcopy(file_input)
                 duplicate['selector'] = '#other-resume'
                 page['controls'].append(duplicate)
+            elif kind == 'missing':
+                for key in ('controls',):
+                    page[key] = [c for c in page[key] if c.get('id') != '_systemfield_resume']
+                page['entry']['root_evidence'] = [
+                    c for c in page['entry']['root_evidence']
+                    if c.get('id') != '_systemfield_resume']
             else:
                 for c in page['controls'] + page['entry']['root_evidence']:
                     if c.get('id') == '_systemfield_resume':
-                        c['label'] = 'Supporting document'
+                        if kind == 'wrong-label':
+                            c['label'] = 'Supporting document'
+                        elif kind == 'disabled':
+                            c['disabled'] = True
+                        else:
+                            c['type'] = 'text'
 
     result, _, seen = await _run_recovery(
         authority, monkeypatch, raw=raw, on_submit=late_receiver_change)

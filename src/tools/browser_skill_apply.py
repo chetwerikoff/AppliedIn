@@ -2698,8 +2698,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                 last_reason, previous = str(exc), None
                 diagnostics.set('pair.stable', None)
             except TimeoutError as exc:
-                last_reason = _read_failure_reason(exc, entry_session)
-                diagnostics.set('deadline.remaining', False)
+                last_reason, previous = _read_failure_reason(exc, entry_session), None
+                diagnostics.read_failed(phase)
+                diagnostics.set('deadline.remaining', loop.time() < deadline)
                 break
             except (OSError, bsk.Unavailable) as exc:
                 last_reason, previous = _read_failure_reason(exc, entry_session), None
@@ -6321,11 +6322,11 @@ class ApplicationIPCController:
                     'visible-recaptcha', 'visible-hcaptcha'}
                 for frame in observed.get('frames', []))):
             raise CaptchaGate('Visible application challenge requires manual authentication.')
-        if self.entry_provenance is not None and 'entry' in page:
+        if self.entry_provenance is not None:
             # Issue #214: an entry-admitted producer's fresh ENTRY_PAGE passes
             # the same frame/response admission as every scoped read before
-            # any reversible effect.
-            _entry_artifacts(page['entry'], self.entry_provenance)
+            # any reversible effect. A missing entry census is malformed.
+            _entry_artifacts(page.get('entry'), self.entry_provenance)
         if any(c.get('type') == 'password' for c in page.get('controls', [])):
             raise Gate('Sign in yourself in the dedicated profile before private preparation.')
         selector = args[1] if len(args) > 1 else None

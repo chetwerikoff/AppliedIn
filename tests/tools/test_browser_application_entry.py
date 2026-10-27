@@ -2702,3 +2702,224 @@ async def test_issue214_unavailable_read_names_its_class_only(monkeypatch):
     assert clock[0] == start + forms._ASHBY_WAIT_SECONDS
     assert not decide.await_count
     no_mutations(session)
+
+
+async def test_issue214_raw_producer_refuses_a_missing_entry_census(monkeypatch):
+    from tests.tools.test_browser_formless import (
+        _issue184_prepare_producer, _issue184_real_producer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
+        monkeypatch, facts)
+    await _issue184_prepare_producer(producer, provenance, facts)
+    controller.entry_provenance = provenance
+    for snapshot in (endpoint.current, endpoint.fixed):
+        del snapshot['entry']
+    with pytest.raises(forms.Gate, match='inventory is malformed'):
+        await controller.before_ipc(
+            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
+    assert not [call for call in endpoint.calls if call[0] in {'fill', 'click'}]
+
+
+async def test_issue214_early_reader_timeout_marks_its_failed_read(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    clock = fake_clock(monkeypatch)
+    start = clock[0]
+    _, _, session, decide = world(monkeypatch)
+
+    async def early(s):
+        raise TimeoutError
+    session.on_page = early
+    report = await attempt()
+    assert ('application form inventory read failed (exception=TimeoutError) after bounded wait'
+            in report['question'])
+    state = _wait_map(report['question'])
+    # The reader failed before the deadline: PAGE is unavailable and time remains.
+    assert state['read.page_available'] == 'false'
+    assert state['deadline.remaining'] == 'true'
+    assert state['pair.stable'] == 'unknown/unavailable'
+    assert _logged_map(caplog) == state
+    assert clock[0] == start
+    assert not decide.await_count
+    no_mutations(session)
+
+
+def _issue214_native_passive_world(monkeypatch):
+    # Real ENTRY_PAGE/fixed reader output: a native Ashby form plus a hidden
+    # category (a) provider frame and a source-less display:none (b) frame.
+    row, raw, decide, provenance = native_real_world(
+        monkeypatch, nativePair=True, frames=['R', 'Z'], inside=True,
+        zParentAttrs={'id': 'foreign'})
+    for snapshot in (raw.current, raw.fixed):
+        assert [f['status'] for f in snapshot['entry']['frames']] == ['unknown', 'unknown']
+        assert [f['source'] for f in snapshot['entry']['frames']] == ['url', 'absent']
+    return row, raw, decide, provenance
+
+
+def _issue214_approve_email(row, page, raw, provenance):
+    item = next(c for c in page['controls'] if c['selector'] == '#email')
+    fresh = {c['selector']: c for c in raw.fixed['controls']}
+    question = forms._disclosure_question(
+        page, item, fresh, posting('ashby'), provenance=provenance)
+    row['human_approved_answers'][question['label']] = {
+        'value': 'test@example-co.test', 'label': question['control_label'],
+        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
+                                    'type', 'form_selector', 'form_action')}}
+
+
+@pytest.mark.parametrize('drift', ['unknown-frame', 'response-error', 'visible-challenge'])
+async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift_refuses(
+        monkeypatch, drift):
+    row, raw, _, provenance = _issue214_native_passive_world(monkeypatch)
+    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    _issue214_approve_email(row, page, raw, provenance)
+    filled = {}
+    receipt = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'test@example-co.test'}, filled=filled,
+        resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
+        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+    assert receipt['action'] == 'fill'
+    assert filled == {'#email': 'test@example-co.test'}
+    after = await session.page()
+    email = next(c for c in after['controls'] if c['selector'] == '#email')
+    assert email['value'] == 'test@example-co.test' and email['has_value'] is True
+    assert after['entry']['frames'] == raw.current['entry']['frames']
+    for snapshot in (raw.current, raw.fixed):
+        if drift == 'unknown-frame':
+            snapshot['entry']['frames'].append(
+                {**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'})
+        elif drift == 'response-error':
+            snapshot['entry']['response_error'] = True
+        else:
+            snapshot['entry']['frames'].append({'status': 'visible-recaptcha'})
+    with pytest.raises(forms.Gate):
+        await session.call('fill', '#email', '--value', 'another@example-co.test')
+    with pytest.raises(forms.Gate):
+        await session.call('click', '#submit')
+    assert [c for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]
+    assert not [c for c in raw.calls if c[0] in {'click', 'upload', 'select'}]
+
+
+@pytest.mark.parametrize('drift', ['unknown-frame', 'response-error'])
+async def test_issue214_raw_producer_fill_with_passive_frames_then_drift_refuses(
+        monkeypatch, drift):
+    from tests.tools.test_browser_formless import (
+        _issue184_prepare_producer, _issue184_real_producer)
+    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
+        monkeypatch, facts)
+    controller.entry_provenance = provenance
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['frames'] += [{**_ISSUE214_A, 'root': ''}, {**_ISSUE214_B, 'root': ''}]
+    session, page = await _issue184_prepare_producer(producer, provenance, facts)
+    action = {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'}
+    kwargs = dict(facts=facts, filled=controller.filled, resume_path='', company=COMPANY,
+                  jd_text='', resume_tex='', github='', pk=PK, job_url=posting('ashby'),
+                  provenance=provenance)
+    receipt = await forms.execute(session, page, action, **kwargs)
+    assert receipt['action'] == 'fill'
+    fills = [call for call in endpoint.calls if call[0] == 'fill']
+    assert fills == [('fill', '#_systemfield_email', '--value', facts['Email'])]
+    after = await session.page()
+    target = next(c for c in after['controls'] if c['selector'] == '#_systemfield_email')
+    assert target['value'] == facts['Email'] and target['has_value'] is True
+    for snapshot in (endpoint.current, endpoint.fixed):
+        if drift == 'unknown-frame':
+            snapshot['entry']['frames'].append(
+                {**_ISSUE214_A, 'root': '', 'origin': 'https://widgets.example-co.test'})
+        else:
+            snapshot['entry']['response_error'] = True
+    with pytest.raises(forms.CaptchaArtifactGate):
+        await controller.before_ipc(
+            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
+    assert [call for call in endpoint.calls if call[0] == 'fill'] == fills
+    assert not controller.committed and not any(c[0] == 'click' for c in endpoint.calls)
+
+
+async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_click(monkeypatch):
+    """Passive frames admitted, parent Email prefilled, the existing final
+    refusal fires with no click, and the unchanged run caller persists it."""
+    from types import SimpleNamespace
+    from agent import run
+    from core import events, profiles, rotation
+    from tools import browser_apply, browser_runtime, credentials
+    from tools import posting_guard as pg
+
+    row, raw, decide, provenance = _issue214_native_passive_world(monkeypatch)
+    scoped = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    admitted = await forms._stable_application_form(
+        scoped, scoped.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    _issue214_approve_email(row, admitted, raw, provenance)
+    monkeypatch.setattr(forms, '_bootstrap',
+                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    decide.side_effect = [
+        {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        {'action': 'submit', 'selector': '#submit'},
+    ]
+    result = await forms.apply(posting('ashby'), COMPANY, {'Email': 'test@example-co.test'},
+                               'synthetic', pk=PK, resume_path='Resume.pdf')
+    assert result['status'] == 'gate', result
+    assert 'no click is safe' in result['question']
+    assert [c for c in raw.calls if c[0] == 'fill'] == [
+        ('fill', '#email', '--value', 'test@example-co.test')]
+    assert not [c for c in raw.calls if c[0] == 'click']
+
+    checked = pg.analyze('Synthetic engineering job. ' * 40)
+    tracked = {'pk': PK, 'status': 'tailored', 'company': COMPANY,
+               'jd_url': posting('ashby'), 'jd_text': checked['text'],
+               'posting_guard': checked['posting_guard']}
+    writes = []
+
+    class Tracking:
+        def get(self, pk):
+            assert pk == PK
+            return dict(tracked)
+
+        get_current = get
+
+        def update_posting_guard(self, pk, observed, inspected=None, *,
+                                 reviewed_generation=None, source_witness=False,
+                                 settle_refusal=False):
+            from core.storage.base import guard_observation_matches, guard_patch
+            if not guard_observation_matches(self.get(pk), observed):
+                return False
+            patch = guard_patch(self.get(pk), inspected,
+                                reviewed_generation=reviewed_generation,
+                                source_witness=source_witness, settle_refusal=settle_refusal)
+            if patch is None:
+                return False
+            tracked.update(patch)
+            return True
+
+        def set_status(self, pk, status, **kwargs):
+            writes.append(status)
+            tracked.update(status=getattr(status, 'value', status), **kwargs)
+
+    stores = SimpleNamespace(tracking=Tracking(), secrets=None,
+                             answer_bank=SimpleNamespace(all_facts=lambda company: {}))
+
+    async def forward(*args, **kwargs):
+        return deepcopy(result)
+
+    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **k: False)
+    monkeypatch.setattr(run, '_jd_meta', AsyncMock(return_value=checked))
+    monkeypatch.setattr(run, '_no_sponsorship', lambda *a, **k: False)
+    monkeypatch.setattr(run, 'get_settings', lambda: SimpleNamespace(browser_model='synthetic'))
+    monkeypatch.setattr(run, '_github_context', lambda: '')
+    monkeypatch.setattr(run, '_resume_pdf_path', lambda row: '/synthetic/resume.pdf')
+    monkeypatch.setattr(rotation, 'ensure', lambda *a, **k: None)
+    monkeypatch.setattr(profiles, 'resolve_for', lambda row: None)
+    monkeypatch.setattr(profiles, 'expand_all', lambda original: original)
+    monkeypatch.setattr(credentials, 'get_login', lambda *a: None)
+    monkeypatch.setattr(browser_runtime, 'configuration', lambda: {'engine': 'browser_skill'})
+    monkeypatch.setattr(browser_apply, 'apply', forward)
+    monkeypatch.setattr(events, 'emit', lambda kind, **kw: None)
+    consumed = await run._apply_direct(PK, stores)
+    assert consumed['result'] == 'gated' and consumed['question'] == result['question']
+    assert tracked['status'] == 'needs_human'
+    assert tracked['gate_pending']['question'] == result['question']

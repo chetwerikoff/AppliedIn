@@ -331,7 +331,12 @@ def guard_patch(current: dict, inspected: dict | None,
                 or current.get("status") not in ("tailored", "needs_human")
                 or current.get("gate_reason") == "submit_uncertain"):
             return None
-        return {"reviewed_guard_generation": reviewed_generation}
+        patch = {"reviewed_guard_generation": reviewed_generation}
+        # The refusal's failure marker answers exactly this review; left behind,
+        # it blocks requeue routes that require an empty fail_kind.
+        if current.get("fail_kind") == "posting_guard_review_required":
+            patch["fail_kind"] = ""
+        return patch
     if not isinstance(inspected, dict):
         return None
     cleaned, meta = inspected.get("text"), inspected.get("posting_guard")

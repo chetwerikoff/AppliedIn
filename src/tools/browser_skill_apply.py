@@ -6514,6 +6514,50 @@ def _protected_resume_snapshot(staged: str) -> str:
         raise Gate('Cannot protect a stable per-attempt PDF upload snapshot.') from exc
 
 
+def _upload_tree_member(page, selector) -> bool:
+    """Issue #232: the clicked control is the résumé input, its
+    dropzone, or a button inside the upload container, matched by selector
+    against the structural upload tree. Malformed trees are never members."""
+    try:
+        tree = _upload_tree(page)
+    except Gate:
+        return False
+    if not isinstance(selector, str) or not selector:
+        return False
+    nodes = tree['nodes']
+
+    def inside_container(i):
+        while i != -1:
+            if i == tree['container']:
+                return True
+            i = nodes[i]['parent']
+        return False
+
+    members = {nodes[tree['input']].get('target_selector'),
+               nodes[tree['dropzone']].get('target_selector')}
+    members.update(node.get('target_selector') for i, node in enumerate(nodes)
+                   if node.get('tag') == 'button' and inside_container(i))
+    return selector in members
+
+
+_LABEL_CLASSES = (
+    ('autofill', re.compile(r'auto-?fill', re.I)),
+    ('upload', re.compile(r'\bupload', re.I)),
+    ('attach', re.compile(r'\battach', re.I)),
+    ('submit', re.compile(r'\bsubmit\b', re.I)),
+    ('apply', re.compile(r'\bapply\b', re.I)),
+    ('next', re.compile(r'^\s*(?:next|continue)\b', re.I)),
+    ('yes', re.compile(r'^\s*yes\s*$', re.I)),
+    ('no', re.compile(r'^\s*no\s*$', re.I)),
+)
+
+
+def _label_class(target: dict) -> str:
+    # A fixed class name for logs; the employer's button text never leaves.
+    text = str(target.get('label') or '')
+    return next((name for name, rx in _LABEL_CLASSES if rx.search(text)), 'other')
+
+
 class ApplicationIPCController:
     """One application-owned verdict, separately protecting reversible writes."""
 
@@ -6980,13 +7024,16 @@ class ApplicationIPCController:
             except Gate:
                 identity_match = 'unavailable'
             _LOG.info('final pdf guard pk=%s attempted=%s completed=%s pending=%s '
-                      'identity_match=%s target=%s/%s submit_control=%s private=%s',
+                      'identity_match=%s target=%s/%s submit_control=%s private=%s '
+                      'upload_tree_member=%s label_class=%s',
                       self.pk, self.upload_attempted, self.upload_completed,
                       self.upload_pending, identity_match,
                       target.get('tag') if target.get('tag') in kinds else 'other',
                       target.get('type') if target.get('type') in kinds else 'other',
                       is_submission(target) or native_submit(target),
-                      self._private_content(page))
+                      self._private_content(page),
+                      _upload_tree_member(page, target.get('selector')),
+                      _label_class(target))
             raise
 
     async def authorize_final_submit(self, session, page: dict, target: dict) -> None:
@@ -7450,6 +7497,37 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'form_action', 'formaction', 'form_selector', 'in_form',
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
+                    if (verb == 'click' and isinstance(current, dict)
+                            and action.get('selector')
+                            and isinstance(session, _ReversibleEntryReader)
+                            and isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'
+                            and isinstance(_formless_root(page), dict)
+                            and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
+                            and page['entry']['upload_tree'].get('scope') == 'container'
+                            and _upload_tree_member(page, current.get('selector'))
+                            and not uploaded and not session.upload_attempted
+                            and (producer_guard is None or (
+                                not producer_guard.upload_attempted
+                                and not producer_guard.upload_completed))):
+                        # Issue #232: live, the model's first decision
+                        # clicked the résumé upload control. The page then held
+                        # values, so the producer took the click for Submit and
+                        # refused it for the missing PDF. That click is an upload
+                        # request: the one-shot recovery runs and it never clicks.
+                        result = await _reversible_recover_upload(
+                            session, page, provenance=provenance, allowed=allowed,
+                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        uploaded = True
+                        history.append(result)
+                        page = await session.page()
+                        step['url'] = page['url']
+                        if not allowed(page['url']):
+                            raise _navigation_gate(
+                                'Upload redirected to an unrelated job or tenant.',
+                                url, page.get('url'), provenance=provenance)
+                        continue
                     recovered_upload = False
                     # Production models also click the Submit control rather than
                     # choose submit; only the offline fixture converts that above.

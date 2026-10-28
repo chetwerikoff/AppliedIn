@@ -34,7 +34,6 @@ def _no_values(caplog, guard):
 @pytest.mark.parametrize(('selector', 'kind'), [
     ('#_systemfield_name', 'input/text'),
     ('#additional', 'textarea/textarea'),
-    ('#_systemfield_resume', 'input/file'),
 ])
 async def test_non_submit_first_click_reaches_pdf_guard_and_says_so(
         monkeypatch, tmp_path, caplog, selector, kind):
@@ -51,7 +50,8 @@ async def test_non_submit_first_click_reaches_pdf_guard_and_says_so(
     pk = transport._application_controller.pk
     assert _lines(caplog, 'final pdf guard') == [
         f'final pdf guard pk={pk} attempted=False completed=False pending=False '
-        f'identity_match=False target={kind} submit_control=False private=True']
+        f'identity_match=False target={kind} submit_control=False private=True '
+        f'upload_tree_member=False label_class=other']
     assert _lines(caplog, 'submit recovery skipped') == []
     _no_values(caplog, transport._application_controller)
     _no_production_commit(raw, transport, row)

@@ -7396,6 +7396,27 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'form_action', 'formaction', 'form_selector', 'in_form',
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
+                    recovered_upload = False
+                    if (verb == 'submit'
+                            and isinstance(session, _ReversibleEntryReader)
+                            and isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby' and _formless_root(page)
+                            and not uploaded and not session.upload_attempted
+                            and (producer_guard is None or (
+                                not producer_guard.upload_attempted
+                                and not producer_guard.upload_completed))):
+                        target = control(page, action, 'decision-submit')
+                        if not (is_submission(target) or native_submit(target)):
+                            raise Gate('Submit requires a current application-commit control.')
+                        result = await _reversible_recover_upload(
+                            session, page, provenance=provenance, allowed=allowed,
+                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        # The raw guard's separate proof and the independent
+                        # passive settlement both precede this local receipt.
+                        uploaded = True
+                        history.append(result)
+                        recovered_upload = True
                     if verb == 'gate':
                         # An unguarded producer cannot bind a controller question
                         # from untrusted model prose; keep the model gate unbound.
@@ -7417,6 +7438,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise Gate('The application has not been submitted; review the form.')
                     if verb == 'wait':
                         await asyncio.sleep(1)
+                    elif recovered_upload:
+                        # Submit1 recovery never enters the committing branch;
+                        # the common loop tail rechecks the actual page/route.
+                        pass
                     elif verb == 'navigate':
                         href = action.get('url', '')
                         if href not in {c.get('href') for c in page['controls']}:
@@ -7433,32 +7458,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
-                        if (isinstance(session, _ReversibleEntryReader)
-                                and isinstance(provenance, ApplicationEntryProvenance)
-                                and provenance.ats == 'ashby' and _formless_root(page)
-                                and not uploaded and not session.upload_attempted
-                                and (producer_guard is None or (
-                                    not producer_guard.upload_attempted
-                                    and not producer_guard.upload_completed))):
-                            result = await _reversible_recover_upload(
-                                session, page, provenance=provenance, allowed=allowed,
-                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
-                            uploaded = True
-                            history.append(result)
-                            page = await session.page()
-                            step['url'] = page['url']
-                            if not allowed(page['url']):
-                                raise _navigation_gate(
-                                    'Reversible recovery changed to an unrelated job or tenant.',
-                                    url, page.get('url'), provenance=provenance)
-
-                            # Submit1 is preparation, never a committing click.
-                            # Always re-enter the common fresh decision loop.
-                            continue
-                            target = control(page, action, 'decision-submit')
-                            if not (is_submission(target) or native_submit(target)):
-                                raise Gate('Submit changed after guarded résumé recovery.')
                         if isinstance(session, _ReversibleEntryReader):
                             await _reversible_retain_before_click(
                                 session, retained, provenance=provenance,

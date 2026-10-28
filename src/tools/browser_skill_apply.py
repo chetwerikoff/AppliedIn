@@ -3238,148 +3238,6 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
     return _upload_delta(before, comparison, filename)
 
 
-# Stable receiver coordinates and owner/linked submitted-value associations.
-# The changing user value, listbox option actors and wrapper-root "inside"
-# certificate are intentionally not permanent DOM-object identities.
-_RETENTION_STABLE_KEYS = (
-    'selector', 'id', 'tag', 'type', 'native_type', 'label', 'question',
-    'in_form', 'form_selector', 'form_action', 'formaction',
-    'native_form_owner_selector', 'form_action_attr_present', 'form_action_raw',
-    'formaction_attr_present', 'formaction_raw', 'href', 'submit',
-    'navigates', 'commits_application', 'required', 'disabled', 'readonly',
-    'inert', 'role', 'label_selector', 'associated', 'entry_label',
-    'field_entry', 'in_container', 'declared_owner', 'native_owner', 'dropzone',
-)
-_RETENTION_COMBO_LINK_KEYS = ('linked', 'link_id', 'hidden_selector')
-
-
-def _reversible_retained_certificate(page: dict, selector: str, *,
-                                     provenance, linked: bool = False,
-                                     file: bool = False) -> dict:
-    root = _formless_root(page)
-    evidence = (page.get('entry') or {}).get('root_evidence')
-    if (not isinstance(root, dict) or not isinstance(evidence, list)
-            or not isinstance(root.get('excluded'), list)
-            or any(not isinstance(x, str) for x in root['excluded'])
-            or selector in root['excluded']
-            or len({c.get('selector') for c in evidence if isinstance(c, dict)})
-                 != len(evidence)):
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    originals = [c for c in page['controls'] if c.get('selector') == selector]
-    members = [c for c in evidence if c.get('selector') == selector]
-    if (len(originals) != 1 or len(members) != 1
-            or members[0].get('unique') is not True
-            or members[0].get('in_container') is not True
-            or originals[0].get('disabled') or originals[0].get('inert')
-            or members[0].get('disabled') or members[0].get('inert')
-            or members[0].get('native_owner') or members[0].get('declared_owner')
-            or members[0].get('formaction') is not None):
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    original, member = originals[0], members[0]
-    if root.get('root'):
-        _formless_boundary(page, provenance)
-    elif root.get('error') in _REVERSIBLE_ROOT_ERRORS:
-        if not linked:
-            _reversible_entry_recipient(page, original, clipped_file=file)
-    else:
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    if linked and member.get('type') != 'hidden':
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    if file and (original.get('type') != 'file' or
-                 member.get('id') != '_systemfield_resume'):
-        raise Gate('Original semantic résumé input is no longer proven.')
-    def stable(control):
-        return tuple((key, repr(control.get(key))) for key in _RETENTION_STABLE_KEYS)
-    combo = original.get('combobox') or {}
-    return {
-        'identity': (stable(original), stable(member),
-                     tuple((k, repr(combo.get(k))) for k in _RETENTION_COMBO_LINK_KEYS),
-                     root.get('container'), root.get('submit')),
-        'value': (original.get('value'), original.get('has_value'),
-                  original.get('checked'), original.get('files'),
-                  combo.get('selected_value'), combo.get('displayed_text'),
-                  combo.get('hidden_value')),
-        'linked_selector': combo.get('hidden_selector') or '',
-    }
-
-
-async def _reversible_retained_pair(session: _ReversibleEntryReader, selectors: list[str],
-                                    *, provenance, allowed, filename: str = '',
-                                    file_selector: str = '',
-                                    original_tree: dict | None = None) -> dict:
-    """PAGE/fixed equality for every durable original and submitted-value link."""
-    page = await session.page()
-    answer = await session.call('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-    fixed = answer.get('value') if isinstance(answer, dict) else None
-    if not isinstance(fixed, dict):
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    if page.get('url') != fixed.get('url') or page.get('entry') != fixed.get('entry'):
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    for observed in (page, fixed):
-        _inventory_ok(observed, complete=False)
-        _entry_safety(observed, allowed, provenance)
-    results = []
-    for observed in (page, fixed):
-        certs = {}
-        for selector in dict.fromkeys([*selectors, *([file_selector] if file_selector else [])]):
-            cert = _reversible_retained_certificate(
-                observed, selector, provenance=provenance, file=selector == file_selector)
-            certs[selector] = cert
-            if cert['linked_selector']:
-                hidden = cert['linked_selector']
-                certs[hidden] = _reversible_retained_certificate(
-                    observed, hidden, provenance=provenance, linked=True)
-        if file_selector:
-            tree = _upload_tree(observed)
-            root = _formless_root(observed)
-            if (not isinstance(original_tree, dict)
-                    or tree['nodes'][tree['input']].get('target_selector') != file_selector
-                    or tree['nodes'][tree['dropzone']].get('target_selector') !=
-                       original_tree['nodes'][original_tree['dropzone']].get('target_selector')
-                    or tree.get('attached') is not True
-                    or tree.get('filename') != filename or len(tree.get('items', [])) != 1
-                    or certs[file_selector]['value'][3] != [filename]
-                    or (root.get('error') == 'application root sibling identity mismatch'
-                        and tree.get('scope') != 'container')
-                    or (root.get('root') and tree.get('scope') is not None)):
-                raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-        results.append(certs)
-    if results[0] != results[1]:
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    return results[0]
-
-
-async def _reversible_retain_before_click(session: _ReversibleEntryReader,
-                                          retained: dict, *, provenance,
-                                          allowed, filename: str = '') -> None:
-    if not retained and not session.upload_before:
-        return
-    original = session.upload_before
-    file_selector = ''
-    tree = None
-    if original is not None:
-        tree = _upload_tree(original)
-        file_selector = tree['nodes'][tree['input']]['target_selector']
-    try:
-        current = await _reversible_retained_pair(
-            session, [s for s in retained if s != file_selector],
-            provenance=provenance, allowed=allowed, filename=filename,
-            file_selector=file_selector, original_tree=tree)
-        for selector, expected in retained.items():
-            if selector not in current or current[selector] != expected:
-                raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-        if original is not None:
-            baseline = _reversible_retained_certificate(
-                original, file_selector, provenance=provenance, file=True)
-            if (file_selector not in current
-                    or current[file_selector]['identity'] != baseline['identity']):
-                raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    except Gate:
-        # The existing receiver-outside refusal is the final protection, not
-        # a new classifier or a model-derived commitment permission.
-        raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.') from None
-
-
 async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict,
                                      *, provenance, allowed, resume_path: str,
                                      ctx, raw_session, producer_guard,
@@ -7119,7 +6977,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
-    retained = {}
     uploaded = False
     session = None
     page = None
@@ -7455,10 +7312,44 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
-                        if isinstance(session, _ReversibleEntryReader):
-                            await _reversible_retain_before_click(
-                                session, retained, provenance=provenance,
-                                allowed=allowed, filename=Path(resume_path).name)
+                        if (isinstance(session, _ReversibleEntryReader)
+                                and session.upload_before is not None):
+                            # Only the original uploaded file is rechecked at
+                            # Submit; other controls keep their write-time and
+                            # pinned final-Submit guards, not per-step retention.
+                            baseline = session.upload_before
+                            baseline_tree = _upload_tree(baseline)
+                            file_selector = _upload_input(
+                                baseline, baseline_tree)['selector']
+                            filename = Path(resume_path).name
+                            current_file = await _reversible_upload_pair(
+                                session, allowed=allowed, provenance=provenance,
+                                selector=file_selector, empty=False, filename=filename)
+                            current_tree = _upload_tree(current_file)
+                            originals = [c for c in baseline['controls']
+                                         if c.get('selector') == file_selector]
+                            current = [c for c in current_file['controls']
+                                       if c.get('selector') == file_selector]
+                            file_keys = (
+                                'selector', 'id', 'tag', 'type', 'label', 'question',
+                                'in_form', 'form_selector', 'form_action', 'formaction',
+                                'native_form_owner_selector', 'required', 'disabled',
+                                'readonly', 'inert')
+                            if (len(originals) != 1 or len(current) != 1
+                                    or any(originals[0].get(key) != current[0].get(key)
+                                           for key in file_keys)
+                                    or _upload_candidates(baseline)[0] !=
+                                       _upload_candidates(current_file)[0]
+                                    or current_tree.get('attached') is not True
+                                    or current_tree.get('filename') != filename
+                                    or len(current_tree.get('items', [])) != 1
+                                    or current_tree['nodes'][current_tree['dropzone']].get(
+                                        'target_selector') != baseline_tree['nodes'][
+                                            baseline_tree['dropzone']].get('target_selector')
+                                    or any(_formless_root(baseline).get(key) !=
+                                           _formless_root(current_file).get(key)
+                                           for key in ('container', 'submit'))):
+                                raise Gate('Original semantic résumé input is no longer proven.')
                         if (ctx is None and (producer_guard is None or
                                 getattr(raw_session, '_application_controller', None) is not producer_guard)):
                             raise Gate('Application Submit lacks a bound raw IPC guard; no click is safe.')
@@ -7536,17 +7427,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     'step': context['step']}
                     else:
                         target = control(page, action, 'decision-action')
-                        retention_before = None
-                        if (isinstance(session, _ReversibleEntryReader)
-                                and verb in {'fill', 'select', 'choose', 'combobox'}):
-                            retention_before = await _reversible_retained_pair(
-                                session, [target['selector']], provenance=provenance,
-                                allowed=allowed)
                         if verb == 'click':
-                            if isinstance(session, _ReversibleEntryReader):
-                                await _reversible_retain_before_click(
-                                    session, retained, provenance=provenance,
-                                    allowed=allowed, filename=Path(resume_path).name)
                             # Reversible pre-private preparation need not borrow
                             # Submit authority. Once this click might commit,
                             # no unmediated Session may fall through to raw IPC.
@@ -7574,18 +7455,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if verb == 'click':
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))
-                        if (retention_before is not None
-                                and result.get('selector') == target['selector']):
-                            retention_after = await _reversible_retained_pair(
-                                session, [target['selector']], provenance=provenance,
-                                allowed=allowed)
-                            if (retention_before.keys() != retention_after.keys()
-                                    or any(retention_before[key]['identity'] !=
-                                           retention_after[key]['identity']
-                                           for key in retention_before)):
-                                raise Gate('receiver outside root or foreign native receiver; '
-                                           'native form receiver not proven.')
-                            retained.update(retention_after)
                         history.append(result)
                     page = await session.page()
                     step['url'] = page['url']

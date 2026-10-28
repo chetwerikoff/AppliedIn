@@ -277,12 +277,20 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    # Issue #218: a model upload on the reversible route now Gates before
-    # even its first chooser, regardless of an ambiguous-root variant.
-    assert 'no direct chooser is permitted' in result['question'], result
-    assert decide.await_count == 1
-    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
-    assert not transport._application_controller.upload_completed
+    # Unsafe ambiguous roots retain their structural refusal; other shapes
+    # exercise the guarded response to the model's upload decision.
+    expected_upload_result = (cause if cause == 'ambiguous application roots'
+                              else 'no direct chooser is permitted')
+    assert expected_upload_result in result['question'], result
+    assert decide.await_count == (2 if cause == 'ambiguous application roots' else 1)
+    if cause == 'ambiguous application roots':
+        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+            ('upload', file['selector'], '--file',
+             transport._application_controller.resume_path)]
+        assert transport._application_controller.upload_completed
+    else:
+        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
+        assert not transport._application_controller.upload_completed
     assert not transport._application_controller.committed
 
 
@@ -3474,6 +3482,12 @@ def _issue218_main_reader_scripts():
         ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
          "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
          "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
+        ("  const unsafeSibling=!!wrapper && siblings.some(n=>\n"
+         "    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));\n", ""),
+        ("    structuralError=unsafeSibling ?\n"
+         "      'application root sibling identity mismatch: unsafe sibling' :\n"
+         "      'application root sibling identity mismatch';",
+         "    structuralError='application root sibling identity mismatch';"),
     ]
     for updated, previous in changes:
         assert source.count(updated) == old.count(updated) == 1, updated[:80]

@@ -3172,7 +3172,17 @@ async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
     def file_snapshot(observation):
         controls = [c for c in observation['controls']
                     if c.get('selector') == selector]
-        return tuple(controls[0].get(key) for key in fields) if len(controls) == 1 else None
+        if len(controls) != 1:
+            return None
+        control = controls[0]
+        def equivalent(key):
+            value = control.get(key)
+            if key == 'question' and value is None:
+                return ''
+            if key in {'disabled', 'readonly', 'inert'} and value is None:
+                return False
+            return value
+        return tuple(equivalent(key) for key in fields)
     if file_snapshot(page) is None or file_snapshot(page) != file_snapshot(fixed):
         raise Gate('Upload PAGE/fixed original receiver disagreement.',
                    reason='defect_witness')
@@ -6570,7 +6580,9 @@ class ApplicationIPCController:
                 and navigation_allowed(url, provenance=proof))
 
     def _fresh_preparation(self, url: str) -> None:
-        if not (_job_preparation_route(url, self.url, pk=self.pk, company=self.company,
+        if not (_job_preparation_route(url, self.url,
+                                       provenance=self.entry_provenance,
+                                       pk=self.pk, company=self.company,
                                        fixture_context=self.fixture_context)
                 or self._verified_redirect_url(url)):
             raise Gate('The page is not a proven same-job preparation route.')
@@ -7269,6 +7281,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         raise _navigation_gate(
                             'Initial redirect is not proven to be the same employer job.',
                             url, page.get('url'), provenance=provenance)
+                model_upload_feedback = ''
+                model_upload_decisions = 0
                 for _ in range(100):
                     if submitted:
                         context = handoff(
@@ -7301,7 +7315,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 f'SERVER ACTION RECEIPTS: verified controls {verified}; '
                                 f'résumé attachment verified={uploaded}. '
                                 'Do not replay completed writes. The server rechecks actual '
-                                'values and attachment before submit.')
+                                'values and attachment before submit.' + model_upload_feedback)
                     # Decision-only choice data comes from a fresh independent PAGE witness.
                     choices = await _current_approved_choices(
                         session, page, pk, *trusted_origins, provenance=provenance,
@@ -7336,6 +7350,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 raise pending
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, model_history, model=model)
+                    model_upload_feedback = ''
                     verb = action.get('action')
                     if verb == 'click' and ctx is not None and action.get('selector'):
                         candidate = control(page, action, 'decision-initial')
@@ -7343,13 +7358,25 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             # The fixture's native Continue is a real Submit
                             # action, never the generic pre-private click path.
                             verb = 'submit'
-                    if (verb == 'upload' and isinstance(session, _ReversibleEntryReader)
-                            and isinstance(provenance, ApplicationEntryProvenance)
-                            and provenance.ats == 'ashby'):
-                        # Generic execute(upload) can prove a filename but not a
-                        # settled passive item on this fallback. Submit owns recovery.
-                        raise Gate('Reversible Ashby résumé upload requires guarded Submit recovery; '
-                                   'no direct chooser is permitted.')
+                    upload_container_mismatch = (
+                        isinstance(session, _ReversibleEntryReader)
+                        and isinstance(provenance, ApplicationEntryProvenance)
+                        and provenance.ats == 'ashby'
+                        and verb == 'upload'
+                        and isinstance(_formless_root(page), dict)
+                        and _formless_root(page).get('error') ==
+                            'application root sibling identity mismatch'
+                        and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
+                        and page['entry']['upload_tree'].get('scope') == 'container')
+                    if upload_container_mismatch:
+                        model_upload_decisions += 1
+                        if model_upload_decisions >= 3:
+                            raise Gate('Repeated model résumé upload decisions; the server-owned '
+                                       'upload did not run. Continue with the remaining fields.')
+                        model_upload_feedback = (
+                            '\nRésumé upload is server-owned on this page and runs before Submit; '
+                            'continue with the remaining fields.')
+                        continue
                     if action.get('selector'):
                         old = control(page, action, 'decision-initial')
                         page = await session.page()
@@ -7406,6 +7433,32 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
+                        if (isinstance(session, _ReversibleEntryReader)
+                                and isinstance(provenance, ApplicationEntryProvenance)
+                                and provenance.ats == 'ashby' and _formless_root(page)
+                                and not uploaded and not session.upload_attempted
+                                and (producer_guard is None or (
+                                    not producer_guard.upload_attempted
+                                    and not producer_guard.upload_completed))):
+                            result = await _reversible_recover_upload(
+                                session, page, provenance=provenance, allowed=allowed,
+                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                            uploaded = True
+                            history.append(result)
+                            page = await session.page()
+                            step['url'] = page['url']
+                            if not allowed(page['url']):
+                                raise _navigation_gate(
+                                    'Reversible recovery changed to an unrelated job or tenant.',
+                                    url, page.get('url'), provenance=provenance)
+
+                            # Submit1 is preparation, never a committing click.
+                            # Always re-enter the common fresh decision loop.
+                            continue
+                            target = control(page, action, 'decision-submit')
+                            if not (is_submission(target) or native_submit(target)):
+                                raise Gate('Submit changed after guarded résumé recovery.')
                         if isinstance(session, _ReversibleEntryReader):
                             await _reversible_retain_before_click(
                                 session, retained, provenance=provenance,
@@ -7450,22 +7503,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 **({'fixture_context': ctx} if ctx else {}))
                             if not result.get('uploaded'):
                                 raise Gate('The exact passive résumé attachment did not remain proven.')
-                            uploaded = True
-                            history.append(result)
-                        elif (isinstance(session, _ReversibleEntryReader)
-                              and isinstance(provenance, ApplicationEntryProvenance)
-                              and provenance.ats == 'ashby'
-                              and _formless_root(page) and not uploaded
-                              and not session.upload_attempted
-                              and (producer_guard is None or (
-                                  not producer_guard.upload_attempted
-                                  and not producer_guard.upload_completed))):
-                            result = await _reversible_recover_upload(
-                                session, page, provenance=provenance, allowed=allowed,
-                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
-                            # Receipt/history are local only after independent
-                            # settled passive attachment and exact _upload_delta.
                             uploaded = True
                             history.append(result)
                         else:

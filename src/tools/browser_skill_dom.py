@@ -377,6 +377,8 @@ _ASHBY_ROOT = r"""
       !n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));
   };
   const siblings=wrapper ? Array.from(wrapper.children) : [];
+  const unsafeSibling=!!wrapper && siblings.some(n=>
+    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
     container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
     panes.length===1 && panes[0].tagName==='DIV' && panes[0].parentElement===wrapper &&
@@ -392,7 +394,9 @@ _ASHBY_ROOT = r"""
     panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
     exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
     wrapper.children[0]===container && wrapper.children[1]===exactSubmit))
-    structuralError='application root sibling identity mismatch';
+    structuralError=unsafeSibling ?
+      'application root sibling identity mismatch: unsafe sibling' :
+      'application root sibling identity mismatch';
   const paneNodes=new Set();
   if (!forms.length) for (const p of panes) {
     paneNodes.add(p); p.querySelectorAll('*').forEach(n=>paneNodes.add(n));

@@ -463,18 +463,30 @@ def _admit_optional_owner_question(raw):
 
 
 def _script_recovery_decisions(monkeypatch, *, first='submit',
-                               on_submit=None, timeline=None):
+                               on_submit=None, timeline=None, after_upload='submit',
+                               upload_decisions=1, tasks=None):
     """Exercise the sealed two-fill IPC prefix before any missing-proof Submit."""
     seen = []
     actions = [
         {'action': 'fill', 'selector': '#_systemfield_name', 'fact': 'Name'},
         {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'},
-        ({'action': 'submit', 'selector': '#structural-submit'} if first == 'submit'
-         else {'action': 'upload', 'selector': '#_systemfield_resume'}),
-        ({'action': 'gate', 'question': 'Synthetic inspection without a second click'}
-         if first == 'submit'
-         else {'action': 'submit', 'selector': '#structural-submit'}),
     ]
+    if first == 'submit':
+        actions.extend([
+            {'action': 'submit', 'selector': '#structural-submit'},
+            {'action': 'gate', 'question': 'Synthetic inspection without a second click'},
+        ])
+    else:
+        actions.extend([
+            {'action': 'upload', 'selector': '#_systemfield_resume'}
+        ] * upload_decisions)
+        actions.append(
+            {'action': 'submit', 'selector': '#structural-submit'}
+            if after_upload == 'submit'
+            else {'action': 'gate', 'question': 'Synthetic next decision'})
+        if after_upload == 'submit':
+            actions.append({'action': 'gate', 'question':
+                            'Synthetic inspection without a second click'})
 
     async def decide(self, task, page, history, *, model):
         assert model == 'synthetic-fixture'
@@ -490,6 +502,8 @@ def _script_recovery_decisions(monkeypatch, *, first='submit',
                        for item in history)
         seen.append((action['action'], self.upload_ipc,
                      'résumé attachment verified=True' in task))
+        if tasks is not None:
+            tasks.append(task)
         if timeline is not None:
             timeline.append(f'decision{index}')
         self.decisions += 1
@@ -833,6 +847,8 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
+    # Recovery enters the production same-job check at the guarded IPC edge.
+    authority.row['jd_url'] = fixture.URL
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
@@ -860,21 +876,77 @@ async def test_reversible_direct_model_upload_is_refused_before_chooser(
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
+    authority.row['jd_url'] = fixture.URL
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
-    _admit_optional_owner_question(raw)
-    _script_recovery_decisions(monkeypatch, first='upload')
+    _seed_mismatch_synthetic_owner_grants(authority, raw)
+    tasks = []
+    _script_recovery_decisions(
+        monkeypatch, first='upload', after_upload='gate', tasks=tasks)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
+    assert 'Résumé upload is server-owned on this page and runs before Submit; continue with the remaining fields.' in tasks[3]
+    assert authority.fills == 2 and authority.upload_ipc == 0
+    assert not raw.uploads
+    assert authority.decisions == 4
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+
+
+@pytest.mark.parametrize('transport', ['effect', 'call'])
+async def test_repeated_model_upload_feedback_gates_only_after_three_decisions(
+        authority, monkeypatch, transport):
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    authority.row['jd_url'] = fixture.URL
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
+    raw = MismatchFixtureRaw(authority)
+    _seed_mismatch_synthetic_owner_grants(authority, raw)
+    tasks = []
+    _script_recovery_decisions(
+        monkeypatch, first='upload', upload_decisions=3, tasks=tasks)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert result['status'] == 'gate'
+    assert 'Repeated model résumé upload decisions' in result['question']
+    assert authority.decisions == 5 and len(tasks) == 5
+    assert authority.fills == 2 and authority.upload_ipc == 0
+    assert not raw.uploads
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+
+
+@pytest.mark.parametrize('transport', ['effect', 'call'])
+async def test_reversible_upload_feedback_then_submit_recovery_never_clicks_submit1(
+        authority, monkeypatch, transport):
+    """An earlier model upload request cannot make Submit1 commit after recovery."""
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    authority.row['jd_url'] = fixture.URL
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
+    raw = MismatchFixtureRaw(authority)
+    _seed_mismatch_synthetic_owner_grants(authority, raw)
+    _script_recovery_decisions(monkeypatch, first='upload', after_upload='submit')
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate', result
-    assert 'no direct chooser is permitted' in result['question']
-    assert authority.fills == 2 and authority.upload_ipc == 0
-    assert not raw.uploads
+    assert 'Synthetic inspection without a second click' in result['question']
+    assert authority.decisions == 5 and authority.fills == 2
+    assert authority.upload_ipc == 1 and authority.ipc_index == 3
+    assert len(raw.uploads) == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
-
+    assert authority.post_attempts == authority.post_count == 0
+    assert not any(call[0] == 'click' for call in raw.calls)
 
 @pytest.mark.parametrize('mutation', [
     'readonly', 'duplicate', 'retained', 'root', 'uploadtree', 'change-url',

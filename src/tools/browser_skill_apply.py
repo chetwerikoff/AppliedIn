@@ -2913,6 +2913,10 @@ class _ReversibleEntryReader:
 
     def __init__(self, raw):
         self.raw = raw
+        self.upload_attempted = False
+        self.upload_pending = False
+        self.upload_before = None
+        self._upload_edge = None
 
     def __getattr__(self, name):
         # The production application_effect/controller are still owned by
@@ -2926,9 +2930,25 @@ class _ReversibleEntryReader:
             raise Gate('Reversible preparation page observation is unavailable.')
         return page
 
+    async def application_effect(self, *args, **kwargs):
+        if args and args[0] == 'upload':
+            return await self._delegated_upload(*args, **kwargs)
+        return await _effect_call(self.raw, *args, **kwargs)
+
+    async def _delegated_upload(self, *args, **kwargs):
+        edge = self._upload_edge
+        if edge is None or self.upload_attempted:
+            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
+        # Consume the one-shot edge before any await. A failed fresh witness
+        # cannot be reused to obtain a second or weaker chooser authorization.
+        self._upload_edge = None
+        return await edge(args, kwargs)
+
     async def call(self, *args, **kwargs):
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+        if args and args[0] == 'upload':
+            return await self._delegated_upload(*args, **kwargs)
         return await self.raw.call(*args, **kwargs)
 
 
@@ -2951,7 +2971,8 @@ def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
 
 
 def _reversible_entry_recipient(page: dict, target: dict,
-                                witness: dict | None = None) -> None:
+                                witness: dict | None = None, *,
+                                clipped_file: bool = False) -> None:
     """Prove exact application membership using the independent ENTRY census."""
     root = _formless_root(page)
     entry = page.get('entry') or {}
@@ -3000,6 +3021,12 @@ def _reversible_entry_recipient(page: dict, target: dict,
                              and bool(target.get('question')))
     native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
                     or (entry_label and target.get('tag') == 'input'))
+    # The original native input is CSS-clipped while its independently visible
+    # linked dropzone is interactive. This exception belongs only to the exact
+    # recovery caller, never to general reversible field admission.
+    file_only = (clipped_file and e.get('id') == '_systemfield_resume'
+                 and e.get('type') == target.get('type') == 'file'
+                 and target.get('id') == '_systemfield_resume')
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3013,7 +3040,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
             ('evidence.disabled', e.get('disabled')),
             ('evidence.readonly', e.get('readonly')),
             ('evidence.inert', e.get('inert')),
-            ('evidence.visible', e.get('visible') is not True),
+            ('evidence.visible', e.get('visible') is not True and not file_only),
             ('tag.equal', e.get('tag') != target.get('tag')),
             ('type.equal', e.get('type') != target.get('type')),
             ('required.equal', not (custom or pair_member)
@@ -3040,7 +3067,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
                     predicate, target)
     if witness is not None:
         dom = witness.get(selector)
-        if (not isinstance(dom, dict) or dom.get('visible') is not True
+        if (not isinstance(dom, dict) or (dom.get('visible') is not True and not file_only)
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
                 or dom.get('inert') is not False

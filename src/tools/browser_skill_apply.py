@@ -3323,7 +3323,11 @@ async def _reversible_retained_pair(session: _ReversibleEntryReader, selectors: 
     fixed = answer.get('value') if isinstance(answer, dict) else None
     if not isinstance(fixed, dict):
         raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    if page.get('url') != fixed.get('url') or page.get('entry') != fixed.get('entry'):
+    # Compare the application root, then the exact retained receiver
+    # certificates below. Whole-entry equality would also bind unrelated
+    # optional inventory/upload metadata to every field-write operation.
+    if (page.get('url') != fixed.get('url')
+            or _formless_root(page) != _formless_root(fixed)):
         raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
     for observed in (page, fixed):
         _inventory_ok(observed, complete=False)

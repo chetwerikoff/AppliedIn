@@ -5437,10 +5437,37 @@ def _currently_granted(page: dict, item: dict, grants, pk: str, provenance,
         exact_approval(
             pk, key, prior['value'], target=_bound_target(page, item),
             url=page['url'], provenance=provenance,
+            witnessed_options=_granted_privacy_options(item, prior),
             **({'fixture_context': fixture_context} if fixture_context else {}))
     except Gate:
         return False
     return True
+
+
+_PRIVACY_AFFIRMATIVE = frozenset({
+    'agree', 'i agree', 'acknowledge', 'i acknowledge', 'confirm', 'i confirm'})
+
+
+def _granted_privacy_options(item: dict, grant: dict) -> list | None:
+    """Issue #223: bootstrap matched this grant against the opened, Escape-closed
+    listbox; re-reading the reclosed picker found no options and asked the owner
+    again. Only a standard privacy acknowledgement whose whole option list has
+    exactly one affirmative caption, the granted one, may defer that comparison
+    to the guarded write, which re-witnesses the real listbox before any click.
+    """
+    options = grant.get('options')
+    if (not _closed_material_combobox(item)
+            or _assent_scope(item) != 'standard_privacy'
+            or not isinstance(options, list) or not options
+            or any(not isinstance(o, dict) or not isinstance(o.get('label'), str)
+                   for o in options)
+            or len({_same_key(o['label']) for o in options}) != len(options)):
+        return None
+    affirmative = [o for o in options if _same_key(o['label']) in _PRIVACY_AFFIRMATIVE]
+    if (len(affirmative) != 1
+            or _same_key(affirmative[0]['label']) != _same_key(grant['value'])):
+        return None
+    return options
 
 
 def _rootless_skips(row: dict) -> bool:

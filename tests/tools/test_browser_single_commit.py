@@ -1110,3 +1110,416 @@ def test_both_raw_readers_scope_labelled_identity_to_application_root(reader, vi
     page = dom({'url': entry('ashby'), 'actionAttr': 'explicit'}, source)
     assert scoped_identity_conflict(page, '#application-form',
                                     'synthetic-job-42', 'example-co') == expected
+
+
+# Issue #223: a standard application-processing privacy acknowledgement rendered
+# as a closed input/combobox. The owner had already approved the exact option,
+# yet the run asked again. Bootstrap accepted the grant against the opened and
+# Escape-closed listbox, while the required-owner gate re-read the reclosed
+# picker, found no options to compare and treated the grant as missing.
+PRIVACY_URL = "http://127.0.0.1/fixture/example-co/jobs/1"
+PRIVACY_PK = "example-co#1"
+PRIVACY_QUESTION = ("I acknowledge the processing of my personal data "
+                    "for this application")
+PRIVACY_OPTIONS = [
+    {"selector": "#privacy-agree", "unique": True, "label": "I agree",
+     "value": "ACK", "selected": False, "safe": True},
+    {"selector": "#privacy-decline", "unique": True, "label": "I do not agree",
+     "value": "NOACK", "selected": False, "safe": True},
+]
+
+
+def _privacy_combobox(*, options=None, linked=True, caption="", value=""):
+    return {
+        "selector": "#privacy", "label": "Privacy notice",
+        "question": PRIVACY_QUESTION, "tag": "input", "type": "combobox",
+        "required": True, "disabled": False, "value": caption,
+        "has_value": bool(caption), "in_form": True,
+        "form_selector": "#application", "form_action": PRIVACY_URL,
+        "formaction": "", "submit": False, "checked": False, "name": "privacy",
+        "options": [], "combobox": {
+            "linked": linked, "link_id": "privacy-list" if linked else "",
+            "listbox_selector": "#privacy-list" if linked else "",
+            "options": __import__("copy").deepcopy(
+                PRIVACY_OPTIONS if options is None else options) if linked else [],
+            "selected_text": caption, "displayed_text": caption,
+            "selected_value": value, "hidden_selector": "#privacy-code",
+            "hidden_value": value,
+        },
+    }
+
+
+def _privacy_page(target):
+    hidden = (target["combobox"] or {}).get("hidden_value", "")
+    submit = {"selector": "#submit", "label": "Submit application",
+              "question": "", "tag": "button", "type": "submit",
+              "required": False, "disabled": False, "in_form": True,
+              "form_selector": "#application", "form_action": PRIVACY_URL,
+              "native_form_owner_selector": "#application", "formaction": "",
+              "submit": True, "checked": False, "name": "", "value": "",
+              "has_value": False, "options": [], "combobox": None}
+    receiver = {"selector": "#privacy-code", "label": "Response code",
+                "question": "", "tag": "input", "type": "hidden",
+                "required": False, "disabled": False, "value": hidden,
+                "has_value": bool(hidden), "in_form": True,
+                "form_selector": "#application", "form_action": PRIVACY_URL,
+                "formaction": "", "submit": False, "checked": False,
+                "name": "response_code", "options": []}
+    return {"url": PRIVACY_URL, "text": "Synthetic form",
+            "controls": [target, submit] + ([receiver] if target["combobox"] else []),
+            "inventory_verified": True, "truncated": False,
+            "opaque_controls": False, "shadow_roots": False,
+            "unsupported_frames": []}
+
+
+def _privacy_witness(current):
+    return {"url": current["url"], "controls": [
+        {"selector": c["selector"], "unique": True, "unique_form": True,
+         "tag": c["tag"], "type": c["type"], "in_form": c["in_form"],
+         "form_selector": c["form_selector"], "form_action": c["form_action"],
+         "native_form_owner_selector": c.get("native_form_owner_selector"),
+         "formaction": c["formaction"], "disabled": c["disabled"],
+         "readonly": False, "inert": False, "visible": True, "visible_text": "",
+         "options": __import__("copy").deepcopy(c["options"]),
+         "combobox": __import__("copy").deepcopy(c.get("combobox"))}
+        for c in current["controls"]]}
+
+
+def _privacy_grant(value="I agree", options=None):
+    options = PRIVACY_OPTIONS if options is None else options
+    return {"value": value, "selector": "#privacy", "url": PRIVACY_URL,
+            "label": "Privacy notice", "question": PRIVACY_QUESTION,
+            "tag": "input", "type": "combobox",
+            "form_selector": "#application", "form_action": PRIVACY_URL,
+            "options": [{k: o[k] for k in ("selector", "label", "value")}
+                        for o in options]}
+
+
+class _PrivacyPicker:
+    """Closed picker: click opens the exclusive listbox, Escape closes it,
+    and the affirmative option commits caption plus hidden machine value."""
+
+    def __init__(self, options=None, *, initial=None):
+        from copy import deepcopy
+        self.options = PRIVACY_OPTIONS if options is None else options
+        self.closed = _privacy_page(_privacy_combobox(linked=False))
+        self.opened = _privacy_page(_privacy_combobox(options=self.options))
+        self.current = deepcopy(initial or self.closed)
+        self.calls = []
+        self.controller = forms.ApplicationIPCController(
+            PRIVACY_PK, "example-co", PRIVACY_URL, "", {}, {}, [], {},
+            lambda: None)
+
+        async def raw_page(_session):
+            return await self.page()
+        self.controller._page = raw_page
+        self.controller._fresh_preparation = lambda _origin: None
+        self._application_controller = self.controller
+
+    async def page(self):
+        from copy import deepcopy
+        return deepcopy(self.current)
+
+    async def application_effect(self, *args):
+        await self.controller.before_ipc(self, args, {})
+        try:
+            result = await self.call(*args)
+        except Exception:
+            await self.controller.after_ipc(self, args, {}, succeeded=False)
+            raise
+        await self.controller.after_ipc(self, args, {}, succeeded=True)
+        return result
+
+    async def call(self, *args):
+        from copy import deepcopy
+        self.calls.append(args)
+        if args == ("evaluate", forms._FIXED_CONTROL_WITNESS):
+            return {"value": _privacy_witness(self.current)}
+        if args == ("click", "#privacy"):
+            self.current = deepcopy(self.opened)
+            return {}
+        if args == ("press", "Escape"):
+            self.current = deepcopy(self.closed)
+            return {}
+        if args[:2] == ("fill", "#privacy"):
+            return {}
+        if args[:3] == ("select", "#privacy", "--value"):
+            self.current = _privacy_page(_privacy_select(args[3]))
+            return {}
+        chosen = [o for o in self.options
+                  if args == ("click", o["selector"])]
+        if chosen:
+            self.current = _privacy_page(_privacy_combobox(
+                linked=False, caption=chosen[0]["label"],
+                value=chosen[0]["value"]))
+            return {}
+        pytest.fail(f"Unexpected browser IPC: {args}")
+
+
+def _privacy_row(monkeypatch, grants):
+    row = {"pk": PRIVACY_PK, "status": "submitting",
+           "human_approved_answers": grants}
+    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: row)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_granted_closed_privacy_combobox_is_not_asked_again(monkeypatch):
+    """AC1: closed -> witnessed open -> Escape -> exact grant -> guarded choice."""
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
+    session = _PrivacyPicker()
+    closed = await session.page()
+    assert forms._assent_scope(closed["controls"][0]) == "standard_privacy"
+    assert forms._closed_material_combobox(closed["controls"][0])
+    await forms._bootstrap(session, closed, PRIVACY_PK, {}, PRIVACY_URL)
+    assert [c for c in session.calls if c[0] != "evaluate"] == [
+        ("click", "#privacy"), ("press", "Escape")]
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is None
+    filled = {}
+    receipt = await forms.execute(
+        session, await session.page(),
+        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
+        facts={}, filled=filled, resume_path="", company="example-co",
+        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
+    assert ("click", "#privacy-agree") in session.calls
+    assert ("click", "#privacy-decline") not in session.calls
+    assert not any(c[:2] == ("click", "#submit") for c in session.calls)
+    assert receipt["committed_caption"] == "I agree"
+    assert receipt["committed_value"] == "ACK"
+    assert receipt["hidden_selector"] == "#privacy-code"
+    assert filled == {"#privacy": "I agree"}
+
+
+def _privacy_select(value=""):
+    options = [{"label": "Choose", "value": ""},
+               {"label": "I agree", "value": "ACK"},
+               {"label": "I do not agree", "value": "NOACK"}]
+    return {**_privacy_combobox(), "tag": "select", "type": "select",
+            "value": value, "has_value": bool(value), "options": options,
+            "combobox": None}
+
+
+def _post_action_page(caption="I agree", selected="ACK", hidden="ACK"):
+    """A separately simulated fresh PAGE after the option click. Its fields are
+    test data for the unchanged readback guards, not evidence of live reader
+    output."""
+    page = _privacy_page(_privacy_combobox(
+        linked=False, caption=caption, value=selected))
+    page["controls"][2].update(value=hidden, has_value=bool(hidden))
+    return page
+
+
+@pytest.mark.asyncio
+async def test_granted_privacy_combobox_receipt_is_not_value_proof(monkeypatch):
+    """AC5: receipt and intent first, then fresh PAGE through final readback."""
+    row = _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
+    session = _PrivacyPicker()
+    filled = {}
+    receipt = await forms.execute(
+        session, await session.page(),
+        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
+        facts={}, filled=filled, resume_path="", company="example-co",
+        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
+    assert receipt["selected_option"] == {
+        "selector": "#privacy-agree", "label": "I agree", "value": "ACK"}
+    assert receipt["hidden_value"] == "ACK"
+
+    fresh = _post_action_page()
+    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
+    forms.check_form(fresh, filled, True, receipts=[receipt])
+
+    for bad in (_post_action_page(caption="I do not agree"),
+                _post_action_page(selected="NOACK"),
+                _post_action_page(hidden="NOACK"),
+                _post_action_page(hidden="")):
+        with pytest.raises(forms.Gate):
+            forms.check_approvals(PRIVACY_PK, [receipt], bad)
+            forms.check_form(bad, filled, True, receipts=[receipt])
+    absent = _post_action_page()
+    del absent["controls"][2]
+    foreign = _post_action_page()
+    foreign["controls"][2].update(form_selector="#other-form",
+                                  form_action=PRIVACY_URL + "/other")
+    for bad in (absent, foreign):
+        with pytest.raises(forms.Gate):
+            forms.check_approvals(PRIVACY_PK, [receipt], bad)
+            forms.check_form(bad, filled, True, receipts=[receipt])
+    row["human_approved_answers"][PRIVACY_QUESTION]["value"] = "I do not agree"
+    with pytest.raises(forms.Gate):
+        forms.check_approvals(PRIVACY_PK, [receipt], fresh)
+
+
+@pytest.mark.asyncio
+async def test_granted_prelinked_privacy_combobox_needs_no_open(monkeypatch):
+    """AC1: a picker already exposing its exclusive listbox is not asked again."""
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
+    session = _PrivacyPicker()
+    session.current = session.opened
+    assert await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
+    filled = {}
+    receipt = await forms.execute(
+        session, await session.page(),
+        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
+        facts={}, filled=filled, resume_path="", company="example-co",
+        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
+    assert [c for c in session.calls if c[0] != "evaluate"] == [
+        ("click", "#privacy-agree")]
+    assert (receipt["committed_caption"], receipt["committed_value"]) == (
+        "I agree", "ACK")
+    fresh = _post_action_page()
+    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
+    forms.check_form(fresh, filled, True, receipts=[receipt])
+
+
+@pytest.mark.asyncio
+async def test_granted_native_privacy_select_maps_caption_to_value(monkeypatch):
+    """AC1: the native select writes the option's own machine value."""
+    target = _privacy_select()
+    grant = {**_privacy_grant(), "tag": "select", "type": "select",
+             "options": target["options"]}
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: grant})
+    session = _PrivacyPicker(initial=_privacy_page(target))
+    assert await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
+    filled = {}
+    receipt = await forms.execute(
+        session, await session.page(),
+        {"action": "select", "selector": "#privacy", "fact": PRIVACY_QUESTION,
+         "value": "ACK"},
+        facts={}, filled=filled, resume_path="", company="example-co",
+        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
+    assert ("select", "#privacy", "--value", "ACK") in session.calls
+    assert receipt["action"] == "select"
+    fresh = _privacy_page(_privacy_select("ACK"))
+    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
+    forms.check_form(fresh, filled, True, receipts=[receipt])
+    with pytest.raises(forms.Gate):
+        forms.check_form(_privacy_page(_privacy_select("NOACK")), filled, True,
+                         receipts=[receipt])
+
+
+AFFIRMATIVE_AND_NEGATIVE = [
+    {"selector": "#privacy-agree", "unique": True, "label": "I agree",
+     "value": "ACK", "selected": False, "safe": True},
+    {"selector": "#privacy-decline", "unique": True, "label": "Disagree",
+     "value": "NOACK", "selected": False, "safe": True},
+]
+
+
+def _two(first, second):
+    return [{**AFFIRMATIVE_AND_NEGATIVE[0], "label": first},
+            {**AFFIRMATIVE_AND_NEGATIVE[1], "label": second}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options,value", [
+    (_two("I agree", "Confirm"), "I agree"),
+    (_two("I agree", "I do not agree"), "I do not agree"),
+    (AFFIRMATIVE_AND_NEGATIVE, "Disagree"),
+    (_two("I agree to marketing", "No"), "I agree to marketing"),
+    (_two("I agree to third-party sharing", "No"),
+     "I agree to third-party sharing"),
+    (_two("I agree to arbitration", "No"), "I agree to arbitration"),
+    (_two("Yes", "No"), "Yes"),
+    (_two("Understood", "No"), "Understood"),
+])
+async def test_closed_privacy_combobox_outside_closed_caption_set_is_asked(
+        monkeypatch, options, value):
+    """AC2/AC4: only one whole affirmative caption, the granted one, continues.
+    A contained 'agree' token or a positive-looking word is not that caption."""
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant(value, options)})
+    session = _PrivacyPicker(options)
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is not None and pending.reason == "owner_question"
+    assert [c for c in session.calls if c[0] != "evaluate"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question", [
+    "I consent to processing of my personal data for this application "
+    "and for marketing",
+    "I acknowledge processing of my personal data for this application "
+    "and sharing with partners",
+    "I agree to arbitration of any claim about this application",
+    "I certify the information in this application is accurate",
+    "I acknowledge the privacy notice",
+])
+async def test_closed_combobox_beyond_standard_privacy_keeps_owner_routing(
+        monkeypatch, question):
+    """AC4: marketing, sharing, arbitration, attestation and ambiguous scope
+    never borrow the deferred comparison, even with an affirmative grant."""
+    session = _PrivacyPicker()
+    for page in (session.closed, session.opened, session.current):
+        page["controls"][0]["question"] = question
+    assert forms._assent_scope(session.closed["controls"][0]) != "standard_privacy"
+    _privacy_row(monkeypatch, {question: {**_privacy_grant(), "question": question}})
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is not None and pending.reason == "owner_question"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    "none", "url", "selector", "type", "form", "question", "options", "value",
+])
+async def test_closed_privacy_combobox_without_exact_grant_is_asked(
+        monkeypatch, change):
+    """AC4: the deferred comparison never replaces the exact per-control grant."""
+    grant = _privacy_grant()
+    if change == "url":
+        grant["url"] = PRIVACY_URL + "/other"
+    elif change == "selector":
+        grant["selector"] = "#other"
+    elif change == "type":
+        grant["type"] = "select"
+    elif change == "form":
+        grant["form_action"] = PRIVACY_URL + "/other"
+    elif change == "question":
+        grant["question"] = "Another question"
+    elif change == "options":
+        grant["options"] = grant["options"][:1]
+        grant["options"][0]["label"] = "I confirm"
+    elif change == "value":
+        grant["value"] = "I confirm"
+    _privacy_row(monkeypatch, {} if change == "none" else {PRIVACY_QUESTION: grant})
+    session = _PrivacyPicker()
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is not None and pending.reason == "owner_question"
+
+
+@pytest.mark.asyncio
+async def test_granted_closed_privacy_combobox_rechecks_listbox_before_click(
+        monkeypatch):
+    """AC3: the deferred comparison is bootstrap-only; the guarded write still
+    matches the grant to the real listbox and never clicks a changed option."""
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
+    changed = [{**PRIVACY_OPTIONS[0], "value": "OTHER"}, PRIVACY_OPTIONS[1]]
+    session = _PrivacyPicker(changed)
+    assert await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
+    with pytest.raises(forms.Gate):
+        await forms.execute(
+            session, await session.page(),
+            {"action": "combobox", "selector": "#privacy",
+             "fact": PRIVACY_QUESTION},
+            facts={}, filled={}, resume_path="", company="example-co",
+            jd_text="", resume_tex="", github="", pk=PRIVACY_PK,
+            job_url=PRIVACY_URL)
+    assert not any(c[0] == "click" and c[1] != "#privacy" for c in session.calls)
+
+
+def test_standard_privacy_checkbox_keeps_its_no_grant_path(monkeypatch):
+    """AC2: select/combobox never inherit the checkbox no-grant shortcut."""
+    _privacy_row(monkeypatch, {})
+    target = _privacy_combobox()
+    with pytest.raises(forms.Gate, match="human-approved answer"):
+        forms.exact_approval(PRIVACY_PK, PRIVACY_QUESTION, "I agree",
+                             target=target, url=PRIVACY_URL)
+    checkbox = _assent_target(PRIVACY_QUESTION)
+    forms.exact_approval(PRIVACY_PK, PRIVACY_QUESTION, "yes",
+                         target=checkbox, url="https://example.test/application")

@@ -6790,7 +6790,7 @@ class ApplicationIPCController:
              and target.get('native_type') in {'submit', 'image'})
                 or target.get('submit') is True or target.get('navigates') is True
                 or target.get('formaction') or target.get('commits_application')):
-            await self.authorize_final_submit(session, page, target)
+            await self._final_submit_with_evidence(session, page, target)
             self.committed = True
             self.mark_click_started()
             return
@@ -6883,7 +6883,7 @@ class ApplicationIPCController:
         if (known_submit or self._private_content(page)
                 or any(r.get('action') == 'choose' and r.get('type') == 'button'
                        for r in self.history)):
-            await self.authorize_final_submit(session, page, target)
+            await self._final_submit_with_evidence(session, page, target)
             self.committed = True
             self.mark_click_started()
             return
@@ -6909,6 +6909,33 @@ class ApplicationIPCController:
             # A failed or cancelled transport cannot prove a file attachment,
             # regardless of unchanged local bytes and prior upload history.
             self.upload_completed = succeeded
+
+    async def _final_submit_with_evidence(self, session, page: dict, target: dict) -> None:
+        # Issue #228: live resumed Ashby rows met the PDF refusal below with no
+        # upload in the run, and nothing recorded which click got there. The
+        # final guard stays byte-pinned, so its evidence is logged out here.
+        # Structure only: known names and booleans, never values.
+        try:
+            await self.authorize_final_submit(session, page, target)
+        except Gate as refusal:
+            if not str(refusal).startswith('This row’s protected tailored PDF has not been verified.'):
+                raise
+            kinds = {'input', 'button', 'textarea', 'select', 'a', 'div', 'span',
+                     'text', 'email', 'tel', 'url', 'number', 'date', 'file', 'submit',
+                     'image', 'radio', 'checkbox', 'combobox'}
+            try:
+                identity_match = self.upload_identity == self._row_pdf()
+            except Gate:
+                identity_match = 'unavailable'
+            _LOG.info('final pdf guard pk=%s attempted=%s completed=%s pending=%s '
+                      'identity_match=%s target=%s/%s submit_control=%s private=%s',
+                      self.pk, self.upload_attempted, self.upload_completed,
+                      self.upload_pending, identity_match,
+                      target.get('tag') if target.get('tag') in kinds else 'other',
+                      target.get('type') if target.get('type') in kinds else 'other',
+                      is_submission(target) or native_submit(target),
+                      self._private_content(page))
+            raise
 
     async def authorize_final_submit(self, session, page: dict, target: dict) -> None:
         """The ONE full authoritative pre-Submit decision at raw click IPC."""
@@ -7374,6 +7401,21 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         uploaded = True
                         history.append(result)
                         recovered_upload = True
+                    elif verb == 'submit' or submit_click:
+                        # Issue #228: a live Submit reached the PDF guard with no
+                        # recovery line. Name the first false term, never a value.
+                        skipped = next((name for name, held in (
+                            ('reversible_session', lambda: isinstance(session, _ReversibleEntryReader)),
+                            ('ashby_entry', lambda: isinstance(provenance, ApplicationEntryProvenance)
+                                and provenance.ats == 'ashby'),
+                            ('formless_root', lambda: bool(_formless_root(page))),
+                            ('not_uploaded', lambda: not uploaded),
+                            ('session_upload_not_attempted', lambda: not session.upload_attempted),
+                            ('producer_upload_not_attempted', lambda: producer_guard is None
+                                or not producer_guard.upload_attempted),
+                            ('producer_upload_not_completed', lambda: producer_guard is None
+                                or not producer_guard.upload_completed)) if not held()), 'none')
+                        _LOG.info('submit recovery skipped pk=%s term=%s', pk, skipped)
                     if verb == 'gate':
                         # An unguarded producer cannot bind a controller question
                         # from untrusted model prose; keep the model gate unbound.

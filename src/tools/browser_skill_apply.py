@@ -3289,17 +3289,7 @@ def _reversible_retained_certificate(page: dict, selector: str, *,
                  member.get('id') != '_systemfield_resume'):
         raise Gate('Original semantic résumé input is no longer proven.')
     def stable(control):
-        # The independent PAGE/fixed readers may represent absent optional
-        # flags as None versus False and an unnamed question as None versus
-        # ''. Those are identical receiver semantics, not owner drift.
-        def equivalent(key):
-            value = control.get(key)
-            if key == 'question' and value is None:
-                return ''
-            if key in {'disabled', 'readonly', 'inert'} and value is None:
-                return False
-            return value
-        return tuple((key, repr(equivalent(key))) for key in _RETENTION_STABLE_KEYS)
+        return tuple((key, repr(control.get(key))) for key in _RETENTION_STABLE_KEYS)
     combo = original.get('combobox') or {}
     return {
         'identity': (stable(original), stable(member),
@@ -3323,11 +3313,7 @@ async def _reversible_retained_pair(session: _ReversibleEntryReader, selectors: 
     fixed = answer.get('value') if isinstance(answer, dict) else None
     if not isinstance(fixed, dict):
         raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-    # Compare the application root, then the exact retained receiver
-    # certificates below. Whole-entry equality would also bind unrelated
-    # optional inventory/upload metadata to every field-write operation.
-    if (page.get('url') != fixed.get('url')
-            or _formless_root(page) != _formless_root(fixed)):
+    if page.get('url') != fixed.get('url') or page.get('entry') != fixed.get('entry'):
         raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
     for observed in (page, fixed):
         _inventory_ok(observed, complete=False)

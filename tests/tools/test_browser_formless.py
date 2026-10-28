@@ -3478,7 +3478,7 @@ def _issue218_main_reader_scripts():
         assert source.count(updated) == old.count(updated) == 1, updated[:80]
         source = source.replace(updated, previous, 1)
         old = old.replace(updated, previous, 1)
-    git_blob = b'blob ' + str(len(source.encode())).encode() + b'\\0' + source.encode()
+    git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
     assert hashlib.sha1(git_blob).hexdigest() == 'c06c4900a89919bc410289cffaffb46958370e1c'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1

@@ -3289,7 +3289,17 @@ def _reversible_retained_certificate(page: dict, selector: str, *,
                  member.get('id') != '_systemfield_resume'):
         raise Gate('Original semantic résumé input is no longer proven.')
     def stable(control):
-        return tuple((key, repr(control.get(key))) for key in _RETENTION_STABLE_KEYS)
+        # The independent PAGE/fixed readers may represent absent optional
+        # flags as None versus False and an unnamed question as None versus
+        # ''. Those are identical receiver semantics, not owner drift.
+        def equivalent(key):
+            value = control.get(key)
+            if key == 'question' and value is None:
+                return ''
+            if key in {'disabled', 'readonly', 'inert'} and value is None:
+                return False
+            return value
+        return tuple((key, repr(equivalent(key))) for key in _RETENTION_STABLE_KEYS)
     combo = original.get('combobox') or {}
     return {
         'identity': (stable(original), stable(member),
@@ -7405,8 +7415,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             and (producer_guard is None or (
                                 not producer_guard.upload_attempted
                                 and not producer_guard.upload_completed))):
-                        target = control(page, action, 'decision-submit')
-                        if not (is_submission(target) or native_submit(target)):
+                        # Reuse the independently refreshed current selector
+                        # certificate, rather than creating a 22nd resolver site.
+                        target = current if action.get('selector') else None
+                        if not isinstance(target, dict) or not (
+                                is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
                         result = await _reversible_recover_upload(
                             session, page, provenance=provenance, allowed=allowed,

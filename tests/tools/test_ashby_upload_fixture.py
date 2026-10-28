@@ -803,6 +803,30 @@ def _bind_mismatch_fixture_producer(authority, monkeypatch, *, transport='effect
     monkeypatch.setattr(fixture._SyntheticRun, 'facade', closed_with_controller)
 
 
+def _seed_mismatch_synthetic_owner_grants(authority, raw):
+    """Offline owner-approved facts bind to their exact original PAGE receivers.
+
+    The unrequested optional textarea is already valued before this scenario;
+    the mismatch route otherwise correctly asks its owner before model planning.
+    No production grant/approval guard is patched or bypassed here.
+    """
+    for page in (raw.current, raw.fixed):
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#additional':
+                c['value'] = 'Synthetic supplied context'
+                c['has_value'] = True
+    for key, selector in [('Name', '#_systemfield_name'),
+                          ('Email', '#_systemfield_email')]:
+        original = next(c for c in raw.current['controls'] if c['selector'] == selector)
+        target = forms._bound_target(raw.current, original)
+        grant = {field: target.get(field) for field in
+                 ('selector', 'label', 'question', 'tag', 'type',
+                  'form_selector', 'form_action')}
+        grant.update(value=fixture._FACTS[key], url=fixture.URL)
+        assert grant['label'] == key
+        authority.row['human_approved_answers'][key] = grant
+
+
 @pytest.mark.parametrize('transport', ['effect', 'call'])
 async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate(
         authority, monkeypatch, transport):
@@ -812,7 +836,7 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
-    _admit_optional_owner_question(raw)
+    _seed_mismatch_synthetic_owner_grants(authority, raw)
     _script_recovery_decisions(monkeypatch)
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(

@@ -3208,6 +3208,93 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
     return _upload_delta(before, comparison, filename)
 
 
+async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict,
+                                     *, provenance, allowed, resume_path: str,
+                                     ctx, raw_session, producer_guard,
+                                     verify_dispatch) -> dict:
+    """Submit-decision recovery owns one file effect, never the Submit click."""
+    if (not isinstance(provenance, ApplicationEntryProvenance)
+            or provenance.ats != 'ashby' or session.upload_attempted
+            or session._upload_edge is not None):
+        raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
+    if ctx is None:
+        if (session.raw is not raw_session or producer_guard is None
+                or getattr(raw_session, '_application_controller', None) is not producer_guard
+                or producer_guard.upload_attempted or producer_guard.upload_completed):
+            raise Gate('Application producer did not retain its raw IPC guard; no upload is safe.')
+    else:
+        # Test-only: the original sealed _Closed facade remains the only
+        # forwarding delegate. Its exact IPC/PDF/one-shot restrictions are
+        # neither widened nor reimplemented by the proxy/controller binding.
+        proxy = session.raw
+        controller = getattr(proxy, '_application_controller', None)
+        sealed = getattr(proxy, '_sealed_delegate', None)
+        if (not isinstance(controller, ApplicationIPCController)
+                or controller.fixture_context is not ctx
+                or controller.upload_attempted or controller.upload_completed
+                or sealed is None or not hasattr(sealed, '_closed_admissions')
+                or not callable(getattr(sealed, 'call', None))
+                or getattr(proxy, '_original_raw', None) is not raw_session):
+            raise Gate('The reversible synthetic closed facade/controller binding is unavailable.')
+    verify_dispatch()
+    selector = next((c['selector'] for c in page['controls']
+                     if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
+                     and re.search(r'resume|résumé|cv', label(c), re.I)), '')
+    if not selector or sum(c.get('type') == 'file' and
+                           re.search(r'resume|résumé|cv', label(c), re.I) is not None
+                           for c in page['controls']) != 1:
+        raise Gate('missing unique labelled resume receiver; inspect manually.')
+    before = await _reversible_upload_pair(
+        session, allowed=allowed, provenance=provenance, selector=selector, empty=True)
+    baseline_tree = _upload_tree(before)
+    filename = Path(resume_path).name
+
+    async def upload_edge(args: tuple, kwargs: dict):
+        verify_dispatch()
+        if (args != ('upload', selector, '--file', resume_path)
+                or kwargs != {'timeout': 130}):
+            raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
+        fresh = await _reversible_upload_pair(
+            session, allowed=allowed, provenance=provenance, selector=selector, empty=True)
+        if (_root_identity(fresh) != _root_identity(before)
+                or _upload_shape(_upload_tree(fresh)) != _upload_shape(baseline_tree)
+                or _upload_candidates(fresh) != _upload_candidates(before)):
+            raise Gate('The original empty résumé input changed before upload.')
+        if ctx is None:
+            # Neither the raw producer's native-input tuple nor a synthetic
+            # facade demonstrates BrowserSkill's chooser on a CSS-clipped input.
+            # No translation to the independently witnessed dropzone is allowed.
+            raise Gate('BrowserSkill clipped native-input upload chooser is unproven; '
+                       'complete the attachment manually. No chooser attempted.')
+        session.upload_before = fresh
+        session.upload_attempted = session.upload_pending = True
+        return await _effect_call(session.raw, *args, **kwargs)
+
+    session._upload_edge = upload_edge
+    try:
+        # Both application_effect (production) and call (closed offline
+        # fixture) enter the same one-shot effect-adjacent guard.
+        await _effect_call(session, 'upload', selector, '--file', resume_path, timeout=130)
+    finally:
+        session._upload_edge = None
+    if not session.upload_attempted or session.upload_before is None:
+        raise Gate('The guarded résumé upload did not reach its effect boundary.')
+    try:
+        deadline = _upload_clock() + 8.0
+        async with asyncio.timeout(8.0):
+            while _upload_clock() < deadline:
+                after = await _reversible_upload_pair(
+                    session, allowed=allowed, provenance=provenance,
+                    selector=selector, empty=False, filename=filename)
+                if _reversible_upload_settled(session.upload_before, after, filename):
+                    return {'action': 'upload', 'label': 'Resume',
+                            'uploaded': True}
+                await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
+        raise TimeoutError
+    finally:
+        session.upload_pending = False
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')

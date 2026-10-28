@@ -3094,7 +3094,7 @@ def _reversible_entry_scope(page: dict, witness: dict) -> frozenset[str]:
 
 
 def _reversible_upload_structure(page: dict, selector: str, *, empty: bool,
-                                 filename: str = '') -> dict:
+                                 filename: str = '', prior: str = '') -> dict:
     """Reversible upload proof uses the same complete tree as both real readers.
 
     The old ordered-root route never accepts a container scope. This exceptional
@@ -3133,20 +3133,50 @@ def _reversible_upload_structure(page: dict, selector: str, *, empty: bool,
             or drop_selector == selector or len(drops) != 1
             or drop_selector in root['excluded']):
         raise Gate('The unique same-container upload dropzone is not proven.')
-    if empty and (candidates[0].get('files') != [] or original.get('files') != []
-                  or tree.get('items') != [] or tree.get('attached') is not False
-                  or tree.get('filename') not in (None, '')):
-        raise Gate('The original empty résumé input changed before upload.')
-    if (not empty and (original.get('files') not in ([], [filename])
-                       or candidates[0].get('files') != original.get('files')
-                       or tree.get('filename') not in (None, '', filename))):
+    if empty and prior:
+        # A resumed run can find an earlier run's attachment. It is neither
+        # current-run proof nor permission to replace an arbitrary file: both
+        # readers must see exactly one passive, excluded, differently named PDF.
+        if (prior == filename
+                or not re.fullmatch(r'[^/\\\x00-\x1f]{1,200}\.pdf', prior, re.I)
+                or candidates[0].get('files') != [prior]
+                or original.get('files') != [prior]
+                or tree.get('attached') is not True
+                or tree.get('filename') != prior
+                or not isinstance(tree.get('items'), list)
+                or len(tree['items']) != 1
+                or type(tree.get('delete')) is not int
+                or not root['excluded']):
+            raise Gate('The retained résumé has no exact original attachment proof.')
+    elif empty:
+        if (candidates[0].get('files') != [] or original.get('files') != []
+                or tree.get('items') != [] or tree.get('attached') is not False
+                or tree.get('filename') not in (None, '')):
+            raise Gate('The original empty résumé input changed before upload.')
+    elif prior:
+        # The old item can remain while the chooser settles. These states are
+        # tolerated only as intermediates; settlement alone decides success.
+        files = original.get('files')
+        items = tree.get('items')
+        if (files not in ([], [prior], [filename])
+                or candidates[0].get('files') != files
+                or not isinstance(items, list) or len(items) > 1
+                or type(tree.get('attached')) is not bool
+                or (tree['attached'] and not (
+                    tree.get('filename') == prior
+                    or (tree.get('filename') == filename and files == [filename])))
+                or (not tree['attached'] and tree.get('filename') not in (None, ''))):
+            raise Gate('The original résumé input changed unexpectedly during upload.')
+    elif (original.get('files') not in ([], [filename])
+          or candidates[0].get('files') != original.get('files')
+          or tree.get('filename') not in (None, '', filename)):
         raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
     return tree
 
 
 async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
                                   provenance, selector: str, empty: bool,
-                                  filename: str = '') -> dict:
+                                  filename: str = '', prior: str = '') -> dict:
     """Two fresh real reader observations; never substitute a fixture tree."""
     page = await session.page()
     response = await session.call('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
@@ -3158,7 +3188,7 @@ async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
         _inventory_ok(observation, complete=False)
         _entry_safety(observation, allowed, provenance)
         _reversible_upload_structure(observation, selector, empty=empty,
-                                     filename=filename)
+                                     filename=filename, prior=prior)
     if (page.get('url') != fixed.get('url')
             or page.get('entry') != fixed.get('entry')):
         raise Gate('Upload PAGE/fixed structural witness disagreement.',
@@ -3189,7 +3219,8 @@ async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
     return page
 
 
-def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool:
+def _reversible_upload_settled(before: dict, after: dict, filename: str,
+                               *, prior: str = '') -> bool:
     """Preserve the ordered _upload_delta guard, accounting for ARCH08:38.
 
     Only a proven passive attached delete can enlarge root.excluded. Remove
@@ -3201,6 +3232,8 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
     if (not isinstance(pre_root, dict) or not isinstance(post_root, dict)
             or tree.get('scope') != 'container'):
         raise Gate('Original application root or submit changed during upload.')
+    if prior and (tree.get('attached') is not True or tree.get('filename') != filename):
+        return False
     comparison = after
     if tree.get('attached') is True:
         index = tree.get('delete')
@@ -3213,9 +3246,14 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
         # the masked tree node as an actionable CSS selector.
         exclusions = pre_root.get('excluded')
         post_exclusions = post_root.get('excluded')
+        # A retained item already owns the last exclusion; its replacement
+        # may take that slot, but nothing else may enter or leave.
         if (not isinstance(exclusions, list) or not isinstance(post_exclusions, list)
-                or len(post_exclusions) != len(exclusions) + 1
-                or post_exclusions[:-1] != exclusions):
+                or (prior and (not exclusions
+                               or len(post_exclusions) != len(exclusions)
+                               or post_exclusions[:-1] != exclusions[:-1]))
+                or (not prior and (len(post_exclusions) != len(exclusions) + 1
+                                   or post_exclusions[:-1] != exclusions))):
             raise Gate('The attached-file passive delete is not excluded.')
         delete_selector = post_exclusions[-1]
         mask = nodes[index].get('selector')
@@ -3235,6 +3273,29 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
         from copy import deepcopy
         comparison = deepcopy(after)
         comparison['entry']['formless']['excluded'] = list(exclusions)
+        if prior:
+            # _upload_delta requires an item-free baseline. Prove instead that
+            # exactly the one retained item was replaced by the staged PDF and
+            # that the root, receivers and all other controls stayed put.
+            old_tree = _upload_tree(before)
+            before_id, after_id = _root_identity(before), _root_identity(after)
+            if (prior == filename or before['url'] != after['url']
+                    or before_id is None or after_id is None
+                    or before_id[0] != after_id[0] or before_id[2] != after_id[2]
+                    or old_tree.get('attached') is not True
+                    or old_tree.get('filename') != prior
+                    or len(old_tree.get('items', [])) != 1
+                    or len(tree.get('items', [])) != 1
+                    or _upload_input(before, old_tree).get('files') != [prior]
+                    or _upload_input(after, tree).get('files') != [filename]
+                    or _upload_candidates(before) != _upload_candidates(after)
+                    or _upload_shape(old_tree, old_tree['items']) !=
+                       _upload_shape(tree, tree['items'])
+                    or any(old_tree['nodes'][old_tree[key]].get('target_selector') !=
+                           tree['nodes'][tree[key]].get('target_selector')
+                           for key in ('input', 'dropzone'))):
+                raise Gate('The retained résumé was not safely replaced by the staged PDF.')
+            return True
     return _upload_delta(before, comparison, filename)
 
 
@@ -3245,12 +3306,14 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
     """Submit-decision recovery owns one file effect, never the Submit click."""
     if (not isinstance(provenance, ApplicationEntryProvenance)
             or provenance.ats != 'ashby' or session.upload_attempted
-            or session._upload_edge is not None):
+            or session.upload_pending or session._upload_edge is not None):
         raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
     if ctx is None:
         if (session.raw is not raw_session or producer_guard is None
                 or getattr(raw_session, '_application_controller', None) is not producer_guard
-                or producer_guard.upload_attempted or producer_guard.upload_completed):
+                or producer_guard.upload_attempted or producer_guard.upload_completed
+                or producer_guard.upload_pending
+                or producer_guard.upload_identity is not None):
             raise Gate('Application producer did not retain its raw IPC guard; no upload is safe.')
     else:
         # Test-only: the original sealed _Closed facade remains the only
@@ -3262,6 +3325,7 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
         if (not isinstance(controller, ApplicationIPCController)
                 or controller.fixture_context is not ctx
                 or controller.upload_attempted or controller.upload_completed
+                or controller.upload_pending or controller.upload_identity is not None
                 or sealed is None or type(sealed).__name__ != '_Closed'
                 or getattr(type(sealed), '__slots__', ()) != ('_closed_admissions',)
                 or not callable(getattr(sealed, 'call', None))
@@ -3275,10 +3339,21 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
                            re.search(r'resume|résumé|cv', label(c), re.I) is not None
                            for c in page['controls']) != 1:
         raise Gate('missing unique labelled resume receiver; inspect manually.')
-    before = await _reversible_upload_pair(
-        session, allowed=allowed, provenance=provenance, selector=selector, empty=True)
-    baseline_tree = _upload_tree(before)
     filename = Path(resume_path).name
+    # Only a single retained basename is a candidate; the paired readers
+    # below decide whether it is an exact, passive, replaceable attachment.
+    observed = [c.get('files') for c in page['controls'] if c.get('selector') == selector]
+    prior = (observed[0][0] if len(observed) == 1 and isinstance(observed[0], list)
+             and len(observed[0]) == 1 and isinstance(observed[0][0], str) else '')
+    if prior and prior == filename:
+        # The staged name is deterministic, so an identical retained name
+        # cannot be told apart from this run's upload after the chooser.
+        raise Gate('The retained résumé has the staged filename; a new upload cannot be proven.')
+    before = await _reversible_upload_pair(
+        session, allowed=allowed, provenance=provenance, selector=selector,
+        empty=True, filename=filename, prior=prior)
+    baseline_tree = _upload_tree(before)
+    raw_guard = producer_guard if ctx is None else controller
 
     async def upload_edge(args: tuple, kwargs: dict):
         verify_dispatch()
@@ -3286,11 +3361,16 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
                 or kwargs != {'timeout': 130}):
             raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
         fresh = await _reversible_upload_pair(
-            session, allowed=allowed, provenance=provenance, selector=selector, empty=True)
+            session, allowed=allowed, provenance=provenance, selector=selector,
+            empty=True, filename=filename, prior=prior)
+        earlier = next(c for c in before['controls'] if c.get('selector') == selector)
+        current = next(c for c in fresh['controls'] if c.get('selector') == selector)
         if (_root_identity(fresh) != _root_identity(before)
                 or _upload_shape(_upload_tree(fresh)) != _upload_shape(baseline_tree)
-                or _upload_candidates(fresh) != _upload_candidates(before)):
-            raise Gate('The original empty résumé input changed before upload.')
+                or _upload_candidates(fresh) != _upload_candidates(before)
+                or any(earlier.get(key) != current.get(key) for key in ('files', 'value'))):
+            raise Gate('The original résumé input changed before upload.' if prior
+                       else 'The original empty résumé input changed before upload.')
         session.upload_before = fresh
         session.upload_attempted = session.upload_pending = True
         return await _effect_call(session.raw, *args, **kwargs)
@@ -3310,8 +3390,15 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
             while _upload_clock() < deadline:
                 after = await _reversible_upload_pair(
                     session, allowed=allowed, provenance=provenance,
-                    selector=selector, empty=False, filename=filename)
-                if _reversible_upload_settled(session.upload_before, after, filename):
+                    selector=selector, empty=False, filename=filename, prior=prior)
+                if _reversible_upload_settled(
+                        session.upload_before, after, filename, prior=prior):
+                    # Passive UI settlement is not the producer's PDF proof;
+                    # a visible attachment alone never becomes a receipt.
+                    if (not raw_guard.upload_attempted or raw_guard.upload_pending
+                            or not raw_guard.upload_completed
+                            or raw_guard.upload_identity != raw_guard._row_pdf()):
+                        raise Gate('The current-run protected PDF upload is not proven.')
                     return {'action': 'upload', 'label': 'Resume',
                             'uploaded': True}
                 await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))

@@ -998,3 +998,318 @@ async def test_reversible_upload_delta_rejects_unexcluded_attached_delete(
     after['entry']['formless']['excluded'].pop()
     with pytest.raises(forms.Gate, match='attached-file passive delete'):
         forms._reversible_upload_settled(before, after, filename)
+
+
+PRIOR_RUN_PDF = 'Earlier Synthetic Resume.pdf'
+
+
+def _resumed_reversible_raw(authority, *, prior=None):
+    """A resumed reversible form: every other field was filled before this run.
+
+    With prior, the real readers also see a passive attachment that an earlier
+    run left behind. Neither the filename nor the attachment is current-run
+    proof; only the guarded chooser below may produce that.
+    """
+    raw = MismatchFixtureRaw(authority)
+    if prior:
+        raw.current, raw.fixed = mismatch_snapshot(authority, changes={
+            'attached': True, 'files': [prior], 'displayName': prior})
+    _seed_mismatch_synthetic_owner_grants(authority, raw)
+    for page in (raw.current, raw.fixed):
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#_systemfield_name':
+                c.update(value=fixture._FACTS['Name'], has_value=True)
+            elif c['selector'] == '#_systemfield_email':
+                c.update(value=fixture._FACTS['Email'], has_value=True)
+    return raw
+
+
+async def _resumed_submit_first(authority, monkeypatch, *, raw=None, prior=None,
+                                transport='effect', actions=None, prepare=None,
+                                on_first_decision=None):
+    """Decision zero is Submit: no fill, no model upload precedes it."""
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    authority.row['jd_url'] = fixture.URL
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
+    # The sealed effect sequence is only the native résumé chooser: a
+    # prefilled form has nothing for this run to fill.
+    monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', lambda self: (
+        ('upload', '#_systemfield_resume', '--file', self.resume_path),))
+    controllers = []
+    bound = fixture._SyntheticRun.facade
+
+    def observed_facade(self, inner):
+        proxy = bound(self, inner)
+        controllers.append(proxy._application_controller)
+        if prepare:
+            prepare(proxy._application_controller)
+        return proxy
+
+    monkeypatch.setattr(fixture._SyntheticRun, 'facade', observed_facade)
+    raw = raw or _resumed_reversible_raw(authority, prior=prior)
+    actions = actions or [
+        {'action': 'submit', 'selector': '#structural-submit'},
+        {'action': 'gate', 'question': 'Synthetic next decision'}]
+    timeline = []
+    original_call = raw.call
+
+    async def traced(method, *args, **kwargs):
+        if method in {'fill', 'upload', 'click'}:
+            timeline.append(method)
+        return await original_call(method, *args, **kwargs)
+
+    raw.call = traced
+
+    async def decide(self, task, page, history, *, model):
+        assert model == 'synthetic-fixture'
+        index = self.decisions
+        assert index < len(actions), 'unexpected automatic retry or extra decision'
+        timeline.append((f'decision{index}', self.upload_ipc,
+                         'résumé attachment verified=True' in task))
+        if index == 0 and on_first_decision:
+            on_first_decision((raw.current, raw.fixed))
+        self.decisions += 1
+        return actions[index]
+
+    monkeypatch.setattr(fixture._SyntheticRun, 'decision', decide)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    return result, raw, timeline, controllers
+
+
+def _no_commit(authority, raw):
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert authority.post_attempts == authority.post_count == 0
+    assert not authority.hold and not authority.row.get('possible_submission')
+    assert not any(call[0] == 'click' for call in raw.calls)
+
+
+@pytest.mark.parametrize('transport', ['effect', 'call'])
+@pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
+async def test_resumed_prefilled_submit_first_uploads_once_then_redecides(
+        authority, monkeypatch, prior, transport):
+    """Issue #224: a resumed run's very first decision is Submit.
+
+    On the base revision a retained earlier-run attachment refused in the
+    recovery preflight ("original empty résumé input changed"), so a resumed
+    run could never reach a guarded Submit. Both receivers must now take
+    exactly one current-run chooser upload, then a fresh model decision; the
+    first Submit itself never clicks, holds or posts.
+    """
+    result, raw, timeline, controllers = await _resumed_submit_first(
+        authority, monkeypatch, prior=prior, transport=transport)
+    assert result['status'] == 'gate', result
+    assert 'Synthetic next decision' in result['question']
+    assert timeline == [('decision0', 0, False), 'upload', ('decision1', 1, True)]
+    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+                            authority.resume_path), {'timeout': 130})]
+    assert authority.upload_ipc == 1 and authority.uploaded
+    assert authority.fills == 0 and authority.decisions == 2
+    # The raw producer, not the passive item, owns the current-run proof.
+    assert len(controllers) == 1
+    guard = controllers[0]
+    assert guard.upload_attempted and guard.upload_completed
+    assert not guard.upload_pending and guard.upload_identity == guard._row_pdf()
+    _no_commit(authority, raw)
+
+
+@pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
+async def test_resumed_second_submit_still_meets_the_unchanged_final_guard(
+        authority, monkeypatch, prior):
+    """Recovery is not authorization: a later Submit goes through the full
+    existing final guard, which here refuses on the fixture's own invariant
+    rather than inheriting permission from the first decision."""
+    result, raw, timeline, _ = await _resumed_submit_first(
+        authority, monkeypatch, prior=prior, actions=[
+            {'action': 'submit', 'selector': '#structural-submit'},
+            {'action': 'submit', 'selector': '#structural-submit'}])
+    assert timeline == [('decision0', 0, False), 'upload', ('decision1', 1, True)]
+    assert result['status'] == 'gate', result
+    # Raised inside ApplicationIPCController.authorize_final_submit: the
+    # synthetic row has no canonical job id, an invariant unrelated to upload.
+    assert result['question'].startswith(
+        'Current canonical job ID changed before Submit. Last button: Submit application.')
+    assert len(raw.uploads) == authority.upload_ipc == 1
+    _no_commit(authority, raw)
+
+
+def _two_retained(pair):
+    for page in pair:
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#_systemfield_resume':
+                c['files'] = [PRIOR_RUN_PDF, 'Second.pdf']
+
+
+def _split_witness(pair):
+    for c in pair[1]['controls'] + pair[1]['entry']['root_evidence']:
+        if c['selector'] == '#_systemfield_resume':
+            c['files'] = ['Other Synthetic Resume.pdf']
+
+
+def _display_disagrees(pair):
+    for page in pair:
+        page['entry']['upload_tree']['filename'] = 'Other Synthetic Resume.pdf'
+
+
+def _input_without_item(pair):
+    for page in pair:
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#_systemfield_resume':
+                c['files'] = [PRIOR_RUN_PDF]
+
+
+@pytest.mark.parametrize('case,prior,mutate,refusal', [
+    ('staged-name', 'Synthetic-Resume.pdf', None, 'has the staged filename'),
+    ('not-pdf', 'Earlier Synthetic Resume.docx', None, 'no exact original attachment proof'),
+    ('two-files', PRIOR_RUN_PDF, _two_retained, 'original empty résumé input changed'),
+    ('split-witness', PRIOR_RUN_PDF, _split_witness, 'no exact original attachment proof'),
+    ('display-disagrees', PRIOR_RUN_PDF, _display_disagrees,
+     'no exact original attachment proof'),
+    ('input-without-item', None, _input_without_item, 'no exact original attachment proof'),
+])
+async def test_resumed_ineligible_retained_attachment_gates_before_any_upload(
+        authority, monkeypatch, case, prior, mutate, refusal):
+    """A visible filename is never eligibility. Wrong, ambiguous or unwitnessed
+    retained files keep the existing Gate with no chooser effect at all."""
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    if case == 'staged-name':
+        assert prior == Path(authority.resume_path).name
+    raw = _resumed_reversible_raw(authority, prior=prior)
+    late = case == 'split-witness'
+    if mutate and not late:
+        mutate((raw.current, raw.fixed))
+    # A split reader pair is already refused by bootstrap; inject it after
+    # the decision so the recovery's own paired preflight is what refuses.
+    result, raw, timeline, controllers = await _resumed_submit_first(
+        authority, monkeypatch, raw=raw, on_first_decision=mutate if late else None)
+    assert result['status'] == 'gate', result
+    assert refusal in result['question'], result
+    assert timeline == [('decision0', 0, False)]
+    assert raw.uploads == [] and authority.upload_ipc == 0
+    assert not controllers[0].upload_attempted
+    _no_commit(authority, raw)
+
+
+async def test_resumed_retained_attachment_drift_before_effect_gates_without_upload(
+        authority, monkeypatch):
+    """The PAGE/fixed pair is re-read at the effect edge; a retained file that
+    changed after preflight is refused before the chooser is opened."""
+    original = forms._reversible_upload_pair
+    calls = []
+
+    async def drift_after_preflight(session, **kwargs):
+        page = await original(session, **kwargs)
+        calls.append(kwargs)
+        if len(calls) == 1:
+            changed = mismatch_snapshot(authority, changes={
+                'attached': True, 'files': ['Swapped Synthetic Resume.pdf'],
+                'displayName': 'Swapped Synthetic Resume.pdf'})
+            raw = session.raw._original_raw
+            _update_read_values(raw, changed)
+        return page
+
+    monkeypatch.setattr(forms, '_reversible_upload_pair', drift_after_preflight)
+    result, raw, timeline, controllers = await _resumed_submit_first(
+        authority, monkeypatch, prior=PRIOR_RUN_PDF)
+    assert result['status'] == 'gate', result
+    assert len(calls) == 1, 'the effect edge must refuse inside its fresh pair'
+    assert timeline == [('decision0', 0, False)]
+    assert raw.uploads == [] and authority.upload_ipc == 0
+    assert not controllers[0].upload_attempted
+    _no_commit(authority, raw)
+
+
+@pytest.mark.parametrize('state', ['attempted', 'pending', 'identity'])
+async def test_resumed_earlier_current_run_attempt_refuses_new_upload(
+        authority, monkeypatch, state):
+    def earlier_attempt(guard):
+        if state == 'attempted':
+            guard.upload_attempted = True
+        elif state == 'pending':
+            guard.upload_pending = True
+        else:
+            guard.upload_identity = guard._row_pdf()
+
+    result, raw, timeline, _ = await _resumed_submit_first(
+        authority, monkeypatch, prior=PRIOR_RUN_PDF, prepare=earlier_attempt)
+    assert result['status'] == 'gate', result
+    assert timeline == [('decision0', 0, False)]
+    assert raw.uploads == [] and authority.upload_ipc == 0
+    _no_commit(authority, raw)
+
+
+@pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
+async def test_resumed_upload_transport_fault_is_uncertain_without_replay(
+        authority, monkeypatch, prior):
+    raw = _resumed_reversible_raw(authority, prior=prior)
+    original = raw.call
+
+    async def broken(method, *args, **kwargs):
+        if method == 'upload':
+            raw.uploads.append(((method, *args), kwargs))
+            raise OSError('synthetic transport fault')
+        return await original(method, *args, **kwargs)
+
+    raw.call = broken
+    result, raw, timeline, controllers = await _resumed_submit_first(
+        authority, monkeypatch, raw=raw)
+    assert result['status'] == 'uncertain', result
+    assert timeline == [('decision0', 0, False), 'upload']
+    assert len(raw.uploads) == 1
+    assert controllers[0].upload_attempted and not controllers[0].upload_completed
+    _no_commit(authority, raw)
+
+
+@pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
+async def test_resumed_upload_that_never_settles_is_uncertain_once(
+        authority, monkeypatch, prior):
+    """The retained item can stay on screen after the chooser; it is never
+    taken for the new attachment, and the 8 s budget ends uncertain."""
+    from tests.tools.test_ashby_upload import UploadClock
+    clock = UploadClock()
+    monkeypatch.setattr(forms, '_upload_clock', lambda: clock.now)
+    monkeypatch.setattr(forms, '_upload_sleep', clock.sleep)
+    raw = _resumed_reversible_raw(authority, prior=prior)
+
+    async def unchanged(method, *args, **kwargs):
+        if method == 'upload':
+            raw.uploads.append(((method, *args), kwargs))
+            return {}
+        return await RootSession.call(raw, method, *args, **kwargs)
+
+    raw.call = unchanged
+    result, raw, timeline, controllers = await _resumed_submit_first(
+        authority, monkeypatch, raw=raw)
+    assert result['status'] == 'uncertain', result
+    assert clock.now == 8.0
+    assert timeline == [('decision0', 0, False), 'upload']
+    assert len(raw.uploads) == 1
+    _no_commit(authority, raw)
+
+
+def test_retained_attachment_replacement_needs_the_exact_one_item_swap(authority):
+    raw = _resumed_reversible_raw(authority, prior=PRIOR_RUN_PDF)
+    before = deepcopy(raw.current)
+    filename = Path(authority.resume_path).name
+    _update_read_values(raw, mismatch_snapshot(authority, attached=True))
+    after = raw.current
+    assert forms._reversible_upload_settled(
+        before, after, filename, prior=PRIOR_RUN_PDF) is True
+    # The untouched retained item is not settlement of a new upload.
+    assert forms._reversible_upload_settled(
+        before, deepcopy(before), filename, prior=PRIOR_RUN_PDF) is False
+    extra = deepcopy(after)
+    extra['entry']['formless']['excluded'].append('#another-excluded')
+    with pytest.raises(forms.Gate, match='attached-file passive delete'):
+        forms._reversible_upload_settled(before, extra, filename, prior=PRIOR_RUN_PDF)
+    moved = deepcopy(after)
+    for c in moved['controls'] + moved['entry']['root_evidence']:
+        if c['selector'] == '#_systemfield_name':
+            c['value'] = 'Changed Synthetic Name'
+    with pytest.raises(forms.Gate):
+        forms._reversible_upload_settled(before, moved, filename, prior=PRIOR_RUN_PDF)

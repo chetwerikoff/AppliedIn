@@ -6946,6 +6946,13 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             # The fixture's native Continue is a real Submit
                             # action, never the generic pre-private click path.
                             verb = 'submit'
+                    if (verb == 'upload' and isinstance(session, _ReversibleEntryReader)
+                            and isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'):
+                        # Generic execute(upload) can prove a filename but not a
+                        # settled passive item on this fallback. Submit owns recovery.
+                        raise Gate('Reversible Ashby résumé upload requires guarded Submit recovery; '
+                                   'no direct chooser is permitted.')
                     if action.get('selector'):
                         old = control(page, action, 'decision-initial')
                         page = await session.page()

@@ -699,3 +699,201 @@ async def test_recovery_proof_reenters_bootstrap_before_another_decision(
     assert len(raw.uploads) == authority.upload_ipc == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
+
+
+def mismatch_snapshot(authority, *, attached=False, pending=False, changes=None):
+    """Actual PAGE/fixed DOM readers, never a manually fabricated upload tree."""
+    name = Path(authority.resume_path).name
+    params = ({'attached': True, 'files': [name], 'displayName': name}
+              if attached else {'disabledDrop': True, 'files': [name]} if pending else {})
+    pair = observed(sibling=True, **(changes or {}), **params)
+    for page in pair:
+        page['url'] = fixture.URL
+        for c in page['controls'] + page['entry']['root_evidence']:
+            if c['selector'] == '#dropzone':
+                c['selector'] = '#ashby-upload-dropzone'
+        for n in page['entry']['upload_tree']['nodes']:
+            if n.get('target_selector') == '#dropzone':
+                n['target_selector'] = '#ashby-upload-dropzone'
+    return pair
+
+
+class MismatchFixtureRaw(FixtureRaw):
+    def __init__(self, authority):
+        super().__init__(authority)
+        self.current, self.fixed = mismatch_snapshot(authority)
+
+    async def call(self, method, *args, **kwargs):
+        if method != 'upload':
+            return await RootSession.call(self, method, *args, **kwargs)
+        self.uploads.append(((method, *args), kwargs))
+        after = mismatch_snapshot(self.authority, attached=True)
+        for old, new in zip((self.current, self.fixed), after):
+            lookup = {c['selector']: c for c in old['controls'] + old['entry']['root_evidence']}
+            for c in new['controls'] + new['entry']['root_evidence']:
+                for key in ('value', 'has_value', 'required'):
+                    if c.get('type') != 'file' and key in lookup.get(c['selector'], {}):
+                        c[key] = lookup[c['selector']][key]
+        self.current, self.fixed = after
+        return {}
+
+
+def _bind_mismatch_fixture_producer(authority, monkeypatch, *, transport='effect'):
+    """Test-local real controller bound to the existing sealed fixture delegate."""
+    from tools.browser_skill_apply import ApplicationIPCController
+
+    original_facade = fixture._SyntheticRun.facade
+    original_ipc = fixture._SyntheticRun._positive_ipc
+
+    def native_tuple(self):
+        seq = original_ipc(self)
+        if not self.ashby_upload:
+            return seq
+        assert seq[-1][0] == 'upload'
+        return (*seq[:-1], ('upload', '#_systemfield_resume', '--file', self.resume_path))
+
+    def closed_with_controller(self, raw):
+        sealed = original_facade(self, raw)
+        controller = ApplicationIPCController(
+            fixture.PK, fixture.COMPANY, fixture.URL, self.resume_path,
+            dict(fixture._FACTS), {}, [], {'url': fixture.URL}, lambda: None,
+            fixture_context=self, entry_provenance=self.entry_provenance())
+
+        class Proxy:
+            _sealed_delegate = sealed
+            _original_raw = raw
+            _application_controller = controller
+
+            async def page(self):
+                return (await sealed.call('evaluate', forms.ENTRY_PAGE))['value']
+
+            async def call(self, *args, **kwargs):
+                if args and args[0] == 'upload':
+                    if transport == 'call':
+                        return await self._guarded_upload(*args, **kwargs)
+                    # Make both guarded transport methods run through the
+                    # identical one-shot test-local controller.
+                    raise PermissionError('Unexpected unmediated fixture upload')
+                return await sealed.call(*args, **kwargs)
+
+            async def _guarded_upload(self, *args, **kwargs):
+                await controller.before_ipc(self, args, kwargs)
+                succeeded = False
+                try:
+                    result = await sealed.call(*args, **kwargs)
+                    succeeded = True
+                    return result
+                finally:
+                    await controller.after_ipc(
+                        self, args, kwargs, succeeded=succeeded)
+
+            async def application_effect(self, *args, **kwargs):
+                if args and args[0] == 'upload':
+                    return await self._guarded_upload(*args, **kwargs)
+                return await sealed.call(*args, **kwargs)
+
+        return Proxy()
+
+    monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', native_tuple)
+    monkeypatch.setattr(fixture._SyntheticRun, 'facade', closed_with_controller)
+
+
+@pytest.mark.parametrize('transport', ['effect', 'call'])
+async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate(
+        authority, monkeypatch, transport):
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
+    raw = MismatchFixtureRaw(authority)
+    _admit_optional_owner_question(raw)
+    _script_recovery_decisions(monkeypatch)
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert result['status'] == 'gate', result
+    assert 'Synthetic inspection without a second click' in result['question'], result
+    assert authority.fills == 2 and authority.upload_ipc == 1
+    assert authority.ipc_index == 3 and authority.uploaded
+    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+                            authority.resume_path), {'timeout': 130})]
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert authority.post_attempts == authority.post_count == 0
+    assert authority.decisions == 4
+    assert not any(call[0] == 'click' for call in raw.calls)
+
+
+@pytest.mark.parametrize('transport', ['effect', 'call'])
+async def test_reversible_direct_model_upload_is_refused_before_chooser(
+        authority, monkeypatch, transport):
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
+    raw = MismatchFixtureRaw(authority)
+    _admit_optional_owner_question(raw)
+    _script_recovery_decisions(monkeypatch, first='upload')
+    monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
+    result = await forms.apply(
+        fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
+        pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
+    assert result['status'] == 'gate', result
+    assert 'no direct chooser is permitted' in result['question']
+    assert authority.fills == 2 and authority.upload_ipc == 0
+    assert not raw.uploads
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+
+
+@pytest.mark.parametrize('mutation', [
+    'readonly', 'duplicate', 'retained', 'root', 'uploadtree', 'change-url',
+])
+async def test_reversible_upload_preflight_rejects_drift_before_any_effect(
+        authority, monkeypatch, mutation):
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    raw = MismatchFixtureRaw(authority)
+    original = raw.current, raw.fixed
+    selector = '#_systemfield_resume'
+    for page in original:
+        if mutation == 'readonly':
+            for c in page['controls'] + page['entry']['root_evidence']:
+                if c.get('selector') == selector:
+                    c['readonly'] = True
+        elif mutation == 'duplicate':
+            page['entry']['root_evidence'].append(
+                deepcopy(next(c for c in page['entry']['root_evidence']
+                              if c.get('selector') == selector)))
+        elif mutation == 'retained':
+            for c in page['controls'] + page['entry']['root_evidence']:
+                if c.get('selector') == selector:
+                    c['files'] = ['prior-file.pdf']
+        elif mutation == 'root':
+            page['entry']['formless']['error'] = 'ambiguous application roots'
+        elif mutation == 'uploadtree':
+            page['entry']['upload_tree']['complete'] = False
+        else:
+            page['url'] = 'https://example-co.test/other-job'
+    provenance = authority.entry_provenance()
+    adapter = forms._ReversibleEntryReader(raw)
+    with pytest.raises(forms.Gate):
+        await forms._reversible_upload_pair(
+            adapter, allowed=lambda url: url == fixture.URL,
+            provenance=provenance, selector=selector, empty=True)
+    assert raw.uploads == []
+    assert not any(c[0] in {'upload', 'click'} for c in raw.calls)
+
+
+async def test_reversible_upload_delta_rejects_unexcluded_attached_delete(
+        authority):
+    raw = MismatchFixtureRaw(authority)
+    before = raw.current
+    after = mismatch_snapshot(authority, attached=True)[0]
+    filename = Path(authority.resume_path).name
+    assert forms._reversible_upload_settled(before, after, filename) is True
+    after['entry']['formless']['excluded'].pop()
+    with pytest.raises(forms.Gate, match='attached-file passive delete'):
+        forms._reversible_upload_settled(before, after, filename)

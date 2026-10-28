@@ -3374,7 +3374,8 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
         if (not isinstance(controller, ApplicationIPCController)
                 or controller.fixture_context is not ctx
                 or controller.upload_attempted or controller.upload_completed
-                or sealed is None or not hasattr(sealed, '_closed_admissions')
+                or sealed is None or type(sealed).__name__ != '_Closed'
+                or getattr(type(sealed), '__slots__', ()) != ('_closed_admissions',)
                 or not callable(getattr(sealed, 'call', None))
                 or getattr(proxy, '_original_raw', None) is not raw_session):
             raise Gate('The reversible synthetic closed facade/controller binding is unavailable.')

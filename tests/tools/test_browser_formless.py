@@ -3530,7 +3530,8 @@ def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, att
     normalized['entry']['upload_tree'] = None
     if attached:
         assert tree['filename'] == filename and len(tree['items']) == 1
-        deleted = tree['nodes'][tree['delete']]['selector']
+        deleted = '#delete-0'  # masked id in tree; real CSS in excluded
+        assert tree['nodes'][tree['delete']]['selector'] != deleted
         assert deleted not in {c['selector'] for c in current['controls']}
         assert deleted not in {c['selector'] for c in current['entry']['root_evidence']}
         assert deleted in root['excluded']

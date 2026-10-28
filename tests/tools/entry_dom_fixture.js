@@ -249,7 +249,7 @@ if(spec.formless) {
   if(spec.hiddenOutside) node('input',{id:'outside-hidden',type:'hidden',rect:null},body);
   if(spec.extraChild) node('span',{},wrapper);
   if(spec.inertSibling) {
-    const sibling=node('div',{},wrapper);
+    const sibling=node('div',spec.siblingClass ? {class:spec.siblingClass} : {},wrapper);
     if(spec.inertDescendant==='onclick')
       node('span',{onclick:'syntheticAction()'},sibling);
     if(spec.inertDescendant==='summary') node('summary',{},sibling);

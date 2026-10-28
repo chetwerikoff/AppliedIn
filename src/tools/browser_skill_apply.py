@@ -4729,6 +4729,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                                     provenance, fixture_context=fixture_context))):
                         raise Gate('The reversible observation left the preparation origin.')
                     scope = _reversible_entry_scope(fresh, witness)
+                    if not scope:
+                        _LOG.info('reversible scope empty pk=%s root_error=%s', pk,
+                                  (_formless_root(fresh) or {}).get('error') or '')
                     _auto_grant_from_global(
                         fresh, witness, pk, facts, global_facts or {}, *origins,
                         provenance=provenance, fixture_context=fixture_context,
@@ -5226,6 +5229,9 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                 return Gate('Unsafe application receiver needs operator inspection.',
                             reason='defect_structural')
     scope = _reversible_entry_scope(current, witness) if rootless else None
+    if rootless and not scope:
+        _LOG.info('reversible scope empty pk=%s root_error=%s', pk,
+                  structural.get('error') or '')
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}

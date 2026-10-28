@@ -369,8 +369,12 @@ _ASHBY_ROOT = r"""
   const wrapper=container?.parentElement;
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
-  const inertSibling=e=>{
-    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;
+  // A class alone is styling: it may not certify the wrapper, but it must not
+  // turn the container-scoped mismatch into "unsafe sibling" either. That label
+  // emptied every reversible scope on live Ashby pages after #220.
+  const inertSibling=(e,styled=false)=>{
+    if(!['DIV','SPAN'].includes(e.tagName) ||
+       Array.from(e.attributes).some(a=>!(styled && a.name==='class'))) return false;
     const nodes=[e,...Array.from(e.querySelectorAll('*'))];
     const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label[for],[autofocus],[controls]';
     return !e.querySelectorAll(interactive).length && nodes.every(n=>
@@ -378,7 +382,7 @@ _ASHBY_ROOT = r"""
   };
   const siblings=wrapper ? Array.from(wrapper.children) : [];
   const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));
+    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
     container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
     panes.length===1 && panes[0].tagName==='DIV' && panes[0].parentElement===wrapper &&

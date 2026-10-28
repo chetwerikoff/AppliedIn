@@ -1601,6 +1601,32 @@ async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch
     no_mutations(raw)
 
 
+
+@pytest.mark.parametrize('descendant,error', [
+    (None, 'application root sibling identity mismatch'),
+    ('onclick', 'application root sibling identity mismatch: unsafe sibling'),
+    ('summary', 'application root sibling identity mismatch: unsafe sibling'),
+])
+def test_styled_inert_sibling_keeps_reversible_scope_without_wrapper_authority(
+        descendant, error):
+    # After #220 a wrapper sibling carrying only a class was labelled "unsafe
+    # sibling", which is not a tolerated reversible root error, so every
+    # reversible scope came back empty and no Ashby row could be filled. A
+    # class is styling: the page must return to the container-scoped mismatch.
+    # It still never certifies the wrapper, and real interactivity still refuses.
+    page, fixed = observed(inertSibling=True, siblingClass='synthetic-decoration',
+                           **({'inertDescendant': descendant} if descendant else {}))
+    for current in (page, fixed):
+        assert current['entry']['formless']['error'] == error
+        assert current['entry']['root'] is None
+    scope = forms._reversible_entry_scope(
+        page, {c['selector']: c for c in fixed['controls']})
+    if descendant is None:
+        assert scope
+    else:
+        assert not scope
+
+
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
         monkeypatch):
     row, raw, decide, provenance = root_world(monkeypatch, idless=True, domOrder=True)
@@ -3482,6 +3508,15 @@ def _issue218_main_reader_scripts():
         ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
          "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
          "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
+        ("  // A class alone is styling: it may not certify the wrapper, but it must not\n"
+         "  // turn the container-scoped mismatch into \"unsafe sibling\" either. That label\n"
+         "  // emptied every reversible scope on live Ashby pages after #220.\n"
+         "  const inertSibling=(e,styled=false)=>{\n"
+         "    if(!['DIV','SPAN'].includes(e.tagName) ||\n"
+         "       Array.from(e.attributes).some(a=>!(styled && a.name==='class'))) return false;",
+         "  const inertSibling=e=>{\n"
+         "    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;"),
+        ("!inertSibling(n,true));", "!inertSibling(n));"),
         ("  const unsafeSibling=!!wrapper && siblings.some(n=>\n"
          "    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));\n", ""),
         ("    structuralError=unsafeSibling ?\n"

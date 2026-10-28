@@ -2931,8 +2931,10 @@ class _ReversibleEntryReader:
         return page
 
     async def application_effect(self, *args, **kwargs):
-        if args and args[0] == 'upload':
+        if args and args[0] == 'upload' and self._upload_edge is not None:
             return await self._delegated_upload(*args, **kwargs)
+        if args and args[0] == 'upload' and self.upload_attempted:
+            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
         return await _effect_call(self.raw, *args, **kwargs)
 
     async def _delegated_upload(self, *args, **kwargs):
@@ -2947,8 +2949,10 @@ class _ReversibleEntryReader:
     async def call(self, *args, **kwargs):
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-        if args and args[0] == 'upload':
+        if args and args[0] == 'upload' and self._upload_edge is not None:
             return await self._delegated_upload(*args, **kwargs)
+        if args and args[0] == 'upload' and self.upload_attempted:
+            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
         return await self.raw.call(*args, **kwargs)
 
 
@@ -3248,7 +3252,7 @@ def _reversible_retained_certificate(page: dict, selector: str, *,
     original, member = originals[0], members[0]
     if root.get('root'):
         _formless_boundary(page, provenance)
-    elif root.get('error') == 'application root sibling identity mismatch':
+    elif root.get('error') in _REVERSIBLE_ROOT_ERRORS:
         if not linked:
             _reversible_entry_recipient(page, original, clipped_file=file)
     else:

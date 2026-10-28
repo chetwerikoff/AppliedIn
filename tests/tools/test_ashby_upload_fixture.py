@@ -453,6 +453,29 @@ async def test_persistent_fixture_entry_split_terminal_uncertain_and_no_retry(
     await _transient_fixture_run(authority, monkeypatch, persistent=True)
 
 
+WAIT = {'action': 'wait'}
+
+
+def _late_resume_field(pages):
+    """FF-224e: the résumé field renders after the first decision.
+
+    The one server-owned upload runs just before the model's first decision.
+    When the résumé field has not rendered by then, both real readers report
+    no upload tree (the DOM reader emits null until the container's upload
+    root is complete), so only the model-intent fallbacks can upload. The
+    returned callable renders the field on both readers.
+    """
+    trees = [page['entry']['upload_tree'] for page in pages]
+    for page in pages:
+        page['entry']['upload_tree'] = None
+
+    def render():
+        for page, tree in zip(pages, trees):
+            page['entry']['upload_tree'] = tree
+
+    return render
+
+
 def _admit_optional_owner_question(raw):
     # This synthetic form has no pending owner question; the next model
     # decision must be reachable after a proven upload, not inferred from Gate.
@@ -464,7 +487,7 @@ def _admit_optional_owner_question(raw):
 
 def _script_recovery_decisions(monkeypatch, *, first='submit',
                                on_submit=None, timeline=None, after_upload='submit',
-                               upload_decisions=1, tasks=None):
+                               upload_decisions=1, tasks=None, on_first_decision=None):
     """Exercise the sealed two-fill IPC prefix before any missing-proof Submit."""
     seen = []
     actions = [
@@ -493,6 +516,8 @@ def _script_recovery_decisions(monkeypatch, *, first='submit',
         index = self.decisions
         assert index < len(actions), 'unexpected automatic retry or extra decision'
         action = actions[index]
+        if index == 0 and on_first_decision:
+            on_first_decision()
         if index == 2 and first == 'submit':
             assert self.ipc_index == 2 and not self.uploaded
             if on_submit:
@@ -844,6 +869,8 @@ def _seed_mismatch_synthetic_owner_grants(authority, raw):
 @pytest.mark.parametrize('transport', ['effect', 'call'])
 async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate(
         authority, monkeypatch, transport):
+    """Submit-time fallback: the résumé field rendered after the first
+    decision, so the Submit decision takes the one guarded upload."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -853,7 +880,8 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
     _seed_mismatch_synthetic_owner_grants(authority, raw)
-    _script_recovery_decisions(monkeypatch)
+    _script_recovery_decisions(
+        monkeypatch, on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
@@ -875,7 +903,8 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
         authority, monkeypatch, transport):
     """Issue #230: the model never chooses Submit while the résumé is empty, so
     deferring its upload decision to Submit looped into the repeat gate live.
-    The decision itself now takes the one guarded recovery upload."""
+    The decision itself now takes the one guarded recovery upload. FF-224e:
+    this is the fallback for a résumé field rendered after the first decision."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -886,7 +915,8 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
     _seed_mismatch_synthetic_owner_grants(authority, raw)
     tasks = []
     _script_recovery_decisions(
-        monkeypatch, first='upload', after_upload='gate', tasks=tasks)
+        monkeypatch, first='upload', after_upload='gate', tasks=tasks,
+        on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
@@ -906,7 +936,8 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
 async def test_repeated_model_upload_after_recovery_never_uploads_twice(
         authority, monkeypatch, transport):
     """After the one recovery upload, further model upload decisions only get
-    feedback, never a second chooser, and three of them still gate."""
+    feedback, never a second chooser, and three of them still gate. The
+    résumé field renders after the first decision (FF-224e fallback shape)."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -917,7 +948,8 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
     _seed_mismatch_synthetic_owner_grants(authority, raw)
     tasks = []
     _script_recovery_decisions(
-        monkeypatch, first='upload', upload_decisions=4, after_upload='gate', tasks=tasks)
+        monkeypatch, first='upload', upload_decisions=4, after_upload='gate', tasks=tasks,
+        on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
@@ -938,7 +970,8 @@ async def test_reversible_upload_feedback_then_submit_recovery_never_clicks_subm
         authority, monkeypatch, transport):
     """After the upload decision's recovery, Submit is no second upload: it
     meets the final guard with the PDF proven, which still refuses here on a
-    later check of this fixture, and nothing is clicked."""
+    later check of this fixture, and nothing is clicked. The résumé field
+    renders after the first decision (FF-224e fallback shape)."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -947,7 +980,9 @@ async def test_reversible_upload_feedback_then_submit_recovery_never_clicks_subm
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
     _seed_mismatch_synthetic_owner_grants(authority, raw)
-    _script_recovery_decisions(monkeypatch, first='upload', after_upload='submit')
+    _script_recovery_decisions(
+        monkeypatch, first='upload', after_upload='submit',
+        on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
@@ -1104,25 +1139,26 @@ def _no_commit(authority, raw):
 
 @pytest.mark.parametrize('transport', ['effect', 'call'])
 @pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
-async def test_resumed_prefilled_submit_first_uploads_once_then_redecides(
+async def test_resumed_prefilled_form_uploads_once_before_the_first_decision(
         authority, monkeypatch, prior, transport):
-    """Issue #224: a resumed run's very first decision is Submit.
+    """Issues #224 and FF-224e: a resumed, prefilled form.
 
     On the base revision a retained earlier-run attachment refused in the
-    recovery preflight ("original empty résumé input changed"), so a resumed
-    run could never reach a guarded Submit. Both receivers must now take
-    exactly one current-run chooser upload, then a fresh model decision; the
-    first Submit itself never clicks, holds or posts.
+    recovery preflight ("original empty résumé input changed"). Live, the
+    model then kept finding routes to the PDF guard before any upload. Both
+    receivers now take exactly one current-run chooser upload before the
+    model's first decision, which already sees the verified attachment.
     """
     result, raw, timeline, controllers = await _resumed_submit_first(
-        authority, monkeypatch, prior=prior, transport=transport)
+        authority, monkeypatch, prior=prior, transport=transport,
+        actions=[{'action': 'gate', 'question': 'Synthetic next decision'}])
     assert result['status'] == 'gate', result
     assert 'Synthetic next decision' in result['question']
-    assert timeline == [('decision0', 0, False), 'upload', ('decision1', 1, True)]
+    assert timeline == ['upload', ('decision0', 1, True)]
     assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
                             authority.resume_path), {'timeout': 130})]
     assert authority.upload_ipc == 1 and authority.uploaded
-    assert authority.fills == 0 and authority.decisions == 2
+    assert authority.fills == 0 and authority.decisions == 1
     # The raw producer, not the passive item, owns the current-run proof.
     assert len(controllers) == 1
     guard = controllers[0]
@@ -1134,14 +1170,13 @@ async def test_resumed_prefilled_submit_first_uploads_once_then_redecides(
 @pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
 async def test_resumed_second_submit_still_meets_the_unchanged_final_guard(
         authority, monkeypatch, prior):
-    """Recovery is not authorization: a later Submit goes through the full
-    existing final guard, which here refuses on the fixture's own invariant
-    rather than inheriting permission from the first decision."""
+    """The upload is not authorization: the Submit after it goes through the
+    full existing final guard, which here refuses on the fixture's own
+    invariant rather than inheriting permission from the upload."""
     result, raw, timeline, _ = await _resumed_submit_first(
         authority, monkeypatch, prior=prior, actions=[
-            {'action': 'submit', 'selector': '#structural-submit'},
             {'action': 'submit', 'selector': '#structural-submit'}])
-    assert timeline == [('decision0', 0, False), 'upload', ('decision1', 1, True)]
+    assert timeline == ['upload', ('decision0', 1, True)]
     assert result['status'] == 'gate', result
     # Raised inside ApplicationIPCController.authorize_final_submit: the
     # synthetic row has no canonical job id, an invariant unrelated to upload.
@@ -1176,17 +1211,22 @@ def _input_without_item(pair):
                 c['files'] = [PRIOR_RUN_PDF]
 
 
-@pytest.mark.parametrize('case,prior,mutate,refusal', [
-    ('staged-name', 'Synthetic-Resume.pdf', None, 'has the staged filename'),
-    ('not-pdf', 'Earlier Synthetic Resume.docx', None, 'no exact original attachment proof'),
-    ('two-files', PRIOR_RUN_PDF, _two_retained, 'original empty résumé input changed'),
-    ('split-witness', PRIOR_RUN_PDF, _split_witness, 'no exact original attachment proof'),
+# The proactive upload takes only an empty receiver or one retained,
+# differently named PDF; any other receiver is left to the Submit decision,
+# whose recovery refuses it the same way.
+@pytest.mark.parametrize('case,prior,mutate,refusal,proactive', [
+    ('staged-name', 'Synthetic-Resume.pdf', None, 'has the staged filename', False),
+    ('not-pdf', 'Earlier Synthetic Resume.docx', None,
+     'no exact original attachment proof', False),
+    ('two-files', PRIOR_RUN_PDF, _two_retained, 'original empty résumé input changed', False),
+    ('split-witness', PRIOR_RUN_PDF, _split_witness, 'no exact original attachment proof', True),
     ('display-disagrees', PRIOR_RUN_PDF, _display_disagrees,
-     'no exact original attachment proof'),
-    ('input-without-item', None, _input_without_item, 'no exact original attachment proof'),
+     'no exact original attachment proof', True),
+    ('input-without-item', None, _input_without_item,
+     'no exact original attachment proof', True),
 ])
 async def test_resumed_ineligible_retained_attachment_gates_before_any_upload(
-        authority, monkeypatch, case, prior, mutate, refusal):
+        authority, monkeypatch, case, prior, mutate, refusal, proactive):
     """A visible filename is never eligibility. Wrong, ambiguous or unwitnessed
     retained files keep the existing Gate with no chooser effect at all."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
@@ -1196,13 +1236,21 @@ async def test_resumed_ineligible_retained_attachment_gates_before_any_upload(
     late = case == 'split-witness'
     if mutate and not late:
         mutate((raw.current, raw.fixed))
-    # A split reader pair is already refused by bootstrap; inject it after
-    # the decision so the recovery's own paired preflight is what refuses.
+    if late:
+        # A split reader pair is already refused by bootstrap; inject it as
+        # the recovery starts so its own paired preflight is what refuses.
+        recover = forms._reversible_recover_upload
+
+        async def split_then_recover(*args, **kwargs):
+            mutate((raw.current, raw.fixed))
+            return await recover(*args, **kwargs)
+
+        monkeypatch.setattr(forms, '_reversible_recover_upload', split_then_recover)
     result, raw, timeline, controllers = await _resumed_submit_first(
-        authority, monkeypatch, raw=raw, on_first_decision=mutate if late else None)
+        authority, monkeypatch, raw=raw)
     assert result['status'] == 'gate', result
     assert refusal in result['question'], result
-    assert timeline == [('decision0', 0, False)]
+    assert timeline == ([] if proactive else [('decision0', 0, False)])
     assert raw.uploads == [] and authority.upload_ipc == 0
     assert not controllers[0].upload_attempted
     _no_commit(authority, raw)
@@ -1231,7 +1279,7 @@ async def test_resumed_retained_attachment_drift_before_effect_gates_without_upl
         authority, monkeypatch, prior=PRIOR_RUN_PDF)
     assert result['status'] == 'gate', result
     assert len(calls) == 1, 'the effect edge must refuse inside its fresh pair'
-    assert timeline == [('decision0', 0, False)]
+    assert timeline == []
     assert raw.uploads == [] and authority.upload_ipc == 0
     assert not controllers[0].upload_attempted
     _no_commit(authority, raw)
@@ -1251,7 +1299,7 @@ async def test_resumed_earlier_current_run_attempt_refuses_new_upload(
     result, raw, timeline, _ = await _resumed_submit_first(
         authority, monkeypatch, prior=PRIOR_RUN_PDF, prepare=earlier_attempt)
     assert result['status'] == 'gate', result
-    assert timeline == [('decision0', 0, False)]
+    assert timeline == []
     assert raw.uploads == [] and authority.upload_ipc == 0
     _no_commit(authority, raw)
 
@@ -1259,6 +1307,8 @@ async def test_resumed_earlier_current_run_attempt_refuses_new_upload(
 @pytest.mark.parametrize('prior', [None, PRIOR_RUN_PDF])
 async def test_resumed_upload_transport_fault_is_uncertain_without_replay(
         authority, monkeypatch, prior):
+    """A transport fault in the upload before the first decision ends the run
+    uncertain, exactly as a fault in the Submit-time recovery did."""
     raw = _resumed_reversible_raw(authority, prior=prior)
     original = raw.call
 
@@ -1272,7 +1322,7 @@ async def test_resumed_upload_transport_fault_is_uncertain_without_replay(
     result, raw, timeline, controllers = await _resumed_submit_first(
         authority, monkeypatch, raw=raw)
     assert result['status'] == 'uncertain', result
-    assert timeline == [('decision0', 0, False), 'upload']
+    assert timeline == ['upload']
     assert len(raw.uploads) == 1
     assert controllers[0].upload_attempted and not controllers[0].upload_completed
     _no_commit(authority, raw)
@@ -1300,7 +1350,7 @@ async def test_resumed_upload_that_never_settles_is_uncertain_once(
         authority, monkeypatch, raw=raw)
     assert result['status'] == 'uncertain', result
     assert clock.now == 8.0
-    assert timeline == [('decision0', 0, False), 'upload']
+    assert timeline == ['upload']
     assert len(raw.uploads) == 1
     _no_commit(authority, raw)
 
@@ -1368,8 +1418,20 @@ def _production_submit_click(monkeypatch, tmp_path, *, upload=None):
 
     raw.call = call
 
-    async def run_apply(actions):
+    async def run_apply(actions, *, late=False):
         decide.side_effect = actions
+        if late:
+            render, pending = _late_resume_field((raw.current, raw.fixed)), list(actions)
+
+            def rendered_at_first_decision(*_args, **_kwargs):
+                if len(pending) == len(actions):
+                    render()
+                action = pending.pop(0)
+                if isinstance(action, BaseException):
+                    raise action
+                return action
+
+            decide.side_effect = rendered_at_first_decision
         return await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                  pk=PK, resume_path=pdf)
 
@@ -1387,15 +1449,16 @@ async def test_production_submit_click_without_upload_recovers_then_meets_final_
         monkeypatch, tmp_path):
     """The live symptom: a model click on Submit right after bootstrap was refused
     at the final guard for the missing row PDF, so the row could never proceed.
-    The click now takes the one guarded upload, then a fresh decision; the second
-    click passes the PDF proof and is refused by a later final-guard check."""
+    Fallback for a résumé field rendered after the first decision: the click
+    takes the one guarded upload, then a fresh decision; the second click
+    passes the PDF proof and is refused by a later final-guard check."""
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
-    result = await run_apply([click, click])
+    result = await run_apply([WAIT, click, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
     assert 'Unverified or changed form value' in result['question'], result
-    assert decide.await_count == 2
+    assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
     # The staged PDF is released after the run; recovery compared the
@@ -1408,9 +1471,10 @@ async def test_production_submit_click_without_upload_recovers_then_meets_final_
 @pytest.mark.parametrize('failure', ['fault', 'refused'])
 async def test_production_submit_click_upload_failure_stops_without_click(
         monkeypatch, tmp_path, failure):
-    """Once the recovery has passed its effect edge, any transport failure,
-    even one reported as no-effect, stays terminal uncertain: the chooser may
-    have acted, so nothing is retried, recorded as uploaded or clicked."""
+    """Once the upload before the first decision has passed its effect edge,
+    any transport failure, even one reported as no-effect, stays terminal
+    uncertain as in the recovery: the chooser may have acted, so nothing is
+    retried, recorded as uploaded, decided or clicked."""
     from tools.browser_skill import Unavailable
 
     async def broken():
@@ -1422,25 +1486,26 @@ async def test_production_submit_click_upload_failure_stops_without_click(
 
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path, upload=broken)
-    result = await run_apply([click, click])
+    result = await run_apply([click])
     assert result == {
         'status': 'uncertain', 'step': result['step'],
         'detail': 'Résumé upload interrupted after the browser command; inspect manually'}
-    assert decide.await_count == 1
+    assert decide.await_count == 0
     assert len(uploads) == 1
     assert not transport._application_controller.upload_completed
     _no_production_commit(raw, transport, row)
 
 
 async def test_production_submit_click_never_uploads_a_second_time(monkeypatch, tmp_path):
-    """After the one recovery, neither a model upload nor further Submit clicks
-    can reach the chooser again; each later click goes to the final guard."""
+    """After the one upload before the first decision, neither a model upload
+    nor a Submit click can reach the chooser again; the click goes to the
+    final guard."""
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     upload = {'action': 'upload', 'selector': '#_systemfield_resume'}
-    result = await run_apply([click, upload, click])
+    result = await run_apply([upload, click])
     assert result['status'] == 'gate', result
     assert 'Unverified or changed form value' in result['question'], result
     assert len(uploads) == 1
-    assert decide.await_count == 3
+    assert decide.await_count == 2
     _no_production_commit(raw, transport, row)

@@ -795,10 +795,18 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     receiver is owner-asked in field order, natively required or not."""
     row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
     page = endpoint.current
-    model_calls = []
+    model_calls, upload_grants = [], []
     decision.side_effect = lambda *a, **k: model_calls.append(len(row.get(
         'human_approved_answers') or {})) or forms.Gate('synthetic model stop')
-    asked, _ = await _owner_order(row, endpoint, stores, pdf)
+    original_call = endpoint.call
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            upload_grants.append(len(row.get('human_approved_answers') or {}))
+        return await original_call(method, *args, **kwargs)
+
+    endpoint.call = call
+    asked, outcome = await _owner_order(row, endpoint, stores, pdf)
     assert asked == ['#_systemfield_name', '#_systemfield_email',
                      *(_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES)),
                      '#additional']
@@ -806,9 +814,13 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     assert not _by_locator(page, _LOCATION)['required']
     boolean = row['human_approved_answers']['Synthetic Boolean question']
     assert boolean
-    # The model is reached only once every owner question is answered.
-    assert model_calls and all(n == len(asked) for n in model_calls)
-    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
+    # FF-224e: the server-owned résumé upload runs before the first model
+    # decision, but never ahead of an owner question: it starts only once
+    # every one is answered. This endpoint's chooser never settles, so the
+    # run ends uncertain, as a recovery upload does, and the model is not reached.
+    assert upload_grants == [len(asked)]
+    assert outcome['status'] == 'uncertain' and not model_calls
+    assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
 
 
 @pytest.mark.asyncio
@@ -958,15 +970,14 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
             return {}
         return await original_call(method, *args, **kwargs)
     raw.call = call
-    # Issue #230: the upload decision itself runs the one recovery upload, so
-    # the first Submit already meets the final value guard.
-    decide.side_effect = [dict(action='upload', selector=file['selector']),
-                          dict(action='submit', selector=button['selector'])]
+    # FF-224e: the one server upload runs before the first decision, so the
+    # first Submit already meets the final value guard.
+    decide.side_effect = [dict(action='submit', selector=button['selector'])]
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
     assert 'Unverified or changed form value' in result['question'], result
-    assert decide.await_count == 2
+    assert decide.await_count == 1
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('upload', file['selector'], '--file',
          transport._application_controller.resume_path)]

@@ -6558,6 +6558,29 @@ def _label_class(target: dict) -> str:
     return next((name for name, rx in _LABEL_CLASSES if rx.search(text)), 'other')
 
 
+def _proactive_upload_receiver(page: dict, resume_path: str) -> bool:
+    """The résumé receiver is empty or holds one retained, differently named PDF."""
+    receivers = [c for c in page.get('controls', [])
+                 if c.get('type') == 'file' and re.search(r'resume|résumé|cv', label(c), re.I)]
+    if len(receivers) != 1:
+        return False
+    files = receivers[0].get('files')
+    if files in (None, []):
+        return True
+    return (isinstance(files, list) and len(files) == 1 and isinstance(files[0], str)
+            and files[0].lower().endswith('.pdf') and files[0] != Path(resume_path).name)
+
+
+def _boolean_pair_member(page: dict, selector: str) -> bool:
+    matches = [c for c in page.get('controls', []) if c.get('selector') == selector]
+    if len(matches) != 1:
+        return False
+    try:
+        return any(m.get('selector') == selector for m in _boolean_pair(page, matches[0]))
+    except Gate:
+        return False
+
+
 class ApplicationIPCController:
     """One application-owned verdict, separately protecting reversible writes."""
 
@@ -7353,6 +7376,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             url, page.get('url'), provenance=provenance)
                 model_upload_feedback = ''
                 model_upload_decisions = 0
+                decided = False
                 for _ in range(100):
                     if submitted:
                         context = handoff(
@@ -7418,10 +7442,56 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 provenance=provenance, fixture_context=ctx)
                             if pending is not None:
                                 raise pending
+                    if (not decided
+                            and isinstance(session, _ReversibleEntryReader)
+                            and isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'
+                            and isinstance(_formless_root(page), dict)
+                            and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
+                            and page['entry']['upload_tree'].get('scope') == 'container'
+                            and _proactive_upload_receiver(page, resume_path)
+                            and not uploaded and not session.upload_attempted
+                            and (producer_guard is None or (
+                                not producer_guard.upload_attempted
+                                and not producer_guard.upload_completed))):
+                        # Issue FF-224e: every model-intent trigger (upload decision,
+                        # upload-control click, Submit) waited for the model, which
+                        # kept finding another route to the PDF guard. The one
+                        # server-owned upload runs before the first decision, after
+                        # the owner gate, so a pending owner question still wins.
+                        # A résumé field rendered after that point still reaches
+                        # those triggers, under the same one-upload terms.
+                        result = await _reversible_recover_upload(
+                            session, page, provenance=provenance, allowed=allowed,
+                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        uploaded = True
+                        history.append(result)
+                        page = await session.page()
+                        step['url'] = page['url']
+                        if not allowed(page['url']):
+                            raise _navigation_gate(
+                                'Upload redirected to an unrelated job or tenant.',
+                                url, page.get('url'), provenance=provenance)
+                        continue
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, model_history, model=model)
+                    decided = True
                     model_upload_feedback = ''
                     verb = action.get('action')
+                    if (verb == 'click' and action.get('selector')
+                            and isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'
+                            and _boolean_pair_member(page, action['selector'])):
+                        # Issue FF-224e: a Yes/No answer button clicked directly
+                        # reached the final guard as an unclassified click. It is
+                        # the guarded boolean choice, routed by its question key,
+                        # which is what the choice grant is recorded under.
+                        clicked = next(c for c in page['controls']
+                                       if c.get('selector') == action['selector'])
+                        action = {'action': 'choose', 'selector': action['selector'],
+                                  'fact': clicked['question']}
+                        verb = 'choose'
                     if verb == 'click' and ctx is not None and action.get('selector'):
                         candidate = control(page, action, 'decision-initial')
                         if is_submission(candidate) or native_submit(candidate):

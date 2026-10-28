@@ -6,6 +6,9 @@ raw producer treated the click as possibly committing and refused it at the
 final guard for the missing row PDF. A click on a member of the structural
 upload tree is an upload request: it runs the one-shot guarded upload and is
 never dispatched. These cases run the real raw producer (no fixture context).
+
+FF-224e uploads before the first decision, so this path is the fallback for a
+résumé field rendered after it: the first decision waits, then the field appears.
 """
 from copy import deepcopy
 import logging
@@ -13,7 +16,8 @@ import logging
 import pytest
 
 from tools import browser_skill_apply as forms
-from tests.tools.test_ashby_upload_fixture import _no_production_commit, _production_submit_click
+from tests.tools.test_ashby_upload_fixture import (
+    WAIT, _no_production_commit, _production_submit_click)
 
 INNER = '#dropzone-attach'
 
@@ -57,11 +61,12 @@ async def test_upload_control_click_uploads_once_never_clicks_then_meets_the_gua
             return result
 
         raw.call = keep_inner_button
-    result = await run_apply([{'action': 'click', 'selector': selector}, click])
+    result = await run_apply([WAIT, {'action': 'click', 'selector': selector}, click],
+                             late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
     assert 'Unverified or changed form value' in result['question'], result
-    assert decide.await_count == 2
+    assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
@@ -75,7 +80,7 @@ async def test_second_upload_control_click_does_not_upload_again(monkeypatch, tm
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     dropzone = {'action': 'click', 'selector': '#dropzone'}
-    result = await run_apply([dropzone, dropzone, click])
+    result = await run_apply([WAIT, dropzone, dropzone, click], late=True)
     assert result['status'] == 'gate', result
     guard = transport._application_controller
     assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
@@ -93,10 +98,11 @@ async def test_non_upload_button_click_still_meets_the_final_guard(monkeypatch, 
         dropzone = next(c for c in page['controls'] if c['selector'] == '#dropzone')
         page['controls'].append({**deepcopy(dropzone), 'selector': '#autofill-pane',
                                  'label': 'Autofill from resume'})
-    result = await run_apply([{'action': 'click', 'selector': '#autofill-pane'}])
+    result = await run_apply([WAIT, {'action': 'click', 'selector': '#autofill-pane'}],
+                             late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF has not been verified' in result['question']
-    assert decide.await_count == 1 and uploads == []
+    assert decide.await_count == 2 and uploads == []
     [line] = _pdf_lines(caplog)
     assert line.endswith('target=button/button submit_control=False private=True '
                          'upload_tree_member=False label_class=autofill'), line

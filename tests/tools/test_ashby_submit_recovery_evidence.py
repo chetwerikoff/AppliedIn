@@ -8,6 +8,9 @@ of a prefilled page: the raw producer sends every unclassified click on a page
 with private values to the final guard, while the upload recovery only runs
 for a Submit decision. These tests pin the two log lines that tell those paths
 apart and keep the refusal itself unchanged: the logs are evidence, not a gate.
+
+FF-224e uploads before the first decision, so these paths remain only for a
+résumé field rendered after it: the first decision waits, then the field appears.
 """
 import logging
 from pathlib import Path
@@ -15,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from tools import browser_skill_apply as forms
-from tests.tools.test_ashby_upload_fixture import _no_production_commit, _production_submit_click
+from tests.tools.test_ashby_upload_fixture import (
+    WAIT, _no_production_commit, _production_submit_click)
 
 
 def _lines(caplog, prefix):
@@ -43,10 +47,10 @@ async def test_non_submit_first_click_reaches_pdf_guard_and_says_so(
     caplog.set_level(logging.INFO, logger=forms.__name__)
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
-    result = await run_apply([{'action': 'click', 'selector': selector}])
+    result = await run_apply([WAIT, {'action': 'click', 'selector': selector}], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF has not been verified' in result['question']
-    assert decide.await_count == 1 and uploads == []
+    assert decide.await_count == 2 and uploads == []
     pk = transport._application_controller.pk
     assert _lines(caplog, 'final pdf guard') == [
         f'final pdf guard pk={pk} attempted=False completed=False pending=False '
@@ -64,10 +68,10 @@ async def test_submit_click_recovers_and_a_later_submit_names_the_skipped_term(
     caplog.set_level(logging.INFO, logger=forms.__name__)
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
-    result = await run_apply([click, click])
+    result = await run_apply([WAIT, click, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert len(uploads) == 1 and decide.await_count == 2
+    assert len(uploads) == 1 and decide.await_count == 3
     pk = transport._application_controller.pk
     assert _lines(caplog, 'submit recovery skipped') == [
         f'submit recovery skipped pk={pk} term=not_uploaded']

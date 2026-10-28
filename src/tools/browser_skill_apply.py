@@ -3198,10 +3198,26 @@ def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool
         if (type(index) is not int or not 0 <= index < len(nodes)
                 or not isinstance(nodes[index].get('selector'), str)):
             raise Gate('The exact passive attached-file item was not proven.')
-        delete_selector = nodes[index]['selector']
+        # upload_tree masks an element id with the original 128-bit JS
+        # signature; root.excluded uses its actual selector. Do not interpret
+        # the masked tree node as an actionable CSS selector.
         exclusions = pre_root.get('excluded')
-        if (not isinstance(exclusions, list)
-                or post_root.get('excluded') != [*exclusions, delete_selector]
+        post_exclusions = post_root.get('excluded')
+        if (not isinstance(exclusions, list) or not isinstance(post_exclusions, list)
+                or len(post_exclusions) != len(exclusions) + 1
+                or post_exclusions[:-1] != exclusions):
+            raise Gate('The attached-file passive delete is not excluded.')
+        delete_selector = post_exclusions[-1]
+        mask = nodes[index].get('selector')
+        matched = mask == delete_selector
+        match = re.fullmatch(r'#([A-Za-z_][A-Za-z0-9_-]{0,127})', delete_selector)
+        if match:
+            seeds = [2166136261, 2246822519, 3266489917, 668265263]
+            for char in match.group(1):
+                seeds = [((h ^ ord(char)) * (16777619 + i * 2)) & 0xffffffff
+                         for i, h in enumerate(seeds)]
+            matched = matched or mask == '#' + ''.join(f'{h:08x}' for h in seeds)
+        if (not matched
                 or delete_selector in {c.get('selector') for c in after['controls']}
                 or delete_selector in {c.get('selector') for c in
                                        after['entry']['root_evidence']}):
@@ -7526,8 +7542,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))
                         if (retention_before is not None
-                                and result.get('selector') == target['selector']
-                                and target['selector'] in filled):
+                                and result.get('selector') == target['selector']):
                             retention_after = await _reversible_retained_pair(
                                 session, [target['selector']], provenance=provenance,
                                 allowed=allowed)

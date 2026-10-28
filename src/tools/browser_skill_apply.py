@@ -7092,6 +7092,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     trusted_origins = (url, direct_url)
     step = {'last_button': '', 'url': url}
     filled, history = {}, []
+    retained = {}
     uploaded = False
     session = None
     page = None
@@ -7384,6 +7385,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
+                        if isinstance(session, _ReversibleEntryReader):
+                            await _reversible_retain_before_click(
+                                session, retained, provenance=provenance,
+                                allowed=allowed, filename=Path(resume_path).name)
                         if (ctx is None and (producer_guard is None or
                                 getattr(raw_session, '_application_controller', None) is not producer_guard)):
                             raise Gate('Application Submit lacks a bound raw IPC guard; no click is safe.')
@@ -7477,7 +7482,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     'step': context['step']}
                     else:
                         target = control(page, action, 'decision-action')
+                        retention_before = None
+                        if (isinstance(session, _ReversibleEntryReader)
+                                and verb in {'fill', 'select', 'choose', 'combobox'}):
+                            retention_before = await _reversible_retained_pair(
+                                session, [target['selector']], provenance=provenance,
+                                allowed=allowed)
                         if verb == 'click':
+                            if isinstance(session, _ReversibleEntryReader):
+                                await _reversible_retain_before_click(
+                                    session, retained, provenance=provenance,
+                                    allowed=allowed, filename=Path(resume_path).name)
                             # Reversible pre-private preparation need not borrow
                             # Submit authority. Once this click might commit,
                             # no unmediated Session may fall through to raw IPC.
@@ -7505,6 +7520,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if verb == 'click':
                             step['last_button'] = target['label']
                         uploaded = uploaded or bool(result.get('uploaded'))
+                        if (retention_before is not None
+                                and result.get('selector') == target['selector']
+                                and target['selector'] in filled):
+                            retention_after = await _reversible_retained_pair(
+                                session, [target['selector']], provenance=provenance,
+                                allowed=allowed)
+                            if (retention_before.keys() != retention_after.keys()
+                                    or any(retention_before[key]['identity'] !=
+                                           retention_after[key]['identity']
+                                           for key in retention_before)):
+                                raise Gate('receiver outside root or foreign native receiver; '
+                                           'native form receiver not proven.')
+                            retained.update(retention_after)
                         history.append(result)
                     page = await session.page()
                     step['url'] = page['url']

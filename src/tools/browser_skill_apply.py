@@ -1924,10 +1924,22 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             or provenance.ats != 'ashby'
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
         raise Gate('formless structural recipient not proven; inspect manually.')
-    if root.get('error'):
+    sibling_mismatch = root.get('error') == 'application root sibling identity mismatch'
+    if root.get('error') and not sibling_mismatch:
         raise Gate(root['error'] + '; inspect the application manually.',
                    reason='defect_structural' if root['error'].startswith('unsupported') else 'defect_ashby_root_identity')
-    if not root.get('root'):
+    if sibling_mismatch:
+        # Only the historic wrapper/inside certificates are unavailable on this
+        # exact shape. The independent container census and unchanged Submit
+        # predicates below still own the final irreversible decision.
+        excluded = root.get('excluded')
+        if (root.get('root') or not root.get('pane') or not root.get('container')
+                or not root.get('submit') or root.get('truncated')
+                or not isinstance(excluded, list)
+                or any(not isinstance(selector, str) for selector in excluded)):
+            raise Gate('application root sibling identity mismatch; inspect the application manually.',
+                       reason='defect_ashby_root_identity')
+    elif not root.get('root'):
         raise _EntryNotReady('no unique application root')
     evidence = (page.get('entry') or {}).get('root_evidence')
     if (root.get('truncated') or not isinstance(evidence, list) or not evidence
@@ -1937,6 +1949,8 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     if len(set(selectors)) != len(selectors) or any(not c.get('unique') for c in evidence):
         raise Gate('ambiguous application root control identity; inspect manually.',
                    reason='defect_structural')
+    if sibling_mismatch and sum(c.get('submit') is True for c in evidence) != 1:
+        raise Gate('exact structural submit changed; inspect manually.')
     ignored = set()
     for owner in {c.get('native_owner') for c in evidence if c.get('native_owner')}:
         siblings = [c for c in page['controls'] if c.get('form_selector') == owner]
@@ -1950,7 +1964,9 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             continue
         if c.get('native_owner') or c.get('declared_owner') or c.get('formaction') is not None:
             raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
-        if not c.get('inside'):
+        if (sibling_mismatch and c['selector'] in excluded):
+            raise Gate('candidate control outside application container; inspect manually.')
+        if not c.get('inside') and not sibling_mismatch:
             raise Gate('exact submit outside root' if c.get('submit') else
                        'receiver outside root' if c.get('type') == 'hidden' else
                        'candidate control outside root')

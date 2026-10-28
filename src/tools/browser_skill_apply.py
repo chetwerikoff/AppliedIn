@@ -7284,6 +7284,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 raise Gate('The exact passive résumé attachment did not remain proven.')
                             uploaded = True
                             history.append(result)
+                        elif (isinstance(session, _ReversibleEntryReader)
+                              and isinstance(provenance, ApplicationEntryProvenance)
+                              and provenance.ats == 'ashby'
+                              and _formless_root(page) and not uploaded
+                              and not session.upload_attempted
+                              and (producer_guard is None or (
+                                  not producer_guard.upload_attempted
+                                  and not producer_guard.upload_completed))):
+                            result = await _reversible_recover_upload(
+                                session, page, provenance=provenance, allowed=allowed,
+                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                            # Receipt/history are local only after independent
+                            # settled passive attachment and exact _upload_delta.
+                            uploaded = True
+                            history.append(result)
                         else:
                             before = page
                             step['last_button'] = target.get('label', '')

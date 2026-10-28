@@ -706,7 +706,7 @@ def mismatch_snapshot(authority, *, attached=False, pending=False, changes=None)
     name = Path(authority.resume_path).name
     params = ({'attached': True, 'files': [name], 'displayName': name}
               if attached else {'disabledDrop': True, 'files': [name]} if pending else {})
-    pair = observed(sibling=True, **(changes or {}), **params)
+    pair = observed(movePane=True, **(changes or {}), **params)
     for page in pair:
         page['url'] = fixture.URL
         for c in page['controls'] + page['entry']['root_evidence']:

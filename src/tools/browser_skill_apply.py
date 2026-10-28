@@ -3026,7 +3026,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
     # recovery caller, never to general reversible field admission.
     file_only = (clipped_file and e.get('id') == '_systemfield_resume'
                  and e.get('type') == target.get('type') == 'file'
-                 and target.get('id') == '_systemfield_resume')
+                 and target.get('selector') == e.get('selector'))
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3109,7 +3109,7 @@ def _reversible_upload_structure(page: dict, selector: str, *, empty: bool,
     original = _upload_input(page, tree)
     candidates = [c for c in page.get('controls', [])
                   if c.get('selector') == selector and c.get('type') == 'file'
-                  and c.get('id') == '_systemfield_resume']
+                  and c.get('tag') == 'input']
     if (len(candidates) != 1 or original['selector'] != selector
             or original.get('in_container') is not True
             or original.get('unique') is not True
@@ -3256,7 +3256,7 @@ def _reversible_retained_certificate(page: dict, selector: str, *,
     if linked and member.get('type') != 'hidden':
         raise Gate('receiver outside root or foreign native receiver; native form receiver not proven.')
     if file and (original.get('type') != 'file' or
-                 original.get('id') != '_systemfield_resume'):
+                 member.get('id') != '_systemfield_resume'):
         raise Gate('Original semantic résumé input is no longer proven.')
     def stable(control):
         return tuple((key, repr(control.get(key))) for key in _RETENTION_STABLE_KEYS)
@@ -3380,7 +3380,7 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
                 or getattr(proxy, '_original_raw', None) is not raw_session):
             raise Gate('The reversible synthetic closed facade/controller binding is unavailable.')
     verify_dispatch()
-    selector = next((c['selector'] for c in page['controls']
+    selector = next((c['selector'] for c in (page.get('entry') or {}).get('root_evidence', [])
                      if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
                      and re.search(r'resume|résumé|cv', label(c), re.I)), '')
     if not selector or sum(c.get('type') == 'file' and

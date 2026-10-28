@@ -7340,12 +7340,43 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
                         and page['entry']['upload_tree'].get('scope') == 'container')
                     if upload_container_mismatch:
+                        # Issue #230: the model never chooses Submit while the résumé
+                        # field is empty, so deferring its upload to Submit looped
+                        # until the repeat gate. Its upload decision takes the same
+                        # one-shot recovery, under the Submit-time preconditions.
+                        skipped = next((name for name, held in (
+                            ('not_uploaded', lambda: not uploaded),
+                            ('session_upload_not_attempted', lambda: not session.upload_attempted),
+                            ('producer_upload_not_attempted', lambda: producer_guard is None
+                                or not producer_guard.upload_attempted),
+                            ('producer_upload_not_completed', lambda: producer_guard is None
+                                or not producer_guard.upload_completed)) if not held()), None)
+                        if skipped is None:
+                            result = await _reversible_recover_upload(
+                                session, page, provenance=provenance, allowed=allowed,
+                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
+                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                            uploaded = True
+                            history.append(result)
+                            page = await session.page()
+                            step['url'] = page['url']
+                            if not allowed(page['url']):
+                                raise _navigation_gate(
+                                    'Upload redirected to an unrelated job or tenant.',
+                                    url, page.get('url'), provenance=provenance)
+                            continue
+                        _LOG.info('upload recovery skipped pk=%s term=%s', pk, skipped)
                         model_upload_decisions += 1
                         if model_upload_decisions >= 3:
                             raise Gate('Repeated model résumé upload decisions; the server-owned '
-                                       'upload did not run. Continue with the remaining fields.')
+                                       'upload did not run. Continue with the remaining fields.'
+                                       if not uploaded else
+                                       'Repeated model résumé upload decisions after the server-owned '
+                                       'upload. Continue with the remaining fields.')
                         model_upload_feedback = (
                             '\nRésumé upload is server-owned on this page and runs before Submit; '
+                            'continue with the remaining fields.' if not uploaded else
+                            '\nThe résumé is already attached by the server; '
                             'continue with the remaining fields.')
                         continue
                     if action.get('selector'):

@@ -871,8 +871,11 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
 
 
 @pytest.mark.parametrize('transport', ['effect', 'call'])
-async def test_reversible_direct_model_upload_is_refused_before_chooser(
+async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
         authority, monkeypatch, transport):
+    """Issue #230: the model never chooses Submit while the résumé is empty, so
+    deferring its upload decision to Submit looped into the repeat gate live.
+    The decision itself now takes the one guarded recovery upload."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -889,16 +892,21 @@ async def test_reversible_direct_model_upload_is_refused_before_chooser(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
-    assert 'Résumé upload is server-owned on this page and runs before Submit; continue with the remaining fields.' in tasks[3]
-    assert authority.fills == 2 and authority.upload_ipc == 0
-    assert not raw.uploads
+    assert 'résumé attachment verified=True' in tasks[3]
+    assert 'runs before Submit' not in tasks[3]
+    assert authority.fills == 2 and authority.upload_ipc == 1 and authority.uploaded
+    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+                            authority.resume_path), {'timeout': 130})]
     assert authority.decisions == 4
     assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert not any(call[0] == 'click' for call in raw.calls)
 
 
 @pytest.mark.parametrize('transport', ['effect', 'call'])
-async def test_repeated_model_upload_feedback_gates_only_after_three_decisions(
+async def test_repeated_model_upload_after_recovery_never_uploads_twice(
         authority, monkeypatch, transport):
+    """After the one recovery upload, further model upload decisions only get
+    feedback, never a second chooser, and three of them still gate."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -909,23 +917,28 @@ async def test_repeated_model_upload_feedback_gates_only_after_three_decisions(
     _seed_mismatch_synthetic_owner_grants(authority, raw)
     tasks = []
     _script_recovery_decisions(
-        monkeypatch, first='upload', upload_decisions=3, tasks=tasks)
+        monkeypatch, first='upload', upload_decisions=4, after_upload='gate', tasks=tasks)
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate'
-    assert 'Repeated model résumé upload decisions' in result['question']
-    assert authority.decisions == 5 and len(tasks) == 5
-    assert authority.fills == 2 and authority.upload_ipc == 0
-    assert not raw.uploads
+    assert ('Repeated model résumé upload decisions after the server-owned upload'
+            in result['question'])
+    assert authority.decisions == 6 and len(tasks) == 6
+    assert 'The résumé is already attached by the server' in tasks[4]
+    assert authority.fills == 2 and authority.upload_ipc == 1
+    assert len(raw.uploads) == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert not any(call[0] == 'click' for call in raw.calls)
 
 
 @pytest.mark.parametrize('transport', ['effect', 'call'])
 async def test_reversible_upload_feedback_then_submit_recovery_never_clicks_submit1(
         authority, monkeypatch, transport):
-    """An earlier model upload request cannot make Submit1 commit after recovery."""
+    """After the upload decision's recovery, Submit is no second upload: it
+    meets the final guard with the PDF proven, which still refuses here on a
+    later check of this fixture, and nothing is clicked."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -940,8 +953,8 @@ async def test_reversible_upload_feedback_then_submit_recovery_never_clicks_subm
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate', result
-    assert 'Synthetic inspection without a second click' in result['question']
-    assert authority.decisions == 5 and authority.fills == 2
+    assert 'protected tailored PDF' not in result['question']
+    assert authority.decisions == 4 and authority.fills == 2
     assert authority.upload_ipc == 1 and authority.ipc_index == 3
     assert len(raw.uploads) == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0

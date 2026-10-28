@@ -958,14 +958,15 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
             return {}
         return await original_call(method, *args, **kwargs)
     raw.call = call
+    # Issue #230: the upload decision itself runs the one recovery upload, so
+    # the first Submit already meets the final value guard.
     decide.side_effect = [dict(action='upload', selector=file['selector']),
-                          dict(action='submit', selector=button['selector']),
                           dict(action='submit', selector=button['selector'])]
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
     assert 'Unverified or changed form value' in result['question'], result
-    assert decide.await_count == 3
+    assert decide.await_count == 2
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('upload', file['selector'], '--file',
          transport._application_controller.resume_path)]

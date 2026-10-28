@@ -301,7 +301,7 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
         monkeypatch, tmp_path, confirmed):
     """The real formless facade must reach the same production raw-IPC verdict."""
     from tests.tools.test_browser_formless import (
-        RootSession, observed, approve_fields, action_sequence,
+        RootSession, observed, approve_fields, action_sequence, effect_calls,
     )
 
     row, _, tracking, raw, _, pdf = _world(monkeypatch, tmp_path, ats='ashby')
@@ -337,9 +337,9 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
     monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
     result = await forms.apply(row['jd_url'], COMPANY, facts, 'synthetic',
                                pk=row['pk'], resume_path=pdf)
-    effects = [c[:2] for c in spy.calls if c[0] not in {'evaluate', 'navigate'}]
+    effects = [c[:2] for c in effect_calls(spy.calls)]
     assert effects == [('fill', '#_systemfield_name'), ('fill', '#_systemfield_email'),
-                       ('upload', '#dropzone'), ('click', '#structural-submit')], result
+                       ('set', Path(pdf).name), ('click', '#structural-submit')], result
     assert result['status'] == ('applied' if confirmed else 'uncertain'), result
     assert submit_hold.is_held(row['pk'], tracking=tracking)
     assert raw._application_controller.committed

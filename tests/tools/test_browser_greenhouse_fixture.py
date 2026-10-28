@@ -103,8 +103,7 @@ def test_fixture_run_always_executes_every_leg_even_after_failure(monkeypatch, c
     assert fixture.run() == 1
     assert calls == [{}, {'greenhouse': True}, {'greenhouse_empty_placeholder': True},
                      {'w_lookalike': True}, {'ashby': True}, {'ashby_upload': True},
-                     {'ashby_upload': True, 'ashby_upload_transient': True},
                      {'custom_question': 'radio'}, {'custom_question': 'checkbox'}]
     report = json.loads(capsys.readouterr().out)
     assert report['safe_gate'] is False
-    assert report['sessions'] == 9 and len(report['legs']) == 8 == len(calls) - 1
+    assert report['sessions'] == 8 and len(report['legs']) == 8 == len(calls)

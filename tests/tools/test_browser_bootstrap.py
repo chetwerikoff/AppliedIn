@@ -4964,11 +4964,11 @@ def test_every_production_observe_controls_caller_names_its_site():
         if kw is None:
             # Both bootstrap and execute preserve the two-argument seam for
             # fixed synthetic witness doubles; code-owned context supplies site.
-            assert (2720 <= node.lineno <= 2760 or
+            assert (2521 <= node.lineno <= 2561 or
                     4320 <= node.lineno <= 4360)
             continue
         if isinstance(kw, ast.Name):
-            assert kw.id == 'site' and 2720 <= node.lineno <= 2910
+            assert kw.id == 'site' and 2521 <= node.lineno <= 2711
         else:
             assert isinstance(kw, ast.Constant) and isinstance(kw.value, str) and kw.value
             literal_sites.append(kw.value)

@@ -13,7 +13,7 @@ import pytest
 from agent import run
 from tools import browser_skill_apply as forms
 from tests.tools.test_browser_application_entry import COMPANY, PK, dom, posting, entry
-from tests.tools.test_browser_formless import root_world, observed
+from tests.tools.test_browser_formless import effect_calls, observed, resume_set_name, root_world
 from tests.tools.test_browser_controller_support import install_controller_session
 
 
@@ -224,38 +224,19 @@ async def test_ambiguous_root_wins_over_open_required_location(monkeypatch, tmp_
                 if c['type'] == 'file' and c['label'] == 'Resume')
     submit = next(c for c in endpoint.current['controls']
                   if c['label'] == 'Submit application')
-    original_call = endpoint.call
-
-    async def keep_both_roots_after_upload(method, *args, **kwargs):
-        if method != 'upload':
-            return await original_call(method, *args, **kwargs)
-        assert args[0] == file['selector'] and args[1] == '--file'
-        assert kwargs == {'timeout': 130}
-        endpoint.calls.append((method, *args))
-        refreshed = observed(
-            missingPane=True, secondFormlessComplete=True, attached=True,
-            files=[Path(args[2]).name], displayName=Path(args[2]).name)
-        for earlier, later in zip((endpoint.current, endpoint.fixed), refreshed):
-            later['controls'].extend(
-                deepcopy(c) for c in earlier['controls']
-                if c['selector'] in {'#location', '#start-date', '#boolean-yes',
-                                     '#boolean-no', '#certification'})
-        endpoint.current, endpoint.fixed = refreshed
-        return {}
-
-    endpoint.call = keep_both_roots_after_upload
     decision.side_effect = [
         {'action': 'upload', 'selector': file['selector']},
         {'action': 'submit', 'selector': submit['selector']},
     ]
     result = await _apply(pdf)
     assert result['status'] == 'gate', result
-    assert 'ambiguous application roots' in result['question'], result
+    # FF-224g: two roots leave no unique labelled receiver, so the model's
+    # upload is refused before the direct set; Location is still never asked.
+    assert 'missing unique labelled resume receiver' in result['question'], result
     assert result['reason'] != 'owner_question'
     assert result['form_question'] is None
-    assert decision.await_count == 2
-    assert [c[0] for c in endpoint.calls
-            if c[0] in {'fill', 'click', 'upload', 'select'}] == ['upload']
+    assert decision.await_count == 1
+    assert effect_calls(endpoint.calls) == []
 
 
 @pytest.mark.asyncio
@@ -796,12 +777,16 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
     page = endpoint.current
     model_calls, upload_grants = [], []
-    decision.side_effect = lambda *a, **k: model_calls.append(len(row.get(
-        'human_approved_answers') or {})) or forms.Gate('synthetic model stop')
+
+    def decide(*a, **k):
+        model_calls.append(len(row.get('human_approved_answers') or {}))
+        raise forms.Gate('synthetic model stop')
+
+    decision.side_effect = decide
     original_call = endpoint.call
 
     async def call(method, *args, **kwargs):
-        if method == 'upload':
+        if method == 'evaluate' and resume_set_name(args[0]):
             upload_grants.append(len(row.get('human_approved_answers') or {}))
         return await original_call(method, *args, **kwargs)
 
@@ -816,13 +801,11 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     assert boolean
     # FF-224e: the server-owned résumé upload runs before the first model
     # decision, but never ahead of an owner question: it starts only once
-    # every one is answered. FF-224f: this ended uncertain only because the
-    # chooser went to the clipped input, which this endpoint (like BrowserSkill)
-    # refuses. On the dropzone it runs; the endpoint then renders its base
-    # layout, not this census, so settlement refuses and the model is not reached.
+    # every one is answered. FF-224g: it is one direct set on the input, which
+    # reads back on the same node, so the model is reached only after it.
     assert upload_grants == [len(asked)]
-    assert [c[:2] for c in endpoint.calls if c[0] == 'upload'] == [('upload', '#dropzone')]
-    assert outcome['status'] == 'gate' and not model_calls
+    assert [c[0] for c in effect_calls(endpoint.calls)] == ['set']
+    assert outcome['status'] == 'gate' and model_calls == [len(asked)]
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
 
 
@@ -959,19 +942,17 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
     row, raw, decide, _ = root_world(monkeypatch, **spec)
     optional((raw.current, raw.fixed))
     transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-    file = next(c for c in raw.current['controls']
-                if c['type'] == 'file' and c['label'] == 'Resume')
     button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
     original_call = raw.call
 
     async def call(method, *args, **kwargs):
-        if method == 'upload':
+        name = resume_set_name(args[0]) if method == 'evaluate' else None
+        if name:
             raw.calls.append((method, *args))
-            name = Path(args[2]).name
             raw.current, raw.fixed = observed(
                 **spec, attached=True, files=[name], displayName=name)
             optional((raw.current, raw.fixed))
-            return {}
+            return {'value': {'set': True, 'files': [name]}}
         return await original_call(method, *args, **kwargs)
     raw.call = call
     # FF-224e: the one server upload runs before the first decision, so the
@@ -982,9 +963,8 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
     assert result['status'] == 'gate', result
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 1
-    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
-        ('upload', '#dropzone', '--file',
-         transport._application_controller.resume_path)]
+    assert effect_calls(raw.calls) == [
+        ('set', Path(transport._application_controller.resume_path).name)]
     assert not transport._application_controller.committed
 
 

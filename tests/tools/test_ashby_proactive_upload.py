@@ -13,6 +13,8 @@ final guard as an unclassified click. It now takes the guarded Boolean choice.
 The production cases run the real raw producer and controller (no fixture
 context) on the reversible Ashby route; nothing is clicked or committed.
 """
+from pathlib import Path
+
 import pytest
 
 from tools import browser_skill_apply as forms
@@ -39,55 +41,62 @@ async def test_upload_runs_once_before_the_first_decision(monkeypatch, tmp_path)
     assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
     assert seen == [(1, True)]
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
     _no_production_commit(raw, transport, row)
 
 
-async def test_chooser_opens_from_the_visible_dropzone_not_the_clipped_input(
-        monkeypatch, tmp_path, caplog):
-    """FF-224f: live, every resumed Ashby row ended uncertain two seconds after
-    bootstrap, before any decision. The upload was sent to the native résumé
-    input, which Ashby clips out of view. BrowserSkill opens a file chooser by
-    clicking a visible upload button, so it refused with no effect; past the
-    effect edge, any refusal is terminal uncertain (pinned below), so the row
-    was held. The chooser opener is the visible dropzone, as on the entry route.
-
-    The fake CLI here does what the real one does: only the opener works."""
-    import logging
-    from tools.browser_skill import Unavailable
-
+async def test_upload_is_a_direct_set_on_the_clipped_input_with_no_chooser(
+        monkeypatch, tmp_path):
+    """FF-224g: BrowserSkill opens a file chooser by clicking an opener, and
+    live Ashby clips the input and varies the opener, so every chooser design
+    (PRs 227 to 238) stopped at the résumé. The upload is now one direct file
+    set on the exact input, and the producer records it from its own readback.
+    The fake CLI fails any chooser upload, as no chooser may run here."""
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     tree = raw.current['entry']['upload_tree']
-    opener = tree['nodes'][tree['dropzone']]['target_selector']
-    clipped = tree['nodes'][tree['input']]['target_selector']
-    assert opener != clipped
-    upload = raw.call
-
-    async def cli(method, *args, **kwargs):
-        if method == 'upload' and args[0] != opener:
-            uploads.append((method, *args))
-            refusal = Unavailable('BrowserSkill operation unavailable: file_input_not_activated')
-            refusal.code, refusal.effect_state = 'file_input_not_activated', 'none'
-            raise refusal
-        return await upload(method, *args, **kwargs)
-
-    raw.call = cli
-    seen = []
-
-    def first_decision(task, *_args, **_kwargs):
-        seen.append('résumé attachment verified=True' in task)
-        return STOP
-
-    with caplog.at_level(logging.INFO, logger=forms.__name__):
-        result = await run_apply(first_decision)
-    assert 'upload interrupted' not in caplog.text
+    assert tree['nodes'][tree['input']]['target_selector'] == forms._ASHBY_RESUME_SELECTOR
+    result = await run_apply([STOP])
     assert result['status'] == 'gate' and 'Synthetic next decision' in result['question'], result
-    assert seen == [True]
     guard = transport._application_controller
-    assert uploads == [('upload', opener, '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
+    assert not [c for c in raw.calls if c[0] == 'upload']
     assert guard.upload_completed and guard.upload_identity is not None
+    _no_production_commit(raw, transport, row)
+
+
+async def test_an_incomplete_upload_tree_no_longer_stops_the_upload(monkeypatch, tmp_path):
+    """FF-224g: live, the run gated on 'Incomplete or overflowing upload
+    structural witness' before any upload, because the DOM upload tree read
+    complete=false. The direct set reads no upload tree."""
+    run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path)
+    for page in (raw.current, raw.fixed):
+        page['entry']['upload_tree']['complete'] = False
+    result = await run_apply([STOP])
+    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question'], result
+    guard = transport._application_controller
+    assert uploads == [('set', Path(guard.resume_path).name)] and guard.upload_completed
+    _no_production_commit(raw, transport, row)
+
+
+async def test_set_that_does_not_read_back_is_a_gate_not_uncertain(monkeypatch, tmp_path):
+    """The set ran but the input does not hold the row PDF's name: a normal
+    Gate, and the producer records no upload for the final guard."""
+    async def unread():
+        return {'value': {'set': True, 'files': []}}
+
+    run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path, upload=unread)
+    result = await run_apply([STOP])
+    assert result['status'] == 'gate', result
+    assert result['question'].startswith(
+        'The uploaded résumé was not proven in the current file input.'), result
+    guard = transport._application_controller
+    assert len(uploads) == 1 and decide.await_count == 0
+    assert guard.upload_attempted and not guard.upload_completed
+    assert guard.upload_identity is None
     _no_production_commit(raw, transport, row)
 
 
@@ -127,7 +136,7 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     assert 'protected tailored PDF' not in result['question']
     assert decide.await_count == len(later)
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     _no_production_commit(raw, transport, row)
 
 

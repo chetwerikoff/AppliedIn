@@ -644,30 +644,44 @@ async def test_new_confirmation_needs_exact_route_and_independent_witness(monkey
 
 
 @pytest.mark.asyncio
-async def test_formless_upload_producer_binds_dropzone_to_exact_file_input(
+async def test_formless_resume_set_producer_admits_only_its_own_exact_set(
         monkeypatch, tmp_path):
-    """The structural chooser IPC names a dropzone, never an arbitrary file target."""
-    from tests.tools.test_browser_formless import observed
+    """FF-224g: the producer admits only the direct set built from its own row
+    PDF, and records the upload only from its own readback of the exact input."""
+    from tests.tools.test_browser_formless import observed, set_resume_files
 
-    page, _ = observed()
+    page, fixed = observed()
     pdf = tmp_path / "Resume.pdf"
     pdf.write_bytes(b"%PDF-1.4\\nsynthetic row document\\n")
     controller = _controller(resume_path=str(pdf))
     identity = ("row", "seed", controller.expected_digest)
     monkeypatch.setattr(controller, "_row_pdf", lambda: identity)
+    monkeypatch.setattr(controller, "_row", lambda: {"ats": "ashby"})
     session, calls = await _setup(monkeypatch, page, controller)
 
+    async def fake_command(*argv, **kwargs):
+        calls.append((argv, kwargs))
+        set_resume_files((page, fixed), pdf.name)
+        return {"value": {"set": True, "files": [pdf.name]}}
+
+    monkeypatch.setattr(bsk, "command", fake_command)
+    other = forms._resume_file_set_script(pdf.name, b"%PDF-1.4 other bytes")
+    with pytest.raises(forms.Gate, match="executable or effectful IPC is forbidden"):
+        await session.application_effect("evaluate", other)
     with pytest.raises(forms.Gate, match="exact protected PDF file input"):
         await session.application_effect(
-            "upload", "#untrusted-drop", "--file", str(pdf), timeout=130)
-    assert calls == []
+            "upload", "#dropzone", "--file", str(pdf), timeout=130)
     with pytest.raises(forms.Gate):
         await session.application_effect("click", "#dropzone")
-    assert calls == []
-    await session.application_effect(
-        "upload", "#dropzone", "--file", str(pdf), timeout=130)
-    assert [entry[0][:2] for entry in calls] == [("upload", "#dropzone")]
+    assert calls == [] and not controller.upload_attempted
+    script = forms._resume_file_set_script(pdf.name, pdf.read_bytes())
+    await session.application_effect("evaluate", script)
+    assert [entry[0][:2] for entry in calls] == [("evaluate", script)]
     assert controller.upload_completed is True
+    assert controller.upload_identity == identity
+    with pytest.raises(forms.Gate, match="already attempted"):
+        await session.application_effect("evaluate", script)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(("required", "value", "has_value", "receipt", "reason"), [

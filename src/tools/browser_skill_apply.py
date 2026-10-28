@@ -2056,115 +2056,40 @@ def _upload_tree(page):
             raise Gate('Original upload input/container/dropzone is ambiguous.')
     return tree
 
-def _upload_shape(tree, removed=()):
-    # Re-key edges after the sole allowed insertion/removal, never selectors.
-    nodes, kept, output = tree['nodes'], {}, []
-    removed = set(removed)
-    for i, node in enumerate(nodes):
-        if i in removed or node['parent'] in removed:
-            removed.add(i)
-            continue
-        kept[i] = len(output)
-        output.append((kept.get(node['parent'], -1), node.get('tag'),
-                       node.get('attrs'), node.get('text')))
-    return output
+
+_ASHBY_RESUME_SELECTOR = '#_systemfield_resume'
 
 
-def _upload_input(page, tree):
-    selector = tree['nodes'][tree['input']]['target_selector']
-    matches = [c for c in page['entry']['root_evidence']
-               if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
-               and c.get('selector') == selector]
-    if len(matches) != 1:
-        raise Gate('Original semantic résumé input is no longer proven.')
-    return matches[0]
+def _resume_file_set_script(filename: str, data: bytes) -> str:
+    """The one code-owned direct file set on the exact Ashby résumé input.
+
+    Issue FF-224g: BrowserSkill's upload verb opens a file chooser by clicking
+    an opener. Live Ashby clips the input and varies the opener (a retained
+    file item, a hidden or replaced dropzone), so each chooser design stopped
+    at the résumé, and the structural witness it needed failed first. Setting
+    the files on the input itself needs no opener and no witness. The
+    application Chrome exposes no CDP for DOM.setFileInputFiles, so the File
+    is built in the page from the row PDF's own bytes.
+    """
+    import base64
+    import json
+    payload = json.dumps({'selector': _ASHBY_RESUME_SELECTOR, 'name': filename,
+                          'data': base64.b64encode(data).decode('ascii')})
+    return ('(() => { const p = ' + payload + ';'
+            ' const inputs = document.querySelectorAll(p.selector);'
+            " if (inputs.length !== 1 || inputs[0].type !== 'file')"
+            ' return {set: false, files: null};'
+            ' const input = inputs[0], raw = atob(p.data);'
+            ' const bytes = new Uint8Array(raw.length);'
+            ' for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);'
+            ' const transfer = new DataTransfer();'
+            " transfer.items.add(new File([bytes], p.name, {type: 'application/pdf'}));"
+            ' input.files = transfer.files;'
+            " input.dispatchEvent(new Event('input', {bubbles: true}));"
+            " input.dispatchEvent(new Event('change', {bubbles: true}));"
+            ' return {set: true, files: Array.from(input.files, f => f.name)}; })()')
 
 
-def _upload_candidates(page):
-    evidence = (page.get('entry') or {}).get('root_evidence')
-    if (not isinstance(evidence, list)
-            or any(not isinstance(control, dict) for control in evidence)):
-        raise Gate('Original semantic résumé input is no longer proven.')
-    originals = [control for control in evidence
-                 if control.get('id') == '_systemfield_resume'
-                 and control.get('type') == 'file']
-    if len(originals) != 1:
-        raise Gate('Original semantic résumé input is no longer proven.')
-    original = originals[0]
-    original_semantics = {key: value for key, value in original.items()
-                         if key not in {'selector', 'label_selector', 'files',
-                                        'value', 'has_value'}}
-    candidates = [{key: value for key, value in control.items()
-                   if key not in {'selector', 'label_selector', 'files'}}
-                  for control in evidence
-                  if control is not original and control.get('dropzone') is not True]
-    return original_semantics, candidates
-
-
-def _upload_delta(before, after, filename):
-    pre, post = _upload_tree(before), _upload_tree(after)
-    current = _upload_input(after, post)
-    if _formless_root(before) != _formless_root(after) or before['url'] != after['url']:
-        raise Gate('Original application root or submit changed during upload.')
-    # Candidate semantics and values must survive positional selector re-keying.
-    def candidates(page):
-        original = _upload_input(page, _upload_tree(page))
-        # The chooser sets fakepath/value flags; only this verified input may change them.
-        return [{k: v for k, v in c.items()
-                 if k not in {'selector', 'label_selector', 'files'}
-                 and (c is not original or k not in {'value', 'has_value'})}
-                for c in page['entry']['root_evidence']]
-    if candidates(before) != candidates(after):
-        raise Gate('Application control semantics changed during upload.')
-    unchanged_pending = (_upload_shape(pre) == _upload_shape(post)
-                         and not post.get('items'))
-    if unchanged_pending and current.get('files') == []:
-        return False
-    if current.get('files') != [filename]:
-        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
-    if unchanged_pending:
-        return False
-    if (pre.get('items') or not post.get('attached') or post.get('filename') != filename
-            or len(post.get('items', [])) != 1):
-        raise Gate('The exact passive attached-file item was not proven.')
-    # Retained input, dropzone and container are bound by their original subtree,
-    # semantic input ID and the independently observed complete ordered tree.
-    target = _upload_shape(post, post['items'])
-    removals = [()]
-    if len(pre.get('svgs', [])) == 1 and not post.get('svgs'):
-        removals.append(pre['svgs'])
-    if any(_upload_shape(pre, icons) == target for icons in removals):
-        return True
-    # Ashby also flattens one text-only span inside the original dropzone.
-    # Compare each single collapse, never repeatedly normalize arbitrary markup.
-    nodes = pre['nodes']
-    children = [[] for _ in nodes]
-    inside = set()
-    for i, node in enumerate(nodes):
-        if node['parent'] >= 0:
-            children[node['parent']].append(i)
-        if node['parent'] == pre['dropzone'] or node['parent'] in inside:
-            inside.add(i)
-    for inner in inside:
-        outer = nodes[inner]['parent']
-        if (nodes[inner]['tag'] != 'span' or outer not in inside
-                or nodes[outer]['tag'] != 'span' or children[outer] != [inner]
-                or len(children[inner]) != 1):
-            continue
-        text = children[inner][0]
-        if nodes[text]['tag'] != '#text' or children[text]:
-            continue
-        collapsed = dict(pre, nodes=[dict(node) for node in nodes])
-        collapsed['nodes'][text]['parent'] = outer
-        if any(_upload_shape(collapsed, [inner, *icons]) == target for icons in removals):
-            return True
-    raise Gate('Unexpected structural mutation during résumé attachment; inspect manually.')
-
-
-
-# Keep unknown iframe diagnostics structural and free of URL payloads.
-# Each other path component may be a posting/account identifier or token.
-# Exact known-safe public provider hosts, never tenant-controlled suffixes.
 _FRAME_SAFE_ORIGIN_HOSTS = frozenset({
     'newassets.hcaptcha.com', 'www.recaptcha.net', 'www.google.com',
     'jobs.ashbyhq.com', 'jobs.lever.co',
@@ -2373,11 +2298,6 @@ def _entry_safety(page, allowed, provenance, *, readiness=False):
 
 _ASHBY_WAIT_SECONDS = 90.0
 
-def _upload_clock():
-    return asyncio.get_running_loop().time()
-
-_upload_sleep = asyncio.sleep
-
 class _EntrySession:
     """Route every nested reader through scoped scripts and fresh authority."""
     def __init__(self, raw, allowed, provenance, step=None, *, resume_path='',
@@ -2389,129 +2309,13 @@ class _EntrySession:
         self._readiness = False
         self.on_committing_click = None
         self.upload_attempted = False
-        self.upload_pending = False
-        self.upload_result = None
         self.resume_path = resume_path
 
     async def page(self):
         result = await self.call('evaluate', ENTRY_PAGE)
         return result['value']
 
-    async def _upload_pair(self, *, settle_before=None):
-        try:
-            page = await self.page()
-            fixed = (await self.call('evaluate', _FIXED_CONTROL_WITNESS)).get('value')
-            _inventory_ok(page)
-            if settle_before is not None:
-                # A split read cannot mask a definitive change on either witness.
-                # The opaque upload subtree is deliberately not root identity.
-                filename = Path(self.resume_path).name
-                for witness in (page, fixed):
-                    previous_root, current_root = _formless_root(settle_before), _formless_root(witness)
-                    if (previous_root and current_root and previous_root.get('submit') != current_root.get('submit')):
-                        raise Gate('exact structural submit changed during upload.')
-                    if (witness.get('url') != settle_before['url'] or current_root != previous_root):
-                        raise Gate('Original application root or submit changed during upload.')
-                    evidence = witness['entry']['root_evidence']
-                    original = next(c for c in evidence
-                                    if c.get('id') == '_systemfield_resume'
-                                    and c.get('type') == 'file')
-                    if original.get('files') not in ([], [filename]):
-                        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
-                    tree = (witness.get('entry') or {}).get('upload_tree')
-                    if not isinstance(tree, dict) or type(tree.get('complete')) is not bool:
-                        raise Gate('Incomplete or overflowing upload structural witness; inspect manually.')
-                    if (tree.get('filename') not in (None, '', filename)
-                            or (tree.get('items') and tree.get('attached') is not True)):
-                        raise Gate('The exact passive attached-file item was not proven.')
-                    if tree['complete'] is True:
-                        _upload_tree(witness)
-                    if _upload_candidates(settle_before) != _upload_candidates(witness):
-                        raise Gate('Application control semantics changed during upload.')
-            if (fixed.get('url') != page.get('url')
-                    or fixed.get('entry') != page.get('entry')):
-                if (settle_before is not None
-                        and page.get('url') == fixed.get('url') == settle_before['url']):
-                    return None  # Entry-only disagreement cannot prove attachment.
-                raise Gate('Upload PAGE/fixed structural witness disagreement.',
-                           reason='defect_witness')
-        except Gate:
-            raise
-        except Exception:
-            raise Gate('Upload structural/file witness is unavailable; inspect the attachment '
-                       'manually. No automatic repeat was attempted.') from None
-        return page
-
-    async def _upload(self, args, kwargs, selector):
-        if (self.upload_attempted or len(args) != 4 or args[2] != '--file'
-                or not isinstance(args[3], str) or not args[3] or args[3] != self.resume_path
-                or kwargs != {'timeout': 130}):
-            raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
-        before = await self._upload_pair()
-        tree = _upload_tree(before)
-        if self.fixture_context is not None and getattr(
-                self.fixture_context, 'ashby_upload_transient', False):
-            # Capture the validated pre-upload pair, not the last incidental PAGE.
-            from copy import deepcopy
-            self.fixture_context.upload_before_tree = deepcopy(tree)
-        original = _upload_input(before, tree)
-        if original['selector'] != selector or tree.get('items') or original.get('files') != []:
-            raise Gate('The original empty résumé input changed before upload.')
-        drop = tree['nodes'][tree['dropzone']]['target_selector']
-        if not drop or drop == selector:
-            raise Gate('The unique same-container upload dropzone is not proven.')
-        filename = Path(args[3]).name
-        self.upload_attempted = self.upload_pending = True
-        try:
-            try:
-                result = await _effect_call(self.raw, 'upload', drop, '--file', args[3], timeout=130)
-            except (Exception, asyncio.CancelledError) as exc:
-                if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
-                    raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
-                               "dedicated profile; inspect the attachment before retrying.") from None
-                definitive = False
-                if (isinstance(exc, bsk.Unavailable) and exc.code == 'unsupported'
-                        and exc.effect_state == 'none'):
-                    try:
-                        fresh = await self._upload_pair()
-                        fresh_tree = _upload_tree(fresh)
-                        definitive = (_upload_input(fresh, fresh_tree).get('files') == []
-                                      and _upload_shape(tree) == _upload_shape(fresh_tree)
-                                      and _root_identity(before) == _root_identity(fresh))
-                    except (Exception, asyncio.CancelledError):
-                        pass
-                if definitive:
-                    raise Gate('BrowserSkill upload unsupported with no effect; the original input '
-                               'is empty. Complete the attachment manually; no retry was attempted.') from None
-                raise Gate('The résumé upload outcome is unclear; inspect the attachment manually. '
-                           'No automatic repeat was attempted.') from None
-            deadline = _upload_clock() + 8.0
-            # Cancellation bounds even a hanging reader without its generic Exception
-            # handler converting deadline exhaustion into a human Gate.
-            async with asyncio.timeout(8.0):
-                while _upload_clock() < deadline:
-                    after = await self._upload_pair(settle_before=before)
-                    if _upload_clock() >= deadline:
-                        raise TimeoutError
-                    if after is None:
-                        await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
-                        continue
-                    post = (after.get('entry') or {}).get('upload_tree')
-                    opaque = isinstance(post, dict) and post.get('complete') is False
-                    if not opaque and _upload_delta(before, after, filename):
-                        self.formless_identity = _root_identity(after)
-                        self.upload_result = after
-                        return result
-                    await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
-            raise TimeoutError
-        finally:
-            self.upload_pending = False
-
     async def call(self, *args, **kwargs):
-        if self.upload_pending and (kwargs or args not in {
-                ('evaluate', ENTRY_PAGE), ('evaluate', _FIXED_CONTROL_WITNESS),
-                ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)}):
-            raise Gate('Only read-only observations are permitted during upload settling.')
         if args and args[0] != 'evaluate':
             if self.committing:
                 raise Gate('A possibly committing application action cannot be retried.')
@@ -2523,12 +2327,9 @@ class _EntrySession:
             if args[0] not in {'fill', 'select', 'upload', 'click'}:
                 raise Gate('Unsupported effectful application entry IPC.')
             if args[0] == 'upload' and root:
-                receivers = [c for c in (current.get('entry') or {}).get('root_evidence', [])
-                             if isinstance(c, dict) and c.get('selector') == selector
-                             and c.get('type') == 'file']
-                if len(receivers) != 1:
-                    raise Gate('unsupported root target forbidden at IPC producer.')
-                return await self._upload(args, kwargs, selector)
+                # Issue FF-224g: the Ashby résumé is attached only by the direct
+                # file set in _ashby_resume_upload; no chooser runs on this root.
+                raise Gate('unsupported root target forbidden at IPC producer.')
             current, _ = await _observe_controls(self, current, site='upload-root-readback')
             matches = [c for c in current.get('controls', [])
                        if c.get('selector') == selector]
@@ -2921,9 +2722,6 @@ class _ReversibleEntryReader:
     def __init__(self, raw):
         self.raw = raw
         self.upload_attempted = False
-        self.upload_pending = False
-        self.upload_before = None
-        self._upload_edge = None
 
     def __getattr__(self, name):
         # The production application_effect/controller are still owned by
@@ -2938,30 +2736,22 @@ class _ReversibleEntryReader:
         return page
 
     async def application_effect(self, *args, **kwargs):
-        if args and args[0] == 'upload' and self._upload_edge is not None:
-            return await self._delegated_upload(*args, **kwargs)
-        if args and args[0] == 'upload' and self.upload_attempted:
-            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
+        if args and args[0] == 'upload':
+            raise Gate(_REVERSIBLE_UPLOAD_REFUSAL)
         return await _effect_call(self.raw, *args, **kwargs)
-
-    async def _delegated_upload(self, *args, **kwargs):
-        edge = self._upload_edge
-        if edge is None or self.upload_attempted:
-            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
-        # Consume the one-shot edge before any await. A failed fresh witness
-        # cannot be reused to obtain a second or weaker chooser authorization.
-        self._upload_edge = None
-        return await edge(args, kwargs)
 
     async def call(self, *args, **kwargs):
         if args == ('evaluate', _FIXED_CONTROL_WITNESS):
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-        if args and args[0] == 'upload' and self._upload_edge is not None:
-            return await self._delegated_upload(*args, **kwargs)
-        if args and args[0] == 'upload' and self.upload_attempted:
-            raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
+        if args and args[0] == 'upload':
+            raise Gate(_REVERSIBLE_UPLOAD_REFUSAL)
         return await self.raw.call(*args, **kwargs)
 
+
+# Issue FF-224g: a chooser upload on this route was refused live (the input is
+# clipped) after its effect edge. The direct file set is the only attachment.
+_REVERSIBLE_UPLOAD_REFUSAL = ('Only the server-owned direct résumé file set may '
+                              'attach on this route.')
 
 # Live Ashby renders the autofill pane outside the container/Submit wrapper, so
 # the historic root certificate fails while the container and Submit stay
@@ -2982,8 +2772,7 @@ def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
 
 
 def _reversible_entry_recipient(page: dict, target: dict,
-                                witness: dict | None = None, *,
-                                clipped_file: bool = False) -> None:
+                                witness: dict | None = None) -> None:
     """Prove exact application membership using the independent ENTRY census."""
     root = _formless_root(page)
     entry = page.get('entry') or {}
@@ -3032,12 +2821,6 @@ def _reversible_entry_recipient(page: dict, target: dict,
                              and bool(target.get('question')))
     native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
                     or (entry_label and target.get('tag') == 'input'))
-    # The original native input is CSS-clipped while its independently visible
-    # linked dropzone is interactive. This exception belongs only to the exact
-    # recovery caller, never to general reversible field admission.
-    file_only = (clipped_file and e.get('id') == '_systemfield_resume'
-                 and e.get('type') == target.get('type') == 'file'
-                 and target.get('selector') == e.get('selector'))
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3051,7 +2834,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
             ('evidence.disabled', e.get('disabled')),
             ('evidence.readonly', e.get('readonly')),
             ('evidence.inert', e.get('inert')),
-            ('evidence.visible', e.get('visible') is not True and not file_only),
+            ('evidence.visible', e.get('visible') is not True),
             ('tag.equal', e.get('tag') != target.get('tag')),
             ('type.equal', e.get('type') != target.get('type')),
             ('required.equal', not (custom or pair_member)
@@ -3078,7 +2861,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
                     predicate, target)
     if witness is not None:
         dom = witness.get(selector)
-        if (not isinstance(dom, dict) or (dom.get('visible') is not True and not file_only)
+        if (not isinstance(dom, dict) or dom.get('visible') is not True
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
                 or dom.get('inert') is not False
@@ -3100,326 +2883,42 @@ def _reversible_entry_scope(page: dict, witness: dict) -> frozenset[str]:
     return frozenset(admitted)
 
 
-def _reversible_upload_structure(page: dict, selector: str, *, empty: bool,
-                                 filename: str = '', prior: str = '') -> dict:
-    """Reversible upload proof uses the same complete tree as both real readers.
+async def _ashby_resume_upload(session, page: dict, *, resume_path: str,
+                               verify_dispatch=None) -> dict:
+    """The one server-owned Ashby résumé upload; every trigger calls it.
 
-    The old ordered-root route never accepts a container scope. This exceptional
-    scope is read only by this recovery path, not general control admission.
+    A direct file set on the exact input, with no chooser, opener or upload
+    tree. Its proof is the input reading back exactly the row PDF's name; the
+    raw producer independently records the upload from its own readback, and
+    the final Submit guard alone proves the bytes are the row PDF.
     """
-    root = _formless_root(page)
-    tree = _upload_tree(page)
-    if (not isinstance(root, dict)
-            or root.get('error') != 'application root sibling identity mismatch'
-            or root.get('root') or not root.get('pane')
-            or not root.get('container') or not root.get('submit')
-            or root.get('truncated') or tree.get('scope') != 'container'
-            or not isinstance(root.get('excluded'), list)
-            or any(not isinstance(value, str) for value in root['excluded'])):
-        raise Gate('The exact container-scoped résumé upload witness is unavailable.')
-    original = _upload_input(page, tree)
-    candidates = [c for c in page.get('controls', [])
-                  if c.get('selector') == selector and c.get('type') == 'file'
-                  and c.get('tag') == 'input']
-    if (len(candidates) != 1 or original['selector'] != selector
-            or original.get('in_container') is not True
-            or original.get('unique') is not True
-            or selector in root['excluded']
-            or candidates[0].get('disabled') or candidates[0].get('readonly')
-            or candidates[0].get('inert') or candidates[0].get('in_form') is not False
-            or not re.search(r'resume|résumé|cv', label(candidates[0]), re.I)):
-        raise Gate('Original semantic résumé input is no longer proven.')
-    _reversible_entry_recipient(page, candidates[0], clipped_file=True)
-    drop_selector = tree['nodes'][tree['dropzone']].get('target_selector')
-    drops = [c for c in page.get('entry', {}).get('root_evidence', [])
-             if c.get('selector') == drop_selector and c.get('dropzone') is True
-             and c.get('unique') is True and c.get('in_container') is True
-             and c.get('visible') is True and not c.get('disabled')
-             and not c.get('inert')]
-    if (not isinstance(drop_selector, str) or not drop_selector
-            or drop_selector == selector or len(drops) != 1
-            or drop_selector in root['excluded']):
-        raise Gate('The unique same-container upload dropzone is not proven.')
-    if empty and prior:
-        # A resumed run can find an earlier run's attachment. It is neither
-        # current-run proof nor permission to replace an arbitrary file: both
-        # readers must see exactly one passive, excluded, differently named PDF.
-        if (prior == filename
-                or not re.fullmatch(r'[^/\\\x00-\x1f]{1,200}\.pdf', prior, re.I)
-                or candidates[0].get('files') != [prior]
-                or original.get('files') != [prior]
-                or tree.get('attached') is not True
-                or tree.get('filename') != prior
-                or not isinstance(tree.get('items'), list)
-                or len(tree['items']) != 1
-                or type(tree.get('delete')) is not int
-                or not root['excluded']):
-            raise Gate('The retained résumé has no exact original attachment proof.')
-    elif empty:
-        if (candidates[0].get('files') != [] or original.get('files') != []
-                or tree.get('items') != [] or tree.get('attached') is not False
-                or tree.get('filename') not in (None, '')):
-            raise Gate('The original empty résumé input changed before upload.')
-    elif prior:
-        # The old item can remain while the chooser settles. These states are
-        # tolerated only as intermediates; settlement alone decides success.
-        files = original.get('files')
-        items = tree.get('items')
-        if (files not in ([], [prior], [filename])
-                or candidates[0].get('files') != files
-                or not isinstance(items, list) or len(items) > 1
-                or type(tree.get('attached')) is not bool
-                or (tree['attached'] and not (
-                    tree.get('filename') == prior
-                    or (tree.get('filename') == filename and files == [filename])))
-                or (not tree['attached'] and tree.get('filename') not in (None, ''))):
-            raise Gate('The original résumé input changed unexpectedly during upload.')
-    elif (original.get('files') not in ([], [filename])
-          or candidates[0].get('files') != original.get('files')
-          or tree.get('filename') not in (None, '', filename)):
-        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
-    return tree
-
-
-async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
-                                  provenance, selector: str, empty: bool,
-                                  filename: str = '', prior: str = '') -> dict:
-    """Two fresh real reader observations; never substitute a fixture tree."""
-    page = await session.page()
-    response = await session.call('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
-    fixed = response.get('value') if isinstance(response, dict) else None
-    if not isinstance(fixed, dict):
-        raise Gate('Upload PAGE/fixed structural witness disagreement.',
-                   reason='defect_witness')
-    for observation in (page, fixed):
-        _inventory_ok(observation, complete=False)
-        _entry_safety(observation, allowed, provenance)
-        _reversible_upload_structure(observation, selector, empty=empty,
-                                     filename=filename, prior=prior)
-    if (page.get('url') != fixed.get('url')
-            or page.get('entry') != fixed.get('entry')):
-        raise Gate('Upload PAGE/fixed structural witness disagreement.',
-                   reason='defect_witness')
-    # The independent fixed reader must also agree on this clipped original,
-    # not just on the opaque complete tree and input selector.
-    fields = ('selector', 'id', 'tag', 'type', 'label', 'question',
-              'in_form', 'form_selector', 'form_action', 'formaction',
-              'native_form_owner_selector', 'disabled', 'readonly', 'inert',
-              'required', 'files', 'value')
-    def file_snapshot(observation):
-        controls = [c for c in observation['controls']
-                    if c.get('selector') == selector]
-        if len(controls) != 1:
-            return None
-        control = controls[0]
-        def equivalent(key):
-            value = control.get(key)
-            if key == 'question' and value is None:
-                return ''
-            if key in {'disabled', 'readonly', 'inert'} and value is None:
-                return False
-            return value
-        return tuple(equivalent(key) for key in fields)
-    if file_snapshot(page) is None or file_snapshot(page) != file_snapshot(fixed):
-        raise Gate('Upload PAGE/fixed original receiver disagreement.',
-                   reason='defect_witness')
-    return page
-
-
-def _reversible_upload_settled(before: dict, after: dict, filename: str,
-                               *, prior: str = '') -> bool:
-    """Preserve the ordered _upload_delta guard, accounting for ARCH08:38.
-
-    Only a proven passive attached delete can enlarge root.excluded. Remove
-    that single protective delta from a comparison copy; keep it excluded
-    from every actual action consumer and from the final-root observation.
-    """
-    pre_root, post_root = _formless_root(before), _formless_root(after)
-    tree = _upload_tree(after)
-    if (not isinstance(pre_root, dict) or not isinstance(post_root, dict)
-            or tree.get('scope') != 'container'):
-        raise Gate('Original application root or submit changed during upload.')
-    if prior and (tree.get('attached') is not True or tree.get('filename') != filename):
-        return False
-    comparison = after
-    if tree.get('attached') is True:
-        index = tree.get('delete')
-        nodes = tree['nodes']
-        if (type(index) is not int or not 0 <= index < len(nodes)
-                or not isinstance(nodes[index].get('selector'), str)):
-            raise Gate('The exact passive attached-file item was not proven.')
-        # upload_tree masks an element id with the original 128-bit JS
-        # signature; root.excluded uses its actual selector. Do not interpret
-        # the masked tree node as an actionable CSS selector.
-        exclusions = pre_root.get('excluded')
-        post_exclusions = post_root.get('excluded')
-        # A retained item already owns the last exclusion; its replacement
-        # may take that slot, but nothing else may enter or leave.
-        if (not isinstance(exclusions, list) or not isinstance(post_exclusions, list)
-                or (prior and (not exclusions
-                               or len(post_exclusions) != len(exclusions)
-                               or post_exclusions[:-1] != exclusions[:-1]))
-                or (not prior and (len(post_exclusions) != len(exclusions) + 1
-                                   or post_exclusions[:-1] != exclusions))):
-            raise Gate('The attached-file passive delete is not excluded.')
-        delete_selector = post_exclusions[-1]
-        mask = nodes[index].get('selector')
-        matched = mask == delete_selector
-        match = re.fullmatch(r'#([A-Za-z_][A-Za-z0-9_-]{0,127})', delete_selector)
-        if match:
-            seeds = [2166136261, 2246822519, 3266489917, 668265263]
-            for char in match.group(1):
-                seeds = [((h ^ ord(char)) * (16777619 + i * 2)) & 0xffffffff
-                         for i, h in enumerate(seeds)]
-            matched = matched or mask == '#' + ''.join(f'{h:08x}' for h in seeds)
-        if (not matched
-                or delete_selector in {c.get('selector') for c in after['controls']}
-                or delete_selector in {c.get('selector') for c in
-                                       after['entry']['root_evidence']}):
-            raise Gate('The attached-file passive delete is not excluded.')
-        from copy import deepcopy
-        comparison = deepcopy(after)
-        comparison['entry']['formless']['excluded'] = list(exclusions)
-        if prior:
-            # _upload_delta requires an item-free baseline. Prove instead that
-            # exactly the one retained item was replaced by the staged PDF and
-            # that the root, receivers and all other controls stayed put.
-            old_tree = _upload_tree(before)
-            before_id, after_id = _root_identity(before), _root_identity(after)
-            if (prior == filename or before['url'] != after['url']
-                    or before_id is None or after_id is None
-                    or before_id[0] != after_id[0] or before_id[2] != after_id[2]
-                    or old_tree.get('attached') is not True
-                    or old_tree.get('filename') != prior
-                    or len(old_tree.get('items', [])) != 1
-                    or len(tree.get('items', [])) != 1
-                    or _upload_input(before, old_tree).get('files') != [prior]
-                    or _upload_input(after, tree).get('files') != [filename]
-                    or _upload_candidates(before) != _upload_candidates(after)
-                    or _upload_shape(old_tree, old_tree['items']) !=
-                       _upload_shape(tree, tree['items'])
-                    or any(old_tree['nodes'][old_tree[key]].get('target_selector') !=
-                           tree['nodes'][tree[key]].get('target_selector')
-                           for key in ('input', 'dropzone'))):
-                raise Gate('The retained résumé was not safely replaced by the staged PDF.')
-            return True
-    return _upload_delta(before, comparison, filename)
-
-
-async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict,
-                                     *, provenance, allowed, resume_path: str,
-                                     ctx, raw_session, producer_guard,
-                                     verify_dispatch) -> dict:
-    """Submit-decision recovery owns one file effect, never the Submit click."""
-    if (not isinstance(provenance, ApplicationEntryProvenance)
-            or provenance.ats != 'ashby' or session.upload_attempted
-            or session.upload_pending or session._upload_edge is not None):
-        raise Gate('Only one recovery-owned reversible résumé upload is permitted.')
-    if ctx is None:
-        if (session.raw is not raw_session or producer_guard is None
-                or getattr(raw_session, '_application_controller', None) is not producer_guard
-                or producer_guard.upload_attempted or producer_guard.upload_completed
-                or producer_guard.upload_pending
-                or producer_guard.upload_identity is not None):
-            raise Gate('Application producer did not retain its raw IPC guard; no upload is safe.')
-    else:
-        # Test-only: the original sealed _Closed facade remains the only
-        # forwarding delegate. Its exact IPC/PDF/one-shot restrictions are
-        # neither widened nor reimplemented by the proxy/controller binding.
-        proxy = session.raw
-        controller = getattr(proxy, '_application_controller', None)
-        sealed = getattr(proxy, '_sealed_delegate', None)
-        if (not isinstance(controller, ApplicationIPCController)
-                or controller.fixture_context is not ctx
-                or controller.upload_attempted or controller.upload_completed
-                or controller.upload_pending or controller.upload_identity is not None
-                or sealed is None or type(sealed).__name__ != '_Closed'
-                or getattr(type(sealed), '__slots__', ()) != ('_closed_admissions',)
-                or not callable(getattr(sealed, 'call', None))
-                or getattr(proxy, '_original_raw', None) is not raw_session):
-            raise Gate('The reversible synthetic closed facade/controller binding is unavailable.')
-    verify_dispatch()
-    selector = next((c['selector'] for c in (page.get('entry') or {}).get('root_evidence', [])
-                     if c.get('id') == '_systemfield_resume' and c.get('type') == 'file'
-                     and re.search(r'resume|résumé|cv', label(c), re.I)), '')
-    if not selector or sum(c.get('type') == 'file' and
-                           re.search(r'resume|résumé|cv', label(c), re.I) is not None
-                           for c in page['controls']) != 1:
+    receivers = [c for c in page.get('controls', [])
+                 if c.get('type') == 'file' and re.search(r'resume|résumé|cv', label(c), re.I)]
+    if len(receivers) != 1 or receivers[0].get('selector') != _ASHBY_RESUME_SELECTOR:
         raise Gate('missing unique labelled resume receiver; inspect manually.')
-    filename = Path(resume_path).name
-    # Only a single retained basename is a candidate; the paired readers
-    # below decide whether it is an exact, passive, replaceable attachment.
-    observed = [c.get('files') for c in page['controls'] if c.get('selector') == selector]
-    prior = (observed[0][0] if len(observed) == 1 and isinstance(observed[0], list)
-             and len(observed[0]) == 1 and isinstance(observed[0][0], str) else '')
-    if prior and prior == filename:
-        # The staged name is deterministic, so an identical retained name
-        # cannot be told apart from this run's upload after the chooser.
-        raise Gate('The retained résumé has the staged filename; a new upload cannot be proven.')
-    before = await _reversible_upload_pair(
-        session, allowed=allowed, provenance=provenance, selector=selector,
-        empty=True, filename=filename, prior=prior)
-    baseline_tree = _upload_tree(before)
-    # Issue FF-224f: BrowserSkill opens the chooser by clicking a visible
-    # opener. Live Ashby clips the native input out of view, so a chooser sent
-    # there was refused after the effect edge and every resumed row ended
-    # uncertain. The opener is the proven same-container dropzone, as on the
-    # entry route; the producer maps it back to this exact input.
-    opener = baseline_tree['nodes'][baseline_tree['dropzone']]['target_selector']
-    raw_guard = producer_guard if ctx is None else controller
-
-    async def upload_edge(args: tuple, kwargs: dict):
+    if session.upload_attempted:
+        raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
+    if verify_dispatch is not None:
         verify_dispatch()
-        if (args != ('upload', opener, '--file', resume_path)
-                or kwargs != {'timeout': 130}):
-            raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
-        fresh = await _reversible_upload_pair(
-            session, allowed=allowed, provenance=provenance, selector=selector,
-            empty=True, filename=filename, prior=prior)
-        earlier = next(c for c in before['controls'] if c.get('selector') == selector)
-        current = next(c for c in fresh['controls'] if c.get('selector') == selector)
-        fresh_tree = _upload_tree(fresh)
-        if (_root_identity(fresh) != _root_identity(before)
-                or fresh_tree['nodes'][fresh_tree['dropzone']].get('target_selector') != opener
-                or _upload_shape(fresh_tree) != _upload_shape(baseline_tree)
-                or _upload_candidates(fresh) != _upload_candidates(before)
-                or any(earlier.get(key) != current.get(key) for key in ('files', 'value'))):
-            raise Gate('The original résumé input changed before upload.' if prior
-                       else 'The original empty résumé input changed before upload.')
-        session.upload_before = fresh
-        session.upload_attempted = session.upload_pending = True
-        return await _effect_call(session.raw, *args, **kwargs)
-
-    session._upload_edge = upload_edge
+    filename = Path(resume_path).name
     try:
-        # Both application_effect (production) and call (closed offline
-        # fixture) enter the same one-shot effect-adjacent guard.
-        await _effect_call(session, 'upload', opener, '--file', resume_path, timeout=130)
-    finally:
-        session._upload_edge = None
-    if not session.upload_attempted or session.upload_before is None:
-        raise Gate('The guarded résumé upload did not reach its effect boundary.')
-    try:
-        deadline = _upload_clock() + 8.0
-        async with asyncio.timeout(8.0):
-            while _upload_clock() < deadline:
-                after = await _reversible_upload_pair(
-                    session, allowed=allowed, provenance=provenance,
-                    selector=selector, empty=False, filename=filename, prior=prior)
-                if _reversible_upload_settled(
-                        session.upload_before, after, filename, prior=prior):
-                    # Passive UI settlement is not the producer's PDF proof;
-                    # a visible attachment alone never becomes a receipt.
-                    if (not raw_guard.upload_attempted or raw_guard.upload_pending
-                            or not raw_guard.upload_completed
-                            or raw_guard.upload_identity != raw_guard._row_pdf()):
-                        raise Gate('The current-run protected PDF upload is not proven.')
-                    return {'action': 'upload', 'label': 'Resume',
-                            'uploaded': True}
-                await _upload_sleep(min(0.25, max(0, deadline - _upload_clock())))
-        raise TimeoutError
-    finally:
-        session.upload_pending = False
+        data = Path(resume_path).read_bytes()
+    except OSError:
+        raise Gate('The row-tailored staged PDF is missing.') from None
+    script = _resume_file_set_script(filename, data)
+    # From here a non-Gate exception is classified uncertain by apply(): the
+    # set may have landed even though its reply was lost.
+    session.upload_attempted = True
+    result = await _effect_call(session.raw, 'evaluate', script)
+    value = result.get('value') if isinstance(result, dict) else None
+    readback = await session.page()
+    current = [c for c in readback.get('controls', [])
+               if c.get('selector') == _ASHBY_RESUME_SELECTOR and c.get('type') == 'file']
+    if (not isinstance(value, dict) or value.get('files') != [filename]
+            or len(current) != 1 or current[0].get('files') != [filename]):
+        raise Gate('The uploaded résumé was not proven in the current file input.')
+    return {'action': 'upload', 'label': receivers[0].get('label') or 'Resume',
+            'uploaded': True}
 
 
 def _radio_group(page: dict, target: dict) -> list[dict]:
@@ -6178,12 +5677,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         check_form_destination(page, target, job_url or page.get('url', ''),
                                provenance=provenance)
         if _formless_root(page) and isinstance(session, _EntrySession):
-            await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
+            result = await _ashby_resume_upload(session, page, resume_path=resume_path)
             observed, _ = await _observe_controls(session, await session.page(), site='execute-upload-readback')
-            tree = _upload_tree(observed)
-            _upload_input(observed, tree)
-            if not tree.get('attached') or tree.get('filename') != Path(resume_path).name:
-                raise Gate('The exact passive résumé attachment did not remain proven.')
             # Existing approved fields may have shifted nth-of-type selectors.
             rebound = {new['selector']: filled[old['selector']]
                        for old, new in zip(page['entry']['root_evidence'],
@@ -6192,7 +5687,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             for old in page['entry']['root_evidence']:
                 filled.pop(old['selector'], None)
             filled.update(rebound)
-            return {'action': verb, 'label': target['label'], 'uploaded': True}
+            return result
         step = 'effect'
         try:
             await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
@@ -6210,19 +5705,11 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             try:
                 reread = await session.page()
                 filename = Path(resume_path).name
-                tree_data = (reread.get('entry') or {}).get('upload_tree')
-                if _formless_root(reread) and tree_data is not None:
-                    tree = _upload_tree(reread)
-                    file_input = _upload_input(reread, tree)
-                    confirmed = (tree.get('attached') is True
-                                 and tree.get('filename') == filename
-                                 and file_input.get('files') == [filename])
-                else:
-                    file_inputs = [item for item in reread.get('controls', [])
-                                   if item.get('selector') == target['selector']
-                                   and item.get('type') == 'file']
-                    confirmed = (len(file_inputs) == 1
-                                 and file_inputs[0].get('files') == [filename])
+                file_inputs = [item for item in reread.get('controls', [])
+                               if item.get('selector') == target['selector']
+                               and item.get('type') == 'file']
+                confirmed = (len(file_inputs) == 1
+                             and file_inputs[0].get('files') == [filename])
                 attached = 'true' if confirmed else 'false'
             except (Exception, asyncio.CancelledError):
                 pass
@@ -6566,17 +6053,11 @@ def _label_class(target: dict) -> str:
     return next((name for name, rx in _LABEL_CLASSES if rx.search(text)), 'other')
 
 
-def _proactive_upload_receiver(page: dict, resume_path: str) -> bool:
-    """The résumé receiver is empty or holds one retained, differently named PDF."""
+def _proactive_upload_receiver(page: dict) -> bool:
+    """One exact résumé input; the direct set replaces any retained file."""
     receivers = [c for c in page.get('controls', [])
                  if c.get('type') == 'file' and re.search(r'resume|résumé|cv', label(c), re.I)]
-    if len(receivers) != 1:
-        return False
-    files = receivers[0].get('files')
-    if files in (None, []):
-        return True
-    return (isinstance(files, list) and len(files) == 1 and isinstance(files[0], str)
-            and files[0].lower().endswith('.pdf') and files[0] != Path(resume_path).name)
+    return len(receivers) == 1 and receivers[0].get('selector') == _ASHBY_RESUME_SELECTOR
 
 
 def _boolean_pair_member(page: dict, selector: str) -> bool:
@@ -6611,6 +6092,7 @@ class ApplicationIPCController:
         self.upload_attempted = False
         self.upload_identity = None
         self.upload_pending = False
+        self._resume_set_identity = None
         self.committed = False
         self._material_witness_selector = None
         self._material_witness_request = None
@@ -6752,6 +6234,12 @@ class ApplicationIPCController:
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
                 stat.st_ctime_ns, self.expected_digest)
 
+    def _resume_set_script(self):
+        if not self.resume_path or not Path(self.resume_path).is_file():
+            return None
+        return _resume_file_set_script(Path(self.resume_path).name,
+                                       Path(self.resume_path).read_bytes())
+
     def _choice(self, page: dict, selector: str):
         # Never infer option authority from a CSS class or an ATS/widget name.
         for owner in page.get('controls', []):
@@ -6808,7 +6296,9 @@ class ApplicationIPCController:
                     or _committing_get_route(args[1])):
                 raise Gate('Unknown, executable or committing GET navigation is not preparation.')
             return
-        if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'}:
+        resume_set = (op == 'evaluate' and len(args) == 2 and not kwargs
+                      and args[1] == self._resume_set_script())
+        if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'} and not resume_set:
             raise Gate('Raw application executable or effectful IPC is forbidden.')
         page = await self._page(session)
         self._fresh_preparation(page['url'])
@@ -6828,22 +6318,32 @@ class ApplicationIPCController:
         selector = args[1] if len(args) > 1 else None
         targets = [item for item in page.get('controls', [])
                    if item.get('selector') == selector and not item.get('disabled')]
+        if resume_set:
+            if (self.upload_attempted or self.upload_pending
+                    or self.upload_identity is not None):
+                raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
+            receivers = [item for item in page.get('controls', [])
+                         if item.get('type') == 'file' and not item.get('disabled')
+                         and re.search(r'resume|résumé|cv', label(item), re.I)]
+            ats = (self.entry_provenance.ats if self.entry_provenance is not None
+                   else self._row().get('ats'))
+            if (ats != 'ashby' or len(receivers) != 1
+                    or receivers[0].get('selector') != _ASHBY_RESUME_SELECTOR):
+                raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
+            target = receivers[0]
+            if (target.get('submit') is True or target.get('navigates') is True
+                    or target.get('formaction') or target.get('commits_application')):
+                raise Gate('A submission-capable upload receiver is not reversible preparation.')
+            # Identity is recorded only after the input reads back the row PDF.
+            self._resume_set_identity = self._row_pdf()
+            self.upload_attempted = True
+            self.upload_completed = False
+            self.upload_pending = True
+            return
         if op == 'upload':
             if self.upload_attempted:
                 raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
             file_target = targets[0] if len(targets) == 1 else None
-            if _formless_root(page) and (not file_target or file_target.get('type') != 'file'):
-                # The dropzone is itself a button in PAGE controls. Match the
-                # independent structural tree, not an empty selector lookup.
-                tree = _upload_tree(page)
-                original = _upload_input(page, tree)
-                drop = tree['nodes'][tree['dropzone']].get('target_selector')
-                if selector != drop or drop == original['selector']:
-                    raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
-                linked = [item for item in page['controls']
-                          if item.get('selector') == original['selector']
-                          and item.get('type') == 'file']
-                file_target = linked[0] if len(linked) == 1 else None
             if (len(args) != 4 or args[2] != '--file'
                     or str(Path(args[3]).resolve()) != self.resume_path
                     or kwargs != {'timeout': 130}
@@ -7036,6 +6536,23 @@ class ApplicationIPCController:
             # A failed or cancelled transport cannot prove a file attachment,
             # regardless of unchanged local bytes and prior upload history.
             self.upload_completed = succeeded
+        elif args and args[0] == 'evaluate' and self.upload_pending:
+            self.upload_pending = False
+            identity, self._resume_set_identity = self._resume_set_identity, None
+            if identity != self._row_pdf():
+                self.upload_completed = False
+                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.')
+            if not succeeded:
+                return
+            # The producer's own fresh read, not the set script's reply, is
+            # what records the upload for the final Submit guard.
+            page = await self._page(session)
+            current = [c for c in page.get('controls', [])
+                       if c.get('selector') == _ASHBY_RESUME_SELECTOR
+                       and c.get('type') == 'file']
+            if len(current) == 1 and current[0].get('files') == [Path(self.resume_path).name]:
+                self.upload_identity = identity
+                self.upload_completed = True
 
     async def _final_submit_with_evidence(self, session, page: dict, target: dict) -> None:
         # Issue #228: live resumed Ashby rows met the PDF refusal below with no
@@ -7455,9 +6972,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             and isinstance(provenance, ApplicationEntryProvenance)
                             and provenance.ats == 'ashby'
                             and isinstance(_formless_root(page), dict)
-                            and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
-                            and page['entry']['upload_tree'].get('scope') == 'container'
-                            and _proactive_upload_receiver(page, resume_path)
+                            and _proactive_upload_receiver(page)
                             and not uploaded and not session.upload_attempted
                             and (producer_guard is None or (
                                 not producer_guard.upload_attempted
@@ -7469,10 +6984,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # the owner gate, so a pending owner question still wins.
                         # A résumé field rendered after that point still reaches
                         # those triggers, under the same one-upload terms.
-                        result = await _reversible_recover_upload(
-                            session, page, provenance=provenance, allowed=allowed,
-                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        result = await _ashby_resume_upload(
+                            session, page, resume_path=resume_path,
+                            verify_dispatch=verify_dispatch)
                         uploaded = True
                         history.append(result)
                         page = await session.page()
@@ -7511,11 +7025,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         and isinstance(provenance, ApplicationEntryProvenance)
                         and provenance.ats == 'ashby'
                         and verb == 'upload'
-                        and isinstance(_formless_root(page), dict)
-                        and _formless_root(page).get('error') ==
-                            'application root sibling identity mismatch'
-                        and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
-                        and page['entry']['upload_tree'].get('scope') == 'container')
+                        and isinstance(_formless_root(page), dict))
                     if upload_container_mismatch:
                         # Issue #230: the model never chooses Submit while the résumé
                         # field is empty, so deferring its upload to Submit looped
@@ -7529,10 +7039,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             ('producer_upload_not_completed', lambda: producer_guard is None
                                 or not producer_guard.upload_completed)) if not held()), None)
                         if skipped is None:
-                            result = await _reversible_recover_upload(
-                                session, page, provenance=provenance, allowed=allowed,
-                                resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                                producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                            result = await _ashby_resume_upload(
+                                session, page, resume_path=resume_path,
+                                verify_dispatch=verify_dispatch)
                             uploaded = True
                             history.append(result)
                             page = await session.page()
@@ -7581,8 +7090,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             and isinstance(provenance, ApplicationEntryProvenance)
                             and provenance.ats == 'ashby'
                             and isinstance(_formless_root(page), dict)
-                            and isinstance((page.get('entry') or {}).get('upload_tree'), dict)
-                            and page['entry']['upload_tree'].get('scope') == 'container'
                             and _upload_tree_member(page, current.get('selector'))
                             and not uploaded and not session.upload_attempted
                             and (producer_guard is None or (
@@ -7593,10 +7100,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         # values, so the producer took the click for Submit and
                         # refused it for the missing PDF. That click is an upload
                         # request: the one-shot recovery runs and it never clicks.
-                        result = await _reversible_recover_upload(
-                            session, page, provenance=provenance, allowed=allowed,
-                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        result = await _ashby_resume_upload(
+                            session, page, resume_path=resume_path,
+                            verify_dispatch=verify_dispatch)
                         uploaded = True
                         history.append(result)
                         page = await session.page()
@@ -7631,10 +7137,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             raise Gate('Submit requires a current application-commit control.')
                         # The recovered click is a Submit decision that never clicks.
                         verb = 'submit'
-                        result = await _reversible_recover_upload(
-                            session, page, provenance=provenance, allowed=allowed,
-                            resume_path=resume_path, ctx=ctx, raw_session=raw_session,
-                            producer_guard=producer_guard, verify_dispatch=verify_dispatch)
+                        result = await _ashby_resume_upload(
+                            session, page, resume_path=resume_path,
+                            verify_dispatch=verify_dispatch)
                         # The raw guard's separate proof and the independent
                         # passive settlement both precede this local receipt.
                         uploaded = True
@@ -7696,44 +7201,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         target = control(page, action, 'decision-submit')
                         if not (is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
-                        if (isinstance(session, _ReversibleEntryReader)
-                                and session.upload_before is not None):
-                            # Only the original uploaded file is rechecked at
-                            # Submit; other controls keep their write-time and
-                            # pinned final-Submit guards, not per-step retention.
-                            baseline = session.upload_before
-                            baseline_tree = _upload_tree(baseline)
-                            file_selector = _upload_input(
-                                baseline, baseline_tree)['selector']
-                            filename = Path(resume_path).name
-                            current_file = await _reversible_upload_pair(
-                                session, allowed=allowed, provenance=provenance,
-                                selector=file_selector, empty=False, filename=filename)
-                            current_tree = _upload_tree(current_file)
-                            originals = [c for c in baseline['controls']
-                                         if c.get('selector') == file_selector]
-                            current = [c for c in current_file['controls']
-                                       if c.get('selector') == file_selector]
-                            file_keys = (
-                                'selector', 'id', 'tag', 'type', 'label', 'question',
-                                'in_form', 'form_selector', 'form_action', 'formaction',
-                                'native_form_owner_selector', 'required', 'disabled',
-                                'readonly', 'inert')
-                            if (len(originals) != 1 or len(current) != 1
-                                    or any(originals[0].get(key) != current[0].get(key)
-                                           for key in file_keys)
-                                    or _upload_candidates(baseline)[0] !=
-                                       _upload_candidates(current_file)[0]
-                                    or current_tree.get('attached') is not True
-                                    or current_tree.get('filename') != filename
-                                    or len(current_tree.get('items', [])) != 1
-                                    or current_tree['nodes'][current_tree['dropzone']].get(
-                                        'target_selector') != baseline_tree['nodes'][
-                                            baseline_tree['dropzone']].get('target_selector')
-                                    or any(_formless_root(baseline).get(key) !=
-                                           _formless_root(current_file).get(key)
-                                           for key in ('container', 'submit'))):
-                                raise Gate('Original semantic résumé input is no longer proven.')
                         if (ctx is None and (producer_guard is None or
                                 getattr(raw_session, '_application_controller', None) is not producer_guard)):
                             raise Gate('Application Submit lacks a bound raw IPC guard; no click is safe.')
@@ -7745,9 +7212,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 and (producer_guard is None or (
                                     not producer_guard.upload_attempted
                                     and not producer_guard.upload_completed))):
-                            # An old displayed filename cannot stand in for this run's
-                            # guarded chooser transfer. Only an empty original receiver
-                            # may be repaired before entering any Submit state.
+                            # An old displayed filename cannot stand in for this
+                            # run's upload; the one direct set runs before Submit.
                             verify_dispatch()
                             members = _formless_boundary(page, provenance)
                             receivers = [c for c in page['controls']
@@ -7757,14 +7223,6 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     {c['selector'] for c in members if c.get('type') == 'file'}):
                                 raise Gate('missing unique labelled resume receiver; inspect manually.')
                             upload_action = {'action': 'upload', 'selector': receivers[0]['selector']}
-                            receiver = receivers[0]  # Already unique; execute revalidates it.
-                            tree = _upload_tree(page)
-                            original = _upload_input(page, tree)
-                            if (receiver['selector'] != original['selector']
-                                    or receiver.get('files') != [] or original.get('files') != []
-                                    or tree.get('items') != [] or tree.get('attached') is not False
-                                    or tree.get('filename') not in (None, '')):
-                                raise Gate('The original empty résumé input changed before upload.')
                             result = await execute(
                                 session, page, upload_action, facts=facts, filled=filled,
                                 resume_path=resume_path, company=company, jd_text=jd_text,

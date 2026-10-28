@@ -1022,26 +1022,23 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
     assert "Traceback" not in result.stderr, result.stderr
     reports = [json.loads(line) for line in result.stdout.splitlines()
                if line.lstrip().startswith("{")]
-    assert len(reports) == 10, (result.stdout, result.stderr)
+    assert len(reports) == 9, (result.stdout, result.stderr)
     assert {report['scenario'] for report in reports[:-1]} == {
         'entry', 'greenhouse', 'greenhouse_empty_placeholder',
         'w_button_aria_label', 'ashby', 'ashby-upload',
         'lever_custom_radio', 'lever_custom_checkbox'}
-    assert {report['variant'] for report in reports[:-1]
-            if report['scenario'] == 'ashby-upload'} == {
-                'ordinary', 'transient+unwrap'}
     assert all(report['status'] == 'gate'
                and report['submitted'] is False
                and report['submit']['call_entered'] is False
                and report['submit']['ipc_returned'] is False
                and report['submit']['post_attempts'] == 0
                for report in reports[:-1]), [
-        (report['scenario'], report.get('variant'), report['status'],
+        (report['scenario'], report['status'],
          report['submitted'], report['applicant_ipc'], report['submit'])
         for report in reports[:-1]
     ]
     # The aggregate summary has safe_gate/legs, not a submitted attribute;
-    # the nine per-session reports carry the actual Submit IPC observations.
+    # the eight per-session reports carry the actual Submit IPC observations.
     assert reports[-1]['safe_gate'] is False
     events = [json.loads(line) for line in log.read_text().splitlines()]
     kinds = [e["kind"] for e in events]
@@ -1052,8 +1049,8 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                    and (e["dotenv"], e["cost"]) != ("1", "True")
                    for e in events)
     actions = [e["operation"] for e in events if e["kind"] == "async_bsk"]
-    # One BSK session per independently checked scenario/variant report.
-    # The final aggregate has no session; the two Ashby upload variants do.
+    # One BSK session per independently checked scenario report.
+    # The final aggregate has no session.
     expected_sessions = len(reports[:-1])
     assert actions.count('session_start') == actions.count('session_stop') == expected_sessions
     assert actions.count('navigate') == expected_sessions

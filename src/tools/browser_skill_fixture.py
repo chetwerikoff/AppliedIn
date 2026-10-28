@@ -8,7 +8,6 @@ is refused with 405.
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 import json
 import os
 import sys
@@ -165,8 +164,8 @@ label {display:block} .clipped {position:absolute;width:1px;height:1px;clip:rect
 <iframe src="https://www.recaptcha.net/recaptcha/enterprise/bframe" style="display:none"></iframe>
 <div><iframe style="display:none"></iframe></div></body></html>'''
 
-def _ashby_upload_form(*, unwrap=False) -> bytes:
-    # Keep the original first-human Gate intact; this is a separate chooser leg.
+def _ashby_upload_form() -> bytes:
+    # Keep the original first-human Gate intact; this is a separate upload leg.
     document = _ashby_form().replace(b'>Application answer</label>', b'>Name</label>')
     document = document.replace(
         b'<button type="button" class="ashby-application-form-input-file-dropzone-upload">Upload</button>',
@@ -196,13 +195,6 @@ input.addEventListener('change',()=>{
  },1800);
 });
 </script>'''
-    if unwrap:
-        document = document.replace(b'</svg>Upload</button>',
-                                    b'</svg><span><span>Upload</span></span></button>')
-        script = script.replace(b" drop.querySelector('svg')?.remove();",
-                                b" drop.querySelector('svg')?.remove();\n"
-                                b" const inner=drop.querySelector('span > span');\n"
-                                b" inner.replaceWith(...inner.childNodes);")
     return document.replace(b'</body>', script + b'</body>')
 
 
@@ -481,9 +473,7 @@ class _SyntheticRun:
                  "entry_initial_not_ready", "entry_wait", "entry_observations",
                  "greenhouse", "greenhouse_empty_placeholder", "visible_badge_anchor", "native_validity",
                  "w_lookalike", "w_target_ipc", "ashby", "custom_question", "choice_ipc",
-                 "ashby_upload", "ashby_upload_transient", "ashby_upload_unwrap", "upload_ipc",
-                 "upload_before_tree", "upload_pair_page", "upload_pair_trace",
-                 "upload_pair_complete")
+                 "ashby_upload", "upload_ipc")
     def __init__(self, resume_path: str):
         self._origin = _ORIGIN
         self.resume_path = resume_path
@@ -535,13 +525,7 @@ class _SyntheticRun:
         self.custom_question = ''
         self.choice_ipc = 0
         self.ashby_upload = False
-        self.ashby_upload_transient = False
-        self.ashby_upload_unwrap = False
         self.upload_ipc = 0
-        self.upload_before_tree = None
-        self.upload_pair_page = None
-        self.upload_pair_trace = []
-        self.upload_pair_complete = False
         self.observe_page(None)
 
     def entry_provenance(self):
@@ -601,11 +585,15 @@ class _SyntheticRun:
                 'form_selector': '#application-form', 'form_action': URL,
             }
 
+    def resume_set_script(self) -> str:
+        from tools.browser_skill_apply import _resume_file_set_script
+        return _resume_file_set_script(Path(self.resume_path).name, _RESUME_BYTES)
+
     def _positive_ipc(self) -> tuple[tuple[str, ...], ...]:
         if self.ashby_upload:
             return (('fill', '#_systemfield_name', '--value', _FACTS['Name']),
                     ('fill', '#_systemfield_email', '--value', _FACTS['Email']),
-                    ('upload', '#ashby-upload-dropzone', '--file', self.resume_path))
+                    ('evaluate', self.resume_set_script()))
         return (('fill', '#name', '--value', _FACTS['Name']),
                 *(ipc for selector in _CHOICE_SELECTORS.values()
                   for ipc in (('click', selector), ('click', selector+'-option'))),
@@ -839,7 +827,9 @@ class _SyntheticRun:
                     return await raw.call(*args)
                 if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")
-                if state.positive and args and args[0] == "evaluate":
+                resume_set = (state.positive and state.ashby_upload and not kwargs
+                              and args == ('evaluate', state.resume_set_script()))
+                if state.positive and args and args[0] == "evaluate" and not resume_set:
                     from tools.browser_skill_apply import (
                         ENTRY_PAGE, _ENTRY_FIXED_CONTROL_WITNESS,
                         GREENHOUSE_PAGE, _GREENHOUSE_FIXED_CONTROL_WITNESS)
@@ -851,51 +841,6 @@ class _SyntheticRun:
                         raise PermissionError("Fixture denies this browser operation.")
                     result = await raw.call(*args)
                     observed = result.get('value') if isinstance(result, dict) else None
-                    if (state.ashby_upload_transient and state.upload_ipc
-                            and not state.upload_pair_complete and isinstance(observed, dict)):
-                        if args[1] == page_script:
-                            if len(state.upload_pair_trace) <= 1:
-                                # Fix two sequential states before the live tree may settle:
-                                # first split, then an agreeing opaque-pending sample.
-                                tree = (observed.get('entry') or {}).get('upload_tree')
-                                if isinstance(tree, dict) and tree.get('complete') is True:
-                                    if not isinstance(state.upload_before_tree, dict):
-                                        raise PermissionError('Synthetic pre-upload tree was not observed.')
-                                    observed = deepcopy(observed)
-                                    pending = deepcopy(state.upload_before_tree)
-                                    pending.update(complete=False, attached=False, filename='', items=[])
-                                    observed['entry']['upload_tree'] = pending
-                                    result = {'value': observed}
-                            state.upload_pair_page = deepcopy(observed)
-                        elif state.upload_pair_page is not None:
-                            if not state.upload_pair_trace:
-                                # Only this sealed fixture perturbs the first sequential
-                                # witness boundary. The production readers are untouched.
-                                if not isinstance(state.upload_before_tree, dict):
-                                    raise PermissionError('Synthetic pre-upload tree was not observed.')
-                                observed = deepcopy(observed)
-                                tree = deepcopy(state.upload_before_tree)
-                                if tree == state.upload_pair_page['entry']['upload_tree']:
-                                    tree['complete'] = False
-                                observed['entry']['upload_tree'] = tree
-                                result = {'value': observed}
-                            elif (len(state.upload_pair_trace) == 1
-                                  and (observed.get('entry') or {}).get('upload_tree', {}).get('complete') is True):
-                                # The real timer may complete between PAGE and fixed;
-                                # retain the sequence-controlled pending sample in both.
-                                observed = deepcopy(observed)
-                                observed['entry']['upload_tree'] = deepcopy(
-                                    state.upload_pair_page['entry']['upload_tree'])
-                                result = {'value': observed}
-                            page = state.upload_pair_page
-                            state.upload_pair_trace.append({
-                                'page': page, 'fixed': deepcopy(observed)})
-                            if (page['entry'] == observed['entry']
-                                    and page['entry']['upload_tree'].get('complete') is True
-                                    and page['entry']['upload_tree'].get('attached') is True):
-                                # Later form reads are not upload-settle pairs.
-                                state.upload_pair_complete = True
-                            state.upload_pair_page = None
                     if not isinstance(observed, dict) or observed.get('url') != URL:
                         raise PermissionError('Fixture page escaped the fixed job URL.')
                     field = 'greenhouse' if state.greenhouse else 'entry'
@@ -941,24 +886,18 @@ class _SyntheticRun:
                     raise PermissionError("Fixture never permits applicant or committing BSK IPC.")
                 sequence = state._positive_ipc()
                 if (state.ipc_index >= len(sequence) or args != sequence[state.ipc_index]
-                        or (args[0] == "upload" and kwargs != {"timeout": 130})
-                        or (args[0] != "upload" and kwargs)):
+                        or kwargs):
                     raise PermissionError("Fixture denies this browser operation.")
-                if args[0] == "upload" and (
-                        args[3] != state.resume_path
-                        or Path(state.resume_path).read_bytes() != _RESUME_BYTES):
+                if resume_set and Path(state.resume_path).read_bytes() != _RESUME_BYTES:
                     raise PermissionError("Fixture attachment is not the staged synthetic PDF.")
                 if args[0] == "click" and args[1] in _OPTION_SELECTORS:
                     key = _OPTION_SELECTORS[args[1]]
                     selector = _CHOICE_SELECTORS[key]
                     if selector not in state.open_controls:
                         raise PermissionError("Fixture option was not opened by its combobox.")
-                if args[0] == 'upload':
-                    if (state.ashby_upload_transient
-                            and not isinstance(state.upload_before_tree, dict)):
-                        raise PermissionError('No independent pre-upload structural witness.')
+                if resume_set:
                     state.upload_ipc += 1
-                await raw.call(*args, **kwargs)
+                result = await raw.call(*args, **kwargs)
                 if state.greenhouse and args[0] == 'click' and args[1] in _OPTION_SELECTORS:
                     result = await raw.call('evaluate', _COMMITTED_VALIDITY)
                     observed = result.get('value') if isinstance(result, dict) else None
@@ -975,8 +914,9 @@ class _SyntheticRun:
                 if args[0] == "fill":
                     state.fills += 1
                     state.input_values[args[1]] = args[3]
-                elif args[0] == "upload":
+                elif resume_set:
                     state.uploaded = True
+                    return result
                 elif args[0] == 'click' and args[1] in _CHOICE_SELECTORS.values():
                     state.open_controls.add(args[1])
                 elif args[0] == "click" and args[1] in _OPTION_SELECTORS:
@@ -1007,7 +947,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         if type(state) is not _SyntheticRun or state.ashby:
             document = _ashby_form()
         if type(state) is _SyntheticRun and state.ashby_upload:
-            document = _ashby_upload_form(unwrap=state.ashby_upload_unwrap)
+            document = _ashby_upload_form()
         if type(state) is _SyntheticRun and state.w_lookalike:
             document = document.replace(b'id="w-button"', b'id="w-button" aria-label="Synthetic consent"')
         if type(state) is _SyntheticRun and state.custom_question:
@@ -1048,8 +988,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
 
 
 def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
-                  w_lookalike=False, ashby=False, custom_question='', ashby_upload=False,
-                  ashby_upload_transient=None) -> int:
+                  w_lookalike=False, ashby=False, custom_question='', ashby_upload=False) -> int:
     """Independent sealed sessions share only the original fixed loopback route."""
     if not _daemon_origin() or _SESSION_ENTRY.get() is not None:
         raise RuntimeError("Synthetic fixture requires the exclusive daemon CLI entry.")
@@ -1068,13 +1007,9 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 state.greenhouse_empty_placeholder = greenhouse_empty_placeholder
                 greenhouse = state.greenhouse
                 state.w_lookalike = w_lookalike
-                state.ashby = bool(ashby or ashby_upload or ashby_upload_transient)
+                state.ashby = bool(ashby or ashby_upload)
                 state.custom_question = custom_question
-                state.ashby_upload = bool(ashby_upload or ashby_upload_transient)
-                # The existing transient upload session also exercises the span
-                # unwrap; a separate session would break the sealed dispatch.
-                state.ashby_upload_transient = ashby_upload_transient is True
-                state.ashby_upload_unwrap = state.ashby_upload_transient
+                state.ashby_upload = bool(ashby_upload)
                 state.enable_positive_fixture()
                 server.synthetic_run = state
                 token = _SESSION_ENTRY.set(state)
@@ -1264,30 +1199,6 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                           and state.submit_call_entered == state.submit_ipc == 0
                           and state.post_attempts == state.post_count == 0
                           and (state.last_page or {}).get('inventory_verified') is True)
-                    if state.ashby_upload_unwrap:
-                        # A missing read or failed upload must report an unsafe
-                        # leg, never crash into an unstructured Python traceback.
-                        if not isinstance(state.upload_before_tree, dict):
-                            ok = False
-                        else:
-                            from tools.browser_skill_apply import _upload_shape
-                            pre_spans = sum(n[1] == 'span'
-                                            for n in _upload_shape(state.upload_before_tree))
-                            post_spans = sum(n[1] == 'span'
-                                             for n in _upload_shape(tree, tree.get('items', [])))
-                            ok = ok and pre_spans == post_spans + 1
-                    if state.ashby_upload_transient:
-                        pairs = state.upload_pair_trace
-                        ok = (ok and len(pairs) >= 3
-                              and pairs[0]['page']['entry'] != pairs[0]['fixed']['entry']
-                              and all(p['page']['url'] == p['fixed']['url'] == URL
-                                      and p['page']['entry']['formless'] == p['fixed']['entry']['formless']
-                                      and p['page']['inventory_verified'] is True for p in pairs)
-                              and all(p['page']['entry'] == p['fixed']['entry'] for p in pairs[1:])
-                              and any(p['page']['entry']['upload_tree'].get('complete') is False
-                                      for p in pairs[1:-1])
-                              and pairs[-1]['page']['entry']['upload_tree'].get('complete') is True
-                              and pairs[-1]['page']['entry']['upload_tree'].get('attached') is True)
                 inventory = {key: (state.last_page or {}).get(key) for key in (
                     "inventory_verified", "truncated", "opaque_controls",
                     "shadow_roots", "unsupported_frames")}
@@ -1297,8 +1208,6 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                             "ready_state", "offending_elements", "shadow_hosts",
                             "frames", "rejected_frames")}
                 print(json.dumps({"fixture": "ashby-formless" if state.ashby else "native-form",
-                                  'variant': ('transient+unwrap' if state.ashby_upload_transient else 'ordinary')
-                                             if state.ashby_upload else None,
                                   'scenario': ('lever_custom_'+custom_question if custom_question else
                                                'ashby-upload' if state.ashby_upload else
                                                'ashby' if state.ashby else
@@ -1314,16 +1223,6 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                                   'entry_wait': state.entry_wait,
                                   'entry_initial_not_ready': state.entry_initial_not_ready,
                                   'entry_observations': state.entry_observations,
-                                  'upload_pair_trace': [{
-                                      'page_url': p['page']['url'], 'fixed_url': p['fixed']['url'],
-                                      'original_root_agrees': (p['page']['entry']['formless']
-                                                               == p['fixed']['entry']['formless']),
-                                      'page_inventory_verified': p['page']['inventory_verified'],
-                                      'entry_agrees': p['page']['entry'] == p['fixed']['entry'],
-                                      'page_complete': p['page']['entry']['upload_tree'].get('complete'),
-                                      'fixed_complete': p['fixed']['entry']['upload_tree'].get('complete'),
-                                      'page_attached': p['page']['entry']['upload_tree'].get('attached')}
-                                      for p in state.upload_pair_trace],
                                   "submitted": state.submit_ipc > 0,
                                   "status": result.get("status"),
                                   'applicant_ipc': state.ipc_index, 'model_decisions': state.decisions,
@@ -1357,10 +1256,8 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
 
 
 def _ashby_upload_leg() -> int:
-    """Keep every upload sub-case inside the existing top-level Ashby leg."""
-    ordinary = _run_scenario(ashby_upload=True)
-    transient = _run_scenario(ashby_upload=True, ashby_upload_transient=True)
-    return 0 if ordinary == transient == 0 else 1
+    """The upload sub-case stays inside the existing top-level Ashby leg."""
+    return _run_scenario(ashby_upload=True)
 
 
 def run() -> int:
@@ -1370,7 +1267,6 @@ def run() -> int:
     empty_placeholder = _run_scenario(greenhouse_empty_placeholder=True)
     lookalike = _run_scenario(w_lookalike=True)
     ashby = _run_scenario(ashby=True)
-    # Both upload sub-cases remain one logical Ashby fixture leg.
     ashby_upload = _ashby_upload_leg()
     radio = _run_scenario(custom_question='radio')
     checkbox = _run_scenario(custom_question='checkbox')
@@ -1392,5 +1288,5 @@ def run() -> int:
                       'lever_custom_checkbox': 'PASS' if checkbox == 0 else 'FAIL',
                       'legs': {name: 'PASS' if status == 0 else 'FAIL'
                                for name, status in legs.items()},
-                      'sessions': len(legs) + 1}))
+                      'sessions': len(legs)}))
     return 0 if ok else 1

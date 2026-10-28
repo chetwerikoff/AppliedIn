@@ -178,6 +178,36 @@ def observed(**changes):
     return page, fixed
 
 
+def resume_set_name(script):
+    """The file name of the code-owned direct résumé set, or None for any other script."""
+    import json
+    prefix = '(() => { const p = '
+    if not isinstance(script, str) or not script.startswith(prefix):
+        return None
+    payload, _ = json.JSONDecoder().raw_decode(script[len(prefix):])
+    return payload['name'] if payload.get('selector') == forms._ASHBY_RESUME_SELECTOR else None
+
+
+def effect_calls(calls):
+    """Non-read IPC in order, with the direct résumé set shown as ('set', name)."""
+    out = []
+    for c in calls:
+        name = resume_set_name(c[1]) if c[0] == 'evaluate' and len(c) > 1 else None
+        if name:
+            out.append(('set', name))
+        elif c[0] not in {'evaluate', 'navigate'}:
+            out.append(c)
+    return out
+
+
+def set_resume_files(snapshots, name):
+    """Live Ashby keeps the same input node and only its files change (FF-224g probe)."""
+    for snapshot in snapshots:
+        for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+            if c['selector'] == forms._ASHBY_RESUME_SELECTOR:
+                c['files'] = [name]
+
+
 class RootSession:
     def __init__(self, page, fixed):
         self.current, self.fixed = deepcopy(page), deepcopy(fixed)
@@ -193,6 +223,12 @@ class RootSession:
 
     async def call(self, method, *args, **kwargs):
         self.calls.append((method, *args))
+        if method == 'evaluate' and resume_set_name(args[0]):
+            # The page assigns File.name, a basename, even though the bytes
+            # come from an absolute per-attempt snapshot path.
+            name = resume_set_name(args[0])
+            set_resume_files((self.current, self.fixed), name)
+            return {'value': {'set': True, 'files': [name]}}
         if method == 'evaluate':
             if args == (forms.ENTRY_PAGE,):
                 return {'value': deepcopy(self.current)}
@@ -208,20 +244,7 @@ class RootSession:
                         c.update(value=value, has_value=True)
             return {}
         if method == 'upload':
-            selector, _, path = args
-            assert selector == '#dropzone' and kwargs == {'timeout': 130}
-            # Browser File.name is a basename even when the protected snapshot
-            # supplied to BrowserSkill has an absolute per-attempt path.
-            after = observed(attached=True, files=[Path(path).name], displayName=Path(path).name)
-            for old, new in zip((self.current, self.fixed), after):
-                lookup = {c['selector']: c for c in old['controls'] + old['entry']['root_evidence']}
-                for c in new['controls'] + new['entry']['root_evidence']:
-                    source = lookup.get(c['selector'], {})
-                    for key in ('value', 'has_value'):
-                        if key in source:
-                            c[key] = source[key]
-            self.current, self.fixed = after
-            return {}
+            pytest.fail('FF-224g: the Ashby résumé is a direct file set, never a chooser upload')
         if method == 'click':
             if self.before_click:
                 self.before_click()
@@ -258,39 +281,17 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     file = next(c for c in raw.current['controls']
                 if c['type'] == 'file' and c['label'] == 'Resume')
     button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
-    original_call = raw.call
-    async def call(method, *args, **kwargs):
-        if method == 'upload':
-            # A native input is a valid chooser target on the generic fallback;
-            # preserve the adversarial layout after selection, not a clean DOM.
-            assert args[0] == file['selector'] and args[1] == '--file'
-            assert kwargs == {'timeout': 130}
-            raw.calls.append((method, *args))
-            name = Path(args[2]).name
-            raw.current, raw.fixed = observed(
-                **changes, attached=True, files=[name], displayName=name)
-            return {}
-        return await original_call(method, *args, **kwargs)
-    raw.call = call
     decide.side_effect = [dict(action='upload', selector=file['selector']),
                           dict(action='submit', selector=button['selector'])]
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    # Unsafe ambiguous roots retain their structural refusal; other shapes
-    # exercise the guarded response to the model's upload decision.
-    expected_upload_result = (cause if cause == 'ambiguous application roots'
-                              else 'no direct chooser is permitted')
-    assert expected_upload_result in result['question'], result
-    assert decide.await_count == (2 if cause == 'ambiguous application roots' else 1)
-    if cause == 'ambiguous application roots':
-        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
-            ('upload', file['selector'], '--file',
-             transport._application_controller.resume_path)]
-        assert transport._application_controller.upload_completed
-    else:
-        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
-        assert not transport._application_controller.upload_completed
+    # The model's upload may take the one reversible direct set, exactly as the
+    # chooser did before FF-224g; the structural refusal still stops Submit.
+    assert (cause in result['question']
+            or 'missing unique labelled resume receiver' in result['question']), result
+    effects = effect_calls(raw.calls)
+    assert effects in ([], [('set', Path(transport._application_controller.resume_path).name)])
     assert not transport._application_controller.committed
 
 
@@ -817,10 +818,10 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     assert ('For the required résumé file input, use upload with its selector; '
             'the server attaches the staged file. ') in task
     assert f'Exact human-authorized fact KEYS on this tracked job: {list(facts)}. ' in task
-    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
+    assert effect_calls(raw.calls) == [
         ('fill', '#_systemfield_name', '--value', 'Test User'),
         ('fill', '#_systemfield_email', '--value', 'test@example-co.test'),
-        ('upload', '#dropzone', '--file', transport._application_controller.resume_path),
+        ('set', Path(transport._application_controller.resume_path).name),
         ('click', '#structural-submit')]
     assert checkpoints == ['held', 'checked']
 
@@ -1143,35 +1144,28 @@ async def test_structural_fill_requires_exact_independent_readback(monkeypatch):
                             provenance=provenance)
 
 
-async def test_upload_requires_independent_fixed_readback(monkeypatch):
-    # A benign post-IPC disagreement is never attachment proof, even when
-    # the PAGE side is complete: it exhausts the read-only budget without retry.
-    from tests.tools.test_ashby_upload import UploadClock
-    clock = UploadClock()
-    monkeypatch.setattr(forms, '_upload_clock', lambda: clock.now)
-    monkeypatch.setattr(forms, '_upload_sleep', clock.sleep)
+async def test_upload_requires_independent_fixed_readback(monkeypatch, tmp_path):
+    # FF-224g: the PAGE side alone never proves the direct set. A fixed witness
+    # that still shows no file is a Gate after one set, never a repeat.
     _, raw, session, page, provenance = await admitted(monkeypatch)
-    identity = session.formless_identity
     original = raw.call
     async def corrupt(method, *args, **kw):
         result = await original(method, *args, **kw)
-        if method == 'upload':
+        if method == 'evaluate' and resume_set_name(args[0]):
             for c in raw.fixed['controls'] + raw.fixed['entry']['root_evidence']:
                 if c['type'] == 'file':
                     c['files'] = []
         return result
     raw.call = corrupt
-    with pytest.raises(TimeoutError):
+    pdf = tmp_path / 'Resume.pdf'
+    pdf.write_bytes(b'%PDF-1.4 synthetic')
+    with pytest.raises(forms.Gate):
         await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
+                            resume_path=str(pdf), company=COMPANY, jd_text='',
                             resume_tex='', github='', pk=PK, job_url=posting('ashby'),
                             provenance=provenance)
-    assert clock.now == 8.0 and clock.steps == [0.25] * 32
-    assert session.formless_identity == identity and session.upload_result is None
-    # The fixed reader never confirmed the staged file: a timeout has no
-    # attachment receipt, and cannot create a submitting IPC permission.
-    assert not session.upload_pending and session.upload_result is None
-    assert len([c for c in raw.calls if c[0] == 'upload']) == 1
+    assert session.upload_attempted
+    assert [c for c in effect_calls(raw.calls) if c[0] == 'set'] == [('set', 'Resume.pdf')]
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
 
@@ -1265,21 +1259,23 @@ async def test_ipc_producer_takes_its_own_fresh_independent_witness(monkeypatch)
     no_mutations(raw)
 
 
-async def test_structural_upload_cannot_accept_an_additional_file(monkeypatch):
+async def test_structural_upload_cannot_accept_an_additional_file(monkeypatch, tmp_path):
     _, raw, session, page, provenance = await admitted(monkeypatch)
     original = raw.call
     async def extra_file(method, *args, **kw):
         result = await original(method, *args, **kw)
-        if method == 'upload':
+        if method == 'evaluate' and resume_set_name(args[0]):
             for snapshot in (raw.current, raw.fixed):
                 for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
                     if c.get('type') == 'file':
                         c['files'].append('Unexpected.pdf')
         return result
     raw.call = extra_file
-    with pytest.raises(forms.Gate, match='exact staged résumé'):
+    pdf = tmp_path / 'Resume.pdf'
+    pdf.write_bytes(b'%PDF-1.4 synthetic')
+    with pytest.raises(forms.Gate, match='not proven in the current file input'):
         await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
+                            resume_path=str(pdf), company=COMPANY, jd_text='',
                             resume_tex='', github='', pk=PK, job_url=posting('ashby'),
                             provenance=provenance)
 
@@ -1324,7 +1320,7 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     assert 'changed before submit' in result['question']
     # This is a post-admission drift, not a zero-total-IPC admission refusal.
     assert [c for c in raw.calls if c[0] == 'fill'], result
-    assert len([c for c in raw.calls if c[0] == 'upload']) == 1
+    assert len([c for c in effect_calls(raw.calls) if c[0] == 'set']) == 1
     assert not [c for c in raw.calls if c[0] == 'click']
 
 
@@ -3240,152 +3236,6 @@ async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
             raw._reversible_session, raw.current, site='execute')
     no_mutations(raw)
 
-
-# Issue #194: generic reversible upload failures retain the original Gate but
-# name their phase and single passive attachment read on production stdout.
-_ISSUE194_PRIVATE_FAILURE = 'SYNTHETIC_PRIVATE_UPLOAD_EXCEPTION_NOT_FOR_LOGS'
-
-
-@pytest.mark.parametrize('step,attached,reason,error_type,file_access', [
-    ('effect', 'true', 'unsupported', 'Unavailable', False),
-    ('effect', 'false', 'none', 'Unavailable', False),
-    ('effect', 'unknown', 'none', 'Unavailable', False),
-    ('page', 'true', 'none', 'Exception', False),
-    ('observe', 'false', 'none', 'RuntimeError', False),
-    ('observe', 'unknown', 'none', 'RuntimeError', False),
-    ('effect', 'false', 'none', 'Unavailable', True),
-    ('effect', 'true', 'upload_failed', 'Unavailable', False),
-])
-async def test_issue194_reversible_upload_failure_production_info(
-        monkeypatch, capsys, step, attached, reason, error_type, file_access):
-    _row, raw, _, provenance = root_world(monkeypatch)
-    session = forms._ReversibleEntryReader(raw)
-    filename = 'Resume.pdf'
-    selector = next(c['selector'] for c in raw.current['controls']
-                    if c.get('type') == 'file')
-    if step == 'effect':
-        failure = forms.bsk.Unavailable(_ISSUE194_PRIVATE_FAILURE)
-        failure.code = reason if reason != 'none' else None
-        failure.file_access_required = file_access
-    elif step == 'page':
-        # A dynamically created invalid type name must be sanitized.
-        failure = type('9PrivateSyntheticError', (RuntimeError,), {})(
-            _ISSUE194_PRIVATE_FAILURE)
-    else:
-        failure = RuntimeError(_ISSUE194_PRIVATE_FAILURE)
-
-    original_call = raw.call
-    uploads = 0
-    post_upload_pages = 0
-
-    async def call(method, *args, **kwargs):
-        nonlocal uploads, post_upload_pages
-        if method == 'upload':
-            uploads += 1
-            assert args == (selector, '--file', filename)
-            assert kwargs == {'timeout': 130}
-            raw.calls.append((method, *args))
-            if not (step == 'effect' and attached == 'false'):
-                # Synthetic CLI failure may occur after the picker took effect.
-                files = ([filename, 'Unexpected.pdf'] if attached == 'false'
-                         else [filename])
-                raw.current, raw.fixed = observed(
-                    attached=True, files=files, displayName=filename)
-            if step == 'effect':
-                raise failure
-            return {}
-        if method == 'evaluate' and args == (forms.ENTRY_PAGE,) and uploads:
-            post_upload_pages += 1
-            if step == 'page' and post_upload_pages == 1:
-                raw.calls.append((method, *args))
-                raise failure
-            # The second read is diagnostics-only after page/observe failure;
-            # effect failure has no prior PAGE read.
-            diagnostic_read = 1 if step == 'effect' else 2
-            if attached == 'unknown' and post_upload_pages == diagnostic_read:
-                raw.calls.append((method, *args))
-                raise RuntimeError(_ISSUE194_PRIVATE_FAILURE)
-        return await original_call(method, *args, **kwargs)
-
-    raw.call = call
-    if step == 'observe':
-        original_observer = forms._observe_controls
-
-        async def observe(session, page, **kwargs):
-            if kwargs.get('site') == 'execute-formless-upload':
-                raise failure
-            return await original_observer(session, page, **kwargs)
-
-        monkeypatch.setattr(forms, '_observe_controls', observe)
-
-    expected_gate = (
-        "Enable BrowserSkill's Allow access to file URLs permission in the "
-        "dedicated profile; inspect the attachment before retrying."
-        if file_access else
-        'The résumé upload outcome is unclear; inspect the attachment '
-        'before retrying. No automatic repeat was attempted.'
-    )
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        with pytest.raises(forms.Gate) as caught:
-            await forms.execute(
-                session, raw.current, dict(action='upload', selector=selector),
-                facts={}, filled={}, resume_path=filename, company=COMPANY,
-                jd_text='', resume_tex='', github='', pk=PK,
-                job_url=posting('ashby'), provenance=provenance)
-        output = capsys.readouterr().out
-
-    assert str(caught.value) == expected_gate
-    lines = [line for line in output.splitlines()
-             if 'resume upload failure pk=' in line]
-    assert len(lines) == 1
-    message = (f'resume upload failure pk={PK} step={step} '
-               f'exception={error_type} reason={reason} '
-               f'attached={attached}')
-    assert re.fullmatch(
-        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
-        lines[0])
-    for private in (_ISSUE194_PRIVATE_FAILURE,
-                    filename, 'Unexpected.pdf'):
-        assert private not in output
-    assert uploads == 1 and post_upload_pages == (1 if step == 'effect' else 2)
-    assert [c for c in raw.calls if c[0] == 'upload'] == [
-        ('upload', selector, '--file', filename)]
-    assert not [c for c in raw.calls
-                if c[0] in {'click', 'select', 'fill', 'submit'}]
-
-
-async def test_issue194_existing_upload_gate_is_neither_logged_nor_retried(
-        monkeypatch, capsys):
-    _row, raw, _, provenance = root_world(monkeypatch)
-    session = forms._ReversibleEntryReader(raw)
-    selector = next(c['selector'] for c in raw.current['controls']
-                    if c.get('type') == 'file')
-    original_call = raw.call
-
-    async def call(method, *args, **kwargs):
-        if method == 'upload':
-            raw.calls.append((method, *args))
-            raise forms.Gate('Synthetic pre-existing upload Gate',
-                             reason='owner_question')
-        return await original_call(method, *args, **kwargs)
-
-    raw.call = call
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        with pytest.raises(forms.Gate) as caught:
-            await forms.execute(
-                session, raw.current, dict(action='upload', selector=selector),
-                facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
-                jd_text='', resume_tex='', github='', pk=PK,
-                job_url=posting('ashby'), provenance=provenance)
-        output = capsys.readouterr().out
-
-    assert str(caught.value) == 'Synthetic pre-existing upload Gate'
-    assert caught.value.reason == 'owner_question'
-    assert 'resume upload failure pk=' not in output
-    assert [c for c in raw.calls if c[0] == 'upload'] == [
-        ('upload', selector, '--file', 'Resume.pdf')]
 
 def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
     """A newly owner-answerable date must not expand the prior GLOBAL grant scope."""

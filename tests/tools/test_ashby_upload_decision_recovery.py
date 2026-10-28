@@ -10,6 +10,7 @@ FF-224e uploads before the first decision, so this path is the fallback for a
 résumé field rendered after it: the first decision waits, then the field appears.
 """
 import logging
+from pathlib import Path
 
 from tools import browser_skill_apply as forms
 from tests.tools.test_ashby_upload_fixture import (
@@ -36,7 +37,7 @@ async def test_upload_decision_uploads_once_then_submit_meets_the_guard(monkeypa
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
     _no_production_commit(raw, transport, row)
 
@@ -53,7 +54,7 @@ async def test_second_upload_decision_does_not_upload_again(monkeypatch, tmp_pat
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 4
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     assert _skipped(caplog) == [f'upload recovery skipped pk={guard.pk} term=not_uploaded']
     text = '\n'.join(record.getMessage() for record in caplog.records)
     assert 'Synthetic value' not in text and guard.resume_path not in text

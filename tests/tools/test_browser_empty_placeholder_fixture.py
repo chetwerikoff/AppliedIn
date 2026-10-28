@@ -12,8 +12,6 @@ import pytest
 from tools import browser_skill_apply as forms, browser_skill_fixture as fixture
 from tests.tools.test_browser_lever_fixture import observed
 from tests.tools.test_browser_greenhouse_fixture import Tree
-from tests.tools.test_ashby_upload_fixture import snapshot
-from tests.tools.test_ashby_upload_unwrap import tree_pair
 
 
 def test_empty_fixture_is_separate_required_blank_with_zero_height_box():
@@ -71,23 +69,6 @@ def traversal(state, *, premature=False):
         state.last_page['controls'] = [dict(selector='#_systemfield_resume', files=[filename])]
         state.fills, state.decisions, state.ipc_index, state.upload_ipc = 2, 4, 3, 1
         state.uploaded = True
-        if state.ashby_upload_unwrap:
-            # The stubbed upload must retain the exact one-span shape proof.
-            before, after = tree_pair()
-            state.upload_before_tree = before['entry']['upload_tree']
-            state.last_page['entry']['upload_tree'] = after['entry']['upload_tree']
-            state.last_page['entry']['upload_tree']['filename'] = filename
-        if state.ashby_upload_transient:
-            # The aggregate traversal mocks the apply loop. Feed its real
-            # fixture adjudicator the same three ordered pairs proven by the
-            # separate facade-reader test; a missing trace must fail closed.
-            first = snapshot(state, pending=True)
-            first[1]['entry']['upload_tree'] = snapshot(state)[1]['entry']['upload_tree']
-            pending = snapshot(state, pending=True)
-            complete = snapshot(state, attached=True)
-            state.upload_pair_trace = [
-                {'page': page, 'fixed': fixed}
-                for page, fixed in (first, pending, complete)]
         return dict(status='gate', form_question=dict(
             owner_kind='ashby-formless-root', selector='#additional'))
     if state.ashby:
@@ -156,12 +137,11 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
     monkeypatch.setattr(forms, 'apply', apply)
     assert fixture.run() == int(premature)
     reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert reports[-1]['sessions'] == 9
+    assert reports[-1]['sessions'] == 8
     assert len(reports[-1]['legs']) == len(STAGES) == 8
     assert set(reports[-1]['legs']) == set(STAGES)
     assert {r['scenario'] for r in reports[:-1]} == set(STAGES)
-    upload_reports = [r for r in reports[:-1] if r['scenario'] == 'ashby-upload']
-    assert {r['variant'] for r in upload_reports} == {'ordinary', 'transient+unwrap'}
+    assert [r['scenario'] for r in reports[:-1]].count('ashby-upload') == 1
     for report in reports[:-1]:
         # The current reader does not issue a C2 form-owner certificate for
         # Country. In particular, this synthetic path cannot claim one simply
@@ -176,17 +156,6 @@ def test_actual_all_leg_dispatch_reports_each_stage_and_safety(monkeypatch, caps
         assert report['post_received'] is False
         if report['scenario'] == 'ashby-upload':
             assert report['upload_ipc'] == 1
-            trace = report['upload_pair_trace']
-            if report['variant'] == 'transient+unwrap':
-                assert [pair['entry_agrees'] for pair in trace] == [False, True, True]
-                assert [pair['page_complete'] for pair in trace] == [False, False, True]
-                assert [pair['fixed_complete'] for pair in trace] == [True, False, True]
-                assert all(pair['page_url'] == pair['fixed_url'] == fixture.URL
-                           and pair['original_root_agrees']
-                           and pair['page_inventory_verified'] for pair in trace)
-                assert trace[-1]['page_attached'] is True
-            else:
-                assert trace == []
         else:
             assert report['upload_ipc'] == 0
     assert reports[-1]['legs'] == {

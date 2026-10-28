@@ -13,6 +13,8 @@ résumé field rendered after it: the first decision waits, then the field appea
 from copy import deepcopy
 import logging
 
+from pathlib import Path
+
 import pytest
 
 from tools import browser_skill_apply as forms
@@ -68,7 +70,7 @@ async def test_upload_control_click_uploads_once_never_clicks_then_meets_the_gua
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
     assert _pdf_lines(caplog) == []
     _no_production_commit(raw, transport, row)
@@ -83,7 +85,7 @@ async def test_second_upload_control_click_does_not_upload_again(monkeypatch, tm
     result = await run_apply([WAIT, dropzone, dropzone, click], late=True)
     assert result['status'] == 'gate', result
     guard = transport._application_controller
-    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
+    assert uploads == [('set', Path(guard.resume_path).name)]
     _no_production_commit(raw, transport, row)
 
 

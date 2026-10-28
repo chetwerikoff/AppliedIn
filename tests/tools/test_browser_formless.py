@@ -3440,3 +3440,113 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
     assert not [c for c in raw.calls if extra['selector'] in c[1:2]]
     assert not [c for c in raw.calls if c[0] == 'click']
     assert not transport._application_controller.committed
+
+
+def _issue218_main_reader_scripts():
+    """Reconstruct and hash-pin the exact main DOM producer, not a hand-built tree."""
+    import hashlib
+    from tools import browser_skill_dom as producer
+
+    source = Path(producer.__file__).read_text()
+    old = producer._ENTRY_OBSERVATION
+    changes = [
+        (
+            "  // The exact sibling mismatch loses wrapper ownership but retains one bounded,\n"
+            "  // independently observed application container. It has no Submit authority.\n"
+            "  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&\n"
+            "    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&\n"
+            "    !!container && !!exactSubmit;\n"
+            "  const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);\n"
+            "  let passiveDelete=null;\n",
+            "",
+        ),
+        ("  if (uploadRoot) try {\n    const source=[], stack=[[uploadRoot,-1]];",
+         "  if (structuralRoot) try {\n    const source=[], stack=[[structuralRoot,-1]];"),
+        ("uploadRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')",
+         "structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')"),
+        ("    const items=Array.from(uploadRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n\n",
+         "    const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n"),
+        ("        passiveDelete=del;\n", ""),
+        ("    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector).concat(\n"
+         "      containerUploadRoot && passiveDelete ? [selector(passiveDelete)] : []),",
+         "    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),"),
+        ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
+         "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
+         "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
+    ]
+    for updated, previous in changes:
+        assert source.count(updated) == old.count(updated) == 1, updated[:80]
+        source = source.replace(updated, previous, 1)
+        old = old.replace(updated, previous, 1)
+    git_blob = b'blob ' + str(len(source.encode())).encode() + b'\\0' + source.encode()
+    assert hashlib.sha1(git_blob).hexdigest() == 'c06c4900a89919bc410289cffaffb46958370e1c'
+    assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
+    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
+    return [
+        forms.ENTRY_PAGE.replace(producer._ENTRY_OBSERVATION, old, 1),
+        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(producer._ENTRY_OBSERVATION, old, 1),
+    ]
+
+
+@pytest.mark.parametrize('reader_index', [0, 1])
+@pytest.mark.parametrize('spec_change', [
+    {}, {'duplicateSubmit': True}, {'duplicatePane': True},
+    {'secondFormlessComplete': True}, {'missingPane': True},
+])
+def test_issue218_non_mismatch_readers_stay_byte_identical_to_main(reader_index, spec_change):
+    main = _issue218_main_reader_scripts()[reader_index]
+    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
+    spec = dict(root=False, formless=True, url=entry('ashby'), **spec_change)
+    from json import dumps
+    assert dumps(dom(spec, reader), ensure_ascii=False, separators=(',', ':')) == dumps(
+        dom(spec, main), ensure_ascii=False, separators=(',', ':'))
+
+
+@pytest.mark.parametrize('reader_index', [0, 1])
+@pytest.mark.parametrize('attached', [False, True])
+def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, attached):
+    from json import dumps
+    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
+    main = _issue218_main_reader_scripts()[reader_index]
+    filename = 'Synthetic-Resume.pdf'
+    spec = dict(root=False, formless=True, sibling=True, url=entry('ashby'),
+                **({'attached': True, 'files': [filename], 'displayName': filename}
+                   if attached else {}))
+    current, baseline = dom(spec, reader), dom(spec, main)
+    root = current['entry']['formless']
+    tree = current['entry']['upload_tree']
+    assert root['error'] == 'application root sibling identity mismatch'
+    assert current['entry']['root'] is None
+    assert root['root'] == '' and root['container'] and root['submit'] and root['pane']
+    assert tree['complete'] is True and tree['scope'] == 'container'
+    assert 1 <= len(tree['nodes']) <= 4096
+    assert tree['nodes'][0]['tag'] == 'div'
+    assert tree['nodes'][tree['input']]['target_selector'] == '#_systemfield_resume'
+    assert tree['nodes'][tree['dropzone']]['target_selector'] == '#dropzone'
+    assert tree['attached'] is attached
+    assert baseline['entry']['upload_tree'] is None
+    normalized = deepcopy(current)
+    normalized['entry']['upload_tree'] = None
+    if attached:
+        assert tree['filename'] == filename and len(tree['items']) == 1
+        deleted = tree['nodes'][tree['delete']]['selector']
+        assert deleted not in {c['selector'] for c in current['controls']}
+        assert deleted not in {c['selector'] for c in current['entry']['root_evidence']}
+        assert deleted in root['excluded']
+        assert root['excluded'] == [*baseline['entry']['formless']['excluded'], deleted]
+        for section in ('controls',):
+            assert current[section] == [
+                c for c in baseline[section] if c['selector'] != deleted]
+            normalized[section] = baseline[section]
+        assert current['entry']['root_evidence'] == [
+            c for c in baseline['entry']['root_evidence']
+            if c['selector'] != deleted]
+        normalized['entry']['root_evidence'] = baseline['entry']['root_evidence']
+        normalized['entry']['formless']['excluded'] = baseline['entry']['formless']['excluded']
+        assert deleted not in {c['selector'] for c in
+                               forms._reversible_entry_scope(current, {})}
+    else:
+        assert tree['items'] == [] and not tree.get('attached')
+        assert root['excluded'] == baseline['entry']['formless']['excluded']
+    assert dumps(normalized, ensure_ascii=False, separators=(',', ':')) == dumps(
+        baseline, ensure_ascii=False, separators=(',', ':'))

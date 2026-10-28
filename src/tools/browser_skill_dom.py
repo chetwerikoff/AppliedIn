@@ -406,10 +406,17 @@ _ASHBY_ROOT = r"""
       h[i]=Math.imul(h[i]^c.codePointAt(0),16777619+i*2)>>>0;
     return h.map(n=>n.toString(16).padStart(8,'0')).join('');
   };
+  // The exact sibling mismatch loses wrapper ownership but retains one bounded,
+  // independently observed application container. It has no Submit authority.
+  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
+    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&
+    !!container && !!exactSubmit;
+  const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);
+  let passiveDelete=null;
   const uploadTree={complete:false,nodes:[],input:null,container:null,dropzone:null,
     items:[],svgs:[],attached:false};
-  if (structuralRoot) try {
-    const source=[], stack=[[structuralRoot,-1]];
+  if (uploadRoot) try {
+    const source=[], stack=[[uploadRoot,-1]];
     while(stack.length) {
       const [n,parent]=stack.pop();
       if (![1,3].includes(n.nodeType)) throw Error('unreadable structural node');
@@ -442,7 +449,7 @@ _ASHBY_ROOT = r"""
     const drop=drops.length===1 ? drops[0] : null;
     if(!input || input.type!=='file' || !file || !container.contains(file) ||
         file.querySelectorAll('input').length!==1 || !drop || drop.form ||
-        structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload').length!==1 ||
+        uploadRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload').length!==1 ||
         drop.hasAttribute('form') || drop.hasAttribute('formaction') ||
         drop.disabled || drop.closest('[inert]') || !entryEvidenceVisible(drop)) throw Error('ambiguous file container');
     uploadTree.input=source.indexOf(input); uploadTree.container=source.indexOf(file);
@@ -451,7 +458,8 @@ _ASHBY_ROOT = r"""
     uploadTree.nodes[uploadTree.dropzone].target_selector=selector(drop);
     uploadTree.svgs=Array.from(drop.querySelectorAll('svg')).filter(n=>
       !n.parentElement.closest('svg')).map(n=>source.indexOf(n));
-    const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));
+    const items=Array.from(uploadRoot.querySelectorAll('div.ashby-application-form-input-file-item'));
+
     uploadTree.items=items.map(n=>source.indexOf(n));
     if(items.length===1) {
       const item=items[0], names=item.querySelectorAll('p.ashby-application-form-input-file-item-name'),
@@ -483,6 +491,7 @@ _ASHBY_ROOT = r"""
         uploadTree.delete=source.indexOf(del);
         // A proven passive delete never enters any downstream action consumer.
         excluded.add(del);
+        passiveDelete=del;
       }
     }
     uploadTree.complete=true;
@@ -570,7 +579,8 @@ _ASHBY_ROOT = r"""
     root:structuralRoot ? selector(structuralRoot) : '',
     container:container ? selector(container) : '',
     submit:exactSubmit ? selector(exactSubmit) : '',
-    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),
+    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector).concat(
+      containerUploadRoot && passiveDelete ? [selector(passiveDelete)] : []),
     pane:panes.length===1 ? selector(panes[0]) : '',
     error:structuralError,truncated:evidenceNodes.length>500} : null;
 """
@@ -964,7 +974,8 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
     root:ashbyNative ? null : nativeRoot ?
       {selector:selector(nativeRoot),action:nativeRoot.action} : null,
     ...(ashbyNative ? {native_candidates:nativeCandidates} : {}),
-    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,
+    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :
+      (containerUploadRoot ? {...uploadTree,scope:'container'} : null),
     helper_challenge:reservedButtons.some(e=>!(e.tagName === 'BUTTON' && e.id === 'hcaptchaSubmitBtn' &&
           e.matches('.hidden')) ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&

@@ -157,14 +157,17 @@ if(spec.nativePair && spec.foreignFirst) {
 if(spec.formless) {
   if(spec.leadingInert)node('div',{},body);
   const wrapper=node(spec.wrapperTag || 'div',
-    {...(spec.idless ? {} : {id:'application-root'}),class:spec.wrapperClass || ''},body);
+    {...(spec.idless ? {} : {id:'application-root'}),class:spec.wrapperClass || '',
+     ...spec.wrapperAttrs},body);
   const pane=node(spec.paneTag || 'div',
-    {...(spec.idless ? {} : {id:'autofill'}),class:'ashby-application-form-autofill-pane'},wrapper);
+    {...(spec.idless ? {} : {id:'autofill'}),class:'ashby-application-form-autofill-pane',
+     ...(spec.highlight ? {'data-highlight':'synthetic'} : {})},wrapper);
   const helper=node('input',{id:'autofill-file',type:'file'},pane);
   node('button',{id:'autofill-button',type:'button',text:'Autofill'},pane);
   if(!form) Object.defineProperty(helper,'value',{get:()=> {throw Error('AUTOFILL VALUE READ');}});
   const container=node('div',
-    {...(spec.idless ? {} : {id:'application-fields'}),class:'ashby-application-form-container'},wrapper);
+    {...(spec.idless ? {} : {id:'application-fields'}),class:'ashby-application-form-container',
+     ...(spec.highlight ? {'data-highlight':'synthetic'} : {})},wrapper);
   const field=(tag,id,type,text,required=false) => {
     const entry=node('div',{class:'ashby-application-form-field-entry'},container);
     const l=node('label',{id:id+'-label','for':id,class:'ashby-application-form-question-title',text},entry);
@@ -249,7 +252,14 @@ if(spec.formless) {
   if(spec.hiddenOutside) node('input',{id:'outside-hidden',type:'hidden',rect:null},body);
   if(spec.extraChild) node('span',{},wrapper);
   if(spec.inertSibling) {
-    const sibling=node('div',spec.siblingClass ? {class:spec.siblingClass} : {},wrapper);
+    const sibling=node('div',{...(spec.siblingClass ? {class:spec.siblingClass} : {}),
+      ...spec.siblingAttrs},wrapper);
+    if(spec.inertDescendant==='content') {
+      const list=node('ul',{class:'synthetic-list'},node('div',{class:'synthetic-body'},sibling));
+      node('strong',{text:'Synthetic'},node('p',{},sibling));
+      node('span',{text:'Synthetic'},node('li',{},list));
+    }
+    if(spec.inertDescendant==='button') node('button',{type:'button',text:'Synthetic'},sibling);
     if(spec.inertDescendant==='onclick')
       node('span',{onclick:'syntheticAction()'},sibling);
     if(spec.inertDescendant==='summary') node('summary',{},sibling);

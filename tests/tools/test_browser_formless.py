@@ -1602,29 +1602,45 @@ async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch
 
 
 
-@pytest.mark.parametrize('descendant,error', [
-    (None, 'application root sibling identity mismatch'),
-    ('onclick', 'application root sibling identity mismatch: unsafe sibling'),
-    ('summary', 'application root sibling identity mismatch: unsafe sibling'),
+_UNSAFE = 'application root sibling identity mismatch: unsafe sibling'
+_LIVE_SIBLING = dict(inertSibling=True, inertBeforeContainer=True, highlight=True,
+                     siblingClass='synthetic-decoration',
+                     siblingAttrs={'data-highlight': 'synthetic'})
+
+
+@pytest.mark.parametrize('changes,error', [
+    ({}, 'application root sibling identity mismatch'),
+    ({'inertDescendant': 'content'}, 'application root sibling identity mismatch'),
+    ({'wrapperAttrs': {'tabindex': '-1', 'role': 'region', 'aria-labelledby': 'synthetic'},
+      'inertDescendant': 'content'}, 'application root sibling identity mismatch'),
+    ({'siblingAttrs': {'data-highlight': 'synthetic', 'onclick': 'syntheticAction()'}}, _UNSAFE),
+    ({'siblingAttrs': {'data-highlight': 'synthetic', 'role': 'note'}}, _UNSAFE),
+    ({'siblingAttrs': {'data-highlight': 'synthetic', 'tabindex': '-1'}}, _UNSAFE),
+    ({'siblingAttrs': {'data-highlight': 'synthetic', 'contenteditable': 'true'}}, _UNSAFE),
+    ({'siblingAttrs': {'data-highlight': 'synthetic', 'href': '#synthetic'}}, _UNSAFE),
+    ({'inertDescendant': 'button'}, _UNSAFE),
+    ({'inertDescendant': 'onclick'}, _UNSAFE),
+    ({'inertDescendant': 'summary'}, _UNSAFE),
 ])
 def test_styled_inert_sibling_keeps_reversible_scope_without_wrapper_authority(
-        descendant, error):
-    # After #220 a wrapper sibling carrying only a class was labelled "unsafe
-    # sibling", which is not a tolerated reversible root error, so every
-    # reversible scope came back empty and no Ashby row could be filled. A
-    # class is styling: the page must return to the container-scoped mismatch.
-    # It still never certifies the wrapper, and real interactivity still refuses.
-    page, fixed = observed(inertSibling=True, siblingClass='synthetic-decoration',
-                           **({'inertDescendant': descendant} if descendant else {}))
+        changes, error):
+    # Live Ashby (Issue #222) puts an inert div carrying class + data-highlight
+    # beside the pane, container and Submit. After #220 that sibling was
+    # labelled "unsafe sibling", which is not a tolerated reversible root error,
+    # so every reversible scope came back empty and no row could be filled.
+    # class and data-* are styling: the page returns to the container-scoped
+    # mismatch, still never certifies the wrapper, and any other attribute or
+    # real interactivity on the sibling still refuses.
+    page, fixed = observed(**{**_LIVE_SIBLING, **changes})
     for current in (page, fixed):
         assert current['entry']['formless']['error'] == error
         assert current['entry']['root'] is None
     scope = forms._reversible_entry_scope(
         page, {c['selector']: c for c in fixed['controls']})
-    if descendant is None:
-        assert scope
-    else:
+    if error == _UNSAFE:
         assert not scope
+    else:
+        assert scope
 
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
@@ -3508,12 +3524,13 @@ def _issue218_main_reader_scripts():
         ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
          "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
          "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
-        ("  // A class alone is styling: it may not certify the wrapper, but it must not\n"
-         "  // turn the container-scoped mismatch into \"unsafe sibling\" either. That label\n"
-         "  // emptied every reversible scope on live Ashby pages after #220.\n"
+        ("  // class and data-* are styling: they may not certify the wrapper, but must\n"
+         "  // not turn the container-scoped mismatch into \"unsafe sibling\" either. Live\n"
+         "  // Ashby decorates an inert sibling with data-highlight, and that label\n"
+         "  // emptied every reversible scope after #220. Any other attribute is unsafe.\n"
          "  const inertSibling=(e,styled=false)=>{\n"
-         "    if(!['DIV','SPAN'].includes(e.tagName) ||\n"
-         "       Array.from(e.attributes).some(a=>!(styled && a.name==='class'))) return false;",
+         "    if(!['DIV','SPAN'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n"
+         "       !(styled && (a.name==='class' || /^data-/i.test(a.name))))) return false;",
          "  const inertSibling=e=>{\n"
          "    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;"),
         ("!inertSibling(n,true));", "!inertSibling(n));"),

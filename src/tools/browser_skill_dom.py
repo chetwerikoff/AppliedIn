@@ -369,12 +369,13 @@ _ASHBY_ROOT = r"""
   const wrapper=container?.parentElement;
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
-  // A class alone is styling: it may not certify the wrapper, but it must not
-  // turn the container-scoped mismatch into "unsafe sibling" either. That label
-  // emptied every reversible scope on live Ashby pages after #220.
+  // class and data-* are styling: they may not certify the wrapper, but must
+  // not turn the container-scoped mismatch into "unsafe sibling" either. Live
+  // Ashby decorates an inert sibling with data-highlight, and that label
+  // emptied every reversible scope after #220. Any other attribute is unsafe.
   const inertSibling=(e,styled=false)=>{
-    if(!['DIV','SPAN'].includes(e.tagName) ||
-       Array.from(e.attributes).some(a=>!(styled && a.name==='class'))) return false;
+    if(!['DIV','SPAN'].includes(e.tagName) || Array.from(e.attributes).some(a=>
+       !(styled && (a.name==='class' || /^data-/i.test(a.name))))) return false;
     const nodes=[e,...Array.from(e.querySelectorAll('*'))];
     const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label[for],[autofocus],[controls]';
     return !e.querySelectorAll(interactive).length && nodes.every(n=>

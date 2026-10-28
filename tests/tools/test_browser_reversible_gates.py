@@ -926,10 +926,9 @@ def test_receiver_defect_names_structure_never_ids_or_values(monkeypatch, tmp_pa
     {'movePane': True}, {'moveSubmit': True},
 ])
 @pytest.mark.asyncio
-async def test_tolerated_mismatch_with_nothing_unanswered_reaches_guarded_submit(
+async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guard(
         monkeypatch, tmp_path, spec):
-    """Fully valued tolerated mismatches reach the guarded Submit click; without
-    employer confirmation, the attempt stays uncertain with a durable hold."""
+    """Submit on a tolerated mismatch is still refused by the final value re-check when this run did not fill the values."""
     def optional(snapshots):
         # Already-valued receivers are never re-asked, so nothing is left for
         # the owner on this route and preparation reaches the final guard.
@@ -943,7 +942,7 @@ async def test_tolerated_mismatch_with_nothing_unanswered_reaches_guarded_submit
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     row, raw, decide, _ = root_world(monkeypatch, **spec)
     optional((raw.current, raw.fixed))
-    transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     file = next(c for c in raw.current['controls']
                 if c['type'] == 'file' and c['label'] == 'Resume')
     button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
@@ -960,22 +959,17 @@ async def test_tolerated_mismatch_with_nothing_unanswered_reaches_guarded_submit
         return await original_call(method, *args, **kwargs)
     raw.call = call
     decide.side_effect = [dict(action='upload', selector=file['selector']),
+                          dict(action='submit', selector=button['selector']),
                           dict(action='submit', selector=button['selector'])]
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
-    assert result['status'] == 'uncertain', result
-    assert 'check the employer portal before retrying' in result['detail'].lower()
-    assert decide.await_count == 2
+    assert result['status'] == 'gate', result
+    assert 'Unverified or changed form value' in result['question'], result
+    assert decide.await_count == 3
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('upload', file['selector'], '--file',
-         transport._application_controller.resume_path),
-        ('click', button['selector'])]
-    assert transport._application_controller.committed
-    assert tracking.r.get(f'submit_hold:{PK}') is not None
-    assert row['status'] == 'needs_human'
-    assert row['gate_reason'] == 'submit_uncertain'
-    assert row['fail_kind'] == 'uncertain'
-    assert forms.submit_hold.blocked(PK, row, tracking=tracking)
+         transport._application_controller.resume_path)]
+    assert not transport._application_controller.committed
 
 
 # Issue #202 AC6/AC8: exact SKIP suppression and question-key collisions on the

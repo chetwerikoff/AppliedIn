@@ -1313,3 +1313,121 @@ def test_retained_attachment_replacement_needs_the_exact_one_item_swap(authority
             c['value'] = 'Changed Synthetic Name'
     with pytest.raises(forms.Gate):
         forms._reversible_upload_settled(before, moved, filename, prior=PRIOR_RUN_PDF)
+
+
+# ARCH21:58: production models click the Submit control instead of choosing
+# submit. Only the offline fixture converts that click, so these cases run the
+# real raw producer and controller (no fixture context) on the reversible route.
+
+def _production_submit_click(monkeypatch, tmp_path, *, upload=None):
+    from tests.tools.test_browser_application_entry import PK, COMPANY, posting
+    from tests.tools.test_browser_formless import root_world
+    from tests.tools.test_browser_controller_support import install_controller_session
+
+    def prefilled(snapshots):
+        for snapshot in snapshots:
+            for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
+                if c.get('type') not in {'file', 'submit'} and c.get('tag') != 'button':
+                    c['value'] = 'Synthetic value'
+                    if 'has_value' in c:
+                        c['has_value'] = True
+
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+    row, raw, decide, _ = root_world(monkeypatch, movePane=True)
+    prefilled((raw.current, raw.fixed))
+    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
+    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
+    original_call = raw.call
+    uploads = []
+
+    async def call(method, *args, **kwargs):
+        if method == 'upload':
+            uploads.append((method, *args))
+            raw.calls.append((method, *args))
+            if upload is not None:
+                return await upload()
+            name = Path(args[2]).name
+            raw.current, raw.fixed = observed(
+                movePane=True, attached=True, files=[name], displayName=name)
+            prefilled((raw.current, raw.fixed))
+            return {}
+        return await original_call(method, *args, **kwargs)
+
+    raw.call = call
+
+    async def run_apply(actions):
+        decide.side_effect = actions
+        return await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
+                                 pk=PK, resume_path=pdf)
+
+    click = {'action': 'click', 'selector': button['selector']}
+    return run_apply, click, raw, decide, transport, uploads, row
+
+
+def _no_production_commit(raw, transport, row):
+    assert not [c for c in raw.calls if c[0] == 'click']
+    assert not transport._application_controller.committed
+    assert not row.get('possible_submission')
+
+
+async def test_production_submit_click_without_upload_recovers_then_meets_final_guard(
+        monkeypatch, tmp_path):
+    """The live symptom: a model click on Submit right after bootstrap was refused
+    at the final guard for the missing row PDF, so the row could never proceed.
+    The click now takes the one guarded upload, then a fresh decision; the second
+    click passes the PDF proof and is refused by a later final-guard check."""
+    run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path)
+    result = await run_apply([click, click])
+    assert result['status'] == 'gate', result
+    assert 'protected tailored PDF' not in result['question']
+    assert 'Unverified or changed form value' in result['question'], result
+    assert decide.await_count == 2
+    guard = transport._application_controller
+    assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
+    # The staged PDF is released after the run; recovery compared the
+    # producer's upload_identity with it before recording the receipt.
+    assert guard.upload_attempted and guard.upload_completed
+    assert not guard.upload_pending and guard.upload_identity is not None
+    _no_production_commit(raw, transport, row)
+
+
+@pytest.mark.parametrize('failure', ['fault', 'refused'])
+async def test_production_submit_click_upload_failure_stops_without_click(
+        monkeypatch, tmp_path, failure):
+    """Once the recovery has passed its effect edge, any transport failure,
+    even one reported as no-effect, stays terminal uncertain: the chooser may
+    have acted, so nothing is retried, recorded as uploaded or clicked."""
+    from tools.browser_skill import Unavailable
+
+    async def broken():
+        if failure == 'fault':
+            raise OSError('synthetic transport fault')
+        exc = Unavailable('synthetic definitive refusal')
+        exc.code, exc.effect_state = 'unsupported', 'none'
+        raise exc
+
+    run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path, upload=broken)
+    result = await run_apply([click, click])
+    assert result == {
+        'status': 'uncertain', 'step': result['step'],
+        'detail': 'Résumé upload interrupted after the browser command; inspect manually'}
+    assert decide.await_count == 1
+    assert len(uploads) == 1
+    assert not transport._application_controller.upload_completed
+    _no_production_commit(raw, transport, row)
+
+
+async def test_production_submit_click_never_uploads_a_second_time(monkeypatch, tmp_path):
+    """After the one recovery, neither a model upload nor further Submit clicks
+    can reach the chooser again; each later click goes to the final guard."""
+    run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path)
+    upload = {'action': 'upload', 'selector': '#_systemfield_resume'}
+    result = await run_apply([click, upload, click])
+    assert result['status'] == 'gate', result
+    assert 'Unverified or changed form value' in result['question'], result
+    assert len(uploads) == 1
+    assert decide.await_count == 3
+    _no_production_commit(raw, transport, row)

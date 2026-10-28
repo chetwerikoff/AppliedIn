@@ -7341,7 +7341,15 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  'disabled', 'required')):
                             raise Gate('The control changed while planning; review the form.')
                     recovered_upload = False
-                    if (verb == 'submit'
+                    # Production models also click the Submit control rather than
+                    # choose submit; only the offline fixture converts that above.
+                    # Such a click would reach the final guard and be refused for
+                    # the missing PDF, so it takes the same recovery instead.
+                    submit_click = (
+                        verb == 'click' and bool(action.get('selector'))
+                        and isinstance(current, dict)
+                        and (is_submission(current) or native_submit(current)))
+                    if ((verb == 'submit' or submit_click)
                             and isinstance(session, _ReversibleEntryReader)
                             and isinstance(provenance, ApplicationEntryProvenance)
                             and provenance.ats == 'ashby' and _formless_root(page)
@@ -7355,6 +7363,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if not isinstance(target, dict) or not (
                                 is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current application-commit control.')
+                        # The recovered click is a Submit decision that never clicks.
+                        verb = 'submit'
                         result = await _reversible_recover_upload(
                             session, page, provenance=provenance, allowed=allowed,
                             resume_path=resume_path, ctx=ctx, raw_session=raw_session,

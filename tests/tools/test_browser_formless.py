@@ -277,11 +277,12 @@ async def prepared_shape_refusal(monkeypatch, tmp_path, changes, cause):
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert cause in result['question'], result
-    assert decide.await_count == 2  # preparation reached the actual final guard
-    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
-        ('upload', file['selector'], '--file', transport._application_controller.resume_path)]
-    assert transport._application_controller.upload_completed
+    # Issue #218: a model upload on the reversible route now Gates before
+    # even its first chooser, regardless of an ambiguous-root variant.
+    assert 'no direct chooser is permitted' in result['question'], result
+    assert decide.await_count == 1
+    assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
+    assert not transport._application_controller.upload_completed
     assert not transport._application_controller.committed
 
 
@@ -3509,7 +3510,7 @@ def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, att
     reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
     main = _issue218_main_reader_scripts()[reader_index]
     filename = 'Synthetic-Resume.pdf'
-    spec = dict(root=False, formless=True, sibling=True, url=entry('ashby'),
+    spec = dict(root=False, formless=True, movePane=True, url=entry('ashby'),
                 **({'attached': True, 'files': [filename], 'displayName': filename}
                    if attached else {}))
     current, baseline = dom(spec, reader), dom(spec, main)

@@ -760,6 +760,11 @@ def _bind_mismatch_fixture_producer(authority, monkeypatch, *, transport='effect
             fixture_context=self, entry_provenance=self.entry_provenance())
 
         class Proxy:
+            def __getattribute__(self, key):
+                if key == 'application_effect' and transport == 'call':
+                    raise AttributeError(key)
+                return object.__getattribute__(self, key)
+
             _sealed_delegate = sealed
             _original_raw = raw
             _application_controller = controller

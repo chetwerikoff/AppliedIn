@@ -3089,6 +3089,125 @@ def _reversible_entry_scope(page: dict, witness: dict) -> frozenset[str]:
     return frozenset(admitted)
 
 
+def _reversible_upload_structure(page: dict, selector: str, *, empty: bool,
+                                 filename: str = '') -> dict:
+    """Reversible upload proof uses the same complete tree as both real readers.
+
+    The old ordered-root route never accepts a container scope. This exceptional
+    scope is read only by this recovery path, not general control admission.
+    """
+    root = _formless_root(page)
+    tree = _upload_tree(page)
+    if (not isinstance(root, dict)
+            or root.get('error') != 'application root sibling identity mismatch'
+            or root.get('root') or not root.get('pane')
+            or not root.get('container') or not root.get('submit')
+            or root.get('truncated') or tree.get('scope') != 'container'
+            or not isinstance(root.get('excluded'), list)
+            or any(not isinstance(value, str) for value in root['excluded'])):
+        raise Gate('The exact container-scoped résumé upload witness is unavailable.')
+    original = _upload_input(page, tree)
+    candidates = [c for c in page.get('controls', [])
+                  if c.get('selector') == selector and c.get('type') == 'file'
+                  and c.get('id') == '_systemfield_resume']
+    if (len(candidates) != 1 or original['selector'] != selector
+            or original.get('in_container') is not True
+            or original.get('unique') is not True
+            or selector in root['excluded']
+            or candidates[0].get('disabled') or candidates[0].get('readonly')
+            or candidates[0].get('inert') or candidates[0].get('in_form') is not False
+            or not re.search(r'resume|résumé|cv', label(candidates[0]), re.I)):
+        raise Gate('Original semantic résumé input is no longer proven.')
+    _reversible_entry_recipient(page, candidates[0], clipped_file=True)
+    drop_selector = tree['nodes'][tree['dropzone']].get('target_selector')
+    drops = [c for c in page.get('entry', {}).get('root_evidence', [])
+             if c.get('selector') == drop_selector and c.get('dropzone') is True
+             and c.get('unique') is True and c.get('in_container') is True
+             and c.get('visible') is True and not c.get('disabled')
+             and not c.get('inert')]
+    if (not isinstance(drop_selector, str) or not drop_selector
+            or drop_selector == selector or len(drops) != 1
+            or drop_selector in root['excluded']):
+        raise Gate('The unique same-container upload dropzone is not proven.')
+    if empty and (candidates[0].get('files') != [] or original.get('files') != []
+                  or tree.get('items') != [] or tree.get('attached') is not False
+                  or tree.get('filename') not in (None, '')):
+        raise Gate('The original empty résumé input changed before upload.')
+    if (not empty and (original.get('files') not in ([], [filename])
+                       or candidates[0].get('files') != original.get('files')
+                       or tree.get('filename') not in (None, '', filename))):
+        raise Gate('Only the exact staged résumé may be uploaded; file proof is missing.')
+    return tree
+
+
+async def _reversible_upload_pair(session: _ReversibleEntryReader, *, allowed,
+                                  provenance, selector: str, empty: bool,
+                                  filename: str = '') -> dict:
+    """Two fresh real reader observations; never substitute a fixture tree."""
+    page = await session.page()
+    response = await session.call('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+    fixed = response.get('value') if isinstance(response, dict) else None
+    if not isinstance(fixed, dict):
+        raise Gate('Upload PAGE/fixed structural witness disagreement.',
+                   reason='defect_witness')
+    for observation in (page, fixed):
+        _inventory_ok(observation, complete=False)
+        _entry_safety(observation, allowed, provenance)
+        _reversible_upload_structure(observation, selector, empty=empty,
+                                     filename=filename)
+    if (page.get('url') != fixed.get('url')
+            or page.get('entry') != fixed.get('entry')):
+        raise Gate('Upload PAGE/fixed structural witness disagreement.',
+                   reason='defect_witness')
+    # The independent fixed reader must also agree on this clipped original,
+    # not just on the opaque complete tree and input selector.
+    fields = ('selector', 'id', 'tag', 'type', 'label', 'question',
+              'in_form', 'form_selector', 'form_action', 'formaction',
+              'native_form_owner_selector', 'disabled', 'readonly', 'inert',
+              'required', 'files', 'value')
+    def file_snapshot(observation):
+        controls = [c for c in observation['controls']
+                    if c.get('selector') == selector]
+        return tuple(controls[0].get(key) for key in fields) if len(controls) == 1 else None
+    if file_snapshot(page) is None or file_snapshot(page) != file_snapshot(fixed):
+        raise Gate('Upload PAGE/fixed original receiver disagreement.',
+                   reason='defect_witness')
+    return page
+
+
+def _reversible_upload_settled(before: dict, after: dict, filename: str) -> bool:
+    """Preserve the ordered _upload_delta guard, accounting for ARCH08:38.
+
+    Only a proven passive attached delete can enlarge root.excluded. Remove
+    that single protective delta from a comparison copy; keep it excluded
+    from every actual action consumer and from the final-root observation.
+    """
+    pre_root, post_root = _formless_root(before), _formless_root(after)
+    tree = _upload_tree(after)
+    if (not isinstance(pre_root, dict) or not isinstance(post_root, dict)
+            or tree.get('scope') != 'container'):
+        raise Gate('Original application root or submit changed during upload.')
+    comparison = after
+    if tree.get('attached') is True:
+        index = tree.get('delete')
+        nodes = tree['nodes']
+        if (type(index) is not int or not 0 <= index < len(nodes)
+                or not isinstance(nodes[index].get('selector'), str)):
+            raise Gate('The exact passive attached-file item was not proven.')
+        delete_selector = nodes[index]['selector']
+        exclusions = pre_root.get('excluded')
+        if (not isinstance(exclusions, list)
+                or post_root.get('excluded') != [*exclusions, delete_selector]
+                or delete_selector in {c.get('selector') for c in after['controls']}
+                or delete_selector in {c.get('selector') for c in
+                                       after['entry']['root_evidence']}):
+            raise Gate('The attached-file passive delete is not excluded.')
+        from copy import deepcopy
+        comparison = deepcopy(after)
+        comparison['entry']['formless']['excluded'] = list(exclusions)
+    return _upload_delta(before, comparison, filename)
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')

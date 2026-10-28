@@ -3360,11 +3360,17 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
         session, allowed=allowed, provenance=provenance, selector=selector,
         empty=True, filename=filename, prior=prior)
     baseline_tree = _upload_tree(before)
+    # Issue FF-224f: BrowserSkill opens the chooser by clicking a visible
+    # opener. Live Ashby clips the native input out of view, so a chooser sent
+    # there was refused after the effect edge and every resumed row ended
+    # uncertain. The opener is the proven same-container dropzone, as on the
+    # entry route; the producer maps it back to this exact input.
+    opener = baseline_tree['nodes'][baseline_tree['dropzone']]['target_selector']
     raw_guard = producer_guard if ctx is None else controller
 
     async def upload_edge(args: tuple, kwargs: dict):
         verify_dispatch()
-        if (args != ('upload', selector, '--file', resume_path)
+        if (args != ('upload', opener, '--file', resume_path)
                 or kwargs != {'timeout': 130}):
             raise Gate('Only one exact default chooser upload is permitted; no modes or retries.')
         fresh = await _reversible_upload_pair(
@@ -3372,8 +3378,10 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
             empty=True, filename=filename, prior=prior)
         earlier = next(c for c in before['controls'] if c.get('selector') == selector)
         current = next(c for c in fresh['controls'] if c.get('selector') == selector)
+        fresh_tree = _upload_tree(fresh)
         if (_root_identity(fresh) != _root_identity(before)
-                or _upload_shape(_upload_tree(fresh)) != _upload_shape(baseline_tree)
+                or fresh_tree['nodes'][fresh_tree['dropzone']].get('target_selector') != opener
+                or _upload_shape(fresh_tree) != _upload_shape(baseline_tree)
                 or _upload_candidates(fresh) != _upload_candidates(before)
                 or any(earlier.get(key) != current.get(key) for key in ('files', 'value'))):
             raise Gate('The original résumé input changed before upload.' if prior
@@ -3386,7 +3394,7 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
     try:
         # Both application_effect (production) and call (closed offline
         # fixture) enter the same one-shot effect-adjacent guard.
-        await _effect_call(session, 'upload', selector, '--file', resume_path, timeout=130)
+        await _effect_call(session, 'upload', opener, '--file', resume_path, timeout=130)
     finally:
         session._upload_edge = None
     if not session.upload_attempted or session.upload_before is None:
@@ -7856,6 +7864,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
     except (Exception, asyncio.CancelledError) as exc:
         if (getattr(session, 'upload_attempted', False)
                 and not isinstance(exc, Gate)):
+            # Issue FF-224f: a live run ended here with no trace of what was
+            # raised. Class and source line only: the message can carry page text.
+            _LOG.info('upload interrupted pk=%s exc=%s at=%s',
+                      pk, type(exc).__name__, _innermost_src_frame(exc))
             message = 'Résumé upload interrupted after the browser command; inspect manually'
             if isinstance(exc, asyncio.CancelledError):
                 # Persist the existing terminal outcome before propagating cancellation.
@@ -8274,3 +8286,15 @@ def _entry_artifacts(entry, provenance, readiness=False) -> bool:
     if entry.get('helper_challenge'):
         raise CaptchaGate('visible hCaptcha challenge control; inspect manually.')
     return pending_hidden_r
+
+
+def _innermost_src_frame(exc: BaseException) -> str:
+    """file:line of the deepest traceback frame inside src/, never a value."""
+    root = Path(__file__).resolve().parents[1]
+    where, tb = 'unknown', exc.__traceback__
+    while tb is not None:
+        path = Path(tb.tb_frame.f_code.co_filename).resolve()
+        if path.is_relative_to(root):
+            where = f'src/{path.relative_to(root).as_posix()}:{tb.tb_lineno}'
+        tb = tb.tb_next
+    return where

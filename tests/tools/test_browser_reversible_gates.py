@@ -816,10 +816,13 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     assert boolean
     # FF-224e: the server-owned résumé upload runs before the first model
     # decision, but never ahead of an owner question: it starts only once
-    # every one is answered. This endpoint's chooser never settles, so the
-    # run ends uncertain, as a recovery upload does, and the model is not reached.
+    # every one is answered. FF-224f: this ended uncertain only because the
+    # chooser went to the clipped input, which this endpoint (like BrowserSkill)
+    # refuses. On the dropzone it runs; the endpoint then renders its base
+    # layout, not this census, so settlement refuses and the model is not reached.
     assert upload_grants == [len(asked)]
-    assert outcome['status'] == 'uncertain' and not model_calls
+    assert [c[:2] for c in endpoint.calls if c[0] == 'upload'] == [('upload', '#dropzone')]
+    assert outcome['status'] == 'gate' and not model_calls
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
 
 
@@ -827,9 +830,10 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
 async def test_prevalued_receiver_is_never_owner_asked(monkeypatch, tmp_path):
     row, endpoint, decision, stores, pdf = _live_census(
         monkeypatch, tmp_path, mutate="location.children[0].value='Synthetic city';")
+    census = endpoint.current
     asked, _ = await _owner_order(row, endpoint, stores, pdf)
-    assert _by_locator(endpoint.current, _LOCATION)['selector'] not in asked
-    assert _by_locator(endpoint.current, _DATE)['selector'] in asked
+    assert _by_locator(census, _LOCATION)['selector'] not in asked
+    assert _by_locator(census, _DATE)['selector'] in asked
 
 
 def test_only_the_sibling_mismatch_route_asks_every_receiver():
@@ -979,7 +983,7 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 1
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
-        ('upload', file['selector'], '--file',
+        ('upload', '#dropzone', '--file',
          transport._application_controller.resume_path)]
     assert not transport._application_controller.committed
 

@@ -39,8 +39,77 @@ async def test_upload_runs_once_before_the_first_decision(monkeypatch, tmp_path)
     assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
     assert seen == [(1, True)]
     guard = transport._application_controller
-    assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
+    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
+    _no_production_commit(raw, transport, row)
+
+
+async def test_chooser_opens_from_the_visible_dropzone_not_the_clipped_input(
+        monkeypatch, tmp_path, caplog):
+    """FF-224f: live, every resumed Ashby row ended uncertain two seconds after
+    bootstrap, before any decision. The upload was sent to the native résumé
+    input, which Ashby clips out of view. BrowserSkill opens a file chooser by
+    clicking a visible upload button, so it refused with no effect; past the
+    effect edge, any refusal is terminal uncertain (pinned below), so the row
+    was held. The chooser opener is the visible dropzone, as on the entry route.
+
+    The fake CLI here does what the real one does: only the opener works."""
+    import logging
+    from tools.browser_skill import Unavailable
+
+    run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path)
+    tree = raw.current['entry']['upload_tree']
+    opener = tree['nodes'][tree['dropzone']]['target_selector']
+    clipped = tree['nodes'][tree['input']]['target_selector']
+    assert opener != clipped
+    upload = raw.call
+
+    async def cli(method, *args, **kwargs):
+        if method == 'upload' and args[0] != opener:
+            uploads.append((method, *args))
+            refusal = Unavailable('BrowserSkill operation unavailable: file_input_not_activated')
+            refusal.code, refusal.effect_state = 'file_input_not_activated', 'none'
+            raise refusal
+        return await upload(method, *args, **kwargs)
+
+    raw.call = cli
+    seen = []
+
+    def first_decision(task, *_args, **_kwargs):
+        seen.append('résumé attachment verified=True' in task)
+        return STOP
+
+    with caplog.at_level(logging.INFO, logger=forms.__name__):
+        result = await run_apply(first_decision)
+    assert 'upload interrupted' not in caplog.text
+    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question'], result
+    assert seen == [True]
+    guard = transport._application_controller
+    assert uploads == [('upload', opener, '--file', guard.resume_path)]
+    assert guard.upload_completed and guard.upload_identity is not None
+    _no_production_commit(raw, transport, row)
+
+
+async def test_interrupted_upload_logs_class_and_source_line_only(
+        monkeypatch, tmp_path, caplog):
+    """FF-224f: the uncertain return after the effect edge logged nothing, so
+    the live exception had to be inferred. It now names the class and the
+    innermost src/ line, never the message, which can carry page text."""
+    import logging
+
+    async def broken():
+        raise OSError('synthetic secret page text')
+
+    run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
+        monkeypatch, tmp_path, upload=broken)
+    with caplog.at_level(logging.INFO, logger=forms.__name__):
+        result = await run_apply([STOP])
+    assert result['status'] == 'uncertain' and decide.await_count == 0
+    lines = [r.getMessage() for r in caplog.records if 'upload interrupted' in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert ' exc=OSError at=src/' in lines[0] and '.py:' in lines[0]
+    assert 'secret' not in caplog.text
     _no_production_commit(raw, transport, row)
 
 
@@ -58,7 +127,7 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     assert 'protected tailored PDF' not in result['question']
     assert decide.await_count == len(later)
     guard = transport._application_controller
-    assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
+    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
     _no_production_commit(raw, transport, row)
 
 

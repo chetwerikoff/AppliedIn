@@ -782,14 +782,6 @@ def _bind_mismatch_fixture_producer(authority, monkeypatch, *, transport='effect
     from tools.browser_skill_apply import ApplicationIPCController
 
     original_facade = fixture._SyntheticRun.facade
-    original_ipc = fixture._SyntheticRun._positive_ipc
-
-    def native_tuple(self):
-        seq = original_ipc(self)
-        if not self.ashby_upload:
-            return seq
-        assert seq[-1][0] == 'upload'
-        return (*seq[:-1], ('upload', '#_systemfield_resume', '--file', self.resume_path))
 
     def closed_with_controller(self, raw):
         sealed = original_facade(self, raw)
@@ -838,7 +830,6 @@ def _bind_mismatch_fixture_producer(authority, monkeypatch, *, transport='effect
 
         return Proxy()
 
-    monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', native_tuple)
     monkeypatch.setattr(fixture._SyntheticRun, 'facade', closed_with_controller)
 
 
@@ -890,7 +881,7 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
     assert 'Synthetic inspection without a second click' in result['question'], result
     assert authority.fills == 2 and authority.upload_ipc == 1
     assert authority.ipc_index == 3 and authority.uploaded
-    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+    assert raw.uploads == [(('upload', '#ashby-upload-dropzone', '--file',
                             authority.resume_path), {'timeout': 130})]
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
@@ -925,7 +916,7 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
     assert 'résumé attachment verified=True' in tasks[3]
     assert 'runs before Submit' not in tasks[3]
     assert authority.fills == 2 and authority.upload_ipc == 1 and authority.uploaded
-    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+    assert raw.uploads == [(('upload', '#ashby-upload-dropzone', '--file',
                             authority.resume_path), {'timeout': 130})]
     assert authority.decisions == 4
     assert authority.submit_ipc == authority.submit_call_entered == 0
@@ -1085,7 +1076,7 @@ async def _resumed_submit_first(authority, monkeypatch, *, raw=None, prior=None,
     # The sealed effect sequence is only the native résumé chooser: a
     # prefilled form has nothing for this run to fill.
     monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', lambda self: (
-        ('upload', '#_systemfield_resume', '--file', self.resume_path),))
+        ('upload', '#ashby-upload-dropzone', '--file', self.resume_path),))
     controllers = []
     bound = fixture._SyntheticRun.facade
 
@@ -1155,7 +1146,7 @@ async def test_resumed_prefilled_form_uploads_once_before_the_first_decision(
     assert result['status'] == 'gate', result
     assert 'Synthetic next decision' in result['question']
     assert timeline == ['upload', ('decision0', 1, True)]
-    assert raw.uploads == [(('upload', '#_systemfield_resume', '--file',
+    assert raw.uploads == [(('upload', '#ashby-upload-dropzone', '--file',
                             authority.resume_path), {'timeout': 130})]
     assert authority.upload_ipc == 1 and authority.uploaded
     assert authority.fills == 0 and authority.decisions == 1
@@ -1460,7 +1451,7 @@ async def test_production_submit_click_without_upload_recovers_then_meets_final_
     assert 'Unverified or changed form value' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
-    assert uploads == [('upload', '#_systemfield_resume', '--file', guard.resume_path)]
+    assert uploads == [('upload', '#dropzone', '--file', guard.resume_path)]
     # The staged PDF is released after the run; recovery compared the
     # producer's upload_identity with it before recording the receipt.
     assert guard.upload_attempted and guard.upload_completed

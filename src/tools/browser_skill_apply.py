@@ -3433,12 +3433,6 @@ async def _reversible_recover_upload(session: _ReversibleEntryReader, page: dict
                 or _upload_shape(_upload_tree(fresh)) != _upload_shape(baseline_tree)
                 or _upload_candidates(fresh) != _upload_candidates(before)):
             raise Gate('The original empty résumé input changed before upload.')
-        if ctx is None:
-            # Neither the raw producer's native-input tuple nor a synthetic
-            # facade demonstrates BrowserSkill's chooser on a CSS-clipped input.
-            # No translation to the independently witnessed dropzone is allowed.
-            raise Gate('BrowserSkill clipped native-input upload chooser is unproven; '
-                       'complete the attachment manually. No chooser attempted.')
         session.upload_before = fresh
         session.upload_attempted = session.upload_pending = True
         return await _effect_call(session.raw, *args, **kwargs)

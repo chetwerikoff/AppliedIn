@@ -916,6 +916,13 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                            witnessed_options=witnessed_options,
                            provenance=provenance,
                            **({'fixture_context': ctx} if ctx else {}))
+            # The submitted field is the receiver's name; a renamed receiver
+            # carries the same machine value into a different form field.
+            if (receipt.get('action') == 'combobox' and receipt.get('hidden_selector')
+                    and [c.get('name') for c in page.get('controls', [])
+                         if c.get('selector') == receipt['hidden_selector']]
+                    != [receipt.get('hidden_name')]):
+                raise Gate('The committed form receiver name changed.')
 
 
 def hold_possible_submission(pk: str, step: dict, *, fixture_context=None) -> None:
@@ -5390,9 +5397,22 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
             return Gate('The guarded executor cannot write this required control; '
                         'operator inspection is required.',
                         reason='defect_' + _required_owner_gate_type(item))
+        witnessed_options = None
+        if (_closed_material_combobox(item)
+                and _assent_scope(item) == 'standard_privacy'
+                and isinstance(grants, dict)
+                and isinstance(grants.get(item.get('question') or item.get('label')), dict)):
+            try:
+                current, witness, item, observed = await _witness_material_combobox(
+                    session, current, witness, item, *origins, provenance=provenance,
+                    pk=pk, fixture_context=fixture_context)
+                witnessed_options = observed['options']
+            except Gate:
+                pass  # An unwitnessed list keeps the existing owner question.
         # A currently bound grant is not a missing answer, even when bootstrap
         # had no new global fact to settle. Stale grants never authorize a write.
-        if _currently_granted(current, item, grants, pk, provenance, fixture_context):
+        if _currently_granted(current, item, grants, pk, provenance, fixture_context,
+                              witnessed_options=witnessed_options):
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
@@ -5428,7 +5448,7 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
 
 
 def _currently_granted(page: dict, item: dict, grants, pk: str, provenance,
-                       fixture_context) -> bool:
+                       fixture_context, witnessed_options=None) -> bool:
     key = _key(page, item)
     prior = grants.get(key) if isinstance(grants, dict) else None
     if not (isinstance(prior, dict) and isinstance(prior.get('value'), str)):
@@ -5437,7 +5457,7 @@ def _currently_granted(page: dict, item: dict, grants, pk: str, provenance,
         exact_approval(
             pk, key, prior['value'], target=_bound_target(page, item),
             url=page['url'], provenance=provenance,
-            witnessed_options=_granted_privacy_options(item, prior),
+            witnessed_options=_granted_privacy_options(item, prior, witnessed_options),
             **({'fixture_context': fixture_context} if fixture_context else {}))
     except Gate:
         return False
@@ -5448,14 +5468,14 @@ _PRIVACY_AFFIRMATIVE = frozenset({
     'agree', 'i agree', 'acknowledge', 'i acknowledge', 'confirm', 'i confirm'})
 
 
-def _granted_privacy_options(item: dict, grant: dict) -> list | None:
+def _granted_privacy_options(item: dict, grant: dict, options) -> list | None:
     """Issue #223: bootstrap matched this grant against the opened, Escape-closed
     listbox; re-reading the reclosed picker found no options and asked the owner
-    again. Only a standard privacy acknowledgement whose whole option list has
-    exactly one affirmative caption, the granted one, may defer that comparison
-    to the guarded write, which re-witnesses the real listbox before any click.
+    again. A standard privacy acknowledgement may use the options freshly
+    witnessed by its own open/Escape only when that whole list has exactly one
+    affirmative caption, the granted one. The stored grant list is never the
+    witness: a changed listbox must reach the owner.
     """
-    options = grant.get('options')
     if (not _closed_material_combobox(item)
             or _assent_scope(item) != 'standard_privacy'
             or not isinstance(options, list) or not options
@@ -5768,6 +5788,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                 or selected.get('safe') is not True):
             raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
         before = current.get('combobox') or {}
+        receivers = [c for c in latest['controls']
+                     if before.get('hidden_selector')
+                     and c.get('selector') == before['hidden_selector']
+                     and before['hidden_selector'] in latest_witness]
         await _effect_call(session, 'click', selected['selector'])
         # Receiver presence, current displayed caption and submitted bytes are
         # checked at final Submit; an option click is not that authorization.
@@ -5780,6 +5804,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                 'hidden_selector': before.get('hidden_selector', ''),
                 'hidden_value_before': before.get('hidden_value', ''),
                 'hidden_value': committed if before.get('hidden_selector') else '',
+                **({'hidden_name': receivers[0].get('name')} if len(receivers) == 1 else {}),
                 **({'witnessed_options': witnessed_options,
                     'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
                    if witnessed_options is not None else {})}

@@ -1325,6 +1325,7 @@ async def test_granted_privacy_combobox_receipt_is_not_value_proof(monkeypatch):
     assert receipt["selected_option"] == {
         "selector": "#privacy-agree", "label": "I agree", "value": "ACK"}
     assert receipt["hidden_value"] == "ACK"
+    assert receipt["hidden_name"] == "response_code"
 
     fresh = _post_action_page()
     forms.check_approvals(PRIVACY_PK, [receipt], fresh)
@@ -1342,6 +1343,10 @@ async def test_granted_privacy_combobox_receipt_is_not_value_proof(monkeypatch):
     foreign = _post_action_page()
     foreign["controls"][2].update(form_selector="#other-form",
                                   form_action=PRIVACY_URL + "/other")
+    renamed = _post_action_page()
+    renamed["controls"][2]["name"] = "marketing_opt_in"
+    with pytest.raises(forms.Gate, match="receiver name changed"):
+        forms.check_approvals(PRIVACY_PK, [receipt], renamed)
     for bad in (absent, foreign):
         with pytest.raises(forms.Gate):
             forms.check_approvals(PRIVACY_PK, [receipt], bad)
@@ -1435,7 +1440,7 @@ async def test_closed_privacy_combobox_outside_closed_caption_set_is_asked(
     pending = await forms._required_owner_gate(
         session, await session.page(), PRIVACY_PK, PRIVACY_URL)
     assert pending is not None and pending.reason == "owner_question"
-    assert [c for c in session.calls if c[0] != "evaluate"] == []
+    assert not any(c[0] == "click" and c[1] != "#privacy" for c in session.calls)
 
 
 @pytest.mark.asyncio
@@ -1493,15 +1498,18 @@ async def test_closed_privacy_combobox_without_exact_grant_is_asked(
 
 
 @pytest.mark.asyncio
-async def test_granted_closed_privacy_combobox_rechecks_listbox_before_click(
-        monkeypatch):
-    """AC3: the deferred comparison is bootstrap-only; the guarded write still
-    matches the grant to the real listbox and never clicks a changed option."""
+async def test_stale_stored_privacy_option_list_goes_to_the_owner(monkeypatch):
+    """ARCH22:30: the grant's stored option list is not a witness. The owner
+    gate opens the picker itself; a listbox that changed since the owner
+    answered is asked again, and the guarded write still refuses it."""
     _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
     changed = [{**PRIVACY_OPTIONS[0], "value": "OTHER"}, PRIVACY_OPTIONS[1]]
     session = _PrivacyPicker(changed)
-    assert await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is not None and pending.reason == "owner_question"
+    assert [c for c in session.calls if c[0] != "evaluate"] == [
+        ("click", "#privacy"), ("press", "Escape")]
     with pytest.raises(forms.Gate):
         await forms.execute(
             session, await session.page(),
@@ -1511,6 +1519,19 @@ async def test_granted_closed_privacy_combobox_rechecks_listbox_before_click(
             jd_text="", resume_tex="", github="", pk=PRIVACY_PK,
             job_url=PRIVACY_URL)
     assert not any(c[0] == "click" and c[1] != "#privacy" for c in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_unwitnessable_privacy_listbox_goes_to_the_owner(monkeypatch):
+    """ARCH22:30: without a fresh listbox witness the grant is not sufficient."""
+    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
+    session = _PrivacyPicker()
+    session.opened = session.closed  # the click never mounts a listbox
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(forms.asyncio, "sleep", lambda *_a: real_sleep(0))
+    pending = await forms._required_owner_gate(
+        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
+    assert pending is not None and pending.reason == "owner_question"
 
 
 def test_standard_privacy_checkbox_keeps_its_no_grant_path(monkeypatch):

@@ -975,7 +975,7 @@ _ENTRY_OBSERVATION = _ENTRY_RESPONSE_NODES + r"""
       {selector:selector(nativeRoot),action:nativeRoot.action} : null,
     ...(ashbyNative ? {native_candidates:nativeCandidates} : {}),
     formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :
-      (containerUploadRoot ? {...uploadTree,scope:'container'} : null),
+      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),
     helper_challenge:reservedButtons.some(e=>!(e.tagName === 'BUTTON' && e.id === 'hcaptchaSubmitBtn' &&
           e.matches('.hidden')) ||
       (!!e.getClientRects().length && getComputedStyle(e).visibility!=='hidden' &&

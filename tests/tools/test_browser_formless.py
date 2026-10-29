@@ -3245,34 +3245,27 @@ def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
         'label': 'Start date', 'question': '', 'value': '', 'has_value': False,
     }
     assert forms._native_answer(target)
-    forms._require_native_action(target, 'fill')
+    # The obsolete per-step native-action helper is gone; bank admission is not.
+    assert not hasattr(forms, '_require_native_action')
     assert not forms._bank_auto_eligible(
         target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
 
 
 
-async def test_rooted_untyped_yes_no_pair_refuses_unproven_requiredness(monkeypatch):
-    """Issue #202 AC2: on a truly root-proven Ashby form, an untyped Yes/No
-    group has no reader-backed requiredness signal, so unknown is never
-    OPTIONAL: the bounded wait refuses before any model or IPC effect."""
-    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
+async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(monkeypatch):
+    """#241: rooted Yes/No can be inspected and prepared, not silently approved.
+
+    The separate final-Submit tests reject an unanswered or unapproved pair;
+    unreadable requiredness is no longer an early structural admission ban.
+    """
     _, raw, decision, provenance = root_world(monkeypatch, yesNo=True)
     assert forms._formless_root(raw.current)['root'] == '#application-root'
-    group = [e for e in raw.current['entry']['root_evidence'] if e.get('boolean_group')]
+    group = [e for e in raw.current['entry']['root_evidence']
+             if e.get('boolean_group')]
     assert len(group) == 2 and all(e['in_container'] for e in group)
-    with pytest.raises(forms.Gate, match='unproven rooted Yes/No requiredness') as refusal:
-        forms._formless_boundary(raw.current, provenance)
-    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
-                                  resume_path='Resume.pdf')
-    with pytest.raises(forms.Gate, match='unproven rooted Yes/No requiredness') as waited:
-        await forms._stable_application_form(
-            session, session.allowed, provenance,
-            deadline=asyncio.get_running_loop().time() + 1)
-    assert waited.value.wait_predicates['receiver.qualifies'] == 'false'
-    assert waited.value.wait_predicates['root.owner_proven'] == 'true'
+    assert forms._formless_boundary(raw.current, provenance)
     assert not decision.await_count
     no_mutations(raw)
-    # Without the group the same root-proven form still qualifies.
     _, plain, _, provenance = root_world(monkeypatch)
     assert forms._formless_boundary(plain.current, provenance)
 

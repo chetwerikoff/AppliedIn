@@ -4993,7 +4993,9 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
 
 
 async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
-                               provenance=None, fixture_context=None) -> Gate | None:
+                               provenance=None, fixture_context=None,
+                               facts: dict | None = None,
+                               global_facts: dict | None = None) -> Gate | None:
     """Bind the first still-required answer before delegating any planning to the model.
 
     The Ashby rootless path previously returned from bootstrap after bank grants;
@@ -5157,8 +5159,12 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         question['pk'] = pk
         if every and _owner_skip_applies(row, pk, question, current, item):
             continue
-        return Gate(_choice_prompt(item, question), form_question=question,
-                    reason='owner_question')
+        prompt = _choice_prompt(item, question)
+        saved_key = (_fact_key(facts or {}, question['label'])
+                     or _fact_key(global_facts or {}, question['label']))
+        if saved_key is not None:
+            prompt += '\nA matching answer is saved in facts.md; confirm or provide it.'
+        return Gate(prompt, form_question=question, reason='owner_question')
     if not every and _rootless_skips(row):
         # A proven root voids every rootless SKIP on this job (ARCH21:26): its
         # field may have re-rendered under another caption, so each blank field
@@ -7211,13 +7217,18 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     # a new owner question, including on the reversible fallback.
                     if (isinstance(session, _ReversibleEntryReader)
                             or (producer_guard is not None
-                                and producer_guard.upload_completed)):
+                                and producer_guard.upload_completed)
+                            or (producer_guard is not None
+                                and isinstance(provenance, ApplicationEntryProvenance)
+                                and provenance.ats == 'ashby'
+                                and _formless_root(page))):
                         if isinstance(session, _ReversibleEntryReader):
                             _entry_safety(page, allowed, provenance)
                         if _required_owner_gate_admitted(page, provenance):
                             pending = await _required_owner_gate(
                                 session, page, pk, *trusted_origins,
-                                provenance=provenance, fixture_context=ctx)
+                                provenance=provenance, fixture_context=ctx,
+                                facts=facts, global_facts=global_facts)
                             if pending is not None:
                                 raise pending
                     if (not decided
@@ -7426,7 +7437,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if _required_owner_gate_admitted(fresh, provenance):
                             pending = await _required_owner_gate(
                                 session, fresh, pk, *trusted_origins,
-                                provenance=provenance, fixture_context=ctx)
+                                provenance=provenance, fixture_context=ctx,
+                                facts=facts, global_facts=global_facts)
                             if pending is not None:
                                 raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))

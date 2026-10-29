@@ -3184,3 +3184,82 @@ async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
                             job_url=target_url, provenance=provenance)
     assert gated.value.reason == 'defect_provenance'
     session.call.assert_not_awaited()
+
+
+@pytest.mark.parametrize('shape', ['attestation', 'composite', 'free_text'])
+async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
+        monkeypatch, shape):
+    """Composite owner questions must not collapse into an unanswerable prose gate."""
+    if shape == 'attestation':
+        controls = [target(
+            selector='#attestation', label='I certify this statement',
+            question='I certify this statement', type='checkbox', required=True,
+            checked=False, visible_text='I certify this statement')]
+    elif shape == 'composite':
+        controls = [
+            target(selector='#authorization-a', tag='select', type='select',
+                   label='Authorization choice A', required=True, options=[
+                       {'label': 'Yes', 'value': 'yes'}]),
+            target(selector='#authorization-b', tag='select', type='select',
+                   label='Authorization choice B', required=True, options=[
+                       {'label': 'No', 'value': 'no'}]),
+            target(selector='#essay-a', tag='textarea', type='textarea',
+                   label='Synthetic essay A', required=True),
+            target(selector='#essay-b', tag='textarea', type='textarea',
+                   label='Synthetic essay B', required=True),
+        ]
+    else:
+        controls = [target(selector='#free-text', tag='textarea', type='textarea',
+                           label='Synthetic free-text question', required=True)]
+    current = page(*controls)
+    controller = object.__new__(forms.ApplicationIPCController)
+    session = SimpleNamespace(
+        raw=SimpleNamespace(_application_controller=controller),
+        page=AsyncMock(return_value=current),
+    )
+    granted = set()
+    company_facts = {controls[0]['label']: 'Synthetic company answer'}
+    global_facts = ({controls[1]['label']: 'Synthetic global answer'}
+                    if shape == 'composite' else {})
+    monkeypatch.setattr(forms, '_row', lambda *_a, **_k: {
+        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
+    monkeypatch.setattr(forms, '_required_owner_gate_admitted',
+                        lambda *_a: True)
+    monkeypatch.setattr(
+        forms, '_currently_granted',
+        lambda _page, item, *_a, **_k: item['selector'] in granted)
+    def disclosure(observed, item, *_args, **_kwargs):
+        return {
+            'selector': item['selector'], 'label': item['label'],
+            'control_label': item['label'],
+            'question': item.get('question') or item['label'],
+            'type': item['type'], 'tag': item['tag'],
+            'required': item['required'],
+            'requiredness': 'required' if item['required'] else 'optional',
+            'url': observed['url'],
+            'form_selector': item['form_selector'],
+            'form_action': item['form_action'],
+            'options': item.get('options', []),
+        }
+    monkeypatch.setattr(forms, '_disclosure_question', disclosure)
+    for item in controls:
+        pending = await forms._required_owner_gate(
+            session, current, 'example-co#synthetic', current['url'],
+            facts=company_facts, global_facts=global_facts)
+        assert isinstance(pending, forms.Gate)
+        question = pending.form_question
+        assert pending.reason == 'owner_question'
+        assert question['selector'] == item['selector']
+        assert question['label'] == item['label']
+        assert question['type'] == item['type']
+        assert question['required'] is True
+        assert question['requiredness'] == 'required'
+        assert question['pk'] == 'example-co#synthetic'
+        if item['label'] in {**company_facts, **global_facts}:
+            assert 'matching answer is saved in facts.md' in str(pending)
+            assert 'Synthetic company answer' not in str(pending)
+            assert 'Synthetic global answer' not in str(pending)
+        granted.add(item['selector'])
+    assert await forms._required_owner_gate(
+        session, current, 'example-co#synthetic', current['url'],
+        facts=company_facts, global_facts=global_facts) is None

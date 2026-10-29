@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
+from collections import UserDict
 from functools import wraps
 import ipaddress
 import socket
@@ -1174,6 +1175,94 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         raise Gate('The tailored PDF is missing; nothing may be submitted without it.')
 
 
+class _ApprovedFormValues(UserDict):
+    """Shared writer ledger and current row context; never a grant itself.
+
+    The pinned Submit method supplies self.filled only. This mutable view
+    permits a fresh, exact approval check on every populated live receiver.
+    """
+
+    def __init__(self, values: dict, pk: str, facts: dict, *,
+                 fixture_context=None, provenance=None):
+        super().__init__()
+        self.data = values
+        self.pk, self.facts = pk, facts
+        self.fixture_context, self.provenance = fixture_context, provenance
+
+
+def _final_exact_grant(page: dict, target: dict, answer: str,
+                       filled: dict, receipts: list | None = None) -> None:
+    """Rebind a live answer to the current row's observed-control grant."""
+    if not isinstance(filled, _ApprovedFormValues):
+        return  # Standalone structural callers do not represent raw Submit.
+    key = _key(page, target)
+    if target.get('type') == 'radio':
+        row = (_row(filled.pk, fixture_context=filled.fixture_context)
+               if filled.fixture_context is not None else _row(filled.pk))
+        grants = row.get('human_approved_answers')
+        grant = grants.get(key) if isinstance(grants, dict) else None
+        answer = grant.get('value', '') if isinstance(grant, dict) else ''
+        if not (_same(answer, target.get('label', ''))
+                or _same(answer, target.get('value', ''))):
+            raise Gate('The native selected member is not the approved answer.')
+    if not isinstance(answer, str) or not answer.strip():
+        raise Gate('A filled control lacks an exact approved answer.')
+    if (target.get('type') not in {'checkbox', 'radio', 'button'}
+            and not _material_form_choice(target)):
+        fact_key = _fact_key(filled.facts, key)
+        if (fact_key is None
+                or not _same(str(filled.facts[fact_key]).strip(), answer)):
+            raise Gate('The current form value differs from its approved facts.')
+    extra = {}
+    if target.get('type') == 'combobox' and _material_form_choice(target):
+        related = [r for r in receipts or []
+                   if r.get('action') == 'combobox'
+                   and r.get('selector') == target.get('selector')]
+        if (len(related) != 1
+                or not isinstance(related[0].get('witnessed_options'), list)):
+            raise Gate('A material selected option lacks its exact witnessed grant.')
+        extra['witnessed_options'] = related[0]['witnessed_options']
+    exact_approval(
+        filled.pk, key, answer, target=_bound_target(page, target),
+        url=page.get('url', ''), provenance=filled.provenance,
+        **({'fixture_context': filled.fixture_context}
+           if filled.fixture_context is not None else {}),
+        **extra)
+
+
+def _combo_receiver_allowed(page: dict, owner: dict, receiver: dict) -> bool:
+    """Allow only a named receiver on one native form or proven formless root."""
+    if owner.get('in_form') is True:
+        return (receiver.get('in_form') is True
+                and bool(owner.get('form_selector'))
+                and bool(owner.get('form_action'))
+                and receiver.get('form_selector') == owner.get('form_selector')
+                and receiver.get('form_action') == owner.get('form_action'))
+    root = _formless_root(page)
+    if (not isinstance(root, dict) or not root.get('root') or root.get('error')
+            or not root.get('submit') or owner.get('in_form') is not False
+            or receiver.get('in_form') is not False
+            or any(item.get(k) for item in (owner, receiver)
+                   for k in ('native_form_owner_selector', 'form_selector',
+                             'form_action', 'formaction', 'href'))
+            or not isinstance((page.get('entry') or {}).get('root_evidence'), list)):
+        return False
+    evidence = (page.get('entry') or {})['root_evidence']
+    for item in (owner, receiver):
+        matches = [e for e in evidence if isinstance(e, dict)
+                   and e.get('selector') == item.get('selector')]
+        if (len(matches) != 1 or not matches[0].get('inside')
+                or not matches[0].get('in_container')
+                or matches[0].get('native_owner')
+                or matches[0].get('declared_owner')
+                or matches[0].get('formaction') is not None
+                or matches[0].get('type') != item.get('type')):
+            return False
+    bound = _bound_target(page, owner)
+    return (bound.get('form_selector') == root['root']
+            and bound.get('form_action') == root['submit'])
+
+
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                receipts: list | None = None) -> None:
     if page.get('truncated') or page.get('inventory_verified') is not True:
@@ -1197,17 +1286,18 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
+    seen_boolean = set()
     for target in controls:
         typ = target.get('type', '')
         if typ == 'hidden':
-            if target.get('in_form') is True and (
+            if (target.get('required') or target.get('has_value')
+                    or bool(target.get('value'))):
                     target.get('required') or target.get('has_value')
                     or bool(target.get('value'))):
                 owners = [c for c in controls if c.get('type') == 'combobox'
-                          and c.get('in_form') is True
-                          and c.get('form_selector') == target.get('form_selector')
                           and (c.get('combobox') or {}).get('hidden_selector')
-                          == target.get('selector')]
+                          == target.get('selector')
+                          and _combo_receiver_allowed(page, c, target)]
                 owner = owners[0] if len(owners) == 1 else None
                 combo = (owner.get('combobox') or {}) if owner else {}
                 value = target.get('value')
@@ -1215,9 +1305,6 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 # Only the actual named form value and current accessible
                 # selection, never a historical receipt, can authorize Submit.
                 if (owner is None or not target.get('name')
-                        or not owner.get('form_selector')
-                        or not owner.get('form_action')
-                        or owner.get('form_action') != target.get('form_action')
                         or expected is None
                         or not _same(combo.get('selected_text', ''), expected)
                         or not _same(combo.get('displayed_text', ''),
@@ -1229,11 +1316,33 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
 
         if target.get('disabled'):
-            if target.get('selector') in filled:
-                raise Gate('A previously approved form control is disabled at final Submit.')
+            if (target.get('selector') in filled or target.get('checked')
+                    or target.get('has_value') or target.get('required')):
+                raise Gate('A previously approved or required form control is disabled at final Submit.')
+            continue
+        if (typ == 'button' and target.get('tag') == 'button'
+                and _formless_root(page)
+                and str(target.get('label') or '').casefold() in {'yes', 'no'}):
+            if target['selector'] in seen_boolean:
+                continue
+            members = _boolean_pair(page, target)
+            seen_boolean.update(c['selector'] for c in members)
+            selected = [c for c in members if c.get('checked') is True]
+            if len(selected) != 1:
+                raise Gate('A Yes/No answer is empty or conflicting at final Submit.')
+            answer = selected[0]['label']
+            _final_exact_grant(page, members[0], answer, filled, receipts)
+            guarded_value(selected[0], answer)
             continue
         if typ in {'button', 'submit'}:
             continue
+        if (target.get('required') is not True
+                and target.get('required') is not False
+                and typ not in {'file', 'hidden', 'submit', 'image'}
+                and not target.get('checked') and not target.get('has_value')
+                and not str(target.get('value') or '').strip()
+                and not (target.get('combobox') or {}).get('selected_text')):
+            raise Gate('This unanswered field has unreadable requiredness.')
         expected = filled.get(target['selector'])
         if typ == 'combobox':
             combo = target.get('combobox') or {}
@@ -1277,10 +1386,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                            and c.get('in_form') is True
                            and c.get('form_selector') == target.get('form_selector')]
                 receiver = matches[0] if len(matches) == 1 else None
-            if (receiver is None or receiver.get('in_form') is not True
-                    or not target.get('form_selector') or not target.get('form_action')
-                    or receiver.get('form_selector') != target.get('form_selector')
-                    or receiver.get('form_action') != target.get('form_action')
+            if (receiver is None or not _combo_receiver_allowed(page, target, receiver)
                     or not receiver.get('name')
                     or (not hidden and receiver.get('has_value') is not True)
                     or not isinstance(receiver.get('value'), str)
@@ -1288,6 +1394,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     or receiver['value'] != combo['selected_value']):
                 raise Gate('A hidden form value is not independently authorized.'
                            if hidden else 'The combobox has no verified form-own value receiver.')
+            _final_exact_grant(page, target, combo['selected_text'], filled, receipts)
             guarded_value(target, expected)
             continue
         if target.get('in_form') and (
@@ -1326,6 +1433,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     group = _radio_group(page, target)
                     if sum(bool(member.get('checked')) for member in group) != 1:
                         raise Gate('Native radio group has conflicting checked members.')
+                _final_exact_grant(page, target, 'yes' if typ == 'checkbox' else value,
+                                   filled, receipts)
                 guarded_value(target, target.get('label', value))
             elif expected is not None:
                 raise Gate('A previously verified checkbox/radio choice has changed.')
@@ -1373,6 +1482,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                             and _same(r.get('approved_value', ''), observed)
                             for r in receipts):
                         raise Gate('Native selected caption differs from approved answer.')
+                _final_exact_grant(page, target, observed, filled, receipts)
                 guarded_value(target, observed or expected or '')
                 # The receipt binds the visible approved caption above; filled
                 # stores the actual option.value and must match that receiver.
@@ -1747,23 +1857,7 @@ def _safe_diagnostic(value) -> str:
 
 
 def _inventory_ok(page: dict, *, complete: bool = True) -> None:
-    if (complete and (page.get('inventory_verified') is not True or page.get('truncated')
-            or page.get('opaque_controls') or page.get('shadow_roots')
-            or page.get('unsupported_frames'))):
-        causes = []
-        for flag in ('opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'):
-            if page.get(flag):
-                causes.append(flag + (' count=' + str(len(page[flag]))
-                              if flag == 'unsupported_frames' and isinstance(page[flag], list) else ''))
-        if page.get('opaque_controls'):
-            count = page.get('opaque_count')
-            causes.append('opaque_count=' + str(count if type(count) is int and count >= 0 else 'unavailable'))
-            locators = page.get('opaque_locators')
-            causes.extend('control=' + _safe_diagnostic(x) for x in (
-                locators[:3] if isinstance(locators, list) and locators else [None]))
-        if not causes:
-            causes.append('inventory_verified=false/readiness')
-        raise Gate('The current form inventory is incomplete; ' + '; '.join(causes))
+    # Only the final check_form owns complete/opaque inventory refusal.
     controls = page.get('controls')
     if (not isinstance(controls, list) or
             any(not isinstance(c, dict) or not isinstance(c.get('selector'), str)
@@ -1985,11 +2079,6 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
             continue
         if not c.get('in_container'):
             raise Gate('candidate control outside application container; inspect manually.')
-        if c.get('boolean_group') is not False:
-            # Issue #202: a rooted Ashby Yes/No has no readable requiredness and
-            # check_form skips buttons, so admitting it would let an unanswered
-            # (or unknown-requiredness) pair pass the final decision silently.
-            raise Gate('unproven rooted Yes/No requiredness; inspect the application manually.')
         typ = c.get('type')
         if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
                 'listbox', 'option', 'button'}:
@@ -1997,11 +2086,29 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
         if c.get('iti') or c.get('contenteditable'):
             raise Gate('unsupported .iti phone-country picker' if c.get('iti')
                        else 'unsupported contenteditable widget')
-        if typ == 'hidden' or (typ == 'file' and c.get('id') != '_systemfield_resume'):
-            raise Gate('unsupported hidden receiver' if typ == 'hidden'
-                       else 'unsupported file receiver')
-        if (not c.get('associated') or not c.get('label') or c.get('disabled')
-                or c.get('readonly') or c.get('inert')
+        if typ == 'hidden':
+            original = lookup.get(c['selector'])
+            owners = [item for item in page['controls']
+                      if item.get('type') == 'combobox'
+                      and (item.get('combobox') or {}).get('hidden_selector') == c['selector']
+                      and _combo_receiver_allowed(page, item, original or {})]
+            if (not original or len(owners) != 1
+                    or c.get('type') != original.get('type')
+                    or c.get('value') != original.get('value')
+                    or not original.get('name')
+                    or (owners[0].get('combobox') or {}).get('selected_value')
+                       != original.get('value')):
+                raise Gate('unsupported hidden receiver')
+            continue
+        if typ == 'file' and c.get('id') != '_systemfield_resume':
+            raise Gate('unsupported file receiver')
+        filled_or_required = (c.get('required') is True or c.get('checked') is True
+                              or (typ not in {'radio', 'checkbox'}
+                                  and (c.get('has_value')
+                                       or bool(str(c.get('value') or '').strip()))))
+        if ((filled_or_required and
+                (not c.get('associated') or not c.get('label')))
+                or c.get('disabled') or c.get('readonly') or c.get('inert')
                 or (typ != 'file' and not c.get('visible'))):
             raise Gate('application label/control association or editability changed; inspect manually.')
         original = lookup.get(c['selector'])
@@ -2974,7 +3081,7 @@ def _boolean_pair(page: dict, target: dict, *,
     # group identity is the census field entry under its single question title.
     native = target.get('native_type')
     entry = _yes_no_entry(page, target) if native == 'submit' else ''
-    if (not root or root.get('root') or target.get('tag') != 'button'
+    if (not root or target.get('tag') != 'button'
             or target.get('type') != 'button'
             or (native == 'submit' and not entry)
             or (native != 'submit' and (not isinstance(name, str) or not name.strip()))
@@ -2989,7 +3096,7 @@ def _boolean_pair(page: dict, target: dict, *,
             or any(c.get('type') != 'button'
                    or c.get('native_type') != ('submit' if entry else 'button')
                    or c.get('in_form') is not False or c.get('disabled')
-                   or c.get('required') is not True
+                   or (not root.get('root') and c.get('required') is not True)
                    or ((c.get('has_value') or c.get('checked')
                         or c.get('value') not in ('', None)) and not (
                         c.get('checked') is True and c.get('has_value') is True
@@ -3004,23 +3111,38 @@ def _boolean_pair(page: dict, target: dict, *,
     if sum(bool(m.get('checked')) for m in members) > 1:
         raise Gate('More than one Boolean answer is selected.', reason='defect_button')
     for member in members:
-        _reversible_entry_recipient(page, member, witness)
+        if root.get('root'):
+            evidence = [e for e in (page.get('entry') or {}).get('root_evidence', [])
+                        if isinstance(e, dict) and e.get('selector') == member['selector']]
+            if (len(evidence) != 1 or not evidence[0].get('inside')
+                    or not evidence[0].get('in_container')
+                    or evidence[0].get('yes_no') is not True
+                    or evidence[0].get('native_owner')
+                    or evidence[0].get('declared_owner')
+                    or evidence[0].get('formaction') is not None):
+                raise Gate('The Boolean answer is outside the verified application root.',
+                           reason='defect_button')
+        else:
+            _reversible_entry_recipient(page, member, witness)
     return members
 
 
 def _bound_target(page: dict, target: dict) -> dict:
-    """Grant identity for a radio is its entire group, never one model option."""
+    """Exact grant identity includes the entire choice pair on formless roots."""
     structural = _formless_root(page)
+    if target.get('type') == 'button' and structural:
+        members = _boolean_pair(page, target)
+        bound = {**members[0], 'boolean_members': [
+            {'selector': c['selector'], 'caption': c['label'],
+             'value': c['label'].casefold()} for c in members]}
+        if structural.get('root') and target.get('in_form') is False:
+            bound.update(owner_kind='ashby-formless-root',
+                         form_selector=structural['root'],
+                         form_action=structural['submit'])
+        return bound
     if structural and (structural.get('root') or target.get('in_form') is not False):
         return {**target, 'owner_kind': 'ashby-formless-root',
                 'form_selector': structural['root'], 'form_action': structural['submit']}
-    # A reversible rootless field has no structural owner. Its exact identity
-    # is the independently observed native receiver used by the raw producer.
-    if target.get('type') == 'button':
-        members = _boolean_pair(page, target)
-        return {**members[0], 'boolean_members': [
-            {'selector': c['selector'], 'caption': c['label'],
-             'value': c['label'].casefold()} for c in members]}
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
@@ -3331,26 +3453,14 @@ def _approved_boolean_pair(page: dict, target: dict, pk: str, *,
     return answer, matching[0]
 
 
-def _require_native_action(target: dict, verb: str) -> None:
-    """Never dispatch fill to a select or select to a text-entry field."""
-    if verb == 'fill':
-        allowed = ((target.get('tag') == 'input' and
-                    target.get('type') in _TEXT_TYPES)
-                   or (target.get('tag') == 'textarea' and
-                       target.get('type') == 'textarea'))
-    elif verb == 'select':
-        allowed = target.get('tag') == 'select' and target.get('type') == 'select'
-    else:
-        return
-    if not allowed:
-        raise Gate('The requested form action does not match this native control.')
-
-
 def _form_subject(page: dict, target: dict) -> list[dict]:
     if _formless_root(page):
         selectors = {c['selector'] for c in page['entry'].get('root_evidence', [])
                      if c.get('in_container') and c.get('associated')}
-        if target.get('selector') not in selectors:
+        if (target.get('selector') not in selectors
+                and not (target.get('type') == 'button'
+                         and _yes_no_entry(page, target)
+                         and _boolean_pair(page, target))):
             raise Gate('autofill or non-applicant target cannot request an answer.')
         return [c for c in page['controls'] if c['selector'] in selectors]
     form = target.get('form_selector')
@@ -3498,10 +3608,14 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
             raise Gate('Unscoped reversible receiver is not an application member.',
                        reason='defect_receiver')
         members = _formless_boundary(page, provenance)
-        if target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}:
+        if (target.get('selector') not in {c['selector'] for c in members if c['type'] != 'file'}
+                and not (target.get('type') == 'button'
+                         and _yes_no_entry(page, target)
+                         and _boolean_pair(page, target))):
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
     choice = target.get('type') in {'radio', 'checkbox'}
-    boolean_choice = reversible and target.get('type') == 'button'
+    boolean_choice = bool((reversible or (structural and structural.get('root')))
+                          and target.get('type') == 'button')
     if boolean_choice:
         members = _boolean_pair(page, target, witness=witness)
         target = members[0]
@@ -3929,35 +4043,6 @@ async def _bootstrap_wall(session, page: dict, witness: dict, *origins: str,
                         raise MaterialAssentGate(
                             _choice_prompt(c, question),
                             form_question=question, reason='owner_question')
-                # PAGE.label can come from non-visible names or option captions.
-                # The independent witness identifies real rendered labeling text.
-                proof = witness.get(c.get('selector'))
-                visible_label = 'unavailable'
-                if (isinstance(proof, dict) and proof.get('visible') is True
-                        and proof.get('type') == c.get('type')
-                        and proof.get('tag') == c.get('tag')
-                        and isinstance(proof.get('diagnostic_visible_label'), str)
-                        and proof['diagnostic_visible_label'].strip()):
-                    visible_label = proof['diagnostic_visible_label'][:120]
-                kind = c.get('type')
-                diagnostic_type = (kind if isinstance(kind, str)
-                                   and kind in _MATERIAL_DIAGNOSTIC_TYPES
-                                   else 'unavailable')
-                raise MaterialAssentGate(
-                    'Material assent outside a bound choice needs human inspection. '
-                    f"Control type: {diagnostic_type}; tag: {c.get('tag')}; "
-                    f"visible label: {visible_label!r}; "
-                    f"matched: {assent_match.group(0) if assent_match else 'select options'}."
-                    + (f" Disclosure: {disclosure_failure}. "
-                       + _material_witness_disclosure_detail(
-                           c, attempted=witness_attempted,
-                           reason=witness_failure,
-                           option_predicate=option_predicate) + '.'
-                       if _material_form_choice(c) and disclosure_failure
-                       and c.get('type') == 'combobox'
-                       else (f" Disclosure: {disclosure_failure}."
-                             if _material_form_choice(c) and disclosure_failure
-                             else '')))
 
 
 
@@ -4404,26 +4489,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
             for c in page['controls']):
         return page
-    try:
-        page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-material')
-    except Gate as exc:
-        # The independent DOM validator remains fail-closed. Its rejected
-        # linked shape still has a safe, code-normalized owner diagnostic;
-        # never proceed to grants or a witness attempt on this path.
-        malformed_link = ('predicate=combobox.linked.shape;' in str(exc))
-        material = next((c for c in page['controls']
-                         if c.get('in_form') and c.get('type') == 'combobox'
-                         and _material_form_choice(c)), None)
-        if not malformed_link or material is None:
-            raise
-        raise MaterialAssentGate(
-            'Material assent outside a bound choice needs human inspection. '
-            'Control type: combobox; tag: unavailable; '
-            "visible label: 'unavailable'; matched: select options."
-            ' Disclosure: The combobox option linkage is incomplete or ambiguous. '
-            + _material_witness_disclosure_detail(
-                material, attempted=False,
-                option_predicate='combobox.linked.shape') + '.') from None
+    page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-material')
     if provenance is not None and (
             not _preparation_current(provenance, fixture_context=fixture_context)
             or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
@@ -5459,8 +5525,6 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if verb in {'fill', 'select', 'choose'}:
         if verb == 'choose':
             _require_guarded_choice(page, target)
-        else:
-            _require_native_action(target, verb)
         observed, witness = await _execute_observe_controls(session, page)
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
@@ -5473,8 +5537,6 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if not _unanswered(observed, target,
                                owner_all=_owner_asks_every_receiver(observed)):
                 raise Gate('Only required, unanswered native choices can be selected.')
-        else:
-            _require_native_action(target, verb)
         if _identity(target) != _identity(control(page, action, 'execute-identity')):
             raise Gate('The selected field changed before human authorization.')
         page = observed
@@ -5595,8 +5657,6 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if not _unanswered(latest, current,
                                owner_all=_owner_asks_every_receiver(latest)):
                 raise Gate('The required choice is no longer unanswered.')
-        else:
-            _require_native_action(current, verb)
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
         if provenance is not None and (
@@ -6082,7 +6142,10 @@ class ApplicationIPCController:
         self.protected_snapshot = bool(seal_stage)
         staged = _protected_resume_snapshot(resume_path) if seal_stage else resume_path
         self.resume_path = str(Path(staged).resolve()) if staged else ''
-        self.facts, self.filled, self.history = facts, filled, history
+        self.facts, self.history = facts, history
+        self.filled = _ApprovedFormValues(
+            filled, pk, facts, fixture_context=fixture_context,
+            provenance=verified_redirect or entry_provenance)
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
         self.verified_redirect = verified_redirect
@@ -6411,6 +6474,23 @@ class ApplicationIPCController:
         if len(targets) != 1:
             raise Gate('Ambiguous application click; no IPC.')
         target = targets[0]
+        if (target.get('tag') == 'button' and target.get('type') == 'button'
+                and str(target.get('label') or '').casefold() in {'yes', 'no'}
+                and _formless_root(page)
+                and self._row().get('ats') == 'ashby'):
+            if not _formless_root(page).get('root'):
+                page, target = await self._reversible_receiver(session, page, target)
+            else:
+                _boolean_pair(page, target)
+            if not _unanswered(page, target):
+                raise Gate('The Boolean answer has already been selected.',
+                           reason='defect_button')
+            approved = _approved_boolean_pair(page, target, self.pk,
+                                              fixture_context=self.fixture_context)
+            if not approved or approved[1].get('selector') != selector:
+                raise Gate('The clicked Boolean is not the witnessed owner choice.',
+                           reason='defect_button')
+            return
         # Explicitly submitting/navigating choices are never ordinary selection
         # writes. They reach the single full guard rather than bypassing it by role.
         if ((target.get('tag') in {'input', 'button'}
@@ -6429,20 +6509,6 @@ class ApplicationIPCController:
                                                fixture_context=self.fixture_context)
             if not approved or approved[1].get('selector') != selector:
                 raise Gate('The clicked radio/checkbox is not the exact approved answer.')
-            return
-        if (target.get('tag') == 'button' and target.get('type') == 'button'
-                and str(target.get('label') or '').casefold() in {'yes', 'no'}
-                and _formless_root(page) and not _formless_root(page).get('root')
-                and self._row().get('ats') == 'ashby'):
-            page, target = await self._reversible_receiver(session, page, target)
-            if not _unanswered(page, target):
-                raise Gate('The Boolean answer has already been selected.',
-                           reason='defect_button')
-            approved = _approved_boolean_pair(page, target, self.pk,
-                                              fixture_context=self.fixture_context)
-            if not approved or approved[1].get('selector') != selector:
-                raise Gate('The clicked Boolean is not the witnessed owner choice.',
-                           reason='defect_button')
             return
         if target.get('type') == 'combobox':
             # The preceding sole commit classification owns submit/form overrides.

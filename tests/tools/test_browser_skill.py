@@ -1829,7 +1829,7 @@ async def test_submit_label_on_js_button_cannot_prove_native_click(
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate'
-    assert 'Unverified or changed form value' in result['question']
+    assert 'The current form value differs from its approved facts' in result['question']
     assert final_calls == [raw._application_controller]
     assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
 
@@ -2511,8 +2511,8 @@ def test_greenhouse_ordinary_reader_never_trusts_badge():
     from tools.browser_skill_dom import PAGE
     observed = _gh_dom(script=PAGE)
     assert 'greenhouse' not in observed and observed['unsupported_frames']
-    with pytest.raises(forms.Gate, match='incomplete'):
-        forms._inventory_ok(observed)
+    with pytest.raises(forms.Gate, match='incomplete|uninspectable'):
+        forms.check_form(observed, {}, uploaded=True)
 
 
 @pytest.mark.parametrize('provenance', [None, object(), forms.VendorRedirectProvenance(
@@ -2580,8 +2580,8 @@ def test_greenhouse_badge_does_not_relax_adjacent_inventory_guards(key, value):
     observed = _gh_dom()
     observed[key] = value
     _gh_safe(observed)
-    with pytest.raises(forms.Gate, match='incomplete'):
-        forms._inventory_ok(observed)
+    with pytest.raises(forms.Gate, match='incomplete|uninspectable'):
+        forms.check_form(observed, {}, uploaded=True)
 
 
 @pytest.mark.parametrize('change,old,new', [
@@ -2628,8 +2628,8 @@ def test_greenhouse_proxy_exact_four_or_five_names_in_both_readers(value_attribu
     result = _proxy_dom({'proxyValueAttribute': value_attribute})
     # ARCH21:18 / #139 binding 6/9: a React-select proxy fingerprint is no
     # authority. Missing accessible linkage remains opaque at final Submit.
-    with pytest.raises(forms.Gate, match='opaque_controls'):
-        forms._inventory_ok(result['page'])
+    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+        forms.check_form(result['page'], {}, uploaded=True)
     for reader in result.values():
         for key in ['location', 'country']:
             target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
@@ -2657,8 +2657,8 @@ def test_greenhouse_proxy_exact_four_or_five_names_in_both_readers(value_attribu
 @pytest.mark.parametrize('key', ['location', 'country'])
 def test_greenhouse_proxy_five_name_isolated_negatives(mutation, key):
     result = _proxy_dom({'proxyMutation': {'key': key, **mutation}})
-    with pytest.raises(forms.Gate, match='opaque_controls'):
-        forms._inventory_ok(result['page'])
+    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+        forms.check_form(result['page'], {}, uploaded=True)
     for reader in result.values():
         target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
         # Binding 6/9: changing a proxy cannot manufacture an ARIA link or a

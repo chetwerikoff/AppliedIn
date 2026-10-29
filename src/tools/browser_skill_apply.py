@@ -3297,7 +3297,10 @@ def _unanswered(page: dict, target: dict, *, owner_all: bool = False) -> bool:
             members = _boolean_pair(page, target)
         except Gate:
             members = [target]
-        return any(required(c) for c in members) and not any(
+        # A verified Ashby Yes/No census can have unreadable requiredness.
+        # It remains an unanswered choice until its exact owner grant is applied.
+        return (bool((_formless_root(page) or {}).get('root'))
+                or any(required(c) for c in members)) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
         return required(target) and not target.get('checked')

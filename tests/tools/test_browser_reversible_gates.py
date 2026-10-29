@@ -352,6 +352,28 @@ def _record_choice_click(endpoint, selector, value):
     endpoint.call = call
 
 
+def _record_boolean_press(endpoint, selector):
+    """The probed live Ashby shape of a pressed Yes/No member (FF-243a).
+
+    Ashby marks the chosen <button> only with aria-pressed, which the reader
+    reports as checked; its value stays '' and has_value False. An earlier
+    double also wrote value/has_value onto the button, a shape no live page
+    produces, which kept the formless readback green while every live row gated.
+    """
+    previous = endpoint.call
+
+    async def call(method, *args, **kwargs):
+        outcome = await previous(method, *args, **kwargs)
+        if method == 'click' and args == (selector,):
+            for snapshot in (endpoint.current, endpoint.fixed):
+                for control in snapshot['controls']:
+                    if control['selector'] == selector:
+                        control.update(value='', has_value=False, checked=True)
+        return outcome
+
+    endpoint.call = call
+
+
 @pytest.mark.asyncio
 async def test_boolean_pair_grant_only_clicks_witnessed_selected_member(monkeypatch, tmp_path):
     row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
@@ -362,7 +384,7 @@ async def test_boolean_pair_grant_only_clicks_witnessed_selected_member(monkeypa
     assert not decision.await_count
     assert not [call for call in endpoint.calls if call[0] == 'click']
     _answer(row, stores, gate, 'No')
-    _record_choice_click(endpoint, '#boolean-no', 'no')
+    _record_boolean_press(endpoint, '#boolean-no')
     decision.side_effect = [
         {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
         {'action': 'gate', 'question': 'Synthetic verification complete'}]

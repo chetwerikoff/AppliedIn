@@ -3397,6 +3397,15 @@ def _issue218_main_reader_scripts():
         assert source.count(updated) == old.count(updated) == 1, updated[:80]
         source = source.replace(updated, previous, 1)
         old = old.replace(updated, previous, 1)
+    # FF-243a changed the controls reader, outside _ENTRY_OBSERVATION, so it
+    # is reverted in the hashed source only; both compared readers carry it.
+    pressed = (
+        "      // Ashby marks the chosen Yes/No <button> only with aria-pressed.\n"
+        "      has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'\n"
+        "        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'),\n")
+    assert source.count(pressed) == 1 and old.count(pressed) == 0
+    source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
+                            "e.getAttribute('aria-checked') === 'true',\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
     assert hashlib.sha1(git_blob).hexdigest() == '855b0e763bf93a1587d968e1825092733b9dd644'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1

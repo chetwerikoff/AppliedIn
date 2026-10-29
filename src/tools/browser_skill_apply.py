@@ -2908,7 +2908,8 @@ def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
                 reason='defect_receiver')
 
 
-def _readback_gate(pk: str, verb: str, target: dict, actual: dict, written: str) -> Gate:
+def _readback_gate(pk: str, verb: str, target: dict, actual: dict, written: str,
+                   failed: str = '') -> Gate:
     """Name the readback comparison that failed and its shape, never a value.
 
     FF-243a: a bare readback Gate stalled every formless Ashby row for an
@@ -2918,7 +2919,7 @@ def _readback_gate(pk: str, verb: str, target: dict, actual: dict, written: str)
         return (value if isinstance(value, str)
                 and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,39}', value) else 'unavailable')
     observed = actual.get('value') if isinstance(actual.get('value'), str) else ''
-    failed = '+'.join(name for name, bad in (
+    failed = failed or '+'.join(name for name, bad in (
         ('value', observed != written), ('has_value', not actual.get('has_value'))) if bad)
     detail = (f'verb={shape(verb)}; tag={shape(actual.get("tag"))}; '
               f'type={shape(actual.get("type"))}; '
@@ -3154,10 +3155,12 @@ def _boolean_pair(page: dict, target: dict, *,
                    or c.get('native_type') != ('submit' if entry else 'button')
                    or c.get('in_form') is not False or c.get('disabled')
                    or (not root.get('root') and c.get('required') is not True)
+                   # A live Ashby member is a <button>: the reader proves its
+                   # selection by aria-pressed (as checked), never by a value.
                    or ((c.get('has_value') or c.get('checked')
                         or c.get('value') not in ('', None)) and not (
-                        c.get('checked') is True and c.get('has_value') is True
-                        and c.get('value') == str(c.get('label', '')).casefold()))
+                        c.get('checked') is True and c.get('has_value') is False
+                        and c.get('value') == ''))
                    or any(c.get(k) for k in (
                        'submit', 'navigates', 'commits_application', 'href',
                        'form_selector', 'form_action', 'formaction',
@@ -5831,7 +5834,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
-            if actual.get('value') != write_value or not actual.get('has_value'):
+            if current['type'] == 'button':
+                # A <button> never carries the answer as a value; only its
+                # pressed member, inside the same pair the grant binds, does.
+                selected = [c for c in _boolean_pair(readback, actual)
+                            if c.get('checked') is True]
+                if (len(selected) != 1 or selected[0]['selector'] != current['selector']
+                        or not _same(value, actual.get('label', ''))):
+                    raise _readback_gate(pk, verb, current, actual, write_value, 'selected')
+            elif actual.get('value') != write_value or not actual.get('has_value'):
                 raise _readback_gate(pk, verb, current, actual, write_value)
             # The DOM readback uses the machine value (e.g. "remote"), while
             # the row grant binds the owner's answer (e.g. "Remote").

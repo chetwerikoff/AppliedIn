@@ -21,7 +21,7 @@ from tools import browser_skill_apply as forms
 from tests.tools.test_ashby_upload_fixture import (
     WAIT, _no_production_commit, _production_submit_click)
 from tests.tools.test_browser_reversible_gates import (
-    _answer, _apply, _fixture, _only_required, _record_choice_click)
+    _answer, _apply, _fixture, _only_required, _record_boolean_press)
 
 UPLOAD = {'action': 'upload', 'selector': '#_systemfield_resume'}
 STOP = {'action': 'gate', 'question': 'Synthetic next decision'}
@@ -182,7 +182,7 @@ async def test_boolean_click_on_the_approved_member_is_the_guarded_choice(
     _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
     gate = await _apply(pdf)
     _answer(row, stores, gate, 'No')
-    _record_choice_click(endpoint, '#boolean-no', 'no')
+    _record_boolean_press(endpoint, '#boolean-no')
     routed = []
     execute = forms.execute
 

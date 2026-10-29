@@ -67,7 +67,7 @@ async def test_upload_control_click_uploads_once_never_clicks_then_meets_the_gua
                              late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]

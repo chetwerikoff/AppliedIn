@@ -65,8 +65,8 @@ def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():
     assert later['page']['opaque_controls'] is True
     assert later['page']['inventory_verified'] is False
     assert later['page']['opaque_count'] > 0
-    with pytest.raises(forms.Gate, match='opaque'):
-        forms._inventory_ok(later['page'])
+    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+        forms.check_form(later['page'], {}, uploaded=True)
     assert [c['selector'] for c in later['page']['controls']] == [
         c['selector'] for c in later['witness']['controls']]
     assert any(c['selector'] == '#additional' for c in later['page']['controls'])

@@ -34,7 +34,7 @@ async def test_upload_decision_uploads_once_then_submit_meets_the_guard(monkeypa
     result = await run_apply([WAIT, UPLOAD, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
@@ -51,7 +51,7 @@ async def test_second_upload_decision_does_not_upload_again(monkeypatch, tmp_pat
     result = await run_apply([WAIT, UPLOAD, UPLOAD, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert decide.await_count == 4
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]

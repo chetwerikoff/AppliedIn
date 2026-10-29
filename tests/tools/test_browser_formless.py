@@ -3264,15 +3264,14 @@ async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(mo
              if e.get('boolean_group')]
     assert len(group) == 2 and all(e['in_container'] for e in group)
     assert forms._formless_boundary(raw.current, provenance)
-    # This real-reader rooted fixture exposes native-submit buttons but not
-    # a verified Yes/No choice identity. Preparation is reversible; a final
-    # Submit must not silently ignore their unapproved answer.
+    # The reader identifies both members; final Submit still rejects an empty pair
+    # rather than silently ignoring its unapproved answer.
     selectors = {e['selector'] for e in group}
     isolated = deepcopy(raw.current)
     isolated['controls'] = [c for c in isolated['controls']
                             if c['selector'] in selectors]
     assert len(isolated['controls']) == 2
-    with pytest.raises(forms.Gate, match='rooted Yes/No choice has no verified member identity'):
+    with pytest.raises(forms.Gate, match='A Yes/No answer is empty or conflicting'):
         forms.check_form(isolated, {}, uploaded=True)
     assert not decision.await_count
     no_mutations(raw)
@@ -3347,7 +3346,7 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
 
 
 def _issue218_main_reader_scripts():
-    """Reconstruct and hash-pin the exact main DOM producer, not a hand-built tree."""
+    """Reconstruct and hash-pin this reader baseline, not a hand-built tree."""
     import hashlib
     from tools import browser_skill_dom as producer
 
@@ -3399,7 +3398,7 @@ def _issue218_main_reader_scripts():
         source = source.replace(updated, previous, 1)
         old = old.replace(updated, previous, 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == 'c06c4900a89919bc410289cffaffb46958370e1c'
+    assert hashlib.sha1(git_blob).hexdigest() == '855b0e763bf93a1587d968e1825092733b9dd644'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
     return [

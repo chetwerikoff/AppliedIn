@@ -1263,6 +1263,57 @@ def _combo_receiver_allowed(page: dict, owner: dict, receiver: dict) -> bool:
             and bound.get('form_action') == root['submit'])
 
 
+def _rooted_unproved_boolean_group(page: dict, target: dict) -> bool:
+    """An untyped rooted Yes/No pair whose entry reader cannot prove choice identity.
+
+    A native submit-typed button in such a group is neither a proven
+    reversible choice nor a legitimate Submit receiver. Preparation may
+    inspect it, but the final guard must refuse rather than skip its value.
+    """
+    root = _formless_root(page)
+    if (not isinstance(root, dict) or not root.get('root')
+            or target.get('tag') != 'button' or target.get('type') != 'submit'
+            or target.get('native_type') != 'submit'
+            or target.get('in_form') is not False
+            or target.get('submit') is True):
+        return False
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not isinstance(evidence, list):
+        return False
+    members = [e for e in evidence
+               if isinstance(e, dict) and e.get('boolean_group') is True]
+    if (len(members) != 2
+            or {e.get('caption') for e in members} != {'Yes', 'No'}
+            or len({e.get('selector') for e in members}) != 2):
+        return False
+    controls = {c.get('selector'): c for c in page.get('controls', [])
+                if isinstance(c, dict)}
+    if len(controls) != len(page.get('controls', [])):
+        return False
+    for member in members:
+        actual = controls.get(member.get('selector'))
+        if (actual is None or actual.get('tag') != 'button'
+                or actual.get('type') != 'submit'
+                or actual.get('native_type') != 'submit'
+                or actual.get('label') != member.get('caption')
+                or actual.get('disabled') or actual.get('in_form') is not False
+                or actual.get('submit') is True
+                or member.get('tag') != 'button' or member.get('type') != 'submit'
+                or member.get('native_type') != 'submit'
+                or member.get('yes_no') is True
+                or member.get('untyped') is not True
+                or member.get('submit') is True
+                or member.get('inside') is not True
+                or member.get('in_container') is not True
+                or member.get('unique') is not True
+                or member.get('visible') is not True
+                or member.get('disabled')
+                or member.get('native_owner') or member.get('declared_owner')
+                or member.get('formaction') is not None):
+            return False
+    return target.get('selector') in {e['selector'] for e in members}
+
+
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                receipts: list | None = None) -> None:
     if page.get('truncated') or page.get('inventory_verified') is not True:
@@ -1289,6 +1340,11 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     seen_boolean = set()
     for target in controls:
         typ = target.get('type', '')
+        # A rooted untyped Yes/No whose native submit type was not resolved
+        # by the independent reader must never fall through the button skip.
+        # No exact per-member approval can be inferred from that inventory.
+        if _rooted_unproved_boolean_group(page, target):
+            raise Gate('A rooted Yes/No choice has no verified member identity at final Submit.')
         if typ == 'hidden':
             if (target.get('required') or target.get('has_value')
                     or bool(target.get('value'))):
@@ -2088,12 +2144,9 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
         if not c.get('in_container'):
             raise Gate('candidate control outside application container; inspect manually.')
         typ = c.get('type')
-        # A rooted Ashby Yes/No member can inherit native submit type from an
-        # untyped button. The structural reader identifies its choice group;
-        # its selection and exact owner grant are checked at raw click and at
-        # final Submit, not by the preparatory field-value census.
-        if (c.get('boolean_group') and c.get('yes_no') is True
-                and c.get('tag') == 'button' and typ in {'button', 'submit'}):
+        # This uniquely witnessed, but not choice-verified, group may be
+        # inspected. Its native submit buttons are barred at final Submit.
+        if _rooted_unproved_boolean_group(page, c):
             continue
         if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
                 'listbox', 'option', 'button'}:

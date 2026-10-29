@@ -2088,6 +2088,13 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
         if not c.get('in_container'):
             raise Gate('candidate control outside application container; inspect manually.')
         typ = c.get('type')
+        # A rooted Ashby Yes/No member can inherit native submit type from an
+        # untyped button. The structural reader identifies its choice group;
+        # its selection and exact owner grant are checked at raw click and at
+        # final Submit, not by the preparatory field-value census.
+        if (c.get('boolean_group') and c.get('yes_no') is True
+                and c.get('tag') == 'button' and typ in {'button', 'submit'}):
+            continue
         if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
                 'listbox', 'option', 'button'}:
             continue

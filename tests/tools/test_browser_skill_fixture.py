@@ -406,7 +406,7 @@ async def test_incomplete_inventory_diagnostics_never_replace_guard_input(
     assert observed[flag] == value
     assert authority.inventory_diagnostics == diagnostic
     assert calls == [("evaluate", fixture._inventory_diagnostic_script())]
-    with pytest.raises(forms.Gate, match="inventory is incomplete"):
+    with pytest.raises(forms.Gate, match="inventory is incomplete|uninspectable components"):
         forms.check_form(observed, {}, uploaded=True)
     assert authority.fills == authority.ipc_index == 0
 

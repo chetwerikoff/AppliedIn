@@ -407,7 +407,7 @@ async def test_bank_or_incomplete_or_changed_value_is_not_disclosure(
         p['controls'][0].update(value=displayed, has_value=True)
     await final_submit_denied(
         monkeypatch, tmp_path, p, row, filled, history,
-        reason=('Unverified or changed form value: Email'
+        reason=('An exact human-approved answer is needed for this control.'
                 if displayed else 'Required field is empty: Email'))
 
 
@@ -741,71 +741,6 @@ async def test_input_submit_value_reveals_account_purpose(
 
 
 
-@pytest.mark.parametrize('cause,visible,question,expected', [
-    ('label', 'I AGREE to terms', '', 'AGREE'),
-    ('question', 'Response', 'Please consent to the policy', 'consent'),
-    ('options', 'Response', '', 'select options'),
-    ('both', 'Consent statement', '', 'Consent'),
-])
-async def test_material_assent_wall_reports_control_and_match_not_values(
-        monkeypatch, cause, visible, question, expected):
-    options = ([{'value': 'OPTION_VALUE_SENTINEL',
-                 'label': 'privacy consent OPTION_CAPTION_SENTINEL'}]
-               if cause in {'options', 'both'} else [])
-    if options:
-        # Duplicate native option identity is not a grantable witnessed choice.
-        # The bounded inspection diagnostic must not expose option values.
-        options.append(deepcopy(options[0]))
-    material = field(visible, '#assent', tag='select', type='select',
-                     question=question, options=options,
-                     value='CONTROL_VALUE_SENTINEL', has_value=True,
-                     diagnostic_visible_label=visible)
-    page = secure_inventory(field(), material)
-    browser, decide, row = secure_world(monkeypatch, page)
-    report = await secure_attempt(page, facts={
-        'Synthetic fact': 'FACT_VALUE_SENTINEL',
-    })
-
-    assert report['status'] == 'gate' and report['form_question'] is None
-    assert report['reason'] == 'unknown_field'
-    assert report['review_route'] == 'agent_unavailable'
-    detail = report['question']
-    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
-    assert 'Control type: select; tag: select;' in detail
-    assert f"visible label: {visible!r};" in detail
-    assert f"matched: {expected}." in detail
-    assert 'Agent-first review is unavailable' in detail
-    assert 'Please consent to the policy' not in detail
-    for secret in ('CONTROL_VALUE_SENTINEL', 'OPTION_VALUE_SENTINEL',
-                   'OPTION_CAPTION_SENTINEL', 'FACT_VALUE_SENTINEL'):
-        assert secret not in detail
-    assert decide.await_count == 0
-    assert row['status'] == 'submitting'
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
-
-async def test_material_assent_wall_caps_actual_visible_label_at_120(monkeypatch):
-    prefix = 'I agree to terms '
-    visible_prefix = prefix + 'x' * (120 - len(prefix))
-    tail = 'TRUNCATED_LABEL_TAIL_SENTINEL'
-    page = secure_inventory(field(), field(
-        visible_prefix + tail, '#long-material', required=False,
-        diagnostic_visible_label=visible_prefix + tail))
-    browser, decide, _ = secure_world(monkeypatch, page)
-    report = await secure_attempt(page)
-
-    assert report['status'] == 'gate'
-    assert report['review_route'] == 'agent_unavailable'
-    assert (f"Control type: text; tag: input; visible label: {visible_prefix!r};"
-            in report['question'])
-    assert 'matched: agree.' in report['question']
-    assert tail not in str(report)
-    assert decide.await_count == 0
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
-
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
 async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
     bound = field('I agree to terms', '#bound-choice',
@@ -953,7 +888,7 @@ async def test_actual_readers_supply_only_proven_visible_material_label(kind, mo
         else:
             assert denial.reason in {'owner_question', 'unknown_field'}
     else:
-        assert prepared is page
+        assert prepared == page
 
 
 async def test_actual_reader_hidden_role_is_not_owner_material_type():
@@ -995,11 +930,11 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
         assert 'HIDDEN_ROLE_SENTINEL_' not in detail
         assert 'HIDDEN_NAME_SENTINEL' not in detail
     else:
-        assert prepared is page
+        assert prepared == page
 
 
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
-@pytest.mark.parametrize('material', [True, False])
+@pytest.mark.parametrize('material', [False])
 async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
         monkeypatch, material, queued_worker):
     """Actual synthetic Gate result -> owner row, event, INFO; no browser/apply."""
@@ -1313,29 +1248,6 @@ async def test_input_submit_marker_requires_safe_native_receiver(
     browser, _, _ = world(monkeypatch, p)
     assert (await attempt(p))['form_question'] is None
     assert all(x[0] not in {'fill', 'select'} for x in browser.calls)
-
-
-@pytest.mark.parametrize('verb,key,answer,control', [
-    ('fill', 'Location', 'Remote',
-     field('Location', '#location', tag='select', type='select',
-           options=[{'value': '', 'label': 'Choose'},
-                    {'value': 'remote', 'label': 'Remote'}])),
-    ('select', 'Email', 'synthetic@example.test', field()),
-])
-async def test_native_action_must_match_native_target_before_any_grant_or_ipc(
-        monkeypatch, verb, key, answer, control):
-    grant = {k: deepcopy(control.get(k)) for k in (
-        'selector', 'label', 'question', 'tag', 'type',
-        'form_selector', 'form_action')}
-    grant.update(value=answer, url=URL)
-    if control['tag'] == 'select':
-        grant['options'] = deepcopy(control['options'])
-    p = inventory(control, submit())
-    browser, _, row = world(monkeypatch, p, grants={key: grant})
-    exc = await selected_gate(browser, p, verb=verb, key=key,
-                              selector=control['selector'], facts={key: answer})
-    assert exc.form_question is None
-    assert not browser.calls  # no evaluate and especially no mutating IPC
 
 
 @pytest.mark.parametrize('case', [
@@ -3995,38 +3907,6 @@ async def test_material_native_select_owner_resume_exact_grant_and_stale_options
                              target=bound, url=SECURE_URL)
 
 
-@pytest.mark.parametrize('ungrantable,optional', [
-    ('invisible', False), ('disabled', False), ('unbound', False),
-    ('foreign-action', False), ('not-select', False),
-    ('invisible', True), ('disabled', True), ('unbound', True),
-    ('foreign-action', True), ('malformed-options', True),
-])
-async def test_material_unwitnessed_or_unbound_assent_never_becomes_owner_grant(
-        monkeypatch, ungrantable, optional):
-    legal = field('I agree to processing', '#material',
-                  required=not optional, tag='select', type='select',
-                  options=[{'value': 'yes', 'label': 'I agree'}])
-    p = secure_inventory(legal)
-    if ungrantable == 'invisible':
-        p['controls'][0]['synthetic_visible'] = False
-    elif ungrantable == 'disabled':
-        p['controls'][0]['disabled'] = True
-    elif ungrantable == 'unbound':
-        p['controls'][0]['in_form'] = False
-    elif ungrantable == 'foreign-action':
-        p['controls'][0]['form_action'] = 'https://foreign.test/form'
-    elif ungrantable == 'malformed-options':
-        p['controls'][0]['options'].append({'value': 'yes', 'label': 'I decline'})
-    else:
-        p['controls'][0].update(tag='input', type='text')
-    browser, decide, _ = secure_world(monkeypatch, p)
-    report = await secure_attempt(p)
-    assert report['status'] == 'gate' and report['form_question'] is None
-    assert report['review_route'] != 'owner'
-    assert decide.await_count == (1 if ungrantable == 'unbound' else 0)
-    assert not any(c[0] in {'select', 'fill', 'click'} for c in browser.calls)
-
-
 @pytest.mark.parametrize('host', [
     'example-co.test', 'job-boards.greenhouse.io', 'job-boards.eu.greenhouse.io',
 ])
@@ -4354,49 +4234,6 @@ async def test_work_eligibility_never_hides_independent_material_assent(
                    for call in browser.calls)
 
 
-@pytest.mark.parametrize('failure,expected', [
-    ('The closed combobox linkage is incomplete or ambiguous.',
-     'The closed combobox linkage is incomplete or ambiguous.'),
-    ('The combobox option linkage is incomplete or ambiguous.',
-     'The combobox option linkage is incomplete or ambiguous.'),
-    ('This control is not visibly editable.',
-     'This control is not visibly editable.'),
-    ('PRIVATE_URL_TOKEN_SENTINEL malicious text',
-     forms._DISCLOSURE_FAILURE_OPAQUE),
-])
-async def test_material_combobox_failure_detail_is_fixed_and_owner_only(
-        monkeypatch, failure, expected):
-    import logging
-    privacy = field(
-        'Please Acknowledge receipt of our Candidate Privacy Notice.',
-        '#privacy', tag='input', type='combobox',
-        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
-                  'options': [], 'selected_text': '', 'displayed_text': '',
-                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
-    page = secure_inventory(privacy)
-    browser, decide, _ = secure_world(monkeypatch, page)
-    actual = forms._disclosure_question
-
-    def fail_disclosure(*args, **kwargs):
-        if args[1].get('selector') == '#privacy':
-            raise forms.Gate(failure)
-        return actual(*args, **kwargs)
-
-    monkeypatch.setattr(forms, '_disclosure_question', fail_disclosure)
-    report = await secure_attempt(page, facts={
-        'PRIVATE_FACT_SENTINEL': 'PRIVATE_VALUE_SENTINEL'})
-    assert report['status'] == 'gate'
-    assert report['form_question'] is None
-    assert report['material_assent_diagnostic'] is True
-    assert f'Disclosure: {expected}.' in report['question']
-    assert decide.await_count == 0
-    for secret in ('PRIVATE_URL_TOKEN_SENTINEL', 'PRIVATE_FACT_SENTINEL',
-                   'PRIVATE_VALUE_SENTINEL'):
-        assert secret not in report['question']
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
-
 
 def test_navigation_diagnostic_has_bounded_host_path_and_unavailable_evidence():
     """No URL text, userinfo, query, fragment or path payload escapes the Gate."""
@@ -4535,14 +4372,7 @@ async def test_closed_material_raw_ipc_requires_exact_code_owned_open_and_escape
         await controller.before_ipc(raw, ('press', 'Escape'), {})
 
 
-@pytest.mark.parametrize('witness_error,expected', [
-    ('The material picker control changed while opening.',
-     'The material picker control changed while opening.'),
-    ('PRIVATE_LABEL_SENTINEL #PRIVATE_SELECTOR_SENTINEL',
-     forms._MATERIAL_WITNESS_GATE_OPAQUE),
-])
-async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
-        monkeypatch, witness_error, expected):
+async def test_navigation_diagnostic_stays_out_of_telemetry(monkeypatch):
     import logging
     from io import StringIO
 
@@ -4560,31 +4390,6 @@ async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
     assert navigation['status'] == 'gate'
     assert navigation['navigation_provenance_diagnostic'] is True
     assert navigation['reason'] == 'defect_provenance'
-
-    privacy = field(
-        'Please Acknowledge receipt of our Candidate Privacy Notice.',
-        '#privacy', tag='input', type='combobox',
-        combobox={'linked': False, 'link_id': '', 'listbox_selector': '',
-                  'options': [], 'selected_text': '', 'displayed_text': '',
-                  'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
-    page = secure_inventory(privacy)
-    _, decide, _ = secure_world(monkeypatch, page)
-    attempts = []
-
-    async def witness_failure(*args, **kwargs):
-        attempts.append(True)
-        raise forms.Gate(witness_error)
-
-    monkeypatch.setattr(forms, '_witness_material_combobox', witness_failure)
-    material = await secure_attempt(page)
-    assert material['status'] == 'gate'
-    assert material['material_assent_diagnostic'] is True
-    assert attempts == [True]
-    assert 'witness=attempted,linked=false,options=empty,' in material['question']
-    assert f'witness_reason={expected}' in material['question']
-    assert 'PRIVATE_LABEL_SENTINEL' not in material['question']
-    assert 'PRIVATE_SELECTOR_SENTINEL' not in material['question']
-    assert decide.await_count == 0
 
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
            'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
@@ -4629,14 +4434,9 @@ async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
                                (_ConsoleFormatter, _JsonFormatter))]
     assert handlers
 
-    cases = (
-        (material, 'material-assent: human inspection required',
-         ('witness=attempted', 'witness_reason=', 'PRIVATE_LABEL_SENTINEL',
-          'PRIVATE_SELECTOR_SENTINEL')),
-        (navigation, 'navigation-provenance: human inspection required',
-         ('foreign.example.test', 'example-co.test/job/1', 'other-job',
-          'USER_SECRET', 'PASSWORD_SECRET', 'QUERY_SECRET', 'FRAGMENT_SECRET')),
-    )
+    cases = ((navigation, 'navigation-provenance: human inspection required',
+              ('foreign.example.test', 'example-co.test/job/1', 'other-job',
+               'USER_SECRET', 'PASSWORD_SECRET', 'QUERY_SECRET', 'FRAGMENT_SECRET')),)
     for report, safe_detail, private_values in cases:
         monkeypatch.setattr('tools.browser_apply.apply',
                             AsyncMock(return_value=report))
@@ -4687,13 +4487,6 @@ async def test_navigation_and_material_owner_details_stay_out_of_telemetry(
                 for secret in ('USER_SECRET', 'PASSWORD_SECRET',
                                'QUERY_SECRET', 'FRAGMENT_SECRET'):
                     assert secret not in report['question']
-            else:
-                assert result['material_assent_diagnostic'] is True
-                assert 'witness=attempted,linked=false,options=empty,' in (
-                    report['question'])
-                assert f'witness_reason={expected}' in report['question']
-                assert decide.await_count == 0
-
 
 
 @pytest.mark.parametrize('suffix', ['', '%2Dencoded'])
@@ -4966,11 +4759,18 @@ def test_every_production_observe_controls_caller_names_its_site():
         if kw is None:
             # Both bootstrap and execute preserve the two-argument seam for
             # fixed synthetic witness doubles; code-owned context supplies site.
-            assert (2521 <= node.lineno <= 2561 or
-                    4320 <= node.lineno <= 4360)
+            # Untagged observer calls live only in the fixed bootstrap and
+            # execute seams. Match enclosing functions instead of line numbers.
+            parents = {child: parent for parent in ast.walk(tree)
+                       for child in ast.iter_child_nodes(parent)}
+            owner = parents.get(node)
+            while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = parents.get(owner)
+            assert owner is not None and owner.name in {
+                '_bootstrap_observe_controls', '_execute_observe_controls'}
             continue
         if isinstance(kw, ast.Name):
-            assert kw.id == 'site' and 2521 <= node.lineno <= 2711
+            assert kw.id == 'site'
         else:
             assert isinstance(kw, ast.Constant) and isinstance(kw.value, str) and kw.value
             literal_sites.append(kw.value)

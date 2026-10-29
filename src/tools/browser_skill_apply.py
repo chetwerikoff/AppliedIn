@@ -2104,7 +2104,7 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
         # Group membership alone is not a grant. Do not restore a per-step
         # structural ban for the buttons or their passive checkbox: the one
         # final Submit check refuses every still-unproved rooted group.
-        if c.get('boolean_group') is True:
+        if root.get('root') and c.get('boolean_group') is True:
             continue
         if (c.get('dropzone') and c.get('tag') == 'button') or typ in {
                 'listbox', 'option', 'button'}:

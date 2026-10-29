@@ -3204,6 +3204,7 @@ def _validate_rooted_boolean_groups(page: dict) -> None:
     if not group:
         return
     buttons = []
+    companions = {}
     for item in group:
         if item.get('tag') == 'button':
             if (item.get('yes_no') is not True or item.get('type') != 'button'
@@ -3213,16 +3214,16 @@ def _validate_rooted_boolean_groups(page: dict) -> None:
                 raise Gate('A rooted Yes/No choice has no verified member identity at final Submit.')
             buttons.append(item)
             continue
-        # Ashby keeps an unnamed, unchecked invisible checkbox as an internal
-        # toggle proxy. It cannot submit a value; any changed or named proxy
-        # remains a final-gate refusal rather than disappearing from the census.
+        # Live Ashby (FF-243a probe) keeps one named, invisible checkbox per
+        # pair as its state companion: checked iff Yes is pressed. It is held
+        # here until its pair is verified below; any other checkbox refuses.
         if (item.get('tag') == 'input' and item.get('type') == 'checkbox'
                 and item.get('native_type') == 'checkbox'
                 and item.get('visible') is False and item.get('required') is False
-                and item.get('checked') is False and not item.get('name')
                 and not item.get('native_owner') and not item.get('declared_owner')
                 and item.get('formaction') is None and not item.get('submit')
                 and not item.get('disabled') and not item.get('inert')):
+            companions.setdefault(item.get('field_entry'), []).append(item)
             continue
         raise Gate('A rooted Yes/No group contains an unverified submission control at final Submit.')
     selectors = [item.get('selector') for item in buttons]
@@ -3230,6 +3231,7 @@ def _validate_rooted_boolean_groups(page: dict) -> None:
             or len(selectors) != len(set(selectors))):
         raise Gate('Rooted Yes/No member identity is ambiguous at final Submit.')
     covered = set()
+    pairs = {}
     for item in buttons:
         matches = [control for control in page.get('controls', [])
                    if control.get('selector') == item.get('selector')]
@@ -3242,8 +3244,25 @@ def _validate_rooted_boolean_groups(page: dict) -> None:
         if member_selectors != expected:
             raise Gate('A rooted Yes/No field entry does not contain exactly its two verified members.')
         covered.update(member_selectors)
+        pairs[item['field_entry']] = members
     if covered != set(selectors):
         raise Gate('A rooted Yes/No member is not covered by one verified pair.')
+    if (set(companions) - set(pairs)
+            or any(len(found) != 1 for found in companions.values())):
+        raise Gate('A rooted Yes/No state checkbox is not the single companion '
+                   'of one verified pair at final Submit.')
+    live = {control.get('selector') for control in page.get('controls', [])}
+    for entry, found in companions.items():
+        companion = found[0]
+        if companion.get('selector') in live:
+            raise Gate('A rooted Yes/No state checkbox is also a live form control '
+                       'at final Submit.')
+        pressed = [member for member in pairs[entry] if member.get('checked') is True]
+        yes = (len(pressed) == 1
+               and str(pressed[0].get('label') or '').casefold() == 'yes')
+        if companion.get('checked') is not yes:
+            raise Gate('A rooted Yes/No state checkbox disagrees with its pressed '
+                       'member at final Submit.')
 
 
 def _bound_target(page: dict, target: dict) -> dict:

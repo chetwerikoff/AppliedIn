@@ -95,13 +95,21 @@ def _rooted_boolean_reader(*, multiple=False, selected=False, selected_member="N
             "untyped(other,{text:'Yes'});untyped(other,{text:'No'});"
             "node('input',{type:'checkbox',style:{display:'none'},rect:null},other);"
         )
+    # FF-243a probe of a live Ashby page: each pair's hidden checkbox is
+    # named, and is checked exactly when Yes is pressed.
+    mutation += "group.children[2].setAttribute('name','synthetic-companion');"
+    if multiple:
+        mutation += "other.children[2].setAttribute('name','synthetic-companion-2');"
     if selected:
-        # FF-243a probe of a live Ashby page: the chosen member gains only
-        # aria-pressed; a <button> never carries the answer as its value.
+        # The chosen member gains only aria-pressed; a <button> never carries
+        # the answer as its value.
         selected_index = 0 if selected_member == "Yes" else 1
         mutation += f"group.children[{selected_index}].setAttribute('aria-pressed','true');"
+        if selected_member == "Yes":
+            mutation += "group.children[2].checked=true;"
         if multiple:
-            mutation += "other.children[0].setAttribute('aria-pressed','true');"
+            mutation += ("other.children[0].setAttribute('aria-pressed','true');"
+                         "other.children[2].checked=true;")
     page, witness = _rooted_live_dom(mutation)
     assert page["entry"] == witness["entry"]
     assert page["entry"]["formless"]["root"]

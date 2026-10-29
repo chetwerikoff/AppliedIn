@@ -937,26 +937,23 @@ async def test_actual_readers_supply_only_proven_visible_material_label(kind, mo
 
     monkeypatch.setattr(forms, '_row', lambda _pk: {
         'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-    with pytest.raises(forms.MaterialAssentGate) as denial:
-        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
-    if kind == 'select-options' and denial.value.reason == 'owner_question':
-        # A fully witnessed, unselected native option list can be answered by
-        # the owner. The options themselves still authorize no write.
-        question = denial.value.form_question
-        assert question['tag'] == question['type'] == 'select'
-        assert question['options'] and question['pk'] == PK
-        return
-    detail = str(denial.value)
-    assert detail.startswith('Material assent outside a bound choice needs human inspection.')
-    assert f'matched: {match}.' in detail
-    assert unsafe not in detail
-    assert 'OPTION_VALUE_SENTINEL' not in detail
-    if kind == 'visible-label':
-        assert "visible label: 'I agree to terms " in detail
-        assert 'x' * (120 - len('I agree to terms ')) in detail
+    # #241 removes the bootstrap-only fallback which interpreted arbitrary
+    # material-sounding labels as a separate write barrier. An actual
+    # form-owned material SELECT may still request its exact owner grant.
+    try:
+        prepared = await forms._bootstrap(
+            OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    except forms.Gate as denial:
+        assert not str(denial).startswith(
+            'Material assent outside a bound choice needs human inspection.')
+        if kind == 'select-options' and denial.reason == 'owner_question':
+            question = denial.form_question
+            assert question['tag'] == question['type'] == 'select'
+            assert question['options'] and question['pk'] == PK
+        else:
+            assert denial.reason in {'owner_question', 'unknown_field'}
     else:
-        assert "visible label: 'unavailable';" in detail
-    assert denial.value.reason == 'unknown_field'
+        assert prepared is page
 
 
 async def test_actual_reader_hidden_role_is_not_owner_material_type():
@@ -986,14 +983,19 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
         async def page(self):
             return deepcopy(page)
 
-    with pytest.raises(forms.MaterialAssentGate) as denial:
-        await forms._bootstrap(OfflineReaderSession(), page, PK, {}, SECURE_URL)
-    detail = str(denial.value)
-    assert ("Control type: unavailable; tag: input; "
-            "visible label: 'unavailable'; matched: consent." in detail)
-    assert 'HIDDEN_ROLE_SENTINEL_' not in detail
-    assert 'HIDDEN_NAME_SENTINEL' not in detail
-    assert denial.value.reason == 'unknown_field'
+    # A malicious hidden ARIA role never upgrades the control into a
+    # material-choice grant, and no longer forces an early diagnostic gate.
+    try:
+        prepared = await forms._bootstrap(
+            OfflineReaderSession(), page, PK, {}, SECURE_URL)
+    except forms.Gate as denial:
+        detail = str(denial)
+        assert not detail.startswith(
+            'Material assent outside a bound choice needs human inspection.')
+        assert 'HIDDEN_ROLE_SENTINEL_' not in detail
+        assert 'HIDDEN_NAME_SENTINEL' not in detail
+    else:
+        assert prepared is page
 
 
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])

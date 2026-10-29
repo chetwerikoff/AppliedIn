@@ -1274,7 +1274,6 @@ def _rooted_unproved_boolean_group(page: dict, target: dict) -> bool:
     if (not isinstance(root, dict) or not root.get('root')
             or target.get('tag') != 'button' or target.get('type') != 'submit'
             or target.get('native_type') != 'submit'
-            or target.get('in_form') is not False
             or target.get('submit') is True):
         return False
     evidence = (page.get('entry') or {}).get('root_evidence')

@@ -194,7 +194,8 @@ async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, gr
     monkeypatch.setattr(forms, '_row', lambda pk: row if pk == PK else
                         pytest.fail('Unexpected synthetic row lookup'))
     browser = Browser(page)
-    filled, history = {}, []
+    filled = forms._ApprovedFormValues({}, PK, facts or {})
+    history = []
     observed = await forms._bootstrap(
         browser, page, PK, facts or {}, SECURE_URL,
         filled=filled, history=history, job_url=SECURE_URL,
@@ -1362,7 +1363,8 @@ async def test_direct_ats_required_control_liveness_from_zero_grants(monkeypatch
     page = secure_inventory(name, email, phone, resume, privacy, yes, no)
     browser, decide, row = secure_world(monkeypatch, page)
     browser.allow_mutations = True
-    bank, filled, history = {}, {}, []
+    bank, history = {}, []
+    filled = forms._ApprovedFormValues({}, PK, bank)
     answers = [
         ('Full name', 'Test User', 'fill', '#full-name'),
         ('Email', 'test@example.test', 'fill', '#email'),

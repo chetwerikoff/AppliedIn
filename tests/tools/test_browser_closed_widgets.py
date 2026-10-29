@@ -38,6 +38,9 @@ def dom(**scenario):
 def combo(snapshot, key='location'):
     return next(c for c in snapshot['page']['controls'] if c['selector'] == '#'+key)
 
+def approved_values(values=None):
+    return forms._ApprovedFormValues(values or {}, 'example-co#1', {})
+
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 @pytest.mark.parametrize('active_only', [False, True])
@@ -271,7 +274,7 @@ def focused_final_page(page, key='location'):
 async def test_four_exact_commits_and_presubmit_current_reread(grants):
     # The generic option click is preparation, not proof. Four independent
     # *current form-owned* values must agree with the approved captions.
-    session, filled, receipts = FormOwnedSelection(), {}, []
+    session, filled, receipts = FormOwnedSelection(), approved_values(), []
     for key in KEYS:
         receipts.append(await choose(session, grants, key, filled))
     current, _ = await forms._observe_controls(session, await session.page())
@@ -297,8 +300,8 @@ async def test_four_exact_commits_and_presubmit_current_reread(grants):
     {'danger': 'ancestor'}, {'danger': 'descendant'},
 ])
 async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
-    session, filled = (FormOwnedSelection(**scenario) if scenario.get('caption')
-                       else Session(**scenario)), {}
+    session = FormOwnedSelection(**scenario) if scenario.get('caption') else Session(**scenario)
+    filled = {}
     if scenario.get('danger'):
         # A potential committing option is never reversible preparation.
         with pytest.raises(forms.Gate):
@@ -328,7 +331,7 @@ async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
 
 
 @pytest.mark.parametrize('key', ['selected_text', 'displayed_text', 'hidden_value', 'selected_value'])
-async def test_each_current_readback_is_literal_and_independent(grants, key):
+async def test_each_current_readback_is_literal_and_independent(grants, key, monkeypatch):
     if key == 'hidden_value':
         # Unlike the CSS-only closed widget, this generic fixture has an
         # actual named hidden form receiver and its independently read code.
@@ -336,7 +339,12 @@ async def test_each_current_readback_is_literal_and_independent(grants, key):
         base = generic.page(generic.control(
             selected_text='Example Country', selected_value='EX',
             hidden_value='EX'))
-        filled = {'#country': 'Example Country'}
+        filled = approved_values({'#country': 'Example Country'})
+        country = base['controls'][0]
+        row = {'pk': 'example-co#1', 'status': 'submitting',
+               'human_approved_answers': {
+                   forms._key(base, country): generic.grant()}}
+        monkeypatch.setattr(forms, '_row', lambda _pk: row)
         forms.check_form(base, filled, True)
         mutated = copy.deepcopy(base)
         mutated['controls'][0]['combobox']['hidden_value'] = 'Different code'
@@ -353,7 +361,7 @@ async def test_each_current_readback_is_literal_and_independent(grants, key):
     assert session.observed_choice == (
         receipt['committed_caption'], receipt['committed_value'])
     base = focused_final_page(await session.page())
-    filled = {'#location': 'Approved location'}
+    filled = approved_values({'#location': 'Approved location'})
     forms.check_form(base, filled, True, receipts=[receipt])
     mutated = copy.deepcopy(base)
     next(c for c in mutated['controls'] if c['selector'] == '#location')['combobox'][key] = 'Different location'
@@ -382,7 +390,7 @@ async def test_receipt_cannot_replace_current_admission_or_click_witness(grants,
     receipt = await choose(session, grants)
     current = _current_form_owned_choice(
         focused_final_page(await session.page()), receipt)
-    filled = {'#location': 'Approved location'}
+    filled = approved_values({'#location': 'Approved location'})
     forms.check_form(current, filled, True, receipts=[receipt])
     forged = dict(receipt)
     forged[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
@@ -406,7 +414,7 @@ async def test_no_receipt_is_not_a_committed_selection(grants):
     receipt = await choose(session, grants)
     current = _current_form_owned_choice(
         focused_final_page(await session.page()), receipt)
-    filled = {'#location': 'Approved location'}
+    filled = approved_values({'#location': 'Approved location'})
     forms.check_form(current, filled, True, receipts=[receipt])
     # Fresh approved caption and this form's named submitted value suffice.
     forms.check_form(current, filled, True, receipts=[])
@@ -460,7 +468,7 @@ async def test_anchor_drift_does_not_confer_submit_authority(grants, anchor, sta
 
     # Old shape-anchor drift is not an automatic intermediate human Gate.
     # Nor may an old receipt mint the final form-owned submitted value.
-    session, filled = Drift(), {}
+    session, filled = Drift(), approved_values()
     receipt = await choose(session, grants, filled=filled)
     assert receipt['action'] == 'combobox'
     assert ('click', '#submit') not in session.calls
@@ -480,7 +488,7 @@ async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase, monk
             if args == ('click', '#location'):
                 self.snapshot = dom(phases={'location': phase})
             return result
-    session, filled = Drift(), {}
+    session, filled = Drift(), approved_values()
     receipt = await choose(session, grants, filled=filled)
     # Missing/late-mounted picker options produce no invented selection
     # receipt, and the final form guard refuses the incomplete control.
@@ -498,7 +506,7 @@ async def test_legacy_shape_loss_cannot_grant_a_final_submitted_value(grants):
             if args == ('click', '#location'):
                 self.snapshot = dom(phases={'location': 'C1'}, badGraph=True)
             return result
-    session, filled = Drift(), {}
+    session, filled = Drift(), approved_values()
     receipt = await choose(session, grants, filled=filled)
     # A generic ARIA relationship can still allow reversible preparation
     # even when the former library-specific graph mode disappears.
@@ -513,7 +521,7 @@ async def test_forged_plain_receipt_is_not_code_witnessed(grants):
     receipt = await choose(session, grants)
     current = _current_form_owned_choice(
         focused_final_page(await session.page()), receipt)
-    filled = {'#location': 'Approved location'}
+    filled = approved_values({'#location': 'Approved location'})
     forged = dict(receipt)
     forged['committed_value'] = 'forged'
     forms.check_form(current, filled, True, receipts=[forged])
@@ -652,7 +660,7 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
 async def test_option_machine_attributes_never_replace_live_submitted_value(grants, attrs):
     # An opaque machine code need not equal the approved displayed caption.
     # The actual form-owned current value MUST equal the selected option code.
-    session, filled = FormOwnedSelection(optionAttrs=attrs), {}
+    session, filled = FormOwnedSelection(optionAttrs=attrs), approved_values()
     receipt = await choose(session, grants, filled=filled)
     assert receipt['action'] == 'combobox'
     assert session.observed_choice is not None
@@ -666,7 +674,7 @@ async def test_option_machine_attributes_never_replace_live_submitted_value(gran
     assert ('click', '#submit') not in session.calls
 
 async def test_attribute_less_option_commits_exact_caption_and_receiver(grants):
-    session, filled = FormOwnedSelection(optionAttrs={}), {}
+    session, filled = FormOwnedSelection(optionAttrs={}), approved_values()
     receipt = await choose(session, grants, filled=filled)
     assert receipt['committed_caption'] == receipt['committed_value'] == grants['location']
     assert receipt['hidden_value'] == ''  # No invented hidden input commitment.
@@ -990,7 +998,7 @@ async def test_required_proxy_mutation_denies_real_final_submit(
 async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):
     # A required synthetic proxy disappearing after a real option selection
     # is not itself authority. The final current named input and caption are.
-    session, filled = FormOwnedSelection(requiredProxy=True), {}
+    session, filled = FormOwnedSelection(requiredProxy=True), approved_values()
     receipt = await choose(session, grants, filled=filled)
     current, _ = await forms._observe_controls(session, await session.page())
     final = focused_final_page(current)

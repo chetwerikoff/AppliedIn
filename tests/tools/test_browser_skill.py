@@ -680,7 +680,8 @@ def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
     decline = target(selector='#decline', type='radio', label='No',
                      question='Authorized to work?', name='work_auth',
                      value='no', has_value=True)
-    forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
+    with pytest.raises(forms.Gate, match='row-bound approved form values'):
+        forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
 
 
 def test_native_select_can_derive_the_option_without_a_model_guessed_value():

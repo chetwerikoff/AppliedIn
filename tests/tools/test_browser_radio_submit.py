@@ -41,6 +41,17 @@ async def test_radio_group_drift_refuses_real_final_submit(
     # Baseline: the current native selection has one form, name, visible
     # question, unique machine values and exactly one checked radio.
     filled['#yes'] = 'Yes'
+    yes, no = page['controls'][:2]
+    row['human_approved_answers'] = {forms._key(page, yes): {
+        'value': 'Yes', 'selector': yes['selector'], 'url': page['url'],
+        'label': yes['label'], 'question': yes['question'],
+        'tag': yes['tag'], 'type': yes['type'],
+        'form_selector': yes['form_selector'], 'form_action': yes['form_action'],
+        'radio_name': yes['name'],
+        'radio_members': [{'selector': member['selector'],
+                           'caption': member['label'], 'value': member['value']}
+                          for member in (yes, no)],
+    }}
     forms.check_form(page, filled, uploaded=True)
 
     yes, no = page['controls'][:2]

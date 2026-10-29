@@ -1193,18 +1193,32 @@ class _ApprovedFormValues(UserDict):
 def _final_exact_grant(page: dict, target: dict, answer: str,
                        filled: dict, receipts: list | None = None) -> None:
     """Rebind a live answer to the current row's observed-control grant."""
+    typ = target.get('type')
     if not isinstance(filled, _ApprovedFormValues):
-        return  # Standalone structural callers do not represent raw Submit.
+        if (typ in {'radio', 'button'}
+                or (typ == 'checkbox' and _assent_scope(target) != 'standard_privacy')):
+            raise Gate('Final Submit requires row-bound approved form values.')
+        return
     key = _key(page, target)
-    if target.get('type') == 'radio':
+    if (typ in {'radio', 'button'}
+            or (typ == 'checkbox' and _assent_scope(target) != 'standard_privacy')):
         row = (_row(filled.pk, fixture_context=filled.fixture_context)
                if filled.fixture_context is not None else _row(filled.pk))
         grants = row.get('human_approved_answers')
         grant = grants.get(key) if isinstance(grants, dict) else None
-        answer = grant.get('value', '') if isinstance(grant, dict) else ''
-        if not (_same(answer, target.get('label', ''))
-                or _same(answer, target.get('value', ''))):
-            raise Gate('The native selected member is not the approved answer.')
+        stored_answer = grant.get('value', '') if isinstance(grant, dict) else ''
+        if not isinstance(stored_answer, str) or not stored_answer.strip():
+            raise Gate('An exact human-approved answer is needed for this control.')
+        if typ == 'radio':
+            if not (_same(stored_answer, target.get('label', ''))
+                    or _same(stored_answer, target.get('value', ''))):
+                raise Gate('The native selected member is not the approved answer.')
+        elif typ == 'button':
+            if not isinstance(answer, str) or not _same(stored_answer, answer):
+                raise Gate('An exact human-approved answer is needed for this control.')
+        elif not _same(stored_answer, 'yes'):
+            raise Gate('An exact human-approved answer is needed for this control.')
+        answer = stored_answer
     if not isinstance(answer, str) or not answer.strip():
         raise Gate('A filled control lacks an exact approved answer.')
     if (target.get('type') not in {'checkbox', 'radio', 'button'}

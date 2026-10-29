@@ -85,7 +85,7 @@ def _rooted_live_dom(mutate):
             dom(spec, prefix + forms._ENTRY_FIXED_CONTROL_WITNESS))
 
 
-def _rooted_boolean_reader(*, multiple=False, selected=False):
+def _rooted_boolean_reader(*, multiple=False, selected=False, selected_member="No"):
     # Both independent readers must expose the production-shaped default-submit buttons.
     mutation = ""
     if multiple:
@@ -96,8 +96,11 @@ def _rooted_boolean_reader(*, multiple=False, selected=False):
             "node('input',{type:'checkbox',style:{display:'none'},rect:null},other);"
         )
     if selected:
-        mutation += ("group.children[1].setAttribute('aria-checked','true');"
-                     "group.children[1].value='no';")
+        selected_index = 0 if selected_member == "Yes" else 1
+        mutation += (
+            f"group.children[{selected_index}].setAttribute('aria-checked','true');"
+            f"group.children[{selected_index}].value='{selected_member.lower()}';"
+        )
         if multiple:
             mutation += ("other.children[0].setAttribute('aria-checked','true');"
                          "other.children[0].value='yes';")
@@ -159,6 +162,14 @@ def test_invented_value_with_matching_ledger_and_facts_is_not_a_grant(monkeypatc
                grants={"Name": _grant(page, page["controls"][0], "Test User")})
 
 
+def test_final_submit_rejects_plain_dict_instead_of_row_bound_values():
+    page = _isolated_reader_boolean(_rooted_boolean_reader(selected=True))
+    selected = next(c for c in page['controls'] if c.get('checked') is True)
+    with pytest.raises(forms.Gate, match='row-bound approved form values'):
+        forms.check_form(page, {selected['selector']: selected['value']},
+                         uploaded=True)
+
+
 def test_reader_rooted_boolean_pair_is_a_proven_reversible_choice():
     page = _isolated_reader_boolean(_rooted_boolean_reader())
     yes = next(c for c in page["controls"]
@@ -193,6 +204,16 @@ def test_reader_rooted_boolean_accepts_exact_grant_and_guarded_choice_click(
     assert forms._approved_boolean_pair(page, yes, PK) == ("No", selected)
 
 
+def test_reader_rooted_boolean_accepts_casefolded_stored_grant(monkeypatch):
+    page = _isolated_reader_boolean(_rooted_boolean_reader(selected=True))
+    yes = next(c for c in page["controls"] if c["label"] == "Yes")
+    selected = next(c for c in page["controls"] if c.get("checked") is True)
+    key = forms._key(page, yes)
+    _check(monkeypatch, page, facts={}, values={},
+           grants={key: _grant(page, yes, "no")})
+    assert forms._approved_boolean_pair(page, yes, PK) == ("no", selected)
+
+
 def test_reader_rooted_boolean_refuses_grant_for_the_other_member(monkeypatch):
     page = _isolated_reader_boolean(_rooted_boolean_reader(selected=True))
     yes = next(c for c in page["controls"] if c["label"] == "Yes")
@@ -200,6 +221,17 @@ def test_reader_rooted_boolean_refuses_grant_for_the_other_member(monkeypatch):
     with pytest.raises(forms.Gate, match="exact human-approved answer"):
         _check(monkeypatch, page, facts={}, values={},
                grants={key: _grant(page, yes, "Yes")})
+
+
+def test_reader_rooted_boolean_rejects_grant_for_different_live_caption(
+        monkeypatch):
+    page = _isolated_reader_boolean(
+        _rooted_boolean_reader(selected=True, selected_member="Yes"))
+    yes = next(c for c in page["controls"] if c["label"] == "Yes")
+    key = forms._key(page, yes)
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        _check(monkeypatch, page, facts={}, values={},
+               grants={key: _grant(page, yes, "no")})
 
 
 def test_reader_multiple_rooted_yes_no_pairs_each_require_an_exact_grant(
@@ -244,6 +276,15 @@ def test_unapproved_ticked_assent_refused_even_if_writer_ledger_agrees(monkeypat
     page = _page(_assent(checked=True))
     with pytest.raises(forms.Gate, match="exact human-approved answer"):
         _check(monkeypatch, page, facts={}, values={"#assent": "on"}, grants={})
+
+
+def test_ticked_checkbox_accepts_casefolded_affirmative_grant(monkeypatch):
+    page = _page(_assent(checked=True))
+    target = page["controls"][0]
+    grant = _grant(page, target, "Yes")
+    grant["visible_text"] = target["label"]
+    _check(monkeypatch, page, facts={}, values={"#assent": "on"},
+           grants={forms._key(page, target): grant})
 
 
 def _reader_hidden_combobox(drift="normal"):

@@ -10,6 +10,10 @@ from pathlib import Path
 _helpers = runpy.run_path(str(Path(__file__).with_name('test_browser_closed_widgets.py')))
 Session, dom, combo, KEYS, URL = (_helpers[k] for k in ('Session', 'dom', 'combo', 'KEYS', 'URL'))
 
+def approved_values(values=None, facts=None):
+    return forms._ApprovedFormValues(
+        values or {}, 'example-co#1', facts or {})
+
 
 class PhoneSession(Session):
     def __init__(self, **scenario):
@@ -42,6 +46,9 @@ def phone_grants(monkeypatch):
         grants[key] = {k: target[k] for k in (
             'selector', 'label', 'question', 'tag', 'type', 'form_selector', 'form_action')}
         grants[key].update(value=answer, url=URL)
+    # The focused-country projection has no sibling Phone receiver to
+    # disambiguate the shared reader question, so retain its observed key.
+    grants['Phone'] = dict(grants['Country'])
     row = {'pk': 'example-co#1', 'status': 'submitting', 'human_approved_answers': grants}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
     return facts, row
@@ -51,7 +58,7 @@ async def choose_country(session, facts, filled=None):
     return await forms._execute_combobox(
         session, await session.page(),
         {'action': 'combobox', 'selector': '#country', 'fact': 'Country'},
-        facts=facts, filled=filled if filled is not None else {}, pk='example-co#1',
+        facts=facts, filled=filled if filled is not None else approved_values(facts=facts), pk='example-co#1',
         job_url=URL, ctx=None, provenance=None)
 
 
@@ -80,7 +87,7 @@ def completed_approved_form(page, facts, country_receipt):
     final['controls'] = [c for c in final['controls'] if c['selector'] in keep]
     final.update(inventory_verified=True, truncated=False, opaque_controls=False,
                  shadow_roots=False, unsupported_frames=[])
-    filled, receipts = {}, []
+    filled, receipts = approved_values(facts=facts), []
     for key in (*KEYS, 'country'):
         field = combo({'page': final}, key)
         bank_key = 'Country' if key == 'country' else key
@@ -98,7 +105,7 @@ def completed_approved_form(page, facts, country_receipt):
             'committed_caption': caption, 'committed_value': value,
             'hidden_selector': '', 'hidden_value': '',
         })
-    return final, filled, receipts
+    return final, approved_values(filled, facts), receipts
 
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 def test_exact_phone_inventory_uses_both_production_readers(phase):
@@ -225,7 +232,7 @@ async def test_country_candidate_cannot_supply_initial_admission(phone_grants, p
 
 @pytest.mark.parametrize('key', ['selected_text', 'displayed_text'])
 async def test_each_country_token_projection_is_literal(phone_grants, key):
-    session, filled = PhoneSession(), {}
+    session, filled = PhoneSession(), approved_values(facts=phone_grants[0])
     receipt = await choose_country(session, phone_grants[0], filled)
     final = focused_country(await session.page(), receipt, form_owned=True)
     forms.check_form(final, filled, True, receipts=[receipt])
@@ -240,7 +247,7 @@ async def test_each_country_token_projection_is_literal(phone_grants, key):
 ])
 async def test_country_history_cannot_replace_original_proof(phone_grants, tamper):
     facts, row = phone_grants
-    session, filled = PhoneSession(), {}
+    session, filled = PhoneSession(), approved_values(facts=facts)
     receipt = await choose_country(session, facts, filled)
     current = focused_country(await session.page(), receipt, form_owned=True)
     if tamper == 'receipt_copy':

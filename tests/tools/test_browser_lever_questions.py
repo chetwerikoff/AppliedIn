@@ -334,6 +334,7 @@ def test_current_named_choice_needs_exact_form_value_and_row_grant(
            'possible_submission': False,
            'human_approved_answers': {key: grant}}
     monkeypatch.setattr(forms, '_row', lambda pk: row)
+    filled = forms._ApprovedFormValues(filled, row['pk'], {})
     receipt = {
         'action': 'choose', 'selector': target['selector'],
         'label': target['label'], 'question': target['question'],

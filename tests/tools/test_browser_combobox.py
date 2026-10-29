@@ -16,6 +16,9 @@ OPTIONS = [
      'value': 'OT', 'selected': False, 'safe': True},
 ]
 
+def approved_values(values=None, facts=None):
+    return forms._ApprovedFormValues(values or {}, PK, facts or {})
+
 def control(*, selected_text='', selected_value='', hidden_value='',
             hidden_selector='#country-code', required=True):
     return {
@@ -181,7 +184,7 @@ def test_resume_job_mints_the_exact_combobox_grant_from_direct_gate(monkeypatch)
     committed = page(control(selected_text='Example Country', selected_value='EX',
                              hidden_value='EX'))
     session = Session(current, committed)
-    filled = {}
+    filled = approved_values()
     receipt = asyncio.run(forms.execute(
         session, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'What country?'},
@@ -216,7 +219,7 @@ async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypat
            'human_approved_answers': {'What country?': grant()}}
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
     session = Session(current, committed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         session, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'What country?'},
@@ -254,7 +257,7 @@ async def test_popup_link_may_disappear_after_verified_form_commit(monkeypatch):
         'pk': PK, 'status': 'submitting',
         'human_approved_answers': {'What country?': grant()}})
     session = Session(current, committed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         session, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'What country?'},
@@ -313,7 +316,7 @@ async def test_hidden_value_must_change_to_the_selected_machine_value(
            'human_approved_answers': {'What country?': grant()}}
     monkeypatch.setattr(forms, '_row', lambda _pk: row)
     session = Session(current, committed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         session, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'What country?'},
@@ -607,7 +610,7 @@ async def test_closed_aria_picker_binds_exclusive_listbox_after_open(monkeypatch
             return (self.initial, self.opened, self.opened, self.committed)[self.stage]
 
     session = LazyLinkSession(page(closed), opened, committed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         session, page(closed),
         {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
@@ -902,7 +905,7 @@ async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_
 
     committed = material_page(selected=True)
     browser = Session(current, committed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         browser, current, {'action': 'combobox', 'selector': '#country',
                            'fact': 'Data processing consent?'},
@@ -959,7 +962,7 @@ async def test_material_closed_popup_exact_receipt_survives_final_approval(
             'form_selector': '#application', 'form_action': URL,
             'options': question['options']}}
     session = Session(opened, closed)
-    filled = {}
+    filled = approved_values()
     receipt = await forms.execute(
         session, opened, {'action': 'combobox', 'selector': '#country',
                           'fact': 'Data processing consent?'},

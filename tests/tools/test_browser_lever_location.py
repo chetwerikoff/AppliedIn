@@ -281,7 +281,7 @@ def grant_row(monkeypatch):
 
 async def run_choice(session, *, approved=ANSWER, verb='combobox'):
     initial = await session.page()
-    filled = {}
+    filled = forms._ApprovedFormValues({}, PK, {'Current location': approved})
     receipt = await forms.execute(
         session, initial, {'action': verb, 'selector': '#current-location',
                            'fact': 'Current location'},

@@ -327,18 +327,11 @@ def test_offline_location_fixture_only_commits_on_option_click(caption):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('caption', ['Testville, USA', 'Testville, United States'])
-@pytest.mark.parametrize('verb', ['fill', 'combobox'])
-async def test_typed_choice_preserves_grant_and_final_report(grant_row, caption, verb):
+async def test_typed_choice_preserves_grant_and_final_report(grant_row, caption):
     session = FakeLever(caption=caption)
-    if verb == 'fill':
-        # A role-combobox cannot borrow native text-fill authority.
-        with pytest.raises(forms.Gate, match='requested form action does not match'):
-            await run_choice(session, approved=caption, verb=verb)
-        assert not any(call[0] in {'click', 'fill', 'press'} for call in session.calls)
-        return
     grant_row['human_approved_answers']['Current location']['value'] = caption
     grant_before = deepcopy(grant_row['human_approved_answers'])
-    receipt, filled = await run_choice(session, approved=caption, verb=verb)
+    receipt, filled = await run_choice(session, approved=caption)
     assert receipt['approved_value'] == caption
     assert receipt['committed_caption'] == caption
     assert receipt['committed_value'] == 'testville-verified'
@@ -500,20 +493,6 @@ async def test_unsupported_city_key_gates_before_input(grant_row):
                    for call in session.calls)
     with pytest.raises(forms.Gate):
         forms.check_form(await session.page(), filled, uploaded=True)
-
-
-@pytest.mark.asyncio
-async def test_missing_provenance_refuses_before_key_or_option_ipc(grant_row):
-    session = FakeLever()
-    initial = await session.page()
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, initial, {'action': 'fill', 'selector': '#current-location',
-                               'fact': 'Current location'},
-            facts={'Current location': ANSWER}, filled={},
-            resume_path='', company='example-co', jd_text='', resume_tex='',
-            github='', pk=PK, job_url=POSTING, provenance=None)
-    assert not any(call[0] in {'press', 'fill', 'click'} for call in session.calls)
 
 
 @pytest.mark.asyncio

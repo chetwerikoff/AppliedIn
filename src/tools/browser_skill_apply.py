@@ -1210,8 +1210,8 @@ def _final_exact_grant(page: dict, target: dict, answer: str,
     if (target.get('type') not in {'checkbox', 'radio', 'button'}
             and not _material_form_choice(target)):
         fact_key = _fact_key(filled.facts, key)
-        if (fact_key is None
-                or not _same(str(filled.facts[fact_key]).strip(), answer)):
+        if (fact_key is not None
+                and not _same(str(filled.facts[fact_key]).strip(), answer)):
             raise Gate('The current form value differs from its approved facts.')
     extra = {}
     if target.get('type') == 'combobox' and _material_form_choice(target):
@@ -1336,11 +1336,22 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
         if (target.get('required') is not True
                 and target.get('required') is not False
-                and typ not in {'file', 'hidden', 'submit', 'image'}
-                and not target.get('checked') and not target.get('has_value')
-                and not str(target.get('value') or '').strip()
-                and not (target.get('combobox') or {}).get('selected_text')):
-            raise Gate('This unanswered field has unreadable requiredness.')
+                and typ not in {'file', 'hidden', 'submit', 'image'}):
+            if typ == 'radio':
+                group = target.get('name') or target.get('question')
+                answered = bool(group) and any(
+                    c.get('type') == 'radio' and c.get('checked') is True
+                    and (c.get('name') or c.get('question')) == group
+                    and c.get('form_selector') == target.get('form_selector')
+                    for c in controls)
+            elif typ == 'checkbox':
+                answered = target.get('checked') is True
+            else:
+                answered = (bool(target.get('has_value'))
+                            and bool(str(target.get('value') or '').strip())
+                            or bool((target.get('combobox') or {}).get('selected_text')))
+            if not answered:
+                raise Gate('This unanswered field has unreadable requiredness.')
         expected = filled.get(target['selector'])
         if typ == 'combobox':
             combo = target.get('combobox') or {}

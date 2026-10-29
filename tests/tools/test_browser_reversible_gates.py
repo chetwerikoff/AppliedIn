@@ -899,10 +899,12 @@ async def test_boolean_click_after_choose_reaches_final_submit_guard(monkeypatch
     monkeypatch.setattr(controller, '_fresh_preparation', lambda url: None)
     final_guard = AsyncMock(side_effect=forms.Gate('final guard decided'))
     monkeypatch.setattr(controller, 'authorize_final_submit', final_guard)
-    with pytest.raises(forms.Gate, match='final guard decided'):
+    # The synthetic producer lacks an independent fixed-witness readback.
+    # The final path must reject it instead of treating a button label as proof.
+    with pytest.raises(forms.Gate, match='current DOM witness is unavailable or changed'):
         await controller.before_ipc(
             SimpleNamespace(), ('click', _by_locator(endpoint.current, _NO)['selector']), {})
-    final_guard.assert_awaited_once()
+    final_guard.assert_not_awaited()
     assert controller.committed is False
 
 
@@ -961,7 +963,7 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert decide.await_count == 1
     assert effect_calls(raw.calls) == [
         ('set', Path(transport._application_controller.resume_path).name)]

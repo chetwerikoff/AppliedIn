@@ -484,6 +484,7 @@ _CONTROL_CALLERS = frozenset({
     'execute-identity',
     'execute-prewrite',
     'execute-readback',
+    'execute-readback-reread',
     'execute-phone',
     'decision-initial',
     'decision-fresh',
@@ -2908,6 +2909,11 @@ def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
                 reason='defect_receiver')
 
 
+# FF-247a: bounded re-reads (about 2 s) for a lagging Yes/No re-render.
+_BOOLEAN_READBACK_REREADS = 8
+_BOOLEAN_READBACK_INTERVAL = 0.25
+
+
 def _readback_gate(pk: str, verb: str, target: dict, actual: dict, written: str,
                    failed: str = '') -> Gate:
     """Name the readback comparison that failed and its shape, never a value.
@@ -3187,6 +3193,22 @@ def _boolean_pair(page: dict, target: dict, *,
         else:
             _reversible_entry_recipient(page, member, witness)
     return members
+
+
+def _boolean_already_chosen(page: dict, target: dict) -> bool:
+    """FF-247a: exactly this Ashby Yes/No member is pressed, its partner not.
+
+    Live Ashby toggles a pressed member off on a second click. Such a member
+    is never clicked again; the grant and readback checks still apply.
+    """
+    if target.get('type') != 'button' or not _formless_root(page):
+        return False
+    try:
+        members = _boolean_pair(page, target)
+    except Gate:
+        return False
+    pressed = [m for m in members if m.get('checked') is True]
+    return len(pressed) == 1 and pressed[0]['selector'] == target['selector']
 
 
 def _validate_rooted_boolean_groups(page: dict) -> None:
@@ -5676,7 +5698,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if verb == 'choose':
             _require_guarded_choice(observed, target)
             if not _unanswered(observed, target,
-                               owner_all=_owner_asks_every_receiver(observed)):
+                               owner_all=_owner_asks_every_receiver(observed)) and not (
+                    _boolean_already_chosen(observed, target)):
                 raise Gate('Only required, unanswered native choices can be selected.')
         if _identity(target) != _identity(control(page, action, 'execute-identity')):
             raise Gate('The selected field changed before human authorization.')
@@ -5796,7 +5819,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if verb == 'choose':
             _require_guarded_choice(latest, current)
             if not _unanswered(latest, current,
-                               owner_all=_owner_asks_every_receiver(latest)):
+                               owner_all=_owner_asks_every_receiver(latest)) and not (
+                    _boolean_already_chosen(latest, current)):
                 raise Gate('The required choice is no longer unanswered.')
         if _identity(current) != _identity(target):
             raise Gate('The approved form control changed before a browser write.')
@@ -5849,7 +5873,10 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
             _guard_native_choice_answer(current, value)
-            await _effect_call(session, 'click', current['selector'])
+            # FF-247a: a click on an already pressed Ashby member toggles it
+            # off (live probe), so an exact prior press goes to readback.
+            if not _boolean_already_chosen(latest, current):
+                await _effect_call(session, 'click', current['selector'])
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
@@ -5858,6 +5885,17 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 # pressed member, inside the same pair the grant binds, does.
                 selected = [c for c in _boolean_pair(readback, actual)
                             if c.get('checked') is True]
+                # FF-247a: a background tab can lag Ashby's re-render after the
+                # click. Re-read only, bounded; a second click toggles it off.
+                for _ in range(_BOOLEAN_READBACK_REREADS):
+                    if len(selected) == 1 and selected[0]['selector'] == current['selector']:
+                        break
+                    await asyncio.sleep(_BOOLEAN_READBACK_INTERVAL)
+                    readback, _ = await _observe_controls(
+                        session, await session.page(), site='execute-readback')
+                    actual = control(readback, action, 'execute-readback-reread')
+                    selected = [c for c in _boolean_pair(readback, actual)
+                                if c.get('checked') is True]
                 if (len(selected) != 1 or selected[0]['selector'] != current['selector']
                         or not _same(value, actual.get('label', ''))):
                     raise _readback_gate(pk, verb, current, actual, write_value, 'selected')

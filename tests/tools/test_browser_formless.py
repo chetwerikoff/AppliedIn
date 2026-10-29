@@ -3399,10 +3399,13 @@ def _issue218_main_reader_scripts():
         old = old.replace(updated, previous, 1)
     # FF-243a changed the controls reader, outside _ENTRY_OBSERVATION, so it
     # is reverted in the hashed source only; both compared readers carry it.
+    # FF-247a scoped that aria-pressed read to Ashby Yes/No groups.
     pressed = (
-        "      // Ashby marks the chosen Yes/No <button> only with aria-pressed.\n"
+        "      // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a\n"
+        "      // probe: Yes and No alike); no other button's aria-pressed is an answer.\n"
         "      has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'\n"
-        "        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'),\n")
+        "        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'\n"
+        "          && !!e.closest('div.ashby-application-form-input-yesno')),\n")
     assert source.count(pressed) == 1 and old.count(pressed) == 0
     source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
                             "e.getAttribute('aria-checked') === 'true',\n", 1)

@@ -177,9 +177,11 @@ PAGE = r"""(() => {
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),
-      // Ashby marks the chosen Yes/No <button> only with aria-pressed.
+      // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a
+      // probe: Yes and No alike); no other button's aria-pressed is an answer.
       has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'
-        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'),
+        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
+          && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
       options:e.options ? Array.from(e.options)
         .map(o=>({value:o.value,label:clean(o.textContent)})) : [],

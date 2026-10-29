@@ -79,6 +79,113 @@ async def test_boolean_readback_requires_the_clicked_member_pressed(
     assert [c for c in endpoint.calls if c[0] == 'click'] == [('click', '#boolean-no')]
 
 
+def _record_lagging_press(endpoint, selector, lag):
+    """FF-247a: the probed pressed shape, rendered only after `lag` observations.
+
+    A background tab can lag Ashby's re-render after the click; the pressed
+    member then appears on a later observation without any further click.
+    One observation is PAGE, fixed witness, PAGE: the render lands between two.
+    """
+    previous = endpoint.call
+    state = {'clicked': False, 'reads': 0}
+
+    async def call(method, *args, **kwargs):
+        if state['clicked'] and method == 'evaluate':
+            state['reads'] += 1
+            if state['reads'] % 3 == 1 and state['reads'] // 3 >= lag:
+                for snapshot in (endpoint.current, endpoint.fixed):
+                    for control in snapshot['controls']:
+                        if control['selector'] == selector:
+                            control.update(value='', has_value=False, checked=True)
+        outcome = await previous(method, *args, **kwargs)
+        if method == 'click' and args == (selector,):
+            state['clicked'] = True
+        return outcome
+
+    endpoint.call = call
+
+
+@pytest.mark.parametrize('lag', [1, 3], ids=['one-lagging-read', 'three-lagging-reads'])
+@pytest.mark.asyncio
+async def test_lagging_no_press_reads_back_without_a_second_click(
+        monkeypatch, tmp_path, lag):
+    # Before FF-247a the readback took one observation, so a No rendered
+    # pressed a moment after the click gated every row answering No.
+    monkeypatch.setattr(forms, '_BOOLEAN_READBACK_INTERVAL', 0)
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    _answer(row, stores, gate, 'No')
+    _record_lagging_press(endpoint, '#boolean-no', lag)
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Work arrangement?': 'No'})
+    assert result['status'] == 'gate'
+    assert 'did not read back exactly' not in result['question']
+    assert result['question'].startswith('Synthetic verification complete')
+    # A second click would toggle the pressed member off (live probe).
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [('click', '#boolean-no')]
+
+
+@pytest.mark.asyncio
+async def test_no_press_that_never_renders_still_gates_after_bounded_rereads(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(forms, '_BOOLEAN_READBACK_INTERVAL', 0, raising=False)
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    _answer(row, stores, gate, 'No')
+    _record_lagging_press(endpoint, '#boolean-no', 10_000)
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Work arrangement?': 'No'})
+    assert 'failed=selected;' in result['question']
+    assert [c for c in endpoint.calls if c[0] == 'click'] == [('click', '#boolean-no')]
+
+
+def _press(endpoint, selector):
+    for snapshot in (endpoint.current, endpoint.fixed):
+        for control in snapshot['controls']:
+            if control['selector'] == selector:
+                control.update(value='', has_value=False, checked=True)
+
+
+@pytest.mark.asyncio
+async def test_pre_pressed_no_is_not_clicked_again_and_reads_back(monkeypatch, tmp_path):
+    # FF-247a: a click on an already pressed Ashby member toggles it off
+    # (live probe), which read back as failed=selected with checked=False.
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    _answer(row, stores, gate, 'No')
+    _press(endpoint, '#boolean-no')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Work arrangement?': 'No'})
+    assert result['question'].startswith('Synthetic verification complete')
+    assert [c for c in endpoint.calls if c[0] == 'click'] == []
+
+
+@pytest.mark.asyncio
+async def test_pre_pressed_other_member_is_not_treated_as_answered(monkeypatch, tmp_path):
+    # Only the granted member pressed alone skips the click; a pressed partner
+    # still refuses before any browser write.
+    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
+    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
+    gate = await _apply(pdf)
+    _answer(row, stores, gate, 'No')
+    _press(endpoint, '#boolean-yes')
+    decision.side_effect = [
+        {'action': 'choose', 'selector': '#boolean-no', 'fact': 'Work arrangement?'},
+        {'action': 'gate', 'question': 'Synthetic verification complete'}]
+    result = await _apply(pdf, {'Work arrangement?': 'No'})
+    assert not result['question'].startswith('Synthetic verification complete')
+    assert [c for c in endpoint.calls if c[0] == 'click'] == []
+
+
 def test_boolean_member_carrying_a_value_is_not_a_live_ashby_shape():
     # The fabricated double once wrote value/has_value onto the pressed
     # button. No live page produces that, so it fails closed.

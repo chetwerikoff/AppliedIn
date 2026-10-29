@@ -1004,7 +1004,7 @@ async def test_production_submit_click_without_upload_recovers_then_meets_final_
     result = await run_apply([WAIT, click, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
@@ -1052,7 +1052,7 @@ async def test_production_submit_click_never_uploads_a_second_time(monkeypatch, 
     upload = {'action': 'upload', 'selector': '#_systemfield_resume'}
     result = await run_apply([upload, click])
     assert result['status'] == 'gate', result
-    assert 'Unverified or changed form value' in result['question'], result
+    assert 'An exact human-approved answer is needed for this control' in result['question'], result
     assert len(uploads) == 1
     assert decide.await_count == 2
     _no_production_commit(raw, transport, row)

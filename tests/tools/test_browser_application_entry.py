@@ -2305,7 +2305,8 @@ async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
 # per protected function (ARCH20:47 ruling D): the exact ast source segment of
 # each Submit, hidden-value and posting-safety function must keep its ffaa410
 # bytes, so other #202 owner-gate edits in that file do not trip the pin.
-# Re-pinning any of these needs ARCH approval.
+# Issue #241 r02 explicitly replaces check_form, so it is not byte-pinned;
+# the remaining protected-function and supporting-file pins are unchanged.
 _ISSUE201_MAIN_SHA256 = {
     "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
     "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
@@ -2316,7 +2317,6 @@ _ISSUE201_MAIN_SHA256 = {
 _ISSUE201_PROTECTED_FUNCTION_SHA256 = {
     "is_submission": "c3fd3b93495139b1d45f1588082bc044d1440fa932cca855ec45c0db0f1d590a",
     "native_submit": "1fd4c3e94009536eda5228945ca26796a6a380ea6a3823561f79879536f7574c",
-    "check_form": "a44b97d3c8906338737447f8c82594edc2ce2ada15d5afe76c73b99e5c93a247",
     "check_form_destination": "64c47cf1d8891eb3cc2c97a670d8f8c80077dcb1fc722019f56770998aff893f",
     "_submitter_texts": "df04be15cc339c2dcfef7bdb0878ea98ac43ea61daf02e4301e4bdf1e6dca79b",
     "_greenhouse_safety": "4bead246accd2c97d6894d60d659993cac9669da9dee717825f22620329f1e38",

@@ -2908,6 +2908,33 @@ def _receiver_defect(message: str, predicate: str, target: dict) -> Gate:
                 reason='defect_receiver')
 
 
+def _readback_gate(pk: str, verb: str, target: dict, actual: dict, written: str) -> Gate:
+    """Name the readback comparison that failed and its shape, never a value.
+
+    FF-243a: a bare readback Gate stalled every formless Ashby row for an
+    evening with no evidence of which receiver kind could not read back.
+    """
+    def shape(value):
+        return (value if isinstance(value, str)
+                and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,39}', value) else 'unavailable')
+    observed = actual.get('value') if isinstance(actual.get('value'), str) else ''
+    failed = '+'.join(name for name, bad in (
+        ('value', observed != written), ('has_value', not actual.get('has_value'))) if bad)
+    detail = (f'verb={shape(verb)}; tag={shape(actual.get("tag"))}; '
+              f'type={shape(actual.get("type"))}; '
+              f'control={_safe_diagnostic(actual.get("diagnostic_locator"))}; '
+              f'failed={failed}; written_len={len(written)}; read_len={len(observed)}; '
+              f'folded_equal={_same(observed, written)}; '
+              f'checked={actual.get("checked") is True}')
+    # The label is the employer's caption, kept to the local log; the Gate
+    # text follows _receiver_defect and carries only code-owned structure.
+    _LOG.warning('execute-readback mismatch pk=%s %s; selector=%s; label=%r', pk, detail,
+                 _control_selector_display(target.get('selector')),
+                 ' '.join(str(target.get('label') or '').split())[:80])
+    return Gate('The approved structural field value did not read back exactly; '
+                f'{detail}.')
+
+
 def _reversible_entry_recipient(page: dict, target: dict,
                                 witness: dict | None = None) -> None:
     """Prove exact application membership using the independent ENTRY census."""
@@ -5805,7 +5832,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
             if actual.get('value') != write_value or not actual.get('has_value'):
-                raise Gate('The approved structural field value did not read back exactly.')
+                raise _readback_gate(pk, verb, current, actual, write_value)
             # The DOM readback uses the machine value (e.g. "remote"), while
             # the row grant binds the owner's answer (e.g. "Remote").
             exact_approval(pk, form_question['label'], value, target=_bound_target(readback, actual),

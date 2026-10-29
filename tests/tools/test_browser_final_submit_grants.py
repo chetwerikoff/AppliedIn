@@ -91,7 +91,7 @@ def _boolean_page(*, selected=None):
 
 def _assent(*, checked):
     return _field(
-        "#assent", "I accept legal terms", value="on",
+        "#assent", "I certify the foregoing legal declaration", value="on",
         type="checkbox", checked=checked, has_value=True, required=True)
 
 
@@ -103,6 +103,13 @@ def test_value_written_into_wrong_control_cannot_borrow_another_grant(monkeypatc
     with pytest.raises(forms.Gate, match="exact human-approved answer"):
         _check(monkeypatch, page, facts={"Name": "Test User"},
                values={"#wrong": "Test User"}, grants={"Name": grant})
+
+
+def test_exact_owner_grant_can_authorize_a_value_without_a_bank_fact(monkeypatch):
+    # The scoped human grant, not a generic fact-bank copy, is the authority.
+    page = _page(_field())
+    _check(monkeypatch, page, facts={}, values={"#name": "Test User"},
+           grants={"Name": _grant(page, page["controls"][0], "Test User")})
 
 
 def test_invented_value_with_matching_ledger_and_facts_is_not_a_grant(monkeypatch):
@@ -137,6 +144,12 @@ def test_unanswered_rooted_yes_no_refused_at_final_submit(monkeypatch):
     # refuse the missing pair even when requiredness is unreadable.
     with pytest.raises(forms.Gate, match="Yes/No answer is empty"):
         _check(monkeypatch, page, facts={}, values={}, grants={})
+
+
+def test_selected_rooted_yes_no_with_exact_member_grant_is_accepted(monkeypatch):
+    page = _boolean_page(selected="No")
+    _check(monkeypatch, page, facts={}, values={},
+           grants={"Work authorization": _grant(page, page["controls"][0], "No")})
 
 
 def test_ticked_rooted_yes_no_needs_matching_member_and_exact_grant(monkeypatch):
@@ -203,6 +216,16 @@ def test_ashby_combobox_still_rejects_foreign_or_changed_hidden_values(
         _check(monkeypatch, page, facts={"Work mode": "Remote"},
                values={"#choice": "Remote"},
                grants={"Work mode": _grant(page, page["controls"][1], "Remote")})
+
+
+def test_unselected_radio_machine_value_is_not_an_answer(monkeypatch):
+    # Native radios always have machine option.value. With unknown requiredness
+    # that string does not prove any member was checked.
+    radio = _field("#choice", "Choice", type="radio", question="Choice",
+                   name="answer", value="yes", has_value=True,
+                   checked=False, required=None)
+    with pytest.raises(forms.Gate, match="unreadable requiredness"):
+        _check(monkeypatch, _page(radio), facts={}, values={}, grants={})
 
 
 def test_unknown_requiredness_and_opaque_inventory_still_fail_closed(monkeypatch):

@@ -1292,8 +1292,6 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
         if typ == 'hidden':
             if (target.get('required') or target.get('has_value')
                     or bool(target.get('value'))):
-                    target.get('required') or target.get('has_value')
-                    or bool(target.get('value'))):
                 owners = [c for c in controls if c.get('type') == 'combobox'
                           and (c.get('combobox') or {}).get('hidden_selector')
                           == target.get('selector')
@@ -1383,8 +1381,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             if hidden:
                 matches = [c for c in controls if c.get('selector') == hidden
                            and c.get('type') == 'hidden'
-                           and c.get('in_form') is True
-                           and c.get('form_selector') == target.get('form_selector')]
+                           and _combo_receiver_allowed(page, target, c)]
                 receiver = matches[0] if len(matches) == 1 else None
             if (receiver is None or not _combo_receiver_allowed(page, target, receiver)
                     or not receiver.get('name')

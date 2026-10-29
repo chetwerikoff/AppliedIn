@@ -26,7 +26,7 @@ change trades safety for throughput, it is the wrong change.
 - **Restart the daemon after any `src/` change.** There is no hot reload, and the
   browser caches `web/app.js` and `web/styles.css`, so a UI change needs a hard
   reload as well. Testing stale code has wasted more time here than any bug.
-- **Run the tests**: `.venv/bin/python -m pytest -q`. They are offline by design;
+- **Run the tests**: `.venv/bin/python -m pytest -q -n 24`. They are offline by design;
   never add one that reaches the network or drives a browser.
 - **Diagnose with evidence, not theory.** The worst bug in this repo's history was
   guessed at three times and solved once, by reading the browser session's own

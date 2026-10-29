@@ -59,7 +59,7 @@ before changing anything about applying.
 ./appliedin start | stop | status | logs
 ./appliedin start --no-discover      # dashboard + queue worker, crawler off
 .venv/bin/python -m daemon           # foreground, log straight to your terminal
-.venv/bin/python -m pytest -q        # tests, offline, seconds
+.venv/bin/python -m pytest -q -n 24  # tests, offline, ~3 min (xdist, as CI)
 ```
 
 `./appliedin` is the only entry point: `start` is background and writes to
@@ -214,7 +214,7 @@ replace or override the final decision.
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q
+.venv/bin/python -m pytest -q -n 24
 ```
 
 Offline by design. No test may reach the network or drive a browser; inject a fake

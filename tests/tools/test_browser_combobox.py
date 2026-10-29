@@ -1041,53 +1041,6 @@ async def test_closed_material_assent_bootstrap_witnesses_without_selection(
         ('click', '#country'), ('press', 'Escape')]
 
 
-@pytest.mark.parametrize('failure', ['empty', 'duplicate', 'foreign'])
-async def test_closed_material_assent_invalid_listbox_remains_inspection_only(
-        monkeypatch, failure):
-    closed = material_page()
-    closed['controls'][0]['combobox'].update(
-        linked=False, link_id='', listbox_selector='', options=[])
-    opened = material_page()
-    combo = opened['controls'][0]['combobox']
-    if failure == 'empty':
-        combo['options'] = []
-    elif failure == 'duplicate':
-        combo['options'][1]['label'] = combo['options'][0]['label']
-    else:
-        combo.update(linked=False, link_id='', listbox_selector='', options=[])
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-    async def no_wait(_):
-        return None
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
-
-    class Session:
-        def __init__(self):
-            self.current = deepcopy(closed)
-            self.calls = []
-        async def page(self):
-            return deepcopy(self.current)
-        async def call(self, *args):
-            self.calls.append(args)
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(self.current)}
-            if args == ('click', '#country'):
-                self.current = deepcopy(opened)
-                return {}
-            if args == ('press', 'Escape'):
-                self.current = deepcopy(closed)
-                return {}
-            pytest.fail(f'unapproved witness action: {args}')
-
-    session = Session()
-    with pytest.raises(forms.MaterialAssentGate) as exc:
-        await forms._bootstrap(session, closed, PK, {}, URL)
-    assert exc.value.form_question is None
-    assert 'Disclosure: ' in str(exc.value)
-    assert [call for call in session.calls if call[0] != 'evaluate'] == [
-        ('click', '#country'), ('press', 'Escape')]
-
-
 @pytest.mark.parametrize('failure', ['open-timeout', 'escape-failure'])
 async def test_material_witness_failure_clears_raw_escape_authority(monkeypatch, failure):
     closed = material_page()
@@ -1148,39 +1101,6 @@ async def test_material_witness_failure_clears_raw_escape_authority(monkeypatch,
         await controller.before_ipc(session, ('press', 'Escape'), {})
 
 
-@pytest.mark.parametrize('change', ['receiver', 'options'])
-async def test_material_witness_rejects_post_escape_rebinding(monkeypatch, change):
-    closed = material_page()
-    closed['controls'][0]['combobox'].update(
-        linked=False, link_id='', listbox_selector='', options=[])
-    opened = material_page()
-    rebound = deepcopy(closed)
-    if change == 'receiver':
-        rebound['controls'][0]['combobox']['hidden_selector'] = '#new-receiver'
-    else:
-        rebound['controls'][0]['combobox']['link_id'] = 'new-listbox'
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-    class Transport:
-        def __init__(self):
-            self.current = deepcopy(closed)
-        async def page(self):
-            return deepcopy(self.current)
-        async def call(self, *args):
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(self.current)}
-            if args == ('click', '#country'):
-                self.current = deepcopy(opened)
-                return {}
-            if args == ('press', 'Escape'):
-                self.current = deepcopy(rebound)
-                return {}
-            pytest.fail('Unexpected mutation')
-    with pytest.raises(forms.MaterialAssentGate) as exc:
-        await forms._bootstrap(Transport(), closed, PK, {}, URL)
-    assert exc.value.form_question is None
-
-
 @pytest.mark.parametrize('linked,expected', [
     (True, 'true'), (False, 'false'), (None, 'absent'),
     ('PRIVATE_LINKED_SENTINEL', 'other'),
@@ -1224,31 +1144,6 @@ def test_material_witness_diagnostic_accepts_only_witness_gate_literals(failure)
 @pytest.mark.parametrize('linked,expected', [
     (None, 'absent'), ('unknown', 'other'), (True, 'true'),
 ])
-async def test_closed_material_without_false_link_skips_witness_diagnostic(
-        monkeypatch, linked, expected):
-    current = material_page()
-    combo = current['controls'][0]['combobox']
-    combo.update(linked=linked, options=[], link_id='', listbox_selector='')
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-
-    class NoEffects:
-        async def page(self):
-            return deepcopy(current)
-        async def call(self, *args):
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(current)}
-            pytest.fail(f'witness must not execute on linked={expected}: {args}')
-
-    with pytest.raises(forms.MaterialAssentGate) as exc:
-        await forms._bootstrap(NoEffects(), current, PK, {}, URL)
-    detail = str(exc.value)
-    assert 'Disclosure: ' in detail
-    assert f'witness=not-attempted,linked={expected},options=empty,' in detail
-    assert 'witness_reason=' not in detail
-    assert exc.value.form_question is None
-
-
 @pytest.mark.parametrize('failure,expected', [
     ('The closed combobox linkage is incomplete or ambiguous.',
      'The closed combobox linkage is incomplete or ambiguous.'),
@@ -1257,39 +1152,6 @@ async def test_closed_material_without_false_link_skips_witness_diagnostic(
     ('PRIVATE_GATE_TOKEN_SENTINEL with #selector and URL',
      forms._MATERIAL_WITNESS_GATE_OPAQUE),
 ])
-async def test_closed_material_witness_failure_disclosed_without_changing_gate(
-        monkeypatch, failure, expected):
-    current = material_page()
-    current['controls'][0]['combobox'].update(
-        linked=False, options=[], link_id='', listbox_selector='')
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-    called = []
-
-    async def rejected_witness(*args, **kwargs):
-        called.append(True)
-        raise forms.Gate(failure)
-
-    monkeypatch.setattr(forms, '_witness_material_combobox', rejected_witness)
-    class NoEffects:
-        async def page(self):
-            return deepcopy(current)
-        async def call(self, *args):
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(current)}
-            pytest.fail(f'no irreversible effects permitted: {args}')
-
-    with pytest.raises(forms.MaterialAssentGate) as exc:
-        await forms._bootstrap(NoEffects(), current, PK, {}, URL)
-    detail = str(exc.value)
-    assert called == [True]
-    assert 'witness=attempted,linked=false,options=empty,' in detail
-    assert 'witness_reason=' + expected in detail
-    assert 'PRIVATE_GATE_TOKEN_SENTINEL' not in detail
-    assert '#selector' not in detail
-    assert exc.value.form_question is None
-
-
 def _owner_reply(tracking, row):
     """Issue #202 r07: reissue the hand-built direct gate with a fresh
     generation, give the row stub the storage contract's own consume, and

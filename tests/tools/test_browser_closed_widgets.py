@@ -1105,11 +1105,9 @@ def test_diagnostic_locators_are_unique_and_never_page_identifiers(scenario, seg
     assert len(paths) == len(set(paths)) == count
     assert all(forms._safe_diagnostic(path) == path for path in paths)
     with pytest.raises(forms.Gate) as caught:
-        forms._inventory_ok(p)
+        forms.check_form(p, {}, uploaded=True)
     reason = str(caught.value)
-    assert 'opaque_controls' in reason
-    assert 'opaque_count=' + str(p['opaque_count']) in reason
-    assert reason.count('control=') == min(3, p['opaque_count'])
+    assert 'inventory is incomplete' in reason
     assert 'test-user' not in reason and '@' not in reason
     assert 'private-' not in reason
 
@@ -1120,8 +1118,8 @@ def test_repeated_deep_opaque_nodes_remain_fail_closed():
     assert p['opaque_controls'] is True and p['inventory_verified'] is False
     paths = _diagnostic_paths(p, 'canvas:nth-of-type(')
     assert len(paths) == len(set(paths)) == 2
-    with pytest.raises(forms.Gate, match='opaque_count=' + str(p['opaque_count'])):
-        forms._inventory_ok(p)
+    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+        forms.check_form(p, {}, uploaded=True)
 
 
 @pytest.mark.parametrize('depth,count', [(14, 2), (14, 3), (30, 2), (30, 8)])
@@ -1135,15 +1133,14 @@ def test_repeated_deep_opaque_nodes_have_distinct_safe_locators(depth, count):
                and path != 'unavailable' for path in paths)
     assert all(path.count(' > ') >= depth for path in paths)
     with pytest.raises(forms.Gate) as caught:
-        forms._inventory_ok(p)
+        forms.check_form(p, {}, uploaded=True)
     detail = str(caught.value)
-    assert 'opaque_count=' + str(p['opaque_count']) in detail
-    assert detail.count('control=') == min(3, p['opaque_count'])
+    assert 'inventory is incomplete' in detail
     assert 'test-user' not in detail and 'example-co' not in detail and '@' not in detail
 
 def test_safe_diagnostic_accepts_only_bounded_structural_segments():
-    # The browser and Gate share the same per-locator limits. Over-limit
-    # untrusted diagnostics are still redacted, not echoed into a Gate.
+    # Structural locator sanitization remains independent of the final
+    # inventory guard, which never exposes those locator values.
     from tools.browser_skill_dom import _DIAGNOSTIC_MAX_SEGMENTS, _DIAGNOSTIC_MAX_CHARS
     path = ' > '.join(['div:nth-of-type(1)'] * (_DIAGNOSTIC_MAX_SEGMENTS - 1)
                       + ['canvas:nth-of-type(1)'])
@@ -1174,8 +1171,8 @@ def test_safe_diagnostic_rejects_untrusted_or_nonstructural_paths(unsafe):
     page = {'inventory_verified': False, 'opaque_controls': True,
             'opaque_count': 1, 'opaque_locators': [unsafe]}
     with pytest.raises(forms.Gate) as caught:
-        forms._inventory_ok(page)
-    assert 'control=unavailable' in str(caught.value)
+        forms.check_form(page, {}, uploaded=True)
+    assert 'inventory is incomplete' in str(caught.value)
     assert 'synthetic-secret' not in str(caught.value)
     assert '@example-co.test' not in str(caught.value)
 
@@ -1189,10 +1186,10 @@ def test_depth_thirty_opaque_nodes_keep_all_reader_locators_and_capped_gate(coun
     assert len(paths) == len(set(paths)) == count
     assert all(forms._safe_diagnostic(path) == path and path != 'unavailable'
                for path in paths)
-    with pytest.raises(forms.Gate, match='opaque_count=' + str(page['opaque_count'])) as caught:
-        forms._inventory_ok(page)
+    with pytest.raises(forms.Gate, match='inventory is incomplete') as caught:
+        forms.check_form(page, {}, uploaded=True)
     message = str(caught.value)
-    assert message.count('control=') == min(3, page['opaque_count'])
+    assert 'inventory is incomplete' in message
     assert 'test-user' not in message and 'example-co' not in message and '@' not in message
 
 @pytest.mark.parametrize('fresh', [False, True])
@@ -1221,11 +1218,10 @@ async def test_country_cannot_hide_incomplete_final_form(
         except forms.Gate as exc:
             assert 'test-user' not in str(exc) and '@' not in str(exc)
     with pytest.raises(forms.Gate) as caught:
-        forms._inventory_ok(unsafe)
+        forms.check_form(unsafe, {}, uploaded=True)
     reason = str(caught.value)
-    for flag in flags:
-        if flag in {'opaque_controls', 'unsupported_frames', 'shadow_roots', 'truncated'}:
-            assert flag in reason
+    assert ('inventory is incomplete' in reason
+            or 'uninspectable components' in reason)
     assert 'receiverless country commitment' not in reason
     assert 'test-user' not in reason and '@' not in reason and 'https:' not in reason
     snapshot = copy.deepcopy(session.snapshot)

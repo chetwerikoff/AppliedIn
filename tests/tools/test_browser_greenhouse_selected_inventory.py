@@ -150,8 +150,8 @@ def _unproven_final_inventory(page):
     assert page['opaque_controls'] is True
     assert page['opaque_count'] > 0
     assert len(page['opaque_locators']) == page['opaque_count']
-    with pytest.raises(forms.Gate, match='opaque'):
-        forms._inventory_ok(page)
+    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+        forms.check_form(page, {}, uploaded=True)
 
 
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():

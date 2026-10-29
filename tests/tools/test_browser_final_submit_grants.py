@@ -215,6 +215,19 @@ def _reader_hidden_combobox(drift="normal"):
     return page
 
 
+def _hidden_reader_evidence(page):
+    # A dynamically inserted synthetic ID is absent from the fixture's
+    # precomputed ID index, so ENTRY_PAGE may return a positional selector.
+    # Match the raw ID supplied by the reader, then use its actual selector.
+    matches = [e for e in page["entry"]["root_evidence"]
+               if e.get("id") == "synthetic-value"]
+    assert len(matches) == 1
+    evidence = matches[0]
+    assert evidence["tag"] == "input" and evidence["type"] == "hidden"
+    assert evidence["unique"] is True
+    return evidence
+
+
 def _isolated_reader_combo(page):
     # Keep authentic PAGE controls and complete root evidence; omit unrelated
     # required name/email inputs only for the targeted final-receiver test.
@@ -222,23 +235,27 @@ def _isolated_reader_combo(page):
     owner = next(c for c in current["controls"]
                  if c.get("type") == "combobox"
                  and (c.get("combobox") or {}).get("selected_value") == "remote")
-    selector = (owner["combobox"] or {}).get("hidden_selector")
+    selectors = {owner["selector"], (owner["combobox"] or {}).get("hidden_selector")}
+    # A foreign native-form receiver has no combobox linkage, but must still
+    # be checked as an independently inventoried, populated hidden control.
+    selectors.update(c["selector"] for c in current["controls"]
+                     if c.get("type") == "hidden"
+                     and c.get("name") == "work_location")
     current["controls"] = [c for c in current["controls"]
-                           if c["selector"] in {owner["selector"], selector}]
+                           if c["selector"] in selectors]
     return current, owner
 
 
 def test_real_reader_hidden_receiver_remains_absent_not_synthetically_authorized(
         monkeypatch):
     real = _reader_hidden_combobox()
-    evidence = next(e for e in real["entry"]["root_evidence"]
-                    if e["selector"] == "#synthetic-value")
-    assert evidence["type"] == "hidden" and evidence["value"] == "remote"
+    evidence = _hidden_reader_evidence(real)
+    assert evidence["value"] == "remote"
     assert evidence["inside"] and evidence["in_container"]
     assert "name" not in evidence
-    assert not any(c["selector"] == "#synthetic-value" for c in real["controls"])
+    assert not any(c["selector"] == evidence["selector"] for c in real["controls"])
     page, owner = _isolated_reader_combo(real)
-    assert owner["combobox"]["hidden_selector"] == "#synthetic-value"
+    assert owner["combobox"]["hidden_selector"] == evidence["selector"]
     assert owner["combobox"]["hidden_value"] == owner["combobox"]["selected_value"]
     with pytest.raises(forms.Gate, match="hidden form value is not independently authorized"):
         _check(monkeypatch, page, facts={},
@@ -251,16 +268,29 @@ def test_real_reader_combobox_refuses_foreign_native_or_changed_receivers(
         monkeypatch, drift):
     page = _reader_hidden_combobox(
         "normal" if drift == "no-root" else drift)
-    evidence = next(e for e in page["entry"]["root_evidence"]
-                    if e["selector"] == "#synthetic-value")
+    evidence = _hidden_reader_evidence(page)
     if drift == "foreign":
         assert not evidence["inside"] and not evidence["in_container"]
+        assert not any(c["selector"] == evidence["selector"] for c in page["controls"])
     if drift == "native-owned":
-        assert evidence["native_owner"] == "#foreign-owner"
-        assert any(c["selector"] == "#synthetic-value" for c in page["controls"])
+        assert evidence["native_owner"] and evidence["declared_owner"] == "foreign-owner"
+        receivers = [c for c in page["controls"]
+                     if c["selector"] == evidence["selector"]]
+        assert len(receivers) == 1
+        assert receivers[0]["in_form"] is True
+        assert receivers[0]["native_form_owner_selector"] == evidence["native_owner"]
+    if drift == "changed-bytes":
+        assert evidence["value"] == "hybrid"
     if drift == "no-root":
         page["entry"]["formless"]["root"] = ""
     page, owner = _isolated_reader_combo(page)
+    if drift == "native-owned":
+        receiver = next(c for c in page["controls"]
+                        if c["selector"] == evidence["selector"])
+        assert not owner["combobox"]["hidden_selector"]
+        assert not forms._combo_receiver_allowed(page, owner, receiver)
+    else:
+        assert owner["combobox"]["hidden_selector"] == evidence["selector"]
     with pytest.raises(forms.Gate, match="(hidden form value|form-own value receiver)"):
         _check(monkeypatch, page, facts={},
                values={owner["selector"]: "Remote"},

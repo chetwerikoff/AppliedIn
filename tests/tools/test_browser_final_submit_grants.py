@@ -86,7 +86,7 @@ def _rooted_live_dom(mutate):
 
 
 def _rooted_boolean_reader(*, multiple=False, selected=False):
-    # Reader output, not fabricated button/yes_no/field_entry keys.
+    # Both independent readers must expose the production-shaped default-submit buttons.
     mutation = ""
     if multiple:
         mutation += (
@@ -107,9 +107,25 @@ def _rooted_boolean_reader(*, multiple=False, selected=False):
     buttons = [e for e in page["entry"]["root_evidence"]
                if e.get("boolean_group") and e.get("tag") == "button"]
     assert len(buttons) == (4 if multiple else 2)
-    assert all(e["type"] == e["native_type"] == "submit"
-               and not e["yes_no"] and not e["field_entry"] for e in buttons)
+    assert all(e["type"] == "button" and e["native_type"] == "submit"
+               and e["yes_no"] is True and e["field_entry"]
+               and e["caption"].casefold() in {"yes", "no"}
+               for e in buttons)
+    controls = [c for c in page["controls"] if c.get("label", "").casefold() in {"yes", "no"}]
+    assert len(controls) == len(buttons)
+    assert all(c["type"] == "button" and c["native_type"] == "submit"
+               and c["question"] for c in controls)
     return page
+
+
+def _isolated_reader_boolean(page):
+    current = deepcopy(page)
+    current["controls"] = [
+        control for control in current["controls"]
+        if control.get("type") == "button"
+        and control.get("label", "").casefold() in {"yes", "no"}
+    ]
+    return current
 
 
 def _assent(*, checked):
@@ -143,35 +159,78 @@ def test_invented_value_with_matching_ledger_and_facts_is_not_a_grant(monkeypatc
                grants={"Name": _grant(page, page["controls"][0], "Test User")})
 
 
-def test_reader_rooted_boolean_member_is_not_a_reversible_choice():
-    page = _rooted_boolean_reader()
+def test_reader_rooted_boolean_pair_is_a_proven_reversible_choice():
+    page = _isolated_reader_boolean(_rooted_boolean_reader())
     yes = next(c for c in page["controls"]
                if c["tag"] == "button" and c["label"] == "Yes")
-    assert not forms._boolean_pair_member(page, yes["selector"])
-    with pytest.raises(forms.Gate, match="Unsupported Boolean receiver"):
-        forms._boolean_pair(page, yes)
+    members = forms._boolean_pair(page, yes)
+    assert [member["label"] for member in members] == ["Yes", "No"]
+    assert all(forms._boolean_pair_member(page, member["selector"])
+               for member in members)
 
 
-@pytest.mark.parametrize("selected", [False, True])
-def test_reader_rooted_boolean_refuses_even_with_a_guessed_exact_grant(
-        monkeypatch, selected):
-    page = _rooted_boolean_reader(selected=selected)
-    yes = next(c for c in page["controls"]
-               if c["tag"] == "button" and c["label"] == "Yes")
-    grants = ({"Synthetic Boolean question": _grant(page, yes, "No")}
-              if selected else {})
-    with pytest.raises(forms.Gate, match="rooted Yes/No choice has no verified member"):
+@pytest.mark.parametrize(
+    ("selected", "message"),
+    [(False, "A Yes/No answer is empty or conflicting"),
+     (True, "exact human-approved answer")],
+    ids=["unanswered", "unapproved-selection"],
+ )
+def test_reader_rooted_boolean_requires_one_selected_exact_grant(
+        monkeypatch, selected, message):
+    page = _isolated_reader_boolean(_rooted_boolean_reader(selected=selected))
+    with pytest.raises(forms.Gate, match=message):
+        _check(monkeypatch, page, facts={}, values={}, grants={})
+
+
+def test_reader_rooted_boolean_accepts_exact_grant_and_guarded_choice_click(
+        monkeypatch):
+    page = _isolated_reader_boolean(_rooted_boolean_reader(selected=True))
+    yes = next(c for c in page["controls"] if c["label"] == "Yes")
+    selected = next(c for c in page["controls"] if c.get("checked") is True)
+    key = forms._key(page, yes)
+    grant = _grant(page, yes, "No")
+    _check(monkeypatch, page, facts={}, values={}, grants={key: grant})
+    assert forms._approved_boolean_pair(page, yes, PK) == ("No", selected)
+
+
+def test_reader_rooted_boolean_refuses_grant_for_the_other_member(monkeypatch):
+    page = _isolated_reader_boolean(_rooted_boolean_reader(selected=True))
+    yes = next(c for c in page["controls"] if c["label"] == "Yes")
+    key = forms._key(page, yes)
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        _check(monkeypatch, page, facts={}, values={},
+               grants={key: _grant(page, yes, "Yes")})
+
+
+def test_reader_multiple_rooted_yes_no_pairs_each_require_an_exact_grant(
+        monkeypatch):
+    page = _isolated_reader_boolean(
+        _rooted_boolean_reader(multiple=True, selected=True))
+    yes_buttons = [c for c in page["controls"] if c.get("label") == "Yes"]
+    assert len(yes_buttons) == 2
+    grants = {}
+    for yes in yes_buttons:
+        answer = "No" if yes["question"] == "Synthetic Boolean question" else "Yes"
+        grants[forms._key(page, yes)] = _grant(page, yes, answer)
+    _check(monkeypatch, page, facts={}, values={}, grants=grants)
+
+
+def test_reader_multiple_rooted_yes_no_pairs_cannot_skip_an_unanswered_group(
+        monkeypatch):
+    page = _isolated_reader_boolean(
+        _rooted_boolean_reader(multiple=True, selected=True))
+    yes_buttons = [c for c in page["controls"] if c.get("label") == "Yes"]
+    first = yes_buttons[0]
+    grants = {forms._key(page, first): _grant(page, first, "No")}
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
         _check(monkeypatch, page, facts={}, values={}, grants=grants)
 
 
-@pytest.mark.parametrize("selected", [False, True])
-def test_reader_multiple_rooted_yes_no_groups_cannot_bypass_final_grants(
-        monkeypatch, selected):
-    page = _rooted_boolean_reader(multiple=True, selected=selected)
-    assert sum(e.get("boolean_group") is True
-               for e in page["entry"]["root_evidence"]) >= 4
-    # Previously the global len(members)==2 condition failed for four buttons.
-    with pytest.raises(forms.Gate, match="rooted Yes/No choice has no verified member"):
+def test_reader_multiple_rooted_yes_no_pairs_refuse_unanswered_members(
+        monkeypatch):
+    page = _isolated_reader_boolean(
+        _rooted_boolean_reader(multiple=True, selected=False))
+    with pytest.raises(forms.Gate, match="A Yes/No answer is empty or conflicting"):
         _check(monkeypatch, page, facts={}, values={}, grants={})
 
 
@@ -188,8 +247,7 @@ def test_unapproved_ticked_assent_refused_even_if_writer_ledger_agrees(monkeypat
 
 
 def _reader_hidden_combobox(drift="normal"):
-    # The production reader omits an invisible formless hidden receiver from
-    # controls while root_evidence still records its raw value and ownership.
+    # Both independent readers must inventory only the exact rooted hidden receiver.
     parent = "document.body" if drift == "foreign" else "location"
     mutation = (
         "const picker=location.children[0];"
@@ -212,7 +270,7 @@ def _reader_hidden_combobox(drift="normal"):
     page, witness = _rooted_live_dom(mutation)
     assert page["entry"] == witness["entry"]
     assert page["entry"]["formless"]["root"]
-    return page
+    return page, witness
 
 
 def _hidden_reader_evidence(page):
@@ -246,32 +304,41 @@ def _isolated_reader_combo(page):
     return current, owner
 
 
-def test_real_reader_hidden_receiver_remains_absent_not_synthetically_authorized(
-        monkeypatch):
-    real = _reader_hidden_combobox()
+def test_real_reader_hidden_receiver_is_inventoried_and_grant_bound(monkeypatch):
+    real, witness = _reader_hidden_combobox()
     evidence = _hidden_reader_evidence(real)
     assert evidence["value"] == "remote"
+    assert evidence["name"] == "work_location"
     assert evidence["inside"] and evidence["in_container"]
-    assert "name" not in evidence
-    assert not any(c["selector"] == evidence["selector"] for c in real["controls"])
+    for observed in (real, witness):
+        receivers = [c for c in observed["controls"]
+                     if c.get("selector") == evidence["selector"]]
+        assert len(receivers) == 1
+        assert receivers[0]["type"] == "hidden"
+        assert receivers[0]["name"] == "work_location"
+        assert receivers[0]["value"] == "remote"
+        assert receivers[0]["in_form"] is False
     page, owner = _isolated_reader_combo(real)
     assert owner["combobox"]["hidden_selector"] == evidence["selector"]
     assert owner["combobox"]["hidden_value"] == owner["combobox"]["selected_value"]
-    with pytest.raises(forms.Gate, match="hidden form value is not independently authorized"):
-        _check(monkeypatch, page, facts={},
-               values={owner["selector"]: "Remote"},
-               grants={forms._key(page, owner): _grant(page, owner, "Remote")})
-
+    receiver = next(c for c in page["controls"] if c["selector"] == evidence["selector"])
+    assert forms._combo_receiver_allowed(page, owner, receiver)
+    key = forms._key(page, owner)
+    with pytest.raises(forms.Gate, match="exact human-approved answer"):
+        _check(monkeypatch, page, facts={}, values={owner["selector"]: "Remote"}, grants={})
+    _check(monkeypatch, page, facts={}, values={owner["selector"]: "Remote"},
+           grants={key: _grant(page, owner, "Remote")})
 
 @pytest.mark.parametrize("drift", ["foreign", "native-owned", "changed-bytes", "no-root"])
 def test_real_reader_combobox_refuses_foreign_native_or_changed_receivers(
         monkeypatch, drift):
-    page = _reader_hidden_combobox(
+    page, witness = _reader_hidden_combobox(
         "normal" if drift == "no-root" else drift)
     evidence = _hidden_reader_evidence(page)
     if drift == "foreign":
         assert not evidence["inside"] and not evidence["in_container"]
-        assert not any(c["selector"] == evidence["selector"] for c in page["controls"])
+        assert not any(c["selector"] == evidence["selector"]
+                       for c in page["controls"] + witness["controls"])
     if drift == "native-owned":
         assert evidence["native_owner"] and evidence["declared_owner"] == "foreign-owner"
         receivers = [c for c in page["controls"]
@@ -292,8 +359,7 @@ def test_real_reader_combobox_refuses_foreign_native_or_changed_receivers(
     else:
         assert owner["combobox"]["hidden_selector"] == evidence["selector"]
     with pytest.raises(forms.Gate, match="(hidden form value|form-own value receiver)"):
-        _check(monkeypatch, page, facts={},
-               values={owner["selector"]: "Remote"},
+        _check(monkeypatch, page, facts={}, values={owner["selector"]: "Remote"},
                grants={forms._key(page, owner): _grant(page, owner, "Remote")})
 
 

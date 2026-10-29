@@ -1286,19 +1286,9 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
-    # The rooted Ashby reader currently identifies group membership but not
-    # the field entry, selected button or submitted hidden checkbox. That gap
-    # must be a final refusal, including when there are MULTIPLE groups: a
-    # global two-member count silently skipped four native-submit buttons.
-    # Never treat a CSS group or an old grant as a selected, live answer.
     root = _formless_root(page)
     if root and root.get('root'):
-        evidence = (page.get('entry') or {}).get('root_evidence')
-        if not isinstance(evidence, list) or any(
-                not isinstance(item, dict) for item in evidence):
-            raise Gate('Rooted application controls lack independent evidence.')
-        if any(item.get('boolean_group') is True for item in evidence):
-            raise Gate('A rooted Yes/No choice has no verified member identity at final Submit.')
+        _validate_rooted_boolean_groups(page)
     seen_boolean = set()
     for target in controls:
         typ = target.get('type', '')
@@ -3143,6 +3133,8 @@ def _boolean_pair(page: dict, target: dict, *,
             if (len(evidence) != 1 or not evidence[0].get('inside')
                     or not evidence[0].get('in_container')
                     or evidence[0].get('yes_no') is not True
+                    or evidence[0].get('boolean_group') is not True
+                    or evidence[0].get('field_entry') != entry
                     or evidence[0].get('native_owner')
                     or evidence[0].get('declared_owner')
                     or evidence[0].get('formaction') is not None):
@@ -3151,6 +3143,63 @@ def _boolean_pair(page: dict, target: dict, *,
         else:
             _reversible_entry_recipient(page, member, witness)
     return members
+
+
+def _validate_rooted_boolean_groups(page: dict) -> None:
+    """Prove every rooted Yes/No member belongs to exactly one live pair.
+
+    Ashby's untyped question buttons have native_type=submit. The independent
+    reader's field-entry identity keeps those reversible clicks separate from
+    the exact application Submit; every pair is rechecked again below.
+    """
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not isinstance(evidence, list) or any(
+            not isinstance(item, dict) for item in evidence):
+        raise Gate('Rooted application controls lack independent evidence.')
+    group = [item for item in evidence if item.get('boolean_group') is True]
+    if not group:
+        return
+    buttons = []
+    for item in group:
+        if item.get('tag') == 'button':
+            if (item.get('yes_no') is not True or item.get('type') != 'button'
+                    or item.get('native_type') != 'submit'
+                    or not item.get('field_entry')
+                    or str(item.get('caption') or '').casefold() not in {'yes', 'no'}):
+                raise Gate('A rooted Yes/No choice has no verified member identity at final Submit.')
+            buttons.append(item)
+            continue
+        # Ashby keeps an unnamed, unchecked invisible checkbox as an internal
+        # toggle proxy. It cannot submit a value; any changed or named proxy
+        # remains a final-gate refusal rather than disappearing from the census.
+        if (item.get('tag') == 'input' and item.get('type') == 'checkbox'
+                and item.get('native_type') == 'checkbox'
+                and item.get('visible') is False and item.get('required') is False
+                and item.get('checked') is False and not item.get('name')
+                and not item.get('native_owner') and not item.get('declared_owner')
+                and item.get('formaction') is None and not item.get('submit')
+                and not item.get('disabled') and not item.get('inert')):
+            continue
+        raise Gate('A rooted Yes/No group contains an unverified submission control at final Submit.')
+    selectors = [item.get('selector') for item in buttons]
+    if (any(not isinstance(selector, str) or not selector for selector in selectors)
+            or len(selectors) != len(set(selectors))):
+        raise Gate('Rooted Yes/No member identity is ambiguous at final Submit.')
+    covered = set()
+    for item in buttons:
+        matches = [control for control in page.get('controls', [])
+                   if control.get('selector') == item.get('selector')]
+        if len(matches) != 1:
+            raise Gate('A rooted Yes/No member is missing from the live control inventory.')
+        members = _boolean_pair(page, matches[0])
+        member_selectors = {member.get('selector') for member in members}
+        expected = {candidate.get('selector') for candidate in buttons
+                    if candidate.get('field_entry') == item.get('field_entry')}
+        if member_selectors != expected:
+            raise Gate('A rooted Yes/No field entry does not contain exactly its two verified members.')
+        covered.update(member_selectors)
+    if covered != set(selectors):
+        raise Gate('A rooted Yes/No member is not covered by one verified pair.')
 
 
 def _bound_target(page: dict, target: dict) -> dict:

@@ -513,7 +513,7 @@ _ASHBY_ROOT = r"""
   // the single question title of the receiver's own field entry; zero or
   // several titles, or a title owned by another live control, prove nothing.
   const fieldEntry = e => {
-    if (forms.length || structuralRoot || !container || !container.contains(e) || e.id) return null;
+    if (forms.length || !container || !container.contains(e) || e.id) return null;
     const entry=e.closest('div.ashby-application-form-field-entry');
     if (!entry || !container.contains(entry)) return null;
     const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
@@ -533,6 +533,31 @@ _ASHBY_ROOT = r"""
     const buttons=Array.from(field.entry.querySelectorAll('button'));
     return buttons.length===2 && buttons.every(b=>b.parentElement===group && free(b)) &&
       buttons.map(b=>clean(b.innerText)).sort().join('|')==='No|Yes';
+  };
+  // A hidden machine-value receiver is inventory only when exactly one rooted,
+  // visible combobox names it and its current raw value matches that selection.
+  const formlessHiddenReceiver = e => {
+    if (!structuralRoot || !container || !container.contains(e) ||
+        e.tagName!=='INPUT' || e.type!=='hidden' || e.form || e.closest('form') ||
+        e.hasAttribute('form') || e.hasAttribute('formaction') || !e.name ||
+        e.disabled || e.matches(':disabled') || e.closest('[inert]') ||
+        document.querySelectorAll(selector(e)).length!==1) return false;
+    const owners = Array.from(document.querySelectorAll('[role="combobox"]')).filter(owner => {
+      if (owner===e || !owner.matches('[role="combobox"]') ||
+          !structuralRoot.contains(owner) || !container.contains(owner) ||
+          owner.form || owner.closest('form') || owner.disabled ||
+          owner.matches(':disabled') || owner.closest('[inert]') ||
+          !entryEvidenceVisible(owner)) return false;
+      const hiddenId=owner.getAttribute('data-value-input');
+      const hiddenName=owner.getAttribute('data-value-name');
+      const matches=Array.from(document.querySelectorAll('input[type="hidden"]'))
+        .filter(h=>h.form===(owner.form || owner.closest('form')) &&
+          ((hiddenId && h.id===hiddenId) || owner.contains(h) ||
+           (hiddenName && h.name===hiddenName)));
+      return matches.length===1 && matches[0]===e &&
+        owner.getAttribute('data-selected-value')===e.value;
+    });
+    return owners.length===1;
   };
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
@@ -569,7 +594,8 @@ _ASHBY_ROOT = r"""
         // Membership only: a rooted Yes/No group has no proven requiredness.
         boolean_group:!!e.closest('div.ashby-application-form-input-yesno'),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
-        id,label:linked ? clean(labels[0].innerText) : '',label_selector:linked ? selector(labels[0]) : '',
+        id,label:linked ? clean(labels[0].innerText) : '',
+        label_selector:linked ? selector(labels[0]) : '',name:e.name || '',
         associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
         in_container:!!container && container.contains(e),
         native_owner:e.form ? selector(e.form) : '',
@@ -577,6 +603,7 @@ _ASHBY_ROOT = r"""
         submit:e===exactSubmit,untyped:e.getAttribute('type')===null,
         dropzone:e.matches('button.ashby-application-form-input-file-dropzone-upload'),
         required:ashbyYesNo(e) || !!e.required,
+        checked:!!e.checked || e.getAttribute('aria-checked')==='true',
         disabled:!!e.disabled || e.matches(':disabled') || e.getAttribute('aria-disabled')==='true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),inert:!!e.closest('[inert]'),
         visible:entryVisible(e),value:e.type==='password' ? '' : (e.value || ''),
@@ -1008,13 +1035,12 @@ def entry_reader(script: str) -> str:
     transiently. The fixed witness observes provider identities independently.
     """
     # Both readers classify a proven Yes/No member identically. native_type
-    # stays submit, so any click on it still reaches the final Submit guard.
+    # stays submit, so the raw click is admitted only by its exact choice grant.
     assert script.count(_CONTROL_TYPE) == 1
     script = script.replace(_CONTROL_TYPE, _CONTROL_TYPE.replace(
         'const type=', "const type=ashbyYesNo(e) ? 'button' : "))
-    # A button has no required property and Ashby's title marker is a per-build
-    # CSS-module hash, so no stable signal says whether a Yes/No pair is
-    # optional. Every proven pair is owner-asked rather than silently skipped.
+    # Ashby exposes no stable requiredness bit for the untyped pair; ask rather
+    # than silently treating either member as optional.
     yes_no_required = 'required:ashbyYesNo(e) || '
     assert script.count(_CONTROL_REQUIRED) + script.count(_WITNESS_REQUIRED) == 1
     script = script.replace(_CONTROL_REQUIRED,
@@ -1029,13 +1055,18 @@ def entry_reader(script: str) -> str:
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
+    filter = "e.form || e.closest('form') || e.type === 'file')"
+    assert script.count(filter) == 1
+    script = script.replace(filter,
+                            "e.form || e.closest('form') || e.type === 'file' || "
+                            "formlessHiddenReceiver(e))")
     script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
     script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
-                            "return {...(formless ? {label:entryLabel(e), value:e.value || '', "
-                            "submit:['submit','image'].includes(e.type), "
-                            "required:ashbyYesNo(e) || !!e.required,"
-                            "files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
-                            'selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:')
+        "return {...(formless ? {label:entryLabel(e), name:e.name || '', "
+        "value:e.value || '', submit:['submit','image'].includes(e.type), "
+        "required:ashbyYesNo(e) || !!e.required,"
+        "files:e.files ? Array.from(e.files).map(f=>f.name) : []} : {}), "
+        'selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:')
     script = script.replace('return {url:location.href, title,', 'return {entry, url:location.href, title,')
     script = script.replace('return {url: location.href, controls:', 'return {entry, url: location.href, controls:')
     script = script.replace("unsupported_frames:Array.from(document.querySelectorAll('iframe'))\n"

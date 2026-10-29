@@ -3264,6 +3264,16 @@ async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(mo
              if e.get('boolean_group')]
     assert len(group) == 2 and all(e['in_container'] for e in group)
     assert forms._formless_boundary(raw.current, provenance)
+    # This real-reader rooted fixture exposes native-submit buttons but not
+    # a verified Yes/No choice identity. Preparation is reversible; a final
+    # Submit must not silently ignore their unapproved answer.
+    selectors = {e['selector'] for e in group}
+    isolated = deepcopy(raw.current)
+    isolated['controls'] = [c for c in isolated['controls']
+                            if c['selector'] in selectors]
+    assert len(isolated['controls']) == 2
+    with pytest.raises(forms.Gate, match='rooted Yes/No choice has no verified member identity'):
+        forms.check_form(isolated, {}, uploaded=True)
     assert not decision.await_count
     no_mutations(raw)
     _, plain, _, provenance = root_world(monkeypatch)

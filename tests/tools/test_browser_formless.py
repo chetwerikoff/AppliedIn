@@ -3352,6 +3352,136 @@ def _issue218_main_reader_scripts():
 
     source = Path(producer.__file__).read_text()
     old = producer._ENTRY_OBSERVATION
+    # Keep the Issue #218 historical byte/hash oracle unchanged. Remove only
+    # Issue #252's precisely bounded survey delta from both live readers
+    # before reconstructing the old baseline; re-pinning the hash would
+    # silently weaken the original non-survey regression.
+    survey_delta = [
+        (
+            """  // Standalone PAGE must count only the main form, just like both entry readers.
+  const pageSurveyWrappers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-survey-form-container')) : [];
+  const ashbyContainers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!e.closest('.ashby-survey-form-container')) : [];
+  const pageSurveyValid=pageSurveyWrappers.length===0 || (
+    pageSurveyWrappers.length===1 && ashbyContainers.length===1 &&
+    pageSurveyWrappers[0].tagName==='DIV' &&
+    pageSurveyWrappers[0].parentElement===ashbyContainers[0].parentElement &&
+    pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
+    !pageSurveyWrappers[0].querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]'));""",
+            """  const ashbyContainers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-application-form-container')) : [];""",
+            False,
+        ),
+        (
+            """    return pageAshbyNative && !document.querySelector('form') &&
+      pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
+            """    return pageAshbyNative && !document.querySelector('form') &&
+      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
+            False,
+        ),
+        (
+            """  const surveyWrappers=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!e.closest('.ashby-survey-form-container'));""",
+            """  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));""",
+            True,
+        ),
+        (
+            """  const wrapper=container?.parentElement;
+  const survey=surveyWrappers.length===1 ? surveyWrappers[0] : null;
+  const surveyContainers=survey ? Array.from(
+    survey.querySelectorAll('.ashby-application-form-container')) : [];
+  const surveyContainer=surveyContainers.length===1 ? surveyContainers[0] : null;
+  // Only one direct sibling section is a survey. Never elevate it to a new
+  // Submit certificate or treat its controls as bank-approved answers.
+  const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
+    !!surveyContainer && !survey.querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]');
+  // Layout order is decoration, not authority.""",
+            """  const wrapper=container?.parentElement;
+  // Layout order is decoration, not authority.""",
+            True,
+        ),
+        (
+            """  const unsafeSibling=!!wrapper && siblings.some(n=>
+    n!==container && n!==panes[0] && n!==exactSubmit &&
+    !(surveyValid && n===survey) && !inertSibling(n,true));""",
+            """  const unsafeSibling=!!wrapper && siblings.some(n=>
+    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));""",
+            True,
+        ),
+        (
+            """  const structuralRoot=!forms.length && ordered &&
+    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
+            """  const structuralRoot=!forms.length && ordered ? wrapper : null;""",
+            True,
+        ),
+        (
+            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
+      (surveyWrappers.length>0 && !surveyValid)))
+    structuralError='ambiguous application roots';""",
+            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
+    structuralError='ambiguous application roots';""",
+            True,
+        ),
+        (
+            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit.parentElement===wrapper && (
+      (wrapper.children.length===2 &&
+       wrapper.children[0]===container && wrapper.children[1]===exactSubmit) ||
+      (surveyValid && wrapper.children.length===3 &&
+       siblings.includes(container) && siblings.includes(survey) &&
+       siblings.includes(exactSubmit)))))""",
+            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
+    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
+    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))""",
+            True,
+        ),
+        (
+            """  const controlContainer=e=>container?.contains(e) ? container :
+    (surveyValid && surveyContainer?.contains(e) ? surveyContainer : null);
+  const fieldEntry = e => {
+    const region=controlContainer(e);
+    if (forms.length || !region || e.id) return null;
+    const entry=e.closest('div.ashby-application-form-field-entry');
+    if (!entry || !region.contains(entry)) return null;""",
+            """  const fieldEntry = e => {
+    if (forms.length || !container || !container.contains(e) || e.id) return null;
+    const entry=e.closest('div.ashby-application-form-field-entry');
+    if (!entry || !container.contains(entry)) return null;""",
+            True,
+        ),
+        (
+            """        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&""",
+            """        !!container && container.contains(labels[0]) && container.contains(e) &&""",
+            True,
+        ),
+        (
+            """        return ashbyNative && !forms.length && containers.length===1 &&
+          (!surveyWrappers.length || surveyValid) && container?.contains(e) &&""",
+            """        return ashbyNative && !forms.length && containers.length===1 &&
+          container?.contains(e) &&""",
+            True,
+        ),
+        (
+            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!controlContainer(e),""",
+            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!container && container.contains(e),""",
+            True,
+        ),
+    ]
+    for updated, previous, shared in survey_delta:
+        assert source.count(updated) == 1, updated[:80]
+        source = source.replace(updated, previous, 1)
+        if shared:
+            assert old.count(updated) == 1, updated[:80]
+            old = old.replace(updated, previous, 1)
     changes = [
         (
             "  // The exact sibling mismatch loses wrapper ownership but retains one bounded,\n"

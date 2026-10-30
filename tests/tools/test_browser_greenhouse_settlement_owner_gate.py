@@ -44,7 +44,9 @@ class SyntheticBank:
 def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
     case, raw = _world(monkeypatch, 'greenhouse', kind='select')
     if kind == 'text':
-        question = field('Screening detail', '#screening', type='text',
+        # A salary screening input already has an owner-only classification;
+        # generic unbanked free text keeps its original model-first boundary.
+        question = field('Desired salary', '#screening', type='text',
                          form_action=case.url)
     else:
         assert kind == 'select'
@@ -81,8 +83,12 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
     monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)
     monkeypatch.setattr('tools.credentials.get_login', lambda *a, **k: None)
     monkeypatch.setattr('core.events.emit', lambda *a, **k: None)
-    monkeypatch.setattr(run, 'get_settings',
-                        lambda: SimpleNamespace(browser_model='synthetic'))
+    # The exact owner reply rechecks the reviewed Greenhouse watchlist as well
+    # as the row. Use the same synthetic config path for that read and apply.
+    monkeypatch.setattr(
+        run, 'get_settings',
+        lambda: SimpleNamespace(
+            browser_model='synthetic', config_dir=case._watchlist_dir.name))
     monkeypatch.setattr(run, '_resume_pdf_path', lambda row: 'Resume.pdf')
     monkeypatch.setattr(run, '_github_context', lambda: '')
     monkeypatch.setattr('tools.browser_runtime.configuration',
@@ -95,7 +101,7 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
 
 @pytest.mark.parametrize(('kind', 'answer'), [
     ('select', 'Remote'),
-    ('text', 'Synthetic screening detail'),
+    ('text', 'Synthetic salary range'),
 ])
 async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
         monkeypatch, kind, answer):
@@ -117,10 +123,13 @@ async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
     question = row['gate_pending']['form_question']
     assert question['pk'] == case.pk
     assert question['selector'] == '#screening'
-    assert question['label'] == ('Screening detail' if kind == 'text'
+    assert question['label'] == ('Desired salary' if kind == 'text'
                                  else 'Screening choice')
     assert question['type'] == kind
     assert question['url'] == case.url
+    # An owner answer is useful only if its same-job form identity can pass
+    # the independent resume-time alias/config check without a relaxed gate.
+    assert run._direct_form_label(case.pk, row) == question['label']
 
     # An exact phone grant and bank value settle before the missing screening
     # field gates; the ordinary fixture has no raw producer auto-grant binder.

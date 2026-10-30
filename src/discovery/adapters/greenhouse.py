@@ -45,4 +45,13 @@ class GreenhouseAdapter:
                     posted_at=str(j.get("first_published") or ""),
                 )
             )
+        # A successful arbitrary board probe never supplies tenant authority.
+        # Only the uniquely reviewed tuple and exact feed row may carry a pin.
+        from ..tenant_pin import exact_feed_match, reviewed_tuple
+
+        if reviewed_tuple(company.name, expected=company) is not None:
+            for job in jobs:
+                if exact_feed_match(
+                        company, job.job_id, jobs, stored_url=job.jd_url) is not None:
+                    job.greenhouse_board = company.board
         return jobs

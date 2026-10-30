@@ -2972,7 +2972,11 @@ def _reversible_entry_recipient(page: dict, target: dict,
     selector = target.get('selector')
     for predicate, failed in (
             ('formless.object', lambda: not isinstance(root, dict)),
-            ('formless.root', lambda: root.get('root')),
+            # A certified structural root is stronger membership evidence than
+            # the rootless container; it needs its one quarantined helper.
+            ('formless.root', lambda: root.get('root') and (
+                not isinstance(root.get('root'), str)
+                or root.get('error') != '' or not root.get('pane'))),
             ('formless.error', lambda: root.get('error') not in _REVERSIBLE_ROOT_ERRORS),
             ('formless.pane', lambda: root.get('error') and not root.get('pane')),
             ('formless.truncated', lambda: root.get('truncated')),
@@ -3025,6 +3029,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
+            ('evidence.inside', bool(root.get('root')) and e.get('inside') is not True),
             ('evidence.ashby_survey',
              (e.get('ashby_survey') is True) != (target.get('ashby_survey') is True)),
             ('evidence.native_owner', e.get('native_owner')),

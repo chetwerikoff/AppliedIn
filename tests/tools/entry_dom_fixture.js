@@ -274,6 +274,45 @@ if(spec.formless) {
     }
     if(spec.surveyOutside) move(section,body);
   }
+  if(spec.liveForm) {
+    // Issue #252: direct div#form children of the two public captures. Only
+    // tags, classes and attribute names are copied; every text is synthetic.
+    for(const [k,v] of [['id','form'],['tabindex','0'],['role','tabpanel'],
+        ['aria-labelledby','job-application-form']]) wrapper.setAttribute(k,v);
+    wrapper.removeAttribute('class');
+    pane.setAttribute('data-highlight','synthetic');
+    container.setAttribute('data-highlight','synthetic');
+    node('div',{role:'button',class:'synthetic-drop','data-state':'idle'},pane);
+    const upload=node('button',{id:'autofill-upload',class:'synthetic-button',
+      text:'Synthetic upload'},pane);
+    upload.type='submit'; // Untyped like the capture: quarantined, never a target.
+    if(spec.liveExtraSubmit) {
+      const extra=node('button',{id:'autofill-submit',type:'submit',text:'Synthetic'},pane);
+      extra.type='submit';
+    }
+    const section=nodes.find(n=>n.parentElement===wrapper &&
+      n.getAttribute('class')==='ashby-survey-form-container');
+    const legal=node(spec.liveForm==='uploader' ? 'p' : 'div',
+      {class:'synthetic-legal',...(spec.liveForm==='uploader' ? {} : {'data-highlight':'synthetic'})},wrapper);
+    const link=node('a',{href:'https://example.test/legal',
+      target:'_blank',rel:'noopener noreferrer',text:'Synthetic policy'},
+      spec.liveForm==='uploader' ? legal : node('span',{},legal));
+    if(spec.liveLinkExtra==='button') node('button',{id:'legal-button',type:'button',text:'Synthetic'},legal);
+    if(spec.liveLinkExtra==='form') node('form',{id:'legal-form'},legal);
+    if(spec.liveLinkExtra==='nested-button') node('button',{id:'legal-button',type:'button'},link);
+    const order=[pane];
+    if(spec.liveForm==='uploader') {
+      pane.setAttribute('class','ashby-application-form-autofill-uploader');
+      const notice=node('div',{class:'ashby-application-blocking-disclosure',
+        'data-highlight':'synthetic'},wrapper);
+      node('p',{text:'Synthetic disclosure'},node('span',{},notice));
+      order.push(notice,container,...(section ? [section] : []),submit,legal);
+    } else order.push(container,...(section ? [section] : []),legal,submit);
+    if(spec.liveSecondUploader)
+      order.push(node('div',{class:'ashby-application-form-autofill-uploader'},wrapper));
+    wrapper.children.splice(0,wrapper.children.length,...order,
+      ...wrapper.children.filter(n=>!order.includes(n)));
+  }
   if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
   if(spec.extraType) node(spec.extraType==='select' ? 'select':'input',
     {id:'unsupported',type:spec.extraType,required:true,...(spec.extraAttrs || {})},container);

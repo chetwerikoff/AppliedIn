@@ -3356,13 +3356,41 @@ def _issue218_main_reader_scripts():
     # Issue #252's precisely bounded survey delta from both live readers
     # before reconstructing the old baseline; re-pinning the hash would
     # silently weaken the original non-survey regression.
+    # Issue #252 amendment 16:29: the live div#form wrapper, quarantined
+    # uploader and link-only siblings. Invert only that exact delta first.
+    div_form_delta = [
+        ("    // One survey's single nested container is not a second application root.\n    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));\n    const main=all.filter(e=>!e.closest('.ashby-survey-form-container'));\n    const containers=surveys.length===1 && all.length-main.length===1 ? main : all;\n    if(containers.length===1",
+         "    const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    if(containers.length===1",
+         False),
+        ("  // Live Ashby renders the same quarantined autofill helper as an uploader.\n  const panes=Array.from(document.querySelectorAll(\n    '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader'));",
+         "  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));",
+         True),
+        ('  // A styled DIV, SPAN or P sibling whose only controls, if any, are plain\n  // description links. Links are never receivers, targets or click authority.\n  const linkOnlySibling=e=>{\n    if(![\'DIV\',\'SPAN\',\'P\'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n       !(a.name===\'class\' || /^data-/i.test(a.name)))) return false;\n    const nodes=[e,...Array.from(e.querySelectorAll(\'*\'))];\n    const interactive=query+\',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label,[autofocus],[controls],[form],[formaction]\';\n    const links=Array.from(e.querySelectorAll(\'a[href]\'));\n    return Array.from(e.querySelectorAll(interactive)).every(n=>\n      links.includes(n) && Array.from(n.attributes).every(a=>\n        [\'href\',\'target\',\'rel\',\'class\'].includes(a.name) || /^data-/i.test(a.name))) &&\n      nodes.every(n=>!n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));\n  };\n  // The quarantined helper is never a receiver; it may not carry Submit.\n  const paneArmed=panes.length===1 && !!panes[0].querySelector(\n    \'form,button.ashby-application-form-submit-button,button[type="submit"],\'+\n    \'input[type="submit"],input[type="image"],[form],[formaction],\'+\n    \'.ashby-application-form-container,.ashby-survey-form-container\');\n  const paneSafe=panes.length===1 && panes[0].tagName===\'DIV\' &&\n    panes[0].parentElement===wrapper && !paneArmed;\n', '', True),
+        ("!(surveyValid && n===survey) && !inertSibling(n,true) && !linkOnlySibling(n));",
+         "!(surveyValid && n===survey) && !inertSibling(n,true));", True),
+        ("  // Issue #252: the live div#form wrapper. Its direct children are exactly one\n  // quarantined helper, the main container, the exact Submit, at most one valid\n  // survey, and only inert or link-only siblings. It has the pane shape's\n  // authority and no more; any other child leaves the wrapper unowned.\n  const formShape=!!wrapper && wrapper.tagName==='DIV' && wrapper.id==='form' &&\n    !wrapper.getAttribute('class') && container?.tagName==='DIV' &&\n    exactSubmit?.tagName==='BUTTON' && exactSubmit.parentElement===wrapper && paneSafe &&\n    (!surveyWrappers.length || surveyValid) &&\n    siblings.every(n=>n===container || n===panes[0] || n===exactSubmit ||\n      (surveyValid && n===survey) || inertSibling(n,true) || linkOnlySibling(n));\n  const structuralRoot=!forms.length && (formShape || (ordered && paneSafe &&\n    (!surveyWrappers.length || surveyValid))) ? wrapper : null;",
+         '  const structuralRoot=!forms.length && ordered &&\n    (!surveyWrappers.length || surveyValid) ? wrapper : null;',
+         True),
+        ("      paneArmed || (surveyWrappers.length>0 && !surveyValid)))",
+         "      (surveyWrappers.length>0 && !surveyValid)))", True),
+        ("!ordered && !formShape &&\n      !surveyPane && !(",
+         "!ordered && !surveyPane && !(", True),
+        ("style,'+\n            '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader')",
+         "style,.ashby-application-form-autofill-pane')", True),
+    ]
+    for updated, previous, shared in div_form_delta:
+        assert source.count(updated) == 1, updated[:80]
+        source = source.replace(updated, previous, 1)
+        if shared:
+            assert old.count(updated) == 1, updated[:80]
+            old = old.replace(updated, previous, 1)
     survey_delta = [
         (
             """    !pageSurveyWrappers[0].querySelector(
       'form,button.ashby-application-form-submit-button,button[type="submit"],'+
       'input[type="submit"],input[type="image"]') &&
     !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
-      .some(b=>!b.hasAttribute('type'));""",
+      .some(b=>!b.hasAttribute('type')));""",
             """    !pageSurveyWrappers[0].querySelector(
       'form,button.ashby-application-form-submit-button,button[type="submit"],'+
       'input[type="submit"],input[type="image"]'));""",
@@ -3623,9 +3651,14 @@ def _issue218_main_reader_scripts():
     assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
+    # The fixed witness's own #252 survey census reads entry bindings that the
+    # historical observation lacks; invert only that exact clause there.
+    fixed_survey = "      containers.length===1 && (!surveyWrappers.length || surveyValid) &&\n"
+    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(fixed_survey) == 1
     return [
         forms.ENTRY_PAGE.replace(producer._ENTRY_OBSERVATION, old, 1),
-        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(producer._ENTRY_OBSERVATION, old, 1),
+        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(producer._ENTRY_OBSERVATION, old, 1)
+        .replace(fixed_survey, "      containers.length===1 &&\n", 1),
     ]
 
 

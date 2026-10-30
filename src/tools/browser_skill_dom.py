@@ -159,7 +159,9 @@ PAGE = r"""(() => {
     pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
     !pageSurveyWrappers[0].querySelector(
       'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]'));
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
+      .some(b=>!b.hasAttribute('type'));
   const hiddenAshbyChoice=e=>{
     const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
@@ -201,6 +203,8 @@ PAGE = r"""(() => {
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
       commits_application:commitsApplication(e),
       in_form:!!form, form_selector:form ? selector(form) : '',
+      ...(pageAshbyNative && e.closest('div.ashby-survey-form-container')
+        ? {ashby_survey:true} : {}),
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
       ...(pageAshbyNative ? {form_action_attr_present:!!form && form.hasAttribute('action'),
@@ -416,7 +420,8 @@ _ASHBY_ROOT = r"""
   const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
     !!surveyContainer && !survey.querySelector(
       'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]');
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(survey.querySelectorAll('button')).some(b=>!b.hasAttribute('type'));
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
   // class and data-* are styling: they may not certify the wrapper, but must
@@ -680,6 +685,7 @@ _ASHBY_ROOT = r"""
         name:e.name || '',associated:linked || !!hiddenLabel,
         ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
         in_container:!!controlContainer(e),
+        ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),
         native_owner:e.form ? selector(e.form) : '',
         declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
         submit:e===exactSubmit,untyped:e.getAttribute('type')===null,

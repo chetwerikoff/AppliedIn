@@ -138,20 +138,40 @@ def test_two_containers_inside_survey_fail_closed(with_pane):
     _refused(with_pane, surveyExtraContainer=True)
 
 
-# Amendment 16:29: the two public captures' live div#form wrapper. One shape
-# has the autofill uploader, a blocking disclosure, the survey and a link-only
-# paragraph; the other has the legacy pane and a link-only div. All text,
-# labels and links are synthetic; only tags, classes and attribute names match.
+# Amendment 16:29 and ARCH 17:33: the two public captures' live div#form
+# wrapper. 'openai' has the autofill uploader, a blocking disclosure, the
+# survey and a link-only paragraph. 'airwallex' has the uploader, the survey
+# and a link-only div, with no disclosure. 'pane' keeps the legacy pane class.
+# Each main container carries the id-less location combobox whose only caption
+# is its field-entry title. All text, labels and links are synthetic; only
+# tags, classes and attribute names match the captures.
 _LIVE = {
-    'uploader': dict(liveForm='uploader', survey=True),
-    'pane': dict(liveForm='pane'),
+    'openai': dict(liveForm='uploader', survey=True, liveLocation=True, surveyChoices=True),
+    'airwallex': dict(liveForm='airwallex', survey=True, liveLocation=True,
+                      surveyChoices=True),
+    'pane': dict(liveForm='pane', liveLocation=True),
 }
 _QUARANTINED = {'#autofill-file', '#autofill-button', '#autofill-upload'}
+_LOCATION = 'Synthetic location'
+_PLACEHOLDER = 'Synthetic placeholder...'
+_CHOICES = {'#survey-choice-0', '#survey-choice-1'}
 
 
 def _live(shape: str, **changes):
     return _observed(dict(root=False, formless=True, url=entry('ashby'),
-                          **_LIVE[shape], **changes))
+                          **{**_LIVE[shape], **changes}))
+
+
+def _provenance():
+    from tests.tools.test_browser_application_entry import COMPANY, JOB, PK, posting
+    return forms.ApplicationEntryProvenance(
+        PK, COMPANY, 'ashby', JOB, posting('ashby'), 'example-co', entry('ashby'))
+
+
+def _location(snapshot: dict) -> dict:
+    found = [c for c in snapshot['controls'] if c['type'] == 'combobox']
+    assert len(found) == 1
+    return found[0]
 
 
 def _live_valid(shape: str, **changes):
@@ -162,33 +182,122 @@ def _live_valid(shape: str, **changes):
     assert root['container'] == '#application-fields'
     assert root['submit'] == '#structural-submit' and root['pane'] == '#autofill'
     assert _QUARANTINED <= set(root['excluded'])
-    evidence = {e['selector'] for e in page['entry']['root_evidence']}
-    assert not evidence & _QUARANTINED
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    assert not evidence.keys() & _QUARANTINED
     links = [c['selector'] for c in page['controls'] if c['tag'] == 'a']
     assert len(links) == 1 and links[0] not in evidence
+    # One caption rule: the title in every reader, never the placeholder.
+    location = _location(page)
+    assert (location['label'] == _location(fixed)['label']
+            == evidence[location['selector']]['label'] == _LOCATION)
+    assert evidence[location['selector']]['associated'] is True
+    assert not any(_PLACEHOLDER in str(c.get('label')) for c in page['controls'])
+    # The rooted route owns membership: the unchanged boundary passes, and
+    # the rootless reversible scope stays empty on a certified root.
+    members = {c['selector'] for c in forms._formless_boundary(page, _provenance())}
+    assert _MAIN | {location['selector'], '#_systemfield_resume'} <= members
+    assert not members & (_QUARANTINED | {'#structural-submit', links[0]})
+    assert (_SURVEY in members) is ('survey' in _LIVE[shape])
+    # ARCH 17:40: the visually hidden survey radios stay members.
+    assert (_CHOICES <= members) is ('surveyChoices' in _LIVE[shape])
     scope, witness = _scope(page, fixed)
-    assert _MAIN <= scope
-    assert not scope & (_QUARANTINED | {'#structural-submit', links[0]})
-    assert (_SURVEY in scope) is (shape == 'uploader')
-    return page, fixed, scope, witness
+    assert scope == frozenset()
+    return page, fixed, members, witness
 
 
 @pytest.mark.parametrize('shape', sorted(_LIVE))
-def test_live_div_form_wrapper_admits_structural_root(shape):
+def test_live_div_form_root_passes_unchanged_boundary(shape):
     _live_valid(shape)
 
 
+@pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS],
+                         ids=['ENTRY_PAGE', 'FIXED'])
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+def test_location_caption_is_its_title_in_every_reader(reader, shape):
+    spec = dict(root=False, formless=True, url=entry('ashby'), **_LIVE[shape])
+    assert _location(dom(spec, reader))['label'] == _LOCATION
+
+
+def test_standalone_page_location_caption_is_its_title():
+    # PAGE does not quarantine the autofill helper, so use the no-pane shape.
+    assert _location(dom(_spec(False, liveLocation=True), PAGE))['label'] == _LOCATION
+
+
+@pytest.mark.parametrize('title', ['second', 'owned'])
+def test_location_without_its_own_unique_title_has_no_caption(title):
+    page, fixed = _live('openai', liveLocationTitle=title)
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    location = _location(page)
+    # Neither reader falls back to the placeholder; both agree on no caption.
+    assert location['label'] == _location(fixed)['label'] == ''
+    assert evidence[location['selector']]['label'] == ''
+    assert evidence[location['selector']]['associated'] is False
+
+
 def test_live_div_form_survey_gets_no_bank_grant():
-    page, _fixed, scope, witness = _live_valid('uploader', surveyLabel='Email')
+    page, _fixed, members, _witness = _live_valid('airwallex', surveyLabel='Email')
     main = next(c for c in page['controls'] if c['selector'] == '#_systemfield_email')
     survey = next(c for c in page['controls'] if c['selector'] == _SURVEY)
     assert main['label'] == survey['label'] == 'Email'
     assert survey['ashby_survey'] is True and 'ashby_survey' not in main
-    forms._reversible_entry_recipient(page, survey, witness)
     assert forms._bank_auto_eligible(
-        main, 'synthetic@example.test', formless_selectors=scope)
+        main, 'synthetic@example.test', formless_selectors=frozenset(members))
     assert not forms._bank_auto_eligible(
-        survey, 'synthetic@example.test', formless_selectors=scope)
+        survey, 'synthetic@example.test', formless_selectors=frozenset(members))
+
+
+_FACTS = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+async def test_live_entry_bootstrap_grants_main_name_and_email(monkeypatch, shape):
+    import asyncio
+    from tests.tools.test_browser_application_entry import COMPANY, PK, posting
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    row, raw, _, provenance = root_world(monkeypatch, **_LIVE[shape])
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {**_FACTS, _SURVEY_LABEL: 'Synthetic survey answer'}
+    # The survey answer is owner-only: bootstrap asks instead of granting it.
+    with pytest.raises(forms.Gate, match='exact human-approved answer is needed'):
+        await forms._bootstrap(session, page, PK, facts, posting('ashby'),
+                               company=COMPANY, provenance=provenance,
+                               global_facts=dict(facts))
+    assert len(writes) == 1
+    grants = row['human_approved_answers']
+    assert set(grants) == set(_FACTS)
+    for key, selector in (('Name', '#_systemfield_name'), ('Email', '#_systemfield_email')):
+        assert grants[key]['source'] == 'bank-auto'
+        assert grants[key]['selector'] == selector
+        assert grants[key]['value'] == _FACTS[key]
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+async def test_live_controller_bootstrap_takes_the_rooted_route(monkeypatch, shape):
+    from tests.tools.test_browser_application_entry import COMPANY, PK, posting
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    row, raw, _, provenance = root_world(monkeypatch, **_LIVE[shape])
+    raw._application_controller = object()  # Synthetic producer prerequisite.
+    session = forms._ReversibleEntryReader(raw)
+    page = await session.page()
+    assert forms._formless_root(page)['root'] == '#form'
+    writes = _issue182_tracking(monkeypatch, row)
+    returned = await forms._bootstrap(
+        session, page, PK, dict(_FACTS), posting('ashby'), company=COMPANY,
+        provenance=provenance, global_facts=dict(_FACTS))
+    assert returned is page
+    assert len(writes) == 1
+    grants = row['human_approved_answers']
+    assert set(grants) == set(_FACTS)
+    assert {grants[k]['selector'] for k in _FACTS} == _MAIN
+    no_mutations(raw)
 
 
 @pytest.mark.asyncio
@@ -197,7 +306,7 @@ async def test_live_div_form_final_submit_reaches_unchanged_guard(monkeypatch, s
     from tools import browser_skill as bsk
     from tests.tools.test_browser_application_entry import COMPANY, PK, posting
 
-    page, _fixed, _scope_, _witness = _live_valid(shape)
+    page, _fixed, _members, _witness = _live_valid(shape)
     controller = forms.ApplicationIPCController(
         PK, COMPANY, posting('ashby'), '', {}, {}, [], {'url': ''}, lambda: None)
     calls, reached = [], []
@@ -235,19 +344,111 @@ async def test_live_div_form_final_submit_reaches_unchanged_guard(monkeypatch, s
     assert not any(argv[:1] == ('click',) for argv in calls)
 
 
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+def test_hidden_survey_radio_reports_its_visible_label(shape):
+    page, fixed, members, _witness = _live_valid(shape)
+    for snapshot in (page, fixed):
+        evidence = {e['selector']: e for e in snapshot['entry']['root_evidence']}
+        for selector in _CHOICES:
+            e = evidence[selector]
+            assert e['visible'] is False and e['label_visible'] is True
+            assert e['associated'] is True and e['label'].startswith('Synthetic option')
+            assert e['in_container'] is True and e['type'] == 'radio'
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+def test_hidden_radio_with_invisible_label_still_refuses(shape):
+    _live_valid(shape)
+    page, _fixed = _live(shape, surveyChoices='label-hidden')
+    assert page['entry']['formless']['root'] == '#form'
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    assert all(evidence[s]['label_visible'] is False for s in _CHOICES)
+    with pytest.raises(forms.Gate, match='association or editability changed'):
+        forms._formless_boundary(page, _provenance())
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+def test_hidden_radio_outside_container_still_refuses(shape):
+    _live_valid(shape)
+    page, _fixed = _live(shape, surveyChoices='outside')
+    evidence = {e['selector']: e for e in page['entry']['root_evidence']}
+    assert all(evidence[s]['in_container'] is False for s in _CHOICES)
+    with pytest.raises(forms.Gate):
+        forms._formless_boundary(page, _provenance())
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+def test_checked_survey_radio_without_grant_is_refused_at_final_check(shape):
+    _live_valid(shape)
+    page, _fixed = _live(shape, surveyChoiceChecked=True)
+    members = {c['selector']: c for c in forms._formless_boundary(page, _provenance())}
+    assert members['#survey-choice-0']['checked'] is True
+    # The existing final check, on just the survey radios: no owner grant.
+    radios = [c for c in page['controls'] if c['selector'] in _CHOICES]
+    with pytest.raises(forms.Gate, match='Unverified preselected answer'):
+        forms.check_form(dict(page, controls=radios), {}, True)
+
+
+async def test_refused_rooted_boundary_prepares_like_main_and_submit_refuses(monkeypatch):
+    import asyncio
+    from tests.tools.test_browser_application_entry import COMPANY, PK, posting
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    changes = dict(_LIVE['openai'], liveExtraInvisible=True)
+    page, _fixed = _live('openai', liveExtraInvisible=True)
+    assert page['entry']['formless']['root'] == '#form'
+    with pytest.raises(forms.Gate, match='association or editability changed'):
+        forms._formless_boundary(page, _provenance())
+    row, raw, _, provenance = root_world(monkeypatch, **changes)
+    raw._application_controller = object()  # Synthetic producer prerequisite.
+    allowed = lambda url: url == entry('ashby')
+    scoped = forms._EntrySession(raw, allowed, provenance, resume_path='Resume.pdf')
+    session, prepared = await forms._entry_or_reversible_page(
+        scoped, raw, allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    # Entry does not gate: the fallback reads the page as main read it.
+    assert isinstance(session, forms._ReversibleEntryReader)
+    root = forms._formless_root(prepared)
+    assert root['root'] == '' and root['error'] == 'application root sibling identity mismatch'
+    # Name and email are reversible fill receivers again, as on main.
+    _fresh, witness = await forms._observe_controls(session, prepared, site='bootstrap-formless')
+    assert _MAIN <= forms._reversible_entry_scope(prepared, witness)
+    assert '#extra-invisible' not in forms._reversible_entry_scope(prepared, witness)
+    writes = _issue182_tracking(monkeypatch, row)
+    returned = await forms._bootstrap(
+        session, prepared, PK, dict(_FACTS), posting('ashby'), company=COMPANY,
+        provenance=provenance, global_facts=dict(_FACTS))
+    assert returned is prepared and len(writes) == 1
+    grants = row['human_approved_answers']
+    assert {grants[k]['selector'] for k in _FACTS} == _MAIN
+    # Final Submit authority is unchanged: the raw rooted page still refuses.
+    raw_page = await forms._ReversibleEntryReader(raw).page()
+    assert forms._formless_root(raw_page)['root'] == '#form'
+    with pytest.raises(forms.Gate):
+        forms._formless_boundary(raw_page, provenance)
+    no_mutations(raw)
+
+
 @pytest.mark.parametrize('shape,bad', [
-    ('uploader', {'liveExtraSubmit': True}),
+    ('openai', {'liveExtraSubmit': True}),
+    ('airwallex', {'liveExtraSubmit': True}),
     ('pane', {'liveExtraSubmit': True}),
-    ('uploader', {'liveSecondUploader': True}),
-    ('uploader', {'liveLinkExtra': 'button'}),
+    ('openai', {'liveSecondUploader': True}),
+    ('airwallex', {'liveSecondUploader': True}),
+    ('openai', {'liveLinkExtra': 'button'}),
+    ('airwallex', {'liveLinkExtra': 'button'}),
+    ('airwallex', {'liveLinkExtra': 'form'}),
     ('pane', {'liveLinkExtra': 'button'}),
     ('pane', {'liveLinkExtra': 'form'}),
-    ('uploader', {'liveLinkExtra': 'nested-button'}),
-    ('uploader', {'surveySecondSection': True}),
-    ('uploader', {'surveySubmit': True}),
-    ('uploader', {'surveyImplicitSubmit': True}),
-    ('uploader', {'surveyOutside': True}),
-    ('uploader', {'surveyExtraContainer': True}),
+    ('openai', {'liveLinkExtra': 'nested-button'}),
+    ('openai', {'surveySecondSection': True}),
+    ('airwallex', {'surveySecondSection': True}),
+    ('openai', {'surveySubmit': True}),
+    ('openai', {'surveyImplicitSubmit': True}),
+    ('airwallex', {'surveyImplicitSubmit': True}),
+    ('openai', {'surveyOutside': True}),
+    ('openai', {'surveyExtraContainer': True}),
+    ('airwallex', {'surveyExtraContainer': True}),
 ], ids=lambda v: v if isinstance(v, str) else '-'.join(map(str, v.items())))
 def test_live_div_form_negative_shapes_fail_closed(shape, bad):
     _live_valid(shape)
@@ -255,6 +456,8 @@ def test_live_div_form_negative_shapes_fail_closed(shape, bad):
     for snapshot in (page, fixed):
         root = snapshot['entry']['formless']
         assert not (root or {}).get('root')
+    with pytest.raises(forms.Gate):
+        forms._formless_boundary(page, _provenance())
     scope, _ = _scope(page, fixed)
     assert not scope & _MAIN
 
@@ -262,7 +465,7 @@ def test_live_div_form_negative_shapes_fail_closed(shape, bad):
 @pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS],
                          ids=['ENTRY_PAGE', 'FIXED'])
 def test_application_identity_ignores_one_survey_container(reader):
-    spec = dict(root=False, formless=True, url=entry('ashby'), **_LIVE['uploader'])
+    spec = dict(root=False, formless=True, url=entry('ashby'), **_LIVE['openai'])
     assert [r['selector'] for r in dom(spec, reader)['application_identity']] == [
         '#application-fields']
     spec['surveyExtraContainer'] = True

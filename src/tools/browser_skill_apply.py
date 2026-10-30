@@ -1636,10 +1636,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
   // Standalone fixed reads cannot borrow the entry reader's Ashby bindings.
   const fixedAshbyNative = location.protocol==='https:' &&
     location.hostname==='jobs.ashbyhq.com';
-  const fixedAshbyLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
-    (e.getAttribute('aria-labelledby') || '').split(' ')
-      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
-    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const fixedAshbyLabel = e => controlCaption(e);
   const hiddenAshbyChoice=e=>{
     const labels=Array.from(e.labels || []);
     return fixedAshbyNative && !document.querySelector('form') &&
@@ -2157,10 +2154,16 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
                               or (typ not in {'radio', 'checkbox'}
                                   and (c.get('has_value')
                                        or bool(str(c.get('value') or '').strip()))))
+        # ARCH 17:40: a rooted native choice drawn only through its own visible
+        # associated label stays a member; every other invisible control refuses.
+        hidden_choice = (bool(root.get('root')) and typ in {'radio', 'checkbox'}
+                         and c.get('in_container') is True
+                         and c.get('associated') is True and bool(c.get('label'))
+                         and c.get('label_visible') is True)
         if ((filled_or_required and
                 (not c.get('associated') or not c.get('label')))
                 or c.get('disabled') or c.get('readonly') or c.get('inert')
-                or (typ != 'file' and not c.get('visible'))):
+                or (typ != 'file' and not c.get('visible') and not hidden_choice)):
             raise Gate('application label/control association or editability changed; inspect manually.')
         original = lookup.get(c['selector'])
         if not original or any(original.get(k) != c.get(k) for k in (
@@ -2877,9 +2880,10 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
 class _ReversibleEntryReader:
     """ENTRY_PAGE observations on a reversible route; all IPC stays on raw."""
 
-    def __init__(self, raw):
+    def __init__(self, raw, *, rooted_fallback: bool = False):
         self.raw = raw
         self.upload_attempted = False
+        self.rooted_fallback = rooted_fallback
 
     def __getattr__(self, name):
         # The production application_effect/controller are still owned by
@@ -2891,6 +2895,8 @@ class _ReversibleEntryReader:
         page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict) or not page.get('url'):
             raise Gate('Reversible preparation page observation is unavailable.')
+        if self.rooted_fallback:
+            page = _demote_refused_root(page)
         return page
 
     async def application_effect(self, *args, **kwargs):
@@ -2903,7 +2909,39 @@ class _ReversibleEntryReader:
             args = ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
         if args and args[0] == 'upload':
             raise Gate(_REVERSIBLE_UPLOAD_REFUSAL)
-        return await self.raw.call(*args, **kwargs)
+        result = await self.raw.call(*args, **kwargs)
+        if (self.rooted_fallback and args == ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)
+                and isinstance(result, dict) and isinstance(result.get('value'), dict)):
+            # The witness reads the same demoted page, or the pair disagrees.
+            result = {**result, 'value': _demote_refused_root(result['value'])}
+        return result
+
+
+def _demote_refused_root(page: dict) -> dict:
+    """Issue #252 ARCH 17:51: a rooted page whose boundary refused prepares as main.
+
+    Only on the fallback reader that _entry_or_reversible_page opens after the
+    unchanged boundary refused. A certified root (string root, no error, the
+    one quarantined pane) is read exactly as main read the live wrapper: the
+    rootless sibling-mismatch container route, with each member still proven
+    inside the certified root. Every other root shape stays as observed. This
+    only removes authority: the rooted route and its grants are not used, and
+    final Submit still re-runs _formless_boundary on its own fresh read.
+    """
+    from copy import deepcopy
+    root = _formless_root(page)
+    evidence = (page.get('entry') or {}).get('root_evidence')
+    if not (isinstance(root, dict) and isinstance(root.get('root'), str) and root['root']
+            and root.get('error') == '' and root.get('pane')
+            and isinstance(evidence, list)):
+        return page
+    page = deepcopy(page)
+    page['entry']['formless'].update(
+        root='', error='application root sibling identity mismatch')
+    # Membership stays inside the certified root, never the wider document.
+    page['entry']['root_evidence'] = [
+        e for e in evidence if isinstance(e, dict) and e.get('inside') is True]
+    return page
 
 
 # Issue FF-224g: a chooser upload on this route was refused live (the input is
@@ -2972,11 +3010,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
     selector = target.get('selector')
     for predicate, failed in (
             ('formless.object', lambda: not isinstance(root, dict)),
-            # A certified structural root is stronger membership evidence than
-            # the rootless container; it needs its one quarantined helper.
-            ('formless.root', lambda: root.get('root') and (
-                not isinstance(root.get('root'), str)
-                or root.get('error') != '' or not root.get('pane'))),
+            ('formless.root', lambda: root.get('root')),
             ('formless.error', lambda: root.get('error') not in _REVERSIBLE_ROOT_ERRORS),
             ('formless.pane', lambda: root.get('error') and not root.get('pane')),
             ('formless.truncated', lambda: root.get('truncated')),
@@ -3029,7 +3063,6 @@ def _reversible_entry_recipient(page: dict, target: dict,
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
-            ('evidence.inside', bool(root.get('root')) and e.get('inside') is not True),
             ('evidence.ashby_survey',
              (e.get('ashby_survey') is True) != (target.get('ashby_survey') is True)),
             ('evidence.native_owner', e.get('native_owner')),
@@ -4641,6 +4674,16 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                                 not _preparation_current(
                                     provenance, fixture_context=fixture_context))):
                         raise Gate('The reversible observation left the preparation origin.')
+                    if (_formless_root(fresh) or {}).get('root'):
+                        # Issue #252: a certified structural root takes the
+                        # rooted route; its members are exactly the unchanged
+                        # boundary's, never the rootless reversible scope.
+                        members = _formless_boundary(fresh, provenance)
+                        _auto_grant_from_global(
+                            fresh, witness, pk, facts, global_facts or {}, *origins,
+                            provenance=provenance, fixture_context=fixture_context,
+                            formless_selectors=frozenset(c['selector'] for c in members))
+                        return page
                     scope = _reversible_entry_scope(fresh, witness)
                     if not scope:
                         _LOG.info('reversible scope empty pk=%s root_error=%s', pk,
@@ -8045,7 +8088,12 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
             scoped_session, allowed, provenance, deadline=deadline)
     except Gate as exc:
         reason = str(exc).lower()
-        if not any(reason.startswith(message) for message in (
+        # ARCH 17:51: a rooted page whose boundary still refuses prepares as
+        # main does; final Submit re-runs the boundary.
+        boundary_refused = any(reason.startswith(message) for message in (
+            'application label/control association or editability changed',
+            'application field inventory differs from root evidence'))
+        if not boundary_refused and not any(reason.startswith(message) for message in (
                 'ambiguous application roots',
                 'application root sibling identity mismatch',
                 'truncated application inventory after bounded wait',
@@ -8057,7 +8105,8 @@ async def _entry_or_reversible_page(scoped_session, raw_session, allowed,
         try:
             if isinstance(provenance, ApplicationEntryProvenance):
                 # Generic PAGE omits entry.formless; keep raw IPC and read ENTRY_PAGE.
-                reversible = _ReversibleEntryReader(raw_session)
+                reversible = _ReversibleEntryReader(
+                    raw_session, rooted_fallback=boundary_refused)
                 page = await reversible.page()
             else:
                 reversible = raw_session

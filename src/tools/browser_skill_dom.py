@@ -16,6 +16,40 @@ _DIAGNOSTIC_MAX_CHARS = 8192
 _WIDGET_GRAPH = r"""
   // Accessible roles and relationships only: no site/library selectors, C0/C1/C2
   // phases or page-controlled exceptions to a privileged application write.
+  // Issue #252: one caption rule for PAGE, both witnesses and the root census
+  // (declarations, so the entry root code above may call them). On Ashby a
+  // placeholder is never a label. An id-less, formless text-like input takes
+  // only the single question title of its own field entry inside the one main
+  // or one survey container; zero or several titles, or a title owned by
+  // another live control, give no caption.
+  function ashbyFieldTitle(e) {
+    if (!(location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com') ||
+        e.tagName!=='INPUT' || e.id || e.form || e.closest('form') ||
+        document.querySelector('form') || ['checkbox','radio','file','hidden','submit',
+          'button','image','reset'].includes(e.type)) return null;
+    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+    const main=all.filter(c=>!c.closest('.ashby-survey-form-container'));
+    const inner=surveys.length===1 ? all.filter(c=>surveys[0].contains(c)) : [];
+    const regions=main.length!==1 || surveys.length>1 ? [] :
+      [main[0], ...(inner.length===1 ? inner : [])];
+    const region=regions.find(r=>r.contains(e));
+    const entry=region ? e.closest('div.ashby-application-form-field-entry') : null;
+    if (!entry || !region.contains(entry)) return null;
+    const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
+    const owner=titles.length===1 ? titles[0].getAttribute('for') : null;
+    return titles.length===1 && !(owner && document.getElementById(owner)) ? titles[0] : null;
+  }
+  function controlCaption(e) {
+    const title=ashbyFieldTitle(e);
+    if (title) return clean(title.innerText);
+    const ashby=location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com';
+    return clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
+      (e.getAttribute('aria-labelledby') || '').split(' ')
+        .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
+      e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||
+      e.innerText || e.name);
+  }
   const graphNodes = new WeakMap(), newGraphs = new Map();
   const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
@@ -110,10 +144,7 @@ PAGE = r"""(() => {
     }
     return parts.join(' > ');
   };
-  const label = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
-    (e.getAttribute('aria-labelledby') || '').split(' ')
-      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
-    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const label = e => controlCaption(e);
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   const nodes = Array.from(document.querySelectorAll(query));
@@ -336,10 +367,7 @@ PAGE = r"""(() => {
 
 # Native application-root proof and the visible badge predicate have one owner.
 _APPLICATION_ROOT = r"""
-  const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
-    (e.getAttribute('aria-labelledby') || '').split(' ')
-      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
-    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const entryLabel = e => controlCaption(e);
   const candidateVisible = e => {
     const rects=Array.from(e.getClientRects());
     if(!rects.length) return false;
@@ -708,6 +736,21 @@ _ASHBY_ROOT = r"""
         document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
         document.getElementById(labels[0].getAttribute('for'))===e;
       const field=fieldEntry(e);
+      // The shared caption rule; association also needs this census's own
+      // field-entry proof to name the same title.
+      const titleLabel=ashbyFieldTitle(e), titled=!!titleLabel && field?.title===titleLabel;
+      // ARCH 17:40: a native choice is captioned by its own single label[for]
+      // in the same application container, the caption PAGE reads for it.
+      const choiceLabel=!hiddenLabel && !linked && !!id && e.tagName==='INPUT' &&
+        ['radio','checkbox'].includes(e.type) && labels.length===1 &&
+        actualLabels.length===1 && actualLabels[0]===labels[0] &&
+        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&
+        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
+        !!clean(labels[0].innerText) &&
+        !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+          'area[href],audio[controls],video[controls],object,embed,iframe,'+
+          '[role],[tabindex],[contenteditable],[onclick]') ? labels[0] : null;
+      const ownLabel=linked ? labels[0] : hiddenLabel || (titled ? titleLabel : null) || choiceLabel;
       return {selector:sel,unique:document.querySelectorAll(sel).length===1,
         tag:e.tagName.toLowerCase(),
         type:ashbyYesNo(e) ? 'button' : e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
@@ -718,9 +761,14 @@ _ASHBY_ROOT = r"""
         // Membership only: a rooted Yes/No group has no proven requiredness.
         boolean_group:!!e.closest('div.ashby-application-form-input-yesno'),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
-        id,label:linked ? clean(labels[0].innerText) : hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) : '',
-        label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',
-        name:e.name || '',associated:linked || !!hiddenLabel,
+        id,label:titleLabel ? clean(titleLabel.innerText) : linked ? clean(labels[0].innerText) :
+          hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) :
+          choiceLabel ? clean(choiceLabel.innerText) : '',
+        label_selector:titleLabel ? selector(titleLabel) : linked ? selector(labels[0]) :
+          hiddenLabel ? selector(hiddenLabel) : choiceLabel ? selector(choiceLabel) : '',
+        name:e.name || '',associated:linked || !!hiddenLabel || titled || !!choiceLabel,
+        // A reported fact: is the one associated label itself visible?
+        label_visible:!!ownLabel && entryEvidenceVisible(ownLabel),
         ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
         in_container:!!controlContainer(e),
         ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),

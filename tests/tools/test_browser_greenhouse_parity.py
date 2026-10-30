@@ -32,7 +32,7 @@ def observe(kind='greenhouse', **scenario):
 
 
 async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *,
-                                              require_incomplete=True):
+                                              require_incomplete=True, reason=''):
     """Use the production application raw-click guard, not a test-only classifier.
 
     A loopback-only fixture is copied onto a synthetic HTTPS tracked row before
@@ -45,6 +45,12 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *
     if require_incomplete:
         assert page['opaque_controls'] is True
         assert page['inventory_verified'] is False
+    elif reason:
+        # Issue 256: a complete Greenhouse inventory (the unrendered .iti
+        # picker admitted as one phone receiver) must still stop at the one
+        # final guard for the named per-field reason, not an opaque gate.
+        assert page['opaque_controls'] is False
+        assert page['inventory_verified'] is True
     else:
         # Generic accessible preparation can keep the inventory complete.
         # Even an apparently settled choice has no Submit permission without
@@ -79,6 +85,8 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *
         forms.check_form(page, {}, True, pdf.name)
     if require_incomplete:
         assert 'form inventory is incomplete' in str(form_denial.value)
+    elif reason:
+        assert str(form_denial.value).startswith(reason)
     # Both synthetic DOM families have a fixed independent heading. Keep
     # the literal PAGE title through the HTTPS rebind; the final guard must
     # compare against that same exact observed row title, not a fuzzy alias.

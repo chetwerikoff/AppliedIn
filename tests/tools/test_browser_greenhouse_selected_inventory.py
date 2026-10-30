@@ -142,16 +142,26 @@ def _control(source, selector):
     return matches[0]
 
 
-def _unproven_final_inventory(page):
+def _unproven_final_inventory(page, opaque=0):
     # Generic accessibility may observe a picker without proving its form
     # value or every sibling widget. Only the one final Submit guard consumes
     # this complete-inventory requirement; reversible discovery still works.
-    assert page['inventory_verified'] is False
-    assert page['opaque_controls'] is True
-    assert page['opaque_count'] > 0
-    assert len(page['opaque_locators']) == page['opaque_count']
-    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+    # Issue 256 admits the unrendered .iti phone picker as one receiver, so it
+    # no longer masks the real question: only unproven widgets stay opaque.
+    assert page['greenhouse']['phone_pickers'] == 1
+    assert page['opaque_count'] == opaque == len(page['opaque_locators'])
+    assert page['opaque_controls'] is (opaque > 0)
+    assert page['inventory_verified'] is (opaque == 0)
+    with pytest.raises(forms.Gate, match='inventory is incomplete' if opaque else
+                       'Unverified or changed combobox value'):
         forms.check_form(page, {}, uploaded=True)
+    if opaque:
+        return
+    # Country is bound per field: a visually selected Country with its exact
+    # approved answer still has no proven form value, so Submit refuses it.
+    alone = dict(page, controls=[_control(page, '#country')])
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox value: Country'):
+        forms.check_form(alone, {'#country': 'Synthetic Country'}, uploaded=True)
 
 
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
@@ -247,17 +257,17 @@ def test_intact_country_subtree_outside_phone_fieldset_never_downgrades_to_gener
         assert _control(source, '#location')['type'] == 'combobox'
 
 
-@pytest.mark.parametrize('mutation,minimum_opaque', [
+@pytest.mark.parametrize('mutation,opaque', [
+    # The unknown combobox stays opaque; only the admitted phone picker left.
     ('valued-unknown', 1),
-    ('country-outside-fieldset', 1),
-    ('country-subtree-outside-fieldset', 1),
-    ('second-in-phone-fieldset', 2),
+    ('country-outside-fieldset', 0),
+    ('country-subtree-outside-fieldset', 0),
+    ('second-in-phone-fieldset', 1),
 ])
-def test_selected_country_does_not_hide_unproven_widgets(mutation, minimum_opaque):
+def test_selected_country_does_not_hide_unproven_widgets(mutation, opaque):
     out = selected_snapshot(mutation)
     page = out['page']
-    _unproven_final_inventory(page)
-    assert page['opaque_count'] >= minimum_opaque
+    _unproven_final_inventory(page, opaque)
     assert [c['selector'] for c in page['controls']] == [
         c['selector'] for c in out['witness']['controls']]
     if mutation in {'valued-unknown', 'second-in-phone-fieldset'}:

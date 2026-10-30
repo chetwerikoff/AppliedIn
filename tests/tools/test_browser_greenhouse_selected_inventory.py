@@ -50,6 +50,13 @@ def selected_snapshot(mutation=''):
                             'class="select__single-value">Synthetic Country</div>')
     elif mutation == 'unmounted-placeholder-c0':
         selected_country = '<div class="select__placeholder">Choose</div>'
+    elif mutation in {'flagged-country', 'two-flag-country', 'unknown-flag-country'}:
+        # Issue 259: the live shown value is only a flag and a dial code.
+        flags = {'flagged-country': '<div class="iti__flag iti__zz"></div>',
+                 'two-flag-country': ('<div class="iti__flag iti__zz"></div>'
+                                      '<div class="iti__flag iti__zy"></div>'),
+                 'unknown-flag-country': '<div class="iti__flag"></div>'}[mutation]
+        selected_country = f'<div class="select__single-value">{flags}<span>+99</span></div>'
     else:
         selected_country = '<div class="select__single-value">Synthetic Country</div>'
     markup = markup.replace(country_placeholder, selected_country, 1)
@@ -127,6 +134,7 @@ def selected_snapshot(mutation=''):
             '', 'retained-country-placeholder', 'unmounted-placeholder-c0',
             'unknown-country-reference', 'only-missing-country-error',
             'duplicate-country-placeholder', 'foreign-country-placeholder',
+            'flagged-country', 'two-flag-country', 'unknown-flag-country',
         }
 
     return json.loads(reader_output(

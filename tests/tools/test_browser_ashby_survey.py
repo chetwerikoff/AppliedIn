@@ -34,7 +34,7 @@ def _scope(page: dict, fixed: dict):
 
 def _valid(with_pane: bool):
     page, fixed = _observed(_spec(with_pane))
-    expected_error = 'application root sibling identity mismatch' if with_pane else ''
+    expected_error = ''
     for snapshot in (page, fixed):
         root = snapshot['entry']['formless']
         assert root['root'] == '' and root['container'] and root['submit']
@@ -46,6 +46,10 @@ def _valid(with_pane: bool):
                    for selector in _MAIN | {_SURVEY})
         assert evidence[_SURVEY]['associated'] is True
         assert evidence[_SURVEY]['label'] == _SURVEY_LABEL
+        assert evidence[_SURVEY]['ashby_survey'] is True
+        assert 'ashby_survey' not in evidence['#_systemfield_email']
+        assert next(c for c in snapshot['controls'] if c['selector'] == _SURVEY)[
+            'ashby_survey'] is True
         assert evidence[_SURVEY]['native_owner'] == ''
         assert evidence[_SURVEY]['declared_owner'] == ''
     scope, witness = _scope(page, fixed)
@@ -77,6 +81,25 @@ def test_survey_census_does_not_hide_main_labelled_checkbox(reader):
     assert choices[0]['associated_label_selector'] == '#hidden-attestation-label'
 
 
+@pytest.mark.parametrize('with_pane', [True, False], ids=['pane', 'no-pane'])
+def test_survey_email_collision_is_not_auto_granted(with_pane):
+    # A voluntary survey question can carry the same label as a globally
+    # approved fact. Receiver scope does not make it eligible for bank-auto.
+    page, fixed = _observed(_spec(with_pane, surveyLabel='Email'))
+    scope, witness = _scope(page, fixed)
+    assert _MAIN | {_SURVEY} <= scope
+    main = next(c for c in page['controls']
+                if c['selector'] == '#_systemfield_email')
+    survey = next(c for c in page['controls']
+                  if c['selector'] == _SURVEY)
+    assert main['label'] == survey['label'] == 'Email'
+    forms._reversible_entry_recipient(page, survey, witness)
+    assert forms._bank_auto_eligible(
+        main, 'synthetic@example.test', formless_selectors=scope)
+    assert not forms._bank_auto_eligible(
+        survey, 'synthetic@example.test', formless_selectors=scope)
+
+
 def _refused(with_pane: bool, **bad):
     # The positive control makes each negative regression fail on main through
     # live reader behavior, not a new string-constant or marker assertion.
@@ -98,6 +121,11 @@ def test_two_survey_sections_fail_closed(with_pane):
 @pytest.mark.parametrize('with_pane', [True, False], ids=['pane', 'no-pane'])
 def test_explicit_survey_submit_button_fails_closed(with_pane):
     _refused(with_pane, surveySubmit=True)
+
+
+@pytest.mark.parametrize('with_pane', [True, False], ids=['pane', 'no-pane'])
+def test_implicit_survey_submit_button_fails_closed(with_pane):
+    _refused(with_pane, surveyImplicitSubmit=True)
 
 
 @pytest.mark.parametrize('with_pane', [True, False], ids=['pane', 'no-pane'])

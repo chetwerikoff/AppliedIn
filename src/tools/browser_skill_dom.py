@@ -1369,21 +1369,40 @@ _GREENHOUSE_PHONE_PICKER = r"""
     phoneTel.push(w.children[1]);
     greenhouse.phone_pickers++;
   }
-  // Issue 259: preparation re-read of the country picker beside the ONE
-  // admitted tel input. react-select shows its choice only as a visual
-  // single-value node, so this is reported apart from the control: it is never
-  // a selected_text, a form value or Submit authority, only evidence that the
-  // exact option click took. Zero or several pickers or shown values give ''.
-  greenhouse.phone_country = {selector:'', display:''};
+  // Issue 259: re-read of the country picker beside the ONE admitted tel
+  // input. react-select shows its choice only as a visual single-value node,
+  // so this is reported apart from the control and never becomes its
+  // selected_text or form value. Only the exact Greenhouse phone-country proof
+  // in the apply module reads it, together with this session's own recorded
+  // option click. Zero or several pickers or shown values give ''.
+  // The shown value is only a flag and a dial code (+1 is several countries),
+  // so the flag's iti__<iso2> class is read from the shown value and from
+  // each open option: one entry per flag node, '' when it names no country.
+  const flagsOf = n => Array.from(n.querySelectorAll('.iti__flag')).map(f => {
+    const iso = (f.getAttribute('class') || '').split(/\s+/)
+      .map(c => /^iti__([a-z]{2})$/.exec(c)).filter(Boolean);
+    return iso.length === 1 ? iso[0][1] : '';
+  });
+  greenhouse.phone_country = {selector:'', display:'', single_values:0, expanded:false,
+    flags:[], option_flags:{}};
   const phoneSet = phoneTel.length === 1 ? phoneTel[0].closest('fieldset') : null;
   const phoneCombos = phoneSet ? Array.from(phoneSet.querySelectorAll('[role="combobox"]'))
     .filter(e => !pickerParts.has(e)) : [];
   if (phoneCombos.length === 1 && phoneSet.closest('form') === root) {
     const shown = Array.from(phoneSet.querySelectorAll('.select__single-value'));
     const owner = phoneCombos[0].closest('.select__value-container');
+    const one = shown.length === 1 && !!owner && owner.contains(shown[0]);
+    const listId = (phoneCombos[0].getAttribute('aria-controls') || '').trim();
+    const list = /^\S+$/.test(listId) ? byId(listId) : null;
+    const optionFlags = {};
+    if (list && list.getAttribute('role') === 'listbox')
+      Array.from(list.querySelectorAll('[role="option"]'))
+        .forEach(o => { optionFlags[selector(o)] = flagsOf(o); });
     greenhouse.phone_country = {selector:selector(phoneCombos[0]),
-      display:shown.length === 1 && !!owner && owner.contains(shown[0]) ?
-        clean(shown[0].innerText) : ''};
+      display:one ? clean(shown[0].innerText) : '',
+      single_values:shown.length,
+      expanded:phoneCombos[0].getAttribute('aria-expanded') !== 'false',
+      flags:one ? flagsOf(shown[0]) : [], option_flags:optionFlags};
   }
 """
 

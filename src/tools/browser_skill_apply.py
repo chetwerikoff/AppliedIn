@@ -855,7 +855,11 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
             if any(target.get(k, '') != receipt.get(k, '')
                    for k in ('label', 'question')):
                 raise Gate('The approved question changed; human review is required.')
-            if receipt.get('action') == 'combobox':
+            # Issue 259 (c): only the exact proven Greenhouse phone-country
+            # choice lacks an accessible caption and form value to compare.
+            if (receipt.get('action') == 'combobox'
+                    and not _greenhouse_phone_country_proven(
+                        page, target, receipt.get('approved_value'), history)):
                 combo = target.get('combobox') or {}
                 if (not _same(combo.get('selected_text', ''),
                               receipt.get('committed_caption', ''))
@@ -1280,6 +1284,76 @@ def _combo_receiver_allowed(page: dict, owner: dict, receiver: dict) -> bool:
             and bound.get('form_action') == root['submit'])
 
 
+def _greenhouse_phone_country_proven(page: dict, target: dict, answer,
+                                     receipts: list | None) -> bool:
+    """Issue 259 (c): the one receiverless choice that final Submit may accept.
+
+    Greenhouse's react-select #country in the phone fieldset has no name, no
+    hidden receiver and no accessible caption after a choice, so the generic
+    form-value proof can never hold. It is accepted only for that exact shape,
+    keyed "Phone country", when THIS session's controller clicked the one
+    option whose caption equals the approved answer exactly, recorded that
+    option's one flag country and the caption's trailing "+code", and the fresh
+    closed picker still shows exactly one value with that same flag and code.
+    Anything else returns False and the caller's normal refusal applies.
+    """
+    observed = page.get('greenhouse')
+    shown = observed.get('phone_country') if isinstance(observed, dict) else None
+    combo = target.get('combobox')
+    selector = target.get('selector')
+    form = target.get('form_selector')
+    if (urlsplit(str(page.get('url') or '')).hostname != 'job-boards.greenhouse.io'
+            or not isinstance(answer, str) or not answer or answer != answer.strip()
+            or not isinstance(shown, dict) or not isinstance(combo, dict)
+            or observed.get('phone_pickers') != 1
+            or not isinstance(selector, str) or not selector
+            or shown.get('selector') != selector
+            or shown.get('single_values') != 1 or shown.get('expanded') is not False
+            or target.get('type') != 'combobox' or target.get('tag') != 'input'
+            or target.get('label') != 'Country*' or target.get('question') != 'Phone'
+            or target.get('name') or target.get('value') or target.get('has_value')
+            or target.get('disabled') or target.get('in_form') is not True
+            or not form or not target.get('form_action')
+            or combo.get('linked') is not False or combo.get('options') not in (None, [])
+            or any(combo.get(k) for k in ('selected_text', 'selected_value',
+                                          'hidden_selector', 'hidden_value'))):
+        return False
+    # Exactly the tel receiver and this picker answer the "Phone" fieldset.
+    siblings = [c for c in page.get('controls', [])
+                if c.get('selector') != selector and c.get('form_selector') == form
+                and c.get('question') == 'Phone']
+    if (sum(c.get('type') == 'tel' for c in siblings) != 1
+            or any(c.get('type') != 'tel' and (_could_receive_an_answer(c)
+                                                or native_submit(c))
+                   for c in siblings)):
+        return False
+    try:
+        if _key(page, target) != PHONE_COUNTRY_KEY:
+            return False
+    except Gate:
+        return False
+    effects = [r for r in receipts or [] if isinstance(r, dict)
+               and r.get('action') == 'combobox' and r.get('selector') == selector]
+    if len(effects) != 1:
+        return False
+    effect = effects[0]
+    # The shown value is a flag and a dial code only: the flag's country must
+    # be the one this session clicked, and the code the approved caption's own.
+    flag, code = effect.get('country_flag'), effect.get('dial_code')
+    return (not effect.get('unresolved')
+            and effect.get('fact') == PHONE_COUNTRY_KEY
+            and effect.get('url') == page.get('url')
+            and effect.get('approved_value') == answer
+            and effect.get('committed_caption') == answer
+            and effect.get('committed_value') == answer
+            and isinstance(flag, str) and re.fullmatch(r'[a-z]{2}', flag) is not None
+            and isinstance(code, str) and code == _dial_code(answer) != ''
+            and shown.get('flags') == [flag]
+            and shown.get('display') == code
+            and not effect.get('hidden_selector')
+            and not effect.get('hidden_value'))
+
+
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                receipts: list | None = None) -> None:
     if page.get('truncated') or page.get('inventory_verified') is not True:
@@ -1381,6 +1455,12 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             if (not target.get('required') and not has_selection and expected is None
                     and not target.get('has_value')
                     and not str(target.get('value') or '').strip()):
+                continue
+            # Issue 259 (c): the one exact Greenhouse phone-country shape has
+            # no form value to read back; its own proof replaces only that.
+            if _greenhouse_phone_country_proven(page, target, expected, receipts):
+                _final_exact_grant(page, target, expected, filled, receipts)
+                guarded_value(target, expected)
                 continue
             # Closing a listbox may remove aria-controls. At the sole final
             # guard, only fresh displayed and submitted values establish the
@@ -3491,6 +3571,13 @@ def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
 
 
 PHONE_COUNTRY_KEY = 'Phone country'
+
+
+def _dial_code(caption) -> str:
+    """The one trailing "+code" of a Greenhouse phone-country caption, or ''."""
+    match = (re.fullmatch(r'[^+]*\S \+([0-9]{1,4})', caption)
+             if isinstance(caption, str) else None)
+    return '+' + match.group(1) if match else ''
 
 
 def _required_caption(text) -> str:
@@ -5708,6 +5795,9 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
         if not options:
             return unresolved()
         matches = [option for option in options if _same(answer, option['label'])]
+        if question['label'] == PHONE_COUNTRY_KEY:
+            # The Submit proof binds this click's exact caption, not a near match.
+            matches = [option for option in matches if option['label'] == answer]
         if len(matches) != 1:
             return unresolved()
         selected = matches[0]
@@ -5749,8 +5839,21 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                      if before.get('hidden_selector')
                      and c.get('selector') == before['hidden_selector']
                      and before['hidden_selector'] in latest_witness]
-        await _effect_call(session, 'click', selected['selector'])
+        phone_country = None
         if question['label'] == PHONE_COUNTRY_KEY:
+            # Issue 259: the shown choice is only a flag and a dial code, so
+            # the clicked option must name exactly one flag country and end in
+            # its one "+code". Without both nothing is clicked.
+            listed = (((latest.get('greenhouse') or {}).get('phone_country') or {})
+                      .get('option_flags') or {})
+            flags = listed.get(selected['selector']) if isinstance(listed, dict) else None
+            code = _dial_code(selected['label'])
+            if (selected['label'] != answer or not code or not isinstance(flags, list)
+                    or len(flags) != 1 or not re.fullmatch(r'[a-z]{2}', str(flags[0]))):
+                return unresolved()
+            phone_country = {'country_flag': flags[0], 'dial_code': code}
+        await _effect_call(session, 'click', selected['selector'])
+        if phone_country is not None:
             # Issue 259: react-select keeps no caption or form value on the
             # control, so re-read the picker's own shown choice in its phone
             # fieldset before recording anything. A missing, different or
@@ -5768,7 +5871,10 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                         'form_action', 'formaction', 'name', 'disabled'))
                         or _key(after, reread) != PHONE_COUNTRY_KEY
                         or shown.get('selector') != reread['selector']
-                        or shown.get('display') != selected['label']):
+                        or shown.get('single_values') != 1
+                        or shown.get('expanded') is not False
+                        or shown.get('flags') != [phone_country['country_flag']]
+                        or shown.get('display') != phone_country['dial_code']):
                     return unresolved()
             except Gate:
                 return unresolved()
@@ -5784,6 +5890,8 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                 'hidden_value_before': before.get('hidden_value', ''),
                 'hidden_value': committed if before.get('hidden_selector') else '',
                 **({'hidden_name': receivers[0].get('name')} if len(receivers) == 1 else {}),
+                # This session's own exact click, re-read; the Submit proof needs it.
+                **(phone_country or {}),
                 **({'witnessed_options': witnessed_options,
                     'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
                    if witnessed_options is not None else {})}

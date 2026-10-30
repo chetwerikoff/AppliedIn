@@ -48,6 +48,13 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
         # generic unbanked free text keeps its original model-first boundary.
         question = field('Desired salary', '#screening', type='text',
                          form_action=case.url)
+    elif kind == 'salary_select':
+        # A required salary choice is bank-held but explicitly owner-only.
+        question = field(
+            'Desired salary', '#screening', tag='select', type='select',
+            options=[{'value': 'range-a', 'label': 'Synthetic range A'},
+                     {'value': 'range-b', 'label': 'Synthetic range B'}],
+            form_action=case.url)
     else:
         assert kind == 'select'
         question = field(
@@ -182,6 +189,68 @@ async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
     assert not any(call[0] == 'click' and call[1] == '#submit'
                    for call in raw.calls)
 
+
+async def test_bank_held_required_greenhouse_salary_is_direct_owner_gate(monkeypatch):
+    """Bank-auto refuses salary, but the required answer remains owner-answerable."""
+    salary = 'Synthetic range A'
+    case, raw, stores = tracked_greenhouse(
+        monkeypatch, kind='salary_select',
+        bank_facts={'Phone': PHONE, 'Desired salary': salary})
+    # This is the real bank-auto predicate, not a mocked refusal. An ordinary
+    # bank value cannot authorize a salary disclosure for this job/form.
+    assert not forms._bank_auto_eligible(case.page['controls'][1], salary)
+
+    async def model_must_not_run(*a, **kw):
+        pytest.fail('Required bank-held salary must gate before model review')
+
+    monkeypatch.setattr(bsk, 'decision', model_must_not_run)
+    result = await run._apply_direct(case.pk, stores)
+    assert result['result'] == 'gated', result
+
+    row = stores.tracking.get(case.pk)
+    assert row['status'] == 'needs_human'
+    assert row['gate_reason'] == 'owner_question'
+    assert row['gate_source'] == 'applier'
+    assert row['gate_call_id'] == 'direct'
+    assert row['gate_pending']['review_route'] == 'owner'
+    expected_question = {
+        'pk': case.pk,
+        'label': 'Desired salary',
+        'selector': '#screening',
+        'url': case.url,
+        'control_label': 'Desired salary',
+        'question': '',
+        'tag': 'select',
+        'type': 'select',
+        'form_selector': '#application',
+        'form_action': case.url,
+        'origin_row': {
+            'jd_url': case.wrapper, 'company': COMPANY, 'ats': 'greenhouse',
+        },
+        'options': [
+            {'value': 'range-a', 'label': 'Synthetic range A'},
+            {'value': 'range-b', 'label': 'Synthetic range B'},
+        ],
+    }
+    assert row['gate_pending']['form_question'] == expected_question
+    assert run._direct_form_label(case.pk, row) == 'Desired salary'
+    tokens = server._owner_gate_tokens(row)
+    assert tokens['gate_generation']
+    assert tokens['gate_question_identity'] == forms.owner_question_identity(
+        case.pk, expected_question)
+    assert tokens['gate_skip_eligible'] is False
+
+    # The separately approved phone can settle. The bank-held salary cannot
+    # fill, gain an automatic grant, or enqueue/submit an application.
+    assert raw.writes == [('fill', '#phone')]
+    assert raw.target('#screening')['has_value'] is False
+    assert raw.target('#screening')['value'] == ''
+    assert set(row['human_approved_answers']) == {'Phone'}
+    assert stores.answer_bank.facts['Desired salary'] == salary
+    assert stores.answer_bank.writes == []
+    assert ApplyQueue(stores.tracking.r).pending() == []
+    assert not any(call[0] == 'click' and call[1] == '#submit'
+                   for call in raw.calls)
 
 async def test_greenhouse_global_bank_answers_still_auto_fill(monkeypatch):
     """Owner routing changes no guarded native bank-authorized write path."""

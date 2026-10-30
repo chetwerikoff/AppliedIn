@@ -4818,6 +4818,63 @@ def _bootstrap_grant_diagnostics(fn):
     return recorded
 
 
+def _is_required_proxy(control: dict) -> bool:
+    """The id-less, unlabeled required text input a Greenhouse react-select mounts."""
+    return (control.get('tag') == 'input' and control.get('type') == 'text'
+            and bool(control.get('required')) and not label(control)
+            and not str(control.get('selector', '')).startswith('#'))
+
+
+def _required_proxy_owners(controls: list) -> dict:
+    """Map each required proxy's selector to the id-bound combobox just before it.
+
+    Issue #264: Greenhouse follows every required react-select with an
+    `input.requiredInput` that has no id, so its only selector is a positional
+    nth-of-type path. Live read: picking a Location option makes react-select
+    stop rendering that input (the combobox now holds the value), which made the
+    settlement loop refuse a control nothing had lost. The proxy's stable
+    identity is the combobox that owns it, whose `#id` selector survives every
+    write, not its own path.
+    """
+    owners = {}
+    for before, control in zip(controls, controls[1:]):
+        if (_is_required_proxy(control) and before.get('type') == 'combobox'
+                and str(before.get('selector', '')).startswith('#')):
+            owners[control['selector']] = before
+    return owners
+
+
+def _rebind_required_proxy(page: dict, proxy: dict, owner: dict):
+    """Resolve a vanished required proxy through its owner, or None to refuse.
+
+    Returns the same proxy under a shifted selector, or True when the proxy
+    is gone because its owner now holds a committed value. An owner that is
+    absent, ambiguous, or still unanswered refuses: that is a true loss.
+    """
+    controls = page['controls']
+    at = [i for i, c in enumerate(controls) if c['selector'] == owner['selector']]
+    if len(at) != 1 or controls[at[0]].get('type') != 'combobox':
+        return None
+    current = controls[at[0]]
+    following = controls[at[0] + 1] if at[0] + 1 < len(controls) else None
+    if (following is not None and _is_required_proxy(following)
+            and following.get('form_selector') == proxy.get('form_selector')
+            and sum(c['selector'] == following['selector'] for c in controls) == 1):
+        return following
+    if current.get('required') and (current.get('combobox') or {}).get('selected_text'):
+        return True
+    return None
+
+
+def _vanished_required_gate(control: dict, owner: dict | None) -> Gate:
+    """Name the lost control: unlike the bare message, it says which one."""
+    name = re.sub(r'\s+', ' ', label(control)).strip()[:80]
+    if not name and owner is not None:
+        name = 'unlabeled, after "%s"' % re.sub(r'\s+', ' ', label(owner)).strip()[:80]
+    return Gate('A previously observed required control disappeared: '
+                f'label "{name or "unlabeled"}", selector {str(control.get("selector"))[:400]}.')
+
+
 @_bootstrap_grant_diagnostics
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
                      *origins: str, fixture_context=None,
@@ -4989,6 +5046,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
     # The complete current form and all receipts are checked only at Submit.
     seen = set()
     ordinal = 0
+    proxy_owners = _required_proxy_owners(page['controls'])
     # PAGE order, one logical record per required control (one per radio group).
     # Rebind after each committed write: a previous PAGE must not authorize the next.
     for initial in list(page['controls']):
@@ -5012,7 +5070,16 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         # without prematurely treating a disabled *optional* sibling as a Gate.
         matches = [c for c in page['controls'] if c['selector'] == initial['selector']]
         if len(matches) != 1:
-            raise Gate('A previously observed required control disappeared.')
+            owner = proxy_owners.get(initial['selector'])
+            rebound = (_rebind_required_proxy(page, initial, owner)
+                       if not matches and owner is not None else None)
+            if rebound is None:
+                raise _vanished_required_gate(initial, owner)
+            if rebound is True:
+                # The owning combobox holds the committed value; Submit still
+                # checks that value against fresh readback.
+                continue
+            matches = [rebound]
         item = matches[0]
         eligible = kind in _BOOTSTRAP_TYPES and (
             kind != 'select' or item.get('tag') == 'select')

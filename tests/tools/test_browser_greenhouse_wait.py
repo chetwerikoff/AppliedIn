@@ -460,3 +460,22 @@ async def test_wrongtyped_page_caption_cannot_hide_behind_unready_inventory(fast
     with pytest.raises(forms.Gate, match='malformed'):
         await wait(session(raw))
     assert len(raw.reads) == 1
+
+
+@pytest.mark.parametrize('flag', ['opaque_controls', 'shadow_roots'])
+async def test_admitted_not_ready_page_is_recorded_and_named(fast, flag):
+    """Issue #254: a read refused as not ready inside the reader is still a read."""
+    async def persistent(index, kind, value):
+        value[flag] = True
+        value['inventory_verified'] = False
+        return value
+    raw = Raw(hook=persistent)
+    with pytest.raises(forms.Gate) as caught:
+        await wait(session(raw), duration=0.2)
+    assert set(raw.reads) == {'page'}
+    assert str(caught.value).startswith(f'{flag} application inventory after bounded wait')
+    observed = caught.value.wait_predicates
+    assert observed['read.page_available'] == 'true'
+    assert observed['read.origin_allowed'] == 'true'
+    assert observed[flag] == 'true'
+    assert observed['inventory_verified'] == 'false'

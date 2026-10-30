@@ -2047,7 +2047,11 @@ class _GreenhouseSession:
                     # flags present must not conceal a not-ready intermediate read.
                     reason = _greenhouse_not_ready(page, witness=True)
                 if reason:
-                    raise _EntryNotReady(reason)
+                    not_ready = _EntryNotReady(reason)
+                    # Issue #254: the waiter must record this admitted read,
+                    # not report the PAGE as unknown/unavailable.
+                    not_ready.observed_page = page
+                    raise not_ready
         return result
 
 
@@ -2587,6 +2591,11 @@ def _greenhouse_not_ready(page, *, witness=False):
     flags = ('inventory_verified', 'truncated', 'opaque_controls', 'shadow_roots')
     if any(type(page.get(k)) is not bool for k in flags if not witness or k in page):
         raise Gate('The current form control inventory is malformed.')
+    for key in ('opaque_controls', 'shadow_roots'):
+        # Name the observed flag as _entry_not_ready does. A truncated read
+        # keeps the generic reason: its own text selects reversible fallback.
+        if page.get(key) is True:
+            return key + ' application inventory'
     if any(page.get(k) is (False if k == 'inventory_verified' else True)
            for k in flags if not witness or k in page):
         return 'unverified application inventory'
@@ -2672,8 +2681,14 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                                    'no qualifying application form')
                     previous = identity
             except _EntryNotReady as exc:
+                observed = getattr(exc, 'observed_page', None)
                 if phase == 'safety' or (phase == 'page' and entry_session):
                     diagnostics.safety_failed(page or {}, exc)
+                elif phase == 'page' and greenhouse and isinstance(observed, dict):
+                    # _GreenhouseSession.call admitted this PAGE before its
+                    # readiness refusal; record the read it actually made.
+                    diagnostics.page(observed)
+                    diagnostics.safety_passed()
                 last_reason, previous = str(exc), None
                 diagnostics.set('pair.stable', None)
             except TimeoutError as exc:

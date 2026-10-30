@@ -1169,13 +1169,17 @@ async def test_upload_requires_independent_fixed_readback(monkeypatch, tmp_path)
     assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
 
 
-async def test_previous_structural_grant_drift_is_not_reasked(monkeypatch):
+async def test_previous_structural_grant_drift_reasks_that_field(monkeypatch):
+    # Issue #258 (b'): an approval that no longer binds names its key and
+    # re-asks that one field on the current page; it is never written.
     row, raw, session, page, provenance = await admitted(monkeypatch)
     facts = approve_fields(row, page, raw.fixed, provenance)
     row['human_approved_answers']['Name']['form_action'] = '#changed-submit'
-    with pytest.raises(forms.Gate, match='Previously approved structural root or submit changed') as gate:
+    with pytest.raises(forms.Gate, match='Previously approved answer for "Name" no longer binds') as gate:
         await forms._bootstrap(session, page, PK, facts, provenance=provenance)
-    assert gate.value.form_question is None
+    question = gate.value.form_question
+    assert question['label'] == 'Name' and question['pk'] == PK
+    assert question['form_action'] == forms._formless_root(page)['submit']
     no_mutations(raw)
 
 

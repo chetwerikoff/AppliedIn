@@ -478,3 +478,125 @@ def test_standalone_page_identity_ignores_one_survey_container():
     assert [r['selector'] for r in dom(spec, PAGE)['application_identity']] == [
         '#application-fields']
     assert dom(_spec(False, surveyExtraContainer=True), PAGE)['application_identity'] == []
+
+
+# Issue #258: both live captures carry a caption-less picker toggle inside the
+# location field entry. It is a boundary member, but it receives no answer.
+# The persistence tests leave out the voluntary survey radios: an unanswered
+# optional radio group still stops at its own key gate, which is not this fix.
+_TOGGLE = dict(liveLocationToggle=True, surveyChoices=False)
+
+
+async def _entry_bootstrap(monkeypatch, row, raw, provenance, facts):
+    import asyncio
+    from tests.tools.test_browser_application_entry import COMPANY, PK, posting
+
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    return await forms._bootstrap(session, page, PK, facts, posting('ashby'),
+                                  company=COMPANY, provenance=provenance,
+                                  global_facts=dict(facts))
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+async def test_location_grant_binds_on_the_next_run_past_its_toggle(monkeypatch, shape):
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    row, raw, _, provenance = root_world(monkeypatch, **{**_LIVE[shape], **_TOGGLE})
+    toggle = [c for c in raw.current['controls'] if c.get('tag') == 'button'
+              and c['label'] == '' and c.get('question') == _LOCATION]
+    assert len(toggle) == 1
+    members = {c['selector'] for c in forms._formless_boundary(raw.current, _provenance())}
+    assert toggle[0]['selector'] in members
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {**_FACTS, _LOCATION: 'Synthetic City'}
+    # Run 1 lacks one bank answer and stops at its question.
+    with pytest.raises(forms.Gate, match='exact human-approved answer is needed for "Name"'):
+        await _entry_bootstrap(monkeypatch, row, raw, provenance,
+                               {k: v for k, v in facts.items() if k != 'Name'})
+    assert set(row['human_approved_answers']) == {'Email', _LOCATION}
+    # Run 2 on the unchanged page: the stored grants bind, the toggle borrows
+    # no key, and preparation continues without a "Previously approved" gate.
+    returned = await _entry_bootstrap(monkeypatch, row, raw, provenance, facts)
+    assert returned['url'] == entry('ashby')
+    assert set(row['human_approved_answers']) == {'Name', 'Email', _LOCATION}
+    assert len(writes) == 2
+    no_mutations(raw)
+
+
+@pytest.mark.parametrize('shape', ['openai', 'airwallex'])
+async def test_location_grant_binds_in_the_same_run_past_its_toggle(monkeypatch, shape):
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    row, raw, _, provenance = root_world(monkeypatch, **{**_LIVE[shape], **_TOGGLE})
+    writes = _issue182_tracking(monkeypatch, row)
+    facts = {**_FACTS, _LOCATION: 'Synthetic City'}
+    returned = await _entry_bootstrap(monkeypatch, row, raw, provenance, facts)
+    assert returned['url'] == entry('ashby')
+    assert set(row['human_approved_answers']) == {'Name', 'Email', _LOCATION}
+    assert len(writes) == 1
+    no_mutations(raw)
+
+
+# Issue #258 AC3: the OpenAI capture's two acknowledgement checkboxes. PAGE
+# reads them as value "on", unchecked; only the fixed witness sees them hidden.
+_ATTESTATIONS = dict(_TOGGLE, liveAttestations=True)
+
+
+def _attestation_readings(page: dict, fixed: dict):
+    assert page['entry']['formless']['root'] == '#form'
+    for selector in ('#attestation-0', '#attestation-1'):
+        observed = next(c for c in page['controls'] if c['selector'] == selector)
+        hidden = next(c for c in fixed['controls'] if c['selector'] == selector)
+        assert observed['value'] == 'on' and observed['has_value'] is True
+        assert 'ashby_hidden_choice' not in observed
+        assert hidden['ashby_hidden_choice'] is True and hidden['visible'] is False
+    members = {c['selector'] for c in forms._formless_boundary(page, _provenance())}
+    assert {'#attestation-0', '#attestation-1'} <= members
+
+
+@pytest.mark.parametrize('link', [True, False], ids=['agreement-link', 'no-link'])
+async def test_openai_attestation_reaches_its_owner_question(monkeypatch, link):
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    changes = {**_LIVE['openai'], **_ATTESTATIONS,
+               **({} if link else {'liveAttestations': 'no-link'})}
+    row, raw, _, provenance = root_world(monkeypatch, **changes)
+    _attestation_readings(raw.current, raw.fixed)
+    _issue182_tracking(monkeypatch, row)
+    facts = {**_FACTS, _LOCATION: 'Synthetic City'}
+    for _run in range(2):
+        # Not a "Previously approved" dead end, in the first run or the next.
+        with pytest.raises(forms.Gate, match='exact human-approved answer is needed') as gate:
+            await _entry_bootstrap(monkeypatch, row, raw, provenance, facts)
+        assert 'Previously approved' not in str(gate.value)
+        assert gate.value.reason == 'owner_question'
+        question = gate.value.form_question
+        assert question['selector'] == '#attestation-0'
+        assert question['type'] == 'checkbox' and question['ashby_hidden_choice'] is True
+        assert question['visible'] is False
+    assert set(row['human_approved_answers']) == {'Name', 'Email', _LOCATION}
+    # Nothing is checked: the attestation waits for the owner's exact answer.
+    no_mutations(raw)
+
+
+async def test_checked_attestation_without_grant_is_asked_and_refused_at_submit(monkeypatch):
+    from tests.tools.test_browser_formless import _issue182_tracking, no_mutations, root_world
+
+    row, raw, _, provenance = root_world(
+        monkeypatch, **{**_LIVE['openai'], **_ATTESTATIONS, 'attestationChecked': 1})
+    _issue182_tracking(monkeypatch, row)
+    facts = {**_FACTS, _LOCATION: 'Synthetic City'}
+    with pytest.raises(forms.Gate) as gate:
+        await _entry_bootstrap(monkeypatch, row, raw, provenance, facts)
+    assert 'Previously approved' not in str(gate.value)
+    assert gate.value.form_question['selector'] == '#attestation-0'
+    # The existing final check still refuses the pre-checked, ungranted box.
+    boxes = [c for c in raw.current['controls'] if c['selector'] == '#attestation-1']
+    assert boxes[0]['checked'] is True
+    with pytest.raises(forms.Gate, match='Unverified preselected answer'):
+        forms.check_form(dict(raw.current, controls=boxes), {}, True)
+    no_mutations(raw)

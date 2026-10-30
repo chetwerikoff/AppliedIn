@@ -3682,6 +3682,19 @@ def _issue218_main_reader_scripts():
     root_guard = hidden_label_guard('ls[0]', '          ')
     assert old.count(root_guard) == 1
     old = old.replace(root_guard, '', 1)
+    # The #256 Greenhouse-only phone-picker proof lives outside both Ashby
+    # entry readers; remove only that exact block and its one composition.
+    start = source.index('# Issue 256: every live Greenhouse embed read')
+    end = source.index('def greenhouse_reader(script: str) -> str:')
+    assert source.count('_GREENHOUSE_PHONE_PICKER') == 2 and start < end
+    assert producer._GREENHOUSE_PHONE_PICKER not in forms.ENTRY_PAGE
+    assert producer._GREENHOUSE_PHONE_PICKER not in forms._ENTRY_FIXED_CONTROL_WITNESS
+    source = source[:start] + source[end:]
+    composed = ("    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH +\n"
+                "                            _GREENHOUSE_PHONE_PICKER)\n")
+    assert source.count(composed) == 1
+    source = source.replace(composed, "    script = script.replace(_WIDGET_GRAPH, "
+                            "_GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
     assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1

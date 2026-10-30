@@ -1302,9 +1302,78 @@ _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""
 """
 
 
+# Issue 256: every live Greenhouse embed read (Waymo, Stripe, Databricks) has
+# an intl-tel-input (.iti) country picker beside the phone input. Its container
+# is not rendered (display:none); the visible #country combobox in the same
+# phone fieldset is the country receiver, answered from the bank like any other
+# field. The generic reader still counted the 247 unrendered picker nodes as
+# opaque, so no embed inventory could ever qualify. This is the Greenhouse
+# reader only, never the generic graph: admit exactly this closed, unrendered
+# shape inside the bound form, so its parts leave the inventory and the tel
+# input stays the ONE phone receiver. Nothing here chooses a country. A
+# rendered, extra, foreign-linked or unknown part admits nothing, so every
+# picker node stays opaque and the inventory still refuses.
+_GREENHOUSE_PHONE_PICKER = r"""
+  const itiIs = (e, tag, c) => !!e && e.tagName === tag &&
+    (e.getAttribute('class') || '').split(/\s+/).includes(c);
+  const itiRefs = id => Array.from(document.querySelectorAll('[aria-controls],[aria-owns]'))
+    .filter(n => ['aria-controls','aria-owns'].some(k =>
+      (n.getAttribute(k) || '').trim().split(/\s+/).includes(id)));
+  const itiOwned = (e, owner) => !!e.id && byId(e.id) === e &&
+    itiRefs(e.id).length === 1 && itiRefs(e.id)[0] === owner &&
+    owner.getAttribute('aria-controls') === e.id && !owner.hasAttribute('aria-owns');
+  const phonePicker = w => {
+    const kids = Array.from(w.children);
+    if (!root || !root.contains(w) || w.closest('form') !== root || kids.length !== 2 ||
+        !itiIs(kids[0], 'DIV', 'iti__country-container') ||
+        !itiIs(kids[1], 'INPUT', 'iti__tel-input') || kids[1].type !== 'tel' ||
+        w.querySelectorAll('.iti').length) return null;
+    const box = kids[0], parts = Array.from(box.children);
+    if (box.getClientRects().length || parts.length !== 2) return null;
+    const [button, dialog] = parts;
+    const search = Array.from(box.querySelectorAll('[role="combobox"]'));
+    const lists = Array.from(box.querySelectorAll('[role="listbox"]'));
+    if (!itiIs(button, 'BUTTON', 'iti__selected-country') || button.type !== 'button' ||
+        !itiIs(dialog, 'DIV', 'iti__dropdown-content') ||
+        dialog.getAttribute('role') !== 'dialog' || !itiOwned(dialog, button) ||
+        search.length !== 1 || !itiIs(search[0], 'INPUT', 'iti__search-input') ||
+        search[0].type !== 'search' || lists.length !== 1 ||
+        !itiIs(lists[0], 'UL', 'iti__country-list') || !itiOwned(lists[0], search[0]) ||
+        !dialog.contains(search[0]) || !dialog.contains(lists[0])) return null;
+    const list = lists[0], options = Array.from(list.children);
+    if (!options.length || options.some(o => !itiIs(o, 'LI', 'iti__country') ||
+        o.getAttribute('role') !== 'option' || o.querySelectorAll(query).length ||
+        unsafeOption(o))) return null;
+    // Only the button, the search, its clear button and the options act.
+    const all = Array.from(box.querySelectorAll('*'));
+    const acting = new Set([button, search[0], ...options]);
+    const clear = all.filter(n => itiIs(n, 'BUTTON', 'iti__search-clear'));
+    if (clear.length > 1 || (clear.length && clear[0].type !== 'button')) return null;
+    clear.forEach(n => acting.add(n));
+    const roles = new Map([[dialog, 'dialog'], [search[0], 'combobox'], [list, 'listbox']]);
+    options.forEach(o => roles.set(o, 'option'));
+    if (all.some(n => n.tagName.includes('-') || n.shadowRoot ||
+        (n.matches(query) && !acting.has(n)) || n.hasAttribute('aria-owns') ||
+        (n.hasAttribute('aria-controls') && n !== button && n !== search[0]) ||
+        (n.hasAttribute('role') && roles.get(n) !== n.getAttribute('role')) ||
+        n.matches('a,select,textarea,form,iframe,object,embed,canvas,[contenteditable],'+
+          '[formaction],[form],[name],[onclick]'))) return null;
+    return [box, ...all];
+  };
+  greenhouse.phone_pickers = 0;
+  for (const w of Array.from(document.querySelectorAll('.iti'))) {
+    const parts = itiIs(w, 'DIV', 'iti') ? phonePicker(w) : null;
+    if (!parts) continue;
+    parts.forEach(n => pickerParts.add(n));
+    greenhouse.phone_pickers++;
+  }
+"""
+
+
 def greenhouse_reader(script: str) -> str:
     """Visible-only observation, selected by current typed alias in the controller."""
-    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)
+    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH +
+                            _GREENHOUSE_PHONE_PICKER)
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")

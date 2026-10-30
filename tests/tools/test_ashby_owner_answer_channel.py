@@ -97,7 +97,7 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
     return stores, raw, decision
 
 
-async def _gate(stores, expected_label):
+async def _gate(stores, expected_label=None):
     result = await run._apply_direct(PK, stores)
     assert result["result"] == "gated", result
     row = stores.tracking.get(PK)
@@ -106,7 +106,9 @@ async def _gate(stores, expected_label):
     assert row["gate_call_id"] == "direct"
     assert row["gate_source"] == "applier"
     question = row["gate_pending"]["form_question"]
-    assert question["label"] == expected_label
+    assert question["label"]
+    if expected_label is not None:
+        assert question["label"] == expected_label
     tokens = server._owner_gate_tokens(row)
     assert tokens["gate_generation"]
     assert tokens["gate_question_identity"] == forms.owner_question_identity(PK, question)
@@ -195,7 +197,7 @@ async def test_ashby_hidden_attestation_needs_exact_owner_yes(monkeypatch):
     facts = {**_FACTS, _LOCATION: "Synthetic City"}
     stores, raw, decision = _world(
         monkeypatch, "openai", facts, attestations=True)
-    row, tokens = await _gate(stores, row_label := "Synthetic acknowledgement")
+    row, tokens = await _gate(stores)
     question = row["gate_pending"]["form_question"]
     assert question["type"] == "checkbox"
     assert question["ashby_hidden_choice"] is True
@@ -206,5 +208,18 @@ async def test_ashby_hidden_attestation_needs_exact_owner_yes(monkeypatch):
         expected_gate_generation=tokens["gate_generation"],
         expected_question_identity=tokens["gate_question_identity"])["reason"] == "invalid_answer"
     assert stores.answer_bank.writes == []
+    approved = run.resume_job(
+        PK, "yes", stores, disposition="answer",
+        expected_gate_generation=tokens["gate_generation"],
+        expected_question_identity=tokens["gate_question_identity"])
+    assert approved["result"] == "queued", approved
+    grant = stores.tracking.get(PK)["human_approved_answers"][question["label"]]
+    assert grant["value"] == "yes"
+    assert grant["selector"] == "#attestation-0"
+    # Material assent is never written to the reusable bank.
+    assert stores.answer_bank.writes == []
+    second, next_tokens = await _gate(stores)
+    assert second["gate_pending"]["form_question"]["selector"] == "#attestation-1"
+    assert next_tokens["gate_generation"] != tokens["gate_generation"]
     assert decision.await_count == 0
     no_mutations(raw)

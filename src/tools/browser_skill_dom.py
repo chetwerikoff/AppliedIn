@@ -16,6 +16,40 @@ _DIAGNOSTIC_MAX_CHARS = 8192
 _WIDGET_GRAPH = r"""
   // Accessible roles and relationships only: no site/library selectors, C0/C1/C2
   // phases or page-controlled exceptions to a privileged application write.
+  // Issue #252: one caption rule for PAGE, both witnesses and the root census
+  // (declarations, so the entry root code above may call them). On Ashby a
+  // placeholder is never a label. An id-less, formless text-like input takes
+  // only the single question title of its own field entry inside the one main
+  // or one survey container; zero or several titles, or a title owned by
+  // another live control, give no caption.
+  function ashbyFieldTitle(e) {
+    if (!(location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com') ||
+        e.tagName!=='INPUT' || e.id || e.form || e.closest('form') ||
+        document.querySelector('form') || ['checkbox','radio','file','hidden','submit',
+          'button','image','reset'].includes(e.type)) return null;
+    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+    const main=all.filter(c=>!c.closest('.ashby-survey-form-container'));
+    const inner=surveys.length===1 ? all.filter(c=>surveys[0].contains(c)) : [];
+    const regions=main.length!==1 || surveys.length>1 ? [] :
+      [main[0], ...(inner.length===1 ? inner : [])];
+    const region=regions.find(r=>r.contains(e));
+    const entry=region ? e.closest('div.ashby-application-form-field-entry') : null;
+    if (!entry || !region.contains(entry)) return null;
+    const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
+    const owner=titles.length===1 ? titles[0].getAttribute('for') : null;
+    return titles.length===1 && !(owner && document.getElementById(owner)) ? titles[0] : null;
+  }
+  function controlCaption(e) {
+    const title=ashbyFieldTitle(e);
+    if (title) return clean(title.innerText);
+    const ashby=location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com';
+    return clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
+      (e.getAttribute('aria-labelledby') || '').split(' ')
+        .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
+      e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||
+      e.innerText || e.name);
+  }
   const graphNodes = new WeakMap(), newGraphs = new Map();
   const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
@@ -38,7 +72,11 @@ _WIDGET_GRAPH = r"""
   // Explicit labels inside the application receiver, not sibling jobs or footers.
   const applicationIdentity=()=>{
     const roots=Array.from(document.querySelectorAll('form'));
-    const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+    // One survey's single nested container is not a second application root.
+    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+    const main=all.filter(e=>!e.closest('.ashby-survey-form-container'));
+    const containers=surveys.length===1 && all.length-main.length===1 ? main : all;
     if(containers.length===1 && !containers[0].closest('form')) roots.push(containers[0]);
     const id=/^(?:job|requisition|req|posting)\s*(?:id|number|#)\s*[:#]\s*(\S.{0,159})$/i;
     const employer=/^(?:employer|company(?:\s+name)?)\s*:\s*(\S.{0,159})$/i;
@@ -106,10 +144,7 @@ PAGE = r"""(() => {
     }
     return parts.join(' > ');
   };
-  const label = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
-    (e.getAttribute('aria-labelledby') || '').split(' ')
-      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
-    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const label = e => controlCaption(e);
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   const nodes = Array.from(document.querySelectorAll(query));
@@ -146,12 +181,26 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
+  // Standalone PAGE must count only the main form, just like both entry readers.
+  const pageSurveyWrappers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-survey-form-container')) : [];
   const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container')) : [];
+    document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!e.closest('.ashby-survey-form-container')) : [];
+  const pageSurveyValid=pageSurveyWrappers.length===0 || (
+    pageSurveyWrappers.length===1 && ashbyContainers.length===1 &&
+    pageSurveyWrappers[0].tagName==='DIV' &&
+    pageSurveyWrappers[0].parentElement===ashbyContainers[0].parentElement &&
+    pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
+    !pageSurveyWrappers[0].querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
+      .some(b=>!b.hasAttribute('type')));
   const hiddenAshbyChoice=e=>{
     const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
-      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
+      pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
       ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
       e.type==='checkbox' && !e.form && !e.closest('form') &&
       !e.disabled && !e.matches(':disabled') && !visible(e) &&
@@ -189,6 +238,8 @@ PAGE = r"""(() => {
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
       commits_application:commitsApplication(e),
       in_form:!!form, form_selector:form ? selector(form) : '',
+      ...(pageAshbyNative && e.closest('div.ashby-survey-form-container')
+        ? {ashby_survey:true} : {}),
       native_form_owner_selector:e.form ? selector(e.form) : '',
        form_action:formAction, formaction:override, name:e.name || '',
       ...(pageAshbyNative ? {form_action_attr_present:!!form && form.hasAttribute('action'),
@@ -316,10 +367,7 @@ PAGE = r"""(() => {
 
 # Native application-root proof and the visible badge predicate have one owner.
 _APPLICATION_ROOT = r"""
-  const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||
-    (e.getAttribute('aria-labelledby') || '').split(' ')
-      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
-    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const entryLabel = e => controlCaption(e);
   const candidateVisible = e => {
     const rects=Array.from(e.getClientRects());
     if(!rects.length) return false;
@@ -386,12 +434,28 @@ _APPLICATION_ROOT = r"""
 # Structural admission belongs only to ApplicationEntryProvenance, never an alias.
 _ASHBY_ROOT = r"""
   // The pane is structural evidence only: never read its values or build targets.
-  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+  const surveyWrappers=ashbyNative ?
+    Array.from(document.querySelectorAll('.ashby-survey-form-container')) : [];
+  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!(ashbyNative && e.closest('.ashby-survey-form-container')));
   const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
-  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));
+  // Live Ashby renders the same quarantined autofill helper as an uploader.
+  const panes=Array.from(document.querySelectorAll(
+    '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader'));
   const container=containers.length===1 ? containers[0] : null;
   const exactSubmit=submitters.length===1 ? submitters[0] : null;
   const wrapper=container?.parentElement;
+  const survey=surveyWrappers.length===1 ? surveyWrappers[0] : null;
+  const surveyContainers=survey ? Array.from(
+    survey.querySelectorAll('.ashby-application-form-container')) : [];
+  const surveyContainer=surveyContainers.length===1 ? surveyContainers[0] : null;
+  // Only one direct sibling section is a survey. Never elevate it to a new
+  // Submit certificate or treat its controls as bank-approved answers.
+  const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
+    !!surveyContainer && !survey.querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(survey.querySelectorAll('button')).some(b=>!b.hasAttribute('type'));
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
   // class and data-* are styling: they may not certify the wrapper, but must
@@ -406,24 +470,68 @@ _ASHBY_ROOT = r"""
     return !e.querySelectorAll(interactive).length && nodes.every(n=>
       !n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));
   };
+  // A styled DIV, SPAN or P sibling whose only controls, if any, are plain
+  // description links. Links are never receivers, targets or click authority.
+  const linkOnlySibling=e=>{
+    if(!['DIV','SPAN','P'].includes(e.tagName) || Array.from(e.attributes).some(a=>
+       !(a.name==='class' || /^data-/i.test(a.name)))) return false;
+    const nodes=[e,...Array.from(e.querySelectorAll('*'))];
+    const interactive=query+',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label,[autofocus],[controls],[form],[formaction]';
+    const links=Array.from(e.querySelectorAll('a[href]'));
+    return Array.from(e.querySelectorAll(interactive)).every(n=>
+      links.includes(n) && Array.from(n.attributes).every(a=>
+        ['href','target','rel','class'].includes(a.name) || /^data-/i.test(a.name))) &&
+      nodes.every(n=>!n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));
+  };
+  // The quarantined helper is never a receiver; it may not carry Submit.
+  const paneArmed=panes.length===1 && !!panes[0].querySelector(
+    'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+    'input[type="submit"],input[type="image"],[form],[formaction],'+
+    '.ashby-application-form-container,.ashby-survey-form-container');
+  const paneSafe=panes.length===1 && panes[0].tagName==='DIV' &&
+    panes[0].parentElement===wrapper && !paneArmed;
   const siblings=wrapper ? Array.from(wrapper.children) : [];
   const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));
+    n!==container && n!==panes[0] && n!==exactSubmit &&
+    !(surveyValid && n===survey) && !inertSibling(n,true) && !linkOnlySibling(n));
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
     container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
     panes.length===1 && panes[0].tagName==='DIV' && panes[0].parentElement===wrapper &&
     exactSubmit?.parentElement===wrapper &&
     siblings.filter(n=>[container,panes[0],exactSubmit].includes(n)).length===3 &&
     siblings.every(n=>n===container || n===panes[0] || n===exactSubmit || inertSibling(n));
-  const structuralRoot=!forms.length && ordered ? wrapper : null;
+  // A valid survey beside the pane is not an unknown sibling, but it does
+  // not extend the historic three-child certificate to final Submit.
+  const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&
+    panes[0].parentElement===wrapper && exactSubmit?.parentElement===wrapper &&
+    siblings.every(n=>n===container || n===panes[0] || n===survey ||
+      n===exactSubmit || inertSibling(n));
+  // Issue #252: the live div#form wrapper. Its direct children are exactly one
+  // quarantined helper, the main container, the exact Submit, at most one valid
+  // survey, and only inert or link-only siblings. It has the pane shape's
+  // authority and no more; any other child leaves the wrapper unowned.
+  const formShape=!!wrapper && wrapper.tagName==='DIV' && wrapper.id==='form' &&
+    !wrapper.getAttribute('class') && container?.tagName==='DIV' &&
+    exactSubmit?.tagName==='BUTTON' && exactSubmit.parentElement===wrapper && paneSafe &&
+    (!surveyWrappers.length || surveyValid) &&
+    siblings.every(n=>n===container || n===panes[0] || n===exactSubmit ||
+      (surveyValid && n===survey) || inertSibling(n,true) || linkOnlySibling(n));
+  const structuralRoot=!forms.length && (formShape || (ordered && paneSafe &&
+    (!surveyWrappers.length || surveyValid))) ? wrapper : null;
   const root=nativeRoot || structuralRoot;
   let structuralError='';
-  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
+  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
+      paneArmed || (surveyWrappers.length>0 && !surveyValid)))
     structuralError='ambiguous application roots';
-  else if (!forms.length && container && exactSubmit && !ordered && !(
+  else if (!forms.length && container && exactSubmit && !ordered && !formShape &&
+      !surveyPane && !(
     panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
-    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))
+    exactSubmit.parentElement===wrapper && (
+      (wrapper.children.length===2 &&
+       wrapper.children[0]===container && wrapper.children[1]===exactSubmit) ||
+      (surveyValid && wrapper.children.length===3 &&
+       siblings.includes(container) && siblings.includes(survey) &&
+       siblings.includes(exactSubmit)))))
     structuralError=unsafeSibling ?
       'application root sibling identity mismatch: unsafe sibling' :
       'application root sibling identity mismatch';
@@ -442,7 +550,8 @@ _ASHBY_ROOT = r"""
   };
   // The exact sibling mismatch loses wrapper ownership but retains one bounded,
   // independently observed application container. It has no Submit authority.
-  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
+  const containerUploadRoot=(structuralError==='application root sibling identity mismatch' ||
+    (surveyPane && !structuralError)) &&
     !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&
     !!container && !!exactSubmit;
   const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);
@@ -465,7 +574,8 @@ _ASHBY_ROOT = r"""
       } else {
         // Never read an applicant value, autofill, script or CAPTCHA response.
         const p=n.parentElement;
-        if(!p || !p.closest('input,textarea,select,[contenteditable],script,style,.ashby-application-form-autofill-pane')
+        if(!p || !p.closest('input,textarea,select,[contenteditable],script,style,'+
+            '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader')
             && !responseNodes.some(r=>r===p || r.contains(p))) text=signature(n.textContent);
       }
       uploadTree.nodes.push({parent,tag:n.nodeType===3 ? '#text' : n.localName,
@@ -537,10 +647,13 @@ _ASHBY_ROOT = r"""
   // id, so their title's for= resolves to nothing. The only caption proof is
   // the single question title of the receiver's own field entry; zero or
   // several titles, or a title owned by another live control, prove nothing.
+  const controlContainer=e=>container?.contains(e) ? container :
+    (surveyValid && surveyContainer?.contains(e) ? surveyContainer : null);
   const fieldEntry = e => {
-    if (forms.length || !container || !container.contains(e) || e.id) return null;
+    const region=controlContainer(e);
+    if (forms.length || !region || e.id) return null;
     const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !container.contains(entry)) return null;
+    if (!entry || !region.contains(entry)) return null;
     const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
     const owner=titles.length===1 ? titles[0].getAttribute('for') : null;
     return {entry,titles:titles.length,
@@ -606,7 +719,7 @@ _ASHBY_ROOT = r"""
       const hiddenChoice=e=>{
         const ls=Array.from(e.labels || []);
         return ashbyNative && !forms.length && containers.length===1 &&
-          container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+          (!surveyWrappers.length || surveyValid) && container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
           !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
           !entryEvidenceVisible(e) && !e.closest('[inert]') &&
           !e.closest('div.ashby-application-form-input-yesno') && ls.length===1 &&
@@ -619,10 +732,25 @@ _ASHBY_ROOT = r"""
       const hiddenLabel=hiddenChoice(e) ? e.labels[0] : null;
       const linked=labels.length===1 && actualLabels.length===1 && actualLabels[0]===labels[0] &&
         labels[0].matches('label.ashby-application-form-question-title') &&
-        !!container && container.contains(labels[0]) && container.contains(e) &&
+        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&
         document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
         document.getElementById(labels[0].getAttribute('for'))===e;
       const field=fieldEntry(e);
+      // The shared caption rule; association also needs this census's own
+      // field-entry proof to name the same title.
+      const titleLabel=ashbyFieldTitle(e), titled=!!titleLabel && field?.title===titleLabel;
+      // ARCH 17:40: a native choice is captioned by its own single label[for]
+      // in the same application container, the caption PAGE reads for it.
+      const choiceLabel=!hiddenLabel && !linked && !!id && e.tagName==='INPUT' &&
+        ['radio','checkbox'].includes(e.type) && labels.length===1 &&
+        actualLabels.length===1 && actualLabels[0]===labels[0] &&
+        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&
+        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
+        !!clean(labels[0].innerText) &&
+        !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+          'area[href],audio[controls],video[controls],object,embed,iframe,'+
+          '[role],[tabindex],[contenteditable],[onclick]') ? labels[0] : null;
+      const ownLabel=linked ? labels[0] : hiddenLabel || (titled ? titleLabel : null) || choiceLabel;
       return {selector:sel,unique:document.querySelectorAll(sel).length===1,
         tag:e.tagName.toLowerCase(),
         type:ashbyYesNo(e) ? 'button' : e.getAttribute('role') || e.type || e.tagName.toLowerCase(),
@@ -633,11 +761,17 @@ _ASHBY_ROOT = r"""
         // Membership only: a rooted Yes/No group has no proven requiredness.
         boolean_group:!!e.closest('div.ashby-application-form-input-yesno'),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
-        id,label:linked ? clean(labels[0].innerText) : hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) : '',
-        label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',
-        name:e.name || '',associated:linked || !!hiddenLabel,
+        id,label:titleLabel ? clean(titleLabel.innerText) : linked ? clean(labels[0].innerText) :
+          hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) :
+          choiceLabel ? clean(choiceLabel.innerText) : '',
+        label_selector:titleLabel ? selector(titleLabel) : linked ? selector(labels[0]) :
+          hiddenLabel ? selector(hiddenLabel) : choiceLabel ? selector(choiceLabel) : '',
+        name:e.name || '',associated:linked || !!hiddenLabel || titled || !!choiceLabel,
+        // A reported fact: is the one associated label itself visible?
+        label_visible:!!ownLabel && entryEvidenceVisible(ownLabel),
         ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!container && container.contains(e),
+        in_container:!!controlContainer(e),
+        ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),
         native_owner:e.form ? selector(e.form) : '',
         declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
         submit:e===exactSubmit,untyped:e.getAttribute('type')===null,

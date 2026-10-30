@@ -242,6 +242,24 @@ if(spec.formless) {
         text:'Synthetic duplicate label'},parent);
     }
   }
+  if(spec.liveLocation) {
+    // Issue #252 ARCH 17:33: both captures' id-less location combobox. Its
+    // only caption is the field entry's title; the placeholder is UI text.
+    const entry=node('div',{class:'ashby-application-form-field-entry'},container);
+    node('label',{class:'ashby-application-form-question-title',text:'Synthetic location',
+      ...(spec.liveLocationTitle==='owned' ? {'for':'_systemfield_name'} : {})},entry);
+    if(spec.liveLocationTitle==='second')
+      node('label',{class:'ashby-application-form-question-title',text:'Synthetic second title'},entry);
+    node('input',{class:'ashby-application-form-input-autocomplete',
+      placeholder:'Synthetic placeholder...','aria-autocomplete':'list',
+      'aria-expanded':'false','aria-haspopup':'listbox',role:'combobox'},
+      node('div',{},entry));
+  }
+  if(spec.liveExtraInvisible) {
+    // ARCH 17:51: one extra invisible control without any visible label.
+    const entry=node('div',{class:'ashby-application-form-field-entry'},container);
+    node('input',{id:'extra-invisible',type:'checkbox',rect:null},entry);
+  }
   field('textarea','additional','textarea',spec.additionalCaption || 'Additional information',
     spec.additionalRequired === true);
   const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),
@@ -249,6 +267,91 @@ if(spec.formless) {
     ...(spec.submitAttrs || {})},wrapper);
   submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
   const move=(e,to)=> {e.parentElement.children.splice(e.parentElement.children.indexOf(e),1); e.parentElement=to; to.children.push(e);};
+  if(spec.survey) {
+    // Ashby may render the voluntary survey as a sibling with its own nested
+    // application-form container. All labels and values here are synthetic.
+    const section=node('div',{class:'ashby-survey-form-container'},wrapper);
+    const surveyContainer=node('div',{class:'ashby-application-form-container'},section);
+    const surveyEntry=node('div',{class:'ashby-application-form-field-entry'},surveyContainer);
+    const surveyLabel=node('label',{'for':'survey-preference',
+      class:'ashby-application-form-question-title',
+      text:spec.surveyLabel || 'Synthetic voluntary survey question'},surveyEntry);
+    const surveyControl=node('input',{id:'survey-preference',type:'text'},surveyEntry);
+    surveyControl.labels=[surveyLabel];
+    if(spec.surveyChoices) {
+      // ARCH 17:40: the captures' visually hidden survey radios, each drawn
+      // only through its own visible label[for]. Text is synthetic.
+      const choiceEntry=node('div',{class:'ashby-application-form-field-entry'},
+        spec.surveyChoices==='outside' ? wrapper : surveyContainer);
+      node('label',{class:'ashby-application-form-question-title',
+        text:'Synthetic survey choice question'},choiceEntry);
+      for(const n of [0,1]) {
+        const radio=node('input',{id:'survey-choice-'+n,name:'survey-choice',type:'radio',
+          style:{opacity:'0'}},choiceEntry);
+        if(spec.surveyChoiceChecked && n===0) radio.checked=true;
+        node('label',{'for':'survey-choice-'+n,text:'Synthetic option '+n,
+          ...(spec.surveyChoices==='label-hidden' ? {style:{opacity:'0'}} : {})},choiceEntry);
+      }
+    }
+    if(spec.surveySecondSection) {
+      const second=node('div',{class:'ashby-survey-form-container'},wrapper);
+      node('div',{class:'ashby-application-form-container'},second);
+    }
+    if(spec.surveyExtraContainer)
+      node('div',{class:'ashby-application-form-container'},section);
+    if(spec.surveySubmit || spec.surveyImplicitSubmit) {
+      const surveySubmit=node('button',{id:'survey-submit',
+        ...(spec.surveyImplicitSubmit ? {} : {type:'submit'}),
+        text:'Synthetic survey Submit'},surveyContainer);
+      surveySubmit.type='submit';
+    }
+    if(spec.surveyOutside) move(section,body);
+  }
+  if(spec.liveForm) {
+    // Issue #252: direct div#form children of the two public captures. Only
+    // tags, classes and attribute names are copied; every text is synthetic.
+    for(const [k,v] of [['id','form'],['tabindex','0'],['role','tabpanel'],
+        ['aria-labelledby','job-application-form']]) wrapper.setAttribute(k,v);
+    wrapper.removeAttribute('class');
+    pane.setAttribute('data-highlight','synthetic');
+    container.setAttribute('data-highlight','synthetic');
+    node('div',{role:'button',class:'synthetic-drop','data-state':'idle'},pane);
+    const upload=node('button',{id:'autofill-upload',class:'synthetic-button',
+      text:'Synthetic upload'},pane);
+    upload.type='submit'; // Untyped like the capture: quarantined, never a target.
+    if(spec.liveExtraSubmit) {
+      const extra=node('button',{id:'autofill-submit',type:'submit',text:'Synthetic'},pane);
+      extra.type='submit';
+    }
+    const section=nodes.find(n=>n.parentElement===wrapper &&
+      n.getAttribute('class')==='ashby-survey-form-container');
+    // OpenAI ('uploader'): link paragraph. Airwallex: a styled link div with
+    // a classed link directly inside. Legacy 'pane': link in a span in a div.
+    const legal=node(spec.liveForm==='uploader' ? 'p' : 'div',
+      {class:'synthetic-legal',...(spec.liveForm==='uploader' ? {} : {'data-highlight':'synthetic'})},wrapper);
+    const link=node('a',{href:'https://example.test/legal',
+      target:'_blank',rel:'noopener noreferrer',
+      ...(spec.liveForm==='airwallex' ? {class:'synthetic-link'} : {}),text:'Synthetic policy'},
+      spec.liveForm==='pane' ? node('span',{},legal) : legal);
+    if(spec.liveLinkExtra==='button') node('button',{id:'legal-button',type:'button',text:'Synthetic'},legal);
+    if(spec.liveLinkExtra==='form') node('form',{id:'legal-form'},legal);
+    if(spec.liveLinkExtra==='nested-button') node('button',{id:'legal-button',type:'button'},link);
+    const order=[pane];
+    if(spec.liveForm==='uploader') {
+      pane.setAttribute('class','ashby-application-form-autofill-uploader');
+      const notice=node('div',{class:'ashby-application-blocking-disclosure',
+        'data-highlight':'synthetic'},wrapper);
+      node('p',{text:'Synthetic disclosure'},node('span',{},notice));
+      order.push(notice,container,...(section ? [section] : []),submit,legal);
+    } else if(spec.liveForm==='airwallex') {
+      pane.setAttribute('class','ashby-application-form-autofill-uploader');
+      order.push(container,...(section ? [section] : []),legal,submit);
+    } else order.push(container,...(section ? [section] : []),legal,submit);
+    if(spec.liveSecondUploader)
+      order.push(node('div',{class:'ashby-application-form-autofill-uploader'},wrapper));
+    wrapper.children.splice(0,wrapper.children.length,...order,
+      ...wrapper.children.filter(n=>!order.includes(n)));
+  }
   if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
   if(spec.extraType) node(spec.extraType==='select' ? 'select':'input',
     {id:'unsupported',type:spec.extraType,required:true,...(spec.extraAttrs || {})},container);

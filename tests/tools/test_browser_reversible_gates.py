@@ -853,13 +853,17 @@ def test_live_census_reports_the_sibling_mismatch_and_titled_idless_receivers():
     page, _ = _live_dom()
     assert page['entry']['formless']['error'] == 'application root sibling identity mismatch'
     evidence = {e['selector']: e for e in page['entry']['root_evidence']}
-    for suffix, question in ((_LOCATION, 'Synthetic location'),
-                             (_DATE, 'Synthetic start date'),
-                             (_YES, 'Synthetic Boolean question')):
+    for suffix, question, titled in ((_LOCATION, 'Synthetic location', True),
+                                     (_DATE, 'Synthetic start date', True),
+                                     (_YES, 'Synthetic Boolean question', False)):
         control = _by_locator(page, suffix)
         e = evidence[control['selector']]
-        assert (e['id'], e['associated'], e['entry_titles']) == ('', False, 1)
+        # Issue #252 ARCH 17:33: an id-less input takes its single field-entry
+        # title as caption in both readers; a Yes/No button keeps its own text.
+        assert (e['id'], e['associated'], e['entry_titles']) == ('', titled, 1)
         assert e['entry_label'] == control['question'] == question
+        if titled:
+            assert e['label'] == control['label'] == question
     yes, no = _by_locator(page, _YES), _by_locator(page, _NO)
     for member, caption in ((yes, 'Yes'), (no, 'No')):
         e = evidence[member['selector']]

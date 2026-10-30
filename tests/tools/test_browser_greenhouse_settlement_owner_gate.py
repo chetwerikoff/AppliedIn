@@ -16,7 +16,7 @@ from agent import run
 from core.apply_queue import ApplyQueue
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
-from tests.tools.test_browser_bootstrap import field, witness
+from tests.tools.test_browser_bootstrap import field
 from tests.tools.test_browser_bootstrap_settlement import (
     COMPANY, GH_PK, PHONE, _grant, _world,
 )
@@ -184,11 +184,14 @@ async def test_greenhouse_global_bank_answers_still_auto_fill(monkeypatch):
     # an independent synthetic fixed witness. No model, DOM or browser grants.
     stores.tracking.set_status(
         case.pk, Status.SUBMITTING, human_approved_answers={})
-    page = deepcopy(raw.state)
     provenance = forms._configured_alias(case.pk, COMPANY, case.wrapper)
     assert isinstance(provenance, forms.GreenhouseJobAlias)
+    scoped = forms._GreenhouseSession(
+        raw, lambda href: href == case.url, provenance, submitted=lambda: False)
+    page, observed_witness = await forms._observe_controls(
+        scoped, deepcopy(raw.state), site='bootstrap-material')
     forms._auto_grant_from_global(
-        page, witness(page), case.pk, facts, facts, case.wrapper,
+        page, observed_witness, case.pk, facts, facts, case.wrapper,
         provenance=provenance)
     stores.tracking.set_status(case.pk, Status.TAILORED)
     decisions = []

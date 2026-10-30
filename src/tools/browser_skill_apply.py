@@ -5208,11 +5208,7 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     continue
                 except Gate:
                     pass
-            if (_missing_answer_reason(item) == 'owner_question'
-                    or (isinstance(provenance, GreenhouseJobAlias)
-                        and _native_answer(item) and not value)):
-                # Greenhouse required text with no bank fact needs a direct
-                # owner answer; it still uses the model-only write path.
+            if _missing_answer_reason(item) == 'owner_question':
                 prompt = (_choice_prompt(item, question)
                           if kind in {'radio', 'checkbox', 'combobox'}
                           or item.get('tag') == 'select'

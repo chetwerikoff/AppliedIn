@@ -3358,6 +3358,44 @@ def _issue218_main_reader_scripts():
     # silently weaken the original non-survey regression.
     survey_delta = [
         (
+            """    !pageSurveyWrappers[0].querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
+      .some(b=>!b.hasAttribute('type'));""",
+            """    !pageSurveyWrappers[0].querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]'));""",
+            False,
+        ),
+        (
+            """      in_form:!!form, form_selector:form ? selector(form) : '',
+      ...(pageAshbyNative && e.closest('div.ashby-survey-form-container')
+        ? {ashby_survey:true} : {}),
+      native_form_owner_selector:e.form ? selector(e.form) : '',""",
+            """      in_form:!!form, form_selector:form ? selector(form) : '',
+      native_form_owner_selector:e.form ? selector(e.form) : '',""",
+            False,
+        ),
+        (
+            """    !!surveyContainer && !survey.querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]') &&
+    !Array.from(survey.querySelectorAll('button')).some(b=>!b.hasAttribute('type'));""",
+            """    !!surveyContainer && !survey.querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]');""",
+            True,
+        ),
+        (
+            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!controlContainer(e),
+        ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),""",
+            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
+        in_container:!!controlContainer(e),""",
+            True,
+        ),
+        (
             """  // A valid survey beside the pane is not an unknown sibling, but it does
   // not extend the historic three-child certificate to final Submit.
   const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&

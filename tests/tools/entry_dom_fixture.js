@@ -250,10 +250,47 @@ if(spec.formless) {
       ...(spec.liveLocationTitle==='owned' ? {'for':'_systemfield_name'} : {})},entry);
     if(spec.liveLocationTitle==='second')
       node('label',{class:'ashby-application-form-question-title',text:'Synthetic second title'},entry);
+    const picker=node('div',{},entry);
     node('input',{class:'ashby-application-form-input-autocomplete',
       placeholder:'Synthetic placeholder...','aria-autocomplete':'list',
-      'aria-expanded':'false','aria-haspopup':'listbox',role:'combobox'},
-      node('div',{},entry));
+      'aria-expanded':'false','aria-haspopup':'listbox',role:'combobox'},picker);
+    if(spec.liveLocationToggle) {
+      // Issue #258: both captures' caption-less picker toggle, an untyped
+      // <button> (submit by default) inside the location field entry.
+      const toggle=node('button',{class:'synthetic-toggle'},picker);
+      toggle.type='submit';
+    }
+  }
+  if(spec.liveAttestations) {
+    // Issue #258: the OpenAI capture's two acknowledgement checkboxes. Each is
+    // an opacity-0 input drawn only through its own option label[for]; the
+    // first description holds the agreement link. Only tags, classes and
+    // attribute names match the capture; every text is synthetic.
+    const section=node('div',{class:'ashby-application-form-section-container'},container);
+    for(const n of [0,1]) {
+      const set=node('fieldset',{class:'ashby-application-form-input-checkbox-group'},
+        node('div',{},section));
+      node('label',{'for':'attestation-title-'+n,class:'ashby-application-form-question-title',
+        text:n ? 'Synthetic statement: I hereby certify the synthetic facts.'
+          : 'Synthetic arbitration agreement acknowledgement'},set);
+      const p=node('p',{},node('div',{class:'ashby-application-form-question-description'},set));
+      if(n===0 && spec.liveAttestations!=='no-link')
+        node('a',{href:'https://example.test/agreement',target:'_blank',rel:'noopener',
+          text:'Synthetic agreement'},p);
+      else node('strong',{text:'Synthetic statement body'},p);
+      const option=node('div',{class:'ashby-application-form-input-checkbox-group-option'},set);
+      const input=node('input',{id:'attestation-'+n,name:'attestation-'+n,type:'checkbox',
+        style:{opacity:'0'}},
+        node('span',{class:'ashby-application-form-input-checkbox-group-option-checkbox'},option));
+      // A browser checkbox without a value attribute reports value "on",
+      // checked or not.
+      input.value='on';
+      if(spec.attestationChecked===n) input.checked=true;
+      node('label',{'for':'attestation-'+n,
+        class:'ashby-application-form-input-checkbox-group-option-label',
+        text:n ? 'I confirm I have read the above.'
+          : 'I acknowledge the synthetic arbitration agreement.'},option);
+    }
   }
   if(spec.liveExtraInvisible) {
     // ARCH 17:51: one extra invisible control without any visible label.

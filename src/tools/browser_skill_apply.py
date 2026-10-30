@@ -3406,6 +3406,13 @@ def _bound_target(page: dict, target: dict) -> dict:
                  'value': c['value']} for c in members]}
 
 
+def _non_receiver(candidate: dict) -> bool:
+    """Issue #258: a link, or a caption-less widget button, holds no answer."""
+    return (candidate.get('tag') == 'a'
+            or (candidate.get('tag') == 'button'
+                and not str(candidate.get('label') or '').strip()))
+
+
 def _could_receive_an_answer(candidate: dict) -> bool:
     """Only an actual answer receiver may contend for a visible question.
 
@@ -3415,6 +3422,8 @@ def _could_receive_an_answer(candidate: dict) -> bool:
     """
     kind = candidate.get('type')
     if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
+        return False
+    if _non_receiver(candidate):
         return False
     # An unnamed, unlabelled, empty native text control cannot carry its own
     # form-submitted answer or identify a separate approved question. Required
@@ -3486,6 +3495,7 @@ def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
     return [c for c in page.get('controls', [])
             if c.get('selector') not in own
             and c.get('type') not in {'hidden', 'submit', 'image'}
+            and not _non_receiver(c)
             and isinstance(key, str)
             and _same(key, c.get('question') or c.get('label') or '')]
 
@@ -4723,34 +4733,70 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if observed['type'] == 'file':
                 continue
             item = control(page, observed, 'bootstrap-field')
+            if (item.get('tag') == 'button' and observed.get('boolean_group') is not True
+                    and not str(item.get('label') or '').strip()):
+                # Issue #258: a caption-less widget button (the location
+                # picker's toggle) receives no answer. It must not borrow its
+                # field entry's question key and test that field's approval.
+                continue
             key = _key(page, item)
             value = str(facts.get(_fact_key(facts, key)) or '').strip()
             previous = (_row(pk, fixture_context=fixture_context)
                         if fixture_context else _row(pk)).get(
                             'human_approved_answers', {}).get(key)
-            approved = False
-            if item.get('has_value') or value:
+            approved = stale = False
+            # Issue #258: a radio/checkbox DOM value is its machine value ("on"
+            # by default), present while unchecked; only checked is an answer.
+            choice = item.get('type') in {'radio', 'checkbox'}
+            populated = bool(item.get('checked') if choice else item.get('has_value'))
+            if choice and not value and isinstance(previous, dict):
+                # An existing grant must still bind its own choice receiver.
+                value = str(previous.get('value') or '').strip()
+            if populated or value:
                 try:
                     exact_approval(pk, key, value, target=_bound_target(page, item),
                                    url=page['url'], provenance=provenance,
                                    **({'fixture_context': fixture_context} if fixture_context else {}))
                     approved = True
                 except Gate:
-                    if item.get('has_value') or previous:
-                        raise Gate('Previously approved structural root or submit changed') from None
+                    if not previous and populated and not choice:
+                        raise Gate(f'unapproved populated application control "{key}"; '
+                                   'inspect manually.') from None
+                    # A recorded approval that no longer binds re-asks this
+                    # one field; it is never written from the stale grant.
+                    stale = bool(previous)
                 if approved:
-                    if item.get('has_value') and item.get('value') != value:
-                        raise Gate('unapproved populated application control; inspect manually.')
+                    if (not choice and item.get('has_value')
+                            and item.get('value') != value):
+                        raise Gate(f'unapproved populated application control "{key}"; '
+                                   'inspect manually.')
                     guarded_value(item, value)
                     continue
-            if item.get('required') or value:
+            # An unchecked owner-only attestation keeps its owner question even
+            # when optional; it is never checked without an exact grant.
+            attestation = (item.get('type') == 'checkbox' and not item.get('checked')
+                           and not previous and _assent_scope(item) == 'owner')
+            if (attestation and observed.get('ashby_hidden_choice') is True
+                    and item.get('ashby_hidden_choice') is not True):
+                # Issue #258: PAGE ignores opacity, so a hidden Ashby choice the
+                # boundary certified carries its flag only in the fixed witness.
+                dom = witness.get(item['selector'])
+                if (isinstance(dom, dict) and dom.get('ashby_hidden_choice') is True
+                        and dom.get('visible') is False
+                        and dom.get('associated_label_selector')
+                            == observed.get('label_selector')):
+                    item = {**item, 'ashby_hidden_choice': True, 'visible': False,
+                            'associated_label_selector': dom['associated_label_selector']}
+            if item.get('required') or value or attestation or stale:
                 question = _disclosure_question(page, item, witness, *origins, provenance=provenance)
                 question['pk'] = pk
-                raise Gate(f'An exact human-approved answer is needed for "{key}".',
+                raise Gate((f'Previously approved answer for "{key}" no longer binds; '
+                            if stale else '')
+                           + f'An exact human-approved answer is needed for "{key}".',
                            form_question=question,
-                           reason=(_missing_answer_reason(item) if item.get('required')
-                                   and _unanswered(page, item) and not previous
-                                   and not value else 'unknown_field'))
+                           reason=(_missing_answer_reason(item) if attestation or (
+                                   item.get('required') and _unanswered(page, item)
+                                   and not previous and not value) else 'unknown_field'))
         return page
     filled = filled if filled is not None else {}
     history = history if history is not None else []
@@ -4765,7 +4811,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                  and _unanswered(page, c)]
     optional_bank_candidate = bool(global_facts) and any(
         c.get('in_form') and not c.get('required')
-        and not c.get('disabled') and not c.get('has_value')
+        and not c.get('disabled')
+        and not (c.get('checked') if c.get('type') in {'radio', 'checkbox'}
+                 else c.get('has_value'))
         and _fact_key(global_facts, c.get('question') or c.get('label') or '') is not None
         for c in page['controls'])
     if not candidate and not optional_bank_candidate and not (settlement_route and history) and not any(

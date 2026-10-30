@@ -257,7 +257,7 @@ if(spec.formless) {
     const surveyEntry=node('div',{class:'ashby-application-form-field-entry'},surveyContainer);
     const surveyLabel=node('label',{'for':'survey-preference',
       class:'ashby-application-form-question-title',
-      text:'Synthetic voluntary survey question'},surveyEntry);
+      text:spec.surveyLabel || 'Synthetic voluntary survey question'},surveyEntry);
     const surveyControl=node('input',{id:'survey-preference',type:'text'},surveyEntry);
     surveyControl.labels=[surveyLabel];
     if(spec.surveySecondSection) {
@@ -266,8 +266,9 @@ if(spec.formless) {
     }
     if(spec.surveyExtraContainer)
       node('div',{class:'ashby-application-form-container'},section);
-    if(spec.surveySubmit) {
-      const surveySubmit=node('button',{id:'survey-submit',type:'submit',
+    if(spec.surveySubmit || spec.surveyImplicitSubmit) {
+      const surveySubmit=node('button',{id:'survey-submit',
+        ...(spec.surveyImplicitSubmit ? {} : {type:'submit'}),
         text:'Synthetic survey Submit'},surveyContainer);
       surveySubmit.type='submit';
     }

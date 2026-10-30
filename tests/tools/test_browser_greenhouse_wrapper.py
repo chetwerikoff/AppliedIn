@@ -94,7 +94,7 @@ async def _must_final_tenant_deny(state, *, url=URL):
 def test_fresh_alias_uses_persisted_pin_and_rechecks(authority):
     proof = forms._configured_alias(PK, COMPANY, URL)
     assert isinstance(proof, forms.GreenhouseJobAlias)
-    assert proof.url == HOSTED
+    assert proof.url == 'https://job-boards.greenhouse.io/embed/job_app?for=example-board&token=731205'
     assert forms._alias_current(proof)
     assert authority.tracking.reads == [("consistent", PK), ("consistent", PK)]
     assert not forms.navigation_allowed(

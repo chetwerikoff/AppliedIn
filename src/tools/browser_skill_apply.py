@@ -681,9 +681,14 @@ def _configured_alias(pk: str, company: str, url: str, *,
         from discovery.watchlist import load_watchlist
         row = (_row(pk, fixture_context=fixture_context) if fixture_context
                else _row(pk, None, True))
-        configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
+        watchlist_path = Path(get_settings().config_dir) / 'watchlist.yaml'
+        configs = load_watchlist(watchlist_path)
         if row.get('ats') in _APPLICATION_ENTRY:
             return _application_entry(row, pk, company, url, configs)
+        if row.get('ats') == 'greenhouse':
+            from discovery.tenant_pin import reviewed_tuple
+            if reviewed_tuple(company, path=watchlist_path) is None:
+                return None
         return verified_greenhouse_alias(
             row, pk=pk, company=company, url=url, configs=configs)
     except Exception:

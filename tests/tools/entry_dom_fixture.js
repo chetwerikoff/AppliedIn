@@ -219,6 +219,29 @@ if(spec.formless) {
     const group=node('div',{class:'ashby-application-form-input-yesno'},entry);
     for(const text of ['Yes','No']) {const b=node('button',{text},group); b.type='submit'; delete b.required;}
   }
+  if(spec.hiddenAttestation) {
+    const parent=node('div',{class:'ashby-application-form-field-entry'},container);
+    const first=node('label',{id:'hidden-attestation-label',
+      ...(spec.attestationLabels===0 ? {} : {'for':'hidden-attestation'}),
+      text:'Synthetic legal attestation'},parent);
+    const input=node('input',{id:'hidden-attestation',type:'checkbox',required:false},parent);
+    input.getClientRects=()=>[];
+    // A policy link/button in a label must never become a fallback click target.
+    if(spec.attestationInteractive==='link')
+      node('a',{id:'privacy-policy-link',href:'https://example.test/privacy',
+        text:'Privacy Policy'},first);
+    if(spec.attestationInteractive==='button')
+      node('button',{id:'privacy-policy-button',type:'button',text:'Privacy Policy'},first);
+    if(spec.attestationInteractive==='role-link' || spec.attestationInteractive==='role-button')
+      node('span',{role:spec.attestationInteractive==='role-link'?'link':'button',
+        text:'Privacy Policy'},first);
+    if(spec.attestationInteractive==='tabindex')
+      node('span',{tabindex:'0',text:'Privacy Policy'},first);
+    if(spec.attestationLabels===2) {
+      node('label',{id:'hidden-attestation-label-2',for:'hidden-attestation',
+        text:'Synthetic duplicate label'},parent);
+    }
+  }
   field('textarea','additional','textarea',spec.additionalCaption || 'Additional information',
     spec.additionalRequired === true);
   const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),

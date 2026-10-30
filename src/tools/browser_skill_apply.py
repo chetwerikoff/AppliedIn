@@ -4790,13 +4790,13 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
             if item.get('required') or value or attestation or stale:
                 question = _disclosure_question(page, item, witness, *origins, provenance=provenance)
                 question['pk'] = pk
+                # A witnessed single-field question is owner-answerable even if
+                # bank-auto refuses it, the bank is empty, or an approval drifted.
                 raise Gate((f'Previously approved answer for "{key}" no longer binds; '
                             if stale else '')
                            + f'An exact human-approved answer is needed for "{key}".',
                            form_question=question,
-                           reason=(_missing_answer_reason(item) if attestation or (
-                                   item.get('required') and _unanswered(page, item)
-                                   and not previous and not value) else 'unknown_field'))
+                           reason='owner_question')
         return page
     filled = filled if filled is not None else {}
     history = history if history is not None else []

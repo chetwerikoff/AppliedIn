@@ -17,6 +17,11 @@ from tests.tools.test_browser_greenhouse_parity import assert_unapproved_submit_
 
 RECT = dict(width=120, height=24, right=120, bottom=24)
 ZERO = {**RECT, 'height': 0}
+# Issue 256 admits the fixture's unrendered .iti phone picker, so the opaque
+# picker no longer stops Submit first. The required Location placeholder must
+# now be refused itself, by the same single final guard.
+LOCATION_REFUSAL = dict(require_incomplete=False,
+                        reason='Unverified or changed combobox value: Where are you located?')
 
 
 def observe(*, changes=(), optional=False, original=False):
@@ -91,7 +96,7 @@ async def refuses(out, monkeypatch, tmp_path):
     assert observed['url'] == out['page']['url']
     assert lookup['#location']['combobox'] == target['combobox']
     assert session.calls == []
-    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path, **LOCATION_REFUSAL)
 
 
 async def test_greenhouse_empty_zero_height_placeholder_has_safe_generic_read(
@@ -112,7 +117,7 @@ async def test_greenhouse_empty_zero_height_placeholder_has_safe_generic_read(
     assert additional['label'] == 'Additional question'
     assert lookup['#additional']['visible'] is True
     assert session.calls == []
-    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path, **LOCATION_REFUSAL)
 
 
 async def test_greenhouse_empty_zero_height_placeholder_zero_size_denies_submit(
@@ -181,7 +186,7 @@ async def test_greenhouse_required_text_placeholder_keeps_required_field(
     assert target['combobox']['selected_value'] == ''
     assert target['combobox']['linked'] is False
     # A readable placeholder, including 'Choose', is not an approved value.
-    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path)
+    await assert_unapproved_submit_is_refused(out, monkeypatch, tmp_path, **LOCATION_REFUSAL)
 
 
 async def test_greenhouse_optional_native_control_still_passes():

@@ -60,12 +60,17 @@ def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():
     assert all(c['type'] == 'submit' for c in initial['page']['controls'])
     assert not any(forms._native_answer(c) for c in initial['page']['controls'])
     # Hydration does not mint form-value authority. Generic ARIA exposes
-    # receivers, while the large unresolved phone-country list remains opaque
-    # at the one irreversible Submit boundary.
-    assert later['page']['opaque_controls'] is True
-    assert later['page']['inventory_verified'] is False
-    assert later['page']['opaque_count'] > 0
-    with pytest.raises(forms.Gate, match='inventory is incomplete'):
+    # receivers. Issue 256: the unrendered .iti phone-country picker is
+    # admitted as one phone receiver, so the inventory is complete and the
+    # one irreversible Submit boundary refuses the unanswered field itself.
+    assert later['page']['greenhouse']['phone_pickers'] == 1
+    assert later['page']['opaque_controls'] is False
+    assert later['page']['inventory_verified'] is True
+    assert later['page']['opaque_count'] == 0
+    assert not any(c['selector'].startswith(('#iti-', '#country-button', '#country-clear'))
+                   for c in later['page']['controls'])
+    assert sum(c['type'] == 'tel' for c in later['page']['controls']) == 1
+    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
         forms.check_form(later['page'], {}, uploaded=True)
     assert [c['selector'] for c in later['page']['controls']] == [
         c['selector'] for c in later['witness']['controls']]

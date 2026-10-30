@@ -4819,9 +4819,15 @@ def _bootstrap_grant_diagnostics(fn):
 
 
 def _is_required_proxy(control: dict) -> bool:
-    """The id-less, unlabeled required text input a Greenhouse react-select mounts."""
+    """The id-less, unlabeled required text input a Greenhouse react-select mounts.
+
+    Issue #266: judge the control's own caption, not `label()`. That helper
+    prepends the enclosing fieldset's question, so the proxy inside the Phone
+    fieldset inherited the legend "Phone" and was never seen as a proxy.
+    """
     return (control.get('tag') == 'input' and control.get('type') == 'text'
-            and bool(control.get('required')) and not label(control)
+            and bool(control.get('required'))
+            and not str(control.get('label') or '').strip()
             and not str(control.get('selector', '')).startswith('#'))
 
 

@@ -148,22 +148,19 @@ PAGE = r"""(() => {
   };
   const ashbyContainers=pageAshbyNative ? Array.from(
     document.querySelectorAll('.ashby-application-form-container')) : [];
-  const hiddenAshbyLabel=e=>{
-    if(!hiddenAshbyChoice(e)) return null;
-    const labels=Array.from(e.labels || []).filter(l=>clean(l.innerText || l.textContent));
-    return labels.length===1 ? labels[0] : null;
-  };
   const hiddenAshbyChoice=e=>{
-    const labels=Array.from(e.labels || []).filter(l=>clean(l.innerText || l.textContent));
+    const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
       ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
       ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
       e.type==='checkbox' && !e.form && !e.closest('form') &&
-      !e.disabled && !e.matches(':disabled') &&
+      !e.disabled && !e.matches(':disabled') && !visible(e) &&
       !e.closest('div.ashby-application-form-input-yesno') &&
-      !e.closest('[inert]') && labels.length===1 && visible(labels[0]) &&
+      !e.closest('[inert]') && labels.length===1 &&
+      clean(labels[0].innerText || labels[0].textContent) && visible(labels[0]) &&
       document.querySelectorAll(selector(e)).length===1;
   };
+  const hiddenAshbyLabel=e=>hiddenAshbyChoice(e) ? e.labels[0] : null;
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
@@ -603,6 +600,17 @@ _ASHBY_ROOT = r"""
       const labels=id ? Array.from(document.querySelectorAll('label[for]'))
         .filter(l=>l.getAttribute('for')===id) : [];
       const actualLabels=Array.from(e.labels || []);
+      const hiddenChoice=e=>{
+        const ls=Array.from(e.labels || []);
+        return ashbyNative && !forms.length && containers.length===1 &&
+          container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+          !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
+          !entryEvidenceVisible(e) && !e.closest('[inert]') &&
+          !e.closest('div.ashby-application-form-input-yesno') && ls.length===1 &&
+          clean(ls[0].innerText || ls[0].textContent) && entryEvidenceVisible(ls[0]) &&
+          document.querySelectorAll(selector(e)).length===1;
+      };
+      const hiddenLabel=hiddenChoice(e) ? e.labels[0] : null;
       const linked=labels.length===1 && actualLabels.length===1 && actualLabels[0]===labels[0] &&
         labels[0].matches('label.ashby-application-form-question-title') &&
         !!container && container.contains(labels[0]) && container.contains(e) &&
@@ -619,9 +627,10 @@ _ASHBY_ROOT = r"""
         // Membership only: a rooted Yes/No group has no proven requiredness.
         boolean_group:!!e.closest('div.ashby-application-form-input-yesno'),
         native_type:['INPUT','BUTTON'].includes(e.tagName) ? e.type : '',
-        id,label:linked ? clean(labels[0].innerText) : '',
-        label_selector:linked ? selector(labels[0]) : '',name:e.name || '',
-        associated:linked,inside:!!structuralRoot && structuralRoot.contains(e),
+        id,label:linked ? clean(labels[0].innerText) : hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) : '',
+        label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',
+        name:e.name || '',associated:linked || !!hiddenLabel,
+        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
         in_container:!!container && container.contains(e),
         native_owner:e.form ? selector(e.form) : '',
         declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),

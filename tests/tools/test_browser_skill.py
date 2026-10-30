@@ -72,10 +72,10 @@ def page(*controls, text=GOOD, application_marker=False):
 
 
 @pytest.fixture(autouse=True)
-def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch):
-    """Existing control/submit guards isolate transport; witness regressions
-    exercise the real static-evaluate adapter in test_browser_bootstrap.py.
-    """
+def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch, request):
+    """Most legacy guards isolate transport; apply behavior needs both real readers."""
+    if request.node.name == 'test_required_owner_gate_binds_one_live_unanswered_control_per_resume':
+        return
     async def observed(session, current, **kwargs):
         return current, {c['selector']: {
             'visible': True, 'readonly': False, 'disabled': bool(c.get('disabled')),
@@ -3186,80 +3186,26 @@ async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
     session.call.assert_not_awaited()
 
 
-@pytest.mark.parametrize('shape', ['attestation', 'composite', 'free_text'])
+@pytest.mark.asyncio
 async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
-        monkeypatch, shape):
-    """Composite owner questions must not collapse into an unanswerable prose gate."""
-    if shape == 'attestation':
-        controls = [target(
-            selector='#attestation', label='I certify this statement',
-            question='I certify this statement', type='checkbox', required=True,
-            checked=False, visible_text='I certify this statement')]
-    elif shape == 'composite':
-        controls = [
-            target(selector='#authorization-a', tag='select', type='select',
-                   label='Authorization choice A', required=True, options=[
-                       {'label': 'Yes', 'value': 'yes'}]),
-            target(selector='#authorization-b', tag='select', type='select',
-                   label='Authorization choice B', required=True, options=[
-                       {'label': 'No', 'value': 'no'}]),
-            target(selector='#essay-a', tag='textarea', type='textarea',
-                   label='Synthetic essay A', required=True),
-            target(selector='#essay-b', tag='textarea', type='textarea',
-                   label='Synthetic essay B', required=True),
-        ]
-    else:
-        controls = [target(selector='#free-text', tag='textarea', type='textarea',
-                           label='Synthetic free-text question', required=True)]
-    current = page(*controls)
-    controller = object.__new__(forms.ApplicationIPCController)
-    session = SimpleNamespace(
-        raw=SimpleNamespace(_application_controller=controller),
-        page=AsyncMock(return_value=current),
-    )
-    granted = set()
-    company_facts = {controls[0]['label']: 'Synthetic company answer'}
-    global_facts = ({controls[1]['label']: 'Synthetic global answer'}
-                    if shape == 'composite' else {})
-    monkeypatch.setattr(forms, '_row', lambda *_a, **_k: {
-        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
-    monkeypatch.setattr(forms, '_required_owner_gate_admitted',
-                        lambda *_a: True)
-    monkeypatch.setattr(
-        forms, '_currently_granted',
-        lambda _page, item, *_a, **_k: item['selector'] in granted)
-    def disclosure(observed, item, *_args, **_kwargs):
-        return {
-            'selector': item['selector'], 'label': item['label'],
-            'control_label': item['label'],
-            'question': item.get('question') or item['label'],
-            'type': item['type'], 'tag': item['tag'],
-            'required': item['required'],
-            'requiredness': 'required' if item['required'] else 'optional',
-            'url': observed['url'],
-            'form_selector': item['form_selector'],
-            'form_action': item['form_action'],
-            'options': item.get('options', []),
-        }
-    monkeypatch.setattr(forms, '_disclosure_question', disclosure)
-    for item in controls:
-        pending = await forms._required_owner_gate(
-            session, current, 'example-co#synthetic', current['url'],
-            facts=company_facts, global_facts=global_facts)
-        assert isinstance(pending, forms.Gate)
-        question = pending.form_question
-        assert pending.reason == 'owner_question'
-        assert question['selector'] == item['selector']
-        assert question['label'] == item['label']
-        assert question['type'] == item['type']
-        assert question['required'] is True
-        assert question['requiredness'] == 'required'
-        assert question['pk'] == 'example-co#synthetic'
-        if item['label'] in {**company_facts, **global_facts}:
-            assert 'matching answer is saved in facts.md' in str(pending)
-            assert 'Synthetic company answer' not in str(pending)
-            assert 'Synthetic global answer' not in str(pending)
-        granted.add(item['selector'])
-    assert await forms._required_owner_gate(
-        session, current, 'example-co#synthetic', current['url'],
-        facts=company_facts, global_facts=global_facts) is None
+        monkeypatch, tmp_path):
+    """A real apply turn binds the next unanswered census receiver, not prose."""
+    from tests.tools.test_browser_reversible_gates import (
+        _apply, _fixture, _mark_census_answered)
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    for snapshot in (endpoint.current, endpoint.fixed):
+        for control in snapshot['controls']:
+            if control['selector'] != '#additional':
+                _mark_census_answered(control)
+        for evidence in snapshot['entry']['root_evidence']:
+            if evidence['selector'] != '#additional':
+                evidence.update(value='Synthetic answer', checked=True)
+    decision.side_effect = [
+        {'action': 'wait'},
+        {'action': 'gate', 'question': 'Synthetic unbound prose'}]
+    result = await _apply(pdf)
+    assert decision.await_count == 2
+    assert result['reason'] == 'owner_question'
+    assert result['review_route'] == 'owner'
+    assert result['form_question']['selector'] == '#additional'
+    assert 'Synthetic unbound prose' not in result['question']

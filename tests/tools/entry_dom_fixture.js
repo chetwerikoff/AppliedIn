@@ -219,6 +219,18 @@ if(spec.formless) {
     const group=node('div',{class:'ashby-application-form-input-yesno'},entry);
     for(const text of ['Yes','No']) {const b=node('button',{text},group); b.type='submit'; delete b.required;}
   }
+  if(spec.hiddenAttestation) {
+    const parent=node('div',{class:'ashby-application-form-field-entry'},container);
+    const first=node('label',{id:'hidden-attestation-label',
+      ...(spec.attestationLabels===0 ? {} : {'for':'hidden-attestation'}),
+      text:'Synthetic legal attestation'},parent);
+    const input=node('input',{id:'hidden-attestation',type:'checkbox',required:false},parent);
+    input.getClientRects=()=>[];
+    if(spec.attestationLabels===2) {
+      node('label',{id:'hidden-attestation-label-2',for:'hidden-attestation',
+        text:'Synthetic duplicate label'},parent);
+    }
+  }
   field('textarea','additional','textarea',spec.additionalCaption || 'Additional information',
     spec.additionalRequired === true);
   const submit=node('button',{...(spec.idless ? {} : {id:'structural-submit'}),

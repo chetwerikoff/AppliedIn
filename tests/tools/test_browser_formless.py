@@ -3410,7 +3410,7 @@ def _issue218_main_reader_scripts():
     source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
                             "e.getAttribute('aria-checked') === 'true',\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == '9cc0e006abffcbcb4bf8f6eff2971a7395309665'
+    assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
     return [
@@ -3482,3 +3482,23 @@ def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, att
         assert root['excluded'] == baseline['entry']['formless']['excluded']
     assert dumps(normalized, ensure_ascii=False, separators=(',', ':')) == dumps(
         baseline, ensure_ascii=False, separators=(',', ':'))
+
+@pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
+def test_hidden_ashby_attestation_requires_one_visible_label_and_hidden_input(reader):
+    """Both independent readers bind only the hidden receiver's visible label."""
+    valid = dom(dict(root=False, formless=True, missingPane=True,
+                     hiddenAttestation=True, url=entry('ashby')), reader)
+    matches = [c for c in valid['controls']
+               if c.get('selector') == '#hidden-attestation']
+    assert len(matches) == 1
+    assert matches[0]['ashby_hidden_choice'] is True
+    assert matches[0]['visible'] is False
+    assert matches[0]['associated_label_selector'] == '#hidden-attestation-label'
+    assert valid['entry']['formless']['root'] == ''
+    for count in (0, 2):
+        invalid = dom(dict(root=False, formless=True, missingPane=True,
+                           hiddenAttestation=True, attestationLabels=count,
+                           url=entry('ashby')), reader)
+        assert not any(c.get('selector') == '#hidden-attestation'
+                       and c.get('ashby_hidden_choice') is True
+                       for c in invalid['controls'])

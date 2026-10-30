@@ -1719,6 +1719,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         tag:e.tagName.toLowerCase(), type, native_type:nativeType,
         submit:['submit','image'].includes(nativeType) && (e.tagName === 'INPUT' || !!e.form), in_form:!!form,
         form_selector:formSelector,
+        ...(fixedAshbyNative && e.closest('div.ashby-survey-form-container')
+          ? {ashby_survey:true} : {}),
         native_form_owner_selector:e.form ? selector(e.form) : '',
         unique_form:!form || document.querySelectorAll(formSelector).length === 1,
         form_action:form?.action || '',
@@ -3021,6 +3023,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
+            ('evidence.ashby_survey',
+             (e.get('ashby_survey') is True) != (target.get('ashby_survey') is True)),
             ('evidence.native_owner', e.get('native_owner')),
             ('evidence.declared_owner', e.get('declared_owner')),
             ('evidence.formaction', e.get('formaction') is not None),
@@ -3070,6 +3074,7 @@ def _reversible_entry_recipient(page: dict, target: dict,
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
                 or dom.get('inert') is not False
+                or (dom.get('ashby_survey') is True) != (target.get('ashby_survey') is True)
                 or (pair_member and dom.get('label') != target.get('label'))):
             raise Gate('The reversible receiver witness is not editable.',
                        reason='defect_witness')
@@ -4332,6 +4337,7 @@ def _bank_auto_eligible(item: dict, value: str, *,
     subject = label(item)
     if ((not item.get('in_form')
          and item.get('selector') not in formless_selectors) or item.get('disabled')
+            or item.get('ashby_survey') is True  # Voluntary survey is owner-only.
             or item.get('type') == 'date'  # Issue #196: date is owner-only, not new bank scope.
             or item.get('tag') == 'textarea'
             or item.get('type') == 'password'

@@ -1334,8 +1334,10 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
 
         if target.get('disabled'):
+            # Issue #258: a choice's DOM value is "on" while unchecked.
             if (target.get('selector') in filled or target.get('checked')
-                    or target.get('has_value') or target.get('required')):
+                    or (target.get('has_value') and typ not in {'radio', 'checkbox'})
+                    or target.get('required')):
                 raise Gate('A previously approved or required form control is disabled at final Submit.')
             continue
         if (typ == 'button' and target.get('tag') == 'button'
@@ -3406,6 +3408,13 @@ def _bound_target(page: dict, target: dict) -> dict:
                  'value': c['value']} for c in members]}
 
 
+def _non_receiver(candidate: dict) -> bool:
+    """Issue #258: a link, or a caption-less widget button, holds no answer."""
+    return (candidate.get('tag') == 'a'
+            or (candidate.get('tag') == 'button'
+                and not str(candidate.get('label') or '').strip()))
+
+
 def _could_receive_an_answer(candidate: dict) -> bool:
     """Only an actual answer receiver may contend for a visible question.
 
@@ -3416,8 +3425,7 @@ def _could_receive_an_answer(candidate: dict) -> bool:
     kind = candidate.get('type')
     if kind in {'hidden', 'button', 'submit', 'image', 'option'}:
         return False
-    if candidate.get('tag') == 'a':
-        # Issue #258: a link navigates; it holds no answer to compete for.
+    if _non_receiver(candidate):
         return False
     # An unnamed, unlabelled, empty native text control cannot carry its own
     # form-submitted answer or identify a separate approved question. Required
@@ -3489,6 +3497,7 @@ def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
     return [c for c in page.get('controls', [])
             if c.get('selector') not in own
             and c.get('type') not in {'hidden', 'submit', 'image'}
+            and not _non_receiver(c)
             and isinstance(key, str)
             and _same(key, c.get('question') or c.get('label') or '')]
 
@@ -4804,7 +4813,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                  and _unanswered(page, c)]
     optional_bank_candidate = bool(global_facts) and any(
         c.get('in_form') and not c.get('required')
-        and not c.get('disabled') and not c.get('has_value')
+        and not c.get('disabled')
+        and not (c.get('checked') if c.get('type') in {'radio', 'checkbox'}
+                 else c.get('has_value'))
         and _fact_key(global_facts, c.get('question') or c.get('label') or '') is not None
         for c in page['controls'])
     if not candidate and not optional_bank_candidate and not (settlement_route and history) and not any(

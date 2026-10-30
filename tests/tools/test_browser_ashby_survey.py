@@ -600,3 +600,32 @@ async def test_checked_attestation_without_grant_is_asked_and_refused_at_submit(
     with pytest.raises(forms.Gate, match='Unverified preselected answer'):
         forms.check_form(dict(raw.current, controls=boxes), {}, True)
     no_mutations(raw)
+
+
+def test_link_and_toggle_never_collide_but_real_receivers_still_refuse():
+    page, _fixed = _live('openai', **_ATTESTATIONS)
+    box = next(c for c in page['controls'] if c['selector'] == '#attestation-0')
+    link = next(c for c in page['controls'] if c['tag'] == 'a'
+                and c.get('question') == box['question'])
+    toggle = next(c for c in page['controls'] if c.get('tag') == 'button'
+                  and c['label'] == '' and c.get('question') == _LOCATION)
+    assert forms._key(page, box) == box['question']
+    assert not forms._approval_question_collisions(page, box)
+    location = _location(page)
+    assert forms._key(page, location) == _LOCATION
+    assert toggle not in forms._approval_question_collisions(page, location)
+    # A real receiver carrying the same question still refuses at _key.
+    twin = dict(box, selector='#attestation-twin', tag='input', type='text', label='Twin')
+    with pytest.raises(forms.Gate, match='More than one control uses the same approval question'):
+        forms._key(dict(page, controls=[*page['controls'], twin]), box)
+    assert link['tag'] == 'a'
+
+
+def test_disabled_unchecked_choice_is_not_a_filled_control_at_submit():
+    page, _fixed = _live('openai', **_ATTESTATIONS)
+    box = dict(next(c for c in page['controls'] if c['selector'] == '#attestation-1'),
+               disabled=True)
+    assert box['has_value'] is True and box['checked'] is False
+    forms.check_form(dict(page, controls=[box]), {}, True)
+    with pytest.raises(forms.Gate, match='disabled at final Submit'):
+        forms.check_form(dict(page, controls=[dict(box, checked=True)]), {}, True)

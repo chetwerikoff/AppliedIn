@@ -3358,6 +3358,32 @@ def _issue218_main_reader_scripts():
     # silently weaken the original non-survey regression.
     survey_delta = [
         (
+            """  // A valid survey beside the pane is not an unknown sibling, but it does
+  // not extend the historic three-child certificate to final Submit.
+  const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&
+    panes[0].parentElement===wrapper && exactSubmit?.parentElement===wrapper &&
+    siblings.every(n=>n===container || n===panes[0] || n===survey ||
+      n===exactSubmit || inertSibling(n));
+  const structuralRoot=!forms.length && ordered &&
+    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
+            """  const structuralRoot=!forms.length && ordered &&
+    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
+            True,
+        ),
+        (
+            """  else if (!forms.length && container && exactSubmit && !ordered && !surveyPane && !(""",
+            """  else if (!forms.length && container && exactSubmit && !ordered && !(""",
+            True,
+        ),
+        (
+            """  const containerUploadRoot=(structuralError==='application root sibling identity mismatch' ||
+    (surveyPane && !structuralError)) &&
+    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
+            """  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
+    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
+            True,
+        ),
+        (
             """  // Standalone PAGE must count only the main form, just like both entry readers.
   const pageSurveyWrappers=pageAshbyNative ? Array.from(
     document.querySelectorAll('.ashby-survey-form-container')) : [];

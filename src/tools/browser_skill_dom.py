@@ -441,6 +441,12 @@ _ASHBY_ROOT = r"""
     exactSubmit?.parentElement===wrapper &&
     siblings.filter(n=>[container,panes[0],exactSubmit].includes(n)).length===3 &&
     siblings.every(n=>n===container || n===panes[0] || n===exactSubmit || inertSibling(n));
+  // A valid survey beside the pane is not an unknown sibling, but it does
+  // not extend the historic three-child certificate to final Submit.
+  const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&
+    panes[0].parentElement===wrapper && exactSubmit?.parentElement===wrapper &&
+    siblings.every(n=>n===container || n===panes[0] || n===survey ||
+      n===exactSubmit || inertSibling(n));
   const structuralRoot=!forms.length && ordered &&
     (!surveyWrappers.length || surveyValid) ? wrapper : null;
   const root=nativeRoot || structuralRoot;
@@ -448,7 +454,7 @@ _ASHBY_ROOT = r"""
   if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
       (surveyWrappers.length>0 && !surveyValid)))
     structuralError='ambiguous application roots';
-  else if (!forms.length && container && exactSubmit && !ordered && !(
+  else if (!forms.length && container && exactSubmit && !ordered && !surveyPane && !(
     panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
     exactSubmit.parentElement===wrapper && (
       (wrapper.children.length===2 &&
@@ -474,7 +480,8 @@ _ASHBY_ROOT = r"""
   };
   // The exact sibling mismatch loses wrapper ownership but retains one bounded,
   // independently observed application container. It has no Submit authority.
-  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
+  const containerUploadRoot=(structuralError==='application root sibling identity mismatch' ||
+    (surveyPane && !structuralError)) &&
     !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&
     !!container && !!exactSubmit;
   const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);

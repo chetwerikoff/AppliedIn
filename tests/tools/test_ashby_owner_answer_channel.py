@@ -16,7 +16,7 @@ from core.apply_queue import ApplyQueue
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
 from tests.tools.test_browser_application_entry import COMPANY, JOB, PK, posting
-from tests.tools.test_browser_ashby_survey import _ATTESTATIONS, _FACTS, _LIVE, _LOCATION
+from tests.tools.test_browser_ashby_survey import _ATTESTATIONS, _FACTS, _LIVE
 from tests.tools.test_browser_formless import no_mutations, root_world
 from tools import browser_skill_apply as forms
 
@@ -95,6 +95,28 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
     monkeypatch.setattr("core.stores.make_stores", lambda: stores)
     monkeypatch.setattr(forms, "_row", lambda *a, **k: tracking.get(PK) or {})
     return stores, raw, decision
+
+
+def _seed_exact_answers(stores, raw, answers):
+    row = stores.tracking.get(PK)
+    grants = row.get("human_approved_answers") or {}
+    for item in raw.current["controls"]:
+        try:
+            key = forms._key(raw.current, item)
+        except forms.Gate:
+            continue
+        if key not in answers:
+            continue
+        target = forms._bound_target(raw.current, item)
+        grants[key] = {
+            "value": answers[key], "url": raw.current["url"],
+            **{name: target.get(name, "" if name == "question" else None)
+               for name in (
+                   "selector", "label", "question", "tag", "type",
+                   "form_selector", "form_action")},
+        }
+    stores.tracking.set_status(
+        PK, Status.TAILORED, human_approved_answers=grants)
 
 
 async def _gate(stores, expected_label=None):
@@ -178,8 +200,9 @@ async def test_rooted_owner_question_exact_resume_reaches_next_field(
 async def test_voluntary_survey_bank_refusal_has_direct_reply(monkeypatch, shape):
     facts = {**_FACTS, "Synthetic voluntary survey question": "Bank-only response"}
     stores, raw, decision = _world(monkeypatch, shape, facts)
+    _seed_exact_answers(stores, raw, _FACTS)
     row, tokens = await _gate(stores, "Synthetic voluntary survey question")
-    assert row["gate_pending"]["form_question"]["ashby_survey"] is True
+    assert row["gate_pending"]["form_question"]["selector"] == "#survey-preference"
     assert "Synthetic voluntary survey question" not in (
         row.get("human_approved_answers") or {})
     refused = run.resume_job(
@@ -206,9 +229,10 @@ async def test_voluntary_survey_bank_refusal_has_direct_reply(monkeypatch, shape
 
 @pytest.mark.asyncio
 async def test_ashby_hidden_attestation_needs_exact_owner_yes(monkeypatch):
-    facts = {**_FACTS, _LOCATION: "Synthetic City"}
+    facts = dict(_FACTS)
     stores, raw, decision = _world(
         monkeypatch, "openai", facts, attestations=True)
+    _seed_exact_answers(stores, raw, _FACTS)
     row, tokens = await _gate(stores)
     question = row["gate_pending"]["form_question"]
     assert question["type"] == "checkbox"

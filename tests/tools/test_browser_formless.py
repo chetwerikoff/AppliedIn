@@ -3341,10 +3341,8 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
     result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    # A now-required blank is the existing required-field owner question.
-    reason = ('agent_review_unavailable' if render.get('additionalRequired')
-              else 'owner_question')
-    assert result['reason'] == reason, (row.get('status'), result['question'][:200])
+    # Issue #262 makes a required unanswered fact an exact owner-answer gate.
+    assert result['reason'] == 'owner_question'
     assert result['form_question']['selector'] == extra['selector']
     assert result['form_question'].get('route') != 'ashby-sibling-mismatch'  # no SKIP offered
     assert decide.await_count <= 1  # asked before the Submit decision

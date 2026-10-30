@@ -36,6 +36,9 @@ _FACTS = {
     'School': 'Synthetic School', 'Degree': 'Synthetic Degree',
     'Discipline': 'Synthetic Discipline', 'Phone': '+12025550123',
     'Country': 'Synthetic Country',
+    # Issue 259: the Greenhouse reader keys its phone-fieldset country picker
+    # "Phone country"; the generic reader keeps the legacy "Country" key.
+    'Phone country': 'Synthetic Country',
 }
 _MACHINE_VALUES = {key: _FACTS[key] for key in _COMBO_SELECTORS}
 _OPTION_SELECTORS = {selector+'-option': key for key, selector in _CHOICE_SELECTORS.items()}
@@ -718,7 +721,8 @@ class _SyntheticRun:
         self.widget_receipts = [r for r in history if r.get('action') == 'combobox']
         actions = (
             {'action': 'fill', 'selector': '#name', 'fact': 'Name'},
-            *({'action': 'combobox', 'selector': selector, 'fact': key}
+            *({'action': 'combobox', 'selector': selector,
+               'fact': 'Phone country' if self.greenhouse and key == 'Country' else key}
               for key, selector in _CHOICE_SELECTORS.items()),
             {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
             {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},

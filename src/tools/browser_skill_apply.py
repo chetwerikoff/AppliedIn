@@ -3490,6 +3490,64 @@ def _mismatch_question_twins(page: dict, target: dict) -> list[dict]:
             and _same(key, c.get('question') or c.get('label') or '')]
 
 
+PHONE_COUNTRY_KEY = 'Phone country'
+
+
+def _required_caption(text) -> str:
+    """A visible caption without the one trailing required-field marker."""
+    return re.sub(r'\s*\*\s*$', '', text) if isinstance(text, str) else ''
+
+
+def _phone_fieldset_key(page: dict, target: dict, conflicts: list[dict]) -> str | None:
+    """Issue 259: the Greenhouse phone fieldset's tel input and country picker.
+
+    Every live Greenhouse embed (Waymo, Stripe, Databricks) wraps the tel
+    input (caption "Phone*") and a react-select #country combobox (caption
+    "Country*") in ONE fieldset whose legend "Phone" is the question of both.
+    The legend branch below needs a caption equal to the legend, and the
+    required asterisk defeated it, so both receivers refused and every embed
+    row gated at bootstrap. Exactly this pair splits: the tel input keeps the
+    legend key and the country picker gets its own "Phone country" key, which
+    binds only to that bank fact; a bare "Country" fact never chooses it.
+    Any other sibling, type, form, caption or reader leaves the generic path.
+    """
+    question = target.get('question')
+    if (len(conflicts) != 1 or target.get('in_form') is not True
+            or not isinstance(question, str) or not question.strip()):
+        return None
+    pair = [target, conflicts[0]]
+    tel = [c for c in pair if c.get('tag') == 'input' and c.get('type') == 'tel']
+    combo = [c for c in pair if c.get('type') == 'combobox']
+    if (len(tel) != 1 or len(combo) != 1
+            or any(c.get('question') != question or c.get('in_form') is not True
+                   or not c.get('form_selector')
+                   or c.get('form_selector') != target.get('form_selector')
+                   for c in pair)
+            or not _same(_required_caption(tel[0].get('label')), question)
+            or not _same(_required_caption(combo[0].get('label')), 'Country')):
+        return None
+    # Only the Greenhouse reader's one admitted .iti phone fieldset, whose
+    # country picker it located itself; generic phone fieldsets are unchanged.
+    observed = page.get('greenhouse')
+    if (not isinstance(observed, dict) or observed.get('phone_pickers') != 1
+            or not isinstance(observed.get('phone_country'), dict)
+            or not combo[0].get('selector')
+            or observed['phone_country'].get('selector') != combo[0]['selector']):
+        return None
+    key = question if target is tel[0] else PHONE_COUNTRY_KEY
+    # Nothing else in this form may claim the resulting key.
+    others = [c for c in page['controls']
+              if c is not target and c is not conflicts[0]
+              and c.get('selector') not in {target.get('selector'),
+                                            conflicts[0].get('selector')}
+              and _could_receive_an_answer(c)
+              and c.get('form_selector') == target.get('form_selector')]
+    if any(_same(_required_caption(c.get(field)), key)
+           for c in others for field in ('question', 'label')):
+        return None
+    return key
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
@@ -3502,6 +3560,9 @@ def _key(page: dict, target: dict) -> str:
                  if c.get('type') != 'hidden']
     if not conflicts:
         return key
+    phone_key = _phone_fieldset_key(page, target, conflicts)
+    if phone_key is not None:
+        return phone_key
     # A semantic fieldset may supply the SAME legend to several different
     # native answers (e.g. a country picker beside the actual Phone input).
     # Only disambiguate it when exactly one visible native receiver itself
@@ -4426,6 +4487,7 @@ _BANK_AUTO_LOG_KEYS = {
     'first name': 'First Name', 'last name': 'Last Name',
     'email': 'Email', 'email address': 'Email',
     'phone': 'Phone', 'phone number': 'Phone', 'telephone': 'Phone',
+    'phone country': 'Phone country',
     'country': 'Country', 'city': 'City', 'location city': 'Location City',
 }
 
@@ -5688,6 +5750,28 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
                      and c.get('selector') == before['hidden_selector']
                      and before['hidden_selector'] in latest_witness]
         await _effect_call(session, 'click', selected['selector'])
+        if question['label'] == PHONE_COUNTRY_KEY:
+            # Issue 259: react-select keeps no caption or form value on the
+            # control, so re-read the picker's own shown choice in its phone
+            # fieldset before recording anything. A missing, different or
+            # duplicated shown value records nothing; Submit still decides.
+            try:
+                after, _ = await _observe_controls(
+                    session, await session.page(), site='combobox-reread')
+                rereads = [c for c in after['controls']
+                           if c.get('selector') == current['selector']]
+                reread = rereads[0] if len(rereads) == 1 else None
+                shown = (after.get('greenhouse') or {}).get('phone_country') or {}
+                # The open listbox closes on a choice; the receiver may not change.
+                if (reread is None or any(reread.get(k) != current.get(k) for k in (
+                        'label', 'question', 'tag', 'type', 'in_form', 'form_selector',
+                        'form_action', 'formaction', 'name', 'disabled'))
+                        or _key(after, reread) != PHONE_COUNTRY_KEY
+                        or shown.get('selector') != reread['selector']
+                        or shown.get('display') != selected['label']):
+                    return unresolved()
+            except Gate:
+                return unresolved()
         # Receiver presence, current displayed caption and submitted bytes are
         # checked at final Submit; an option click is not that authorization.
         committed = selected.get('value') or selected['label']

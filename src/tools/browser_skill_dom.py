@@ -1361,11 +1361,29 @@ _GREENHOUSE_PHONE_PICKER = r"""
     return [box, ...all];
   };
   greenhouse.phone_pickers = 0;
+  const phoneTel = [];
   for (const w of Array.from(document.querySelectorAll('.iti'))) {
     const parts = itiIs(w, 'DIV', 'iti') ? phonePicker(w) : null;
     if (!parts) continue;
     parts.forEach(n => pickerParts.add(n));
+    phoneTel.push(w.children[1]);
     greenhouse.phone_pickers++;
+  }
+  // Issue 259: preparation re-read of the country picker beside the ONE
+  // admitted tel input. react-select shows its choice only as a visual
+  // single-value node, so this is reported apart from the control: it is never
+  // a selected_text, a form value or Submit authority, only evidence that the
+  // exact option click took. Zero or several pickers or shown values give ''.
+  greenhouse.phone_country = {selector:'', display:''};
+  const phoneSet = phoneTel.length === 1 ? phoneTel[0].closest('fieldset') : null;
+  const phoneCombos = phoneSet ? Array.from(phoneSet.querySelectorAll('[role="combobox"]'))
+    .filter(e => !pickerParts.has(e)) : [];
+  if (phoneCombos.length === 1 && phoneSet.closest('form') === root) {
+    const shown = Array.from(phoneSet.querySelectorAll('.select__single-value'));
+    const owner = phoneCombos[0].closest('.select__value-container');
+    greenhouse.phone_country = {selector:selector(phoneCombos[0]),
+      display:shown.length === 1 && !!owner && owner.contains(shown[0]) ?
+        clean(shown[0].innerText) : ''};
   }
 """
 

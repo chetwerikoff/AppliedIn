@@ -33,16 +33,23 @@ def _proxy(case, question=''):
     return field('', PROXY, type='text', form_action=case.url, question=question)
 
 
-def _world_with_proxy(monkeypatch, rerender, question=''):
+def _flyout(case):
+    return field('Toggle flyout', '#toggle-flyout', required=False, tag='button',
+                 type='button', form_action=case.url)
+
+
+def _world_with_proxy(monkeypatch, rerender, question='', flyout=False):
     """Greenhouse city combobox followed by its proxy; `rerender` runs after the pick.
 
     `question` is the enclosing fieldset's legend, which PAGE copies onto every
-    control inside it, the proxy included.
+    control inside it, the proxy included. `flyout` puts react-select's own
+    "Toggle flyout" button between the combobox and its proxy, as a live
+    Greenhouse dropdown renders them.
     """
     case, raw = _world(monkeypatch, 'greenhouse', kind='combobox')
     for controls in (case.page['controls'], raw.state['controls']):
         at = next(i for i, c in enumerate(controls) if c['selector'] == '#city')
-        controls.insert(at + 1, _proxy(case, question))
+        controls[at + 1:at + 1] = ([_flyout(case)] if flyout else []) + [_proxy(case, question)]
     original = raw.call
 
     async def call(command, *args, **kwargs):
@@ -94,6 +101,26 @@ async def test_vanished_proxy_inside_a_labelled_fieldset_is_not_a_loss(monkeypat
     assert 'Synthetic stop before submit' in outcome['question']
     assert 'disappeared' not in outcome['question']
     assert raw.writes.count(('click', '#city-choice')) == 1
+
+
+async def test_vanished_proxy_behind_the_flyout_button_is_not_a_loss(monkeypatch):
+    """Live Phone fieldset: combobox, "Toggle flyout" button, then the id-less proxy."""
+    case, raw = _world_with_proxy(monkeypatch, _drop_proxy, question='Phone', flyout=True)
+    outcome = await _apply(case)
+    assert outcome['status'] == 'gate'
+    assert 'Synthetic stop before submit' in outcome['question']
+    assert 'disappeared' not in outcome['question']
+    assert raw.writes.count(('click', '#city-choice')) == 1
+
+
+async def test_proxy_behind_the_flyout_button_lost_without_a_committed_owner_refuses(
+        monkeypatch):
+    case, raw = _world_with_proxy(monkeypatch, _lose_value_and_proxy,
+                                  question='Phone', flyout=True)
+    outcome = await _apply(case)
+    assert outcome['status'] == 'gate'
+    assert 'A previously observed required control disappeared' in outcome['question']
+    assert PROXY in outcome['question']
 
 
 async def test_fieldset_proxy_lost_without_a_committed_owner_still_refuses(monkeypatch):
@@ -172,14 +199,22 @@ def test_phone_fieldset_proxy_is_judged_by_its_own_caption_not_the_legend():
                     question='Phone', combobox={'selected_text': 'Test Country'})
     proxy = field('', PROXY, type='text', question='Phone')
     phone = field('Phone', '#phone', type='tel', question='Phone')
+    flyout = field('Toggle flyout', 'button:nth-of-type(1)', required=False, tag='button',
+                   type='button', question='Phone')
     assert forms._is_required_proxy(proxy)
     assert forms.label(proxy) == 'Phone'
-    owners = forms._required_proxy_owners([country, proxy, phone])
+    # Live order: #country combobox, its "Toggle flyout" button, the proxy, then #phone.
+    owners = forms._required_proxy_owners([country, flyout, proxy, phone])
     assert owners == {PROXY: country}
+    assert forms._required_proxy_owners([country, proxy, phone]) == {PROXY: country}
+    # A button is only skipped, never an owner: no combobox before it means no owner.
+    assert forms._required_proxy_owners([phone, flyout, proxy]) == {}
     # The Phone input itself has an id and a caption of its own: never a proxy.
     assert not forms._is_required_proxy(phone)
-    page = {'controls': [country, phone]}
+    page = {'controls': [country, flyout, phone]}
     assert forms._rebind_required_proxy(page, proxy, country) is True
+    moved = {'controls': [country, flyout, {**proxy, 'selector': SHIFTED}, phone]}
+    assert forms._rebind_required_proxy(moved, proxy, country)['selector'] == SHIFTED
     empty = {'controls': [{**country, 'combobox': {'selected_text': ''}}, phone]}
     assert forms._rebind_required_proxy(empty, proxy, country) is None
     assert 'label "Phone"' in str(forms._vanished_required_gate(proxy, country))

@@ -398,9 +398,10 @@ _APPLICATION_ROOT = r"""
 # Structural admission belongs only to ApplicationEntryProvenance, never an alias.
 _ASHBY_ROOT = r"""
   // The pane is structural evidence only: never read its values or build targets.
-  const surveyWrappers=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+  const surveyWrappers=ashbyNative ?
+    Array.from(document.querySelectorAll('.ashby-survey-form-container')) : [];
   const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!e.closest('.ashby-survey-form-container'));
+    .filter(e=>!(ashbyNative && e.closest('.ashby-survey-form-container')));
   const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
   const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));
   const container=containers.length===1 ? containers[0] : null;

@@ -249,6 +249,30 @@ if(spec.formless) {
     ...(spec.submitAttrs || {})},wrapper);
   submit.type='submit'; // HTMLButtonElement's default, despite no type attribute.
   const move=(e,to)=> {e.parentElement.children.splice(e.parentElement.children.indexOf(e),1); e.parentElement=to; to.children.push(e);};
+  if(spec.survey) {
+    // Ashby may render the voluntary survey as a sibling with its own nested
+    // application-form container. All labels and values here are synthetic.
+    const section=node('div',{class:'ashby-survey-form-container'},wrapper);
+    const surveyContainer=node('div',{class:'ashby-application-form-container'},section);
+    const surveyEntry=node('div',{class:'ashby-application-form-field-entry'},surveyContainer);
+    const surveyLabel=node('label',{'for':'survey-preference',
+      class:'ashby-application-form-question-title',
+      text:'Synthetic voluntary survey question'},surveyEntry);
+    const surveyControl=node('input',{id:'survey-preference',type:'text'},surveyEntry);
+    surveyControl.labels=[surveyLabel];
+    if(spec.surveySecondSection) {
+      const second=node('div',{class:'ashby-survey-form-container'},wrapper);
+      node('div',{class:'ashby-application-form-container'},second);
+    }
+    if(spec.surveyExtraContainer)
+      node('div',{class:'ashby-application-form-container'},section);
+    if(spec.surveySubmit) {
+      const surveySubmit=node('button',{id:'survey-submit',type:'submit',
+        text:'Synthetic survey Submit'},surveyContainer);
+      surveySubmit.type='submit';
+    }
+    if(spec.surveyOutside) move(section,body);
+  }
   if(spec.outside) move(nodes.find(e=>e.id===spec.outside),body);
   if(spec.extraType) node(spec.extraType==='select' ? 'select':'input',
     {id:'unsupported',type:spec.extraType,required:true,...(spec.extraAttrs || {})},container);

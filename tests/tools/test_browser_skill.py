@@ -72,10 +72,10 @@ def page(*controls, text=GOOD, application_marker=False):
 
 
 @pytest.fixture(autouse=True)
-def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch):
-    """Existing control/submit guards isolate transport; witness regressions
-    exercise the real static-evaluate adapter in test_browser_bootstrap.py.
-    """
+def _legacy_guard_tests_use_a_separate_observation_stub(monkeypatch, request):
+    """Most legacy guards isolate transport; apply behavior needs both real readers."""
+    if request.node.name == 'test_required_owner_gate_binds_one_live_unanswered_control_per_resume':
+        return
     async def observed(session, current, **kwargs):
         return current, {c['selector']: {
             'visible': True, 'readonly': False, 'disabled': bool(c.get('disabled')),
@@ -3191,3 +3191,28 @@ async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
                             job_url=target_url, provenance=provenance)
     assert gated.value.reason == 'defect_provenance'
     session.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
+        monkeypatch, tmp_path):
+    """A real apply turn binds the next unanswered census receiver, not prose."""
+    from tests.tools.test_browser_reversible_gates import (
+        _apply, _fixture, _mark_census_answered)
+    _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
+    for snapshot in (endpoint.current, endpoint.fixed):
+        for control in snapshot['controls']:
+            if control['selector'] != '#additional':
+                _mark_census_answered(control)
+        for evidence in snapshot['entry']['root_evidence']:
+            if evidence['selector'] != '#additional':
+                evidence.update(value='Synthetic answer', checked=True)
+    decision.side_effect = [
+        {'action': 'wait'},
+        {'action': 'gate', 'question': 'Synthetic unbound prose'}]
+    result = await _apply(pdf)
+    assert decision.await_count == 2
+    assert result['reason'] == 'owner_question'
+    assert result['review_route'] == 'owner'
+    assert result['form_question']['selector'] == '#additional'
+    assert 'Synthetic unbound prose' not in result['question']

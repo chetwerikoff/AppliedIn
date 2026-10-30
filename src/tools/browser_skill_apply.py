@@ -1640,6 +1640,19 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     (e.getAttribute('aria-labelledby') || '').split(' ')
       .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||
     e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);
+  const hiddenAshbyChoice=e=>{
+    const labels=Array.from(e.labels || []);
+    return fixedAshbyNative && !document.querySelector('form') &&
+      container && container.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+      !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
+      !entryEvidenceVisible(e) && !e.closest('[inert]') &&
+      !e.closest('div.ashby-application-form-input-yesno') && labels.length===1 &&
+      clean(labels[0].innerText || labels[0].textContent) && entryEvidenceVisible(labels[0]) &&
+      !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+        'area[href],audio[controls],video[controls],object,embed,iframe,'+
+        '[role],[tabindex],[contenteditable],[onclick]') &&
+      document.querySelectorAll(selector(e)).length===1;
+  };
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
     '[role="option"],[role="radio"],[role="checkbox"],[contenteditable="true"]';
   /* WIDGET_GRAPH */
@@ -1674,7 +1687,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
   return {url: location.href, controls: all
     .filter(e => (!!e.getClientRects().length &&
       getComputedStyle(e).visibility !== 'hidden') ||
-      e.form || e.closest('form') || e.type === 'file')
+      e.form || e.closest('form') || e.type === 'file' || hiddenAshbyChoice(e))
     .map(e => {
       const form = e.form || e.closest('form');
       const nativeType=['INPUT','BUTTON'].includes(e.tagName) ? e.type : '';
@@ -1721,6 +1734,8 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
         inert:!!e.closest('[inert]'), visible:visible(e),
+        ...(hiddenAshbyChoice(e) ? {ashby_hidden_choice:true,
+          associated_label_selector:selector(e.labels[0])} : {}),
         ...(graph ? {graph_label_strict_visible:!!exactNodes && visible(exactNodes.label),
           graph_display_strict_visible:!!exactNodes && (visible(exactNodes.display) || (() => {
             // An untouched blank placeholder can collapse while its selectable box stays shown.
@@ -2993,7 +3008,17 @@ def _reversible_entry_recipient(page: dict, target: dict,
                              and target.get('native_type') == 'button'
                              and bool(target.get('question')))
     native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
-                    or (entry_label and target.get('tag') == 'input'))
+                    or (entry_label and target.get('tag') == 'input')
+                    or (target.get('ashby_hidden_choice') is True
+                        and e.get('ashby_hidden_choice') is True
+                        and e.get('visible') is False
+                        and e.get('label_selector') == target.get('associated_label_selector')
+                        and e.get('label') == target.get('label')) )
+    hidden_labelled_choice = (
+        target.get('tag') == 'input' and target.get('type') == 'checkbox'
+        and target.get('ashby_hidden_choice') is True
+        and e.get('visible') is False and native_label
+        and bool(str(target.get('label') or target.get('question') or '').strip()))
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3007,7 +3032,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
             ('evidence.disabled', e.get('disabled')),
             ('evidence.readonly', e.get('readonly')),
             ('evidence.inert', e.get('inert')),
-            ('evidence.visible', e.get('visible') is not True),
+            ('evidence.visible', e.get('visible') is not True
+             and not hidden_labelled_choice),
             ('tag.equal', e.get('tag') != target.get('tag')),
             ('type.equal', e.get('type') != target.get('type')),
             ('required.equal', not (custom or pair_member)
@@ -3034,7 +3060,14 @@ def _reversible_entry_recipient(page: dict, target: dict,
                     predicate, target)
     if witness is not None:
         dom = witness.get(selector)
-        if (not isinstance(dom, dict) or dom.get('visible') is not True
+        hidden_native_witness = (hidden_labelled_choice and isinstance(dom, dict)
+                                and dom.get('visible') is False
+                                and dom.get('ashby_hidden_choice') is True
+                                and dom.get('associated_label_selector')
+                                    == target.get('associated_label_selector')
+                                and dom.get('visible_text') == target.get('label'))
+        if (not isinstance(dom, dict)
+                or (dom.get('visible') is not True and not hidden_native_witness)
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
                 or dom.get('inert') is not False
@@ -3468,7 +3501,11 @@ def _unanswered(page: dict, target: dict, *, owner_all: bool = False) -> bool:
                 or any(required(c) for c in members)) and not any(
             c.get('checked') for c in members)
     if target.get('type') == 'checkbox':
-        return required(target) and not target.get('checked')
+        hidden_attestation = (target.get('ashby_hidden_choice') is True
+                              and target.get('tag') == 'input'
+                              and bool(target.get('associated_label_selector'))
+                              and not _formless_root(page).get('root'))
+        return (hidden_attestation or required(target)) and not target.get('checked')
     if target.get('type') == 'radio':
         try:
             members = _radio_group(page, target)
@@ -3820,10 +3857,20 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         raise Gate('Complete native labels and questions are required.')
     for member in members:
         dom = witness.get(member['selector'])
-        if (not dom or dom.get('visible') is not True
+        hidden_attestation = (member.get('ashby_hidden_choice') is True
+                              and member.get('type') == 'checkbox'
+                              and isinstance(dom, dict)
+                              and dom.get('ashby_hidden_choice') is True
+                              and dom.get('visible') is False
+                              and dom.get('associated_label_selector')
+                                  == member.get('associated_label_selector')
+                              and dom.get('visible_text') == member.get('label'))
+        if (not isinstance(dom, dict)
+                or (dom.get('visible') is not True and not hidden_attestation)
                 or dom.get('readonly') is True or dom.get('disabled') is True
                 or dom.get('inert') is True or member.get('disabled')
-                or (choice and dom.get('visible_text') != member['label'])
+                or (choice and not hidden_attestation
+                    and dom.get('visible_text') != member['label'])
                 or (member.get('type') == 'combobox'
                     and dom.get('combobox') != member.get('combobox'))):
             raise Gate('This control is not visibly editable.',
@@ -3857,6 +3904,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         'tag': target['tag'], 'type': target['type'],
         'form_selector': target['form_selector'],
         'form_action': target['form_action'],
+        **({'ashby_hidden_choice': True, 'visible': False,
+            'associated_label_selector': target['associated_label_selector']}
+           if target.get('ashby_hidden_choice') is True else {}),
     }
     if structural and not reversible:
         # These legacy envelope slots are opaque structural identities here.
@@ -4995,33 +5045,40 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
 
 
 async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
-                               provenance=None, fixture_context=None) -> Gate | None:
-    """Bind the first still-required answer before delegating any planning to the model.
-
-    The Ashby rootless path previously returned from bootstrap after bank grants;
-    the model then produced an unanswerable prose gate. A fresh independent
-    witness supplies this per-control question, never the model's description.
-    """
+                               provenance=None, fixture_context=None,
+                               facts: dict | None = None,
+                               global_facts: dict | None = None,
+                               allow_census_fallback: bool = False) -> Gate | None:
+    """Bind native requirements first, then rescue an unbound model Gate from census."""
     every = _owner_asks_every_receiver(page)
     if not any((every or c.get('required')) and _unanswered(page, c, owner_all=every)
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
-        # Skip records only originate on the Ashby mismatch route, so only an
-        # Ashby entry can carry one into a later root-proven page.
-        ashby = (isinstance(provenance, ApplicationEntryProvenance)
-                 and provenance.ats == 'ashby')
-        if every or not ashby:
-            return None
-        # A skipped field stays blank-relevant without a native required flag.
-        blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
-                  and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
-        try:
-            early = (_row(pk, fixture_context=fixture_context)
-                     if fixture_context is not None else _row(pk))
-        except Exception:
-            return None
-        if not (blanks and _rootless_skips(early)):
-            return None
+        # The model may recognize a live requirement whose native required
+        # bit is absent. Only its explicit Gate path opts into this census fallback.
+        root = _formless_root(page)
+        ashby_rootless = (allow_census_fallback
+                          and isinstance(provenance, ApplicationEntryProvenance)
+                          and provenance.ats == 'ashby'
+                          and isinstance(root, dict) and not root.get('root'))
+        if ashby_rootless:
+            pass
+        else:
+            # Skip records only originate on the Ashby mismatch route, so only an
+            # Ashby entry can carry one into a later root-proven page.
+            ashby = (isinstance(provenance, ApplicationEntryProvenance)
+                     and provenance.ats == 'ashby')
+            if every or not ashby:
+                return None
+            blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
+                      and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
+            try:
+                early = (_row(pk, fixture_context=fixture_context)
+                         if fixture_context is not None else _row(pk))
+            except Exception:
+                return None
+            if not (blanks and _rootless_skips(early)):
+                return None
     # Synthetic read-only sessions and unguarded legacy routes cannot supply
     # a safely executable direct question. Production writes own this guard.
     raw = getattr(session, 'raw', session)
@@ -5067,14 +5124,39 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}
-    every = _owner_asks_every_receiver(current)
-    for item in current['controls']:
+    controls = current['controls']
+    if allow_census_fallback:
+        controls = sorted(controls, key=lambda c: not (
+            (every or c.get('required')) and _unanswered(current, c, owner_all=every)
+            and c.get('type') not in {
+                'file', 'hidden', 'password', 'submit', 'image'}))
+    for item in controls:
         kind = item.get('type')
-        # On that route an optional receiver outside the admitted scope (a
-        # toggle, the dropzone, a hidden proxy) is skipped, never a defect.
+        census = current.get('entry', {}).get('root_evidence', [])
+        matches = [e for e in census if isinstance(e, dict)
+                   and e.get('selector') == item.get('selector')]
+        evidence = matches[0] if len(matches) == 1 else {}
+        hidden_labelled_choice = (
+            kind == 'checkbox' and item.get('tag') == 'input'
+            and item.get('ashby_hidden_choice') is True
+            and evidence.get('visible') is False
+            and bool(str(evidence.get('label') or evidence.get('entry_label')
+                            or item.get('label') or item.get('question') or '').strip()))
+        supported = (_native_answer(item) or kind in {'checkbox', 'radio'}
+                     and item.get('tag') == 'input'
+                     or kind == 'combobox' and item.get('tag') in {'input', 'div'})
+        census_fallback = (allow_census_fallback and rootless and scope
+                           and item.get('selector') in scope
+                           and evidence.get('in_container') is True
+                           and evidence.get('boolean_group') is not True
+                           and evidence.get('yes_no') is not True
+                           and supported
+                           and (evidence.get('visible') is True
+                                or hidden_labelled_choice))
         owner_needed = item.get('required') or (
-            every and item.get('selector') in scope)
-        if (not owner_needed or not _unanswered(current, item, owner_all=every)
+            every and item.get('selector') in scope) or census_fallback
+        if (not owner_needed or not _unanswered(
+                current, item, owner_all=every or bool(census_fallback))
                 or kind in {'file', 'hidden', 'password', 'submit', 'image'}
                 or native_submit(item)):
             continue
@@ -5153,14 +5235,19 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                               witnessed_options=witnessed_options):
             continue
         question = _disclosure_question(
-            current, item, witness, *origins, bootstrap=True,
+            current, item, witness, *origins, bootstrap=not census_fallback,
             closed_witness=_closed_material_combobox(item),
             reversible_scope=scope, provenance=provenance)
         question['pk'] = pk
-        if every and _owner_skip_applies(row, pk, question, current, item):
+        if (every or census_fallback) and _owner_skip_applies(
+                row, pk, question, current, item):
             continue
-        return Gate(_choice_prompt(item, question), form_question=question,
-                    reason='owner_question')
+        prompt = _choice_prompt(item, question)
+        saved_key = (_fact_key(facts or {}, question['label'])
+                     or _fact_key(global_facts or {}, question['label']))
+        if saved_key is not None:
+            prompt += '\nA matching answer is saved in facts.md; confirm or provide it.'
+        return Gate(prompt, form_question=question, reason='owner_question')
     if not every and _rootless_skips(row):
         # A proven root voids every rootless SKIP on this job (ARCH21:26): its
         # field may have re-rendered under another caption, so each blank field
@@ -5596,9 +5683,18 @@ def _reversible_action_scope(page: dict, witness: dict, target: dict,
     _reversible_entry_recipient(page, target, witness)
     selector = target.get('selector')
     observed = witness.get(selector)
+    hidden_attestation = (target.get('ashby_hidden_choice') is True
+                          and target.get('type') == 'checkbox'
+                          and target.get('tag') == 'input'
+                          and isinstance(observed, dict)
+                          and observed.get('ashby_hidden_choice') is True
+                          and observed.get('visible') is False
+                          and observed.get('associated_label_selector')
+                              == target.get('associated_label_selector')
+                          and observed.get('visible_text') == target.get('label'))
     if (not isinstance(selector, str) or not selector
             or not isinstance(observed, dict)
-            or observed.get('visible') is not True
+            or (observed.get('visible') is not True and not hidden_attestation)
             or observed.get('readonly') is not False
             or observed.get('disabled') is not False
             or observed.get('inert') is not False):
@@ -5901,6 +5997,24 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 if (len(selected) != 1 or selected[0]['selector'] != current['selector']
                         or not _same(value, actual.get('label', ''))):
                     raise _readback_gate(pk, verb, current, actual, write_value, 'selected')
+            elif current.get('ashby_hidden_choice') is True:
+                if actual.get('checked') is not True:
+                    raw = getattr(session, 'raw', session)
+                    controller = getattr(raw, '_application_controller', None)
+                    selector = current.get('associated_label_selector')
+                    if (not isinstance(controller, ApplicationIPCController)
+                            or not selector or controller._hidden_label_fallback):
+                        raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
+                    controller._hidden_label_fallback = True
+                    await _effect_call(session, 'click', selector)
+                    readback, witness = await _observe_controls(
+                        session, await session.page(), site='execute-readback-label')
+                    actual = control(readback, action, 'execute-readback-reread')
+                    dom = witness.get(current['selector'])
+                    if (actual.get('checked') is not True
+                            or not isinstance(dom, dict)
+                            or dom.get('checked') is not True):
+                        raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
             elif actual.get('value') != write_value or not actual.get('has_value'):
                 raise _readback_gate(pk, verb, current, actual, write_value)
             # The DOM readback uses the machine value (e.g. "remote"), while
@@ -6349,6 +6463,7 @@ class ApplicationIPCController:
         self.greenhouse_provenance = (entry_provenance if isinstance(
             entry_provenance, GreenhouseJobAlias) else None)
         self.upload_completed = False
+        self._hidden_label_fallback = False
         self.upload_attempted = False
         self.upload_identity = None
         self.upload_pending = False
@@ -6672,6 +6787,29 @@ class ApplicationIPCController:
         if selector in {c.get('selector') for c in observed.get('root_evidence') or []
                         if isinstance(c, dict) and c.get('dropzone') is True}:
             raise Gate('The clicked application control or option is not current.')
+        if self._hidden_label_fallback:
+            self._hidden_label_fallback = False
+            candidates = [c for c in page.get('controls', [])
+                          if c.get('ashby_hidden_choice') is True
+                          and c.get('associated_label_selector') == selector]
+            if (op != 'click' or len(args) != 2 or kwargs or len(candidates) != 1
+                    or candidates[0].get('checked') is True):
+                raise Gate('The hidden attestation label fallback is no longer valid.')
+            # The independent ENTRY census must still certify this exact,
+            # non-navigating label. A stale PAGE choice cannot grant a label click.
+            evidence = (page.get('entry') or {}).get('root_evidence') or []
+            matches = [e for e in evidence if isinstance(e, dict)
+                       and e.get('selector') == candidates[0]['selector']]
+            if (len(matches) != 1
+                    or matches[0].get('ashby_hidden_choice') is not True
+                    or matches[0].get('label_selector') != selector):
+                raise Gate('The hidden attestation label lacks safe independent evidence.')
+            page, choice = await self._reversible_receiver(session, page, candidates[0])
+            approved = _approved_native_choice(
+                page, choice, self.pk, fixture_context=self.fixture_context)
+            if not approved or approved[0] != 'yes':
+                raise Gate('The associated label has no exact owner yes grant.')
+            return
         if not targets:
             if self._choice(page, selector):
                 return
@@ -6830,6 +6968,20 @@ class ApplicationIPCController:
         # upload in the run, and nothing recorded which click got there. The
         # final guard stays byte-pinned, so its evidence is logged out here.
         # Structure only: known names and booleans, never values.
+        hidden_attestations = [c for c in page.get('controls', [])
+                               if c.get('ashby_hidden_choice') is True]
+        for choice in hidden_attestations:
+            # An optional unanswered or skipped box remains unchecked. Only a
+            # checked attestation needs an exact current yes grant at Submit.
+            if choice.get('checked') is not True:
+                continue
+            try:
+                exact_approval(self.pk, _key(page, choice), 'yes',
+                               target=_bound_target(page, choice),
+                               url=page['url'], **self._ctx())
+            except Gate:
+                raise Gate('An unapproved hidden application attestation blocks Submit.',
+                           reason='owner_question') from None
         try:
             await self.authorize_final_submit(session, page, target)
         except Gate as refusal:
@@ -7240,7 +7392,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         if _required_owner_gate_admitted(page, provenance):
                             pending = await _required_owner_gate(
                                 session, page, pk, *trusted_origins,
-                                provenance=provenance, fixture_context=ctx)
+                                provenance=provenance, fixture_context=ctx,
+                                facts=facts, global_facts=global_facts)
                             if pending is not None:
                                 raise pending
                     if (not decided
@@ -7446,10 +7599,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         fresh = await session.page()
                         if isinstance(session, _ReversibleEntryReader):
                             _entry_safety(fresh, allowed, provenance)
+                        ashby_rootless = (
+                            isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'
+                            and bool(_formless_root(fresh))
+                            and not _formless_root(fresh).get('root'))
                         if _required_owner_gate_admitted(fresh, provenance):
                             pending = await _required_owner_gate(
                                 session, fresh, pk, *trusted_origins,
-                                provenance=provenance, fixture_context=ctx)
+                                provenance=provenance, fixture_context=ctx,
+                                facts=facts, global_facts=global_facts,
+                                allow_census_fallback=ashby_rootless)
                             if pending is not None:
                                 raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))
@@ -7710,10 +7870,15 @@ def owner_skip_eligible(question) -> bool:
             and question.get('owner_kind') == 'ashby-reversible-entry'
             and question.get('route') == _MISMATCH_ROUTE
             and question.get('requiredness') == 'unknown'
-            and question.get('tag') in {'input', 'textarea', 'select', 'div'}
+            and ((question.get('tag') in {'input', 'textarea', 'select', 'div'}
+                  and question.get('type') != 'checkbox')
+                 or (question.get('tag') == 'input'
+                     and question.get('type') == 'checkbox'
+                     and question.get('ashby_hidden_choice') is True
+                     and question.get('visible') is False
+                     and bool(question.get('associated_label_selector'))))
             and question.get('type') not in {
-                'checkbox', 'radio', 'button', 'file', 'hidden', 'password',
-                'submit', 'image'}
+                'radio', 'button', 'file', 'hidden', 'password', 'submit', 'image'}
             and not _material_question(question))
 
 

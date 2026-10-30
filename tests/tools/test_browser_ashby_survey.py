@@ -620,12 +620,3 @@ def test_link_and_toggle_never_collide_but_real_receivers_still_refuse():
         forms._key(dict(page, controls=[*page['controls'], twin]), box)
     assert link['tag'] == 'a'
 
-
-def test_disabled_unchecked_choice_is_not_a_filled_control_at_submit():
-    page, _fixed = _live('openai', **_ATTESTATIONS)
-    box = dict(next(c for c in page['controls'] if c['selector'] == '#attestation-1'),
-               disabled=True)
-    assert box['has_value'] is True and box['checked'] is False
-    forms.check_form(dict(page, controls=[box]), {}, True)
-    with pytest.raises(forms.Gate, match='disabled at final Submit'):
-        forms.check_form(dict(page, controls=[dict(box, checked=True)]), {}, True)

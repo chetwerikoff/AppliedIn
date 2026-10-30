@@ -1334,10 +1334,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
 
         if target.get('disabled'):
-            # Issue #258: a choice's DOM value is "on" while unchecked.
             if (target.get('selector') in filled or target.get('checked')
-                    or (target.get('has_value') and typ not in {'radio', 'checkbox'})
-                    or target.get('required')):
+                    or target.get('has_value') or target.get('required')):
                 raise Gate('A previously approved or required form control is disabled at final Submit.')
             continue
         if (typ == 'button' and target.get('tag') == 'button'

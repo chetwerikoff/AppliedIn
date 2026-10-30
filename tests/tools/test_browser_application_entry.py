@@ -2307,6 +2307,8 @@ async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
 _ISSUE201_MAIN_SHA256 = {
     "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
     "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
+    "src/tools/claude_chrome.py": "cfb72475c28e31583b1465a08df1b3832fcac4b0e02e5df22963a75b31e9c596",
+    "src/discovery/tenant_pin.py": "8bb21e29e8e26d00b7b81b82d92a4f4397044cf96862a85c2cc0d36fff96c407",
 }
 
 _ISSUE201_PROTECTED_FUNCTION_SHA256 = {

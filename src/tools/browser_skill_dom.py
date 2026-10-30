@@ -440,7 +440,8 @@ _ASHBY_ROOT = r"""
     exactSubmit?.parentElement===wrapper &&
     siblings.filter(n=>[container,panes[0],exactSubmit].includes(n)).length===3 &&
     siblings.every(n=>n===container || n===panes[0] || n===exactSubmit || inertSibling(n));
-  const structuralRoot=!forms.length && ordered ? wrapper : null;
+  const structuralRoot=!forms.length && ordered &&
+    (!surveyWrappers.length || surveyValid) ? wrapper : null;
   const root=nativeRoot || structuralRoot;
   let structuralError='';
   if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||

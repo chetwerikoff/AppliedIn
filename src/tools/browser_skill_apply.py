@@ -4869,6 +4869,20 @@ def _required_proxy_owners(controls: list) -> dict:
     return owners
 
 
+def _phone_country_shows_choice(page: dict, owner: dict) -> bool:
+    """True when the phone-country picker itself shows exactly one chosen flag.
+
+    Issue #266: live read after picking the Phone country leaves `#country` with
+    an empty `selected_text` (the picker shows only a flag and a dial code), yet
+    its required proxy unmounts like any other. The picker's own shown choice,
+    read from the same PAGE, is the only commit evidence it has.
+    """
+    shown = (page.get('greenhouse') or {}).get('phone_country') or {}
+    return (shown.get('selector') == owner.get('selector')
+            and shown.get('single_values') == 1 and shown.get('expanded') is False
+            and bool(shown.get('display')) and len(shown.get('flags') or []) == 1)
+
+
 def _rebind_required_proxy(page: dict, proxy: dict, owner: dict):
     """Resolve a vanished required proxy through its owner, or None to refuse.
 
@@ -4882,14 +4896,22 @@ def _rebind_required_proxy(page: dict, proxy: dict, owner: dict):
         return None
     current = controls[at[0]]
     after = at[0] + 1
+    clearable = False
     while after < len(controls) and _is_react_select_button(controls[after]):
+        clearable = clearable or (
+            str(controls[after].get('label') or '').strip().casefold() == 'clear selections')
         after += 1
     following = controls[after] if after < len(controls) else None
     if (following is not None and _is_required_proxy(following)
             and following.get('form_selector') == proxy.get('form_selector')
             and sum(c['selector'] == following['selector'] for c in controls) == 1):
         return following
-    if current.get('required') and (current.get('combobox') or {}).get('selected_text'):
+    # Live reads leave `selected_text` empty after a pick; react-select then shows
+    # its "Clear selections" button (only while it holds a value) or, for the
+    # phone-country picker, its flag and dial code.
+    if current.get('required') and ((current.get('combobox') or {}).get('selected_text')
+                                    or clearable
+                                    or _phone_country_shows_choice(page, current)):
         return True
     return None
 

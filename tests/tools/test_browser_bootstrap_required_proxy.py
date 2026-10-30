@@ -75,6 +75,21 @@ def _shift_proxy(controls):
     next(c for c in controls if c['selector'] == PROXY)['selector'] = SHIFTED
 
 
+def _show_choice_only_in_phone_country(controls):
+    """The picker holds no text: only its flag and dial code say it was picked."""
+    _drop_proxy(controls)
+    next(c for c in controls if c['selector'] == '#city')['combobox']['selected_text'] = ''
+
+
+def _show_choice_only_by_clear_button(controls):
+    """Live Location: no selected_text, but react-select now renders "Clear selections"."""
+    _drop_proxy(controls)
+    at = next(i for i, c in enumerate(controls) if c['selector'] == '#city')
+    controls[at]['combobox']['selected_text'] = ''
+    controls.insert(at + 1, field('Clear selections', '#clear-selections', required=False,
+                                  tag='button', type='button', form_action=controls[at]['form_action']))
+
+
 def _lose_value_and_proxy(controls):
     """The pick did not stick: the proxy is gone but the combobox holds nothing."""
     _drop_proxy(controls)
@@ -121,6 +136,36 @@ async def test_proxy_behind_the_flyout_button_lost_without_a_committed_owner_ref
     assert outcome['status'] == 'gate'
     assert 'A previously observed required control disappeared' in outcome['question']
     assert PROXY in outcome['question']
+
+
+async def test_phone_country_pick_shown_only_by_its_flag_is_not_a_loss(monkeypatch):
+    """Issue #266 live: `#country` keeps no selected_text; greenhouse.phone_country proves it."""
+    case, raw = _world_with_proxy(monkeypatch, _show_choice_only_in_phone_country,
+                                  question='Phone', flyout=True)
+    original = raw.call
+
+    async def call(command, *args, **kwargs):
+        result = await original(command, *args, **kwargs)
+        if command == 'click' and args[0] == '#city-choice':
+            raw.state['greenhouse']['phone_country'] = {
+                'selector': '#city', 'display': '+1', 'single_values': 1,
+                'expanded': False, 'flags': ['us'], 'option_flags': {}}
+        return result
+
+    raw.call = call
+    outcome = await _apply(case)
+    assert outcome['status'] == 'gate'
+    assert 'Synthetic stop before submit' in outcome['question']
+    assert 'disappeared' not in outcome['question']
+
+
+async def test_pick_shown_only_by_the_clear_selections_button_is_not_a_loss(monkeypatch):
+    """Issue #266 live: Location keeps no selected_text; the clear button proves a held value."""
+    case, raw = _world_with_proxy(monkeypatch, _show_choice_only_by_clear_button)
+    outcome = await _apply(case)
+    assert outcome['status'] == 'gate'
+    assert 'Synthetic stop before submit' in outcome['question']
+    assert 'disappeared' not in outcome['question']
 
 
 async def test_fieldset_proxy_lost_without_a_committed_owner_still_refuses(monkeypatch):
@@ -217,6 +262,23 @@ def test_phone_fieldset_proxy_is_judged_by_its_own_caption_not_the_legend():
     assert forms._rebind_required_proxy(moved, proxy, country)['selector'] == SHIFTED
     empty = {'controls': [{**country, 'combobox': {'selected_text': ''}}, phone]}
     assert forms._rebind_required_proxy(empty, proxy, country) is None
+    # Live: after the pick `#country` has no selected_text, only the picker's flag shows it.
+    shown = {'selector': '#country', 'display': '+1', 'single_values': 1,
+             'expanded': False, 'flags': ['us'], 'option_flags': {}}
+    flagged = {**empty, 'greenhouse': {'phone_country': shown}}
+    assert forms._rebind_required_proxy(flagged, proxy, country) is True
+    # Live Location: the "Clear selections" button after the owner proves a held value.
+    clear = field('Clear selections', 'button:nth-of-type(2)', required=False, tag='button',
+                  type='button')
+    cleared = {'controls': [{**country, 'combobox': {'selected_text': ''}}, clear, phone]}
+    assert forms._rebind_required_proxy(cleared, proxy, country) is True
+    # A clear button elsewhere on the page is not evidence for this owner.
+    stray = {'controls': [{**country, 'combobox': {'selected_text': ''}}, phone, clear]}
+    assert forms._rebind_required_proxy(stray, proxy, country) is None
+    for broken in ({'single_values': 0}, {'expanded': True}, {'flags': ['us', 'gb']},
+                   {'display': ''}, {'selector': '#other'}):
+        page = {**empty, 'greenhouse': {'phone_country': {**shown, **broken}}}
+        assert forms._rebind_required_proxy(page, proxy, country) is None, broken
     assert 'label "Phone"' in str(forms._vanished_required_gate(proxy, country))
 
 

@@ -214,6 +214,14 @@ async def test_live_div_form_final_submit_reaches_unchanged_guard(monkeypatch, s
         reached.append(target.get('selector'))
         return await guard(session, current, target)
 
+    dispatched = []
+
+    def refuse_dispatch(pk, _resume_path, **_kwargs):
+        # Offline: the unchanged guard's first store-backed check refuses here.
+        dispatched.append(pk)
+        raise forms.Gate('synthetic unqueued row')
+
+    monkeypatch.setattr(forms, 'check_dispatch', refuse_dispatch)
     monkeypatch.setattr(bsk, 'command', fake_command)
     monkeypatch.setattr(controller, '_fresh_preparation', lambda _url, **_kwargs: None)
     monkeypatch.setattr(controller, '_page', fake_page)
@@ -221,9 +229,9 @@ async def test_live_div_form_final_submit_reaches_unchanged_guard(monkeypatch, s
     session = bsk.Session('apply')
     session.id = 'synthetic-session'
     session.bind_application_controller(controller)
-    with pytest.raises(forms.Gate):
+    with pytest.raises(forms.Gate, match='synthetic unqueued row'):
         await session.application_effect('click', '#structural-submit')
-    assert reached == ['#structural-submit']
+    assert reached == ['#structural-submit'] and dispatched == [PK]
     assert not any(argv[:1] == ('click',) for argv in calls)
 
 

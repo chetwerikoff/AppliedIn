@@ -5303,9 +5303,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
         if not value or authority in {'missing', 'incomplete'}:
             record('needs-human')
-            raise Gate(prompt, form_question=question,
-                       reason=(_missing_answer_reason(item) if previous is None and not value
-                               else 'unknown_field'))
+            # A missing value or a bank-held value refused by bank-auto
+            # still needs an exact owner answer, never an unknown-field gate.
+            raise Gate(prompt, form_question=question, reason='owner_question')
         try:
             exact_approval(
                 pk, key, value, target=_bound_target(page, item),

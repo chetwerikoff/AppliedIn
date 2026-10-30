@@ -1641,6 +1641,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
   const hiddenAshbyChoice=e=>{
     const labels=Array.from(e.labels || []);
     return fixedAshbyNative && !document.querySelector('form') &&
+      containers.length===1 && (!surveyWrappers.length || surveyValid) &&
       container && container.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
       !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
       !entryEvidenceVisible(e) && !e.closest('[inert]') &&

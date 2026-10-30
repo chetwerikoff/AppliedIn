@@ -82,8 +82,15 @@ def _scope_parts(url: str, careers_url: str):
 
 
 def greenhouse_query_id(url: str, careers_url: str) -> str | None:
-    """Only the exact literal employer ?gh_jid=digits wrapper (no parameters)."""
-    p = _scope_parts(url, careers_url)
+    """Exact scoped ?gh_jid identity, including only the bare-host root form."""
+    if isinstance(careers_url, str) and re.fullmatch(
+            r"https://[a-z0-9.-]+", careers_url):
+        source, p = _parts(careers_url + "/"), _parts(url)
+        if (source is None or p is None or p.netloc != source.netloc
+                or p.path != "/"):
+            return None
+    else:
+        p = _scope_parts(url, careers_url)
     if p is None or p.fragment or not re.fullmatch(r"gh_jid=([0-9]+)", p.query):
         return None
     return p.query.split("=", 1)[1]
@@ -99,6 +106,33 @@ def greenhouse_suffix_id(url: str, careers_url: str) -> str | None:
             or not _NUMBER.fullmatch(parts[-1])):
         return None
     return parts[-1]
+
+
+def greenhouse_feed_identity(job: JobRecord, config: CompanyConfig) -> bool:
+    """Literal hosted, query-wrapper or same-host numeric terminal feed URL.
+
+    A feed's employer apply path can differ from the careers listing path.
+    This shape alone grants nothing: the one exact board-feed absolute_url,
+    job ID and reviewed tuple must separately agree.
+    """
+    jid = job.job_id
+    if (config.ats != "greenhouse" or not isinstance(jid, str)
+            or not _NUMBER.fullmatch(jid)):
+        return False
+    if canonical_hosted(job, "greenhouse", config.board, jid):
+        return True
+    if greenhouse_query_id(job.jd_url, config.careers_url) == jid:
+        return True
+    bare = (isinstance(config.careers_url, str) and
+            re.fullmatch(r"https://[a-z0-9.-]+", config.careers_url))
+    source = _parts(config.careers_url + "/" if bare else config.careers_url)
+    target = _parts(job.jd_url)
+    return bool(
+        source and target and source.netloc == target.netloc
+        and not target.query and not target.fragment
+        and re.fullmatch(r"/[A-Za-z0-9._~/-]+/" + re.escape(jid),
+                         target.path)
+    )
 
 
 def canonical_hosted(job: JobRecord, ats: str, board: str, job_id: str) -> bool:
@@ -144,16 +178,21 @@ def reviewed_tuple(name: str, *, path: str | Path | None = None,
             return None
         entry, cfg = matches[0]
         required = {"name", "careers_url", "ats", "board", "discovery", "mode"}
+        bare_gh = (cfg.ats == "greenhouse"
+                   and isinstance(cfg.careers_url, str)
+                   and re.fullmatch(r"https://[a-z0-9.-]+", cfg.careers_url))
+        source_url = cfg.careers_url + "/" if bare_gh else cfg.careers_url
         if (not required.issubset(entry)
                 or cfg.name != name or cfg.mode is not ApplyMode.GATED
                 or cfg.ats not in _HOSTED
                 or not isinstance(cfg.board, str)
                 or _BOARD.fullmatch(cfg.board) is None
-                or _parts(cfg.careers_url) is None
+                or _parts(source_url) is None
                 or urlsplit(cfg.careers_url).query
                 or urlsplit(cfg.careers_url).fragment
-                or not urlsplit(cfg.careers_url).path.strip("/")
-                or urlsplit(cfg.careers_url).path.endswith("/")
+                or (not bare_gh and (
+                    not urlsplit(cfg.careers_url).path.strip("/")
+                    or urlsplit(cfg.careers_url).path.endswith("/")))
                 or str(entry["discovery"]) != cfg.discovery.value
                 or str(entry["mode"]) != cfg.mode.value
                 or any(entry.get(k) != getattr(cfg, k)
@@ -170,8 +209,9 @@ def reviewed_tuple(name: str, *, path: str | Path | None = None,
 
 
 def exact_feed_match(config: CompanyConfig, job_id: str,
-                     rows: list[JobRecord]) -> JobRecord | None:
-    """One current ID row plus an independently canonical hosted target."""
+                     rows: list[JobRecord], *,
+                     stored_url: str | None = None) -> JobRecord | None:
+    """One current ID row with exact unchanged feed absolute_url."""
     if not isinstance(rows, list):
         return None
     matches = [job for job in rows if isinstance(job, JobRecord)
@@ -179,9 +219,11 @@ def exact_feed_match(config: CompanyConfig, job_id: str,
     if len(matches) != 1:
         return None
     job = matches[0]
+    route = (greenhouse_feed_identity(job, config) if config.ats == "greenhouse"
+             else canonical_hosted(job, config.ats, config.board, job_id))
     return job if (
         job.ats == config.ats and job.company == config.name
-        and canonical_hosted(job, config.ats, config.board, job_id)
+        and route and (stored_url is None or stored_url == job.jd_url)
     ) else None
 
 
@@ -231,7 +273,9 @@ def rederive_one(
     if ats != cfg.ats or ats not in _HOSTED:
         return {**result, "status": "ats_conflict", "next_action": _NEXT_MANUAL}
     if ats == "greenhouse":
-        if greenhouse_query_id(url, cfg.careers_url) != job_id:
+        candidate = JobRecord(company=cfg.name, job_id=job_id, title="",
+                              jd_url=str(url), jd_text="", ats=ats)
+        if not greenhouse_feed_identity(candidate, cfg):
             return {**result, "status": "noncanonical_wrapper", "next_action": _NEXT_MANUAL}
     elif not canonical_hosted(
             JobRecord(company=cfg.name, job_id=job_id, title="",
@@ -243,7 +287,8 @@ def rederive_one(
     except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
         return {**result, "status": "feed_unavailable",
                 "next_action": _NEXT_PROOF, "detail": type(exc).__name__}
-    feed = exact_feed_match(cfg, job_id, matches)
+    feed = exact_feed_match(cfg, job_id, matches,
+                            stored_url=url if ats == "greenhouse" else None)
     if feed is None:
         return {**result, "status": "feed_not_proved", "next_action": _NEXT_PROOF}
     result["evidence"] = {"ats": ats, "board": cfg.board,

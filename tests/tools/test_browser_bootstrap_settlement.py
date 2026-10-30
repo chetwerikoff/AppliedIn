@@ -29,7 +29,7 @@ ASHBY_POSTING = f'https://jobs.ashbyhq.com/{COMPANY}/{JOB}'
 ASHBY_APPLY = ASHBY_POSTING + '/application'
 GH_PK = 'example-co#123456'
 GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
-GH_APPLY = 'https://job-boards.greenhouse.io/example-co/jobs/123456'
+GH_APPLY = 'https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=123456'
 PHONE = '+15550101010'
 
 
@@ -308,8 +308,24 @@ def _world(monkeypatch, route, *, kind=None, noisy=False, explicit_ashby_native=
             _ashby_native_candidate(ASHBY_APPLY, case.page['controls'])
         ]
     raw = NativeTransport(case.page)
+    config_dir = '/synthetic-only'
+    if route == 'greenhouse':
+        # A real reviewed YAML tuple is required by #250. Keep the temporary
+        # directory alive with this synthetic case (no network/feed needed).
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        case._watchlist_dir = TemporaryDirectory(prefix='appliedin-gh-fixture-')
+        config_dir = case._watchlist_dir.name
+        (Path(config_dir) / 'watchlist.yaml').write_text(
+            'companies:\n'
+            '  - name: example-co\n'
+            '    careers_url: https://careers.example-co.test/openings\n'
+            '    ats: greenhouse\n'
+            '    board: example-co\n'
+            '    discovery: feed\n'
+            '    mode: gated\n')
     monkeypatch.setattr('core.config.get_settings',
-                        lambda: SimpleNamespace(config_dir='/synthetic-only'))
+                        lambda: SimpleNamespace(config_dir=config_dir))
     monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda path: [case.config])
     monkeypatch.setattr(forms, '_row', lambda pk, *args, **kw: case.row)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *args, **kw: None)

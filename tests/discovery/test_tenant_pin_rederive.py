@@ -133,7 +133,6 @@ def test_unsafe_original_history_is_never_patched(world, changed):
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&x=1",
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&gh_jid=731205",
     "https://careers.example-co.test/openings/engineer?gh_jid=%37%33",
-    "https://careers.example-co.test/openings/job/731205",
     "http://careers.example-co.test/openings/engineer?gh_jid=731205",
     "https://careers.example-co.test/other/engineer?gh_jid=731205",
 ])
@@ -154,6 +153,13 @@ def test_noncanonical_original_url_needs_manual_identity_review(world, url):
 ])
 def test_missing_or_noncanonical_feed_target_cannot_pin(world, target):
     world.rows = [_feed(url=target)]
+    assert _once(world)["status"] == "feed_not_proved"
+    assert world.tracking.writes == 0
+
+
+def test_numeric_terminal_original_requires_matching_literal_feed_url(world):
+    # #250 admits the feed shape, never a row without same-URL feed proof.
+    world.tracking.row["jd_url"] = CAREERS + "/job/731205"
     assert _once(world)["status"] == "feed_not_proved"
     assert world.tracking.writes == 0
 
@@ -348,7 +354,7 @@ def test_original_deployed_tuple_requires_exact_nonpathless_source(
     ("https://careers.example-co.test",
      "https://careers.example-co.test/?gh_jid=" + GH201_JID),
 ])
-def test_existing_greenhouse_guard_keeps_old_pinned_wrapper_but_refuses_canonical_start(
+def test_existing_greenhouse_guard_accepts_pinned_wrapper_and_hosted_feed_candidate(
     careers, wrapper,
 ):
     cfg = CompanyConfig(name=GH201_NAME, careers_url=careers,

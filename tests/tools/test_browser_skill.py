@@ -3089,26 +3089,33 @@ def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, 
     url = 'https://careers.example.test/jobs?gh_jid=101'
     row = {'pk': pk, 'company': 'example-co', 'job_id': '101',
            'ats': 'greenhouse', 'jd_url': url}
-    config = SimpleNamespace(name='example-co', ats='greenhouse', board=None,
-                             careers_url='https://careers.example.test/')
+
+    # Exercise a deployed synthetic tuple instead of a mutable resolver hint.
+    def deploy(*, board='verified-board', careers='https://careers.example.test/jobs'):
+        (tmp_path / 'watchlist.yaml').write_text(
+            'companies:\n'
+            '  - name: example-co\n'
+            f'    careers_url: {careers}\n'
+            '    ats: greenhouse\n'
+            f'    board: {board}\n'
+            '    discovery: feed\n'
+            '    mode: gated\n')
+
+    deploy()
     monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: row)
     monkeypatch.setattr('core.config.get_settings',
                         lambda: SimpleNamespace(config_dir=tmp_path))
-    monkeypatch.setattr('discovery.watchlist.load_watchlist', lambda *_: [config])
-    # Absent board and absent persisted pin grant no *final* ATS authority.
-    assert forms._configured_alias(pk, 'example-co', url) is None
-    config.board = 'verified-board'
     assert forms._configured_alias(pk, 'example-co', url) is None
     row['greenhouse_board'] = 'verified-board'
     proof = forms._configured_alias(pk, 'example-co', url)
     assert isinstance(proof, forms.GreenhouseJobAlias)
-    assert proof.url == 'https://job-boards.greenhouse.io/verified-board/jobs/101'
+    assert proof.url == ('https://job-boards.greenhouse.io/embed/job_app'
+                         '?for=verified-board&token=101')
     assert forms._alias_current(proof)
-    config.board = None
+    deploy(board='')
     assert forms._configured_alias(pk, 'example-co', url) is None
     assert not forms._alias_current(proof)
-    config.careers_url = 'https://different.example.test/'
-    config.board = 'verified-board'
+    deploy(careers='https://different.example.test/jobs')
     assert forms._configured_alias(pk, 'example-co', url) is None
     assert forms._configured_alias(pk, 'wrong-company', url) is None
 

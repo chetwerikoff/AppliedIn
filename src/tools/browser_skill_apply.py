@@ -2992,6 +2992,10 @@ def _reversible_entry_recipient(page: dict, target: dict,
                              and bool(target.get('question')))
     native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
                     or (entry_label and target.get('tag') == 'input'))
+    hidden_labelled_choice = (
+        target.get('tag') == 'input' and target.get('type') in {'checkbox', 'radio'}
+        and e.get('visible') is False and native_label
+        and bool(str(target.get('label') or target.get('question') or '').strip()))
     for predicate, failed in (
             ('evidence.unique', e.get('unique') is not True),
             ('evidence.in_container', e.get('in_container') is not True),
@@ -3005,7 +3009,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
             ('evidence.disabled', e.get('disabled')),
             ('evidence.readonly', e.get('readonly')),
             ('evidence.inert', e.get('inert')),
-            ('evidence.visible', e.get('visible') is not True),
+            ('evidence.visible', e.get('visible') is not True
+             and not hidden_labelled_choice),
             ('tag.equal', e.get('tag') != target.get('tag')),
             ('type.equal', e.get('type') != target.get('type')),
             ('required.equal', not (custom or pair_member)
@@ -3032,7 +3037,10 @@ def _reversible_entry_recipient(page: dict, target: dict,
                     predicate, target)
     if witness is not None:
         dom = witness.get(selector)
-        if (not isinstance(dom, dict) or dom.get('visible') is not True
+        hidden_native_witness = (hidden_labelled_choice and isinstance(dom, dict)
+                                and dom.get('visible') is False)
+        if (not isinstance(dom, dict)
+                or (dom.get('visible') is not True and not hidden_native_witness)
                 or dom.get('readonly') is not False
                 or dom.get('disabled') is not False
                 or dom.get('inert') is not False
@@ -4995,33 +5003,38 @@ def _required_owner_gate_admitted(page: dict, provenance) -> bool:
 async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                                provenance=None, fixture_context=None,
                                facts: dict | None = None,
-                               global_facts: dict | None = None) -> Gate | None:
-    """Bind the first still-required answer before delegating any planning to the model.
-
-    The Ashby rootless path previously returned from bootstrap after bank grants;
-    the model then produced an unanswerable prose gate. A fresh independent
-    witness supplies this per-control question, never the model's description.
-    """
+                               global_facts: dict | None = None,
+                               allow_census_fallback: bool = False) -> Gate | None:
+    """Bind native requirements first, then rescue an unbound model Gate from census."""
     every = _owner_asks_every_receiver(page)
     if not any((every or c.get('required')) and _unanswered(page, c, owner_all=every)
                and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}
                for c in page['controls']):
-        # Skip records only originate on the Ashby mismatch route, so only an
-        # Ashby entry can carry one into a later root-proven page.
-        ashby = (isinstance(provenance, ApplicationEntryProvenance)
-                 and provenance.ats == 'ashby')
-        if every or not ashby:
-            return None
-        # A skipped field stays blank-relevant without a native required flag.
-        blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
-                  and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
-        try:
-            early = (_row(pk, fixture_context=fixture_context)
-                     if fixture_context is not None else _row(pk))
-        except Exception:
-            return None
-        if not (blanks and _rootless_skips(early)):
-            return None
+        # The model may recognize a live requirement whose native required
+        # bit is absent. Only its explicit Gate path opts into this census fallback.
+        root = _formless_root(page)
+        ashby_rootless = (allow_census_fallback
+                          and isinstance(provenance, ApplicationEntryProvenance)
+                          and provenance.ats == 'ashby'
+                          and isinstance(root, dict) and not root.get('root'))
+        if ashby_rootless:
+            pass
+        else:
+            # Skip records only originate on the Ashby mismatch route, so only an
+            # Ashby entry can carry one into a later root-proven page.
+            ashby = (isinstance(provenance, ApplicationEntryProvenance)
+                     and provenance.ats == 'ashby')
+            if every or not ashby:
+                return None
+            blanks = [c for c in page['controls'] if _unanswered(page, c, owner_all=True)
+                      and c.get('type') not in {'file', 'hidden', 'password', 'submit', 'image'}]
+            try:
+                early = (_row(pk, fixture_context=fixture_context)
+                         if fixture_context is not None else _row(pk))
+            except Exception:
+                return None
+            if not (blanks and _rootless_skips(early)):
+                return None
     # Synthetic read-only sessions and unguarded legacy routes cannot supply
     # a safely executable direct question. Production writes own this guard.
     raw = getattr(session, 'raw', session)
@@ -5067,14 +5080,38 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
     grants = row.get('human_approved_answers') or {}
-    every = _owner_asks_every_receiver(current)
-    for item in current['controls']:
+    controls = current['controls']
+    if allow_census_fallback:
+        controls = sorted(controls, key=lambda c: not (
+            (every or c.get('required')) and _unanswered(current, c, owner_all=every)
+            and c.get('type') not in {
+                'file', 'hidden', 'password', 'submit', 'image'}))
+    for item in controls:
         kind = item.get('type')
-        # On that route an optional receiver outside the admitted scope (a
-        # toggle, the dropzone, a hidden proxy) is skipped, never a defect.
+        census = current.get('entry', {}).get('root_evidence', [])
+        matches = [e for e in census if isinstance(e, dict)
+                   and e.get('selector') == item.get('selector')]
+        evidence = matches[0] if len(matches) == 1 else {}
+        hidden_labelled_choice = (
+            kind in {'checkbox', 'radio'} and item.get('tag') == 'input'
+            and evidence.get('visible') is False
+            and bool(str(evidence.get('label') or evidence.get('entry_label')
+                            or item.get('label') or item.get('question') or '').strip()))
+        supported = (_native_answer(item) or kind in {'checkbox', 'radio'}
+                     and item.get('tag') == 'input'
+                     or kind == 'combobox' and item.get('tag') in {'input', 'div'})
+        census_fallback = (allow_census_fallback and rootless and scope
+                           and item.get('selector') in scope
+                           and evidence.get('in_container') is True
+                           and evidence.get('boolean_group') is not True
+                           and evidence.get('yes_no') is not True
+                           and supported
+                           and (evidence.get('visible') is True
+                                or hidden_labelled_choice))
         owner_needed = item.get('required') or (
-            every and item.get('selector') in scope)
-        if (not owner_needed or not _unanswered(current, item, owner_all=every)
+            every and item.get('selector') in scope) or census_fallback
+        if (not owner_needed or not _unanswered(
+                current, item, owner_all=every or bool(census_fallback))
                 or kind in {'file', 'hidden', 'password', 'submit', 'image'}
                 or native_submit(item)):
             continue
@@ -5153,11 +5190,12 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                               witnessed_options=witnessed_options):
             continue
         question = _disclosure_question(
-            current, item, witness, *origins, bootstrap=True,
+            current, item, witness, *origins, bootstrap=not census_fallback,
             closed_witness=_closed_material_combobox(item),
             reversible_scope=scope, provenance=provenance)
         question['pk'] = pk
-        if every and _owner_skip_applies(row, pk, question, current, item):
+        if (every or census_fallback) and _owner_skip_applies(
+                row, pk, question, current, item):
             continue
         prompt = _choice_prompt(item, question)
         saved_key = (_fact_key(facts or {}, question['label'])
@@ -7217,11 +7255,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     # a new owner question, including on the reversible fallback.
                     if (isinstance(session, _ReversibleEntryReader)
                             or (producer_guard is not None
-                                and producer_guard.upload_completed)
-                            or (producer_guard is not None
-                                and isinstance(provenance, ApplicationEntryProvenance)
-                                and provenance.ats == 'ashby'
-                                and _formless_root(page))):
+                                and producer_guard.upload_completed)):
                         if isinstance(session, _ReversibleEntryReader):
                             _entry_safety(page, allowed, provenance)
                         if _required_owner_gate_admitted(page, provenance):
@@ -7434,11 +7468,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         fresh = await session.page()
                         if isinstance(session, _ReversibleEntryReader):
                             _entry_safety(fresh, allowed, provenance)
+                        ashby_rootless = (
+                            isinstance(provenance, ApplicationEntryProvenance)
+                            and provenance.ats == 'ashby'
+                            and bool(_formless_root(fresh))
+                            and not _formless_root(fresh).get('root'))
                         if _required_owner_gate_admitted(fresh, provenance):
                             pending = await _required_owner_gate(
                                 session, fresh, pk, *trusted_origins,
                                 provenance=provenance, fixture_context=ctx,
-                                facts=facts, global_facts=global_facts)
+                                facts=facts, global_facts=global_facts,
+                                allow_census_fallback=ashby_rootless)
                             if pending is not None:
                                 raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))

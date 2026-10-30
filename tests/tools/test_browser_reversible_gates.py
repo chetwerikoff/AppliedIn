@@ -291,7 +291,8 @@ async def test_unwritable_multivalue_select_has_exact_defect_and_no_model(monkey
 
 
 @pytest.mark.asyncio
-async def test_no_required_question_keeps_original_model_gate(monkeypatch, tmp_path):
+async def test_model_gate_binds_optional_rootless_census_question(monkeypatch, tmp_path):
+    """An eligible rootless Ashby census field replaces unbound model prose."""
     _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
     for snapshot in (endpoint.current, endpoint.fixed):
         for c in snapshot['controls']:
@@ -299,10 +300,9 @@ async def test_no_required_question_keeps_original_model_gate(monkeypatch, tmp_p
     decision.return_value = {'action': 'gate', 'question': 'Manual synthetic review'}
     result = await _apply(pdf)
     assert decision.await_count == 1
-    assert result['review_route'] == 'agent_unavailable'
-    assert result['reason'] == 'unknown_field'
-    assert result['form_question'] is None
-
+    assert result['reason'] == 'owner_question'
+    assert result['form_question']['selector'] == '#additional'
+    assert 'Manual synthetic review' not in result['question']
 
 def _only_required(endpoint, selectors):
     """Keep PAGE and independent ENTRY receiver requirements identical."""
@@ -829,6 +829,99 @@ async def test_live_census_owner_questions_follow_full_field_order(monkeypatch, 
     assert [c[0] for c in effect_calls(endpoint.calls)] == ['set']
     assert outcome['status'] == 'gate' and model_calls == [len(asked)]
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'select'}]
+
+
+@pytest.mark.asyncio
+async def test_model_gate_binds_optional_live_census_combobox(monkeypatch, tmp_path):
+    """A live model Gate can identify an optional combobox, but not supply its question."""
+    _, endpoint, decision, _, pdf = _live_census(monkeypatch, tmp_path)
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['formless']['error'] = ''
+        for control in snapshot['controls']:
+            control['required'] = False
+            if control['selector'] in {'#_systemfield_name', '#_systemfield_email'}:
+                control.update(value='Synthetic populated', has_value=True)
+        for evidence in snapshot['entry']['root_evidence']:
+            evidence['required'] = False
+            if evidence['selector'] in {'#_systemfield_name', '#_systemfield_email'}:
+                evidence['value'] = 'Synthetic populated'
+    decision.return_value = {'action': 'gate', 'question': 'Unbound model prose'}
+    result = await _apply(pdf)
+    assert decision.await_count == 1
+    assert result['reason'] == 'owner_question', result
+    assert result['form_question']['selector'] == _by_locator(
+        endpoint.current, _LOCATION)['selector']
+    assert 'Unbound model prose' not in result['question']
+    assert not [call for call in endpoint.calls
+                if call[0] in {'fill', 'click', 'select'}]
+
+def _make_optional_census_reach_model_gate(endpoint, *, leave_unanswered):
+    for snapshot in (endpoint.current, endpoint.fixed):
+        snapshot['entry']['formless']['error'] = ''
+        for control in snapshot['controls'] + snapshot['entry']['root_evidence']:
+            control['required'] = False
+            if control.get('selector') == leave_unanswered:
+                control.update(value='', has_value=False, checked=False)
+            elif control.get('type') == 'button':
+                control['checked'] = control.get('label') == 'Yes'
+            elif control.get('type') != 'file':
+                control.update(value='Synthetic prior answer', has_value=True)
+
+
+@pytest.mark.asyncio
+async def test_model_gate_binds_two_optional_native_selects_one_at_a_time(
+        monkeypatch, tmp_path):
+    row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
+    _make_optional_census_reach_model_gate(
+        endpoint, leave_unanswered='#composite-one')
+    for snapshot in (endpoint.current, endpoint.fixed):
+        template = next(c for c in snapshot['controls']
+                        if c['selector'] == '#_systemfield_name')
+        evidence = next(c for c in snapshot['entry']['root_evidence']
+                        if c['selector'] == '#_systemfield_name')
+        for selector, question in (('#composite-one', 'Synthetic degree'),
+                                   ('#composite-two', 'Synthetic discipline')):
+            control = deepcopy(template)
+            control.update(selector=selector, id=selector[1:], tag='select',
+                           type='select', native_type='select', label=question,
+                           question=question, value='', has_value=False,
+                           options=[{'label': 'Synthetic option',
+                                     'value': 'synthetic-option'}],
+                           required=False, visible=True, disabled=False,
+                           readonly=False, inert=False, combobox=None)
+            witness = deepcopy(evidence)
+            witness.update(selector=selector, id=selector[1:], tag='select',
+                           type='select', native_type='select', label=question,
+                           value='', required=False, visible=True,
+                           disabled=False, readonly=False, inert=False,
+                           in_container=True, options=[])
+            snapshot['controls'].append(control)
+            snapshot['entry']['root_evidence'].append(witness)
+    decision.return_value = {'action': 'gate', 'question': 'Unbound model prose'}
+    first = await _apply(pdf)
+    assert first['reason'] == 'owner_question', first
+    assert first['form_question']['selector'] == '#composite-one'
+    _answer(row, stores, first, 'Synthetic option')
+    second = await _apply(pdf)
+    assert second['reason'] == 'owner_question', second
+    assert second['form_question']['selector'] == '#composite-two'
+    assert decision.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_model_gate_binds_optional_free_text_essay_from_live_census(
+        monkeypatch, tmp_path):
+    _, endpoint, decision, _, pdf = _live_census(monkeypatch, tmp_path)
+    _make_optional_census_reach_model_gate(
+        endpoint, leave_unanswered='#additional')
+    decision.return_value = {'action': 'gate', 'question': 'Unbound essay prose'}
+    result = await _apply(pdf)
+    assert result['reason'] == 'owner_question', result
+    assert result['form_question']['selector'] == '#additional'
+    assert result['form_question']['type'] == 'textarea'
+    assert 'Unbound essay prose' not in result['question']
+    assert decision.await_count == 1
+
 
 
 @pytest.mark.asyncio

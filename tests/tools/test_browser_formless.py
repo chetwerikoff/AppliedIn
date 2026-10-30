@@ -3410,7 +3410,7 @@ def _issue218_main_reader_scripts():
     source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
                             "e.getAttribute('aria-checked') === 'true',\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == '855b0e763bf93a1587d968e1825092733b9dd644'
+    assert hashlib.sha1(git_blob).hexdigest() == 'a270c54814c18fbde9b6cf5c205dca1a2deb0ca7'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
     return [

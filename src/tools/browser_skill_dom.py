@@ -146,10 +146,29 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
+  const ashbyContainers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-application-form-container')) : [];
+  const hiddenAshbyLabel=e=>{
+    if(!hiddenAshbyChoice(e)) return null;
+    const labels=Array.from(e.labels || []).filter(l=>clean(l.innerText || l.textContent));
+    return labels.length===1 ? labels[0] : null;
+  };
+  const hiddenAshbyChoice=e=>{
+    const labels=Array.from(e.labels || []).filter(l=>clean(l.innerText || l.textContent));
+    return pageAshbyNative && !document.querySelector('form') &&
+      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
+      ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
+      ['checkbox','radio'].includes(e.type) && !e.form && !e.closest('form') &&
+      !e.disabled && !e.matches(':disabled') &&
+      !e.closest('div.ashby-application-form-input-yesno') &&
+      !e.closest('[inert]') && labels.length===1 && visible(labels[0]) &&
+      document.querySelectorAll(selector(e)).length===1;
+  };
   const controls = nodes.filter(e => !requiredProxies.has(e) && !pickerParts.has(e) && (e.getAttribute('role') !== 'option' ||
     !Array.from(document.querySelectorAll('[role="combobox"]'))
       .some(c=>currentListbox(c)?.contains(e))) &&
-    (visible(e) || e.form || e.closest('form') || e.type === 'file')).map(e => {
+    (visible(e) || e.form || e.closest('form') || e.type === 'file' ||
+      hiddenAshbyChoice(e))).map(e => {
     const group = e.closest(
       'fieldset,[role="radiogroup"],[data-automation-id="formField"],.form-group');
     const graph = newGraphs.get(e);
@@ -164,7 +183,9 @@ PAGE = r"""(() => {
     // Do not infer a receiver from the visible button label.
     const formAction = form?.action || '';
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
+    const hiddenLabel=hiddenAshbyChoice(e) ? hiddenAshbyLabel(e) : null;
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
+      ...(hiddenLabel ? {visible:false,associated_label_selector:selector(hiddenLabel),ashby_hidden_choice:true} : {}),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
       commits_application:commitsApplication(e),
       in_form:!!form, form_selector:form ? selector(form) : '',
@@ -1060,10 +1081,15 @@ def entry_reader(script: str) -> str:
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
     filter = "e.form || e.closest('form') || e.type === 'file')"
-    assert script.count(filter) == 1
-    script = script.replace(filter,
-                            "e.form || e.closest('form') || e.type === 'file' || "
-                            "formlessHiddenReceiver(e))")
+    hidden_filter = "hiddenAshbyChoice(e)))"
+    if script.count(filter) == 1:
+        script = script.replace(filter,
+                                "e.form || e.closest('form') || e.type === 'file' || "
+                                "formlessHiddenReceiver(e))")
+    else:
+        assert script.count(hidden_filter) == 1
+        script = script.replace(hidden_filter,
+                                "hiddenAshbyChoice(e) || formlessHiddenReceiver(e)))")
     script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
     script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
         "return {...(formless ? {label:entryLabel(e), name:e.name || '', "

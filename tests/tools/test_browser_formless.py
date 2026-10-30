@@ -3409,6 +3409,21 @@ def _issue218_main_reader_scripts():
     assert source.count(pressed) == 1 and old.count(pressed) == 0
     source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
                             "e.getAttribute('aria-checked') === 'true',\n", 1)
+    # The #248 interactive-label admission is not part of the Issue #218
+    # historical source witness; remove only those exact new predicates.
+    def hidden_label_guard(label, indent):
+        return (f"{indent}!{label}.querySelector("
+                "'a[href],button,input,select,textarea,summary,details,'+\n"
+                f"{indent}  'area[href],audio[controls],video[controls],object,embed,iframe,'+\n"
+                f"{indent}  '[role],[tabindex],[contenteditable],[onclick]') &&\n")
+
+    for guard in (hidden_label_guard('labels[0]', '      '),
+                  hidden_label_guard('ls[0]', '          ')):
+        assert source.count(guard) == 1
+        source = source.replace(guard, '', 1)
+    root_guard = hidden_label_guard('ls[0]', '          ')
+    assert old.count(root_guard) == 1
+    old = old.replace(root_guard, '', 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
     assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
@@ -3502,3 +3517,19 @@ def test_hidden_ashby_attestation_requires_one_visible_label_and_hidden_input(re
         assert not any(c.get('selector') == '#hidden-attestation'
                        and c.get('ashby_hidden_choice') is True
                        for c in invalid['controls'])
+
+@pytest.mark.parametrize('reader', [PAGE, forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
+@pytest.mark.parametrize('interactive', ['link', 'button', 'role-link', 'role-button', 'tabindex'])
+def test_hidden_attestation_with_interactive_label_is_not_admitted(reader, interactive):
+    """An embedded Privacy Policy link/interactive widget forbids label fallback."""
+    observed_page = dom(dict(root=False, formless=True, missingPane=True,
+                             hiddenAttestation=True, attestationInteractive=interactive,
+                             url=entry('ashby')), reader)
+    assert not any(c.get('selector') == '#hidden-attestation'
+                   and c.get('ashby_hidden_choice') is True
+                   for c in observed_page['controls'])
+    if 'entry' in observed_page:
+        evidence = [c for c in observed_page['entry']['root_evidence']
+                    if c['selector'] == '#hidden-attestation']
+        assert len(evidence) == 1
+        assert evidence[0]['ashby_hidden_choice'] is False

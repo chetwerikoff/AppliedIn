@@ -1646,6 +1646,9 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
       !entryEvidenceVisible(e) && !e.closest('[inert]') &&
       !e.closest('div.ashby-application-form-input-yesno') && labels.length===1 &&
       clean(labels[0].innerText || labels[0].textContent) && entryEvidenceVisible(labels[0]) &&
+      !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+        'area[href],audio[controls],video[controls],object,embed,iframe,'+
+        '[role],[tabindex],[contenteditable],[onclick]') &&
       document.querySelectorAll(selector(e)).length===1;
   };
   const query = 'input,textarea,select,button,a[href],[role="button"],[role="combobox"],'+
@@ -6774,6 +6777,15 @@ class ApplicationIPCController:
             if (op != 'click' or len(args) != 2 or kwargs or len(candidates) != 1
                     or candidates[0].get('checked') is True):
                 raise Gate('The hidden attestation label fallback is no longer valid.')
+            # The independent ENTRY census must still certify this exact,
+            # non-navigating label. A stale PAGE choice cannot grant a label click.
+            evidence = (page.get('entry') or {}).get('root_evidence') or []
+            matches = [e for e in evidence if isinstance(e, dict)
+                       and e.get('selector') == candidates[0]['selector']]
+            if (len(matches) != 1
+                    or matches[0].get('ashby_hidden_choice') is not True
+                    or matches[0].get('label_selector') != selector):
+                raise Gate('The hidden attestation label lacks safe independent evidence.')
             page, choice = await self._reversible_receiver(session, page, candidates[0])
             approved = _approved_native_choice(
                 page, choice, self.pk, fixture_context=self.fixture_context)
@@ -6941,17 +6953,17 @@ class ApplicationIPCController:
         hidden_attestations = [c for c in page.get('controls', [])
                                if c.get('ashby_hidden_choice') is True]
         for choice in hidden_attestations:
-            key = _key(page, choice)
-            row = self._row()
-            grants = row.get('human_approved_answers')
-            grant = grants.get(key) if isinstance(grants, dict) else None
-            if (choice.get('checked') is not True or not isinstance(grant, dict)
-                    or grant.get('source') not in (None, 'owner')
-                    or not _same(grant.get('value', ''), 'yes')):
+            # An optional unanswered or skipped box remains unchecked. Only a
+            # checked attestation needs an exact current yes grant at Submit.
+            if choice.get('checked') is not True:
+                continue
+            try:
+                exact_approval(self.pk, _key(page, choice), 'yes',
+                               target=_bound_target(page, choice),
+                               url=page['url'], **self._ctx())
+            except Gate:
                 raise Gate('An unapproved hidden application attestation blocks Submit.',
-                           reason='owner_question')
-            exact_approval(self.pk, key, 'yes', target=_bound_target(page, choice),
-                           url=page['url'], **self._ctx())
+                           reason='owner_question') from None
         try:
             await self.authorize_final_submit(session, page, target)
         except Gate as refusal:

@@ -158,6 +158,9 @@ PAGE = r"""(() => {
       !e.closest('div.ashby-application-form-input-yesno') &&
       !e.closest('[inert]') && labels.length===1 &&
       clean(labels[0].innerText || labels[0].textContent) && visible(labels[0]) &&
+      !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+        'area[href],audio[controls],video[controls],object,embed,iframe,'+
+        '[role],[tabindex],[contenteditable],[onclick]') &&
       document.querySelectorAll(selector(e)).length===1;
   };
   const hiddenAshbyLabel=e=>hiddenAshbyChoice(e) ? e.labels[0] : null;
@@ -608,6 +611,9 @@ _ASHBY_ROOT = r"""
           !entryEvidenceVisible(e) && !e.closest('[inert]') &&
           !e.closest('div.ashby-application-form-input-yesno') && ls.length===1 &&
           clean(ls[0].innerText || ls[0].textContent) && entryEvidenceVisible(ls[0]) &&
+          !ls[0].querySelector('a[href],button,input,select,textarea,summary,details,'+
+            'area[href],audio[controls],video[controls],object,embed,iframe,'+
+            '[role],[tabindex],[contenteditable],[onclick]') &&
           document.querySelectorAll(selector(e)).length===1;
       };
       const hiddenLabel=hiddenChoice(e) ? e.labels[0] : null;

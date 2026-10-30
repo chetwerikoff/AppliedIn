@@ -257,6 +257,27 @@ async def test_owner_skipped_hidden_attestation_is_not_asked_again(
     assert again['reason'] == 'unknown_field'
     assert not [call for call in endpoint.calls
                 if call[0] in {'fill', 'click', 'select'}]
+    # An unchecked owner-skipped optional attestation must reach the original
+    # final guard, not be rejected by the additional hidden-choice gate.
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), pdf, {}, {}, [], {}, lambda: None)
+    final_guard = AsyncMock(side_effect=forms.Gate('synthetic final guard reached'))
+    monkeypatch.setattr(controller, 'authorize_final_submit', final_guard)
+    submit = next(c for c in endpoint.current['controls']
+                  if c.get('label') == 'Submit application')
+    with pytest.raises(forms.Gate, match='synthetic final guard reached'):
+        await controller._final_submit_with_evidence(
+            SimpleNamespace(), endpoint.current, submit)
+    final_guard.assert_awaited_once()
+    assert controller.committed is False
+    # Pre-checked without a matching yes grant remains blocked before Submit.
+    for snapshot in (endpoint.current, endpoint.fixed):
+        next(c for c in snapshot['controls']
+             if c['selector'] == selector)['checked'] = True
+    with pytest.raises(forms.Gate, match='unapproved hidden application attestation'):
+        await controller._final_submit_with_evidence(
+            SimpleNamespace(), endpoint.current, submit)
+    final_guard.assert_awaited_once()
 
 
 
@@ -1398,3 +1419,55 @@ async def test_rootless_grant_reuse_is_exact_shape_only_after_a_reload(
     assert gate.get('status') == 'gate'
     assert not [c for c in endpoint.calls if c[0] == 'click'
                 and c[1] == '#structural-submit']
+
+@pytest.mark.asyncio
+async def test_privacy_policy_link_in_hidden_label_never_gets_a_click(monkeypatch, tmp_path):
+    """Even a model-selected label does not authorize a navigating fallback."""
+    _, endpoint, decision, _, pdf = _fixture(
+        monkeypatch, tmp_path, hiddenAttestation=True, movePane=True,
+        attestationInteractive='link')
+    assert not any(c.get('ashby_hidden_choice') is True
+                   for c in endpoint.current['controls'])
+    for snapshot in (endpoint.current, endpoint.fixed):
+        for c in snapshot['controls']:
+            if c.get('type') not in {'file', 'submit'}:
+                _mark_census_answered(c)
+                c['required'] = False
+        for e in snapshot['entry']['root_evidence']:
+            if e.get('selector') != '#hidden-attestation':
+                e.update(value='Synthetic answer', checked=True)
+    decision.return_value = {'action': 'click', 'selector': '#hidden-attestation-label'}
+    outcome = await _apply(pdf)
+    assert outcome['status'] == 'gate'
+    assert not [call for call in endpoint.calls if call[0] == 'click']
+
+
+@pytest.mark.asyncio
+async def test_hidden_label_fallback_rechecks_unsafe_independent_entry_census(
+        monkeypatch, tmp_path):
+    """A stale PAGE admission cannot override independent label safety evidence."""
+    _, endpoint, _, _, pdf = _fixture(
+        monkeypatch, tmp_path, hiddenAttestation=True, movePane=True)
+    current = deepcopy(endpoint.current)
+    checkbox = next(c for c in current['controls']
+                    if c.get('selector') == '#hidden-attestation')
+    assert checkbox['ashby_hidden_choice'] is True
+    evidence = next(e for e in current['entry']['root_evidence']
+                    if e['selector'] == checkbox['selector'])
+    evidence['ashby_hidden_choice'] = False
+    controller = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), pdf, {}, {}, [], {}, lambda: None)
+    controller._hidden_label_fallback = True
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=current))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    # Isolate the raw guard: a positive action witness/grant is not enough when
+    # the independently observed label is now unsafe.
+    receiver = AsyncMock(return_value=(current, checkbox))
+    monkeypatch.setattr(controller, '_reversible_receiver', receiver)
+    monkeypatch.setattr(forms, '_approved_native_choice',
+                        lambda *_args, **_kwargs: ('yes', checkbox))
+    with pytest.raises(forms.Gate, match='lacks safe independent evidence'):
+        await controller.before_ipc(
+            endpoint, ('click', checkbox['associated_label_selector']), {})
+    receiver.assert_not_awaited()
+    assert not [call for call in endpoint.calls if call[0] == 'click']

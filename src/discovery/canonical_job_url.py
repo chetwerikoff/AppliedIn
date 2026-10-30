@@ -90,19 +90,24 @@ def literal_gh_id(url: object) -> str | None:
     return query.split("=", 1)[1]
 
 
-def canonical_shape(job: JobRecord, board: str, ats: str) -> bool:
-    """Literal exact same-ID hosted *candidate*, not proof of tenant ownership."""
+def canonical_shape(job: JobRecord, board: str, ats: str, *,
+                    careers_url: str = "") -> bool:
+    """Literal ATS target or employer-host URL with same-ID Greenhouse proof."""
     if ats not in _HOSTS or not isinstance(board, str) or not _BOARD_PATH.fullmatch(board):
         return False
     jid = job.job_id
     if (not isinstance(jid, str) or
             not (_NUMBER.fullmatch(jid) if ats == "greenhouse" else _UUID.fullmatch(jid))):
         return False
+    if ats == "greenhouse":
+        from .tenant_pin import greenhouse_feed_identity
+        source = CompanyConfig(name=job.company, careers_url=careers_url,
+                               ats=ats, board=board)
+        return greenhouse_feed_identity(job, source)
     p = _literal(job.jd_url)
     if p is None or p.netloc not in _HOSTS[ats]:
         return False
-    tail = f"/{board}/jobs/{jid}" if ats == "greenhouse" else f"/{board}/{jid}"
-    return p.path == tail
+    return p.path == f"/{board}/{jid}"
 
 
 def source_bound(company: CompanyConfig, raw: CompanyConfig) -> bool:
@@ -130,13 +135,21 @@ def consumer_accepts(job: JobRecord, company: CompanyConfig) -> bool:
     """Call the existing pure entry guard; do not reimplement its token rule."""
     if job.ats != company.ats or job.company != company.name:
         return False
-    if company.ats not in ("ashby", "lever"):
-        # Greenhouse canonical hosted routes are not accepted by the existing
-        # wrapper/pin-based _configured_alias -> verified_greenhouse_alias.
-        return False
-    from tools.browser_skill_apply import _application_entry
     row = {"pk": job.pk, "company": job.company, "ats": job.ats,
            "job_id": job.job_id, "jd_url": job.jd_url}
+    if company.ats == "greenhouse":
+        from .tenant_pin import reviewed_tuple
+        from tools.claude_chrome import verified_greenhouse_alias
+        if (not job.greenhouse_board
+                or reviewed_tuple(company.name, expected=company) is None):
+            return False
+        return verified_greenhouse_alias(
+            {**row, "greenhouse_board": job.greenhouse_board},
+            pk=job.pk, company=company.name, url=job.jd_url,
+            configs=[company]) is not None
+    if company.ats not in ("ashby", "lever"):
+        return False
+    from tools.browser_skill_apply import _application_entry
     return _application_entry(row, job.pk, company.name, job.jd_url, [company]) is not None
 
 
@@ -149,11 +162,15 @@ def candidate_result(job: JobRecord, company: CompanyConfig, *, bound: bool,
     if (job.company != company.name or job.ats != company.ats
             or job.pk != make_pk(company.name, job.job_id)):
         return None, "feed_identity_conflict"
-    if not canonical_shape(job, company.board, company.ats):
+    if not canonical_shape(job, company.board, company.ats,
+                           careers_url=company.careers_url):
         return None, "nonliteral_or_noncanonical_ats_target"
-    if not consumer_accepts(job, company):
+    # A pinned row can only originate from one source-bound feed identity.
+    candidate = (job.model_copy(update={"greenhouse_board": company.board})
+                 if company.ats == "greenhouse" else job)
+    if not consumer_accepts(candidate, company):
         return None, "canonical_target_not_supported_by_current_guard"
-    return job, ""
+    return candidate, ""
 
 
 def admit_feed(company: CompanyConfig, raw: CompanyConfig,

@@ -16,9 +16,9 @@ from agent import run
 from core.apply_queue import ApplyQueue
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
-from tests.tools.test_browser_bootstrap import field
+from tests.tools.test_browser_bootstrap import field, witness
 from tests.tools.test_browser_bootstrap_settlement import (
-    COMPANY, GH_PK, PHONE, _world,
+    COMPANY, GH_PK, PHONE, _grant, _world,
 )
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
@@ -64,7 +64,7 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
         location='Synthetic city', ats='greenhouse'))
     tracking.set_status(
         GH_PK, Status.TAILORED, greenhouse_board=COMPANY,
-        human_approved_answers={})
+        human_approved_answers={'Phone': _grant(case.phone, case.url, PHONE)})
     bank = SyntheticBank({'Phone': PHONE} if bank_facts is None else bank_facts)
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
 
@@ -122,11 +122,11 @@ async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
     assert question['type'] == kind
     assert question['url'] == case.url
 
-    # The independent GLOBAL phone fact was safely auto-granted and settled
-    # before the missing screening field gated, without model or Submit IPC.
+    # An exact phone grant and bank value settle before the missing screening
+    # field gates; the ordinary fixture has no raw producer auto-grant binder.
     assert raw.writes == [('fill', '#phone')]
     assert raw.target('#screening')['has_value'] is False
-    assert row['human_approved_answers']['Phone']['source'] == 'bank-auto'
+    assert row['human_approved_answers']['Phone']['value'] == PHONE
     assert question['label'] not in row['human_approved_answers']
     assert stores.answer_bank.writes == []
 
@@ -176,8 +176,21 @@ async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
 
 async def test_greenhouse_global_bank_answers_still_auto_fill(monkeypatch):
     """Owner routing changes no guarded native bank-authorized write path."""
-    case, raw, stores = tracked_greenhouse(
-        monkeypatch, bank_facts={'Phone': PHONE, 'Screening choice': 'Remote'})
+    facts = {'Phone': PHONE, 'Screening choice': 'Remote'}
+    case, raw, stores = tracked_greenhouse(monkeypatch, bank_facts=facts)
+
+    # This fake Session does not bind a production raw IPC controller, so mint
+    # exact GLOBAL grants at the actual code-owned bank admission seam using
+    # an independent synthetic fixed witness. No model, DOM or browser grants.
+    stores.tracking.set_status(
+        case.pk, Status.SUBMITTING, human_approved_answers={})
+    page = deepcopy(raw.state)
+    provenance = forms._configured_alias(case.pk, COMPANY, case.wrapper)
+    assert isinstance(provenance, forms.GreenhouseJobAlias)
+    forms._auto_grant_from_global(
+        page, witness(page), case.pk, facts, facts, case.wrapper,
+        provenance=provenance)
+    stores.tracking.set_status(case.pk, Status.TAILORED)
     decisions = []
 
     async def stop_before_submit(_prompt, _page, _history, *, model):

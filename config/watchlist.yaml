@@ -190,7 +190,10 @@ companies:
     mode: gated
 
   - name: waymo
-    careers_url: https://careers.withwaymo.com/
+    careers_url: https://careers.withwaymo.com/jobs
+    ats: greenhouse
+    board: waymo
+    discovery: feed
     mode: gated
 
   - name: Thinking Machine

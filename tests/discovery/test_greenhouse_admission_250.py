@@ -5,6 +5,7 @@ No live browser, application, external network, approval or submission.
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -17,7 +18,7 @@ from discovery.canonical_job_url import admit_feed, consumer_accepts
 from discovery.tenant_pin import (
     exact_feed_match, greenhouse_query_id, rederive_one, reviewed_tuple,
 )
-from discovery.watchlist import CompanyConfig
+from discovery.watchlist import CompanyConfig, load_watchlist
 from tools.browser_skill_apply import navigation_allowed, _job_preparation_route
 from tools.claude_chrome import verified_greenhouse_alias
 
@@ -122,6 +123,73 @@ def test_feed_mismatch_duplicates_and_missing_review_refuse(monkeypatch, tmp_pat
     assert not rows[0].greenhouse_board
     admitted, refused = admit_feed(cfg, cfg, rows)
     assert not admitted and refused
+
+
+def test_waymo_exact_jobs_page_query_requires_feed_pin_and_embed_only(monkeypatch):
+    """The /jobs?gh_jid=... form is source-bound, not a redirect permission."""
+    from core import config
+
+    watchlist = Path(__file__).resolve().parents[2] / "config" / "watchlist.yaml"
+    configs = [item for item in load_watchlist(watchlist) if item.name == "waymo"]
+    assert len(configs) == 1
+    cfg = configs[0]
+    assert (cfg.careers_url, cfg.ats, cfg.board, cfg.discovery.value, cfg.mode.value) == (
+        "https://careers.withwaymo.com/jobs", "greenhouse", "waymo", "feed", "gated",
+    )
+    monkeypatch.setattr(
+        config, "get_settings",
+        lambda: SimpleNamespace(config_dir=str(watchlist.parent)),
+    )
+    assert reviewed_tuple(cfg.name, path=watchlist, expected=cfg) == cfg
+
+    # Synthetic ID and a mocked feed: never read a real posting or submit.
+    url = f"{cfg.careers_url}?gh_jid={JID}"
+    assert greenhouse_query_id(url, cfg.careers_url) == JID
+    for invalid in (
+        cfg.careers_url + "/?gh_jid=" + JID,
+        cfg.careers_url.replace("/jobs", "/other") + "?gh_jid=" + JID,
+        cfg.careers_url + "?gh_jid=" + JID + "&other=1",
+        cfg.careers_url + "?gh%5Fjid=" + JID,
+        cfg.careers_url + "?gh_jid=" + JID + "#fragment",
+        "https://foreign.example-co.test/jobs?gh_jid=" + JID,
+    ):
+        assert greenhouse_query_id(invalid, cfg.careers_url) is None, invalid
+
+    def respond(request):
+        assert str(request.url) == (
+            "https://boards-api.greenhouse.io/v1/boards/waymo/jobs?content=true"
+        )
+        return httpx.Response(200, json={"jobs": [
+            {"id": int(JID), "absolute_url": url, "title": "Synthetic Engineer"}
+        ]})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        rows = GreenhouseAdapter().fetch(cfg, client)
+    assert len(rows) == 1 and rows[0].greenhouse_board == "waymo"
+    assert exact_feed_match(cfg, JID, rows, stored_url=url) is rows[0]
+    assert exact_feed_match(cfg, JID, rows, stored_url=url + "&extra=1") is None
+    admitted, refused = admit_feed(cfg, cfg, rows)
+    assert len(admitted) == 1 and not refused
+    assert consumer_accepts(admitted[0], cfg)
+
+    pk = make_pk(cfg.name, JID)
+    proof = verified_greenhouse_alias(
+        {"pk": pk, "company": cfg.name, "job_id": JID, "ats": "greenhouse",
+         "jd_url": url, "greenhouse_board": cfg.board},
+        pk=pk, company=cfg.name, url=url, configs=[cfg],
+    )
+    embed = f"https://job-boards.greenhouse.io/embed/job_app?for=waymo&token={JID}"
+    assert proof is not None and proof.url == embed
+    assert navigation_allowed(embed, provenance=proof)
+    assert _job_preparation_route(embed, url, provenance=proof)
+    for invalid in (
+        url, f"https://job-boards.greenhouse.io/waymo/jobs/{JID}",
+        embed + "&extra=1", embed + "#fragment",
+        embed.replace("for=waymo", "for=other"),
+        embed.replace(f"token={JID}", "token=731206"),
+    ):
+        assert not navigation_allowed(invalid, provenance=proof), invalid
+        assert not _job_preparation_route(invalid, url, provenance=proof), invalid
 
 
 def test_root_query_is_not_source_wildcard():

@@ -82,7 +82,7 @@ def _scope_parts(url: str, careers_url: str):
 
 
 def greenhouse_query_id(url: str, careers_url: str) -> str | None:
-    """Exact scoped ?gh_jid identity, including only the bare-host root form."""
+    """Exact scoped ?gh_jid identity: bare-host root or Waymo listing included."""
     if isinstance(careers_url, str) and re.fullmatch(
             r"https://[a-z0-9.-]+", careers_url):
         source, p = _parts(careers_url + "/"), _parts(url)
@@ -91,6 +91,13 @@ def greenhouse_query_id(url: str, careers_url: str) -> str | None:
             return None
     else:
         p = _scope_parts(url, careers_url)
+        if p is None and careers_url == "https://careers.withwaymo.com/jobs":
+            # This reviewed feed links to the listing page itself, not a child.
+            source, target = _parts(careers_url), _parts(url)
+            if (source is not None and target is not None
+                    and target.netloc == source.netloc
+                    and target.path == source.path):
+                p = target
     if p is None or p.fragment or not re.fullmatch(r"gh_jid=([0-9]+)", p.query):
         return None
     return p.query.split("=", 1)[1]

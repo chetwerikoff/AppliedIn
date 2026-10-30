@@ -188,6 +188,18 @@ async def test_voluntary_survey_bank_refusal_has_direct_reply(monkeypatch, shape
         expected_question_identity="q1_wrong")
     assert refused["reason"] == "invalid_answer"
     assert stores.answer_bank.writes == []
+    approved = run.resume_job(
+        PK, "Exact survey response", stores, disposition="answer",
+        expected_gate_generation=tokens["gate_generation"],
+        expected_question_identity=tokens["gate_question_identity"])
+    assert approved["result"] == "queued", approved
+    grant = stores.tracking.get(PK)["human_approved_answers"][
+        "Synthetic voluntary survey question"]
+    assert grant["value"] == "Exact survey response"
+    assert grant["selector"] == row["gate_pending"]["form_question"]["selector"]
+    # A bank fact alone never granted the survey: only the exact owner answer did.
+    assert stores.answer_bank.writes == [
+        ("Synthetic voluntary survey question", "Exact survey response")]
     assert decision.await_count == 0
     no_mutations(raw)
 

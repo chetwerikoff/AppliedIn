@@ -248,14 +248,9 @@ def navigation_allowed(href: str, *origins: str,
     if provenance is not None:
         if not isinstance(provenance, GreenhouseJobAlias):
             return False
-        if href == provenance.wrapper:
-            return True
-        route = _alias_https_parts(href)
-        if not route or route[0] != 'job-boards.greenhouse.io':
-            return False
-        job_path = f'/{provenance.board}/jobs/{provenance.job_id}'
-        path = route[1]
-        return path == job_path or path.startswith(job_path + '/')
+        # An exact pinned embed identity is the only Greenhouse entry route:
+        # not the employer wrapper, hosted posting, extra query or redirect.
+        return isinstance(href, str) and href == provenance.url
     if not bsk.web_url(href):
         return False
     target = urlsplit(href)
@@ -6125,6 +6120,10 @@ def _job_preparation_route(href: str, tracked: str, *,
     """Effectful route authority: exact tracked job, typed proof, or row-bound GH."""
     # Typed redirect/alias proof can establish a different HTTPS origin; do
     # not incorrectly subject that witness to the legacy host classifier.
+    if isinstance(provenance, GreenhouseJobAlias):
+        # Never fall through to same-origin or legacy unpinned routes once
+        # a typed tenant has fixed the exact embed application destination.
+        return navigation_allowed(href, provenance=provenance)
     if provenance is not None and navigation_allowed(href, provenance=provenance):
         return True
     # A Greenhouse custom-careers wrapper and its canonical board route have
@@ -7008,13 +7007,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             raise Gate('Malformed Greenhouse job identity requires human inspection.',
                        reason='defect_tenant')
         _tracked_preparation_job(pk, company, url, fixture_context=ctx)
-        if greenhouse_alias_candidate(url):
-            # An absent/stale pin is NOT an early preparation refusal. It will
-            # be checked afresh by the single final commit guard.
+        tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
+        if greenhouse_alias_candidate(url) or tracked.get('ats') == 'greenhouse':
+            # A pinned hosted feed URL and an employer wrapper share only
+            # the exact board/token embed route. Missing pins retain the
+            # existing reversible preparation path, not final Submit authority.
             provenance = _configured_alias(pk, company, url, fixture_context=ctx)
             direct_url = provenance.url if provenance else url
         else:
-            tracked = (_row(pk, fixture_context=ctx) if ctx else _row(pk)) if pk else {}
             if (tracked.get('ats') in _APPLICATION_ENTRY
                     or urlsplit(url).hostname in {h for h, _ in _APPLICATION_ENTRY.values()}):
                 provenance = _configured_alias(pk, company, url, fixture_context=ctx)
@@ -7028,8 +7028,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                 direct_url = provenance.target_url
 
         def allowed(href: str) -> bool:
-            # A shared ATS host is not same-job evidence. The tracked route,
-            # a verified entry/alias, or a verified redirect is required.
+            # A synthetic fixture's same-URL exception cannot override a
+            # pinned Greenhouse embed route's exact destination certificate.
+            if isinstance(provenance, GreenhouseJobAlias):
+                return _job_preparation_route(
+                    href, url, provenance=provenance, pk=pk, company=company,
+                    fixture_context=ctx)
             return (ctx is not None and href == url) or _job_preparation_route(
                 href, url, provenance=provenance, pk=pk, company=company,
                 fixture_context=ctx)

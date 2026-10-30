@@ -5208,7 +5208,11 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                     continue
                 except Gate:
                     pass
-            if _missing_answer_reason(item) == 'owner_question':
+            if (_missing_answer_reason(item) == 'owner_question'
+                    or (isinstance(provenance, GreenhouseJobAlias)
+                        and _native_answer(item) and not value)):
+                # Greenhouse required text with no bank fact needs a direct
+                # owner answer; it still uses the model-only write path.
                 prompt = (_choice_prompt(item, question)
                           if kind in {'radio', 'checkbox', 'combobox'}
                           or item.get('tag') == 'select'
@@ -5303,9 +5307,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
 
         if not value or authority in {'missing', 'incomplete'}:
             record('needs-human')
+            # No bank value is an answerable owner question, not an unavailable
+            # agent-review fallback. A banked but unapproved value still gates.
             raise Gate(prompt, form_question=question,
-                       reason=(_missing_answer_reason(item) if previous is None and not value
-                               else 'unknown_field'))
+                       reason='owner_question' if not value else 'unknown_field')
         try:
             exact_approval(
                 pk, key, value, target=_bound_target(page, item),

@@ -158,7 +158,7 @@ PAGE = r"""(() => {
     return pageAshbyNative && !document.querySelector('form') &&
       ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
       ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
-      ['checkbox','radio'].includes(e.type) && !e.form && !e.closest('form') &&
+      e.type==='checkbox' && !e.form && !e.closest('form') &&
       !e.disabled && !e.matches(':disabled') &&
       !e.closest('div.ashby-application-form-input-yesno') &&
       !e.closest('[inert]') && labels.length===1 && visible(labels[0]) &&
@@ -1080,16 +1080,9 @@ def entry_reader(script: str) -> str:
     script = script.replace('nodes.filter(e =>', 'nodes.filter(e => !excluded.has(e) &&')
     script = script.replace("Array.from(document.querySelectorAll(query)).filter(e =>",
                             "Array.from(document.querySelectorAll(query)).filter(e => !excluded.has(e) &&")
-    filter = "e.form || e.closest('form') || e.type === 'file')"
-    hidden_filter = "hiddenAshbyChoice(e)))"
-    if script.count(filter) == 1:
-        script = script.replace(filter,
-                                "e.form || e.closest('form') || e.type === 'file' || "
-                                "formlessHiddenReceiver(e))")
-    else:
-        assert script.count(hidden_filter) == 1
-        script = script.replace(hidden_filter,
-                                "hiddenAshbyChoice(e) || formlessHiddenReceiver(e)))")
+    filter = "e.form || e.closest('form') || e.type === 'file'"
+    assert script.count(filter) == 1
+    script = script.replace(filter, filter + " || formlessHiddenReceiver(e)")
     script = script.replace('.filter(h=>h.form === form', '.filter(h=>!excluded.has(h) && h.form === form')
     script = script.replace('return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:',
         "return {...(formless ? {label:entryLabel(e), name:e.name || '', "

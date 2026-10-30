@@ -2993,7 +2993,8 @@ def _reversible_entry_recipient(page: dict, target: dict,
     native_label = ((e.get('associated') is True and e.get('label') == target.get('label'))
                     or (entry_label and target.get('tag') == 'input'))
     hidden_labelled_choice = (
-        target.get('tag') == 'input' and target.get('type') in {'checkbox', 'radio'}
+        target.get('tag') == 'input' and target.get('type') == 'checkbox'
+        and target.get('ashby_hidden_choice') is True
         and e.get('visible') is False and native_label
         and bool(str(target.get('label') or target.get('question') or '').strip()))
     for predicate, failed in (
@@ -5093,7 +5094,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                    and e.get('selector') == item.get('selector')]
         evidence = matches[0] if len(matches) == 1 else {}
         hidden_labelled_choice = (
-            kind in {'checkbox', 'radio'} and item.get('tag') == 'input'
+            kind == 'checkbox' and item.get('tag') == 'input'
+            and item.get('ashby_hidden_choice') is True
             and evidence.get('visible') is False
             and bool(str(evidence.get('label') or evidence.get('entry_label')
                             or item.get('label') or item.get('question') or '').strip()))
@@ -7294,6 +7296,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 'Upload redirected to an unrelated job or tenant.',
                                 url, page.get('url'), provenance=provenance)
                         continue
+                    first_model_decision = not decided
                     action = await (ctx.decision if ctx else bsk.decision)(
                         task + progress, model_page, model_history, model=model)
                     decided = True
@@ -7478,7 +7481,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 session, fresh, pk, *trusted_origins,
                                 provenance=provenance, fixture_context=ctx,
                                 facts=facts, global_facts=global_facts,
-                                allow_census_fallback=ashby_rootless)
+                                allow_census_fallback=(
+                                    ashby_rootless and first_model_decision))
                             if pending is not None:
                                 raise pending
                         raise Gate(str(action.get('question') or 'This form needs your input.'))

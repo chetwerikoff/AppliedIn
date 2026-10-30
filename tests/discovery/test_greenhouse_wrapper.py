@@ -160,7 +160,7 @@ def test_original_historic_wrapper_can_keep_existing_submit_alias_without_new_di
     world.tracking.rows[pk] = deepcopy(existing)
     proof = forms._configured_alias(pk, COMPANY, WRAPPER)
     assert isinstance(proof, forms.GreenhouseJobAlias)
-    assert proof.url == HOSTED
+    assert proof.url == 'https://job-boards.greenhouse.io/embed/job_app?for=example-board&token=731205'
     assert forms._alias_current(proof)
     assert crawler.crawl_company(world.config, Preferences(), world.stores) == 0
     assert world.tracking.rows[pk] == existing

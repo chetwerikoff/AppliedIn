@@ -37,7 +37,10 @@ companies:
     careers_url: https://www.nvidia.com/en-us/about-nvidia/careers/
     mode: gated
   - name: Nebius
-    careers_url: https://nebius.com/careers
+    careers_url: https://careers.nebius.com
+    ats: greenhouse
+    board: nebius
+    discovery: feed
     mode: gated
   - name: CoreWeave
     careers_url: https://www.coreweave.com/careers
@@ -80,13 +83,19 @@ companies:
 
   # --- AI-strong platforms / data ---
   - name: Databricks
-    careers_url: https://www.databricks.com/company/careers/open-positions
+    careers_url: https://databricks.com/company/careers/open-positions
+    ats: greenhouse
+    board: databricks
+    discovery: feed
     mode: gated
   - name: Snowflake
     careers_url: https://careers.snowflake.com/us/en
     mode: gated
   - name: Scale AI
     careers_url: https://scale.com/careers
+    ats: greenhouse
+    board: scaleai
+    discovery: feed
     mode: gated
   - name: Hugging Face
     careers_url: https://apply.workable.com/huggingface
@@ -138,11 +147,26 @@ companies:
     careers_url: https://www.palantir.com/careers/
     mode: gated
 
+  # --- Other explicitly reviewed Greenhouse employer feeds ---
+  - name: MongoDB
+    careers_url: https://www.mongodb.com/careers
+    ats: greenhouse
+    board: mongodb
+    discovery: feed
+    mode: gated
+  - name: Thoughtworks
+    careers_url: https://www.thoughtworks.com/careers
+    ats: greenhouse
+    board: thoughtworks
+    discovery: feed
+    mode: gated
+
   # --- Feed (Greenhouse) — fast, no browser needed ---
   - name: Stripe
-    careers_url: https://boards.greenhouse.io/stripe
+    careers_url: https://stripe.com/jobs
     ats: greenhouse
     board: stripe
+    discovery: feed
     mode: gated
 
   # --- Custom JS portal, crawled with the browser (no public feed) ---
@@ -166,7 +190,10 @@ companies:
     mode: gated
 
   - name: waymo
-    careers_url: https://careers.withwaymo.com/
+    careers_url: https://careers.withwaymo.com/jobs
+    ats: greenhouse
+    board: waymo
+    discovery: feed
     mode: gated
 
   - name: Thinking Machine

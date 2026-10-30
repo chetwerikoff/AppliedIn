@@ -879,24 +879,24 @@ def verified_greenhouse_alias(row: dict, *, pk: str, company: str, url: str,
         return None
     # Only a pathless configured HTTPS origin borrows the already-accepted root path.
     configured_url = careers
-    if isinstance(careers, str) and re.fullmatch(r'https://[^/?#]+', careers):
+    if isinstance(careers, str) and re.fullmatch(r'https://[a-z0-9.-]+', careers):
         configured_url += '/'
-    configured = _alias_https_parts(configured_url)
-    wrapped = _alias_https_parts(url, query=True)
-    if not configured or not wrapped:
+    # The existing pure alias retains the strict literal configured HTTPS
+    # origin and board/pin witness. The scoped feed grammar additionally
+    # admits a same-host numeric-terminal apply URL and bare-host root query.
+    if _alias_https_parts(configured_url) is None:
         return None
-    configured_host, configured_path, _ = configured
-    wrapper_host, wrapper_path, wrapper_query = wrapped
-    match = _ALIAS_JID.fullmatch(wrapper_query)
-    if (not match or match.group(1) != jid or wrapper_host != configured_host
-            or not (configured_path == '/'
-                    or wrapper_path == configured_path
-                    or wrapper_path.startswith(configured_path.rstrip('/') + '/'))):
+    from core.models import JobRecord
+    from discovery.tenant_pin import greenhouse_feed_identity
+
+    candidate = JobRecord(company=name, job_id=jid, title='',
+                          jd_url=url, jd_text='', ats='greenhouse')
+    if not greenhouse_feed_identity(candidate, cfg):
         return None
     return GreenhouseJobAlias(
         pk=pk, company=name, job_id=jid, ats='greenhouse', wrapper=url,
         careers_url=careers, board=board,
-        url=f'https://job-boards.greenhouse.io/{board}/jobs/{jid}')
+        url=f'https://job-boards.greenhouse.io/embed/job_app?for={board}&token={jid}')
 
 
 def direct_board_url(url: str) -> str:

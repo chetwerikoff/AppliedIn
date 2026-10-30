@@ -162,6 +162,8 @@ def candidate_result(job: JobRecord, company: CompanyConfig, *, bound: bool,
     if (job.company != company.name or job.ats != company.ats
             or job.pk != make_pk(company.name, job.job_id)):
         return None, "feed_identity_conflict"
+    if company.ats == "greenhouse" and job.greenhouse_board not in ("", company.board):
+        return None, "feed_identity_conflict"
     if not canonical_shape(job, company.board, company.ats,
                            careers_url=company.careers_url):
         return None, "nonliteral_or_noncanonical_ats_target"

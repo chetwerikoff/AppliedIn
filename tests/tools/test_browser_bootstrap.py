@@ -1573,7 +1573,7 @@ async def test_choice_caption_mismatch_in_dom_witness_gates_without_grant(
 # Issue #29: the configured Greenhouse board, never a discovered iframe or URL,
 # is the only additional authority. All navigation/session calls remain fakes.
 GH_PK = 'example-co#123456'
-GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
+GH_WRAP = 'https://careers.example-co.test/openings/platform-engineer?gh_jid=123456'
 GH_DIRECT = 'https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=123456'
 GH_CAREERS = 'https://careers.example-co.test/openings'
 

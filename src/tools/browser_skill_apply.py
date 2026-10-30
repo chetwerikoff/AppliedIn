@@ -6344,6 +6344,10 @@ class ApplicationIPCController:
         self.verified_redirect = verified_redirect
         self.entry_provenance = (entry_provenance if isinstance(
             entry_provenance, ApplicationEntryProvenance) else None)
+        # The Greenhouse embed certificate must also reach raw IPC; otherwise
+        # a pinned exact embed fails the producer's old hosted-route predicate.
+        self.greenhouse_provenance = (entry_provenance if isinstance(
+            entry_provenance, GreenhouseJobAlias) else None)
         self.upload_completed = False
         self.upload_attempted = False
         self.upload_identity = None
@@ -6389,11 +6393,18 @@ class ApplicationIPCController:
                 and redirect_provenance(self._row(), self.pk, proof.target_url) == proof
                 and navigation_allowed(url, provenance=proof))
 
-    def _fresh_preparation(self, url: str) -> None:
-        if not (_job_preparation_route(url, self.url,
-                                       provenance=self.entry_provenance,
-                                       pk=self.pk, company=self.company,
-                                       fixture_context=self.fixture_context)
+    def _fresh_preparation(self, url: str, *,
+                           initial_navigation: bool = False) -> None:
+        # Before the first navigation only, inspect the tracked wrapper without
+        # treating it as an effect destination. Subsequent private IPC must be
+        # on the exact proven Greenhouse embed, never on a returned wrapper.
+        proof = self.greenhouse_provenance or self.entry_provenance
+        if not ((initial_navigation and self.greenhouse_provenance is not None
+                 and url == self.url)
+                or _job_preparation_route(url, self.url,
+                                          provenance=proof,
+                                          pk=self.pk, company=self.company,
+                                          fixture_context=self.fixture_context)
                 or self._verified_redirect_url(url)):
             raise Gate('The page is not a proven same-job preparation route.')
         _tracked_preparation_job(self.pk, self.company, self.url,
@@ -6544,10 +6555,11 @@ class ApplicationIPCController:
         if op == 'navigate':
             if len(args) != 2 or kwargs:
                 raise Gate('Unknown application navigation IPC arguments.')
-            self._fresh_preparation(self.url)
-            if (not (_job_preparation_route(args[1], self.url, pk=self.pk,
-                                             company=self.company,
-                                             fixture_context=self.fixture_context)
+            self._fresh_preparation(self.url, initial_navigation=True)
+            if (not (_job_preparation_route(
+                         args[1], self.url, provenance=self.greenhouse_provenance,
+                         pk=self.pk, company=self.company,
+                         fixture_context=self.fixture_context)
                      or self._verified_redirect_url(args[1]))
                     or _committing_get_route(args[1])):
                 raise Gate('Unknown, executable or committing GET navigation is not preparation.')

@@ -3086,7 +3086,7 @@ def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, 
     from core.ids import make_pk
 
     pk = make_pk('example-co', '101')
-    url = 'https://careers.example.test/jobs?gh_jid=101'
+    url = 'https://careers.example.test/jobs/role?gh_jid=101'
     row = {'pk': pk, 'company': 'example-co', 'job_id': '101',
            'ats': 'greenhouse', 'jd_url': url}
 

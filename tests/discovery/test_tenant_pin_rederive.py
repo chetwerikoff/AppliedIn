@@ -348,14 +348,14 @@ def test_original_deployed_tuple_requires_exact_nonpathless_source(
     assert (proof is not None) is allowed
 
 
-@pytest.mark.parametrize("careers,wrapper", [
-    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID),
-    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID),
+@pytest.mark.parametrize("careers,wrapper,admitted", [
+    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID, False),
+    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID, True),
     ("https://careers.example-co.test",
-     "https://careers.example-co.test/?gh_jid=" + GH201_JID),
+     "https://careers.example-co.test/?gh_jid=" + GH201_JID, True),
 ])
 def test_existing_greenhouse_guard_accepts_pinned_wrapper_and_hosted_feed_candidate(
-    careers, wrapper,
+    careers, wrapper, admitted,
 ):
     cfg = CompanyConfig(name=GH201_NAME, careers_url=careers,
                         ats="greenhouse", board="example-board")
@@ -366,7 +366,9 @@ def test_existing_greenhouse_guard_accepts_pinned_wrapper_and_hosted_feed_candid
         old, pk=pk, company=GH201_NAME, url=wrapper, configs=[cfg])
     entry = ("https://job-boards.greenhouse.io/embed/job_app"
              "?for=example-board&token=" + GH201_JID)
-    assert proof is not None and proof.url == entry
+    assert (proof is not None) is admitted
+    if admitted:
+        assert proof.url == entry
     canonical = dict(old, jd_url=GH201_POSTING)
     hosted = verified_greenhouse_alias(
         canonical, pk=pk, company=GH201_NAME, url=GH201_POSTING, configs=[cfg])

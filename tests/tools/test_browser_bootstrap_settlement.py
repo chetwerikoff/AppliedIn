@@ -28,7 +28,7 @@ ASHBY_PK = make_pk(COMPANY, JOB)
 ASHBY_POSTING = f'https://jobs.ashbyhq.com/{COMPANY}/{JOB}'
 ASHBY_APPLY = ASHBY_POSTING + '/application'
 GH_PK = 'example-co#123456'
-GH_WRAP = 'https://careers.example-co.test/openings?gh_jid=123456'
+GH_WRAP = 'https://careers.example-co.test/openings/platform-engineer?gh_jid=123456'
 GH_APPLY = 'https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=123456'
 PHONE = '+15550101010'
 
@@ -351,10 +351,14 @@ async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeyp
 
     async def navigate(url):
         visited.append(url)
-        return deepcopy(raw.state)
+        # No pin means no cross-origin embed certificate. The synthetic
+        # host-only page stays on the tracked wrapper URL.
+        page = deepcopy(raw.state)
+        page['url'] = case.wrapper
+        return page
 
     async def stop_after_navigation(_session, page, *_args, **_kwargs):
-        assert page['url'] == case.url
+        assert page['url'] == case.wrapper
         reached_preparation.append(page['url'])
         raise forms.Gate('Synthetic stop after allowed host-only preparation.')
 
@@ -364,7 +368,7 @@ async def test_greenhouse_unpinned_host_prepares_but_final_guard_refuses(monkeyp
     assert outcome['status'] == 'gate'
     assert 'Synthetic stop after allowed host-only preparation' in outcome['question']
     assert visited == [case.wrapper]
-    assert reached_preparation == [case.url]
+    assert reached_preparation == [case.wrapper]
     assert raw.writes == []
 
     # This is the original production final-click decision. Even after

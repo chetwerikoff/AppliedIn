@@ -82,7 +82,7 @@ def _scope_parts(url: str, careers_url: str):
 
 
 def greenhouse_query_id(url: str, careers_url: str) -> str | None:
-    """Exact scoped ?gh_jid identity: bare-host root, listing or child path."""
+    """Exact scoped ?gh_jid identity: bare-host root, child path, or Waymo listing."""
     if isinstance(careers_url, str) and re.fullmatch(
             r"https://[a-z0-9.-]+", careers_url):
         source, p = _parts(careers_url + "/"), _parts(url)
@@ -91,9 +91,9 @@ def greenhouse_query_id(url: str, careers_url: str) -> str | None:
             return None
     else:
         p = _scope_parts(url, careers_url)
-        if p is None:
-            # A configured listing itself may carry the literal ?gh_jid= ID;
-            # only an exact same-host, same-path URL is eligible.
+        if p is None and careers_url == "https://careers.withwaymo.com/jobs":
+            # Waymo's reviewed /jobs listing carries ?gh_jid= directly.
+            # Other path-scoped tuples still require a descendant posting.
             source, target = _parts(careers_url), _parts(url)
             if (source is not None and target is not None
                     and source.path not in ("", "/")

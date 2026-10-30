@@ -2301,17 +2301,14 @@ async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
 
 
 # main@ffaa410e78002928191d04b854471399bff8ca41 source-byte witnesses.
-# The four supporting files stay pinned whole. browser_skill_apply.py is pinned
-# per protected function (ARCH20:47 ruling D): the exact ast source segment of
-# each Submit, hidden-value and posting-safety function must keep its ffaa410
-# bytes, so other #202 owner-gate edits in that file do not trip the pin.
-# Issue #241 r02 explicitly replaces check_form, so it is not byte-pinned;
-# the remaining protected-function and supporting-file pins are unchanged.
+# #250 changes claude_chrome.py and tenant_pin.py outside the protected AST.
+# Preserve the whole-file pins for untouched support files and all protected
+# Submit AST hashes below; don't replace them with a new weak baseline.
 _ISSUE201_MAIN_SHA256 = {
-    "src/tools/claude_chrome.py": "10c3f08e76c920df29f8ebee6f6800333a746305954195d2d8400b10b8fd76dd",
-    "src/discovery/tenant_pin.py": "6b808f2b180a0585120294b0e528d810f1a3b39a5f7bb1214ce2f99281d825b6",
     "src/discovery/watchlist.py": "a34704c63c90381d02f26a7ac4bfc827cc3d3748d2152127b7018b0c1fd9f576",
     "src/core/ids.py": "cedd442c672e89c7f1d0c09dee6cd09d1af7742d63710a315077516be0505654",
+    "src/tools/claude_chrome.py": "cfb72475c28e31583b1465a08df1b3832fcac4b0e02e5df22963a75b31e9c596",
+    "src/discovery/tenant_pin.py": "8bb21e29e8e26d00b7b81b82d92a4f4397044cf96862a85c2cc0d36fff96c407",
 }
 
 _ISSUE201_PROTECTED_FUNCTION_SHA256 = {
@@ -2359,7 +2356,7 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
         assert actual == baseline, (name, actual, baseline)
 
 
-def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():
+def test_issue250_exact_canonical_greenhouse_feed_uses_embed_only():
     from discovery.watchlist import CompanyConfig
 
     company = "example-co"
@@ -2372,8 +2369,14 @@ def test_issue201_exact_canonical_target_is_vetoed_by_existing_raw_consumer():
         row = {"pk": pk, "company": company, "job_id": "731205",
                "ats": "greenhouse", "jd_url": url,
                "greenhouse_board": "example-board"}
-        assert forms.verified_greenhouse_alias(
-            row, pk=pk, company=company, url=url, configs=[cfg]) is None
+        proof = forms.verified_greenhouse_alias(
+            row, pk=pk, company=company, url=url, configs=[cfg])
+        embed = ("https://job-boards.greenhouse.io/embed/job_app"
+                 "?for=example-board&token=731205")
+        assert proof is not None and proof.url == embed
+        assert forms.navigation_allowed(embed, provenance=proof)
+        assert not forms.navigation_allowed(url, provenance=proof)
+        assert not forms.navigation_allowed(embed + "&extra=1", provenance=proof)
 
     jid = "123e4567-e89b-42d3-a456-426614174000"
     pk = f"example-co#{jid}"

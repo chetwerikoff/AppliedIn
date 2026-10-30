@@ -116,7 +116,7 @@ async def _setup(monkeypatch, page, controller):
         return page
 
     monkeypatch.setattr(bsk, "command", fake_command)
-    monkeypatch.setattr(controller, "_fresh_preparation", lambda _url: None)
+    monkeypatch.setattr(controller, "_fresh_preparation", lambda _url, **_kwargs: None)
     monkeypatch.setattr(controller, "_page", fake_page)
     session = bsk.Session("apply")
     session.id = "synthetic-session"

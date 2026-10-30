@@ -56,7 +56,7 @@ def _row(**overrides):
     return record
 
 
-def _feed(ats="greenhouse", job_id="731205", url=HOSTED):
+def _feed(ats="greenhouse", job_id="731205", url=WRAPPER):
     return JobRecord(company="example-co", job_id=job_id,
                      title="Staff Platform Engineer", jd_url=url,
                      jd_text="Synthetic JD", location="Remote",
@@ -133,7 +133,6 @@ def test_unsafe_original_history_is_never_patched(world, changed):
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&x=1",
     "https://careers.example-co.test/openings/engineer?gh_jid=731205&gh_jid=731205",
     "https://careers.example-co.test/openings/engineer?gh_jid=%37%33",
-    "https://careers.example-co.test/openings/job/731205",
     "http://careers.example-co.test/openings/engineer?gh_jid=731205",
     "https://careers.example-co.test/other/engineer?gh_jid=731205",
 ])
@@ -144,7 +143,7 @@ def test_noncanonical_original_url_needs_manual_identity_review(world, url):
 
 
 @pytest.mark.parametrize("target", [
-    "", WRAPPER,
+    "", CAREERS + "/wrong?gh_jid=731205",
     "https://boards.greenhouse.io/other-board/jobs/731205",
     "https://job-boards.greenhouse.io/example-board/jobs/731206",
     "https://job-boards.greenhouse.io:443/example-board/jobs/731205",
@@ -154,6 +153,13 @@ def test_noncanonical_original_url_needs_manual_identity_review(world, url):
 ])
 def test_missing_or_noncanonical_feed_target_cannot_pin(world, target):
     world.rows = [_feed(url=target)]
+    assert _once(world)["status"] == "feed_not_proved"
+    assert world.tracking.writes == 0
+
+
+def test_numeric_terminal_original_requires_matching_literal_feed_url(world):
+    # #250 admits the feed shape, never a row without same-URL feed proof.
+    world.tracking.row["jd_url"] = CAREERS + "/job/731205"
     assert _once(world)["status"] == "feed_not_proved"
     assert world.tracking.writes == 0
 
@@ -309,15 +315,17 @@ def test_original_tenant_pin_query_and_suffix_grammars_remain_distinct(
     assert greenhouse_suffix_id(url, GH201_CAREERS) == suffix_id
 
 
-def test_tenant_pin_pathless_source_never_becomes_a_reviewed_proof():
+def test_bare_source_admits_only_exact_root_query_not_descendants():
     root = "https://careers.example-co.test"
-    assert greenhouse_query_id(root + "/?gh_jid=" + GH201_JID, root) is None
+    assert greenhouse_query_id(root + "/?gh_jid=" + GH201_JID, root) == GH201_JID
+    assert greenhouse_query_id(root + "/job/?gh_jid=" + GH201_JID, root) is None
+    assert greenhouse_query_id(root + "/?gh_jid=" + GH201_JID + "&x=1", root) is None
     assert greenhouse_suffix_id(root + "/job/" + GH201_JID, root) is None
 
 
 @pytest.mark.parametrize("source,allowed", [
     (GH201_CAREERS, True),
-    ("https://careers.example-co.test", False),
+    ("https://careers.example-co.test", True),
     (GH201_CAREERS + "/", False),
 ])
 def test_original_deployed_tuple_requires_exact_nonpathless_source(
@@ -340,14 +348,14 @@ def test_original_deployed_tuple_requires_exact_nonpathless_source(
     assert (proof is not None) is allowed
 
 
-@pytest.mark.parametrize("careers,wrapper", [
-    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID),
-    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID),
+@pytest.mark.parametrize("careers,wrapper,admitted", [
+    (GH201_CAREERS, GH201_CAREERS + "?gh_jid=" + GH201_JID, False),
+    (GH201_CAREERS, GH201_CAREERS + "/staff-platform?gh_jid=" + GH201_JID, True),
     ("https://careers.example-co.test",
-     "https://careers.example-co.test/?gh_jid=" + GH201_JID),
+     "https://careers.example-co.test/?gh_jid=" + GH201_JID, True),
 ])
-def test_existing_greenhouse_guard_keeps_old_pinned_wrapper_but_refuses_canonical_start(
-    careers, wrapper,
+def test_existing_greenhouse_guard_accepts_pinned_wrapper_and_hosted_feed_candidate(
+    careers, wrapper, admitted,
 ):
     cfg = CompanyConfig(name=GH201_NAME, careers_url=careers,
                         ats="greenhouse", board="example-board")
@@ -356,10 +364,15 @@ def test_existing_greenhouse_guard_keeps_old_pinned_wrapper_but_refuses_canonica
                greenhouse_board="example-board", jd_url=wrapper)
     proof = verified_greenhouse_alias(
         old, pk=pk, company=GH201_NAME, url=wrapper, configs=[cfg])
-    assert proof is not None and proof.url == GH201_POSTING
+    entry = ("https://job-boards.greenhouse.io/embed/job_app"
+             "?for=example-board&token=" + GH201_JID)
+    assert (proof is not None) is admitted
+    if admitted:
+        assert proof.url == entry
     canonical = dict(old, jd_url=GH201_POSTING)
-    assert verified_greenhouse_alias(
-        canonical, pk=pk, company=GH201_NAME, url=GH201_POSTING, configs=[cfg]) is None
+    hosted = verified_greenhouse_alias(
+        canonical, pk=pk, company=GH201_NAME, url=GH201_POSTING, configs=[cfg])
+    assert hosted is not None and hosted.url == entry
 
 
 def test_current_application_entry_refuses_dotted_ashby_without_widening_board_token():

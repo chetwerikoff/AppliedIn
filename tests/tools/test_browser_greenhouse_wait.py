@@ -8,7 +8,7 @@ from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
 from tests.tools.test_browser_bootstrap import field, submit, inventory, witness
 
-URL = 'https://job-boards.greenhouse.io/example-co/jobs/123'
+URL = 'https://job-boards.greenhouse.io/embed/job_app?for=example-co&token=123'
 ALIAS = forms.GreenhouseJobAlias(
     pk='example-co#123', company='example-co', ats='greenhouse', job_id='123',
     wrapper='https://careers.example-co.test/job/123', careers_url='https://careers.example-co.test/',
@@ -208,9 +208,13 @@ RETRY = ['greenhouse.equal', 'controls.length.equal', 'visible_text.required_non
          'combobox.link_id.required_nonempty', 'selector.equal', 'visible_text.equal', 'options.equal',
          'combobox.equal', 'inventory.identity.equal', 'selector.unique', 'combobox.object',
          'combobox.PAGE.object', 'combobox.linked.shape'] + [
-             k+'.equal' for k in CONTROL_EQUALS] + [
+             k+'.equal' for k in CONTROL_EQUALS
+             if k not in {'form_action', 'formaction'}] + [
              'combobox.'+k+'.equal' for k in COMBO_EQUALS]
-FATAL = ['url.equal', 'unique.true', 'unique_form.true', 'witness.object',
+# A changed form receiver under a typed embed is an immediate denial, not a
+# retryable PAGE/witness mismatch: the protected destination guard owns this.
+FATAL = ['form_action.equal', 'formaction.equal',
+         'url.equal', 'unique.true', 'unique_form.true', 'witness.object',
          'controls.list', 'control.object',
          'visible.bool', 'readonly.bool', 'inert.bool', 'unlisted',
          'caption-wrong-type']

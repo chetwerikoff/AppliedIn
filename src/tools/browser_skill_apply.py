@@ -719,7 +719,9 @@ def _preparation_destination_allowed(href: str, *origins: str,
                                      provenance: Provenance | None = None,
                                      pk: str = '', company: str = '',
                                      fixture_context=None) -> bool:
-    if isinstance(provenance, VendorRedirectProvenance):
+    if isinstance(provenance, (VendorRedirectProvenance, GreenhouseJobAlias)):
+        # A proven GH tenant cannot borrow the generic tracked-origin
+        # allowance to use an employer redirect or a different form receiver.
         return navigation_allowed(href, provenance=provenance)
     source = (provenance.wrapper if provenance is not None else
               origins[0] if origins else '')

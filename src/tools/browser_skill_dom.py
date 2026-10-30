@@ -146,12 +146,24 @@ PAGE = r"""(() => {
     const list = newGraphs.get(e) ? closedPopup(e) : linkedListbox(e);
     return list && !pickerCandidate(list) ? list : null;
   };
+  // Standalone PAGE must count only the main form, just like both entry readers.
+  const pageSurveyWrappers=pageAshbyNative ? Array.from(
+    document.querySelectorAll('.ashby-survey-form-container')) : [];
   const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container')) : [];
+    document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!e.closest('.ashby-survey-form-container')) : [];
+  const pageSurveyValid=pageSurveyWrappers.length===0 || (
+    pageSurveyWrappers.length===1 && ashbyContainers.length===1 &&
+    pageSurveyWrappers[0].tagName==='DIV' &&
+    pageSurveyWrappers[0].parentElement===ashbyContainers[0].parentElement &&
+    pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
+    !pageSurveyWrappers[0].querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]'));
   const hiddenAshbyChoice=e=>{
     const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
-      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
+      pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
       ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
       e.type==='checkbox' && !e.form && !e.closest('form') &&
       !e.disabled && !e.matches(':disabled') && !visible(e) &&
@@ -386,12 +398,24 @@ _APPLICATION_ROOT = r"""
 # Structural admission belongs only to ApplicationEntryProvenance, never an alias.
 _ASHBY_ROOT = r"""
   // The pane is structural evidence only: never read its values or build targets.
-  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));
+  const surveyWrappers=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
+    .filter(e=>!e.closest('.ashby-survey-form-container'));
   const submitters=Array.from(document.querySelectorAll('button.ashby-application-form-submit-button'));
   const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));
   const container=containers.length===1 ? containers[0] : null;
   const exactSubmit=submitters.length===1 ? submitters[0] : null;
   const wrapper=container?.parentElement;
+  const survey=surveyWrappers.length===1 ? surveyWrappers[0] : null;
+  const surveyContainers=survey ? Array.from(
+    survey.querySelectorAll('.ashby-application-form-container')) : [];
+  const surveyContainer=surveyContainers.length===1 ? surveyContainers[0] : null;
+  // Only one direct sibling section is a survey. Never elevate it to a new
+  // Submit certificate or treat its controls as bank-approved answers.
+  const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
+    !!surveyContainer && !survey.querySelector(
+      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
+      'input[type="submit"],input[type="image"]');
   // Layout order is decoration, not authority. Every additional sibling must
   // be inert; the pane remains quarantined and all controls stay inventoried.
   // class and data-* are styling: they may not certify the wrapper, but must
@@ -408,7 +432,8 @@ _ASHBY_ROOT = r"""
   };
   const siblings=wrapper ? Array.from(wrapper.children) : [];
   const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));
+    n!==container && n!==panes[0] && n!==exactSubmit &&
+    !(surveyValid && n===survey) && !inertSibling(n,true));
   const ordered=!!wrapper && wrapper.tagName==='DIV' && !wrapper.getAttribute('class') &&
     container?.tagName==='DIV' && exactSubmit?.tagName==='BUTTON' &&
     panes.length===1 && panes[0].tagName==='DIV' && panes[0].parentElement===wrapper &&
@@ -418,12 +443,17 @@ _ASHBY_ROOT = r"""
   const structuralRoot=!forms.length && ordered ? wrapper : null;
   const root=nativeRoot || structuralRoot;
   let structuralError='';
-  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
+  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
+      (surveyWrappers.length>0 && !surveyValid)))
     structuralError='ambiguous application roots';
   else if (!forms.length && container && exactSubmit && !ordered && !(
     panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
-    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))
+    exactSubmit.parentElement===wrapper && (
+      (wrapper.children.length===2 &&
+       wrapper.children[0]===container && wrapper.children[1]===exactSubmit) ||
+      (surveyValid && wrapper.children.length===3 &&
+       siblings.includes(container) && siblings.includes(survey) &&
+       siblings.includes(exactSubmit)))))
     structuralError=unsafeSibling ?
       'application root sibling identity mismatch: unsafe sibling' :
       'application root sibling identity mismatch';
@@ -537,10 +567,13 @@ _ASHBY_ROOT = r"""
   // id, so their title's for= resolves to nothing. The only caption proof is
   // the single question title of the receiver's own field entry; zero or
   // several titles, or a title owned by another live control, prove nothing.
+  const controlContainer=e=>container?.contains(e) ? container :
+    (surveyValid && surveyContainer?.contains(e) ? surveyContainer : null);
   const fieldEntry = e => {
-    if (forms.length || !container || !container.contains(e) || e.id) return null;
+    const region=controlContainer(e);
+    if (forms.length || !region || e.id) return null;
     const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !container.contains(entry)) return null;
+    if (!entry || !region.contains(entry)) return null;
     const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));
     const owner=titles.length===1 ? titles[0].getAttribute('for') : null;
     return {entry,titles:titles.length,
@@ -606,7 +639,7 @@ _ASHBY_ROOT = r"""
       const hiddenChoice=e=>{
         const ls=Array.from(e.labels || []);
         return ashbyNative && !forms.length && containers.length===1 &&
-          container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+          (!surveyWrappers.length || surveyValid) && container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
           !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
           !entryEvidenceVisible(e) && !e.closest('[inert]') &&
           !e.closest('div.ashby-application-form-input-yesno') && ls.length===1 &&
@@ -619,7 +652,7 @@ _ASHBY_ROOT = r"""
       const hiddenLabel=hiddenChoice(e) ? e.labels[0] : null;
       const linked=labels.length===1 && actualLabels.length===1 && actualLabels[0]===labels[0] &&
         labels[0].matches('label.ashby-application-form-question-title') &&
-        !!container && container.contains(labels[0]) && container.contains(e) &&
+        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&
         document.querySelectorAll('#'+CSS.escape(id)).length===1 &&
         document.getElementById(labels[0].getAttribute('for'))===e;
       const field=fieldEntry(e);
@@ -637,7 +670,7 @@ _ASHBY_ROOT = r"""
         label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',
         name:e.name || '',associated:linked || !!hiddenLabel,
         ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!container && container.contains(e),
+        in_container:!!controlContainer(e),
         native_owner:e.form ? selector(e.form) : '',
         declared_owner:e.getAttribute('form') || '',formaction:e.getAttribute('formaction'),
         submit:e===exactSubmit,untyped:e.getAttribute('type')===null,

@@ -4819,10 +4819,33 @@ def _bootstrap_grant_diagnostics(fn):
 
 
 def _is_required_proxy(control: dict) -> bool:
-    """The id-less, unlabeled required text input a Greenhouse react-select mounts."""
+    """The id-less, unlabeled required text input a Greenhouse react-select mounts.
+
+    Issue #266: judge the control's own caption, not `label()`. That helper
+    prepends the enclosing fieldset's question, so the proxy inside the Phone
+    fieldset inherited the legend "Phone" and was never seen as a proxy.
+    """
     return (control.get('tag') == 'input' and control.get('type') == 'text'
-            and bool(control.get('required')) and not label(control)
+            and bool(control.get('required'))
+            and not str(control.get('label') or '').strip()
             and not str(control.get('selector', '')).startswith('#'))
+
+
+def _is_react_select_button(control: dict) -> bool:
+    return control.get('tag') == 'button' and control.get('type') == 'button'
+
+
+def _react_select_owner_index(controls: list, proxy_at: int) -> int:
+    """Index of the control just before a proxy, past react-select's own buttons.
+
+    Issue #266: live read of a Greenhouse form puts the "Toggle flyout" button
+    (and "Clear selections" once a value is held) between a dropdown combobox
+    and its proxy, so the combobox is not the proxy's immediate neighbour.
+    """
+    at = proxy_at - 1
+    while at > 0 and _is_react_select_button(controls[at]):
+        at -= 1
+    return at
 
 
 def _required_proxy_owners(controls: list) -> dict:
@@ -4837,11 +4860,27 @@ def _required_proxy_owners(controls: list) -> dict:
     write, not its own path.
     """
     owners = {}
-    for before, control in zip(controls, controls[1:]):
-        if (_is_required_proxy(control) and before.get('type') == 'combobox'
+    for at, control in enumerate(controls):
+        before = controls[_react_select_owner_index(controls, at)] if at else None
+        if (before is not None and _is_required_proxy(control)
+                and before.get('type') == 'combobox'
                 and str(before.get('selector', '')).startswith('#')):
             owners[control['selector']] = before
     return owners
+
+
+def _phone_country_shows_choice(page: dict, owner: dict) -> bool:
+    """True when the phone-country picker itself shows exactly one chosen flag.
+
+    Issue #266: live read after picking the Phone country leaves `#country` with
+    an empty `selected_text` (the picker shows only a flag and a dial code), yet
+    its required proxy unmounts like any other. The picker's own shown choice,
+    read from the same PAGE, is the only commit evidence it has.
+    """
+    shown = (page.get('greenhouse') or {}).get('phone_country') or {}
+    return (shown.get('selector') == owner.get('selector')
+            and shown.get('single_values') == 1 and shown.get('expanded') is False
+            and bool(shown.get('display')) and len(shown.get('flags') or []) == 1)
 
 
 def _rebind_required_proxy(page: dict, proxy: dict, owner: dict):
@@ -4856,12 +4895,23 @@ def _rebind_required_proxy(page: dict, proxy: dict, owner: dict):
     if len(at) != 1 or controls[at[0]].get('type') != 'combobox':
         return None
     current = controls[at[0]]
-    following = controls[at[0] + 1] if at[0] + 1 < len(controls) else None
+    after = at[0] + 1
+    clearable = False
+    while after < len(controls) and _is_react_select_button(controls[after]):
+        clearable = clearable or (
+            str(controls[after].get('label') or '').strip().casefold() == 'clear selections')
+        after += 1
+    following = controls[after] if after < len(controls) else None
     if (following is not None and _is_required_proxy(following)
             and following.get('form_selector') == proxy.get('form_selector')
             and sum(c['selector'] == following['selector'] for c in controls) == 1):
         return following
-    if current.get('required') and (current.get('combobox') or {}).get('selected_text'):
+    # Live reads leave `selected_text` empty after a pick; react-select then shows
+    # its "Clear selections" button (only while it holds a value) or, for the
+    # phone-country picker, its flag and dial code.
+    if current.get('required') and ((current.get('combobox') or {}).get('selected_text')
+                                    or clearable
+                                    or _phone_country_shows_choice(page, current)):
         return True
     return None
 

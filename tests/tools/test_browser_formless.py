@@ -3384,9 +3384,10 @@ def _issue218_main_reader_scripts():
             False,
         ),
         (
-            """  const surveyWrappers=Array.from(document.querySelectorAll('.ashby-survey-form-container'));
+            """  const surveyWrappers=ashbyNative ?
+    Array.from(document.querySelectorAll('.ashby-survey-form-container')) : [];
   const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!e.closest('.ashby-survey-form-container'));""",
+    .filter(e=>!(ashbyNative && e.closest('.ashby-survey-form-container')));""",
             """  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));""",
             True,
         ),

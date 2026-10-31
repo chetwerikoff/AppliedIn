@@ -5933,8 +5933,14 @@ async def _current_approved_choices(session, page: dict, pk: str,
         if (kind not in {'radio', 'checkbox', 'button'}
                 or item.get('disabled') or not _unanswered(current, item)):
             continue
+        # Issue #283: a root-proven Ashby Yes/No pair is advertised on any
+        # entry session once _boolean_pair verifies it; its grant is exact.
+        rooted_ashby_pair = (
+            kind == 'button' and isinstance(provenance, ApplicationEntryProvenance)
+            and provenance.ats == 'ashby'
+            and bool((_formless_root(current) or {}).get('root')))
         if kind == 'button':
-            if not isinstance(session, _ReversibleEntryReader):
+            if not (isinstance(session, _ReversibleEntryReader) or rooted_ashby_pair):
                 continue
             try:
                 if _boolean_pair(current, item)[0] is not item:
@@ -5953,7 +5959,8 @@ async def _current_approved_choices(session, page: dict, pk: str,
             session, current, witness, item, pk, facts or {},
             provenance=provenance, fixture_context=fixture_context)
             if isinstance(session, _ReversibleEntryReader) else None)
-        if isinstance(session, _ReversibleEntryReader) and reversible_scope is None:
+        if (isinstance(session, _ReversibleEntryReader) and reversible_scope is None
+                and not rooted_ashby_pair):
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,

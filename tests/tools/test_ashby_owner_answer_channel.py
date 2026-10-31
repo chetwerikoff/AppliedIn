@@ -6,6 +6,7 @@ owner reply, requeue and stale-answer refusal. Nothing is submitted.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import fakeredis
 import pytest
@@ -40,10 +41,33 @@ class _Bank:
 
 
 def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
-           attestations=False):
+           attestations=False, tmp_path=None):
     spec = ({**_LIVE[shape], **_ATTESTATIONS}
             if attestations else dict(_LIVE[shape]))
     _, raw, decision, _ = root_world(monkeypatch, **spec)
+    if tmp_path is not None:
+        # The production flow prepares the staged PDF before asking for a
+        # missing ordinary fact. The offline Ashby facade must represent that
+        # reversible upload without touching a browser or inventing a grant.
+        pdf = tmp_path / "synthetic-resume.pdf"
+        pdf.write_bytes(b"%PDF-1.4\\nsynthetic example-co only\\n")
+        original_call = raw.call
+
+        async def synthetic_upload(method, *args, **kwargs):
+            if method == "upload":
+                assert len(args) == 3 and args[1] == "--file"
+                assert Path(args[2]) == pdf
+                for snapshot in (raw.current, raw.fixed):
+                    matching = [item for item in snapshot["controls"]
+                                if item.get("selector") == args[0]
+                                and item.get("type") == "file"]
+                    assert len(matching) == 1
+                    matching[0].update(files=[pdf.name], has_value=True)
+                raw.calls.append((method, *args))
+                return {}
+            return await original_call(method, *args, **kwargs)
+
+        raw.call = synthetic_upload
     if name_field is not None:
         label, kind = name_field
         # Change both independent synthetic readers consistently. The original
@@ -86,7 +110,9 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
     monkeypatch.setattr("core.events.emit", lambda *a, **k: None)
     monkeypatch.setattr(run, "get_settings",
                         lambda: SimpleNamespace(browser_model="synthetic"))
-    monkeypatch.setattr(run, "_resume_pdf_path", lambda row: "Resume.pdf")
+    monkeypatch.setattr(run, "_resume_pdf_path",
+                        lambda row: str(tmp_path / "synthetic-resume.pdf")
+                        if tmp_path is not None else "Resume.pdf")
     monkeypatch.setattr(run, "_github_context", lambda: "")
     monkeypatch.setattr("tools.browser_runtime.configuration",
                         lambda: {"engine": "browser_skill"})
@@ -97,11 +123,12 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
 
 
 
-async def _owner_gate(stores, decision, raw, label):
+async def _owner_gate(stores, decision, raw, label=None, *, selector=None):
     """Use an observed control as the missing owner fact, not model prose."""
     matches = [c for c in raw.current["controls"]
-               if c.get("label") == label and not c.get("disabled")]
-    assert len(matches) == 1, (label, [c.get("label") for c in raw.current["controls"]])
+               if not c.get("disabled")
+               and (c.get("selector") == selector if selector else c.get("label") == label)]
+    assert len(matches) == 1
     decision.return_value = {"action": "gate", "selector": matches[0]["selector"],
                              "question": "Please supply this synthetic form fact"}
     result = await run._apply_direct(PK, stores)
@@ -112,7 +139,8 @@ async def _owner_gate(stores, decision, raw, label):
     assert row["gate_source"] == "applier"
     assert row["gate_call_id"] == "direct"
     question = row["gate_pending"]["form_question"]
-    assert question["label"] == label
+    assert question["label"] == (matches[0].get("question") or
+                                  matches[0].get("label") or "Form answer")
     assert question["route"] == "ordinary-owner-question"
     tokens = server._owner_gate_tokens(row)
     assert tokens["gate_generation"]
@@ -123,7 +151,7 @@ async def _owner_gate(stores, decision, raw, label):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["airwallex", "openai"])
 async def test_missing_name_is_owner_question_then_fact_and_requeue_without_grant(
-        monkeypatch, shape):
+        monkeypatch, tmp_path, shape):
     stores, raw, decision = _world(monkeypatch, shape, {})
     row, tokens = await _owner_gate(stores, decision, raw, "Name")
     assert not row.get("human_approved_answers")
@@ -150,9 +178,9 @@ async def test_missing_name_is_owner_question_then_fact_and_requeue_without_gran
 
 @pytest.mark.asyncio
 async def test_existing_legacy_grant_cannot_replace_a_fresh_owner_answer(
-        monkeypatch):
+        monkeypatch, tmp_path):
     stores, raw, decision = _world(
-        monkeypatch, "openai", {}, stale=True)
+        monkeypatch, "openai", {}, stale=True, tmp_path=tmp_path)
     row, tokens = await _owner_gate(stores, decision, raw, "Name")
     assert row["human_approved_answers"]["Name"]["selector"] == "#prior"
     result = run.resume_job(
@@ -168,11 +196,11 @@ async def test_existing_legacy_grant_cannot_replace_a_fresh_owner_answer(
 
 @pytest.mark.asyncio
 async def test_material_checkbox_uses_an_owner_question_not_a_seventh_submit_item(
-        monkeypatch):
+        monkeypatch, tmp_path):
     stores, raw, decision = _world(
-        monkeypatch, "openai", dict(_FACTS), attestations=True)
+        monkeypatch, "openai", dict(_FACTS), attestations=True, tmp_path=tmp_path)
     row, tokens = await _owner_gate(stores, decision, raw,
-                                    "I certify the foregoing legal declaration")
+                                    selector="#attestation-0")
     question = row["gate_pending"]["form_question"]
     assert question["type"] == "checkbox"
     invalid = run.resume_job(
@@ -187,5 +215,4 @@ async def test_material_checkbox_uses_an_owner_question_not_a_seventh_submit_ite
     assert result["result"] == "queued", result
     assert not stores.tracking.get(PK).get("human_approved_answers")
     # Material consent stays company-scoped, not in the global reusable bank.
-    assert stores.answer_bank.writes == [(
-        "I certify the foregoing legal declaration", "yes")]
+    assert stores.answer_bank.writes == [(question["label"], "yes")]

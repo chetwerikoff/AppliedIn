@@ -3936,3 +3936,46 @@ async def test_hidden_choice_flag_needs_root_evidence_and_witness(monkeypatch, c
             'disclosure member witness failed type=checkbox hidden_choice=False '
             'predicate='), messages[0]
         assert _OWNER_ATTESTATION not in messages[0]
+
+
+@pytest.mark.parametrize('damage,token', [
+    ('flag', 'hidden_flag'),
+    ('association', 'hidden_association'),
+    ('text', 'hidden_text'),
+])
+async def test_hidden_choice_member_witness_logs_only_failed_subpredicate_token(
+        monkeypatch, caplog, damage, token):
+    """Issue #276 ARCH delta: a hidden member names its first failed subpredicate."""
+    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
+    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
+    witness = deepcopy({c['selector']: c for c in session.raw.fixed['controls']})
+    flagged = {**target, 'ashby_hidden_choice': True, 'visible': False,
+               'associated_label_selector': witness[_HIDDEN_ATTESTATION][
+                   'associated_label_selector']}
+    dom = witness[_HIDDEN_ATTESTATION]
+    secret = 'Synthetic unlogged caption'
+    if damage == 'flag':
+        dom['ashby_hidden_choice'] = False
+    elif damage == 'association':
+        dom['associated_label_selector'] = '#' + secret.replace(' ', '-')
+    else:
+        dom['visible_text'] = secret
+    with caplog.at_level(logging.INFO, logger=forms._LOG.name):
+        with pytest.raises(forms.Gate) as gate:
+            forms._disclosure_question(page, flagged, witness, posting('ashby'),
+                                       provenance=provenance)
+    assert gate.value.reason == 'defect_witness'
+    messages = [r.getMessage() for r in caplog.records
+                if 'disclosure member witness failed' in r.getMessage()]
+    assert messages == ['disclosure member witness failed type=checkbox '
+                        f'hidden_choice=True predicate={token}']
+    assert secret not in messages[0] and _OWNER_ATTESTATION not in messages[0]
+    assert secret.replace(' ', '-') not in messages[0]
+
+
+def test_non_hidden_member_keeps_visible_predicate():
+    member = {'type': 'checkbox', 'label': 'x', 'disabled': False}
+    dom = {'visible': False, 'ashby_hidden_choice': False,
+           'associated_label_selector': '', 'visible_text': 'x'}
+    assert forms._member_witness_predicate(
+        member, dom, choice=True, hidden_attestation=False) == 'visible'

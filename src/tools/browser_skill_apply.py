@@ -4028,6 +4028,15 @@ def _member_witness_predicate(member: dict, dom, *, choice: bool,
     if not isinstance(dom, dict):
         return 'witness_missing'
     if dom.get('visible') is not True and not hidden_attestation:
+        if member.get('ashby_hidden_choice') is True and dom.get('visible') is False:
+            # Name the first hidden-choice subpredicate that failed, as a token.
+            if dom.get('ashby_hidden_choice') is not True:
+                return 'hidden_flag'
+            if (dom.get('associated_label_selector')
+                    != member.get('associated_label_selector')):
+                return 'hidden_association'
+            if dom.get('visible_text') != member.get('label'):
+                return 'hidden_text'
         return 'visible'
     if dom.get('readonly') is True:
         return 'readonly'

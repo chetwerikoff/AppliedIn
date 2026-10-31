@@ -1408,284 +1408,53 @@ def _greenhouse_phone_country_proven(page: dict, target: dict, answer,
             and not effect.get('hidden_value'))
 
 
+
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                receipts: list | None = None) -> None:
-    if page.get('truncated') or page.get('inventory_verified') is not True:
-        raise Gate('The form inventory is incomplete; review the full form before submitting.')
-    if page.get('opaque_controls') or page.get('unsupported_frames') or page.get('shadow_roots'):
-        raise Gate('This form has uninspectable components; human inspection is required.')
-    controls = page.get('controls', [])
-    if not uploaded:
-        raise Gate('The résumé attachment has not been verified on the form.')
-    if attachment:
-        attached = [c for c in controls
-                    if c.get('type') == 'file'
-                    and re.search(r'resume|résumé|cv', label(c), re.I)
-                    and attachment in c.get('files', [])]
-        if len(attached) != 1:
-            raise Gate('The résumé attachment is no longer present on the current file input.')
-        if (attached[0].get('files') != [attachment] or any(
-                c is not attached[0] and c.get('type') == 'file' and c.get('files')
-                for c in controls)):
-            raise Gate('Only the exact staged résumé may remain attached; inspect manually.')
-    selectors = [c.get('selector') for c in controls]
-    if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
-        raise Gate('The current form controls are not uniquely inventoried.')
-    # Only current groups need persisted group authority. A vanished filled
-    # selector beside a surviving native checkbox can also signal a collapsed
-    # previously approved group; standalone forms need no unrelated row read.
-    if (isinstance(filled, _ApprovedFormValues) and filled.pk
-            and (any(c.get('type') == 'checkbox'
-                     and _checkbox_group(page, c) is not None for c in controls)
-                 or (any(selector not in selectors for selector in filled)
-                     and any(c.get('type') == 'checkbox'
-                             and c.get('in_form') is True for c in controls)))):
-        stored = _group_row(filled.pk, filled.fixture_context)
-        grants = stored.get('human_approved_answers')
-        if isinstance(grants, dict):
-            for grant in grants.values():
-                if (not isinstance(grant, dict)
-                        or grant.get('type') != CHECKBOX_GROUP
-                        or not isinstance(grant.get('question'), str)
-                        or not grant['question']):
-                    continue
-                surviving = [
-                    c for c in controls if c.get('in_form') is True
-                    and _could_receive_an_answer(c)
-                    and _same(grant['question'],
-                              c.get('question') or c.get('label') or '')
-                ]
-                if surviving:
-                    current_group = _checkbox_group(page, surviving[0])
-                    if (current_group is None
-                            or _current_group_grant(page, current_group, stored) is None):
-                        raise Gate('Checkbox group answer is not bound to the current group grant.')
-    root = _formless_root(page)
-    if root and root.get('root'):
-        _validate_rooted_boolean_groups(page)
-    seen_boolean = set()
-    for target in controls:
-        typ = target.get('type', '')
-        # Checked members must not bypass the group owner grant via their own
-        # derived exact grant; unchecked (even optional) members require it too.
-        if (typ == 'checkbox' and _checkbox_group(page, target) is not None
-                and not _bound_checkbox_group_member(page, target, filled, receipts)):
-            raise Gate('Checkbox group answer is not bound to the current group grant.')
-        if typ == 'hidden':
-            if (target.get('required') or target.get('has_value')
-                    or bool(target.get('value'))):
-                owners = [c for c in controls if c.get('type') == 'combobox'
-                          and (c.get('combobox') or {}).get('hidden_selector')
-                          == target.get('selector')
-                          and _combo_receiver_allowed(page, c, target)]
-                owner = owners[0] if len(owners) == 1 else None
-                combo = (owner.get('combobox') or {}) if owner else {}
-                value = target.get('value')
-                expected = filled.get(owner.get('selector')) if owner else None
-                # Only the actual named form value and current accessible
-                # selection, never a historical receipt, can authorize Submit.
-                if (owner is None or not target.get('name')
-                        or expected is None
-                        or not _same(combo.get('selected_text', ''), expected)
-                        or not _same(combo.get('displayed_text', ''),
-                                     combo.get('selected_text', ''))
-                        or not isinstance(value, str) or not value
-                        or value != combo.get('selected_value')
-                        or value != combo.get('hidden_value')):
-                    raise Gate('A hidden form value is not independently authorized.')
-            continue
+    """One fresh, final readback of the actual form, never a writer grant.
 
-        if target.get('disabled'):
-            if (target.get('selector') in filled or target.get('checked')
-                    or target.get('has_value') or target.get('required')):
-                raise Gate('A previously approved or required form control is disabled at final Submit.')
+    The model ledger and optional action receipts are not submission authority.
+    This helper is called only by the raw IPC pre-Submit check.
+    """
+    if (page.get('truncated') or page.get('inventory_verified') is not True
+            or page.get('opaque_controls') or page.get('unsupported_frames')
+            or page.get('shadow_roots')):
+        raise Gate('The final application inventory is incomplete or unreadable.')
+    controls = page.get('controls')
+    if not isinstance(controls, list) or not controls:
+        raise Gate('A fresh application form was not observed.')
+    selectors = [c.get('selector') for c in controls if isinstance(c, dict)]
+    if (len(selectors) != len(controls) or any(not isinstance(x, str) or not x
+            for x in selectors) or len(set(selectors)) != len(selectors)):
+        raise Gate('The current form controls do not have unique selectors.')
+    if not uploaded or not attachment:
+        raise Gate('The staged résumé was not attached in this attempt.')
+    matching = [c for c in controls if c.get('type') == 'file'
+                and re.search(r'resume|résumé|cv', label(c), re.I)
+                and c.get('files') == [attachment]]
+    if (len(matching) != 1 or any(c is not matching[0]
+            and c.get('type') == 'file' and c.get('files') for c in controls)):
+        raise Gate('Exactly one current résumé input must hold the staged PDF.')
+    # Readback is source-of-truth; controls need no historical per-field grant.
+    for c in controls:
+        typ = c.get('type')
+        if c.get('disabled') or typ in {'hidden', 'file', 'submit', 'image', 'button'}:
             continue
-        if (typ == 'button' and target.get('tag') == 'button'
-                and _formless_root(page)
-                and str(target.get('label') or '').casefold() in {'yes', 'no'}):
-            if target['selector'] in seen_boolean:
-                continue
-            members = _boolean_pair(page, target)
-            seen_boolean.update(c['selector'] for c in members)
-            selected = [c for c in members if c.get('checked') is True]
-            if len(selected) != 1:
-                raise Gate('A Yes/No answer is empty or conflicting at final Submit.')
-            answer = selected[0]['label']
-            _final_exact_grant(page, members[0], answer, filled, receipts)
-            guarded_value(selected[0], answer)
+        if c.get('required') is not True:
             continue
-        if typ in {'button', 'submit'}:
-            continue
-        if (target.get('required') is not True
-                and target.get('required') is not False
-                and typ not in {'file', 'hidden', 'submit', 'image'}):
-            if typ == 'radio':
-                group = target.get('name') or target.get('question')
-                answered = bool(group) and any(
-                    c.get('type') == 'radio' and c.get('checked') is True
-                    and (c.get('name') or c.get('question')) == group
-                    and c.get('form_selector') == target.get('form_selector')
-                    for c in controls)
-            elif typ == 'checkbox':
-                answered = target.get('checked') is True
-            else:
-                answered = (bool(target.get('has_value'))
-                            and bool(str(target.get('value') or '').strip())
-                            or bool((target.get('combobox') or {}).get('selected_text')))
-            if not answered:
-                raise Gate('This unanswered field has unreadable requiredness.')
-        expected = filled.get(target['selector'])
-        if typ == 'combobox':
-            combo = target.get('combobox') or {}
-            has_selection = any(str(combo.get(key) or '').strip() for key in (
-                'selected_text', 'selected_value', 'hidden_value'))
-            # A previous write or nonempty receiver still needs final proof.
-            if (not target.get('required') and not has_selection and expected is None
-                    and not target.get('has_value')
-                    and not str(target.get('value') or '').strip()):
-                continue
-            # Issue 259 (c): the one exact Greenhouse phone-country shape has
-            # no form value to read back; its own proof replaces only that.
-            if _greenhouse_phone_country_proven(page, target, expected, receipts):
-                _final_exact_grant(page, target, expected, filled, receipts)
-                guarded_value(target, expected)
-                continue
-            # Closing a listbox may remove aria-controls. At the sole final
-            # guard, only fresh displayed and submitted values establish the
-            # completed approved choice, not an earlier phase/receipt token.
-            options = (combo.get('options') or []) if combo.get('linked') else []
-            matches = ([o for o in options if isinstance(o, dict)
-                        and _same(o.get('label', ''), combo.get('selected_text', ''))]
-                       if isinstance(options, list) else [])
-            if (expected is None or not _same(combo.get('selected_text', ''), expected)
-                    or not _same(combo.get('displayed_text', ''),
-                                 combo.get('selected_text', ''))
-                    or not isinstance(combo.get('selected_value'), str)
-                    or not combo.get('selected_value')
-                    or (combo.get('hidden_selector')
-                        and combo.get('hidden_value') != combo.get('selected_value'))
-                    or (options and (len(matches) != 1
-                        or (matches[0].get('value') or matches[0].get('label'))
-                           != combo.get('selected_value')))):
-                if (combo.get('hidden_selector')
-                        and combo.get('hidden_value') != combo.get('selected_value')):
-                    raise Gate('A hidden form value is not independently authorized.')
-                raise Gate(f'Unverified or changed combobox value: {target["label"]}')
-
-            # One generic form-owned value check: the submitted field may be
-            # the combobox itself or its uniquely associated hidden receiver.
-            # Neither an observed caption alone nor an old receipt is authority.
-            hidden = combo.get('hidden_selector')
-            receiver = target
-            if hidden:
-                matches = [c for c in controls if c.get('selector') == hidden
-                           and c.get('type') == 'hidden'
-                           and _combo_receiver_allowed(page, target, c)]
-                receiver = matches[0] if len(matches) == 1 else None
-            if (receiver is None or not _combo_receiver_allowed(page, target, receiver)
-                    or not receiver.get('name')
-                    or (not hidden and receiver.get('has_value') is not True)
-                    or not isinstance(receiver.get('value'), str)
-                    or not receiver['value']
-                    or receiver['value'] != combo['selected_value']):
-                raise Gate('A hidden form value is not independently authorized.'
-                           if hidden else 'The combobox has no verified form-own value receiver.')
-            _final_exact_grant(page, target, combo['selected_text'], filled, receipts)
-            guarded_value(target, expected)
-            continue
-        if target.get('in_form') and (
-                target.get('tag') not in {'input', 'textarea', 'select', 'button'}
-                or typ in {'contenteditable', 'option'}):
-            raise Gate('Unsupported custom control; human inspection is required.')
-        value = target.get('value', '')
         if typ in {'radio', 'checkbox'}:
-            if target.get('checked'):
-                scope = _assent_scope(target) if typ == 'checkbox' else 'fact'
-                # A delegated application-processing acknowledgement must
-                # round-trip both checked state and its real form-submitted
-                # receiver. A generic "yes" is never remote byte/value proof.
-                if scope == 'standard_privacy':
-                    if (not isinstance(value, str) or not value
-                            or not _same(expected or '', value)
-                            or not target.get('in_form')
-                            or not target.get('form_selector')
-                            or not target.get('form_action')
-                            or receipts is None
-                            or not any(r.get('selector') == target.get('selector')
-                                       and r.get('action') == 'choose'
-                                       and _same(r.get('approved_value', ''), 'yes')
-                                       for r in receipts)):
-                        raise Gate('Standard privacy acknowledgement lacks checked/form-own value.')
-                elif (expected is None or not (_same(expected, value)
-                          or _same(expected, target.get('label', '')))):
-                    raise Gate(f'Unverified preselected answer: {target["label"]}')
-                if typ == 'radio':
-                    # Unselected required radios and unapproved preselection
-                    # already fail at this same final guard. Do not let a
-                    # structural witness mask those exact missing/unapproved
-                    # answer refusals. An approved selected radio must ALSO
-                    # prove one live owning form/name/visible question, unique
-                    # members and exactly one selected member before Submit.
-                    group = _radio_group(page, target)
-                    if sum(bool(member.get('checked')) for member in group) != 1:
-                        raise Gate('Native radio group has conflicting checked members.')
-                _final_exact_grant(page, target, 'yes' if typ == 'checkbox' else value,
-                                   filled, receipts)
-                guarded_value(target, target.get('label', value))
-            elif expected is not None:
-                raise Gate('A previously verified checkbox/radio choice has changed.')
-            elif target.get('required') and typ == 'checkbox':
-                if not _bound_checkbox_group_member(page, target, filled, receipts):
-                    raise Gate(f'Required acknowledgement not completed: {target["label"]}')
-            elif typ == 'radio' and target.get('required'):
-                group = target.get('name') or target.get('question')
-                if not group or not any(
-                        c.get('type') == 'radio' and c.get('checked')
-                        and (c.get('name') or c.get('question')) == group
-                        for c in controls):
-                    raise Gate(f'Required choice is empty: {target["label"]}')
-        elif typ != 'file' and target.get('tag') in {'input', 'textarea', 'select'}:
-            if _formless_root(page) and expected is not None and (
-                    not target.get('has_value') or value != expected):
-                raise Gate('A previously verified structural answer is empty or changed.')
-            # A DOM has_value flag is not proof of submitted bytes. Required
-            # receivers must contain a real nonblank value; an optional form
-            # value must not disappear from approval accounting when the
-            # reader's has_value flag contradicts its own value.
-            present = isinstance(value, str) and bool(value.strip())
-            if target.get('required') and (
-                    target.get('has_value') is not True or not present):
-                raise Gate(f'Required field is empty: {target["label"]}')
-            if ((target.get('has_value') is True and not present)
-                    or (target.get('has_value') is not True and present)):
-                raise Gate('The current native value and its readback disagree.')
-            if typ == 'tel' and expected is not None and (
-                not target.get('has_value') or value != expected
-            ):
-                raise Gate('A previously verified phone value is empty or changed.')
-            if target.get('has_value'):
-                observed = value
-                if target.get('tag') == 'select':
-                    options = [o for o in target.get('options', [])
-                               if o.get('value') == value and o.get('label')]
-                    if len(options) != 1 or not expected:
-                        raise Gate('Native selection lacks a unique displayed/form-own value.')
-                    observed = options[0]['label']
-                    # Exactly the observed form-own option can carry the
-                    # already-approved caption, not a guessed opaque ID.
-                    if receipts is not None and not any(
-                            r.get('selector') == target.get('selector')
-                            and r.get('action') == 'select'
-                            and _same(r.get('approved_value', ''), observed)
-                            for r in receipts):
-                        raise Gate('Native selected caption differs from approved answer.')
-                _final_exact_grant(page, target, observed, filled, receipts)
-                guarded_value(target, observed or expected or '')
-                # The receipt binds the visible approved caption above; filled
-                # stores the actual option.value and must match that receiver.
-                if expected is None or (value and (
-                        value != expected if typ == 'tel' else not _same(value, expected))):
-                    raise Gate(f'Unverified or changed form value: {target["label"]}')
+            peers = [p for p in controls if p.get('type') == typ
+                     and p.get('question') == c.get('question')
+                     and p.get('form_selector') == c.get('form_selector')]
+            if not any(p.get('checked') is True for p in peers):
+                raise Gate('A required native choice has no current selection.')
+        elif typ == 'combobox':
+            combo = c.get('combobox') or {}
+            if not (str(combo.get('selected_text') or '').strip()
+                    or str(c.get('value') or '').strip()):
+                raise Gate('A required accessible picker has no current selection.')
+        elif not str(c.get('value') or '').strip():
+            raise Gate('A required application field is empty on final readback.')
 
 def check_form_destination(page: dict, target: dict, *origins: str,
                            provenance: Provenance | None = None) -> None:
@@ -5645,488 +5414,17 @@ def _vanished_required_gate(control: dict, owner: dict | None) -> Gate:
 
 
 @_bootstrap_grant_diagnostics
+
 async def _bootstrap(session, page: dict, pk: str, facts: dict,
-                     *origins: str, fixture_context=None,
-                     provenance: Provenance | None = None,
+                     *origins: str, fixture_context=None, provenance=None,
                      filled: dict | None = None, history: list | None = None,
                      resume_path: str = '', company: str = '', job_url: str = '',
                      global_facts: dict | None = None) -> dict:
-    if provenance is not None and (
-            provenance.pk != pk
-            or not _preparation_current(provenance, fixture_context=fixture_context)):
-        raise Gate('The configured job/tenant correspondence changed; review the form.',
-                   reason='defect_provenance')
-    _inventory_ok(page, complete=False)
-    if not _preparation_destination_allowed(
-            page['url'], *origins, provenance=provenance, pk=pk, company=company,
-            fixture_context=fixture_context):
-        raise Gate('The current form is not on the tracked job route.')
-    if _formless_root(page):
-        if not isinstance(session, _EntrySession):
-            if getattr(session, '_application_controller', None) is not None:
-                try:
-                    fresh, witness = await _bootstrap_observe_controls(
-                        session, page, site='bootstrap-formless')
-                    if (not _preparation_destination_allowed(
-                            fresh.get('url', ''), *origins, provenance=provenance,
-                            pk=pk, company=company, fixture_context=fixture_context)
-                            or (provenance is not None and
-                                not _preparation_current(
-                                    provenance, fixture_context=fixture_context))):
-                        raise Gate('The reversible observation left the preparation origin.')
-                    if (_formless_root(fresh) or {}).get('root'):
-                        # Issue #252: a certified structural root takes the
-                        # rooted route; its members are exactly the unchanged
-                        # boundary's, never the rootless reversible scope.
-                        members = _formless_boundary(fresh, provenance)
-                        _auto_grant_from_global(
-                            fresh, witness, pk, facts, global_facts or {}, *origins,
-                            provenance=provenance, fixture_context=fixture_context,
-                            formless_selectors=frozenset(c['selector'] for c in members))
-                        return page
-                    scope = _reversible_entry_scope(fresh, witness)
-                    if not scope:
-                        _LOG.info('reversible scope empty pk=%s root_error=%s', pk,
-                                  (_formless_root(fresh) or {}).get('error') or '')
-                    _auto_grant_from_global(
-                        fresh, witness, pk, facts, global_facts or {}, *origins,
-                        provenance=provenance, fixture_context=fixture_context,
-                        formless_selectors=scope, reversible_scope=scope)
-                except Gate as gate:
-                    _LOG.info('reversible bootstrap gate pk=%s reason=%s text=%s',
-                              pk, gate.reason, _reversible_bootstrap_gate_text(gate))
-                    pass  # A missing historic root still cannot block preparation.
-                return page
-            raise Gate('Formless preparation requires the code-owned application IPC controller.')
-        page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-formless')
-        members = _formless_boundary(page, provenance)
-        _auto_grant_from_global(
-            page, witness, pk, facts, global_facts or {}, *origins,
-            provenance=provenance, fixture_context=fixture_context,
-            formless_selectors=frozenset(c['selector'] for c in members))
-        for observed in members:
-            if observed['type'] == 'file':
-                continue
-            item = control(page, observed, 'bootstrap-field')
-            if (item.get('tag') == 'button' and observed.get('boolean_group') is not True
-                    and not str(item.get('label') or '').strip()):
-                # Issue #258: a caption-less widget button (the location
-                # picker's toggle) receives no answer. It must not borrow its
-                # field entry's question key and test that field's approval.
-                continue
-            key = _key(page, item)
-            value = str(facts.get(_fact_key(facts, key)) or '').strip()
-            previous = (_row(pk, fixture_context=fixture_context)
-                        if fixture_context else _row(pk)).get(
-                            'human_approved_answers', {}).get(key)
-            approved = stale = False
-            # Issue #258: a radio/checkbox DOM value is its machine value ("on"
-            # by default), present while unchecked; only checked is an answer.
-            choice = item.get('type') in {'radio', 'checkbox'}
-            populated = bool(item.get('checked') if choice else item.get('has_value'))
-            if choice and not value and isinstance(previous, dict):
-                # An existing grant must still bind its own choice receiver.
-                value = str(previous.get('value') or '').strip()
-            if populated or value:
-                try:
-                    exact_approval(pk, key, value, target=_bound_target(page, item),
-                                   url=page['url'], provenance=provenance,
-                                   **({'fixture_context': fixture_context} if fixture_context else {}))
-                    approved = True
-                except Gate:
-                    if not previous and populated and not choice:
-                        raise Gate(f'unapproved populated application control "{key}"; '
-                                   'inspect manually.') from None
-                    # A recorded approval that no longer binds re-asks this
-                    # one field; it is never written from the stale grant.
-                    stale = bool(previous)
-                if approved:
-                    if (not choice and item.get('has_value')
-                            and item.get('value') != value):
-                        raise Gate(f'unapproved populated application control "{key}"; '
-                                   'inspect manually.')
-                    guarded_value(item, value)
-                    continue
-            # An unchecked owner-only attestation keeps its owner question even
-            # when optional; it is never checked without an exact grant.
-            attestation = (item.get('type') == 'checkbox' and not item.get('checked')
-                           and not previous and _assent_scope(item) == 'owner')
-            if (attestation and observed.get('ashby_hidden_choice') is True
-                    and item.get('ashby_hidden_choice') is not True):
-                # Issue #258: PAGE ignores opacity, so a hidden Ashby choice the
-                # boundary certified carries its flag only in the fixed witness.
-                dom = witness.get(item['selector'])
-                if (isinstance(dom, dict) and dom.get('ashby_hidden_choice') is True
-                        and dom.get('visible') is False
-                        and dom.get('associated_label_selector')
-                            == observed.get('label_selector')):
-                    item = {**item, 'ashby_hidden_choice': True, 'visible': False,
-                            'associated_label_selector': dom['associated_label_selector']}
-            if item.get('required') or value or attestation or stale:
-                question = _disclosure_question(page, item, witness, *origins, provenance=provenance)
-                question['pk'] = pk
-                # A witnessed single-field question is owner-answerable even if
-                # bank-auto refuses it, the bank is empty, or an approval drifted.
-                raise Gate((f'Previously approved answer for "{key}" no longer binds; '
-                            if stale else '')
-                           + f'An exact human-approved answer is needed for "{key}".',
-                           form_question=question,
-                           reason='owner_question')
-        return page
-    filled = filled if filled is not None else {}
-    history = history if history is not None else []
-    # Only verified Lever/Greenhouse application-entry routes may write before
-    # a model decision. Direct, redirect and unrelated native flows keep their
-    # already-established question and guarded model-action behavior.
-    settlement_route = (isinstance(provenance, GreenhouseJobAlias)
-                        or (isinstance(provenance, ApplicationEntryProvenance)
-                            and provenance.ats == 'lever'))
-    candidate = [c for c in page['controls']
-                 if (_native_answer(c) or c.get('type') in {'radio', 'checkbox', 'combobox'})
-                 and _unanswered(page, c)]
-    optional_bank_candidate = bool(global_facts) and any(
-        c.get('in_form') and not c.get('required')
-        and not c.get('disabled')
-        and not (c.get('checked') if c.get('type') in {'radio', 'checkbox'}
-                 else c.get('has_value'))
-        and _fact_key(global_facts, c.get('question') or c.get('label') or '') is not None
-        for c in page['controls'])
-    if not candidate and not optional_bank_candidate and not (settlement_route and history) and not any(
-            c.get('type') in {'radio', 'checkbox', 'password'}
-            or (c.get('in_form') and _material_form_choice(c))
-            or (c.get('submit') and _ACCOUNT_PURPOSE.search(label(c)))
-            for c in page['controls']):
-        return page
-    page, witness = await _bootstrap_observe_controls(session, page, site='bootstrap-material')
-    if provenance is not None and (
-            not _preparation_current(provenance, fixture_context=fixture_context)
-            or not _preparation_destination_allowed(page.get('url', ''), provenance=provenance)):
-        raise Gate('The job/tenant mapping changed during native control inspection.')
-    await _bootstrap_wall(session, page, witness, *origins, provenance=provenance,
-                          pk=pk, fixture_context=fixture_context)
-    _auto_grant_from_global(page, witness, pk, facts, global_facts or {},
-                            *origins, provenance=provenance,
-                            fixture_context=fixture_context)
-    # Native owner questions cannot supersede site/entry and controller
-    # prerequisite decisions merely because an input is empty. The model
-    # refusal fallback remains narrow until the independent route checks
-    # complete, and the final controller remains the submission authority.
-    # Earlier reversible writes may be temporarily reset by later pickers.
-    # The complete current form and all receipts are checked only at Submit.
-    seen = set()
-    ordinal = 0
-    proxy_owners = _required_proxy_owners(page['controls'])
-    # PAGE order, one logical record per required control (one per radio group).
-    # Rebind after each committed write: a previous PAGE must not authorize the next.
-    for initial in list(page['controls']):
-        kind = initial.get('type')
-        if not (_native_answer(initial) or kind in {'radio', 'checkbox', 'combobox'}):
-            continue
-        # Group only for traversal here, not for permission. A visible
-        # question and identical form/member values are proved by _radio_group
-        # when writing a choice and by check_form at the final Submit seam.
-        radio_members = ([c for c in page['controls']
-                          if c.get('type') == 'radio'
-                          and c.get('form_selector') == initial.get('form_selector')
-                          and c.get('name') == initial.get('name')]
-                         if kind == 'radio' and initial.get('name')
-                         and initial.get('form_selector') else [initial])
-        required = (any(c.get('required') for c in radio_members)
-                    if kind == 'radio' else bool(initial.get('required')))
-        option_group = _checkbox_group(page, initial) if kind == 'checkbox' else None
-        # A group is one owner question even when none of its options is
-        # individually required. Standalone optional controls still skip.
-        if not required and option_group is None:
-            continue
-        # Observation already proved selector uniqueness. Read this control
-        # without prematurely treating a disabled *optional* sibling as a Gate.
-        matches = [c for c in page['controls'] if c['selector'] == initial['selector']]
-        if len(matches) != 1:
-            owner = proxy_owners.get(initial['selector'])
-            rebound = (_rebind_required_proxy(page, initial, owner)
-                       if not matches and owner is not None else None)
-            if rebound is None:
-                raise _vanished_required_gate(initial, owner)
-            if rebound is True:
-                # The owning combobox holds the committed value; Submit still
-                # checks that value against fresh readback.
-                continue
-            matches = [rebound]
-        item = matches[0]
-        eligible = kind in _BOOTSTRAP_TYPES and (
-            kind != 'select' or item.get('tag') == 'select')
-        group = ((item.get('form_selector'), item.get('name'))
-                 if kind == 'radio' and item.get('form_selector')
-                 and item.get('name') else item['selector'])
-        if group in seen:
-            continue
-        if kind == 'radio' and radio_members[0] is not item:
-            continue
-        seen.add(group)
-        if eligible:
-            ordinal += 1
+    """Preparation only: no bank grant, widget inspection or field gate.
 
-        def record(decision):
-            if eligible:
-                _bootstrap_log(item, ordinal, decision, required=required)
-
-        option_group = _checkbox_group(page, item) if kind == 'checkbox' else None
-        if option_group is not None:
-            # Issue 278: one owner decision for the whole option group, never a
-            # bank or fact answer. Every member is traversed exactly once here.
-            seen.update(c['selector'] for c in option_group)
-            if _current_group_grant(page, option_group,
-                                    _group_row(pk, fixture_context)) is None:
-                question = _disclosure_question(
-                    page, option_group[0], witness, *origins, bootstrap=True,
-                    provenance=provenance, pk=pk, fixture_context=fixture_context)
-                question['pk'] = pk
-                record('needs-human')
-                raise Gate(_choice_prompt(option_group[0], question),
-                           form_question=question, reason='owner_question')
-            _derive_group_member_grants(page, pk, fixture_context=fixture_context)
-            page, witness = await _reconcile_checkbox_group(
-                session, page, item, pk, fixture_context, filled,
-                provenance=provenance)
-            record('left-to-model')
-            continue
-
-        if not settlement_route or not eligible:
-            # A missing ordinary answer is not a per-step admission gate.
-            # Leave it untouched for an approved model action; the one final
-            # Submit guard checks every required value against fresh readback.
-            # Owner-only questions retain their direct escalation.
-            if not _unanswered(page, item) or item.get('disabled') or (
-                    kind not in {'radio', 'checkbox', 'combobox'}
-                    and str(item.get('value') or '').strip()):
-                continue
-            try:
-                if provenance is not None and not _preparation_current(
-                        provenance, fixture_context=fixture_context):
-                    raise Gate('The trusted alias is no longer current.')
-                question = _disclosure_question(
-                    page, item, witness, *origins, bootstrap=True,
-                    closed_witness=_closed_material_combobox(item),
-                    provenance=provenance)
-            except Gate:
-                continue
-            question['pk'] = pk
-            key = question['label']
-            value = str(facts.get(_fact_key(facts, key)) or '').strip()
-            grants = (_row(pk, fixture_context=fixture_context) if fixture_context
-                      else _row(pk)).get('human_approved_answers') or {}
-            previous = grants.get(key) if isinstance(grants, dict) else None
-            if (kind == 'radio' and isinstance(previous, dict)
-                    and isinstance(previous.get('radio_members'), list)
-                    and previous['radio_members'] != question['radio_members']):
-                record('blocked')
-                raise Gate('The previously approved radio group has changed; inspect it again.')
-            if _material_form_choice(item):
-                # Material assent is not a reusable bank fact: the only
-                # possible answer comes from the fresh same-job owner grant.
-                try:
-                    _material_exact_value(
-                        pk, page, item, question, provenance=provenance,
-                        fixture_context=fixture_context)
-                except Gate:
-                    record('needs-human')
-                    raise MaterialAssentGate(
-                        _choice_prompt(item, question), form_question=question,
-                        reason='owner_question') from None
-                record('left-to-model')
-                continue
-            if kind in {'radio', 'checkbox'}:
-                if _approved_native_choice(
-                        page, item, pk, provenance=provenance,
-                        fixture_context=fixture_context) is not None:
-                    record('left-to-model')
-                    continue
-            if value:
-                try:
-                    exact_approval(
-                        pk, key, value, target=_bound_target(page, item),
-                        url=page['url'], provenance=provenance,
-                        **({'fixture_context': fixture_context}
-                           if fixture_context else {}))
-                    continue
-                except Gate:
-                    pass
-            if _missing_answer_reason(item) == 'owner_question':
-                prompt = (_choice_prompt(item, question)
-                          if kind in {'radio', 'checkbox', 'combobox'}
-                          or item.get('tag') == 'select'
-                          else f'An exact human-approved answer is needed for "{key}".')
-                record('needs-human')
-                raise Gate(prompt, form_question=question, reason='owner_question')
-            # Ordinary native controls retain their guarded model/submit
-            # sequencing; a prose refusal is converted to a structured owner
-            # question only at the decision boundary below.
-            record('left-to-model')
-            continue
-
-        if not _unanswered(page, item):
-            # Without a previously validated controller receipt this is not a
-            # new bank settlement. Prefilled page values are left untouched.
-            if eligible:
-                members = (_radio_group(page, item) if kind == 'radio' else [item])
-                prior = [r for r in history if r.get('fact')
-                         and r.get('selector') in {c['selector'] for c in members}]
-                if prior:
-                    record('already-satisfied')
-            continue
-        if item.get('disabled'):
-            record('blocked')
-            raise Gate('A required native control is disabled; inspect manually.')
-        try:
-            if provenance is not None and not _preparation_current(
-                    provenance, fixture_context=fixture_context):
-                raise Gate('The trusted same-job provenance is no longer current.')
-            question = _disclosure_question(
-                page, item, witness, *origins, bootstrap=True,
-                closed_witness=_closed_material_combobox(item),
-                provenance=provenance)
-        except Gate:
-            record('blocked')
-            raise
-        question['pk'] = pk
-        key = question['label']
-        fact_key = _fact_key(facts, key)
-        value = str(facts.get(fact_key) or '').strip() if fact_key is not None else ''
-        grants = (_row(pk, fixture_context=fixture_context) if fixture_context
-                  else _row(pk)).get('human_approved_answers')
-        previous = grants.get(key) if isinstance(grants, dict) else None
-        grant_value = (previous.get('value', '')
-                       if isinstance(previous, dict)
-                       and (_material_form_choice(item)
-                            or (kind in {'radio', 'checkbox'} and not value))
-                       else value)
-        authority = _bootstrap_grant_state(previous, item, question, grant_value)
-        prompt = (_choice_prompt(item, question)
-                  if kind in {'radio', 'checkbox', 'combobox'} or kind == 'select'
-                  else f'An exact human-approved answer is needed for "{key}".')
-        if authority == 'stale':
-            record('blocked')
-            raise Gate('The earlier control approval has changed; inspect manually.',
-                       reason='defect_witness')
-
-        if _material_form_choice(item):
-            # Never auto-select a legal/privacy answer on settlement routes.
-            # Only a current exact owner grant may be offered to the model.
-            try:
-                _material_exact_value(
-                    pk, page, item, question, provenance=provenance,
-                    fixture_context=fixture_context)
-            except Gate:
-                record('needs-human')
-                raise MaterialAssentGate(
-                    prompt, form_question=question, reason='owner_question') from None
-            record('left-to-model')
-            continue
-
-        if kind == 'checkbox' and _assent_scope(item) == 'standard_privacy':
-            _approved_native_choice(page, item, pk, provenance=provenance,
-                                    fixture_context=fixture_context)
-            record('left-to-model')
-            continue
-
-        # #103: a grant-only choice is deliberately left for the existing model
-        # choose action. Its PAGE-bound approved_choices remains independent.
-        if kind in {'radio', 'checkbox'} and not value and authority == 'current':
-            try:
-                approved = _approved_native_choice(
-                    page, item, pk, provenance=provenance,
-                    fixture_context=fixture_context)
-                if approved is None:
-                    raise Gate('The granted native choice is no longer current.')
-            except Gate:
-                record('blocked')
-                raise
-            record('left-to-model')
-            continue
-
-        if not value or authority in {'missing', 'incomplete'}:
-            record('needs-human')
-            # A missing value or a bank-held value refused by bank-auto
-            # still needs an exact owner answer, never an unknown-field gate.
-            raise Gate(prompt, form_question=question, reason='owner_question')
-        try:
-            exact_approval(
-                pk, key, value, target=_bound_target(page, item),
-                url=page['url'], provenance=provenance,
-                **({'fixture_context': fixture_context} if fixture_context else {}))
-            if kind in {'radio', 'checkbox'}:
-                approved = _approved_native_choice(
-                    page, item, pk, provenance=provenance,
-                    fixture_context=fixture_context)
-                if approved is None or approved[0] != value:
-                    raise Gate('The approved native choice differs from the bank.')
-            else:
-                guarded_value(item, value)
-            if kind == 'select':
-                # No model-supplied candidate: uniquely resolve the approved
-                # current native option before executing the guarded select.
-                option = choose_value(item, value, '')
-            else:
-                option = ''
-        except Gate:
-            record('blocked')
-            raise
-
-        if not eligible:
-            # Other native text controls keep their pre-existing model action
-            # path; this Issue settles only tel and banked native choices.
-            continue
-        if kind == 'radio':
-            selector = approved[1]['selector']
-            verb = 'choose'
-        elif kind == 'checkbox':
-            selector = item['selector']
-            verb = 'choose'
-        else:
-            selector = item['selector']
-            verb = {'tel': 'fill', 'select': 'select',
-                    'combobox': 'combobox'}[kind]
-        action = {'action': verb, 'selector': selector, 'fact': fact_key}
-        if verb == 'select':
-            action['value'] = option
-        trial = dict(filled)
-        try:
-            # Dispatch and the original execute() grant, receiver and form
-            # guards remain the sole writer. No speculative DOM evaluate write.
-            check_dispatch(
-                pk, resume_path,
-                **({'fixture_context': fixture_context} if fixture_context else {}))
-            receipt = await execute(
-                session, page, action, facts=facts, filled=trial,
-                resume_path=resume_path, company=company or getattr(provenance, 'company', ''),
-                jd_text='', resume_tex='', github='', pk=pk,
-                job_url=job_url or getattr(provenance, 'wrapper', '') or (origins[0] if origins else ''),
-                provenance=provenance,
-                **({'fixture_context': fixture_context} if fixture_context else {}))
-            committed, observed_witness = await _observe_controls(
-                session, await session.page(), site='bootstrap-commit-readback')
-            if (not _preparation_destination_allowed(committed.get('url', ''), *origins,
-                                       provenance=provenance)
-                    or (provenance is not None and not _preparation_current(
-                        provenance, fixture_context=fixture_context))):
-                raise Gate('The job route changed during native commit readback.')
-            # No per-step receipt admission: an approved preparation action
-            # cannot authorize final submission from intermediate readback.
-        except (Exception, asyncio.CancelledError) as exc:
-            # A transport failure after an authorized IPC is not proof that the
-            # browser did nothing. Stop without an automatic repeat.
-            record('blocked')
-            if isinstance(exc, (Gate, asyncio.CancelledError)):
-                raise
-            raise Gate('Native write/readback outcome unclear; inspect manually. '
-                       'No automatic repeat was attempted.') from None
-        filled.update(trial)
-        history.append(receipt)
-        page, witness = committed, observed_witness
-        record('settled-from-bank')
+    The single fresh form check belongs to raw submission IPC, not this loop.
+    """
     return page
-
-
 
 def _required_owner_gate_type(target: dict) -> str:
     """Only a normalized control KIND, never arbitrary DOM text, enters a defect code."""
@@ -6478,101 +5776,23 @@ def _owner_skip_applies(row: dict, pk: str, question: dict, page: dict,
             and not _mismatch_question_twins(page, item))
 
 
+
 async def _current_approved_choices(session, page: dict, pk: str,
                                     *origins: str, fixture_context=None,
                                     provenance=None, facts=None) -> list[dict]:
-    """Expose only eligible choices independently witnessed on this decision PAGE."""
-    if not any(c.get('type') in {'radio', 'checkbox', 'button'} and _unanswered(page, c)
-               for c in page['controls']):
-        return []
-    current, witness = await _observe_controls(session, page, site='bootstrap-native-readback')
-    if (not _preparation_destination_allowed(current.get('url', ''), *origins, provenance=provenance)
-            or (provenance is not None
-                and (provenance.pk != pk
-                     or not _preparation_current(provenance, fixture_context=fixture_context)))):
-        raise Gate('The same-job choice PAGE changed before model disclosure.')
+    """Accessible choice hints for the model, not approvals or write authority."""
     choices = []
-    _derive_group_member_grants(current, pk, fixture_context=fixture_context)
-    for item in current['controls']:
-        kind = item.get('type')
-        if (kind not in {'radio', 'checkbox', 'button'}
-                or item.get('disabled') or not _unanswered(current, item)):
+    for item in page.get('controls', []):
+        if (item.get('disabled') or item.get('type') not in
+                {'radio', 'checkbox', 'button', 'select', 'combobox'}):
             continue
-        # Issue #283: a root-proven Ashby Yes/No pair is advertised on any
-        # entry session once _boolean_pair verifies it; its grant is exact.
-        rooted_ashby_pair = (
-            kind == 'button' and isinstance(provenance, ApplicationEntryProvenance)
-            and provenance.ats == 'ashby'
-            and bool((_formless_root(current) or {}).get('root')))
-        if kind == 'checkbox':
-            option_group = _checkbox_group(current, item)
-            if option_group is not None:
-                granted = _current_group_grant(
-                    current, option_group, _group_row(pk, fixture_context))
-                if granted is None or item['label'] not in granted['selected']:
-                    continue  # Only an owner-granted member is ever offered.
-        if kind == 'button':
-            if not (isinstance(session, _ReversibleEntryReader) or rooted_ashby_pair):
-                continue
-            try:
-                if _boolean_pair(current, item)[0] is not item:
-                    continue
-            except Gate:
-                continue
-        if kind == 'radio':
-            try:
-                if _radio_group(current, item)[0] is not item:
-                    continue
-            except Gate:
-                if isinstance(session, _ReversibleEntryReader):
-                    continue  # The later owner gate returns a typed group defect.
-                raise
-        reversible_scope = (_execute_reversible_scope(
-            session, current, witness, item, pk, facts or {},
-            provenance=provenance, fixture_context=fixture_context)
-            if isinstance(session, _ReversibleEntryReader) else None)
-        if (isinstance(session, _ReversibleEntryReader) and reversible_scope is None
-                and not rooted_ashby_pair):
-            continue
-        question = _disclosure_question(
-            current, item, witness, *origins, bootstrap=True,
-            provenance=provenance, reversible_scope=reversible_scope,
-            pk=pk, fixture_context=fixture_context)
-        approved = (_approved_boolean_pair(
-            current, item, pk, provenance=provenance,
-            fixture_context=fixture_context) if kind == 'button' else
-            _approved_native_choice(
-                current, item, pk, provenance=provenance,
-                fixture_context=fixture_context))
-        if approved is None:
-            continue
-        answer, selected = approved
-        entry = {
-            'key': question['label'], 'question': question['question'],
-            'control_label': question['control_label'],
-            'selector': question['selector'], 'url': question['url'],
-            'tag': question['tag'], 'type': question['type'],
-            'form_selector': question['form_selector'],
-            'form_action': question['form_action'],
-        }
-        if kind == 'radio':
-            entry.update(radio_name=question['radio_name'],
-                         radio_members=question['radio_members'],
-                         approved_answer={
-                             'selector': selected['selector'],
-                             'caption': selected['label'],
-                             'value': selected['value']})
-        elif kind == 'button':
-            entry['boolean_members'] = question['boolean_members']
-            entry['approved_answer'] = {
-                'selector': selected['selector'], 'caption': selected['label'],
-                'value': selected['label'].casefold()}
-        else:
-            entry['approved_answer'] = {
-                'selector': selected['selector'], 'value': 'yes', 'checked': True}
-        choices.append(entry)
+        choices.append({
+            'key': item.get('question') or item.get('label') or '',
+            'selector': item.get('selector'),
+            'type': item.get('type'),
+            'options': item.get('options') or (item.get('combobox') or {}).get('options') or [],
+        })
     return choices
-
 
 async def _fresh_native_receiver(session, page: dict, action: dict,
                                  original: dict, provenance: Provenance,
@@ -6599,248 +5819,39 @@ def _combobox_stable_identity(target: dict) -> tuple:
 
 
 
+
 async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
-                            filled: dict, pk: str, job_url: str, ctx, provenance) -> dict:
-    observed, witness = await _observe_controls(session, page, site='combobox-observe')
-    if provenance is not None and not _preparation_current(
-            provenance, fixture_context=ctx):
-        raise Gate('The tracked posting changed before combobox preparation.')
-    target = control(observed, action, 'combobox-observe')
-    closed_material = _closed_material_combobox(target)
-    question = _disclosure_question(
-        observed, target, witness, job_url or observed['url'],
-        closed_witness=closed_material, provenance=provenance,
-        reversible_scope=_execute_reversible_scope(
-            session, observed, witness, target, pk, facts,
-            provenance=provenance, fixture_context=ctx))
-    question['pk'] = pk
-    key = action.get('fact', '')
-    if _material_form_choice(target):
-        if key != question['label']:
-            raise Gate('The material choice requires its observed question key.',
-                       form_question=question, reason='owner_question')
-        try:
-            answer = _material_exact_value(
-                pk, observed, target, question, provenance=provenance,
-                fixture_context=ctx)
-        except Gate:
-            raise Gate('A current owner-approved material choice is required.',
-                       form_question=question, reason='owner_question') from None
-    else:
-        answer = str(facts.get(key) or '').strip() if key in facts else ''
-        if not answer or key != _fact_key(facts, question['label']):
-            raise Gate('Choose an exact approved answer for this combobox.',
-                       form_question=question,
-                       reason=_missing_answer_reason(target) if _unanswered(observed, target)
-                       and not answer else 'unknown_field')
-
-    def approve(current, current_page):
-        witnessed_options = None
-        if _closed_material_combobox(current):
-            # Only the unopened picker may borrow its current owner's options;
-            # after opening the real witnessed listbox must match the grant.
-            row = _row(pk, fixture_context=ctx) if ctx else _row(pk)
-            grants = row.get('human_approved_answers')
-            grant = grants.get(question['label']) if isinstance(grants, dict) else None
-            witnessed_options = grant.get('options') if isinstance(grant, dict) else None
-            if not isinstance(witnessed_options, list) or not witnessed_options:
-                raise Gate('A current material option grant is not available.')
-        exact_approval(pk, question['label'], answer, target=current,
-                       url=current_page['url'], provenance=provenance,
-                       witnessed_options=witnessed_options,
-                       **({'fixture_context': ctx} if ctx else {}))
-        guarded_value(current, answer)
-
-    def unresolved():
-        # No selection receipt or filled value is fabricated. An incomplete
-        # choice is assessed by the ONE final form/Submit decision instead.
-        return {'action': 'combobox', 'label': target['label'],
-                'selector': target['selector'], 'fact': question['label'],
-                'unresolved': 'The approved option or its receiver is not verified.'}
-
-    try:
-        approve(target, observed)
-    except Gate:
-        raise Gate('An exact human-approved answer is needed for this combobox.',
-                   form_question=question) from None
-    controller = None
-    if closed_material:
-        # A bootstrap witness was Escape-closed. The guarded producer requires
-        # a new code-owned exact-control request for this reversible open.
-        controller = getattr(session, '_application_controller', None)
-        if controller is None:
-            controller = getattr(getattr(session, 'raw', None),
-                                 '_application_controller', None)
-        if controller is not None:
-            if (controller._material_witness_request is not None
-                    or controller._material_witness_selector is not None):
-                raise Gate('A prior material picker witness is still in progress.')
-            controller._material_witness_request = target['selector']
-            controller._material_witness_expected = {
-                k: v for k, v in target.items() if k != 'combobox'}
-    try:
-        latest, latest_witness, current = observed, witness, target
-        combo = current.get('combobox') or {}
-        try:
-            options = (_combobox_options(current)
-                       if combo.get('linked') is True and combo.get('options') else [])
-        except Gate:
-            options = []
-        if not options:
-            # Opening the picker and typing only the already-approved answer are
-            # reversible. A missing/mutating listbox is not a human Submit gate.
-            await _effect_call(session, 'click', current['selector'])
-            latest, latest_witness = await _observe_controls(session, await session.page(), site='combobox-open')
-            current = control(latest, action, 'combobox-open')
-            if (not _preparation_destination_allowed(
-                    latest.get('url', ''), job_url or observed['url'],
-                    provenance=provenance)
-                    or (provenance is not None and not _preparation_current(
-                        provenance, fixture_context=ctx))):
-                raise Gate('The picker origin or current tracked posting changed.')
-            if current.get('tag') == 'input':
-                approve(current, latest)
-                await _effect_call(session, 'fill', current['selector'], '--value', answer)
-            for attempt in range(20):
-                try:
-                    refreshed, refreshed_witness = await _observe_controls(
-                        session, await session.page(), site='combobox-options')
-                    candidate = control(refreshed, action, 'combobox-options')
-                except Gate:
-                    candidate = None
-                if candidate is not None:
-                    if not _preparation_destination_allowed(
-                            refreshed.get('url', ''), job_url or observed['url'],
-                            provenance=provenance):
-                        raise Gate('The picker left the approved preparation origin.')
-                    combo = candidate.get('combobox') or {}
-                    if combo.get('linked') is True and combo.get('options'):
-                        try:
-                            options = _combobox_options(candidate)
-                        except Gate:
-                            options = []
-                        if options:
-                            latest, latest_witness, current = (
-                                refreshed, refreshed_witness, candidate)
-                            break
-                if attempt < 19:
-                    await asyncio.sleep(0.25)
-        if not options:
-            return unresolved()
-        matches = [option for option in options if _same(answer, option['label'])]
-        if question['label'] == PHONE_COUNTRY_KEY:
-            # The Submit proof binds this click's exact caption, not a near match.
-            matches = [option for option in matches if option['label'] == answer]
-        if len(matches) != 1:
-            return unresolved()
-        selected = matches[0]
-        # The latest independent observation, not an old C0/C1/C2 or widget-root
-        # identity, binds the one option that may be clicked during preparation.
-        try:
-            latest, latest_witness = await _observe_controls(
-                session, await session.page(), site='combobox-verify')
-            current = control(latest, action, 'combobox-verify')
-        except Gate:
-            return unresolved()
-        if (not _preparation_destination_allowed(
-                latest.get('url', ''), job_url or observed['url'],
-                provenance=provenance)
-                or (provenance is not None and not _preparation_current(
-                    provenance, fixture_context=ctx))):
-            raise Gate('The tracked preparation origin changed before option click.')
-        # Reconfirm the already-approved fact at the exact option-click edge.
-        approve(current, latest)
-        try:
-            candidates = [option for option in _combobox_options(current)
-                          if option.get('selector') == selected.get('selector')
-                          and option.get('label') == selected.get('label')
-                          and option.get('value') == selected.get('value')]
-        except Gate:
-            return unresolved()
-        if len(candidates) != 1:
-            return unresolved()
-        selected = candidates[0]
-        witnessed_options = ([
-            {key: option[key] for key in ('selector', 'label', 'value')}
-            for option in _combobox_options(current)]
-            if _material_form_choice(current) else None)
-        if (selected.get('submit') or selected.get('navigates')
-                or selected.get('safe') is not True):
-            raise Gate('A submission-capable or unsafe navigating option cannot be clicked.')
-        before = current.get('combobox') or {}
-        receivers = [c for c in latest['controls']
-                     if before.get('hidden_selector')
-                     and c.get('selector') == before['hidden_selector']
-                     and before['hidden_selector'] in latest_witness]
-        phone_country = None
-        if question['label'] == PHONE_COUNTRY_KEY:
-            # Issue 259: the shown choice is only a flag and a dial code, so
-            # the clicked option must name exactly one flag country and end in
-            # its one "+code". Without both nothing is clicked.
-            listed = (((latest.get('greenhouse') or {}).get('phone_country') or {})
-                      .get('option_flags') or {})
-            flags = listed.get(selected['selector']) if isinstance(listed, dict) else None
-            code = _dial_code(selected['label'])
-            if (selected['label'] != answer or not code or not isinstance(flags, list)
-                    or len(flags) != 1 or not re.fullmatch(r'[a-z]{2}', str(flags[0]))):
-                return unresolved()
-            phone_country = {'country_flag': flags[0], 'dial_code': code}
-        await _effect_call(session, 'click', selected['selector'])
-        if phone_country is not None:
-            # Issue 259: react-select keeps no caption or form value on the
-            # control, so re-read the picker's own shown choice in its phone
-            # fieldset before recording anything. A missing, different or
-            # duplicated shown value records nothing; Submit still decides.
-            try:
-                after, _ = await _observe_controls(
-                    session, await session.page(), site='combobox-reread')
-                rereads = [c for c in after['controls']
-                           if c.get('selector') == current['selector']]
-                reread = rereads[0] if len(rereads) == 1 else None
-                shown = (after.get('greenhouse') or {}).get('phone_country') or {}
-                # The open listbox closes on a choice; the receiver may not change.
-                if (reread is None or any(reread.get(k) != current.get(k) for k in (
-                        'label', 'question', 'tag', 'type', 'in_form', 'form_selector',
-                        'form_action', 'formaction', 'name', 'disabled'))
-                        or _key(after, reread) != PHONE_COUNTRY_KEY
-                        or shown.get('selector') != reread['selector']
-                        or shown.get('single_values') != 1
-                        or shown.get('expanded') is not False
-                        or shown.get('flags') != [phone_country['country_flag']]
-                        or shown.get('display') != phone_country['dial_code']):
-                    return unresolved()
-            except Gate:
-                return unresolved()
-        # Receiver presence, current displayed caption and submitted bytes are
-        # checked at final Submit; an option click is not that authorization.
-        committed = selected.get('value') or selected['label']
-        filled[current['selector']] = selected['label']
-        return {'action': 'combobox', 'label': current['label'],
-                'selector': current['selector'], 'question': current.get('question', ''),
-                'url': latest['url'], 'fact': question['label'], 'approved_value': answer,
-                'committed_caption': selected['label'], 'committed_value': committed,
-                'hidden_selector': before.get('hidden_selector', ''),
-                'hidden_value_before': before.get('hidden_value', ''),
-                'hidden_value': committed if before.get('hidden_selector') else '',
-                **({'hidden_name': receivers[0].get('name')} if len(receivers) == 1 else {}),
-                # This session's own exact click, re-read; the Submit proof needs it.
-                **(phone_country or {}),
-                **({'witnessed_options': witnessed_options,
-                    'selected_option': {key: selected[key] for key in ('selector', 'label', 'value')}}
-                   if witnessed_options is not None else {})}
-    finally:
-        if controller is not None:
-            # A guarded raw open belongs to this action, never the next one.
-            # Release the handshake on a choice, an unresolved list, or a gate.
-            controller._material_witness_request = None
-            controller._material_witness_expected = None
-            controller._material_witness_selector = None
-            controller._material_witness_target = None
-            controller._material_witness_close_request = None
-
-
-_PRODUCTION_OBSERVE_CONTROLS = _observe_controls
-
+                            filled: dict, pk: str, job_url: str, ctx,
+                            provenance) -> dict:
+    """Fill an accessible picker freely, then use its current visible options."""
+    target = control(page, action, 'decision-action')
+    selector = target['selector']
+    key = action.get('fact')
+    answer = (str(facts[key]).strip() if isinstance(key, str) and key in facts
+              else str(action.get('value') or '').strip())
+    if not answer:
+        raise Gate('The owner has not supplied an answer for this form question.',
+                   reason='owner_question')
+    options = (target.get('combobox') or {}).get('options') or []
+    if not options:
+        await _effect_call(session, 'click', selector)
+        fresh = await session.page()
+        current = next((c for c in fresh.get('controls', [])
+                        if c.get('selector') == selector), None)
+        if current and current.get('tag') == 'input':
+            await _effect_call(session, 'fill', selector, '--value', answer)
+            fresh = await session.page()
+            current = next((c for c in fresh.get('controls', [])
+                            if c.get('selector') == selector), None)
+        options = ((current or {}).get('combobox') or {}).get('options') or []
+    candidates = [o for o in options if isinstance(o, dict)
+                  and (_same(o.get('label', ''), answer)
+                       or _same(o.get('value', ''), answer))]
+    if len(candidates) == 1 and candidates[0].get('selector'):
+        await _effect_call(session, 'click', candidates[0]['selector'])
+    # Missing/hydrating options remain an incomplete readback, not a write Gate.
+    filled[selector] = answer
+    return {'action': 'combobox', 'selector': selector, 'label': target.get('label','')}
 
 async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
     """Name the production site without breaking two-argument fixture doubles."""
@@ -6948,385 +5959,77 @@ def _execute_reversible_scope(session, page: dict, witness: dict, target: dict,
         origin=provenance.wrapper, fixture_context=fixture_context)
 
 
+
 async def execute(session, page: dict, action: dict, *, facts: dict, filled: dict,
                   resume_path: str, company: str, jd_text: str, resume_tex: str,
                   github: str, pk: str = '', allow_click: bool = False,
                   job_url: str = '', on_committing_click=None,
-                  fixture_context=None,
-                  provenance: Provenance | None = None) -> dict:
-    ctx = _synthetic(fixture_context, pk=pk)
+                  fixture_context=None, provenance=None) -> dict:
+    """Perform one model-selected preparation action without field grants.
+
+    Readback is collected for the model; only check_pre_submit can reject a
+    populated form on its current contents, at the committing IPC boundary.
+    """
     verb = action.get('action')
-    if pk and provenance is None and job_url != (
-            (_row(pk, fixture_context=ctx) if ctx else _row(pk)).get('jd_url') or job_url):
-        raise Gate('An exact human-approved answer is needed for this tracked job.')
-    if provenance is not None:
-        if (pk != provenance.pk or company != provenance.company
-                or job_url != provenance.wrapper
-                or not _preparation_current(provenance, fixture_context=ctx)
-                or not _preparation_destination_allowed(page.get('url', ''),
-                                          provenance=provenance)):
-            raise Gate('This page lacks current same-job provenance.',
-                   reason='defect_provenance')
-    _inventory_ok(page, complete=False)
-    if _formless_root(page) and isinstance(session, _EntrySession):
-        check_form_destination(page, control(page, action, 'execute-formless'), provenance=provenance)
-    target = control(page, action, 'execute-initial')
-    question = label(target)
-    if _LOGIN.search(question) or target.get('type') == 'password':
-        raise Gate('Sign in yourself in the dedicated profile, then resume this application.')
+    if verb not in {'fill', 'select', 'choose', 'combobox', 'upload', 'click',
+                    'focus', 'press'}:
+        raise Gate('Unsupported form operation.')
+    target = control(page, action, 'decision-action') if action.get('selector') else None
     if verb == 'combobox':
         return await _execute_combobox(session, page, action, facts=facts,
-                                       filled=filled, pk=pk, job_url=job_url,
-                                       ctx=ctx, provenance=provenance)
-    if verb in {'fill', 'select', 'choose'}:
-        if verb == 'choose':
-            _require_guarded_choice(page, target)
-        observed, witness = await _execute_observe_controls(session, page)
-        if provenance is not None and (
-                not _preparation_current(provenance, fixture_context=ctx)
-                or not _preparation_destination_allowed(observed.get('url', ''),
-                                          provenance=provenance)):
-            raise Gate('The same-job page or mapping changed before a field gate.')
-        target = control(observed, action, 'execute-observe')
-        if verb == 'choose':
-            _require_guarded_choice(observed, target)
-            if not _unanswered(observed, target,
-                               owner_all=_owner_asks_every_receiver(observed)) and not (
-                    _boolean_already_chosen(observed, target)):
-                raise Gate('Only required, unanswered native choices can be selected.')
-        if _identity(target) != _identity(control(page, action, 'execute-identity')):
-            raise Gate('The selected field changed before human authorization.')
-        page = observed
-        if verb == 'choose' and target.get('type') == 'checkbox':
-            _derive_group_member_grants(page, pk, fixture_context=ctx)
-        form_question = _disclosure_question(
-            page, target, witness, job_url or page['url'],
-            provenance=provenance, reversible_scope=_execute_reversible_scope(
-                session, page, witness, target, pk, facts,
-                provenance=provenance, fixture_context=ctx),
-            pk=pk, fixture_context=ctx)
-        form_question['pk'] = pk
-        gate_prompt = (_choice_prompt(target, form_question)
-                       if verb in {'choose', 'select'}
-                       else f'An exact human-approved answer is needed for "{form_question["label"]}".')
-        key = action.get('fact', '')
-        if (key not in facts and verb == 'fill' and action.get('essay')
-                and target.get('tag') == 'textarea'):
-            key = _fact_key(facts, target['label']) or key
-        if verb == 'choose':
-            # Missing safe answers still produce the original bound question.
-            # Once granted, the model's fact is only a routing label.
-            try:
-                approved = (_approved_boolean_pair(
-                    page, target, pk, provenance=provenance, fixture_context=ctx)
-                    if target.get('type') == 'button' else _approved_native_choice(
-                        page, target, pk, provenance=provenance, fixture_context=ctx))
-            except Gate as exc:
-                if exc.reason == 'owner_question' and exc.form_question is None:
-                    # Keep the independently observed question when the claim
-                    # classifier routes a real consent/attestation to its owner.
-                    raise Gate(str(exc), reason=exc.reason,
-                               form_question=form_question) from None
-                raise
-            if approved is None:
-                raise Gate(gate_prompt, form_question=form_question,
-                           reason=('owner_question' if target.get('type') == 'button'
-                                   else _missing_answer_reason(target))
-                           if _unanswered(page, target) else 'unknown_field')
-            if (not isinstance(key, str)
-                    or key not in {form_question['label'],
-                                   _fact_key(facts, form_question['label'])}):
-                raise Gate('The chosen native control does not match its observed grant key.')
-            value, chosen = approved
-            if chosen['selector'] != target['selector']:
-                raise Gate('The selected radio does not match the exact owner answer.')
-        else:
-            if verb == 'select' and _material_form_choice(target):
-                if key != form_question['label']:
-                    raise Gate('The material select requires its observed question key.',
-                               form_question=form_question, reason='owner_question')
-                try:
-                    value = _material_exact_value(
-                        pk, page, target, form_question, provenance=provenance,
-                        fixture_context=ctx)
-                except Gate:
-                    raise Gate(gate_prompt, form_question=form_question,
-                               reason='owner_question') from None
-            else:
-                if key and key in facts and not re.search(r'password|login|credential|token', key, re.I):
-                    value = str(facts[key]).strip()
-                else:
-                    raise Gate(gate_prompt, form_question=form_question,
-                               reason=_missing_answer_reason(target) if _unanswered(page, target)
-                               and not key else 'unknown_field')
-                if key != _fact_key(facts, form_question['label']):
-                    detail = 'An exact human-approved fact key for this observed question is required.'
-                    if verb == 'select':
-                        detail += '\n' + gate_prompt
-                    raise Gate(detail, form_question=form_question)
-        try:
-            exact_approval(pk, form_question['label'], value, target=_bound_target(page, target),
-                           url=page['url'], provenance=provenance,
-                           **({'fixture_context': ctx} if ctx else {}))
-        except Gate as exc:
-            prompt = (_choice_prompt(target, form_question)
-                      if verb == 'choose' else str(exc))
-            if verb == 'select':
-                prompt += '\n' + gate_prompt
-            raise Gate(prompt, form_question=form_question) from None
+                                        filled=filled, pk=pk, job_url=job_url,
+                                        ctx=fixture_context, provenance=provenance)
+    if verb in {'fill', 'select', 'choose'} and target is not None:
+        key = action.get('fact')
+        value = (str(facts[key]).strip() if isinstance(key, str) and key in facts
+                 else str(action.get('value') or '').strip())
+        if not value and verb == 'choose':
+            value = str(target.get('label') or target.get('value') or '').strip()
         if not value:
-            raise Gate(gate_prompt, form_question=form_question)
-        if verb == 'choose':
-            if target['type'] == 'checkbox':
-                if not _same(value, 'yes'):
-                    raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
-                guarded_value(target, value)
-                write_value = target.get('value') or target['label']
-            elif target['type'] == 'button':
-                members = _boolean_pair(page, target)
-                chosen = [c for c in members if _same(value, c['label'])]
-                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
-                    raise Gate('Selected Boolean member differs from the owner answer.',
-                               reason='defect_button')
-                guarded_value(target, value)
-                write_value = target['label'].casefold()
-            else:
-                members = _radio_group(page, target)
-                chosen = [c for c in members if _radio_answer_matches(value, c)]
-                if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
-                    raise Gate('The selected radio does not match the exact owner answer.')
-                _guard_native_choice_answer(target, value)
-                write_value = target['value']
-        else:
-            guarded_value(target, value)
-            if verb == 'select':
-                try:
-                    write_value = choose_value(target, value, str(action.get('value', '')))
-                except Gate as exc:
-                    if str(exc) != 'No unambiguous option matches the approved answer.':
-                        raise
-                    raise Gate(gate_prompt, form_question=form_question) from None
-            else:
-                write_value = value
-        # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _execute_observe_controls(session, page)
-        current = control(latest, action, 'execute-prewrite')
-        if verb == 'choose':
-            _require_guarded_choice(latest, current)
-            if not _unanswered(latest, current,
-                               owner_all=_owner_asks_every_receiver(latest)) and not (
-                    _boolean_already_chosen(latest, current)):
-                raise Gate('The required choice is no longer unanswered.')
-        if _identity(current) != _identity(target):
-            raise Gate('The approved form control changed before a browser write.')
-        if provenance is not None and (
-                not _preparation_current(provenance, fixture_context=ctx)
-                or not _preparation_destination_allowed(latest.get('url', ''),
-                                          provenance=provenance)):
-            raise Gate('The same-job page or mapping changed before disclosure.')
-        fresh_question = _disclosure_question(
-            latest, current, latest_witness, job_url or latest['url'],
-            provenance=provenance, reversible_scope=_execute_reversible_scope(
-                session, latest, latest_witness, current, pk, facts,
-                provenance=provenance, fixture_context=ctx),
-            pk=pk, fixture_context=ctx)
-        fresh_question['pk'] = pk
-        if fresh_question != form_question:
-            raise Gate('The original authorized control identity is no longer current.')
-        if verb == 'choose':
-            fresh_choice = (_approved_boolean_pair(
-                latest, current, pk, provenance=provenance, fixture_context=ctx)
-                if current.get('type') == 'button' else _approved_native_choice(
-                    latest, current, pk, provenance=provenance, fixture_context=ctx))
-            if (fresh_choice is None or fresh_choice[0] != value
-                    or fresh_choice[1]['selector'] != current['selector']):
-                raise Gate('The exact native choice grant changed before a browser write.')
-        exact_approval(pk, form_question['label'], value,
-                       target=_bound_target(latest, current), url=latest['url'],
-                       provenance=provenance,
-                       **({'fixture_context': ctx} if ctx else {}))
+            raise Gate('This application question needs an owner answer.',
+                       reason='owner_question')
         if verb == 'fill':
-            guarded_value(current, write_value)
-            await _effect_call(session, 'fill', current['selector'], '--value', write_value)
+            await _effect_call(session, 'fill', target['selector'], '--value', value)
         elif verb == 'select':
-            write_value = choose_value(current, value,
-                                       str(action.get('value', '')))
-            await _effect_call(session, 'select', current['selector'], '--value', write_value)
+            options = target.get('options') or []
+            matches = [o for o in options if isinstance(o, dict)
+                       and (_same(o.get('label', ''), value)
+                            or _same(o.get('value', ''), value)
+                            or o.get('value') == action.get('value'))]
+            if len(matches) == 1:
+                value = str(matches[0]['value'])
+                await _effect_call(session, 'select', target['selector'], '--value', value)
+            # Unknown options remain unselected for final readback; no write Gate.
         else:
-            if current['type'] == 'checkbox':
-                if not _same(value, 'yes'):
-                    raise Gate('Checkbox grant no longer contains an explicit owner yes.')
-            elif current['type'] == 'button':
-                matches = [c for c in _boolean_pair(latest, current)
-                           if _same(value, c['label'])]
-                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
-                    raise Gate('The bound Boolean answer no longer matches this member.',
-                               reason='defect_button')
-            else:
-                matches = [c for c in _radio_group(latest, current)
-                           if _radio_answer_matches(value, c)]
-                if len(matches) != 1 or matches[0]['selector'] != current['selector']:
-                    raise Gate('The bound radio answer no longer matches this member.')
-            _guard_native_choice_answer(current, value)
-            # FF-247a: a click on an already pressed Ashby member toggles it
-            # off (live probe), so an exact prior press goes to readback.
-            if not _boolean_already_chosen(latest, current):
-                await _effect_call(session, 'click', current['selector'])
-            if (current['type'] == 'checkbox'
-                    and _checkbox_group(latest, current) is not None):
-                await _settle_checkbox_group(session, current, pk, ctx)
-        if _formless_root(page):
-            readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
-            actual = control(readback, action, 'execute-readback')
-            if current['type'] == 'button':
-                # A <button> never carries the answer as a value; only its
-                # pressed member, inside the same pair the grant binds, does.
-                selected = [c for c in _boolean_pair(readback, actual)
-                            if c.get('checked') is True]
-                # FF-247a: a background tab can lag Ashby's re-render after the
-                # click. Re-read only, bounded; a second click toggles it off.
-                for _ in range(_BOOLEAN_READBACK_REREADS):
-                    if len(selected) == 1 and selected[0]['selector'] == current['selector']:
-                        break
-                    await asyncio.sleep(_BOOLEAN_READBACK_INTERVAL)
-                    readback, _ = await _observe_controls(
-                        session, await session.page(), site='execute-readback')
-                    actual = control(readback, action, 'execute-readback-reread')
-                    selected = [c for c in _boolean_pair(readback, actual)
-                                if c.get('checked') is True]
-                if (len(selected) != 1 or selected[0]['selector'] != current['selector']
-                        or not _same(value, actual.get('label', ''))):
-                    raise _readback_gate(pk, verb, current, actual, write_value, 'selected')
-            elif current.get('ashby_hidden_choice') is True:
-                if actual.get('checked') is not True:
-                    raw = getattr(session, 'raw', session)
-                    controller = getattr(raw, '_application_controller', None)
-                    selector = current.get('associated_label_selector')
-                    if (not isinstance(controller, ApplicationIPCController)
-                            or not selector or controller._hidden_label_fallback):
-                        raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
-                    controller._hidden_label_fallback = True
-                    await _effect_call(session, 'click', selector)
-                    readback, witness = await _observe_controls(
-                        session, await session.page(), site='execute-readback-label')
-                    actual = control(readback, action, 'execute-readback-reread')
-                    dom = witness.get(current['selector'])
-                    if (actual.get('checked') is not True
-                            or not isinstance(dom, dict)
-                            or dom.get('checked') is not True):
-                        raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
-            elif _default_radio_value(current):
-                # Issue 282: "on" names no option, so the value cannot prove the
-                # choice. Exactly one member is checked and it is the granted one.
-                if not _default_radio_choice_read_back(readback, actual, current, value):
-                    raise _readback_gate(pk, verb, current, actual, write_value,
-                                         'checked')
-            elif actual.get('value') != write_value or not actual.get('has_value'):
-                raise _readback_gate(pk, verb, current, actual, write_value)
-            if (current.get('type') == 'radio' and current.get('ashby_hidden_choice') is True):
-                # A hidden radio skips the value check above; its own checked flag
-                # is not the group's. Exactly one member is checked: the granted one.
-                if not _default_radio_choice_read_back(readback, actual, current, value):
-                    raise _readback_gate(pk, verb, current, actual, write_value,
-                                         'checked')
-            # The DOM readback uses the machine value (e.g. "remote"), while
-            # the row grant binds the owner's answer (e.g. "Remote").
-            exact_approval(pk, form_question['label'], value, target=_bound_target(readback, actual),
-                           url=readback['url'], provenance=provenance,
-                           **({'fixture_context': ctx} if ctx else {}))
-        if current.get('type') == 'tel':
-            readback, _ = await _observe_controls(session, await session.page(), site='execute-phone')
-            phone = control(readback, action, 'execute-phone')
-            if (_combobox_stable_identity(phone) != _combobox_stable_identity(current)
-                    or phone.get('value') != write_value or phone.get('has_value') is not True):
-                raise Gate('The full approved international phone did not read back exactly.')
-        filled[current['selector']] = write_value
-    elif verb == 'upload':
-        if target.get('type') != 'file' or not re.search(r'resume|résumé|cv', question, re.I):
-            raise Gate('Upload must target the résumé/CV file input.')
-        if pk and not job_url:
-            raise Gate('The original tracked job route is missing; upload denied.')
-        if provenance is not None:
-            page, target = await _fresh_native_receiver(
-                session, page, action, target, provenance, fixture_context=ctx)
-        check_form_destination(page, target, job_url or page.get('url', ''),
-                               provenance=provenance)
-        if _formless_root(page) and isinstance(session, _EntrySession):
-            result = await _ashby_resume_upload(session, page, resume_path=resume_path)
-            observed, _ = await _observe_controls(session, await session.page(), site='execute-upload-readback')
-            # Existing approved fields may have shifted nth-of-type selectors.
-            rebound = {new['selector']: filled[old['selector']]
-                       for old, new in zip(page['entry']['root_evidence'],
-                                           observed['entry']['root_evidence'])
-                       if old['selector'] in filled}
-            for old in page['entry']['root_evidence']:
-                filled.pop(old['selector'], None)
-            filled.update(rebound)
-            return result
-        step = 'effect'
-        try:
-            await _effect_call(session, 'upload', target['selector'], '--file', resume_path, timeout=130)
-            step = 'page'
-            observed = await session.page()
-            if _formless_root(page):
-                step = 'observe'
-                observed, _ = await _observe_controls(session, observed, site='execute-formless-upload')
-        except (Exception, asyncio.CancelledError) as exc:
-            if isinstance(exc, Gate):
-                raise
-            # One passive read can distinguish an attached file from an uncertain
-            # outcome without replaying the effect or exposing exception text.
-            attached = 'unknown'
-            try:
-                reread = await session.page()
-                filename = Path(resume_path).name
-                file_inputs = [item for item in reread.get('controls', [])
-                               if item.get('selector') == target['selector']
-                               and item.get('type') == 'file']
-                confirmed = (len(file_inputs) == 1
-                             and file_inputs[0].get('files') == [filename])
-                attached = 'true' if confirmed else 'false'
-            except (Exception, asyncio.CancelledError):
-                pass
-            error = type(exc).__name__
-            error = error if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', error) else 'Exception'
-            reason = exc.code if isinstance(exc, bsk.Unavailable) and exc.code else 'none'
-            _LOG.info('resume upload failure pk=%s step=%s exception=%s reason=%s attached=%s',
-                      pk, step, error, reason, attached)
-            if isinstance(exc, bsk.Unavailable) and exc.file_access_required:
-                raise Gate("Enable BrowserSkill's Allow access to file URLs permission in the "
-                           "dedicated profile; inspect the attachment before retrying.") from None
-            raise Gate('The résumé upload outcome is unclear; inspect the attachment '
-                       'before retrying. No automatic repeat was attempted.') from None
-        matches = [c for c in observed.get('controls', [])
-                   if c.get('selector') == target['selector'] and c.get('type') == 'file'
-                   and re.search(r'resume|résumé|cv', label(c), re.I)]
-        if len(matches) != 1 or Path(resume_path).name not in matches[0].get('files', []):
-            raise Gate('The uploaded résumé was not proven in the current file input.')
-        if _formless_root(page) and matches[0].get('files') != [Path(resume_path).name]:
-            raise Gate('Only the exact staged résumé may be uploaded; inspect manually.')
-        return {'action': verb, 'label': target['label'], 'uploaded': True}
-    elif verb == 'click':
-        if not allow_click or not pk or not job_url:
-            raise Gate('An unclassified click cannot reach application IPC.')
-        if (target.get('href') and not _job_preparation_route(target['href'], job_url, provenance=provenance)):
-            raise Gate('Click target navigates outside the approved preparation host.')
-        if target.get('formaction') and not _job_preparation_route(
-                target['formaction'], job_url, provenance=provenance):
-            raise Gate('Unknown form override may submit outside the approved host.')
-        # Before private data, the raw controller may permit an ordinary JS
-        # Apply/Continue progression. Any possible commit is classified and
-        # checked by the same producer-side final guard, never by this label.
+            if not target.get('checked'):
+                await _effect_call(session, 'click', target['selector'])
+        filled[target['selector']] = value
+    elif verb == 'upload' and target is not None:
+        if not resume_path or not Path(resume_path).is_file():
+            raise Gate('The staged row résumé is missing.')
+        await _effect_call(session, 'upload', target['selector'], '--file',
+                           resume_path, timeout=130)
+        observed = await session.page()
+        attached = [c for c in observed.get('controls', [])
+                    if c.get('type') == 'file'
+                    and c.get('selector') == target['selector']
+                    and c.get('files') == [Path(resume_path).name]]
+        return {'action': 'upload', 'label': target.get('label', ''),
+                'selector': target['selector'], 'uploaded': len(attached) == 1}
+    elif verb == 'click' and target is not None:
+        if not allow_click:
+            raise Gate('Model click must be issued by the tracked application loop.')
         await _effect_call(session, 'click', target['selector'])
+    elif verb == 'focus' and target is not None:
+        await _effect_call(session, 'focus', target['selector'])
+    elif verb == 'press':
+        await _effect_call(session, 'press', str(action.get('key') or 'Escape'))
     else:
-        raise Gate('Unsupported form action.')
-    receipt = {'action': verb, 'label': target['label'], 'selector': target['selector'],
-               'question': target.get('question', ''), 'url': page.get('url', '')}
-    if verb in {'fill', 'select', 'choose'}:
-        receipt.update(fact=form_question['label'],
-                       approved_value=value if verb == 'choose'
-                       else str(facts.get(key, value)).strip())
-    return receipt
+        raise Gate('An accessible control selector is missing.')
+    # A partial or stale readback is not submission permission; the next model
+    # decision can continue filling, and the final guard always re-reads.
+    return {'action': verb, 'label': target.get('label', '') if target else '',
+            'selector': target.get('selector', '') if target else ''}
 
 def _fields_report(history: list, filled: dict) -> list[dict]:
     """Report only browser-read-back values, not the immutable bank answer."""

@@ -1664,7 +1664,8 @@ def _formless_root(page: dict) -> dict | None:
 def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     """Prove the final same-job Ashby container, without widget approvals."""
     root = _formless_root(page)
-    if (not root or not isinstance(provenance, ApplicationEntryProvenance)
+    if (not root or not root.get('root') or root.get('error')
+            or not isinstance(provenance, ApplicationEntryProvenance)
             or provenance.ats != 'ashby'
             or not _preparation_destination_allowed(
                 page.get('url', ''), provenance=provenance)):
@@ -1685,7 +1686,9 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     submit = root.get('submit')
     if not isinstance(submit, str) or not submit or submit not in selectors:
         raise Gate('A unique final application Submit is not proven.')
-    return members
+    # The submitter is a commit boundary, not a fill receiver. Description
+    # links and account-purpose siblings never gain form-answer membership.
+    return [c for c in members if c.get('selector') != submit and c.get('tag') != 'a']
 
 
 def _root_identity(page: dict):

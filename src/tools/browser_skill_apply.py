@@ -6329,7 +6329,14 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                     continue
             except Gate:
                 pass
-        if rootless and kind in {'radio', 'button'}:
+        # Issue #283: a root-proven Ashby page also owns a required Yes/No
+        # button pair; only a pair that _boolean_pair resolves is writable.
+        rooted_ashby_pair = (
+            kind == 'button' and item.get('tag') == 'button'
+            and bool(structural and structural.get('root'))
+            and isinstance(provenance, ApplicationEntryProvenance)
+            and provenance.ats == 'ashby')
+        if (rootless and kind in {'radio', 'button'}) or rooted_ashby_pair:
             try:
                 _radio_group(current, item) if kind == 'radio' else _boolean_pair(
                     current, item, witness=witness)
@@ -6339,7 +6346,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         writable = (_native_answer(item)
                     or kind == 'combobox' and item.get('tag') in {'input', 'div'}
                     or kind in {'radio', 'checkbox'} and item.get('tag') == 'input'
-                    or rootless and kind == 'button' and item.get('tag') == 'button')
+                    or (rootless or rooted_ashby_pair)
+                    and kind == 'button' and item.get('tag') == 'button')
         if not writable or (rootless and _closed_material_combobox(item)):
             return Gate('The guarded executor cannot write this required control; '
                         'operator inspection is required.',
@@ -6490,6 +6498,12 @@ async def _current_approved_choices(session, page: dict, pk: str,
         if (kind not in {'radio', 'checkbox', 'button'}
                 or item.get('disabled') or not _unanswered(current, item)):
             continue
+        # Issue #283: a root-proven Ashby Yes/No pair is advertised on any
+        # entry session once _boolean_pair verifies it; its grant is exact.
+        rooted_ashby_pair = (
+            kind == 'button' and isinstance(provenance, ApplicationEntryProvenance)
+            and provenance.ats == 'ashby'
+            and bool((_formless_root(current) or {}).get('root')))
         if kind == 'checkbox':
             option_group = _checkbox_group(current, item)
             if option_group is not None:
@@ -6498,7 +6512,7 @@ async def _current_approved_choices(session, page: dict, pk: str,
                 if granted is None or item['label'] not in granted['selected']:
                     continue  # Only an owner-granted member is ever offered.
         if kind == 'button':
-            if not isinstance(session, _ReversibleEntryReader):
+            if not (isinstance(session, _ReversibleEntryReader) or rooted_ashby_pair):
                 continue
             try:
                 if _boolean_pair(current, item)[0] is not item:
@@ -6517,7 +6531,8 @@ async def _current_approved_choices(session, page: dict, pk: str,
             session, current, witness, item, pk, facts or {},
             provenance=provenance, fixture_context=fixture_context)
             if isinstance(session, _ReversibleEntryReader) else None)
-        if isinstance(session, _ReversibleEntryReader) and reversible_scope is None:
+        if (isinstance(session, _ReversibleEntryReader) and reversible_scope is None
+                and not rooted_ashby_pair):
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,

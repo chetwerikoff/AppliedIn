@@ -4065,7 +4065,7 @@ async def _reconcile_checkbox_group(session, page: dict, original: dict,
                 pk, _member_key(member), 'yes', target=_bound_target(fresh, member),
                 url=fresh['url'], provenance=provenance,
                 **({'fixture_context': ctx} if ctx is not None else {}))
-            _guard_native_choice_answer(member, 'yes')
+            _guard_checkbox_choice(fresh, member, 'yes')
             values[member['selector']] = value
     filled.update(values)  # Only after every current member has passed readback.
     return fresh, witness
@@ -4292,6 +4292,21 @@ def _guard_native_choice_answer(selected: dict, answer: str) -> None:
         guarded_value(selected, selected['label'])
 
 
+def _guard_checkbox_choice(page: dict, selected: dict, answer: str) -> None:
+    """Issue 287: a native checkbox group option's yes only means "checked".
+
+    Its answer is the visible option caption, so that caption is guarded, the
+    same value the final check guards. A sanctions group then passes only with
+    safe negative captions checked. Every other control keeps its guard.
+    """
+    if selected.get('type') == 'checkbox' and _checkbox_group(page, selected) is not None:
+        if not _same(answer, 'yes'):
+            raise Gate('Only an explicit owner yes can check a checkbox group option.')
+        guarded_value(selected, selected['label'])
+        return
+    _guard_native_choice_answer(selected, answer)
+
+
 def _approved_native_choice(page: dict, target: dict, pk: str, *,
                             provenance=None, fixture_context=None):
     """Resolve a PAGE-bound native choice from the existing exact grant, not facts."""
@@ -4345,7 +4360,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     exact_approval(pk, key, answer, target=_bound_target(page, target),
                    url=page['url'], provenance=provenance,
                    **({'fixture_context': fixture_context} if fixture_context else {}))
-    _guard_native_choice_answer(selected, answer)
+    _guard_checkbox_choice(page, selected, answer)
     return answer, selected
 
 def _approved_boolean_pair(page: dict, target: dict, pk: str, *,
@@ -5672,7 +5687,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                             and item.get('value') != value):
                         raise Gate(f'unapproved populated application control "{key}"; '
                                    'inspect manually.')
-                    guarded_value(item, value)
+                    if item.get('type') == 'checkbox':
+                        _guard_checkbox_choice(page, item, value)
+                    else:
+                        guarded_value(item, value)
                     continue
             # An unchecked owner-only attestation keeps its owner question even
             # when optional; it is never checked without an exact grant.
@@ -6992,7 +7010,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             if target['type'] == 'checkbox':
                 if not _same(value, 'yes'):
                     raise Gate('Only an explicit owner yes can authorize checking a checkbox.')
-                guarded_value(target, value)
+                _guard_checkbox_choice(page, target, value)
                 write_value = target.get('value') or target['label']
             elif target['type'] == 'button':
                 members = _boolean_pair(page, target)
@@ -7081,7 +7099,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                or _same(value, c['value']))]
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
-            _guard_native_choice_answer(current, value)
+            _guard_checkbox_choice(latest, current, value)
             # FF-247a: a click on an already pressed Ashby member toggles it
             # off (live probe), so an exact prior press goes to readback.
             if not _boolean_already_chosen(latest, current):

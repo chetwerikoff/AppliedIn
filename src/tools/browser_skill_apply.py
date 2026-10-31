@@ -1,8 +1,9 @@
-"""Guarded BrowserSkill form controller.
+"""BrowserSkill application form preparation and final submission guard.
 
-The model chooses a control and an approved fact KEY, never arbitrary values or
-executable code. Submission, uploads, negative self-ID and sanctions answers are
-validated here before the browser acts. Unsupported controls become human gates.
+Accessible preparation is ungated. The code-owned raw IPC controller checks the
+five substantive predicates immediately before a classified Submit click or
+in-form Enter. A page's own change/blur/upload handlers may commit before that
+boundary; this is an explicitly accepted residual risk, not a guarantee.
 """
 from __future__ import annotations
 
@@ -2658,6 +2659,13 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     'focus', 'press'}:
         raise Gate('Unsupported form operation.')
     target = control(page, action, 'decision-action') if action.get('selector') else None
+    if (target is not None
+            and (target.get('type') == 'password' or _LOGIN.search(label(target)))):
+        # Account sign-in is always an owner action; ungated preparation is not
+        # authorization to automate credentials or account creation.
+        raise Gate('An owner account action is required.',
+                   form_question=_ordinary_owner_question(page, target, pk),
+                   reason='owner_question')
     if verb == 'combobox':
         return await _execute_combobox(session, page, action, facts=facts,
                                         filled=filled, pk=pk, job_url=job_url,
@@ -3667,8 +3675,14 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         await asyncio.sleep(0.25)
                         continue
                     if verb in {'gate', 'finish'}:
-                        raise Gate('An additional owner answer or form review is required.',
-                                   reason='owner_question')
+                        field = (control(page, action, 'decision-action')
+                                 if action.get('selector') else None)
+                        if verb == 'gate' and field is not None:
+                            raise Gate('An observed application question needs an owner answer.',
+                                       form_question=_ordinary_owner_question(page, field, pk),
+                                       reason='owner_question')
+                        raise Gate('The observed form needs human inspection.',
+                                   reason='agent_review_unavailable')
                     if verb == 'navigate':
                         href = action.get('url')
                         if (not isinstance(href, str) or

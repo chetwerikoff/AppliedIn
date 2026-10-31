@@ -863,3 +863,144 @@ def test_a_checked_option_needs_a_derived_grant_minted_from_the_current_answer(r
         'group_ref'] = 'old-answer'
     with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
+
+
+# -------------------------------------------------------- r08 review fixes
+
+@pytest.mark.parametrize('labels', [
+    ('I certify the information is accurate', 'I waive arbitration rights'),
+    ('I agree to the terms of service', 'I acknowledge the privacy policy'),
+])
+def test_attestation_checkbox_peers_remain_collision_not_option_group(labels):
+    page = page_of(box(labels[0], '#legal-0'),
+                   box(labels[1], '#legal-1'))
+    assert forms._checkbox_group(page, by(page, '#legal-0')) is None
+    assert forms._checkbox_group(page, by(page, '#legal-1')) is None
+    with pytest.raises(forms.Gate, match=SHARED):
+        forms._key(page, by(page, '#legal-0'))
+
+
+@pytest.mark.parametrize('kind', ['text', 'radio'])
+def test_normalized_mixed_type_question_cannot_hide_behind_group_key(kind):
+    page = group_page()
+    page['controls'].insert(0, field(
+        'Other answer', '#conflict', type=kind, name='other' if kind == 'radio' else '',
+        question='   WHICH   REGIONS CAN YOU WORK IN?  ', form_action=URL))
+    assert forms._checkbox_group(page, by(page, '#region-0')) is None
+    with pytest.raises(forms.Gate, match=SHARED):
+        forms._key(page, by(page, '#region-0'))
+
+
+@pytest.mark.parametrize('flags', [(False, False, False), (False, True, False)])
+async def test_optional_and_mixed_requiredness_groups_ask_owner_before_skipping(
+        row, flags):
+    from tests.tools.test_browser_bootstrap import URL as RAW_URL
+
+    controls = group_controls(form_action=RAW_URL)
+    for control, required in zip(controls, flags):
+        control['required'] = required
+    page = secure_inventory(*controls)
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               title=page['title'], ats='custom')
+    browser = Browser(page)
+    with pytest.raises(forms.Gate) as raised:
+        await forms._bootstrap(browser, page, PK, {}, SECURE_URL,
+                               filled={}, history=[], job_url=SECURE_URL,
+                               company='example-co')
+    assert raised.value.reason == 'owner_question'
+    assert raised.value.form_question['type'] == 'checkbox_group'
+    assert raised.value.form_question['options'] == OPTIONS
+    assert row['human_approved_answers'] == {}
+    assert not any(call[0] in {'click', 'fill', 'select', 'upload'}
+                   for call in browser.calls)
+
+
+@pytest.mark.parametrize('flags', [(True, False, True), (False, False, False)])
+async def test_owner_selected_optional_group_member_can_be_chosen_and_verified(
+        row, flags):
+    page = group_page()
+    for member, required in zip(page['controls'][:3], flags):
+        member['required'] = required
+    answered(row, page, ['Europe'])
+    selected = by(page, '#region-1')
+    assert selected['required'] is False
+    assert forms._unanswered(page, selected)
+    assert forms._approved_native_choice(page, selected, PK)[0] == 'yes'
+    browser = ToggleBrowser(page)
+    choices = await forms._current_approved_choices(browser, page, PK, URL)
+    assert [c['selector'] for c in choices] == ['#region-1']
+    filled = {}
+    await forms.execute(
+        browser, page,
+        {'action': 'choose', 'selector': selected['selector'],
+         'fact': forms._member_key(selected)},
+        facts={}, filled=filled, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    assert selected['checked'] is True
+    assert filled[selected['selector']] == selected['value']
+    run_final(page, forms._ApprovedFormValues(filled, PK, {}))
+
+
+def test_unchanged_standalone_optional_checkbox_is_not_solicited():
+    page = page_of(box('Standalone optional', '#standalone', required=False,
+                       question='Another independent field'))
+    assert forms._checkbox_group(page, by(page, '#standalone')) is None
+    assert not forms._unanswered(page, by(page, '#standalone'))
+
+
+@pytest.mark.parametrize(('selected', 'checked_before', 'cleared'), [
+    (OPTIONS, OPTIONS, []),
+    (['Europe'], OPTIONS, ['#region-0', '#region-2']),
+    (['Europe'], ['Europe'], []),
+])
+async def test_prechecked_group_reconciliation_clears_extras_and_accounts_selected(
+        row, selected, checked_before, cleared):
+    page = group_page()
+    answered(row, page, selected)
+    for member in page['controls'][:3]:
+        member['checked'] = member['label'] in checked_before
+    browser = ToggleBrowser(page)
+    filled = {}
+    current, _ = await forms._reconcile_checkbox_group(
+        browser, page, by(page, '#region-0'), PK, None, filled)
+    assert browser.clicks == cleared
+    assert [c['checked'] for c in page['controls'][:3]] == [
+        label in selected for label in OPTIONS]
+    assert set(filled) == {c['selector'] for c in page['controls'][:3]
+                           if c['label'] in selected}
+    run_final(current, forms._ApprovedFormValues(filled, PK, {}))
+
+
+async def test_prechecked_group_reconciliation_refuses_stuck_unselected_option(row):
+    page = group_page()
+    answered(row, page, ['Europe'])
+    for member in page['controls'][:3]:
+        member['checked'] = True
+
+    class Stuck(ToggleBrowser):
+        async def call(self, *args, **kwargs):
+            if args[0] == 'click':
+                self.clicks.append(args[1])
+                return {}  # No readback state change.
+            return await super().call(*args, **kwargs)
+
+    with pytest.raises(forms.Gate, match='does not match the owner answer'):
+        await forms._reconcile_checkbox_group(
+            Stuck(page), page, by(page, '#region-0'), PK, None, {})
+
+
+def test_collapsed_group_with_surviving_optional_control_fails_final_check(row):
+    first = box('North America', '#region-0', required=True)
+    second = box('Europe', '#region-1', required=False)
+    page = page_of(first, second)
+    answered(row, page, ['North America'])
+    first['checked'] = True
+    filled = forms._ApprovedFormValues(
+        {first['selector']: first['value']}, PK, {})
+    # A dynamic page removes the selected required member; only an unchecked
+    # optional former group member survives, with the old grant still stored.
+    page['controls'].remove(first)
+    assert forms._checkbox_group(page, second) is None
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)

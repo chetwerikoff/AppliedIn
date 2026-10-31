@@ -5,10 +5,9 @@ one fieldset legend. They used to gate with "More than one control uses the same
 approval question; review manually." and could not be answered at all. The
 synthetic pages below carry no real employer, person or application.
 
-Chosen final-check path: pinned `check_form` has NO bound negative-receipt path
-for an unchecked required checkbox (it raises either way), so the page the
-final guard reads shows only the UNSELECTED options of an exactly granted group
-as not required. The tests prove every missing binding still rejects.
+At final Submit, the pinned guard checks EVERY checked and unchecked group
+member against a current owner group grant before the ordinary per-option
+exact grant check. Derived member approvals alone are not authority.
 """
 from __future__ import annotations
 
@@ -29,6 +28,7 @@ URL = SECURE_URL
 QUESTION = 'Which regions can you work in?'
 OPTIONS = ['North America', 'Europe', 'Asia Pacific']
 REQUIRED = 'Required acknowledgement not completed'
+GROUP_BOUND = 'Checkbox group answer is not bound to the current group grant'
 SHARED = 'More than one control uses the same approval question'
 
 
@@ -358,28 +358,28 @@ def test_final_check_rejects_without_a_current_binding_grant(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], ['Europe'])
     del row['human_approved_answers'][QUESTION]
-    with pytest.raises(forms.Gate, match=REQUIRED):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 
 
 def test_final_check_rejects_zero_checked_members(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], [])
-    with pytest.raises(forms.Gate, match=REQUIRED):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 
 
 def test_final_check_rejects_a_checked_member_the_owner_did_not_grant(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], ['Europe', 'North America'])
-    with pytest.raises(forms.Gate, match='exact human-approved answer is needed'):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 
 
 def test_final_check_rejects_a_granted_member_that_is_not_checked(row):
     page = group_page()
     filled = final_state(row, page, ['Europe', 'North America'], ['Europe'])
-    with pytest.raises(forms.Gate, match=REQUIRED):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 
 
@@ -396,8 +396,104 @@ def test_final_check_rejects_option_or_selector_drift(row, drift):
             c['form_selector'] = '#changed'
     else:
         page['controls'].insert(3, box('Africa', '#region-3'))
-    with pytest.raises(forms.Gate, match=REQUIRED):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
+
+
+@pytest.mark.parametrize('change', ['revoked', 'different_selection', 'wrong_type'])
+def test_all_checked_members_still_need_current_group_authority(row, change):
+    page = group_page()
+    filled = final_state(row, page, OPTIONS, OPTIONS)
+    if change == 'revoked':
+        row['human_approved_answers'].pop(QUESTION)
+    elif change == 'different_selection':
+        row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
+    else:
+        row['human_approved_answers'][QUESTION]['type'] = 'checkbox'
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+def test_optional_group_members_cannot_bypass_missing_group_grant(row):
+    page = group_page()
+    for member in page['controls'][:3]:
+        member['required'] = False
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    run_final(page, filled)  # A genuinely current group is valid when optional.
+    row['human_approved_answers'].pop(QUESTION)
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+@pytest.mark.parametrize('drift', ['options', 'member_selector', 'member_form_selector'])
+def test_grant_must_bind_the_complete_stored_option_and_member_census(row, drift):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    grant = row['human_approved_answers'][QUESTION]
+    if drift == 'options':
+        grant['options'] = ['North America', 'Europe']
+    elif drift == 'member_selector':
+        grant['group_members'][0]['selector'] = '#stale'
+    else:
+        grant['group_members'][2]['form_selector'] = '#different'
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+@pytest.mark.parametrize('state', ['unchecked_unknown', 'selected_nonboolean'])
+def test_every_member_needs_an_exact_boolean_checked_state(row, state):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    if state == 'unchecked_unknown':
+        by(page, '#region-0')['checked'] = None
+    else:
+        by(page, '#region-1')['checked'] = 1
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+@pytest.mark.parametrize('drift', ['missing_ref', 'stale_ref', 'selector', 'form_selector'])
+def test_selected_derived_member_needs_current_ref_and_identity(row, drift):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    derived = row['human_approved_answers'][forms._member_key(by(page, '#region-1'))]
+    if drift == 'missing_ref':
+        derived.pop('group_ref')
+    elif drift == 'stale_ref':
+        derived['group_ref'] = 'old-answer'
+    elif drift == 'selector':
+        derived['selector'] = '#stale'
+    else:
+        derived['form_selector'] = '#stale'
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+def test_unchecked_member_cannot_retain_a_stale_derived_grant(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    grants = row['human_approved_answers']
+    stale = deepcopy(grants[forms._member_key(by(page, '#region-1'))])
+    stale['group_ref'] = 'prior-grant'
+    grants[forms._member_key(by(page, '#region-0'))] = stale
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+def test_standalone_checked_checkbox_retains_ordinary_exact_grant(row):
+    page = page_of(box('Independent acknowledgement', '#agree',
+                       question='Independent acknowledgement'))
+    member = by(page, '#agree')
+    member['checked'] = True
+    row['human_approved_answers'][forms._key(page, member)] = {
+        'value': 'yes', 'selector': member['selector'], 'url': page['url'],
+        'label': member['label'], 'question': member['question'],
+        'tag': 'input', 'type': 'checkbox',
+        'form_selector': member['form_selector'],
+        'form_action': member['form_action'], 'visible_text': member['label'],
+    }
+    filled = forms._ApprovedFormValues({member['selector']: member['value']}, PK, {})
+    run_final(page, filled)
 
 
 # -------------------------------------------------------------- unchecking
@@ -633,7 +729,7 @@ def test_a_checked_option_needs_a_derived_grant_minted_from_the_current_answer(r
                  if v.get('source') == 'checkbox-group'}
     row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
     row['human_approved_answers'].update(leftovers)
-    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 
     # A leftover minted from an EARLIER answer for a still-selected option too.
@@ -642,5 +738,5 @@ def test_a_checked_option_needs_a_derived_grant_minted_from_the_current_answer(r
     run_final(page, filled)
     row['human_approved_answers'][forms._member_key(by(page, '#region-1'))][
         'group_ref'] = 'old-answer'
-    with pytest.raises(forms.Gate, match='does not match the current owner answer'):
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)

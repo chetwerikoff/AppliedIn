@@ -16,7 +16,7 @@ _GATE_CLASSES = frozenset({
     'CaptchaArtifactGate', 'NavigationProvenanceGate',
     'MaterialAssentGate', '_EntryNotReady',
 })
-_REVIEWED_GATE_SITES = 154
+_REVIEWED_GATE_SITES = 156
 
 
 def test_literal_reviewed_gate_site_budget():

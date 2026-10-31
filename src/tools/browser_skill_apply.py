@@ -2671,9 +2671,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         # An account-purpose sibling makes this the sign-in/subscription form.
         # This is the surviving account boundary, not an approval for ordinary
         # application answers or a new per-control grant.
-        raise Gate('An owner account action is required.',
-                   form_question=_ordinary_owner_question(page, target, pk),
-                   reason='owner_question')
+        # A password/account form is not an ordinary employer question:
+        # persist a non-resumable human handoff, never an Email field token.
+        raise Gate('An owner account action is required.')
     if verb == 'combobox':
         return await _execute_combobox(session, page, action, facts=facts,
                                         filled=filled, pk=pk, job_url=job_url,

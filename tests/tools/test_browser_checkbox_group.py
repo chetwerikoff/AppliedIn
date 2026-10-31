@@ -69,6 +69,15 @@ def row(monkeypatch):
             assert pk == PK
             stored.update(status=status, **fields)
 
+        def replace_grants_if_unchanged(self, pk, expected, new):
+            from core.storage.base import grants_replace_patch
+            assert pk == PK
+            merged = grants_replace_patch(stored, expected, new)
+            if merged is None:
+                return False
+            stored['human_approved_answers'] = merged
+            return True
+
     monkeypatch.setattr('core.stores.make_stores',
                         lambda: SimpleNamespace(tracking=Tracking()))
     return stored
@@ -288,28 +297,143 @@ def test_stored_group_question_validation():
 
 # ----------------------------------------------------- derived member grants
 
+def test_atomic_group_replace_guards_original_group_and_every_member_value(row, monkeypatch):
+    from core.storage.base import grants_replace_patch
 
-def test_derived_grants_exist_only_for_selected_members_and_follow_the_answer(row):
+    page = group_page()
+    original = grant_for(page, ['Europe'])
+    keys = {member['label']: forms._member_key(member)
+            for member in page['controls'][:3]}
+    old_unselected = {'source': 'checkbox-group', 'group_ref': 'prior',
+                      'value': 'yes', 'selector': '#region-0'}
+    row['human_approved_answers'].update({
+        QUESTION: original,
+        keys['North America']: deepcopy(old_unselected),
+        'other question': {'value': 'preserved'},
+    })
+    calls = []
+
+    def replace(pk, expected, new):
+        calls.append((pk, deepcopy(expected), deepcopy(new)))
+        merged = grants_replace_patch(row, expected, new)
+        assert merged is not None
+        row['human_approved_answers'] = merged
+        return True
+
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace(replace_grants_if_unchanged=replace)))
+    forms._derive_group_member_grants(page, PK)
+    assert len(calls) == 1
+    observed_pk, expected, new = calls[0]
+    assert observed_pk == PK
+    assert expected == {
+        QUESTION: original,
+        keys['North America']: old_unselected,
+        keys['Europe']: None,
+        keys['Asia Pacific']: None,
+    }
+    assert set(new) == set(expected)
+    assert new[QUESTION] == original
+    ref = forms._group_ref(original)
+    for label in OPTIONS:
+        grant = new[keys[label]]
+        assert grant['source'] == 'checkbox-group'
+        assert grant['group_ref'] == ref
+        assert grant['selector'] == f'#region-{OPTIONS.index(label)}'
+        assert grant['form_selector'] == '#application'
+        assert grant['value'] == ('yes' if label == 'Europe' else 'no')
+    assert row['human_approved_answers']['other question'] == {'value': 'preserved'}
+    assert all(row['human_approved_answers'][k] == v for k, v in new.items())
+
+    # Exact already-recorded state needs no second write.
+    forms._derive_group_member_grants(page, PK)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('race', ['revoke_group', 'change_group', 'replace_member',
+                                  'status', 'possible_submission'])
+def test_atomic_group_replace_refuses_concurrent_changes_without_partial_write(
+        row, monkeypatch, race):
+    from core.storage.base import grants_replace_patch
+
+    page = group_page()
+    grants = row['human_approved_answers']
+    grants[QUESTION] = grant_for(page, ['Europe'])
+    key = forms._member_key(by(page, '#region-1'))
+    old_member = {'value': 'yes', 'source': 'checkbox-group',
+                  'group_ref': 'prior-answer'}
+    grants[key] = deepcopy(old_member)
+    calls = []
+
+    def raced(pk, expected, new):
+        calls.append((deepcopy(expected), deepcopy(new)))
+        assert pk == PK
+        if race == 'revoke_group':
+            grants.pop(QUESTION)
+        elif race == 'change_group':
+            grants[QUESTION] = grant_for(page, ['North America'])
+        elif race == 'replace_member':
+            grants[key] = {'source': 'dashboard', 'value': 'changed'}
+        elif race == 'status':
+            row['status'] = 'needs_human'
+        else:
+            row['possible_submission'] = True
+        merged = grants_replace_patch(row, expected, new)
+        if merged is not None:
+            row['human_approved_answers'] = merged
+            return True
+        return False
+
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace(replace_grants_if_unchanged=raced)))
+    with pytest.raises(forms.Gate, match='before atomic recording'):
+        forms._derive_group_member_grants(page, PK)
+    assert len(calls) == 1
+    expected, proposed = calls[0]
+    assert expected[QUESTION]['selected'] == ['Europe']
+    assert expected[key] == old_member
+    assert len(proposed) == len(OPTIONS) + 1
+    assert all(grants.get(forms._member_key(member)) != proposed[
+        forms._member_key(member)] for member in page['controls'][:3]
+        if forms._member_key(member) != key)
+    assert forms._bound_checkbox_group_member(
+        page, by(page, '#region-1'),
+        forms._ApprovedFormValues({}, PK, {})) is False
+
+
+
+def test_atomic_derived_grants_cover_every_member_and_follow_the_answer(row):
     page = group_page()
     answered(row, page, ['North America', 'Asia Pacific'])
     grants = row['human_approved_answers']
     keys = {c['label']: forms._member_key(c) for c in page['controls'][:3]}
-    assert keys['Europe'] not in grants
-    for label in ('North America', 'Asia Pacific'):
+    ref = forms._group_ref(grants[QUESTION])
+    assert set(grants) == {QUESTION, *keys.values()}
+    for label in OPTIONS:
         member = grants[keys[label]]
-        assert member['value'] == 'yes' and member['visible_text'] == label
-        assert forms._approved_native_choice(
-            page, next(c for c in page['controls'] if c['label'] == label), PK)[0] == 'yes'
-    europe = by(page, '#region-1')
-    assert forms._approved_native_choice(page, europe, PK) is None
-    # A narrower answer removes the stale derived grant of the dropped option.
+        selected = label in {'North America', 'Asia Pacific'}
+        assert member['source'] == 'checkbox-group'
+        assert member['group_ref'] == ref
+        assert member['value'] == ('yes' if selected else 'no')
+        assert member['visible_text'] == label
+        control = next(c for c in page['controls'] if c['label'] == label)
+        if selected:
+            assert forms._approved_native_choice(page, control, PK)[0] == 'yes'
+        else:
+            assert forms._approved_native_choice(page, control, PK) is None
+
+    # A narrower owner answer overwrites the old positive key with an inert no,
+    # rather than deleting it or keeping authority from a previous group_ref.
     answered(row, page, ['North America'])
-    assert keys['Asia Pacific'] not in row['human_approved_answers']
-    # A stale group grant removes every derived grant: nothing outlives the owner.
+    assert grants[keys['Asia Pacific']]['value'] == 'no'
+    assert grants[keys['Europe']]['value'] == 'no'
+    assert grants[keys['Asia Pacific']]['group_ref'] == forms._group_ref(grants[QUESTION])
+    before = deepcopy(grants)
     by(page, '#region-2')['label'] = 'Asia'
     forms._derive_group_member_grants(page, PK)
-    assert not any(v.get('source') == 'checkbox-group'
-                   for v in row['human_approved_answers'].values())
+    assert grants == before   # Drift cannot authorize a fresh derived write.
+    assert forms._current_group_grant(
+        page, forms._checkbox_group(page, by(page, '#region-0')), row) is None
 
 
 def test_group_members_are_never_bank_auto_answered(row):
@@ -632,6 +756,8 @@ async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
     assert grant['type'] == 'checkbox_group' and grant['selected'] == ['Europe']
     assert [m['selector'] for m in grant['group_members']] == [
         '#region-0', '#region-1', '#region-2']
+    assert not any(k in stores.tracking.get(case.pk)['human_approved_answers']
+                   for k in (f'{QUESTION} → {label}' for label in OPTIONS))
 
     seen = []
 
@@ -650,6 +776,12 @@ async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
     assert ('click', '#region-0') in raw.writes      # the pre-checked option is cleared
     assert ('click', '#region-2') not in raw.writes
     assert [raw.target(f'#region-{i}')['checked'] for i in range(3)] == [False, True, False]
+    recorded = stores.tracking.get(case.pk)['human_approved_answers']
+    ref = forms._group_ref(recorded[QUESTION])
+    for label in OPTIONS:
+        derived = recorded[f'{QUESTION} → {label}']
+        assert derived['group_ref'] == ref
+        assert derived['value'] == ('yes' if label == 'Europe' else 'no')
     assert not any(call[0] == 'click' and call[1] == '#submit' for call in raw.calls)
 
 
@@ -682,38 +814,12 @@ async def test_raw_click_guard_allows_only_the_exact_clearing_click(monkeypatch,
         await controller.before_ipc(Raw(), ('click', '#region-0'), {})
 
 
-def test_grant_revoked_or_changed_between_reads_writes_nothing(row, monkeypatch):
-    page = group_page()
-    row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
-    first = deepcopy(row)
-    revoked = deepcopy(row)
-    revoked['human_approved_answers'].pop(QUESTION)
-    changed = deepcopy(row)
-    changed['human_approved_answers'][QUESTION] = grant_for(page, ['North America'])
-    writes = []
-    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
-        tracking=SimpleNamespace(set_status=lambda *a, **k: writes.append((a, k)))))
-    for later in (revoked, changed):
-        reads = iter([first, later])
-        monkeypatch.setattr(forms, '_row', lambda pk, *a, **kw: next(reads))
-        with pytest.raises(forms.Gate):
-            forms._derive_group_member_grants(page, PK)
-        assert writes == []
-    # A row that moved out of 'submitting' between the reads is also refused.
-    moved = deepcopy(first)
-    moved['status'] = 'needs_human'
-    reads = iter([first, moved])
-    monkeypatch.setattr(forms, '_row', lambda pk, *a, **kw: next(reads))
-    with pytest.raises(forms.Gate):
-        forms._derive_group_member_grants(page, PK)
-    assert writes == []
-
-
-def test_a_write_that_does_not_read_back_exactly_fails_closed(row, monkeypatch):
+def test_atomic_write_claim_without_actual_write_fails_readback(row, monkeypatch):
     page = group_page()
     row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
     monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
-        tracking=SimpleNamespace(set_status=lambda *a, **k: None)))   # silently dropped
+        tracking=SimpleNamespace(
+            replace_grants_if_unchanged=lambda *a, **k: True)))  # silent no-op
     with pytest.raises(forms.Gate, match='did not record exactly'):
         forms._derive_group_member_grants(page, PK)
 

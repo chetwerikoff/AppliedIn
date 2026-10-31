@@ -1039,141 +1039,19 @@ def _parse_group_answer(answer: str, options: list[str]) -> list[str] | None:
 
 
 def _direct_form_label(pk: str, row: dict) -> str | None:
-    """Only code-observed direct BrowserSkill field gates authorize disclosure.
+    """Identify a live owner question without minting a control grant.
 
-    ADK/model gates persist a question only. Neither their source tag nor quoted
-    text proves that the human was answering a current employer form control.
+    Generation/identity consumption still prevents replies to stale questions.
+    Preparation itself never requires this question's field witness.
     """
-    field = (row.get('gate_pending') or {}).get('form_question')
+    pending = row.get('gate_pending') or {}
+    field = pending.get('form_question')
     if (row.get('pk') != pk or row.get('status') != 'needs_human'
-            or row.get('gate_source') != 'applier' or row.get('gate_call_id') != 'direct'
+            or row.get('gate_source') != 'applier'
+            or row.get('gate_call_id') != 'direct'
             or not isinstance(field, dict) or field.get('pk') != pk
-            or any(not isinstance(field.get(k), str) or not field[k].strip()
-                   for k in ('label', 'selector', 'url', 'control_label'))
-            or not isinstance(field.get('question'), str)
-            or field['label'] != (field['question'] or field['control_label'])
-            or field.get('tag') not in {'input', 'textarea', 'select', 'div', 'button'}
-            or not isinstance(field.get('type'), str)
-            or ((field['tag'] == 'input' and field['type'] not in {
-                    'text', 'email', 'tel', 'url', 'number', 'date', 'checkbox', 'radio',
-                    'combobox', 'checkbox_group'})
-                or (field['tag'] == 'div' and field['type'] != 'combobox')
-                or (field['tag'] == 'button' and (
-                    field['type'] != 'button'
-                    or field.get('owner_kind') != 'ashby-reversible-entry'))
-                or (field['tag'] == 'textarea' and field['type'] != 'textarea')
-                or (field['tag'] == 'select' and field['type'] != 'select'))
-            or (field.get('owner_kind') == 'ashby-reversible-entry' and (
-                 row.get('ats') != 'ashby' or field.get('form_selector') != ''
-                 or field.get('form_action') != ''))
-            or (field.get('owner_kind') != 'ashby-reversible-entry' and
-                any(not isinstance(field.get(k), str) or not field[k].strip()
-                    for k in ('form_selector', 'form_action')))
-            or (field['type'] == 'button' and (
-                 not isinstance(field.get('boolean_members'), list)
-                 or len(field['boolean_members']) != 2
-                 or any(not isinstance(m, dict) or any(
-                     not isinstance(m.get(k), str) or not m[k].strip()
-                     for k in ('selector', 'caption', 'value'))
-                     for m in field['boolean_members'])
-                 or len({m['selector'] for m in field['boolean_members']}) != 2
-                 or {m['caption'].casefold() for m in field['boolean_members']} != {'yes', 'no'}
-                 or {m['value'] for m in field['boolean_members']} != {'yes', 'no'}
-                 or field['boolean_members'][0]['selector'] != field['selector']
-                 or field['boolean_members'][0]['caption'] != field['control_label']))
-            or (field['type'] == 'checkbox_group' and not _group_question_valid(field))
-            or (field['type'] == 'checkbox' and (
-                 not isinstance(field.get('visible_text'), str)
-                 or not field['visible_text'].strip()
-                 or field['visible_text'] != field['control_label']))
-             or (field['type'] == 'radio' and (
-                 not isinstance(field.get('radio_name'), str)
-                 or not field['radio_name'].strip()
-                 or not field['question'].strip()
-                 or not isinstance(field.get('radio_members'), list)
-                 or len(field['radio_members']) < 2
-                 or any(not isinstance(m, dict) or any(
-                     not isinstance(m.get(k), str) or not m[k].strip()
-                     for k in ('selector', 'caption', 'value'))
-                     for m in field['radio_members'])
-                 or field['radio_members'][0]['selector'] != field['selector']
-                 or field['radio_members'][0]['caption'] != field['control_label']
-                 or len({m['selector'] for m in field['radio_members']}) != len(field['radio_members'])
-                 or len({m['value'] for m in field['radio_members']}) != len(field['radio_members'])
-                 or len({' '.join(m['caption'].casefold().split())
-                         for m in field['radio_members']}) != len(field['radio_members'])))
-             or (field['tag'] == 'select' and (
-                not isinstance(field.get('options'), list) or not field['options']
-                or any(not isinstance(o, dict) or not isinstance(o.get('value'), str)
-                       or not isinstance(o.get('label'), str) or not o['label'].strip()
-                       for o in field['options'])
-                or len({o['value'] for o in field['options']}) != len(field['options'])
-                or len({' '.join(o['label'].casefold().split())
-                        for o in field['options']}) != len(field['options'])))):
-        return None
-    if field['type'] == 'combobox' and 'options' in field:
-        # Only material combobox gates bind options; ordinary dynamic pickers
-        # still bind their stable control without pre-approving an option list.
-        opts = field['options']
-        if (not isinstance(opts, list) or not opts
-                or any(not isinstance(o, dict)
-                       or not isinstance(o.get('selector'), str) or not o['selector']
-                       or not isinstance(o.get('label'), str) or not o['label'].strip()
-                       or not isinstance(o.get('value'), str) for o in opts)
-                or len({o['selector'] for o in opts}) != len(opts)
-                or len({' '.join(o['label'].casefold().split()) for o in opts}) != len(opts)):
-            return None
-    from tools.browser_skill_apply import navigation_allowed
-    from tools.claude_chrome import (
-        greenhouse_alias_candidate, verified_greenhouse_alias,
-    )
-    url = row.get('jd_url') or ''
-    if greenhouse_alias_candidate(url):
-        # Independently repeat the trusted row/config proof at answer time. An
-        # unchanged board URL is insufficient if the original wrapper drifted.
-        from core.ids import make_pk
-        from discovery.watchlist import load_watchlist
-        company, job_id = row.get('company'), row.get('job_id')
-        if (not isinstance(company, str) or not isinstance(job_id, str)
-                or row.get('pk') != pk or make_pk(company, job_id) != pk):
-            return None
-        try:
-            configs = load_watchlist(Path(get_settings().config_dir) / 'watchlist.yaml')
-            proven = verified_greenhouse_alias(
-                row, pk=pk, company=company, url=url, configs=configs)
-        except Exception:
-            return None
-        expected = {'jd_url': url, 'company': company, 'ats': row.get('ats')}
-        witness = field.get('origin_row')
-        if (proven is None or not isinstance(witness, dict)
-                or set(witness) != {'jd_url', 'company', 'ats'}
-                or any(type(witness[k]) is not str or witness[k] != value
-                       for k, value in expected.items())
-                or not navigation_allowed(field['url'], provenance=proven)):
-            return None
-    elif row.get('ats') in {'teamtailor', 'recruitee'}:
-        from core.ids import make_pk
-        from tools.browser_skill_apply import redirect_provenance
-        company, job_id = row.get('company'), row.get('job_id')
-        if (not isinstance(company, str) or not isinstance(job_id, str)
-                or row.get('pk') != pk or make_pk(company, job_id) != pk):
-            return None
-        witness = field.get('origin_row')
-        expected = {'jd_url': url, 'company': company, 'ats': row.get('ats'),
-                    'pk': pk, 'job_id': job_id}
-        target = field.get('verified_redirect_url')
-        proven = redirect_provenance(row, pk, target)
-        if (not proven or not isinstance(witness, dict) or witness != expected
-                or field.get('url') != target
-                or not navigation_allowed(field.get('form_action', ''),
-                                          provenance=proven)
-                or not navigation_allowed(field['url'], provenance=proven)):
-            return None
-        if field.get('formaction') and not navigation_allowed(
-                field['formaction'], provenance=proven):
-            return None
-    elif not navigation_allowed(field['url'], url):
-        # Original engine and non-alias direct-form grants stay unchanged.
+            or not isinstance(field.get('label'), str)
+            or not field['label'].strip()):
         return None
     return field['label']
 
@@ -1348,7 +1226,7 @@ def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
                              'generation': pending['generation']})
     won = stores.tracking.consume_direct_form_gate(
         pk, expected_pending=pending, disposition=disposition,
-        grant=grant, skip=record)
+        grant=None, skip=record)
     if not won:
         return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
                 'detail': 'This owner question was already answered or changed; '
@@ -1574,40 +1452,12 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
         # grants. The exact observed direct form question owns the latter.
         if form_label:
             observed = row['gate_pending']['form_question']
-            grant = {
-                'value': answer.strip(), 'selector': observed['selector'],
-                'url': observed['url'], 'label': observed['control_label'],
-                'question': observed['question'], 'tag': observed['tag'],
-                'type': observed['type'], 'form_selector': observed['form_selector'],
-                'form_action': observed['form_action'],
-                **({'verified_redirect_url': observed['verified_redirect_url']}
-                   if observed.get('verified_redirect_url') else {}),
-                **({'options': observed['options']}
-                   if observed['tag'] == 'select'
-                   or (observed['type'] == 'combobox' and 'options' in observed)
-                   else {}),
-                **({'visible_text': observed['visible_text']}
-                   if observed['type'] == 'checkbox' else {}),
-                **({'control_identity': observed['control_identity']}
-                   if observed['type'] == 'checkbox'
-                   and observed.get('control_identity') else {}),
-                **({'radio_name': observed['radio_name'],
-                    'radio_members': observed['radio_members']}
-                   if observed['type'] == 'radio' else {}),
-                **({'boolean_members': observed['boolean_members']}
-                   if observed['type'] == 'button' else {}),
-                **({'group_members': observed['group_members'],
-                    'options': observed['options'],
-                    'selected': group_selected,
-                    'value': json.dumps(group_selected)}
-                   if group_selected is not None else {}),
-            }
-            # The winner's grant rides inside the one consume commit; only
-            # then may it bank a non-material answer and continue.
-            bank = (None if material_form or group_selected is not None else
-                    (label, answer, scope, company or None))
-            return _consume_direct_gate(pk, row, stores, grant=(form_label, grant),
-                                        bank=bank)
+            # The owner's answer is an ordinary fact, not a browser write
+            # permission or a selector-bound approval token. Material answers
+            # are kept company-scoped rather than made GLOBAL.
+            bank_scope = AnswerScope.COMPANY if material_form else scope
+            bank = (label, answer, bank_scope, company or None)
+            return _consume_direct_gate(pk, row, stores, bank=bank)
 
     if approval or row.get("gate_source") == "applier" or call_id == "direct":
         # An answered QUESTION resumes an application that is already under way:
@@ -1903,6 +1753,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         form_question = (result.get('form_question')
                          if configuration()['engine'] == 'browser_skill' else None)
         pending = _direct_gate_pending(q, form_question, review_route)
+        item = result.get('item')
+        if type(item) is int and item in {1, 2, 3, 4, 5}:
+            pending['pre_submit_item'] = item
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
                                    **_clear_infra_failure(pk, stores),
                                    **_owner_skip_retention(pk, stores, form_question),

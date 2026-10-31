@@ -33,6 +33,8 @@ class Unavailable(RuntimeError):
     # Every well-formed identifier the CLI reported (code, reason, nested ones).
     identifiers: frozenset = frozenset()
     reason: str | None = None
+    # The bsk verb that raised it, set where the argv is known (`command`, `_sync`).
+    verb: str = ""
 
 
 # Only these two-token bsk verbs name a subcommand. Any other second token is an
@@ -57,6 +59,7 @@ def _verb(args) -> str:
 def _log_unavailable(args, problem: "Unavailable") -> None:
     """Log which call failed and the CLI's own structured reasons, never values."""
     state = problem.effect_state
+    problem.verb = _verb(args)
     # A no-effect "sync again" refusal is expected after every navigation.
     level = logging.INFO if _sync_refusal(problem) else logging.WARNING
     log.log(level, "bsk unavailable: verb=%s code=%s reason=%s effect_state=%s",
@@ -140,13 +143,14 @@ def _sync_refusal(problem: Unavailable) -> bool:
 
 
 def _sync_cdp_failed(problem: Unavailable) -> bool:
-    """True for a bare `cdp_failed` from `cooperate sync` itself.
+    """True for a bare `cdp_failed` raised by the `cooperate sync` verb itself.
 
     Right after navigating to a Greenhouse embed route the CLI answers the sync
     with code cdp_failed (no reason, no effect_state) and the next sync, under a
     second later, succeeds. The sync only reads the tab, so it cannot have changed
-    anything; the caller applies this to `cooperate sync` and nothing else."""
-    return (problem.code == "cdp_failed" and problem.identifiers == {"cdp_failed"}
+    anything. The verb is checked, so the same error from an action is never matched."""
+    return (problem.verb == "cooperate sync" and problem.code == "cdp_failed"
+            and problem.identifiers == {"cdp_failed"}
             and problem.effect_state in {"", "none"})
 
 

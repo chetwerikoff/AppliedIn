@@ -20,8 +20,6 @@ import pytest
 from tools import browser_skill_apply as forms
 from tests.tools.test_ashby_upload_fixture import (
     WAIT, _no_production_commit, _production_submit_click)
-from tests.tools.test_browser_reversible_gates import (
-    _answer, _apply, _fixture, _only_required, _record_boolean_press)
 
 UPLOAD = {'action': 'upload', 'selector': '#_systemfield_resume'}
 STOP = {'action': 'gate', 'question': 'Synthetic next decision'}
@@ -34,12 +32,12 @@ async def test_upload_runs_once_before_the_first_decision(monkeypatch, tmp_path)
     seen = []
 
     def first_decision(task, *_args, **_kwargs):
-        seen.append((len(uploads), 'résumé attachment verified=True' in task))
+        seen.append(len(uploads))
         return STOP
 
     result = await run_apply(first_decision)
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
-    assert seen == [(1, True)]
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
+    assert seen == [1]
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
@@ -58,7 +56,7 @@ async def test_upload_is_a_direct_set_on_the_clipped_input_with_no_chooser(
     tree = raw.current['entry']['upload_tree']
     assert tree['nodes'][tree['input']]['target_selector'] == forms._ASHBY_RESUME_SELECTOR
     result = await run_apply([STOP])
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question'], result
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable', result
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
     assert not [c for c in raw.calls if c[0] == 'upload']
@@ -89,12 +87,11 @@ async def test_set_that_does_not_read_back_is_a_gate_not_uncertain(monkeypatch, 
 
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path, upload=unread)
-    result = await run_apply([STOP])
-    assert result['status'] == 'gate', result
-    assert result['question'].startswith(
-        'The uploaded résumé was not proven in the current file input.'), result
+    result = await run_apply([{'action': 'click', 'selector': '#submit'}])
+    assert result['status'] == 'gate' and result.get('item') == 2, result
+    assert result['reason'] == 'defect_pre_submit_item_2'
     guard = transport._application_controller
-    assert len(uploads) == 1 and decide.await_count == 0
+    assert len(uploads) == 1 and decide.await_count == 1
     assert guard.upload_attempted and not guard.upload_completed
     assert guard.upload_identity is None
     _no_production_commit(raw, transport, row)
@@ -165,71 +162,37 @@ async def test_field_rendered_after_the_first_decision_is_left_to_the_fallbacks(
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     result = await run_apply([WAIT, STOP], late=True)
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
     assert decide.await_count == 2 and uploads == []
     assert not transport._application_controller.upload_attempted
     _no_production_commit(raw, transport, row)
 
 
-# The Boolean cases mirror the existing choose tests in
-# test_browser_reversible_gates.py with a plain click, so the two routes stay
-# provably the same guarded path.
-
 @pytest.mark.asyncio
-async def test_boolean_click_on_the_approved_member_is_the_guarded_choice(
-        monkeypatch, tmp_path):
-    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
-    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
-    gate = await _apply(pdf)
-    _answer(row, stores, gate, 'No')
-    _record_boolean_press(endpoint, '#boolean-no')
-    routed = []
-    execute = forms.execute
+async def test_plain_boolean_click_is_ungated_preparation():
+    """A Yes/No button is no longer a widget-grant or choice recognizer."""
+    class Session:
+        def __init__(self):
+            self.calls = []
 
-    async def spy(session, page, action, **kwargs):
-        routed.append(dict(action))
-        return await execute(session, page, action, **kwargs)
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {}
 
-    monkeypatch.setattr(forms, 'execute', spy)
-    decision.side_effect = [{'action': 'click', 'selector': '#boolean-no'}, STOP]
-    result = await _apply(pdf, {'Work arrangement?': 'No'})
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
-    assert routed[0] == {'action': 'choose', 'selector': '#boolean-no',
-                         'fact': 'Work arrangement?'}
-    assert [c for c in endpoint.calls if c[0] == 'click'] == [('click', '#boolean-no')]
-
-
-@pytest.mark.parametrize('verb', ['click', 'choose'])
-@pytest.mark.asyncio
-async def test_boolean_click_on_the_unapproved_member_gates_as_choose_does(
-        monkeypatch, tmp_path, verb):
-    """The owner answered Yes; the model picks No. A click is refused exactly
-    as the choose action is, before any browser write."""
-    row, endpoint, decision, stores, pdf = _fixture(monkeypatch, tmp_path)
-    _only_required(endpoint, {'#boolean-yes', '#boolean-no'})
-    gate = await _apply(pdf)
-    _answer(row, stores, gate, 'Yes')
-    action = {'action': verb, 'selector': '#boolean-no'}
-    if verb == 'choose':
-        action['fact'] = 'Work arrangement?'
-    decision.return_value = action
-    result = await _apply(pdf, {'Work arrangement?': 'Yes'})
-    assert result['status'] == 'gate', result
-    assert result['question'].startswith(
-        'The selected radio does not match the exact owner answer.'), result
-    assert [c for c in endpoint.calls if c[0] == 'click'] == []
-
-
-def test_only_a_member_of_an_exact_boolean_pair_is_routed():
-    from copy import deepcopy
-    from tests.tools.test_browser_reversible_gates import _NO, _YES, _by_locator, _live_dom
-
-    page, _ = _live_dom()
-    yes, no = (_by_locator(page, s)['selector'] for s in (_YES, _NO))
-    assert forms._boolean_pair_member(page, yes) and forms._boolean_pair_member(page, no)
-    for selector in ('#_systemfield_name', '#additional', '#dropzone', '', 'missing'):
-        assert not forms._boolean_pair_member(page, selector)
-    # A lone answer button is no exact pair, so its click is left unchanged.
-    alone = deepcopy(page)
-    alone['controls'] = [c for c in alone['controls'] if c['selector'] != no]
-    assert not forms._boolean_pair_member(alone, yes)
+    session = Session()
+    page = {'controls': [
+        {'selector': '#yes', 'label': 'Yes', 'question': 'Work arrangement?',
+         'tag': 'button', 'type': 'button', 'disabled': False},
+        {'selector': '#no', 'label': 'No', 'question': 'Work arrangement?',
+         'tag': 'button', 'type': 'button', 'disabled': False},
+    ]}
+    filled = {}
+    result = await forms.execute(
+        session, page, {'action': 'click', 'selector': '#no'},
+        facts={}, filled=filled, resume_path='synthetic.pdf',
+        company='example-co', jd_text='Synthetic role',
+        resume_tex='', github='', pk='example-co#synthetic',
+        job_url='https://example.test/apply', allow_click=True)
+    assert result['action'] == 'click'
+    assert session.calls == [(('click', '#no'), {})]
+    assert filled == {}

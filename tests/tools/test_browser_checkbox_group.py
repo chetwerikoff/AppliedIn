@@ -1,0 +1,587 @@
+"""Issue 278: a native checkbox option group is ONE owner question.
+
+A Greenhouse form can carry required `input[type=checkbox]` options that share
+one fieldset legend. They used to gate with "More than one control uses the same
+approval question; review manually." and could not be answered at all. The
+synthetic pages below carry no real employer, person or application.
+
+Chosen final-check path: pinned `check_form` has NO bound negative-receipt path
+for an unchecked required checkbox (it raises either way), so the page the
+final guard reads shows only the UNSELECTED options of an exactly granted group
+as not required. The tests prove every missing binding still rejects.
+"""
+from __future__ import annotations
+
+import json
+import logging
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+
+from agent import run
+from tests.tools.test_browser_bootstrap import (
+    Browser, PK, SECURE_URL, field, inventory, secure_inventory, submit, witness,
+)
+from tools import browser_skill_apply as forms
+
+URL = SECURE_URL
+QUESTION = 'Which regions can you work in?'
+OPTIONS = ['North America', 'Europe', 'Asia Pacific']
+SHARED = 'More than one control uses the same approval question'
+
+
+def box(label, selector, **extra):
+    extra.setdefault('question', QUESTION)
+    extra.setdefault('form_action', URL)
+    return field(label, selector, type='checkbox', value='on', has_value=True, **extra)
+
+
+def group_controls(**extra):
+    return [box(label, f'#region-{i}', **extra) for i, label in enumerate(OPTIONS)]
+
+
+def page_of(*controls, resume=True):
+    extra = [field('Resume', '#resume', required=False, type='file',
+                   files=['Resume.pdf'], has_value=True, form_action=URL)] if resume else []
+    page = inventory(*controls, *extra, submit(form_action=URL), url=URL)
+    page['title'] = 'Synthetic Role'
+    return page
+
+
+def group_page(**kw):
+    return page_of(*group_controls(), **kw)
+
+
+def by(page, selector):
+    return next(c for c in page['controls'] if c['selector'] == selector)
+
+
+@pytest.fixture
+def row(monkeypatch):
+    stored = {'pk': PK, 'status': 'submitting', 'possible_submission': False,
+              'human_approved_answers': {}}
+    monkeypatch.setattr(forms, '_row', lambda pk, *a, **kw: stored)
+
+    class Tracking:
+        def set_status(self, pk, status, **fields):
+            assert pk == PK
+            stored.update(status=status, **fields)
+
+    monkeypatch.setattr('core.stores.make_stores',
+                        lambda: SimpleNamespace(tracking=Tracking()))
+    return stored
+
+
+def grant_for(page, selected):
+    """The grant `resume_job` writes for an owner answer (see test_resume_*)."""
+    group = forms._checkbox_group(page, page['controls'][0])
+    first = group[0]
+    return {'value': json.dumps(selected), 'selector': first['selector'], 'url': page['url'],
+            'label': first['label'], 'question': first['question'], 'tag': 'input',
+            'type': 'checkbox_group', 'form_selector': first['form_selector'],
+            'form_action': first['form_action'], 'options': [c['label'] for c in group],
+            'group_members': forms._group_binding(group), 'selected': list(selected)}
+
+
+def answered(row, page, selected):
+    row['human_approved_answers'][QUESTION] = grant_for(page, selected)
+    forms._derive_group_member_grants(page, PK)
+
+
+# ---------------------------------------------------------------- detection
+
+
+def test_group_is_detected_in_page_order_with_distinct_member_keys():
+    page = group_page()
+    group = forms._checkbox_group(page, by(page, '#region-1'))
+    assert [c['label'] for c in group] == OPTIONS
+    keys = {forms._key(page, c) for c in group}
+    assert len(keys) == 3 and QUESTION not in keys
+
+
+def _radio_peer(page):
+    page['controls'].insert(0, field('Remote', '#radio', type='radio', name='x',
+                                     question=QUESTION, form_action=URL))
+
+
+def _text_peer(page):
+    page['controls'].insert(0, field('Other regions', '#other', type='text',
+                                     question=QUESTION, form_action=URL))
+
+
+def _duplicate_label(page):
+    by(page, '#region-1')['label'] = by(page, '#region-0')['label']
+
+
+def _blank_label(page):
+    by(page, '#region-1')['label'] = ''
+
+
+def _hidden_attestation(page):
+    by(page, '#region-1')['ashby_hidden_choice'] = True
+
+
+def _disabled_member(page):
+    by(page, '#region-1')['disabled'] = True
+
+
+def _different_action(page):
+    by(page, '#region-1')['form_action'] = URL + '/other'
+
+
+@pytest.mark.parametrize('mutate', [
+    _radio_peer, _text_peer, _duplicate_label, _blank_label,
+    _hidden_attestation, _disabled_member, _different_action,
+])
+def test_every_other_duplicate_keeps_the_collision_gate(mutate):
+    page = group_page()
+    mutate(page)
+    assert forms._checkbox_group(page, by(page, '#region-0')) is None
+    with pytest.raises(forms.Gate):
+        forms._key(page, by(page, '#region-0'))
+
+
+def test_two_unrelated_checkboxes_with_distinct_questions_are_not_a_group():
+    page = page_of(box('One', '#a', question='First?'), box('Two', '#b', question='Second?'))
+    assert forms._checkbox_group(page, by(page, '#a')) is None
+    assert forms._key(page, by(page, '#a')) == 'First?'
+
+
+def test_remaining_collision_logs_shape_only(caplog):
+    caplog.set_level(logging.INFO, logger=forms.__name__)
+    page = group_page()
+    _radio_peer(page)
+    with pytest.raises(forms.Gate, match=SHARED):
+        forms._key(page, by(page, '#region-0'))
+    logged = ' '.join(r.getMessage() for r in caplog.records
+                      if 'collision' in r.getMessage())
+    assert 'size' in logged and 'radio' in logged and 'checkbox' in logged
+    for private in (QUESTION, *OPTIONS, 'Remote', '#region-0'):
+        assert private not in logged
+
+
+# ----------------------------------------------------------- owner question
+
+
+def test_without_a_grant_the_group_is_one_checkbox_group_owner_question(row):
+    page = group_page()
+    question = forms._disclosure_question(
+        page, by(page, '#region-1'), {c['selector']: c for c in witness(page)['controls']},
+        URL, bootstrap=True, pk=PK)
+    assert question['type'] == 'checkbox_group'
+    assert question['label'] == QUESTION == question['question']
+    assert question['options'] == OPTIONS
+    assert question['selector'] == '#region-0'
+    assert [m['selector'] for m in question['group_members']] == [
+        '#region-0', '#region-1', '#region-2']
+    prompt = forms._choice_prompt(by(page, '#region-0'), {**question, 'pk': PK})
+    for option in OPTIONS:
+        assert option in prompt
+    assert 'JSON array' in prompt
+
+
+async def test_bootstrap_raises_the_owner_question_before_any_write(monkeypatch, row):
+    from tests.tools.test_browser_bootstrap import URL as RAW_URL
+    page = secure_inventory(*group_controls(form_action=RAW_URL))
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               title=page['title'], ats='custom')
+    browser = Browser(page)
+    filled = forms._ApprovedFormValues({}, PK, {})
+    with pytest.raises(forms.Gate) as gate:
+        await forms._bootstrap(browser, page, PK, {}, SECURE_URL, filled=filled,
+                               history=[], job_url=SECURE_URL, company='example-co')
+    assert gate.value.reason == 'owner_question'
+    asked = gate.value.form_question
+    assert asked['type'] == 'checkbox_group' and asked['options'] == OPTIONS
+    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
+                   for call in browser.calls)
+    assert row['human_approved_answers'] == {}
+
+
+# ------------------------------------------------------------------- grant
+
+
+def test_grant_is_current_only_for_the_exact_option_set_and_selectors(row):
+    page = group_page()
+    row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
+    group = forms._checkbox_group(page, by(page, '#region-0'))
+    assert forms._current_group_grant(page, group, row)['selected'] == ['Europe']
+    # Order never matters; the set does.
+    shuffled = deepcopy(page)
+    shuffled['controls'][:3] = list(reversed(shuffled['controls'][:3]))
+    reordered = forms._checkbox_group(shuffled, by(shuffled, '#region-0'))
+    assert forms._current_group_grant(shuffled, reordered, row) is not None
+
+    def renamed(p):
+        by(p, '#region-2')['label'] = 'Asia'
+
+    def added(p):
+        p['controls'].insert(3, box('Africa', '#region-3'))
+
+    def removed(p):
+        p['controls'].pop(2)
+
+    def moved_selector(p):
+        by(p, '#region-2')['selector'] = '#moved'
+
+    def moved_form(p):
+        for c in p['controls'][:3]:
+            c['form_selector'] = '#other-form'
+
+    for drift in (renamed, added, removed, moved_selector, moved_form):
+        drifted = deepcopy(page)
+        drift(drifted)
+        found = forms._checkbox_group(drifted, by(drifted, '#region-0'))
+        assert found is None or forms._current_group_grant(drifted, found, row) is None, drift
+
+
+@pytest.mark.parametrize('selected', [[], ['Unknown'], ['Europe', 'Europe'], 'Europe', None])
+def test_a_malformed_stored_selection_is_never_current(row, selected):
+    page = group_page()
+    stored = grant_for(page, ['Europe'])
+    stored['selected'] = selected
+    stored['value'] = json.dumps(selected)
+    row['human_approved_answers'][QUESTION] = stored
+    group = forms._checkbox_group(page, by(page, '#region-0'))
+    assert forms._current_group_grant(page, group, row) is None
+
+
+def test_owner_answer_must_be_a_json_array_of_exact_offered_labels():
+    parse = run._parse_group_answer
+    assert parse('["Europe", "North America"]', OPTIONS) == ['Europe', 'North America']
+    for bad in ('Europe', '"Europe"', '[]', '{}', '["europe"]', '["Mars"]',
+                '["Europe", "Europe"]', '[1]', '[null]', 'not json', ''):
+        assert parse(bad, OPTIONS) is None, bad
+
+
+def stored_question(page):
+    group = forms._checkbox_group(page, by(page, '#region-0'))
+    return {'pk': PK, 'label': QUESTION, 'selector': '#region-0', 'url': URL,
+            'control_label': OPTIONS[0], 'question': QUESTION, 'tag': 'input',
+            'type': 'checkbox_group', 'form_selector': '#application',
+            'form_action': URL, 'options': [c['label'] for c in group],
+            'group_members': forms._group_binding(group)}
+
+
+def gated_row(question):
+    return {'pk': PK, 'jd_url': URL, 'status': 'needs_human', 'gate_source': 'applier',
+            'gate_call_id': 'direct', 'gate_pending': {'form_question': question}}
+
+
+def test_stored_group_question_validation():
+    question = stored_question(group_page())
+    assert run._direct_form_label(PK, gated_row(question)) == QUESTION
+    for tamper in (
+        lambda q: q.update(options=OPTIONS[:2]),
+        lambda q: q.update(options=list(reversed(OPTIONS))),
+        lambda q: q['group_members'][1].update(form_selector='#elsewhere'),
+        lambda q: q['group_members'][1].update(selector='#region-0'),
+        lambda q: q.update(selector='#region-1'),
+        lambda q: q.update(options=['Only one'], group_members=q['group_members'][:1]),
+    ):
+        changed = deepcopy(question)
+        tamper(changed)
+        assert run._direct_form_label(PK, gated_row(changed)) is None
+
+
+# ----------------------------------------------------- derived member grants
+
+
+def test_derived_grants_exist_only_for_selected_members_and_follow_the_answer(row):
+    page = group_page()
+    answered(row, page, ['North America', 'Asia Pacific'])
+    grants = row['human_approved_answers']
+    keys = {c['label']: forms._member_key(c) for c in page['controls'][:3]}
+    assert keys['Europe'] not in grants
+    for label in ('North America', 'Asia Pacific'):
+        member = grants[keys[label]]
+        assert member['value'] == 'yes' and member['visible_text'] == label
+        assert forms._approved_native_choice(
+            page, next(c for c in page['controls'] if c['label'] == label), PK)[0] == 'yes'
+    europe = by(page, '#region-1')
+    assert forms._approved_native_choice(page, europe, PK) is None
+    # A narrower answer removes the stale derived grant of the dropped option.
+    answered(row, page, ['North America'])
+    assert keys['Asia Pacific'] not in row['human_approved_answers']
+    # A stale group grant removes every derived grant: nothing outlives the owner.
+    by(page, '#region-2')['label'] = 'Asia'
+    forms._derive_group_member_grants(page, PK)
+    assert not any(v.get('source') == 'checkbox-group'
+                   for v in row['human_approved_answers'].values())
+
+
+def test_group_members_are_never_bank_auto_answered(row):
+    page = group_page()
+    proof = {c['selector']: c for c in witness(page)['controls']}
+    forms._auto_grant_from_global(page, proof, PK, {QUESTION: 'yes'}, {QUESTION: 'yes'}, URL)
+    assert row['human_approved_answers'] == {}
+
+
+# ---------------------------------------------------------------- final check
+
+
+def final_state(row, page, selected, checked):
+    answered(row, page, selected)
+    for member in page['controls'][:3]:
+        member['checked'] = member['label'] in checked
+    filled = forms._ApprovedFormValues({}, PK, {})
+    for member in page['controls'][:3]:
+        if member['checked']:
+            filled[member['selector']] = member['value']
+    return filled
+
+
+def run_final(page, filled):
+    forms.check_form(forms._group_final_page(page, PK), filled, True, 'Resume.pdf', [])
+
+
+def test_unmodified_check_form_still_rejects_an_unchecked_required_option(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
+        forms.check_form(page, filled, True, 'Resume.pdf', [])
+
+
+def test_exactly_granted_group_passes_the_final_check(row):
+    page = group_page()
+    filled = final_state(row, page, ['North America', 'Asia Pacific'],
+                         ['North America', 'Asia Pacific'])
+    run_final(page, filled)
+    shown = forms._group_final_page(page, PK)
+    assert [c['required'] for c in shown['controls'][:3]] == [True, False, True]
+    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]  # copy only
+    assert all(a == b for a, b in zip(shown['controls'][3:], page['controls'][3:]))
+
+
+def test_final_check_rejects_without_a_current_binding_grant(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    del row['human_approved_answers'][QUESTION]
+    with pytest.raises(forms.Gate):
+        run_final(page, filled)
+
+
+def test_final_check_rejects_zero_checked_members(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], [])
+    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
+        run_final(page, filled)
+
+
+def test_final_check_rejects_a_checked_member_the_owner_did_not_grant(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe', 'North America'])
+    with pytest.raises(forms.Gate):
+        run_final(page, filled)
+
+
+def test_final_check_rejects_a_granted_member_that_is_not_checked(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe', 'North America'], ['Europe'])
+    with pytest.raises(forms.Gate):
+        run_final(page, filled)
+
+
+@pytest.mark.parametrize('drift', ['option', 'selector', 'form', 'extra'])
+def test_final_check_rejects_option_or_selector_drift(row, drift):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    if drift == 'option':
+        by(page, '#region-2')['label'] = 'APAC'
+    elif drift == 'selector':
+        by(page, '#region-2')['selector'] = '#region-new'
+    elif drift == 'form':
+        for c in page['controls'][:3]:
+            c['form_selector'] = '#changed'
+    else:
+        page['controls'].insert(3, box('Africa', '#region-3'))
+    with pytest.raises(forms.Gate):
+        run_final(page, filled)
+
+
+# -------------------------------------------------------------- unchecking
+
+
+def test_controller_may_only_uncheck_an_ungranted_member_of_the_current_group(row):
+    page = group_page()
+    answered(row, page, ['Europe'])
+    for member in page['controls'][:3]:
+        member['checked'] = True
+    allowed = {c['label']: forms._group_uncheck_allowed(page, c, PK)
+               for c in page['controls'][:3]}
+    assert allowed == {'North America': True, 'Europe': False, 'Asia Pacific': True}
+    row['human_approved_answers'].pop(QUESTION)
+    assert not any(forms._group_uncheck_allowed(page, c, PK) for c in page['controls'][:3])
+    answered(row, page, ['Europe'])
+    by(page, '#region-2')['label'] = 'Asia'
+    assert not any(forms._group_uncheck_allowed(page, c, PK) for c in page['controls'][:3])
+
+
+class ToggleBrowser(Browser):
+    def __init__(self, page):
+        super().__init__(page)
+        self.clicks = []
+
+    async def call(self, *args, **kwargs):
+        if args[0] == 'click':
+            self.clicks.append(args[1])
+            target = next(c for c in self.current['controls'] if c['selector'] == args[1])
+            target['checked'] = not target['checked']
+            return {}
+        return await super().call(*args, **kwargs)
+
+
+async def test_settle_clears_every_ungranted_member_and_verifies_each_state(row):
+    page = group_page()
+    answered(row, page, ['Europe'])
+    by(page, '#region-0')['checked'] = True       # pre-checked, not granted
+    by(page, '#region-1')['checked'] = True       # just written, granted
+    browser = ToggleBrowser(page)
+    await forms._settle_checkbox_group(browser, by(page, '#region-1'), PK, None)
+    assert browser.clicks == ['#region-0']
+    assert [c['checked'] for c in page['controls'][:3]] == [False, True, False]
+
+
+async def test_settle_fails_when_the_ungranted_member_stays_checked(row):
+    page = group_page()
+    answered(row, page, ['Europe'])
+    by(page, '#region-0')['checked'] = True
+    by(page, '#region-1')['checked'] = True
+
+    class Stuck(ToggleBrowser):
+        async def call(self, *args, **kwargs):
+            if args[0] == 'click':
+                self.clicks.append(args[1])
+                return {}
+            return await super().call(*args, **kwargs)
+
+    with pytest.raises(forms.Gate, match='does not match the owner answer'):
+        await forms._settle_checkbox_group(Stuck(page), by(page, '#region-1'), PK, None)
+
+
+# ------------------------------------------------------------- end to end
+
+
+async def test_controller_page_shows_the_final_guard_only_the_bounded_copy(row):
+    page = group_page()
+    answered(row, page, ['Europe'])
+    by(page, '#region-1')['checked'] = True
+
+    class Raw:
+        async def call(self, command, script):
+            assert command == 'evaluate'
+            return {'value': deepcopy(page)}
+
+    row['ats'] = 'custom'
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    shown = await controller._page(Raw())
+    assert [c['required'] for c in shown['controls'][:3]] == [False, True, False]
+    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]
+
+
+async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
+    from tests.tools import test_browser_greenhouse_settlement_owner_gate as owner
+    from tools import browser_skill as bsk
+
+    case, raw, stores = owner.tracked_greenhouse(monkeypatch)
+    members = [box(label, f'#region-{i}', form_action=case.url)
+               for i, label in enumerate(OPTIONS)]
+    members[0]['checked'] = True          # pre-checked, will not be granted
+    for page in (case.page, raw.state):
+        page['controls'][1:2] = deepcopy(members)
+
+    original = raw.call
+
+    async def call(command, *args, **kwargs):
+        if command == 'click':
+            target = raw.target(args[0])
+            assert target['type'] == 'checkbox'
+            raw.writes.append(('click', args[0]))
+            raw.calls.append((command, *args))
+            target['checked'] = not target['checked']
+            return {}
+        return await original(command, *args, **kwargs)
+
+    raw.call = call
+
+    async def model_must_not_run(*a, **kw):
+        pytest.fail('The group is an owner question before any model review')
+
+    monkeypatch.setattr(bsk, 'decision', model_must_not_run)
+    first = await owner.run._apply_direct(case.pk, stores)
+    assert first['result'] == 'gated', first
+    row = stores.tracking.get(case.pk)
+    question = row['gate_pending']['form_question']
+    assert row['gate_reason'] == 'owner_question'
+    assert question['type'] == 'checkbox_group' and question['options'] == OPTIONS
+    assert owner.run._direct_form_label(case.pk, row) == QUESTION
+    assert ('click', '#region-1') not in raw.writes
+
+    tokens = owner.server._owner_gate_tokens(row)
+    for bad in ('Europe', '[]', '["Mars"]', '["Europe","Europe"]', '{"a": 1}'):
+        refused = owner.run.resume_job(
+            case.pk, bad, stores, disposition='answer',
+            expected_gate_generation=tokens['gate_generation'],
+            expected_question_identity=tokens['gate_question_identity'])
+        assert refused['reason'] == 'invalid_answer', bad
+        assert stores.tracking.get(case.pk)['gate_pending'] == row['gate_pending']
+    accepted = owner.run.resume_job(
+        case.pk, json.dumps(['Europe']), stores, disposition='answer',
+        expected_gate_generation=tokens['gate_generation'],
+        expected_question_identity=tokens['gate_question_identity'])
+    assert accepted['result'] == 'queued', accepted
+    assert stores.answer_bank.writes == []          # never banked
+    grant = stores.tracking.get(case.pk)['human_approved_answers'][QUESTION]
+    assert grant['type'] == 'checkbox_group' and grant['selected'] == ['Europe']
+    assert [m['selector'] for m in grant['group_members']] == [
+        '#region-0', '#region-1', '#region-2']
+
+    seen = []
+
+    async def decide(_prompt, page, _history, *, model):
+        choices = page['approved_choices']
+        seen.append([c['selector'] for c in choices])
+        if len(seen) == 1:
+            assert [c['selector'] for c in choices] == ['#region-1']
+            return {'action': 'choose', 'selector': '#region-1', 'fact': choices[0]['key']}
+        return {'action': 'gate', 'question': 'Synthetic stop before Submit'}
+
+    monkeypatch.setattr(bsk, 'decision', decide)
+    second = await owner.run._apply_direct(case.pk, stores)
+    assert second['result'] == 'gated', second
+    assert ('click', '#region-1') in raw.writes
+    assert ('click', '#region-0') in raw.writes      # the pre-checked option is cleared
+    assert ('click', '#region-2') not in raw.writes
+    assert [raw.target(f'#region-{i}')['checked'] for i in range(3)] == [False, True, False]
+    assert not any(call[0] == 'click' and call[1] == '#submit' for call in raw.calls)
+
+
+async def test_raw_click_guard_allows_only_the_exact_clearing_click(monkeypatch, row):
+    from unittest.mock import AsyncMock
+    page = group_page()
+    answered(row, page, ['Europe'])
+    for member in page['controls'][:3]:
+        member['checked'] = True
+    controller = forms.ApplicationIPCController(
+        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
+    monkeypatch.setattr(controller, '_page', AsyncMock(return_value=deepcopy(page)))
+    monkeypatch.setattr(controller, '_fresh_preparation', lambda _url: None)
+    monkeypatch.setattr(controller, '_row', lambda: {'ats': 'custom'})
+
+    class Raw:
+        async def page(self):
+            return deepcopy(page)
+
+        async def call(self, *args):
+            assert args == ('evaluate', forms._FIXED_CONTROL_WITNESS)
+            return {'value': witness(page)}
+
+    await controller.before_ipc(Raw(), ('click', '#region-0'), {})       # not granted
+    await controller.before_ipc(Raw(), ('click', '#region-2'), {})       # not granted
+    with pytest.raises(forms.Gate):                                      # granted: never unchecked
+        await controller.before_ipc(Raw(), ('click', '#region-1'), {})
+    row['human_approved_answers'].pop(QUESTION)
+    with pytest.raises(forms.Gate):                                      # no grant: no clearing
+        await controller.before_ipc(Raw(), ('click', '#region-0'), {})

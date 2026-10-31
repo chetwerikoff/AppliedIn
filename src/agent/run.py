@@ -1005,6 +1005,39 @@ def _gate_label(question: str) -> str | None:
     return max(asked or spans, key=len)
 
 
+def _group_question_valid(field: dict) -> bool:
+    """Issue 278: a stored native checkbox option group, as the browser layer issues it."""
+    options, members = field.get('options'), field.get('group_members')
+    return (field.get('tag') == 'input' and field.get('owner_kind') is None
+            and isinstance(options, list) and isinstance(members, list)
+            and len(options) >= 2 and len(options) == len(members)
+            and all(isinstance(o, str) and o.strip() for o in options)
+            and len({' '.join(o.casefold().split()) for o in options}) == len(options)
+            and all(isinstance(m, dict) and all(
+                isinstance(m.get(k), str) and m[k].strip()
+                for k in ('selector', 'label', 'form_selector'))
+                and m['form_selector'] == field['form_selector']
+                for m in members)
+            and [m['label'] for m in members] == options
+            and len({m['selector'] for m in members}) == len(members)
+            and members[0]['selector'] == field['selector']
+            and members[0]['label'] == field['control_label'])
+
+
+def _parse_group_answer(answer: str, options: list[str]) -> list[str] | None:
+    """A JSON array of exact offered labels; anything else is rejected."""
+    try:
+        chosen = json.loads(answer)
+    except ValueError:
+        return None
+    if (not isinstance(chosen, list) or not chosen
+            or any(not isinstance(c, str) for c in chosen)
+            or len(set(chosen)) != len(chosen)
+            or any(c not in options for c in chosen)):
+        return None
+    return chosen
+
+
 def _direct_form_label(pk: str, row: dict) -> str | None:
     """Only code-observed direct BrowserSkill field gates authorize disclosure.
 
@@ -1022,7 +1055,8 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
             or field.get('tag') not in {'input', 'textarea', 'select', 'div', 'button'}
             or not isinstance(field.get('type'), str)
             or ((field['tag'] == 'input' and field['type'] not in {
-                    'text', 'email', 'tel', 'url', 'number', 'date', 'checkbox', 'radio', 'combobox'})
+                    'text', 'email', 'tel', 'url', 'number', 'date', 'checkbox', 'radio',
+                    'combobox', 'checkbox_group'})
                 or (field['tag'] == 'div' and field['type'] != 'combobox')
                 or (field['tag'] == 'button' and (
                     field['type'] != 'button'
@@ -1047,6 +1081,7 @@ def _direct_form_label(pk: str, row: dict) -> str | None:
                  or {m['value'] for m in field['boolean_members']} != {'yes', 'no'}
                  or field['boolean_members'][0]['selector'] != field['selector']
                  or field['boolean_members'][0]['caption'] != field['control_label']))
+            or (field['type'] == 'checkbox_group' and not _group_question_valid(field))
             or (field['type'] == 'checkbox' and (
                  not isinstance(field.get('visible_text'), str)
                  or not field['visible_text'].strip()
@@ -1486,7 +1521,14 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
         if form_label:
             observed = row['gate_pending']['form_question']
             normalized = ' '.join(answer.casefold().split())
-            if observed['type'] == 'checkbox':
+            group_selected = None
+            if observed['type'] == 'checkbox_group':
+                group_selected = _parse_group_answer(answer, observed['options'])
+                if group_selected is None:
+                    return {'result': 'gated', 'pk': pk, 'reason': 'invalid_answer',
+                            'detail': 'Answer with a JSON array of one or more exact '
+                                      'offered option labels, each at most once.'}
+            elif observed['type'] == 'checkbox':
                 if normalized == 'no':
                     detail = ('Cannot proceed with this application without the required '
                               'acknowledgement: ' + observed['control_label'])
@@ -1551,10 +1593,15 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
                    if observed['type'] == 'radio' else {}),
                 **({'boolean_members': observed['boolean_members']}
                    if observed['type'] == 'button' else {}),
+                **({'group_members': observed['group_members'],
+                    'options': observed['options'],
+                    'selected': group_selected,
+                    'value': json.dumps(group_selected)}
+                   if group_selected is not None else {}),
             }
             # The winner's grant rides inside the one consume commit; only
             # then may it bank a non-material answer and continue.
-            bank = (None if material_form else
+            bank = (None if material_form or group_selected is not None else
                     (label, answer, scope, company or None))
             return _consume_direct_gate(pk, row, stores, grant=(form_label, grant),
                                         bank=bank)

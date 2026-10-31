@@ -201,8 +201,10 @@ PAGE = r"""(() => {
     const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
       pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
-      ashbyContainers[0].contains(e) && e.tagName==='INPUT' &&
-      e.type==='checkbox' && !e.form && !e.closest('form') &&
+      (e.type==='checkbox' && ashbyContainers[0].contains(e) || e.type==='radio' && pageSurveyWrappers.length===1 &&
+        pageSurveyWrappers[0].querySelector('.ashby-application-form-container')?.contains(e)) &&
+      e.tagName==='INPUT' &&
+      ['checkbox','radio'].includes(e.type) && !e.form && !e.closest('form') &&
       !e.disabled && !e.matches(':disabled') && !visible(e) &&
       !e.closest('div.ashby-application-form-input-yesno') &&
       !e.closest('[inert]') && labels.length===1 &&
@@ -249,6 +251,7 @@ PAGE = r"""(() => {
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),
+      ...(e.tagName === 'INPUT' ? {value_attr_present:e.hasAttribute('value')} : {}),
       // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a
       // probe: Yes and No alike); no other button's aria-pressed is an answer.
       has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'
@@ -731,7 +734,9 @@ _ASHBY_ROOT = r"""
       const hiddenChoice=e=>{
         const ls=Array.from(e.labels || []);
         return ashbyNative && !forms.length && containers.length===1 &&
-          (!surveyWrappers.length || surveyValid) && container?.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+          (!surveyWrappers.length || surveyValid) &&
+          (e.type==='checkbox' && container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
+          e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type) &&
           !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
           !entryEvidenceVisible(e) && !e.closest('[inert]') &&
           !e.closest('div.ashby-application-form-input-yesno') && ls.length===1 &&

@@ -1171,6 +1171,7 @@ const field = {id: 'field', tagName: kind === 'custom' ? 'X-FOO' : 'INPUT',
   labels: [], form, name: '', required: true, disabled: false,
   getClientRects: () => kind === 'hidden' ? [] : [1],
   closest: q => q === 'form' ? form : null,
+  hasAttribute: () => false,
   getAttribute: k => k === 'type' ? field.type :
     (k === 'role' && kind === 'combobox' ? 'combobox' : null),
   matches: q => (kind === 'contenteditable' && q.includes('[contenteditable]')) ||

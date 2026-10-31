@@ -314,10 +314,12 @@ class Gate(ValueError):
 class PreSubmitGate(Gate):
     """One sanitized, numbered substantive refusal before committing IPC."""
 
-    def __init__(self, item: int, message: str):
+    def __init__(self, item: int, message: str, *,
+                 form_question: dict | None = None):
         if item not in {1, 2, 3, 4, 5}:
             raise ValueError('Invalid pre-Submit item')
-        super().__init__(message, reason=f'defect_pre_submit_item_{item}')
+        super().__init__(message, form_question=form_question,
+                         reason=f'defect_pre_submit_item_{item}')
         self.item = item
 
 
@@ -577,6 +579,44 @@ def native_submit(target: dict) -> bool:
             and (target.get('native_type') or target.get('type')) in {'submit', 'image'}
             and bool(target.get('native_form_owner_selector'))
             and target.get('native_form_owner_selector') == target.get('form_selector'))
+
+
+
+def _ordinary_owner_question(page: dict, field: dict, pk: str,
+                             *, label_override: str = '') -> dict:
+    """An actionable owner question, never a browser permission token."""
+    kind = field.get('type') or 'text'
+    question = {
+        'pk': pk,
+        'label': label_override or field.get('question') or field.get('label') or 'Form answer',
+        'control_label': field.get('label') or 'Form answer',
+        'selector': field.get('selector') or '',
+        'url': page.get('url') or '',
+        'question': field.get('question') or '',
+        'type': kind, 'tag': field.get('tag') or 'input',
+        'form_selector': field.get('form_selector') or '',
+        'form_action': field.get('form_action') or '',
+        'route': 'ordinary-owner-question',
+    }
+    if kind == 'radio':
+        group = [c for c in page.get('controls', [])
+                 if c.get('type') == 'radio'
+                 and c.get('question') == field.get('question')
+                 and c.get('name') == field.get('name')]
+        question['radio_name'] = field.get('name') or ''
+        question['radio_members'] = [
+            {'selector': c.get('selector'), 'caption': c.get('label'),
+             'value': c.get('value') or c.get('label')} for c in group]
+    elif kind == 'button':
+        question['boolean_members'] = [
+            {'selector': c.get('selector'), 'caption': c.get('label'),
+             'value': c.get('label', '').casefold()}
+            for c in page.get('controls', []) if c.get('type') == 'button'
+            and c.get('question') == field.get('question')]
+    elif field.get('tag') == 'select' or kind == 'combobox':
+        question['options'] = (field.get('options') or
+                               (field.get('combobox') or {}).get('options') or [])
+    return question
 
 
 def guarded_value(target: dict, value: str) -> str:
@@ -1046,39 +1086,6 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
         raise Gate('The tailored résumé is missing or its base changed; re-tailor before applying.')
     if not resume_path or not Path(resume_path).is_file():
         raise Gate('The tailored PDF is missing; nothing may be submitted without it.')
-
-
-def _combo_receiver_allowed(page: dict, owner: dict, receiver: dict) -> bool:
-    """Allow only a named receiver on one native form or proven formless root."""
-    if owner.get('in_form') is True:
-        return (receiver.get('in_form') is True
-                and bool(owner.get('form_selector'))
-                and bool(owner.get('form_action'))
-                and receiver.get('form_selector') == owner.get('form_selector')
-                and receiver.get('form_action') == owner.get('form_action'))
-    root = _formless_root(page)
-    if (not isinstance(root, dict) or not root.get('root') or root.get('error')
-            or not root.get('submit') or owner.get('in_form') is not False
-            or receiver.get('in_form') is not False
-            or any(item.get(k) for item in (owner, receiver)
-                   for k in ('native_form_owner_selector', 'form_selector',
-                             'form_action', 'formaction', 'href'))
-            or not isinstance((page.get('entry') or {}).get('root_evidence'), list)):
-        return False
-    evidence = (page.get('entry') or {})['root_evidence']
-    for item in (owner, receiver):
-        matches = [e for e in evidence if isinstance(e, dict)
-                   and e.get('selector') == item.get('selector')]
-        if (len(matches) != 1 or not matches[0].get('inside')
-                or not matches[0].get('in_container')
-                or matches[0].get('native_owner')
-                or matches[0].get('declared_owner')
-                or matches[0].get('formaction') is not None
-                or matches[0].get('type') != item.get('type')):
-            return False
-    bound = _bound_target(page, owner)
-    return (bound.get('form_selector') == root['root']
-            and bound.get('form_action') == root['submit'])
 
 
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
@@ -2098,7 +2105,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         raise _EntryNotReady(reason)
                     qualifying = any(
                         not _formless_root(page) and c.get('in_form')
-                        and _form_subject(page, c)
+                        and bool(c.get('question') or c.get('label'))
                         and (_native_answer(c) or (c.get('tag') == 'input'
                              and c.get('type') in {'radio', 'checkbox'}))
                         and witness[c['selector']].get('visible') is True
@@ -2157,7 +2164,6 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
 
 _EXECUTE_OBSERVATION_SITE = ContextVar('execute_observation_site', default=False)
 _BOOTSTRAP_OBSERVATION_SITE = ContextVar('bootstrap_observation_site', default='')
-_BOOTSTRAP_BANK_GRANTS = ContextVar('bootstrap_bank_grants', default=None)
 
 async def _bootstrap_observe_controls(session, page: dict, *, site: str):
     """Preserve the two-argument observer seam while naming bootstrap gates."""
@@ -2614,6 +2620,7 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
               else str(action.get('value') or '').strip())
     if not answer:
         raise Gate('The owner has not supplied an answer for this form question.',
+                   form_question=_ordinary_owner_question(page, target, pk),
                    reason='owner_question')
     options = (target.get('combobox') or {}).get('options') or []
     if not options:
@@ -2663,6 +2670,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             value = str(target.get('label') or target.get('value') or '').strip()
         if not value:
             raise Gate('This application question needs an owner answer.',
+                       form_question=_ordinary_owner_question(page, target, pk),
                        reason='owner_question')
         if verb == 'fill':
             await _effect_call(session, 'fill', target['selector'], '--value', value)
@@ -3146,7 +3154,6 @@ class ApplicationIPCController:
         if op == 'navigate':
             if len(args) != 2 or kwargs or not isinstance(args[1], str):
                 raise Gate('Unknown application navigation operation.')
-            self._fresh_preparation(self.url, initial_navigation=True)
             if (not _job_preparation_route(
                     args[1], self.url, provenance=(self.greenhouse_provenance or self.entry_provenance),
                     pk=self.pk, company=self.company,
@@ -3363,7 +3370,11 @@ class ApplicationIPCController:
             stated = parse_salary(label(field) + ' ' + str(field['value']))
             minimum = parse_salary(floor) if floor else None
             if not stated or not minimum or stated[:2] != minimum[:2]:
-                raise PreSubmitGate(4, 'A comparable owner salary floor is required.')
+                raise PreSubmitGate(
+                    4, 'A comparable owner salary floor is required.',
+                    form_question=_ordinary_owner_question(
+                        page, field, self.pk,
+                        label_override='Minimum salary floor'))
             if stated[2] < minimum[2]:
                 raise PreSubmitGate(4, 'The stated salary is below the owner floor.')
 
@@ -3751,7 +3762,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             return {'status': 'gate', 'reason': exc.reason,
                     'item': exc.item,
                     'review_route': 'owner' if exc.item == 4 else 'luna',
-                    'question': str(exc), 'step': step}
+                    'question': str(exc), 'step': step,
+                    'form_question': exc.form_question}
         if isinstance(exc, Gate):
             context = handoff(str(exc), step,
                               captcha_artifact=isinstance(exc, CaptchaArtifactGate))

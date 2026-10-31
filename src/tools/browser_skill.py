@@ -67,6 +67,16 @@ def _log_unavailable(args, problem: "Unavailable") -> None:
                 state if _SAFE_TOKEN.fullmatch(state) else ("-" if not state else "?"))
 
 
+def _failed(args, message: str, reason: str) -> Unavailable:
+    """An Unavailable built outside `_result`, logged like every other bsk failure.
+
+    The reason is a fixed token chosen here, never exception text or an argument."""
+    problem = Unavailable(message)
+    problem.reason = reason
+    _log_unavailable(args, problem)
+    return problem
+
+
 def _env() -> dict:
     # An absent daemon is a visible outage, not permission to create a different
     # daemon/profile on the side. Startup owns the long-lived daemon separately.
@@ -170,15 +180,21 @@ def _sync(*args: str, timeout: int = 10) -> dict:
         result = _result(p.stdout, p.returncode)
         return {"browsers": result} if isinstance(result, list) else result
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Unavailable(f"BrowserSkill unavailable: {type(exc).__name__}") from None
+        reason = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "os_error"
+        raise _failed(args, f"BrowserSkill unavailable: {type(exc).__name__}", reason) from None
     except Unavailable as exc:
         _log_unavailable(args, exc)
         raise
 
 
 async def command(*args: str, timeout: int = 35) -> dict:
+    try:
+        executable = _executable()
+    except Unavailable as exc:
+        _log_unavailable(args, exc)
+        raise
     proc = await asyncio.create_subprocess_exec(
-        _executable(), *args, "--json", env=_env(), stdin=asyncio.subprocess.DEVNULL,
+        executable, *args, "--json", env=_env(), stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -337,7 +353,9 @@ class Session:
             value = data.get("context_id")
         if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', value):
             self._context = ""
-            raise Unavailable("BrowserSkill operation unavailable: cooperation_sync_failed")
+            raise _failed(("cooperate", "sync"),
+                          "BrowserSkill operation unavailable: cooperation_sync_failed",
+                          "cooperation_sync_failed")
         self._context = value
         self._tab_ready = True
         return value
@@ -399,7 +417,9 @@ class Session:
                                    "--name", f"AppliedIn {self.kind}", "--no-focus")
             self.id = result["session_id"]
             if result.get("browser_instance_id") != configuration()["browser"]:
-                raise Unavailable("BrowserSkill unavailable: session profile mismatch")
+                raise _failed(("session", "start"),
+                              "BrowserSkill unavailable: session profile mismatch",
+                              "session_profile_mismatch")
             log.info("BrowserSkill session started (kind=%s, browser=%s, session=%s)",
                      self.kind, result.get("browser_instance_id"), self.id)
             return self

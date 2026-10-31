@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 
 import pytest
 from tools import browser_skill as bsk
@@ -43,18 +44,22 @@ class Fake:
         self.sync_failures: list = []    # bodies for upcoming `cooperate sync` calls
         self.action_failures: list = []  # bodies for upcoming non-sync, non-session calls
         self.n = 0
+        self.start_payload = {"session_id": "s1", "browser_instance_id": "dedicated"}
+        self.sync_payload = None  # replaces a successful sync answer when set
 
     async def __call__(self, exe, *argv, **kwargs):
         args = tuple(a for a in argv if a != "--json")
         self.calls.append(args)
         if args[:2] == ("session", "start"):
-            return _Proc({"session_id": "s1", "browser_instance_id": "dedicated"}, 0)
+            return _Proc(self.start_payload, 0)
         if args[0] == "session":
             return _Proc({"ok": True}, 0)
         queue = self.sync_failures if args[:2] == ("cooperate", "sync") else self.action_failures
         if queue:
             return _Proc(queue.pop(0), 1)
         if args[:2] == ("cooperate", "sync"):
+            if self.sync_payload is not None:
+                return _Proc(self.sync_payload, 0)
             self.n += 1
             return _Proc({"context_id": f"ctx-{self.n}"}, 0)
         return _Proc({"ok": True, "value": {"url": "u"}}, 0)
@@ -172,3 +177,55 @@ def test_failure_log_reports_clean_identifiers(caplog):
         bsk._log_unavailable(("cooperate", "sync", "--session", "s1"), problem)
     assert ("verb=cooperate sync code=cdp_failed reason=target_gone effect_state=unknown"
             in caplog.text)
+
+
+# Criterion: every Unavailable from a bsk call logs, including those built here
+# rather than parsed from the CLI's JSON. Exception text and arguments never do.
+
+@pytest.mark.parametrize("failure,reason", [
+    (subprocess.TimeoutExpired(cmd=["bsk", SECRET], timeout=10), "timeout"),
+    (OSError(f"cannot run {SECRET}"), "os_error"),
+])
+def test_sync_timeout_and_os_error_log_a_fixed_reason(monkeypatch, caplog, failure, reason):
+    def boom(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(bsk, "_executable", lambda: "bsk")
+    monkeypatch.setattr(subprocess, "run", boom)
+    with caplog.at_level(logging.INFO, logger=bsk.log.name):
+        with pytest.raises(bsk.Unavailable) as caught:
+            bsk._sync("browsers", SECRET)
+    assert f"verb=browsers code=- reason={reason} effect_state=-" in caplog.text
+    assert SECRET not in caplog.text
+    assert str(caught.value) == f"BrowserSkill unavailable: {type(failure).__name__}"
+
+
+async def test_missing_executable_logs_for_both_transports(monkeypatch, caplog):
+    monkeypatch.setattr(bsk.shutil, "which", lambda name: None)
+    with caplog.at_level(logging.INFO, logger=bsk.log.name):
+        with pytest.raises(bsk.Unavailable):
+            bsk._sync("status")
+        with pytest.raises(bsk.Unavailable):
+            await bsk.command("navigate", f"https://x.test/?q={SECRET}")
+    assert caplog.text.count("bsk unavailable:") == 2
+    assert "verb=status code=- reason=- effect_state=-" in caplog.text
+    assert "verb=navigate code=- reason=- effect_state=-" in caplog.text
+    assert SECRET not in caplog.text
+
+
+async def test_sync_answer_without_a_context_logs_its_fixed_reason(fake, caplog):
+    async with bsk.Session("apply") as session:
+        fake.sync_payload = {"kind": "sync"}
+        with caplog.at_level(logging.INFO, logger=bsk.log.name):
+            with pytest.raises(bsk.Unavailable, match="cooperation_sync_failed"):
+                await session.sync_context()
+    assert "verb=cooperate sync code=- reason=cooperation_sync_failed" in caplog.text
+
+
+async def test_session_profile_mismatch_logs_its_fixed_reason(fake, caplog):
+    fake.start_payload = {"session_id": "s1", "browser_instance_id": "someone-else"}
+    with caplog.at_level(logging.INFO, logger=bsk.log.name):
+        with pytest.raises(bsk.Unavailable, match="profile mismatch"):
+            async with bsk.Session("apply"):
+                pass
+    assert "verb=session start code=- reason=session_profile_mismatch" in caplog.text
+    assert "someone-else" not in caplog.text

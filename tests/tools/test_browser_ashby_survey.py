@@ -254,7 +254,8 @@ def test_location_toggle_and_attestations_remain_distinct_readback_controls():
         evidence = {e['selector']: e for e in snapshot['entry']['root_evidence']}
         for selector in ('#attestation-0', '#attestation-1'):
             c = next(c for c in snapshot['controls'] if c['selector'] == selector)
-            assert c['value'] == 'on' and c['has_value'] is True
+            assert c['type'] == 'checkbox' and c['value'] == 'on'
+            assert isinstance(c.get('checked'), bool)
             assert selector in evidence
     members = {c['selector'] for c in forms._formless_boundary(page, _provenance())}
     assert toggle[0]['selector'] in members

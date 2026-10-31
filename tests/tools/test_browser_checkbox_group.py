@@ -107,3 +107,18 @@ async def test_ordinary_native_choices_write_without_per_member_grants():
     assert session.calls == [
         (('click', '#north'), {}), (('click', '#south'), {})]
     assert filled == {'#north': 'North', '#south': 'South'}
+
+
+def test_disabled_checked_member_does_not_satisfy_required_native_choice():
+    page = _page(_box('#north', 'North', checked=False),
+                 _box('#south', 'South', checked=True))
+    page['controls'][-1]['disabled'] = True
+    with pytest.raises(forms.Gate, match='required native choice'):
+        forms.check_form(page, {}, True, 'Test User.pdf')
+
+
+def test_disabled_resume_input_is_not_a_staged_pdf_attachment():
+    page = _page(_box('#north', 'North', checked=True))
+    page['controls'][0]['disabled'] = True
+    with pytest.raises(forms.Gate, match='Exactly one current résumé'):
+        forms.check_form(page, {}, True, 'Test User.pdf')

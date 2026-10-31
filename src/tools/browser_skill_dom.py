@@ -1258,7 +1258,13 @@ def entry_reader(script: str) -> str:
     return script
 
 
+_ENTRY_INPUT_VALUE_RECORD = "      value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),"
 ENTRY_PAGE = entry_reader(PAGE)
+assert ENTRY_PAGE.count(_ENTRY_INPUT_VALUE_RECORD) == 1
+ENTRY_PAGE = ENTRY_PAGE.replace(
+    _ENTRY_INPUT_VALUE_RECORD,
+    "      ...(e.tagName === 'INPUT' ? {value_attr_present:e.hasAttribute('value')} : {}),\n"
+    + _ENTRY_INPUT_VALUE_RECORD, 1)
 
 
 _GREENHOUSE_OBSERVATION = _CAPTCHA_RESPONSE_NODES + r"""

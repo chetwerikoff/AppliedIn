@@ -1,7 +1,7 @@
-"""Issue #262: rooted Ashby questions must use the exact direct owner reply.
+"""Issue #293: ordinary Ashby owner questions survive without browser grants.
 
-Offline Airwallex/OpenAI DOM shapes flow through the real form controller,
-applier gate persistence and resume gate consumption. Nothing is submitted.
+Offline synthetic Ashby pages exercise the direct applier question, an exact
+owner reply, requeue and stale-answer refusal. Nothing is submitted.
 """
 from __future__ import annotations
 
@@ -64,8 +64,7 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
     bank = _Bank(facts)
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
     if stale:
-        # An older grant for the exact question key but a different receiver
-        # must be re-asked, never replayed or silently treated as approval.
+        # Legacy approval entries are inert and cannot authorize a write.
         tracking.set_status(
             PK, Status.TAILORED, human_approved_answers={
                 "Name": {"value": "Old synthetic value", "selector": "#prior"}})
@@ -97,40 +96,24 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
     return stores, raw, decision
 
 
-def _seed_exact_answers(stores, raw, answers):
-    row = stores.tracking.get(PK)
-    grants = row.get("human_approved_answers") or {}
-    for item in raw.current["controls"]:
-        try:
-            key = forms._key(raw.current, item)
-        except forms.Gate:
-            continue
-        if key not in answers:
-            continue
-        target = forms._bound_target(raw.current, item)
-        grants[key] = {
-            "value": answers[key], "url": raw.current["url"],
-            **{name: target.get(name, "" if name == "question" else None)
-               for name in (
-                   "selector", "label", "question", "tag", "type",
-                   "form_selector", "form_action")},
-        }
-    stores.tracking.set_status(
-        PK, Status.TAILORED, human_approved_answers=grants)
 
-
-async def _gate(stores, expected_label=None):
+async def _owner_gate(stores, decision, raw, label):
+    """Use an observed control as the missing owner fact, not model prose."""
+    matches = [c for c in raw.current["controls"]
+               if c.get("label") == label and not c.get("disabled")]
+    assert len(matches) == 1, (label, [c.get("label") for c in raw.current["controls"]])
+    decision.return_value = {"action": "gate", "selector": matches[0]["selector"],
+                             "question": "Please supply this synthetic form fact"}
     result = await run._apply_direct(PK, stores)
     assert result["result"] == "gated", result
     row = stores.tracking.get(PK)
-    assert row["status"] == "needs_human"
+    assert row["status"] == Status.NEEDS_HUMAN.value
     assert row["gate_reason"] == "owner_question"
-    assert row["gate_call_id"] == "direct"
     assert row["gate_source"] == "applier"
+    assert row["gate_call_id"] == "direct"
     question = row["gate_pending"]["form_question"]
-    assert question["label"]
-    if expected_label is not None:
-        assert question["label"] == expected_label
+    assert question["label"] == label
+    assert question["route"] == "ordinary-owner-question"
     tokens = server._owner_gate_tokens(row)
     assert tokens["gate_generation"]
     assert tokens["gate_question_identity"] == forms.owner_question_identity(PK, question)
@@ -139,123 +122,70 @@ async def _gate(stores, expected_label=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["airwallex", "openai"])
-@pytest.mark.parametrize("case,bank_facts,name_field,answer,first", [
-    ("salary", {"Desired salary": "Synthetic range"},
-     ("Desired salary", "text"), "Approved synthetic range", "Desired salary"),
-    ("free-text", {"Cover letter": "Bank prose"},
-     ("Cover letter", "textarea"), "Exact owner prose", "Cover letter"),
-    ("date", {"Available start date": "2026-11-15"},
-     ("Available start date", "date"), "2026-11-16", "Available start date"),
-    ("no-bank-fact", {}, None, "Test User", "Name"),
-    ("stale-approval", {"Name": "Test User"}, None, "Updated Test User", "Name"),
-])
-async def test_rooted_owner_question_exact_resume_reaches_next_field(
-        monkeypatch, shape, case, bank_facts, name_field, answer, first):
-    stores, raw, decision = _world(
-        monkeypatch, shape, bank_facts, name_field=name_field,
-        stale=case == "stale-approval")
-    row, tokens = await _gate(stores, first)
-
-    # No bank-refused candidate is auto-granted or filled, including when
-    # the bank already holds its value. A stale grant stays untouched.
-    grants = row.get("human_approved_answers") or {}
-    if case == "stale-approval":
-        assert grants["Name"]["selector"] == "#prior"
-    else:
-        assert first not in grants
+async def test_missing_name_is_owner_question_then_fact_and_requeue_without_grant(
+        monkeypatch, shape):
+    stores, raw, decision = _world(monkeypatch, shape, {})
+    row, tokens = await _owner_gate(stores, decision, raw, "Name")
+    assert not row.get("human_approved_answers")
     assert stores.answer_bank.writes == []
-    assert decision.await_count == 0
-    no_mutations(raw)
 
-    wrong = run.resume_job(
-        PK, answer, stores, disposition="answer",
-        expected_gate_generation=tokens["gate_generation"] + "-wrong",
+    stale = run.resume_job(
+        PK, "Test User", stores, disposition="answer",
+        expected_gate_generation=tokens["gate_generation"] + "-stale",
         expected_question_identity=tokens["gate_question_identity"])
-    assert wrong["reason"] == "invalid_answer"
+    assert stale["reason"] == "invalid_answer"
     assert stores.tracking.get(PK)["gate_pending"] == row["gate_pending"]
-    assert stores.answer_bank.writes == []
-    assert ApplyQueue(stores.tracking.r).pending() == []
 
     resumed = run.resume_job(
-        PK, answer, stores, disposition="answer",
+        PK, "Test User", stores, disposition="answer",
         expected_gate_generation=tokens["gate_generation"],
         expected_question_identity=tokens["gate_question_identity"])
     assert resumed["result"] == "queued", resumed
-    grant = stores.tracking.get(PK)["human_approved_answers"][first]
-    assert grant["value"] == answer
-    assert grant["selector"] == row["gate_pending"]["form_question"]["selector"]
-    assert stores.answer_bank.writes == [(first, answer)]
-    # The exact owner approval permits this field on the second run; it does
-    # not approve any sibling, submit the form or borrow a bank-auto grant.
-    second, next_tokens = await _gate(stores, "Email")
-    assert second["gate_pending"]["form_question"]["selector"] != grant["selector"]
-    assert next_tokens["gate_generation"] != tokens["gate_generation"]
-    assert next_tokens["gate_question_identity"] != tokens["gate_question_identity"]
-    assert decision.await_count == 0
-    no_mutations(raw)
+    current = stores.tracking.get(PK)
+    assert not current.get("human_approved_answers")
+    assert current["status"] == Status.TAILORED.value
+    assert stores.answer_bank.writes == [("Name", "Test User")]
+    assert ApplyQueue(stores.tracking.r).pending()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shape", ["airwallex", "openai"])
-async def test_voluntary_survey_bank_refusal_has_direct_reply(monkeypatch, shape):
-    facts = {**_FACTS, "Synthetic voluntary survey question": "Bank-only response"}
-    stores, raw, decision = _world(monkeypatch, shape, facts)
-    _seed_exact_answers(stores, raw, _FACTS)
-    row, tokens = await _gate(stores, "Synthetic voluntary survey question")
-    assert row["gate_pending"]["form_question"]["selector"] == "#survey-preference"
-    assert "Synthetic voluntary survey question" not in (
-        row.get("human_approved_answers") or {})
-    refused = run.resume_job(
-        PK, "Exact survey response", stores, disposition="answer",
-        expected_gate_generation=tokens["gate_generation"],
-        expected_question_identity="q1_wrong")
-    assert refused["reason"] == "invalid_answer"
-    assert stores.answer_bank.writes == []
-    approved = run.resume_job(
-        PK, "Exact survey response", stores, disposition="answer",
+async def test_existing_legacy_grant_cannot_replace_a_fresh_owner_answer(
+        monkeypatch):
+    stores, raw, decision = _world(
+        monkeypatch, "openai", {}, stale=True)
+    row, tokens = await _owner_gate(stores, decision, raw, "Name")
+    assert row["human_approved_answers"]["Name"]["selector"] == "#prior"
+    result = run.resume_job(
+        PK, "Updated Test User", stores, disposition="answer",
         expected_gate_generation=tokens["gate_generation"],
         expected_question_identity=tokens["gate_question_identity"])
-    assert approved["result"] == "queued", approved
-    grant = stores.tracking.get(PK)["human_approved_answers"][
-        "Synthetic voluntary survey question"]
-    assert grant["value"] == "Exact survey response"
-    assert grant["selector"] == row["gate_pending"]["form_question"]["selector"]
-    # A bank fact alone never granted the survey: only the exact owner answer did.
-    assert stores.answer_bank.writes == [
-        ("Synthetic voluntary survey question", "Exact survey response")]
-    assert decision.await_count == 0
-    no_mutations(raw)
+    assert result["result"] == "queued", result
+    current = stores.tracking.get(PK)
+    # Upgrade-safety retains legacy data inert, not used as a fresh form grant.
+    assert current["human_approved_answers"]["Name"]["selector"] == "#prior"
+    assert stores.answer_bank.writes == [("Name", "Updated Test User")]
 
 
 @pytest.mark.asyncio
-async def test_ashby_hidden_attestation_needs_exact_owner_yes(monkeypatch):
-    facts = dict(_FACTS)
+async def test_material_checkbox_uses_an_owner_question_not_a_seventh_submit_item(
+        monkeypatch):
     stores, raw, decision = _world(
-        monkeypatch, "openai", facts, attestations=True)
-    _seed_exact_answers(stores, raw, _FACTS)
-    row, tokens = await _gate(stores)
+        monkeypatch, "openai", dict(_FACTS), attestations=True)
+    row, tokens = await _owner_gate(stores, decision, raw,
+                                    "I certify the foregoing legal declaration")
     question = row["gate_pending"]["form_question"]
     assert question["type"] == "checkbox"
-    assert question["ashby_hidden_choice"] is True
-    assert question["visible"] is False
-    assert question["selector"] == "#attestation-0"
-    assert run.resume_job(
+    invalid = run.resume_job(
         PK, "maybe", stores, disposition="answer",
         expected_gate_generation=tokens["gate_generation"],
-        expected_question_identity=tokens["gate_question_identity"])["reason"] == "invalid_answer"
-    assert stores.answer_bank.writes == []
-    approved = run.resume_job(
+        expected_question_identity=tokens["gate_question_identity"])
+    assert invalid["reason"] == "invalid_answer"
+    result = run.resume_job(
         PK, "yes", stores, disposition="answer",
         expected_gate_generation=tokens["gate_generation"],
         expected_question_identity=tokens["gate_question_identity"])
-    assert approved["result"] == "queued", approved
-    grant = stores.tracking.get(PK)["human_approved_answers"][question["label"]]
-    assert grant["value"] == "yes"
-    assert grant["selector"] == "#attestation-0"
-    # Material assent is never written to the reusable bank.
-    assert stores.answer_bank.writes == []
-    second, next_tokens = await _gate(stores)
-    assert second["gate_pending"]["form_question"]["selector"] == "#attestation-1"
-    assert next_tokens["gate_generation"] != tokens["gate_generation"]
-    assert decision.await_count == 0
-    no_mutations(raw)
+    assert result["result"] == "queued", result
+    assert not stores.tracking.get(PK).get("human_approved_answers")
+    # Material consent stays company-scoped, not in the global reusable bank.
+    assert stores.answer_bank.writes == [(
+        "I certify the foregoing legal declaration", "yes")]

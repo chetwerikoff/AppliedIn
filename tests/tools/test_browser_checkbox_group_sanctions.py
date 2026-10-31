@@ -232,3 +232,101 @@ def test_exact_follow_up_caption_needs_no_regex_change():
     caption = LISTS[3]
     assert forms._SAFE_OPTION_RX.match(caption)
     assert not forms._SAFE_OPTION_RX.match(LISTS[0])
+
+
+def _spy(monkeypatch, name):
+    """Record each call of a module function with the source line that made it."""
+    import inspect
+    real, calls = getattr(forms, name), []
+
+    def spy(*args, **kwargs):
+        caller = inspect.stack(context=1)[1]
+        calls.append((caller.function, (caller.code_context or [''])[0].strip(), args))
+        return real(*args, **kwargs)
+    monkeypatch.setattr(forms, name, spy)
+    return calls
+
+
+async def test_pre_click_site_guards_the_group_caption(row, monkeypatch):
+    """execute guards again right before its click, on the LATEST page.
+
+    That pre-click guard was the fifth 'yes' site this Issue found. It must take
+    the caption route for a safe negative and still gate an affirmative member.
+    """
+    calls = _spy(monkeypatch, '_guard_checkbox_choice')
+    page = sanctions_page(COUNTRIES_Q, COUNTRIES)
+    answer(row, page, ['None of the above'])
+    none = by(page, f'#opt-{COUNTRIES.index("None of the above")}')
+    await forms.execute(
+        ToggleBrowser(page), page,
+        {'action': 'choose', 'selector': none['selector'],
+         'fact': forms._member_key(none)},
+        facts={}, filled=forms._ApprovedFormValues({}, PK, {}),
+        resume_path='Resume.pdf', company='example-co', jd_text='',
+        resume_tex='', github='', pk=PK, job_url=URL)
+    pre_click = [c for c in calls if c[0] == 'execute'
+                 and c[1] == '_guard_checkbox_choice(latest, current, value)']
+    assert len(pre_click) == 1
+    assert pre_click[0][2][1]['selector'] == none['selector']
+    assert pre_click[0][2][2] == 'yes'
+    assert none['checked'] is True
+
+    # The same pre-click site gates an affirmative member when only it sees one:
+    # every earlier guard is satisfied, then the latest caption is Cuba.
+    real = forms._guard_checkbox_choice
+
+    def only_pre_click_sees_cuba(page_, selected, answer_):
+        import inspect
+        line = (inspect.stack(context=1)[1].code_context or [''])[0].strip()
+        if line == '_guard_checkbox_choice(latest, current, value)':
+            selected = {**selected, 'label': 'Cuba'}
+        return real(page_, selected, answer_)
+    monkeypatch.setattr(forms, '_guard_checkbox_choice', only_pre_click_sees_cuba)
+    page = sanctions_page(COUNTRIES_Q, COUNTRIES)
+    row['human_approved_answers'].clear()
+    answer(row, page, ['None of the above'])
+    none = by(page, f'#opt-{COUNTRIES.index("None of the above")}')
+    browser = ToggleBrowser(page)
+    with pytest.raises(forms.Gate, match=SANCTIONS):
+        await forms.execute(
+            browser, page,
+            {'action': 'choose', 'selector': none['selector'],
+             'fact': forms._member_key(none)},
+            facts={}, filled=forms._ApprovedFormValues({}, PK, {}),
+            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_tex='', github='', pk=PK, job_url=URL)
+    assert browser.clicks == []          # refused before the click
+
+
+def test_every_non_group_or_non_yes_answer_uses_the_pinned_guard(row, monkeypatch):
+    """The wrapper changes ONLY a checkbox-group member's yes; all else delegates."""
+    pinned = _spy(monkeypatch, '_guard_native_choice_answer')
+    # A standalone checkbox yes (non-group) goes through the pinned helper,
+    # also on the real _approved_native_choice route.
+    page = page_of(field('Independent acknowledgement', '#agree', type='checkbox',
+                         value='on', has_value=True,
+                         question='Independent acknowledgement', form_action=URL))
+    agree = by(page, '#agree')
+    assert forms._checkbox_group(page, agree) is None
+    row['human_approved_answers'][forms._key(page, agree)] = {
+        'value': 'yes', 'selector': agree['selector'], 'url': page['url'],
+        'label': agree['label'], 'question': agree['question'],
+        'tag': 'input', 'type': 'checkbox',
+        'form_selector': agree['form_selector'],
+        'form_action': agree['form_action'], 'visible_text': agree['label'],
+    }
+    assert forms._approved_native_choice(page, agree, PK)[0] == 'yes'
+    assert [(c[0], c[2]) for c in pinned] == [('_guard_checkbox_choice', (agree, 'yes'))]
+
+    # A group member with a non-yes answer delegates too.
+    pinned.clear()
+    group_page_ = sanctions_page(LISTS_Q, LISTS)
+    member = by(group_page_, '#opt-2')
+    with pytest.raises(forms.Gate, match=SANCTIONS):
+        forms._guard_checkbox_choice(group_page_, member, 'on')
+    assert [c[2] for c in pinned] == [(member, 'on')]
+
+    # Only a group member's yes takes the caption route, without the pinned helper.
+    pinned.clear()
+    forms._guard_checkbox_choice(group_page_, member, 'yes')
+    assert pinned == []

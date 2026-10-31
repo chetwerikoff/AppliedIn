@@ -2662,9 +2662,15 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         raise Gate('Unsupported form operation.')
     target = control(page, action, 'decision-action') if action.get('selector') else None
     if (target is not None
-            and (target.get('type') == 'password' or _LOGIN.search(label(target)))):
-        # Account sign-in is always an owner action; ungated preparation is not
-        # authorization to automate credentials or account creation.
+            and (target.get('type') == 'password' or _LOGIN.search(label(target))
+                 or any(
+                     c.get('form_selector') == target.get('form_selector')
+                     and (c.get('type') == 'password'
+                          or _ACCOUNT_PURPOSE.search(label(c)))
+                     for c in page.get('controls', []) if isinstance(c, dict)))):
+        # An account-purpose sibling makes this the sign-in/subscription form.
+        # This is the surviving account boundary, not an approval for ordinary
+        # application answers or a new per-control grant.
         raise Gate('An owner account action is required.',
                    form_question=_ordinary_owner_question(page, target, pk),
                    reason='owner_question')

@@ -949,7 +949,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                         raise Gate('The approved radio answer is no longer selected.')
                 else:
                     raise Gate('The approved native choice control changed.')
-                _guard_native_choice_answer(target, answer)
+                _guard_checkbox_choice(page, target, answer)
             # A committed ARIA picker may close. Preserve its witnessed option
             # identity while rechecking the current caption and hidden receiver.
             witnessed_options = None

@@ -80,22 +80,27 @@ async def test_safe_negative_group_selection_passes_every_choice_guard(row, shap
     answer(row, page, selected)
     filled = forms._ApprovedFormValues({}, PK, {})
     browser = ToggleBrowser(page)
+    receipts = []
     for member in members(page):
         if member['label'] not in selected:
             # An unchecked member is not an answer and is never chosen.
             assert forms._approved_native_choice(page, member, PK) is None
             continue
         assert forms._approved_native_choice(page, member, PK)[0] == 'yes'
-        await forms.execute(
+        receipts.append(await forms.execute(
             browser, page,
             {'action': 'choose', 'selector': member['selector'],
              'fact': forms._member_key(member)},
             facts={}, filled=filled, resume_path='Resume.pdf',
             company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL)
+            pk=PK, job_url=URL))
         assert member['checked'] is True
     assert [c['label'] for c in members(page) if c['checked']] == selected
     run_final(page, filled)
+    # The raw-IPC final Submit decision replays every choose receipt.
+    assert [r['approved_value'] for r in receipts] == ['yes'] * len(selected)
+    forms.check_form(page, filled, True, 'Resume.pdf', receipts)
+    forms.check_approvals(PK, receipts, page)
 
 
 @pytest.mark.parametrize('shape', SHAPES)
@@ -330,3 +335,67 @@ def test_every_non_group_or_non_yes_answer_uses_the_pinned_guard(row, monkeypatc
     pinned.clear()
     forms._guard_checkbox_choice(group_page_, member, 'yes')
     assert pinned == []
+
+
+async def test_final_receipt_replay_gates_an_affirmative_group_caption(row):
+    """check_approvals replays a choose receipt: a checked affirmative still gates."""
+    page = sanctions_page(COUNTRIES_Q, COUNTRIES)
+    answer(row, page, ['Cuba', 'None of the above'])
+    none = by(page, f'#opt-{COUNTRIES.index("None of the above")}')
+    filled = forms._ApprovedFormValues({}, PK, {})
+    receipt = await forms.execute(
+        ToggleBrowser(page), page,
+        {'action': 'choose', 'selector': none['selector'],
+         'fact': forms._member_key(none)},
+        facts={}, filled=filled, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    forms.check_approvals(PK, [receipt], page)
+    cuba = by(page, '#opt-0')
+    cuba['checked'] = True
+    forged = {**receipt, 'selector': cuba['selector'], 'label': cuba['label'],
+              'fact': forms._member_key(cuba)}
+    with pytest.raises(forms.Gate, match=SANCTIONS):
+        forms.check_approvals(PK, [receipt, forged], page)
+
+
+async def test_final_receipt_replay_needs_the_member_checked_on_the_current_page(row):
+    """The caption route at the final site only follows the existing checked check."""
+    page = sanctions_page(LISTS_Q, LISTS)
+    answer(row, page, [LISTS[2]])
+    safe = by(page, '#opt-2')
+    filled = forms._ApprovedFormValues({}, PK, {})
+    receipt = await forms.execute(
+        ToggleBrowser(page), page,
+        {'action': 'choose', 'selector': safe['selector'],
+         'fact': forms._member_key(safe)},
+        facts={}, filled=filled, resume_path='Resume.pdf',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk=PK, job_url=URL)
+    forms.check_approvals(PK, [receipt], page)
+    safe['checked'] = False
+    with pytest.raises(forms.Gate, match='no longer checked'):
+        forms.check_approvals(PK, [receipt], page)
+
+
+def test_final_receipt_replay_of_a_non_group_checkbox_uses_the_pinned_helper(
+        row, monkeypatch):
+    page = page_of(field('Independent acknowledgement', '#agree', type='checkbox',
+                         value='on', has_value=True, checked=True,
+                         question='Independent acknowledgement', form_action=URL))
+    agree = by(page, '#agree')
+    assert forms._checkbox_group(page, agree) is None
+    row['human_approved_answers'][forms._key(page, agree)] = {
+        'value': 'yes', 'selector': agree['selector'], 'url': page['url'],
+        'label': agree['label'], 'question': agree['question'],
+        'tag': 'input', 'type': 'checkbox',
+        'form_selector': agree['form_selector'],
+        'form_action': agree['form_action'], 'visible_text': agree['label'],
+    }
+    receipt = {'fact': forms._key(page, agree), 'action': 'choose',
+               'selector': agree['selector'], 'label': agree['label'],
+               'question': agree['question'], 'url': page['url'],
+               'approved_value': 'yes'}
+    pinned = _spy(monkeypatch, '_guard_native_choice_answer')
+    forms.check_approvals(PK, [receipt], page)
+    assert [(c[0], c[2]) for c in pinned] == [('_guard_checkbox_choice', (agree, 'yes'))]

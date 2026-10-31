@@ -5370,6 +5370,38 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         reported.extend(additions)
 
 
+def _owner_grant_facts(row: dict, facts: dict) -> dict:
+    """Issue 290: this row's own owner text/combobox grant is its approved value.
+
+    A direct owner answer is stored twice: exactly, as this row's control-bound
+    grant, and as a shared bank fact that the next owner answer to the same label
+    on any other job overwrites. Every write and readback here takes its value
+    from the bank, so a retry of an approved row read another job's text and
+    failed exact binding on value alone, re-asking the owner forever.
+
+    Only the row's own exact owner value shadows the bank, so nothing new is
+    authorized: exact_approval still binds that value to the same observed
+    control, and a page value that differs from it still gates. Choice grants
+    already bind their members, and material assent is read from its grant.
+    """
+    grants = row.get('human_approved_answers')
+    if not isinstance(grants, dict):
+        return facts
+    out = dict(facts)
+    for key, grant in grants.items():
+        if (not isinstance(key, str) or not key or not isinstance(grant, dict)
+                or grant.get('source') not in (None, 'owner')
+                or not (grant.get('tag') == 'textarea' or grant.get('type') == 'combobox')
+                or not isinstance(grant.get('value'), str) or not grant['value'].strip()
+                or _material_question({**grant, 'control_label': grant.get('label')})):
+            continue
+        wanted = normalize_label(key)
+        for other in [k for k in out if isinstance(k, str) and normalize_label(k) == wanted]:
+            del out[other]
+        out[key] = grant['value']
+    return out
+
+
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:
     row = (_row(pk, fixture_context=fixture_context)
            if fixture_context is not None else _row(pk))
@@ -8358,6 +8390,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         facts = {k: v for k, v in facts.items()
                  if v is not None and str(v).strip()
                  and not re.search(r'password|login|credential|token', k, re.I)}
+        if pk:
+            facts = _owner_grant_facts(
+                _row(pk, fixture_context=ctx) if ctx else _row(pk), facts)
         if ctx is None:
             from core.stores import make_stores
             # Some read-only/fixture store adapters do not expose a bank.

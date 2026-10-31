@@ -29,7 +29,7 @@ from .base import (
     guard_observation_matches,
     guard_patch,
     canonical_repair_row_allowed, canonical_repair_same_witness,
-    canonical_repair_patch, direct_gate_patch,
+    canonical_repair_patch, direct_gate_patch, grants_replace_patch,
 )
 
 
@@ -272,6 +272,31 @@ class RedisTracking(AbstractTracking):
                 # Keep the caller's ORIGINAL expected status and witness.
                 continue
         raise RuntimeError("Tracking row could not be updated after WATCH contention")
+
+    def replace_grants_if_unchanged(self, pk: str, expected: dict, new: dict) -> bool:
+        """WATCH the row and its durable hold; rewrite only the `new` grant keys."""
+        key, hold = f"app:{pk}", f"submit_hold:{pk}"
+        for _ in range(16):
+            try:
+                with self.r.pipeline() as pipe:
+                    pipe.watch(key, hold)
+                    raw = pipe.get(key)
+                    if raw is None or pipe.get(hold) is not None:
+                        pipe.unwatch()
+                        return False
+                    row = json.loads(raw)
+                    merged = grants_replace_patch(row, expected, new)
+                    if merged is None:
+                        pipe.unwatch()
+                        return False
+                    row["human_approved_answers"] = merged
+                    pipe.multi()
+                    pipe.set(key, json.dumps(row, default=str))
+                    pipe.execute()
+                    return True
+            except WatchError:
+                continue
+        raise RuntimeError("Grant replacement could not settle after WATCH contention")
 
     def consume_direct_form_gate(
         self, pk: str, *, expected_pending: dict, disposition: dict,

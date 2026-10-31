@@ -1110,6 +1110,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     if not uploaded or not attachment:
         raise Gate('The staged résumé was not attached in this attempt.')
     matching = [c for c in controls if c.get('type') == 'file'
+                and not c.get('disabled')
                 and re.search(r'resume|résumé|cv', label(c), re.I)
                 and c.get('files') == [attachment]]
     if (len(matching) != 1 or any(c is not matching[0]
@@ -1124,6 +1125,7 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             continue
         if typ in {'radio', 'checkbox'}:
             peers = [p for p in controls if p.get('type') == typ
+                     and not p.get('disabled')
                      and p.get('question') == c.get('question')
                      and p.get('form_selector') == c.get('form_selector')]
             if not any(p.get('checked') is True for p in peers):

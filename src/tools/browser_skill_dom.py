@@ -309,10 +309,13 @@ PAGE = r"""(() => {
     if (named.length !== 1 || !named[0].shadowRoot) return null;
     const host = named[0];
     const inside = Array.from(host.shadowRoot.querySelectorAll('*'));
+    // Whatever the buttons say, nothing but plain buttons may act inside it.
+    const acting = Array.from(host.shadowRoot.querySelectorAll(query));
     return host.hasAttribute('data-bsk-overlay') &&
       host.parentElement === document.documentElement && !!document.body &&
       host.previousElementSibling === document.body && host.childNodes.length === 0 &&
-      !inside.some(n => n.shadowRoot || n.tagName === 'IFRAME') ? host : null;
+      !inside.some(n => n.shadowRoot || n.tagName === 'IFRAME') &&
+      acting.every(n => n.tagName === 'BUTTON' && n.type === 'button') ? host : null;
   })();
   const siteShadow = shadowRoots.some(e => e !== overlayHost);
   // A closed shadow root cannot be inspected. Detect visible custom hosts and

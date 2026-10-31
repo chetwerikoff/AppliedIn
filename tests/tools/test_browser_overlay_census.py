@@ -40,22 +40,27 @@ const build = (node, parent) => {
   for (const child of node.children || []) build(child, e);
   if (node.shadow) {
     const inside = [];
-    const grow = (n) => { const x = {tagName: n.tag.toUpperCase(), shadowRoot: n.shadow ? {} : null};
+    const grow = (n) => { const x = {tagName: n.tag.toUpperCase(), shadowRoot: n.shadow ? {} : null,
+      type: n.type || (n.tag === 'button' ? 'submit' : '')};
       inside.push(x); (n.children || []).forEach(grow); };
     node.shadow.forEach(grow);
-    e.shadowRoot = {querySelectorAll: () => inside};
+    // '*' lists everything; the reader's control query lists only acting elements.
+    e.shadowRoot = {querySelectorAll: q => q === '*' ? inside : inside.filter(
+      x => ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'A'].includes(x.tagName))};
   }
   return e;
 };
 const html = build(spec.html, null);
 const document = {documentElement: html, body: all.find(e => e.tagName === 'BODY') || null,
   querySelectorAll: () => all.slice()};
-const run = new Function('document', process.argv[2] + '; return {site: siteShadow, own: overlayHost !== null};');
-console.log(JSON.stringify(run(document)));
+const run = new Function('document', 'query',
+  process.argv[2] + '; return {site: siteShadow, own: overlayHost !== null};');
+console.log(JSON.stringify(run(document, 'CONTROL_QUERY')));
 """
 
 OVERLAY = {"tag": "browser-skill-overlay", "attrs": ["data-bsk-overlay"],
-           "shadow": [{"tag": "html", "children": [{"tag": "button"}, {"tag": "button"}]}]}
+           "shadow": [{"tag": "html", "children": [
+               {"tag": "button", "type": "button"}, {"tag": "button", "type": "button"}]}]}
 
 
 def census(html_children, extra_body=()):
@@ -72,11 +77,23 @@ def test_exact_live_overlay_is_the_only_exemption():
     assert census([OVERLAY, {"tag": "cs-native-frame-holder"}]) == {"site": False, "own": True}
 
 
-def test_overlay_contents_are_never_inspected_for_controls():
-    # Button labels changed between BrowserSkill versions; the census must not care.
-    renamed = {**OVERLAY, "shadow": [{"tag": "html", "children": [
-        {"tag": "button"}, {"tag": "input"}, {"tag": "a"}]}]}
-    assert census([renamed]) == {"site": False, "own": True}
+def test_overlay_button_labels_are_never_checked():
+    # Labels changed between BrowserSkill versions: only the element kind counts.
+    more = {**OVERLAY, "shadow": [{"tag": "html", "children": [
+        {"tag": "button", "type": "button"}, {"tag": "button", "type": "button"},
+        {"tag": "button", "type": "button"}, {"tag": "div"}, {"tag": "svg"}]}]}
+    assert census([more]) == {"site": False, "own": True}
+
+
+@pytest.mark.parametrize("acting", [
+    {"tag": "input"}, {"tag": "textarea"}, {"tag": "select"}, {"tag": "a"},
+    {"tag": "button"},                       # default type is submit
+    {"tag": "button", "type": "submit"},
+])
+def test_correctly_placed_overlay_with_a_non_button_control_still_gates(acting):
+    hostile = {**OVERLAY, "shadow": [{"tag": "html", "children": [
+        {"tag": "button", "type": "button"}, acting]}]}
+    assert census([hostile]) == {"site": True, "own": False}
 
 
 def test_site_shadow_host_still_gates_with_or_without_the_overlay():

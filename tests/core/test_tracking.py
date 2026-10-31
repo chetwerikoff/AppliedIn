@@ -1432,3 +1432,126 @@ def test_canonical_dynamo_condition_catches_guard_change_after_strong_read(
         job.pk, _CANONICAL_NEW, expected_row=observed)
     assert changed[0]
     assert store.get_current(job.pk)["reviewed_guard_generation"] == "new-review"
+
+
+# Issue #279: guarded grant replacement shared by both tracking backends.
+_G_OLD = {"value": "a", "source": "bank-auto", "form_selector": "", "form_action": ""}
+_G_NEW = {"value": "a", "source": "bank-auto", "form_selector": "#r", "form_action": "#s"}
+_G_OTHER = {"value": "z", "source": "dashboard"}
+
+
+def _grant_row(store, *, status="submitting", grants=None, **extra):
+    job = _synthetic_job("grant-cas")
+    assert store.put_new(job)
+    attrs = dict(extra)
+    if grants is not None:
+        attrs["human_approved_answers"] = grants
+    store.set_status(job.pk, Status(status), **attrs)
+    return job.pk
+
+
+def test_grant_replace_writes_only_the_new_key(repair_backend):
+    store = repair_backend
+    pk = _grant_row(store, grants={"k": dict(_G_OLD), "other": dict(_G_OTHER)})
+    before = deepcopy(store.get(pk))
+    assert store.replace_grants_if_unchanged(pk, {"k": _G_OLD}, {"k": _G_NEW})
+    after = store.get(pk)
+    assert after["human_approved_answers"] == {"k": _G_NEW, "other": _G_OTHER}
+    assert {k: v for k, v in after.items() if k != "human_approved_answers"} == {
+        k: v for k, v in before.items() if k != "human_approved_answers"}
+
+
+def test_grant_replace_creates_an_absent_key_and_map(repair_backend):
+    store = repair_backend
+    pk = _grant_row(store)
+    assert store.replace_grants_if_unchanged(pk, {"k": None}, {"k": _G_NEW})
+    assert store.get(pk)["human_approved_answers"] == {"k": _G_NEW}
+    assert not store.replace_grants_if_unchanged(pk, {"k": None}, {"k": _G_OLD})
+    assert store.get(pk)["human_approved_answers"] == {"k": _G_NEW}
+
+
+def test_grant_replace_writes_nothing_when_expected_changed(repair_backend):
+    store = repair_backend
+    pk = _grant_row(store, grants={"k": dict(_G_OLD), "other": dict(_G_OTHER)})
+    before = deepcopy(store.get(pk))
+    # concurrent change of the guarded key, of a guarded absent key, of a guard-only key
+    assert not store.replace_grants_if_unchanged(
+        pk, {"k": {**_G_OLD, "value": "b"}}, {"k": _G_NEW})
+    assert not store.replace_grants_if_unchanged(
+        pk, {"k": _G_OLD, "missing": dict(_G_OTHER)}, {"k": _G_NEW})
+    assert not store.replace_grants_if_unchanged(
+        pk, {"k": _G_OLD, "other": {**_G_OTHER, "value": "q"}}, {"k": _G_NEW})
+    assert not store.replace_grants_if_unchanged(
+        pk, {"k": None}, {"k": _G_NEW})
+    assert store.get(pk) == before
+
+
+@pytest.mark.parametrize("extra", [{"status": "tailored"}, {"possible_submission": True}])
+def test_grant_replace_needs_submitting_without_possible_submission(repair_backend, extra):
+    store = repair_backend
+    pk = _grant_row(store, status=extra.get("status", "submitting"),
+                    grants={"k": dict(_G_OLD)},
+                    **({"possible_submission": True} if "possible_submission" in extra else {}))
+    before = deepcopy(store.get(pk))
+    assert not store.replace_grants_if_unchanged(pk, {"k": _G_OLD}, {"k": _G_NEW})
+    assert store.get(pk) == before
+
+
+def test_grant_replace_rejects_unguarded_or_malformed_input(repair_backend):
+    store = repair_backend
+    pk = _grant_row(store, grants={"k": dict(_G_OLD)})
+    for expected, new in (({"k": _G_OLD}, {"k": _G_NEW, "x": _G_NEW}), ({"k": _G_OLD}, {}),
+                          ({"k": _G_OLD}, {"k": "text"}), ({"k": "text"}, {"k": _G_NEW})):
+        with pytest.raises(ValueError):
+            store.replace_grants_if_unchanged(pk, expected, new)
+    assert store.get(pk)["human_approved_answers"] == {"k": _G_OLD}
+
+
+def test_grant_replace_missing_row_returns_false(repair_backend):
+    assert not repair_backend.replace_grants_if_unchanged(
+        "example-co#absent", {"k": None}, {"k": _G_NEW})
+
+
+def test_redis_grant_replace_loses_to_a_write_between_read_and_commit():
+    store = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    pk = _grant_row(store, grants={"k": dict(_G_OLD)})
+    original = store.r.pipeline
+    fired = []
+
+    def racing(*args, **kwargs):
+        pipe = original(*args, **kwargs)
+        real_get = pipe.get
+
+        def get(name, *a, **k):
+            value = real_get(name, *a, **k)
+            if name == f"app:{pk}" and not fired:
+                fired.append(1)
+                row = json.loads(value)
+                row["human_approved_answers"]["k"] = {**_G_OLD, "value": "raced"}
+                store.r.set(name, json.dumps(row))
+            return value
+        pipe.get = get
+        return pipe
+    store.r.pipeline = racing
+    assert not store.replace_grants_if_unchanged(pk, {"k": _G_OLD}, {"k": _G_NEW})
+    assert store.get(pk)["human_approved_answers"]["k"]["value"] == "raced"
+
+
+def test_dynamo_grant_replace_condition_catches_a_change_after_the_read(aws, monkeypatch):
+    make_applications_table()
+    store = TrackingStore("applications")
+    pk = _grant_row(store, grants={"k": dict(_G_OLD)})
+    stale = store.get_current(pk)
+    _write_competing_row(store, pk, {"human_approved_answers": {
+        "k": {**_G_OLD, "value": "raced"}}})
+    monkeypatch.setattr(store, "get_current", lambda _pk: stale)
+    assert not store.replace_grants_if_unchanged(pk, {"k": _G_OLD}, {"k": _G_NEW})
+    assert store.get(pk)["human_approved_answers"]["k"]["value"] == "raced"
+    # a status change after the read is refused by the same condition
+    _write_competing_row(store, pk, {"human_approved_answers": {"k": dict(_G_OLD)}})
+    monkeypatch.undo()
+    stale = store.get_current(pk)
+    _write_competing_row(store, pk, {"status": "needs_human"})
+    monkeypatch.setattr(store, "get_current", lambda _pk: stale)
+    assert not store.replace_grants_if_unchanged(pk, {"k": _G_OLD}, {"k": _G_NEW})
+    assert store.get(pk)["human_approved_answers"] == {"k": _G_OLD}

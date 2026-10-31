@@ -1546,6 +1546,9 @@ def resume_job(pk: str, answer: str, stores: Any = None, *,
                    else {}),
                 **({'visible_text': observed['visible_text']}
                    if observed['type'] == 'checkbox' else {}),
+                **({'control_identity': observed['control_identity']}
+                   if observed['type'] == 'checkbox'
+                   and observed.get('control_identity') else {}),
                 **({'radio_name': observed['radio_name'],
                     'radio_members': observed['radio_members']}
                    if observed['type'] == 'radio' else {}),

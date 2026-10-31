@@ -311,6 +311,16 @@ class Gate(ValueError):
             r'defect_[a-z][a-z0-9_]{0,63}', reason) else 'unknown_field')
 
 
+class PreSubmitGate(Gate):
+    """One sanitized, numbered substantive refusal before committing IPC."""
+
+    def __init__(self, item: int, message: str):
+        if item not in {1, 2, 3, 4, 5}:
+            raise ValueError('Invalid pre-Submit item')
+        super().__init__(message, reason=f'defect_pre_submit_item_{item}')
+        self.item = item
+
+
 class NavigationProvenanceGate(Gate):
     """Owner-only routing evidence; never place its message in ordinary telemetry."""
 
@@ -6365,9 +6375,7 @@ class ApplicationIPCController:
         staged = _protected_resume_snapshot(resume_path) if seal_stage else resume_path
         self.resume_path = str(Path(staged).resolve()) if staged else ''
         self.facts, self.history = facts, history
-        self.filled = _ApprovedFormValues(
-            filled, pk, facts, fixture_context=fixture_context,
-            provenance=verified_redirect or entry_provenance)
+        self.filled = filled
         self.step, self.mark_click_started = step, mark_click_started
         self.fixture_context = fixture_context
         self.verified_redirect = verified_redirect
@@ -6576,280 +6584,71 @@ class ApplicationIPCController:
                     return True
         return False
 
+
     async def before_ipc(self, session, args: tuple, kwargs: dict) -> None:
+        """Classify only committing IPC; all other form actions are preparation."""
         if not args or not isinstance(args[0], str) or self.committed:
-            raise Gate('Application IPC already committed or has no classified action.')
+            raise Gate('Application IPC unavailable after a committing attempt.')
         op = args[0]
         if self.upload_pending:
-            raise Gate('An in-flight PDF upload has not settled; no mutation is safe.')
+            raise Gate('A prior upload has not settled.')
         if op == 'navigate':
-            if len(args) != 2 or kwargs:
-                raise Gate('Unknown application navigation IPC arguments.')
+            if len(args) != 2 or kwargs or not isinstance(args[1], str):
+                raise Gate('Unknown application navigation operation.')
             self._fresh_preparation(self.url, initial_navigation=True)
-            if (not (_job_preparation_route(
-                         args[1], self.url, provenance=self.greenhouse_provenance,
-                         pk=self.pk, company=self.company,
-                         fixture_context=self.fixture_context)
-                     or self._verified_redirect_url(args[1]))
-                    or _committing_get_route(args[1])):
-                raise Gate('Unknown, executable or committing GET navigation is not preparation.')
+            if (not _job_preparation_route(
+                    args[1], self.url, provenance=self.greenhouse_provenance,
+                    pk=self.pk, company=self.company,
+                    fixture_context=self.fixture_context)
+                    and not self._verified_redirect_url(args[1])):
+                raise Gate('Navigation outside the tracked application route is forbidden.')
             return
         resume_set = (op == 'evaluate' and len(args) == 2 and not kwargs
                       and args[1] == self._resume_set_script())
         if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'} and not resume_set:
-            raise Gate('Raw application executable or effectful IPC is forbidden.')
-        page = await self._page(session)
-        self._fresh_preparation(page['url'])
-        observed = page.get('entry') or page.get('greenhouse') or {}
-        if (observed.get('helper_challenge') or any(
-                isinstance(frame, dict) and frame.get('status') in {
-                    'visible-recaptcha', 'visible-hcaptcha'}
-                for frame in observed.get('frames', []))):
-            raise CaptchaGate('Visible application challenge requires manual authentication.')
-        if self.entry_provenance is not None:
-            # Issue #214: an entry-admitted producer's fresh ENTRY_PAGE passes
-            # the same frame/response admission as every scoped read before
-            # any reversible effect. A missing entry census is malformed.
-            _entry_artifacts(page.get('entry'), self.entry_provenance)
-        if any(c.get('type') == 'password' for c in page.get('controls', [])):
-            raise Gate('Sign in yourself in the dedicated profile before private preparation.')
-        selector = args[1] if len(args) > 1 else None
-        targets = [item for item in page.get('controls', [])
-                   if item.get('selector') == selector and not item.get('disabled')]
+            raise Gate('Executable or unsupported raw application IPC is forbidden.')
         if resume_set:
-            if (self.upload_attempted or self.upload_pending
-                    or self.upload_identity is not None):
-                raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
-            receivers = [item for item in page.get('controls', [])
-                         if item.get('type') == 'file' and not item.get('disabled')
-                         and re.search(r'resume|résumé|cv', label(item), re.I)]
-            ats = (self.entry_provenance.ats if self.entry_provenance is not None
-                   else self._row().get('ats'))
-            if (ats != 'ashby' or len(receivers) != 1
-                    or receivers[0].get('selector') != _ASHBY_RESUME_SELECTOR):
-                raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
-            target = receivers[0]
-            if (target.get('submit') is True or target.get('navigates') is True
-                    or target.get('formaction') or target.get('commits_application')):
-                raise Gate('A submission-capable upload receiver is not reversible preparation.')
-            # Identity is recorded only after the input reads back the row PDF.
+            if self.upload_attempted:
+                raise Gate('The staged PDF was already uploaded in this attempt.')
             self._resume_set_identity = self._row_pdf()
-            self.upload_attempted = True
+            self.upload_attempted = self.upload_pending = True
             self.upload_completed = False
-            self.upload_pending = True
             return
         if op == 'upload':
-            if self.upload_attempted:
-                raise Gate('The row PDF upload was already attempted; no blind repeat is safe.')
-            file_target = targets[0] if len(targets) == 1 else None
-            if (len(args) != 4 or args[2] != '--file'
+            if (self.upload_attempted or len(args) != 4 or args[2] != '--file'
+                    or not isinstance(args[3], str)
                     or str(Path(args[3]).resolve()) != self.resume_path
-                    or kwargs != {'timeout': 130}
-                    or not file_target or file_target.get('type') != 'file'
-                    or not re.search(r'resume|résumé|cv', label(file_target), re.I)):
-                raise Gate('Only this row’s exact protected PDF file input may be uploaded.')
-            if (file_target.get('submit') is True or file_target.get('navigates') is True
-                    or file_target.get('formaction')
-                    or file_target.get('commits_application')):
-                raise Gate('A submission-capable upload receiver is not reversible preparation.')
+                    or kwargs != {'timeout': 130}):
+                raise Gate('Only the staged row PDF may be uploaded once.')
             self.upload_identity = self._row_pdf()
-            self.upload_attempted = True
+            self.upload_attempted = self.upload_pending = True
             self.upload_completed = False
-            self.upload_pending = True
             return
-        if op in {'fill', 'select'}:
-            if (len(targets) != 1 or len(args) != 4 or args[2] != '--value'
-                    or not isinstance(args[3], str) or kwargs):
-                raise Gate('A unique approved form value receiver is required.')
-            target = targets[0]
-            if (target.get('submit') is True or target.get('navigates') is True
-                    or target.get('formaction')
-                    or target.get('commits_application')):
-                raise Gate('A submission-capable data receiver is not reversible preparation.')
-            if op == 'fill' and target.get('type') not in {
-                    'text', 'email', 'tel', 'date', 'textarea', 'combobox'}:
-                raise Gate('A non-text receiver cannot be filled.')
-            if (_formless_root(page) and not _formless_root(page).get('root')
-                    and self._row().get('ats') in _APPLICATION_ENTRY):
-                page, target = await self._reversible_receiver(session, page, target)
-            if op == 'select':
-                if target.get('tag') != 'select':
-                    raise Gate('A native select is required.')
-                matches = [o for o in target.get('options') or [] if o.get('value') == args[3]]
-                if len(matches) != 1:
-                    raise Gate('The selected form-own option is ambiguous.')
-                self._approved(page, target, matches[0]['label'])
-            else:
-                self._approved(page, target, args[3])
+        # No value, widget, grant, fact source, model action or side-effect gate
+        # is placed on fill/select/choose/focus/blur/ordinary clicks here.
+        if op not in {'click', 'press'}:
             return
-        if op in {'press', 'focus'}:
-            if (op == 'press' and args == ('press', 'Escape') and not kwargs
-                    and self._material_witness_close_request
-                    == self._material_witness_selector
-                    and self._material_witness_target is not None):
-                owner = [c for c in page['controls']
-                         if c.get('selector') == self._material_witness_selector]
-                if (len(owner) != 1 or
-                        any(owner[0].get(k) != v
-                            for k, v in self._material_witness_target.items())
-                        or not _preparation_destination_allowed(
-                            page['url'], self.url)):
-                    raise Gate('The material witness control or origin changed.')
-                return
-            raise Gate('Keyboard or focus IPC lacks a safe application effect classification.')
-        if len(args) != 2 or kwargs:
-            raise Gate('Unknown application click IPC arguments.')
-        if selector in {c.get('selector') for c in observed.get('root_evidence') or []
-                        if isinstance(c, dict) and c.get('dropzone') is True}:
-            raise Gate('The clicked application control or option is not current.')
-        if self._hidden_label_fallback:
-            self._hidden_label_fallback = False
-            candidates = [c for c in page.get('controls', [])
-                          if c.get('ashby_hidden_choice') is True
-                          and c.get('associated_label_selector') == selector]
-            if (op != 'click' or len(args) != 2 or kwargs or len(candidates) != 1
-                    or candidates[0].get('checked') is True):
-                raise Gate('The hidden attestation label fallback is no longer valid.')
-            # The independent ENTRY census must still certify this exact,
-            # non-navigating label. A stale PAGE choice cannot grant a label click.
-            evidence = (page.get('entry') or {}).get('root_evidence') or []
-            matches = [e for e in evidence if isinstance(e, dict)
-                       and e.get('selector') == candidates[0]['selector']]
-            if (len(matches) != 1
-                    or matches[0].get('ashby_hidden_choice') is not True
-                    or matches[0].get('label_selector') != selector):
-                raise Gate('The hidden attestation label lacks safe independent evidence.')
-            page, choice = await self._reversible_receiver(session, page, candidates[0])
-            approved = _approved_native_choice(
-                page, choice, self.pk, fixture_context=self.fixture_context)
-            if not approved or approved[0] != 'yes':
-                raise Gate('The associated label has no exact owner yes grant.')
+        page = await self._page(session)
+        target = None
+        if op == 'click' and len(args) == 2 and not kwargs:
+            matching = [c for c in page.get('controls', [])
+                        if c.get('selector') == args[1]]
+            if len(matching) == 1 and (is_submission(matching[0])
+                                       or native_submit(matching[0])):
+                target = matching[0]
+        elif op == 'press' and len(args) == 2 and not kwargs:
+            if args[1] in {'Enter', 'Return'} and any(
+                    c.get('in_form') for c in page.get('controls', [])):
+                submits = [c for c in page['controls'] if c.get('in_form')
+                           and (is_submission(c) or native_submit(c))]
+                if len(submits) != 1:
+                    raise PreSubmitGate(1, 'The form has no unique implicit Submit receiver.')
+                target = submits[0]
+        if target is None:
             return
-        if not targets:
-            if self._choice(page, selector):
-                return
-            raise Gate('The clicked application control or option is not current.')
-        if len(targets) != 1:
-            raise Gate('Ambiguous application click; no IPC.')
-        target = targets[0]
-        if (target.get('tag') == 'button' and target.get('type') == 'button'
-                and str(target.get('label') or '').casefold() in {'yes', 'no'}
-                and _formless_root(page)
-                and self._row().get('ats') == 'ashby'):
-            if not _formless_root(page).get('root'):
-                page, target = await self._reversible_receiver(session, page, target)
-            else:
-                _boolean_pair(page, target)
-            if not _unanswered(page, target):
-                raise Gate('The Boolean answer has already been selected.',
-                           reason='defect_button')
-            approved = _approved_boolean_pair(page, target, self.pk,
-                                              fixture_context=self.fixture_context)
-            if not approved or approved[1].get('selector') != selector:
-                raise Gate('The clicked Boolean is not the witnessed owner choice.',
-                           reason='defect_button')
-            return
-        # Explicitly submitting/navigating choices are never ordinary selection
-        # writes. They reach the single full guard rather than bypassing it by role.
-        if ((target.get('tag') in {'input', 'button'}
-             and target.get('native_type') in {'submit', 'image'})
-                or target.get('submit') is True or target.get('navigates') is True
-                or target.get('formaction') or target.get('commits_application')):
-            await self._final_submit_with_evidence(session, page, target)
-            self.committed = True
-            self.mark_click_started()
-            return
-        if target.get('type') in {'radio', 'checkbox'}:
-            if _group_uncheck_allowed(page, target, self.pk,
-                                      fixture_context=self.fixture_context):
-                return
-            if (_formless_root(page) and not _formless_root(page).get('root')
-                    and self._row().get('ats') in _APPLICATION_ENTRY):
-                page, target = await self._reversible_receiver(session, page, target)
-            approved = _approved_native_choice(page, target, self.pk,
-                                               fixture_context=self.fixture_context)
-            if not approved or approved[1].get('selector') != selector:
-                raise Gate('The clicked radio/checkbox is not the exact approved answer.')
-            return
-        if target.get('type') == 'combobox':
-            # The preceding sole commit classification owns submit/form overrides.
-            if target.get('href'):
-                raise Gate('A navigating combobox cannot be opened.')
-            if (_material_assent_match(label(target))
-                    and (target.get('combobox') or {}).get('linked') is False):
-                combo = target.get('combobox') or {}
-                if (self._material_witness_request != selector
-                        or not isinstance(self._material_witness_expected, dict)
-                        or any(target.get(k) != v
-                               for k, v in self._material_witness_expected.items())
-                        or combo.get('options') not in (None, [])
-                        or combo.get('link_id') not in ('', None)
-                        or combo.get('listbox_selector') not in ('', None)
-                        or target.get('commits_application')
-                        or target.get('in_form') is not True
-                        or not target.get('form_action')
-                        or self._material_witness_selector is not None):
-                    raise Gate('The closed combobox linkage is incomplete or ambiguous.')
-                # Fresh fixed witness and safe owning form are mandatory at
-                # the last raw effect boundary, not merely at bootstrap.
-                controller = self
-                class RawWitnessReader:
-                    async def page(self):
-                        return await controller._page(session)
-
-                    async def call(self, *request):
-                        if request == ('evaluate', _FIXED_CONTROL_WITNESS):
-                            script = (_GREENHOUSE_FIXED_CONTROL_WITNESS
-                                      if controller._row().get('ats') == 'greenhouse'
-                                      else _FIXED_CONTROL_WITNESS)
-                            return await session.call('evaluate', script)
-                        raise Gate('Only the fixed control witness may be read.')
-                current, proof = await _observe_controls(
-                    RawWitnessReader(), page, site='material-resume-open')
-                matches = [c for c in current['controls']
-                           if c.get('selector') == selector and not c.get('disabled')]
-                if len(matches) != 1:
-                    raise Gate('The material witness control changed before raw click.')
-                actual = matches[0]
-                _disclosure_question(current, actual, proof, self.url,
-                                     closed_witness=True)
-                self._material_witness_target = {
-                    k: v for k, v in actual.items() if k != 'combobox'}
-                self._material_witness_selector = selector
-                return
-            key = _key(page, target)
-            if _material_form_choice(target):
-                answer = _material_exact_value(
-                    self.pk, page, target, {'label': key},
-                    fixture_context=self.fixture_context)
-            else:
-                answer_key = _fact_key(self.facts, key)
-                if answer_key is None:
-                    raise Gate('Opening the picker requires an existing approved answer.')
-                answer = str(self.facts[answer_key]).strip()
-            self._approved(page, target, answer)
-            return
-        text = target.get('label') or ''
-        known_submit = (native_submit(target) or target.get('type') in {'submit', 'image'}
-                        or target.get('submit') is True
-                        or bool(re.search(r'\bsubmit(?: application)?\b|send application|'
-                                          r'finish application|complete application', text, re.I)))
-        if (known_submit or self._private_content(page)
-                or any(r.get('action') == 'choose' and r.get('type') == 'button'
-                       for r in self.history)):
-            await self._final_submit_with_evidence(session, page, target)
-            self.committed = True
-            self.mark_click_started()
-            return
-        # Owner-approved pre-private JS Apply/Continue may navigate on the
-        # current allowed origin, but a known native/explicit Submit never can.
-        if (not _NAVIGATION.match(text) or
-                (target.get('href') and not _job_preparation_route(
-                    target['href'], self.url, pk=self.pk, company=self.company,
-                    fixture_context=self.fixture_context))
-                or target.get('formaction')):
-            raise Gate('Unclassified application click could commit; no IPC.')
-        return
+        await self.check_pre_submit(session, page, target)
+        self.committed = True
+        self.mark_click_started()
 
     async def after_ipc(self, session, args: tuple, kwargs: dict, *,
                         succeeded: bool) -> None:
@@ -6881,155 +6680,183 @@ class ApplicationIPCController:
                 self.upload_identity = identity
                 self.upload_completed = True
 
+
     async def _final_submit_with_evidence(self, session, page: dict, target: dict) -> None:
-        # Issue #228: live resumed Ashby rows met the PDF refusal below with no
-        # upload in the run, and nothing recorded which click got there. The
-        # final guard stays byte-pinned, so its evidence is logged out here.
-        # Structure only: known names and booleans, never values.
-        hidden_attestations = [c for c in page.get('controls', [])
-                               if c.get('ashby_hidden_choice') is True]
-        for choice in hidden_attestations:
-            # An optional unanswered or skipped box remains unchecked. Only a
-            # checked attestation needs an exact current yes grant at Submit.
-            if choice.get('checked') is not True:
+        """Compatibility seam: delegate to the sole fresh pre-Submit check."""
+        await self.check_pre_submit(session, page, target)
+
+
+    async def check_pre_submit(self, session, page: dict, target: dict) -> None:
+        """The only substantive pre-Submit decision at raw application IPC.
+
+        Five item failures stop before IPC; the sixth, uncertain outcome, is
+        decided after a possibly committing effect by the unchanged caller.
+        """
+        from copy import deepcopy
+        from core.ids import make_pk
+        from tools import posting_guard as pg
+
+        if self.committed:
+            raise PreSubmitGate(1, 'A potentially submitted application cannot be retried.')
+        try:
+            check_dispatch(self.pk, self.resume_path, **self._ctx())
+            row = deepcopy(self._row())
+            if (row.get('pk') != self.pk or row.get('company') != self.company
+                    or row.get('jd_url') != self.url
+                    or not isinstance(row.get('job_id'), str)
+                    or make_pk(self.company, row['job_id']) != self.pk):
+                raise Gate('Tracked job identity changed.')
+            fresh_alias = None
+            if (row.get('ats') in {*_APPLICATION_ENTRY, 'greenhouse'}
+                    or urlsplit(page['url']).hostname in {'job-boards.greenhouse.io',
+                        *(host for host, _ in _APPLICATION_ENTRY.values())}
+                    or greenhouse_alias_candidate(self.url)):
+                fresh_alias = _configured_alias(self.pk, self.company, self.url,
+                                                 fixture_context=self.fixture_context)
+                if (not fresh_alias
+                        or not _alias_current(fresh_alias,
+                                              fixture_context=self.fixture_context)
+                        or not navigation_allowed(page['url'], provenance=fresh_alias)):
+                    raise Gate('ATS tenant is not the approved tracked job.')
+            elif not (navigation_allowed(page['url'], self.url)
+                      or self._verified_redirect_url(page['url'])):
+                raise Gate('The final page is not on the tracked employer origin.')
+            if target.get('in_form'):
+                owners = {c.get('form_selector') for c in page.get('controls', [])
+                          if native_submit(c) and c.get('in_form')}
+                if owners and (len(owners) != 1
+                               or target.get('form_selector') not in owners):
+                    raise Gate('The final Submit has competing form owners.')
+                if not target.get('form_action'):
+                    raise Gate('The final form receiver is missing.')
+                for receiver in (target.get('form_action'), target.get('formaction')):
+                    if receiver and not (navigation_allowed(
+                            receiver, self.url, provenance=fresh_alias)
+                            or self._verified_redirect_url(receiver)):
+                        raise Gate('The final receiver is off the tracked ATS.')
+            observed_id = ''
+            host, path = urlsplit(page['url']).hostname, urlsplit(page['url']).path
+            if host in {'jobs.ashbyhq.com', 'jobs.lever.co'}:
+                match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
+                observed_id = match.group(1) if match else ''
+            elif host == 'job-boards.greenhouse.io':
+                match = re.search(r'/jobs/([0-9]+)(?:/|$)', path)
+                observed_id = match.group(1) if match else ''
+            if scoped_identity_conflict(
+                    page, target.get('form_selector') if target.get('in_form')
+                    else (_formless_root(page) or {}).get('container'),
+                    row['job_id'], self.company):
+                raise Gate('Visible final job identity contradicts the tracked job.')
+            if observed_id:
+                if observed_id != row['job_id']:
+                    raise Gate('Final job identifier differs from the tracked job.')
+            elif (not isinstance(page.get('title'), str)
+                  or not isinstance(row.get('title'), str)
+                  or page['title'].strip() != row['title'].strip()):
+                raise Gate('The current final job title is not the tracked role.')
+        except Gate:
+            raise PreSubmitGate(1, 'Tracked job, tenant, form or duplicate proof is unavailable.') from None
+
+        try:
+            if (not self.upload_completed
+                    or self.upload_identity != self._row_pdf()):
+                raise Gate('Staged PDF upload is not current.')
+            if _formless_root(page):
+                _formless_boundary(page, fresh_alias)
+            check_form(page, self.filled, True, Path(self.resume_path).name)
+        except Gate:
+            raise PreSubmitGate(2, 'The exact staged PDF or final form readback is incomplete.') from None
+
+        for field in page.get('controls', []):
+            subject = label(field)
+            if not _SENSITIVE.search(subject):
+                continue
+            if field.get('type') in {'radio', 'checkbox'}:
+                answer = field.get('label') if field.get('checked') else ''
+            elif field.get('tag') == 'select':
+                matches = [o for o in field.get('options') or []
+                           if o.get('value') == field.get('value')]
+                answer = matches[0].get('label', '') if len(matches) == 1 else ''
+            else:
+                answer = field.get('value') or ''
+            if not str(answer).strip():
                 continue
             try:
-                exact_approval(self.pk, _key(page, choice), 'yes',
-                               target=_bound_target(page, choice),
-                               url=page['url'], **self._ctx())
+                guarded_value(field, str(answer))
             except Gate:
-                raise Gate('An unapproved hidden application attestation blocks Submit.',
-                           reason='owner_question') from None
-        try:
-            await self.authorize_final_submit(session, page, target)
-        except Gate as refusal:
-            if not str(refusal).startswith('This row’s protected tailored PDF has not been verified.'):
-                raise
-            kinds = {'input', 'button', 'textarea', 'select', 'a', 'div', 'span',
-                     'text', 'email', 'tel', 'url', 'number', 'date', 'file', 'submit',
-                     'image', 'radio', 'checkbox', 'combobox'}
-            try:
-                identity_match = self.upload_identity == self._row_pdf()
-            except Gate:
-                identity_match = 'unavailable'
-            _LOG.info('final pdf guard pk=%s attempted=%s completed=%s pending=%s '
-                      'identity_match=%s target=%s/%s submit_control=%s private=%s '
-                      'upload_tree_member=%s label_class=%s',
-                      self.pk, self.upload_attempted, self.upload_completed,
-                      self.upload_pending, identity_match,
-                      target.get('tag') if target.get('tag') in kinds else 'other',
-                      target.get('type') if target.get('type') in kinds else 'other',
-                      is_submission(target) or native_submit(target),
-                      self._private_content(page),
-                      _upload_tree_member(page, target.get('selector')),
-                      _label_class(target))
-            raise
+                raise PreSubmitGate(3, 'A protected-characteristic answer is not a decline.') from None
 
-    async def authorize_final_submit(self, session, page: dict, target: dict) -> None:
-        """The ONE full authoritative pre-Submit decision at raw click IPC."""
-        if self.committed:
-            raise Gate('A possibly committing application click cannot be repeated.')
-        if self.upload_pending:
-            raise Gate('A PDF upload is still in flight; no Submit is safe.')
-        from copy import deepcopy
-        from tools import posting_guard as pg
-        check_dispatch(self.pk, self.resume_path, **self._ctx())
-        # Store adapters and offline fixtures may reuse nested approval objects.
-        # Hold-time mutation must not rewrite the pre-hold comparison evidence.
-        row = deepcopy(self._row())
-        fresh_alias = None
-        if (row.get('pk') != self.pk or row.get('company') != self.company
-                or row.get('jd_url') != self.url):
-            raise Gate('Current tracked job identity changed; no Submit.')
-        # Tenant/pin equality is checked only here, not at application entry.
-        if (row.get('ats') in {*_APPLICATION_ENTRY, 'greenhouse'}
-                or urlsplit(page['url']).hostname in {'job-boards.greenhouse.io',
-                    *(host for host, _ in _APPLICATION_ENTRY.values())}
-                or greenhouse_alias_candidate(self.url)):
-            fresh_alias = _configured_alias(self.pk, self.company, self.url,
-                                            fixture_context=self.fixture_context)
-            if not fresh_alias or not _alias_current(fresh_alias,
-                                                      fixture_context=self.fixture_context):
-                raise Gate('The current job/ATS tenant or board cannot be verified for Submit.',
-                           reason='defect_tenant')
-            if not navigation_allowed(page['url'], provenance=fresh_alias):
-                raise Gate('Final form is on a different job/ATS tenant; no Submit.')
-        elif not (navigation_allowed(page['url'], self.url)
-                  or self._verified_redirect_url(page['url'])):
-            raise Gate('Final form is outside the tracked employer job origin.')
-        if target.get('in_form'):
-            # Multiple native Submit owners on one page are ambiguous final
-            # submission evidence, not a reason to gate earlier preparation.
-            owners = {c.get('form_selector') for c in page.get('controls', [])
-                      if native_submit(c) and c.get('in_form')}
-            if owners and (len(owners) != 1 or target.get('form_selector') not in owners):
-                raise Gate('Competing native Submit owners require an exact final form.')
-            if not target.get('form_action'):
-                raise Gate('Final submit receiver is missing; inspect the form before Submit.')
-            for receiver in (target.get('form_action'), target.get('formaction')):
-                if receiver and not (navigation_allowed(
-                        receiver, self.url, provenance=fresh_alias)
-                        or self._verified_redirect_url(receiver)):
-                    raise Gate('Final submit receiver is outside the tracked job/ATS tenant; no Submit.')
-        from core.ids import make_pk
-        if (not isinstance(row.get('job_id'), str) or
-                make_pk(self.company, row['job_id']) != self.pk):
-            raise Gate('Current canonical job ID changed before Submit.')
-        host, path = urlsplit(page['url']).hostname, urlsplit(page['url']).path
-        observed_id = ''
-        if host == 'jobs.ashbyhq.com':
-            match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
-            observed_id = match.group(1) if match else ''
-        elif host == 'job-boards.greenhouse.io':
-            match = re.search(r'/jobs/([0-9]+)(?:/|$)', path)
-            observed_id = match.group(1) if match else ''
-        elif host == 'jobs.lever.co':
-            match = re.search('/(' + _JOB_UUID.pattern + r')(?:/|$)', path, re.I)
-            observed_id = match.group(1) if match else ''
-        conflict = scoped_identity_conflict(
-            page, target.get('form_selector') if target.get('in_form') else
-            (_formless_root(page) or {}).get('container'), row['job_id'], self.company)
-        if conflict:
-            raise Gate('Final page exposes a contradictory visible ' + conflict + '; no Submit.')
-        if observed_id:
-            if observed_id != row['job_id']:
-                raise Gate('Final page exposes a contradictory job ID; no Submit.')
-        else:
-            # Deliberately non-unique owner-approved title fallback.
-            if (not isinstance(page.get('title'), str)
-                    or not isinstance(row.get('title'), str)
-                    or page['title'].strip() != row['title'].strip()):
-                raise Gate('Wrong or missing exact final job title/identity; inspect before Submit.')
-        if not self.upload_completed or self.upload_identity != self._row_pdf():
-            raise Gate('This row’s protected tailored PDF has not been verified.')
-        if _formless_root(page):
-            _formless_boundary(page, fresh_alias)
-        check_form(page, self.filled, True, Path(self.resume_path).name, self.history)
-        check_approvals(self.pk, self.history, page, **self._ctx())
+        # Use only explicit comparable amount/currency/period literals. A model
+        # guess or a mismatched unit does not establish an owner-approved floor.
+        floor = next((f'{k} {v}' for k, v in self.facts.items()
+                      if re.search(r'minimum (?:salary|compensation|pay)|'
+                                   r'(?:salary|compensation) floor', k, re.I)
+                      and isinstance(v, (str, int, float)) and str(v).strip()), '')
+        salary_fields = [c for c in page.get('controls', [])
+                         if re.search(r'\b(?:salary|compensation|pay expectation|'
+                                      r'remuneration|wage)\b', label(c), re.I)
+                         and str(c.get('value') or '').strip()]
+        def parse_salary(raw):
+            currency = re.search(r'\b(?:USD|EUR|GBP|VND)\b|[$€£₫]', raw, re.I)
+            period = re.search(r'\b(?:annual|annually|year|yearly|yr|'
+                               r'month|monthly|mo|hour|hourly|hr)\b', raw, re.I)
+            amount = re.search(r'\b(\d{2,3}(?:,\d{3})+|\d{4,9}|'
+                               r'\d{2,3}(?:\.\d+)?)\s*([kKmM])?\b', raw)
+            if not currency or not period or not amount:
+                return None
+            cur = {'$': 'USD', '€': 'EUR', '£': 'GBP', '₫': 'VND'}
+            code = cur.get(currency.group().upper(), currency.group().upper())
+            unit = period.group().lower()
+            unit = ('year' if unit in {'annual','annually','year','yearly','yr'}
+                    else 'month' if unit in {'month','monthly','mo'} else 'hour')
+            number = float(amount.group(1).replace(',', ''))
+            if amount.group(2):
+                number *= 1000 if amount.group(2).lower() == 'k' else 1000000
+            return code, unit, number
+        for field in salary_fields:
+            stated = parse_salary(label(field) + ' ' + str(field['value']))
+            minimum = parse_salary(floor) if floor else None
+            if not stated or not minimum or stated[:2] != minimum[:2]:
+                raise PreSubmitGate(4, 'A comparable owner salary floor is required.')
+            if stated[2] < minimum[2]:
+                raise PreSubmitGate(4, 'The stated salary is below the owner floor.')
+
+        for field in page.get('controls', []):
+            if not _SANCTIONS_RX.search(label(field)):
+                continue
+            if field.get('type') in {'radio', 'checkbox'}:
+                caption = str(field.get('label') or '') if field.get('checked') else ''
+            elif field.get('tag') == 'select':
+                chosen = [o.get('label') for o in field.get('options') or []
+                          if o.get('value') == field.get('value')]
+                caption = str(chosen[0]) if len(chosen) == 1 else ''
+            else:
+                caption = ''
+            if caption and not _SAFE_OPTION_RX.match(caption):
+                raise PreSubmitGate(5, 'The checked restricted-country answer is not a safe decline.')
+
+        # Own hold is acquired only after all five items pass. It is not prior
+        # submission evidence. Preserve the existing post-hold drift checks.
         expected_page = (_page_identity(page), page.get('title'))
-        # No independent or stale permission token: recheck this same invocation
-        # against a durable possible-submit hold, then validate own state.
         self.step['last_button'] = target.get('label', '')
         hold_possible_submission(self.pk, self.step, **self._ctx())
         check_before_committing_click(self.pk, **self._ctx())
         current_page = await self._page(session)
         if (_page_identity(current_page), current_page.get('title')) != expected_page:
-            raise Gate('Final application form or submit receiver changed before submit; inspect it.')
+            raise Gate('Final application form changed after the own hold; inspect manually.')
         latest = self._row()
         if (latest.get('pk') != self.pk or latest.get('company') != self.company
                 or latest.get('job_id') != row.get('job_id')
                 or latest.get('jd_url') != row.get('jd_url')
                 or latest.get('ats') != row.get('ats')
                 or latest.get('resume_seed') != row.get('resume_seed')
-                or latest.get('human_approved_answers') != row.get('human_approved_answers')
                 or latest.get('possible_submission')
                 or latest.get('status') != 'needs_human'
                 or latest.get('gate_reason') != 'submit_uncertain'):
-            raise Gate('Current row, approval, seed or own post-hold status drifted; no Submit.')
+            raise Gate('Current tracked row changed after the own submission hold.')
         if fresh_alias is not None and not _alias_current(
                 fresh_alias, fixture_context=self.fixture_context):
-            raise Gate('The job/ATS tenant or board changed after the hold; no Submit.',
-                       reason='defect_tenant')
+            raise Gate('ATS tenant changed after the own submission hold.')
         if self.fixture_context is None:
             from core.stores import make_stores
             from core.apply_queue import ApplyQueue
@@ -7039,12 +6866,11 @@ class ApplicationIPCController:
             if (_duplicate_refusal(self.pk) or self.pk not in queue.in_flight()
                     or self.company.strip().lower() not in queue.depth()['running']
                     or not pg.authorised(tracking.get_current(self.pk) or {})):
-                raise Gate('Duplicate, company lease or reviewed posting generation changed.')
-        else:
-            if not self.fixture_context.is_held(self.pk):
-                raise Gate('Own submission hold vanished before IPC.')
+                raise Gate('Duplicate, lease or posting generation changed before raw Submit.')
+        elif not self.fixture_context.is_held(self.pk):
+            raise Gate('Own submission hold vanished before IPC.')
         if self.upload_identity != self._row_pdf():
-            raise Gate('Row PDF bytes changed before the final raw click.')
+            raise Gate('Staged PDF bytes changed after the own submission hold.')
 
 async def _effect_call(raw, *args, **kwargs):
     # Only the real application Session exposes this guarded transport. Offline
@@ -7599,7 +7425,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                     step, mark_click_started, fixture_context=ctx)
                                 offline_guard.upload_completed = uploaded
                                 offline_guard.upload_identity = offline_guard._row_pdf()
-                                await offline_guard.authorize_final_submit(session, page, target)
+                                await offline_guard.check_pre_submit(session, page, target)
                                 mark_click_started()
                                 await session.call('click', target['selector'])
                             else:

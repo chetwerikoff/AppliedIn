@@ -939,8 +939,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                     guarded_value(target, answer)
                 elif target.get('type') == 'radio':
                     group = _radio_group(page, target)
-                    matches = [c for c in group
-                               if _same(answer, c['label']) or _same(answer, c['value'])]
+                    matches = _radio_answer_matches(group, answer)
                     if (len(matches) != 1 or matches[0]['selector'] != target['selector']
                             or not target.get('checked')
                             or sum(bool(c.get('checked')) for c in group) != 1):
@@ -1271,8 +1270,18 @@ def _final_exact_grant(page: dict, target: dict, answer: str,
         if not isinstance(stored_answer, str) or not stored_answer.strip():
             raise Gate('An exact human-approved answer is needed for this control.')
         if typ == 'radio':
-            if not (_same(stored_answer, target.get('label', ''))
-                    or _same(stored_answer, target.get('value', ''))):
+            members = _radio_group(page, target)
+            if _implicit_on_radios(members):
+                selected = [c for c in members if c.get('checked') is True]
+                approved = _radio_answer_matches(members, stored_answer)
+                if (len(selected) != 1 or len(approved) != 1
+                        or selected[0]['selector'] != target.get('selector')
+                        or approved[0]['selector'] != target.get('selector')
+                        or _same_key(approved[0]['label'])
+                           != _same_key(target.get('label', ''))):
+                    raise Gate('The native selected member is not the approved answer.')
+            elif not (_same(stored_answer, target.get('label', ''))
+                      or _same(stored_answer, target.get('value', ''))):
                 raise Gate('The native selected member is not the approved answer.')
         elif typ == 'button':
             if not isinstance(answer, str) or not _same(stored_answer, answer):
@@ -3320,36 +3329,78 @@ async def _ashby_resume_upload(session, page: dict, *, resume_path: str,
             'uploaded': True}
 
 
+def _implicit_on_radios(members: list[dict]) -> bool:
+    """The HTML default 'on' is not a distinct native radio option value."""
+    return bool(members) and all(
+        c.get('tag') == 'input' and c.get('type') == 'radio'
+        and c.get('value_attr_present') is False and c.get('value') == 'on'
+        for c in members)
+
+
+def _radio_answer_matches(members: list[dict], answer: str) -> list[dict]:
+    """Without explicit values, only the distinct observed caption selects a member."""
+    if _implicit_on_radios(members):
+        return [c for c in members if _same(answer, c['label'])]
+    return [c for c in members
+            if _same(answer, c['label']) or _same(answer, c['value'])]
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
-    """One native form/name group, with distinct observed captions and values."""
+    """One complete native radio group; implicit 'on' requires distinct captions."""
     name, form = target.get('name'), target.get('form_selector')
     structural = _formless_root(page)
-    if (target.get('tag') != 'input' or target.get('type') != 'radio'
-            or not isinstance(name, str) or not name.strip()
-            or (not structural and (not isinstance(form, str) or not form.strip()))
-            or not isinstance(target.get('question'), str)
-            or not target['question'].strip()):
-        raise Gate('A native radio group needs a form, name and visible question.')
+
+    def refuse(predicate: str, message: str = (
+            'Radio group members or captions are incomplete or ambiguous.')) -> None:
+        # A public log names only the failed predicate, never page text or values.
+        _LOG.info('radio group failed predicate=%s', predicate)
+        raise Gate(message)
+
+    invalid_target = 'A native radio group needs a form, name and visible question.'
+    if target.get('tag') != 'input':
+        refuse('target.tag', invalid_target)
+    if target.get('type') != 'radio':
+        refuse('target.type', invalid_target)
+    if not isinstance(name, str) or not name.strip():
+        refuse('target.name', invalid_target)
+    if not structural and (not isinstance(form, str) or not form.strip()):
+        refuse('target.form', invalid_target)
+    if not isinstance(target.get('question'), str) or not target['question'].strip():
+        refuse('target.question', invalid_target)
     members = [c for c in page['controls']
                if c.get('type') == 'radio' and c.get('name') == name
                and c.get('form_selector') == form]
     if structural and not structural.get('root'):
-        # The group is all its members: silently filtering a foreign member
-        # would change the meaning of the owner's approved choice.
         for member in members:
-            _reversible_entry_recipient(page, member)
-    if (len(members) < 2 or any(
-            c.get('tag') != 'input' or (not structural and c.get('in_form') is not True)
-            or c.get('question') != target['question']
-            or c.get('form_action') != target.get('form_action')
-            or not isinstance(c.get('selector'), str) or not c['selector']
-            or not isinstance(c.get('label'), str) or not c['label'].strip()
-            or not isinstance(c.get('value'), str) or not c['value'].strip()
-            for c in members)
-            or len({c['selector'] for c in members}) != len(members)
-            or len({c['value'] for c in members}) != len(members)
-            or len({_same_key(c['label']) for c in members}) != len(members)):
-        raise Gate('Radio group members or captions are incomplete or ambiguous.')
+            try:
+                _reversible_entry_recipient(page, member)
+            except Gate:
+                _LOG.info('radio group failed predicate=%s', 'member.root')
+                raise
+    if len(members) < 2:
+        refuse('members.count')
+    for member in members:
+        if member.get('tag') != 'input':
+            refuse('member.tag')
+        if not structural and member.get('in_form') is not True:
+            refuse('member.in_form')
+        if member.get('question') != target['question']:
+            refuse('member.question')
+        if member.get('form_action') != target.get('form_action'):
+            refuse('member.form_action')
+        if not isinstance(member.get('selector'), str) or not member['selector']:
+            refuse('member.selector')
+        if not isinstance(member.get('label'), str) or not member['label'].strip():
+            refuse('member.label')
+        if not isinstance(member.get('value'), str) or not member['value'].strip():
+            refuse('member.value')
+    if len({c['selector'] for c in members}) != len(members):
+        refuse('selectors.distinct')
+    if len({_same_key(c['label']) for c in members}) != len(members):
+        refuse('captions.distinct')
+    if (len({c['value'] for c in members}) != len(members)
+            and not _implicit_on_radios(members)):
+        refuse('values.distinct')
     return members
 
 
@@ -3523,7 +3574,7 @@ def _bound_target(page: dict, target: dict) -> dict:
 
 
 def _bound_target_base(page: dict, target: dict) -> dict:
-    """Exact grant identity includes the entire choice pair on formless roots."""
+    """Exact choice grant includes the complete radio group on rooted Ashby too."""
     structural = _formless_root(page)
     if target.get('type') == 'button' and structural:
         members = _boolean_pair(page, target)
@@ -3535,16 +3586,22 @@ def _bound_target_base(page: dict, target: dict) -> dict:
                          form_selector=structural['root'],
                          form_action=structural['submit'])
         return bound
-    if structural and (structural.get('root') or target.get('in_form') is not False):
+    rooted = structural and (structural.get('root')
+                             or target.get('in_form') is not False)
+    if rooted and target.get('type') != 'radio':
         return {**target, 'owner_kind': 'ashby-formless-root',
                 'form_selector': structural['root'], 'form_action': structural['submit']}
     if target.get('type') != 'radio':
         return target
     members = _radio_group(page, target)
-    return {**members[0], 'radio_name': members[0]['name'],
-            'radio_members': [
-                {'selector': c['selector'], 'caption': c['label'], 'label': c['label'],
-                 'value': c['value']} for c in members]}
+    bound = {**members[0], 'radio_name': members[0]['name'],
+             'radio_members': [
+                 {'selector': c['selector'], 'caption': c['label'], 'label': c['label'],
+                  'value': c['value']} for c in members]}
+    if rooted:
+        bound.update(owner_kind='ashby-formless-root',
+                     form_selector=structural['root'], form_action=structural['submit'])
+    return bound
 
 
 def _non_receiver(candidate: dict) -> bool:
@@ -3896,8 +3953,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     answer = grant['value']
     if target['type'] == 'radio':
         members = _radio_group(page, target)
-        matches = [c for c in members
-                   if _same(answer, c['label']) or _same(answer, c['value'])]
+        matches = _radio_answer_matches(members, answer)
         if len(matches) != 1:
             raise Gate('The previously approved radio answer is ambiguous or changed.')
         selected = matches[0]
@@ -4645,6 +4701,8 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
     elif item.get('type') == 'radio':
         expected['radio_name'] = question.get('radio_name')
         expected['radio_members'] = question.get('radio_members')
+        expected['form_selector'] = question.get('form_selector')
+        expected['form_action'] = question.get('form_action')
     elif item.get('tag') == 'select':
         expected['options'] = item.get('options')
     elif item.get('type') == 'combobox' and _material_form_choice(item):
@@ -4831,8 +4889,11 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         if item.get('type') == 'radio':
             try:
                 members = _radio_group(page, item)
-                matches = [m for m in members if value.casefold() in {
-                    m['label'].casefold(), str(m.get('value') or '').casefold()}]
+                matches = (
+                    _radio_answer_matches(members, value)
+                    if _implicit_on_radios(members) else [
+                        m for m in members if value.casefold() in {
+                            m['label'].casefold(), str(m.get('value') or '').casefold()}])
                 if len(matches) != 1:
                     _bank_auto_log_skip(pk, item, 'radio_mismatch', key)
                     continue
@@ -5291,7 +5352,8 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                           and c.get('form_selector') == initial.get('form_selector')
                           and c.get('name') == initial.get('name')]
                          if kind == 'radio' and initial.get('name')
-                         and initial.get('form_selector') else [initial])
+                         and (initial.get('form_selector') or _formless_root(page))
+                         else [initial])
         required = (any(c.get('required') for c in radio_members)
                     if kind == 'radio' else bool(initial.get('required')))
         if not required:
@@ -5314,8 +5376,9 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         eligible = kind in _BOOTSTRAP_TYPES and (
             kind != 'select' or item.get('tag') == 'select')
         group = ((item.get('form_selector'), item.get('name'))
-                 if kind == 'radio' and item.get('form_selector')
-                 and item.get('name') else item['selector'])
+                 if kind == 'radio' and item.get('name')
+                 and (item.get('form_selector') or _formless_root(page))
+                 else item['selector'])
         if group in seen:
             continue
         if kind == 'radio' and radio_members[0] is not item:
@@ -6501,8 +6564,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 write_value = target['label'].casefold()
             else:
                 members = _radio_group(page, target)
-                chosen = [c for c in members
-                          if (_same(value, c['label']) or _same(value, c['value']))]
+                chosen = _radio_answer_matches(members, value)
                 if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
                     raise Gate('The selected radio does not match the exact owner answer.')
                 _guard_native_choice_answer(target, value)
@@ -6572,9 +6634,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                     raise Gate('The bound Boolean answer no longer matches this member.',
                                reason='defect_button')
             else:
-                matches = [c for c in _radio_group(latest, current)
-                           if (_same(value, c['label'])
-                               or _same(value, c['value']))]
+                matches = _radio_answer_matches(_radio_group(latest, current), value)
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
             _guard_native_choice_answer(current, value)
@@ -6582,7 +6642,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # off (live probe), so an exact prior press goes to readback.
             if not _boolean_already_chosen(latest, current):
                 await _effect_call(session, 'click', current['selector'])
-        if _formless_root(page):
+        if (_formless_root(page) or
+                (verb == 'choose' and current.get('type') == 'radio'
+                 and _implicit_on_radios(_radio_group(latest, current)))):
             readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
             if current['type'] == 'button':
@@ -6622,6 +6684,17 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                             or not isinstance(dom, dict)
                             or dom.get('checked') is not True):
                         raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
+            elif (current.get('type') == 'radio'
+                  and _implicit_on_radios(_radio_group(latest, current))):
+                # All members report the same IDL 'on'; prove this exact click.
+                group = _radio_group(readback, actual)
+                selected = [c for c in group if c.get('checked') is True]
+                if (not _implicit_on_radios(group) or len(selected) != 1
+                        or selected[0]['selector'] != current['selector']
+                        or _same_key(selected[0]['label'])
+                           != _same_key(current['label'])
+                        or not _same(value, actual.get('label', ''))):
+                    raise _readback_gate(pk, verb, current, actual, write_value, 'selected')
             elif actual.get('value') != write_value or not actual.get('has_value'):
                 raise _readback_gate(pk, verb, current, actual, write_value)
             # The DOM readback uses the machine value (e.g. "remote"), while

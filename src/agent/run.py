@@ -1202,10 +1202,9 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
 
 
 def _consume_direct_gate(pk: str, row: dict, stores: Any, *, skip: bool = False,
-                         grant: tuple[str, dict] | None = None,
                          bank: tuple | None = None,
                          refusal: str | None = None) -> dict:
-    """Spend the exact pending gate, then (winner only) bank and continue.
+    """Spend the exact owner question, then bank and continue (no field grant).
 
     The atomic commit moves the row to ``tailored`` with the gate cleared, so a
     later enqueue failure leaves a recoverable tailored row with no live gate:
@@ -1759,7 +1758,9 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         stores.tracking.set_status(pk, Status.NEEDS_HUMAN,
                                    **_clear_infra_failure(pk, stores),
                                    **_owner_skip_retention(pk, stores, form_question),
-                                   gate_reason=result.get("reason") or "unknown_field",
+                                   gate_reason=(f'pre_submit_item_{item}'
+                                                if type(item) is int and item in {1, 2, 3, 4, 5}
+                                                else result.get("reason") or "unknown_field"),
                                    gate_pending=pending,
                                    gate_call_id="direct" if review_route == "owner" else None,
                                    gate_source="applier")

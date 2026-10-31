@@ -26,8 +26,8 @@ def native_radios():
     """Sanitized Ashby shape: no value/data-value attribute, IDL value 'on'."""
     def member(caption, selector):
         return field(
-            caption, selector, tag="input", type="radio", required=True,
-            name="eeo_gender", question=QUESTION, value="on", has_value=True,
+            caption, selector, tag="input", type="radio", native_type="radio",
+            required=True, name="eeo_gender", question=QUESTION, value="on", has_value=True,
             value_attr_present=False, checked=False)
     return secure_inventory(
         member(DECLINE, "#decline"), member(AFFIRM, "#affirm"))
@@ -68,8 +68,9 @@ def test_entry_reader_records_value_attribute_without_rewriting_idl_value():
     }, source)
     radios = [c for c in observed["controls"] if c.get("type") == "radio"]
     assert len(radios) == 2
-    assert all(c["tag"] == "input" and c["value"] == "on"
-               and c["value_attr_present"] is False for c in radios)
+    assert all(c["tag"] == "input" and c["native_type"] == "radio"
+               and c["value"] == "on" and c["value_attr_present"] is False
+               for c in radios)
     assert len({c["selector"] for c in radios}) == 2
 
 
@@ -107,6 +108,7 @@ def test_implicit_on_group_is_accepted_but_on_is_never_a_choice():
     ("duplicate_caption", "captions.distinct"),
     ("duplicate_explicit_value", "values.distinct"),
     ("mixed_default_on", "values.distinct"),
+    ("spoofed_native_type", "values.distinct"),
     ("missing_attribute_evidence", "values.distinct"),
 ])
 def test_every_other_radio_predicate_still_refuses_with_name_only(
@@ -150,6 +152,8 @@ def test_every_other_radio_predicate_still_refuses_with_name_only(
         second.update(value="same", value_attr_present=True)
     elif change == "mixed_default_on":
         second["value_attr_present"] = True
+    elif change == "spoofed_native_type":
+        second["native_type"] = "text"
     elif change == "missing_attribute_evidence":
         first.pop("value_attr_present")
 
@@ -171,13 +175,13 @@ def test_every_other_radio_predicate_still_refuses_with_name_only(
 def test_rooted_formless_radio_group_keeps_complete_bound_identity():
     first = _field(
         selector="#decline", label=DECLINE, value="on", has_value=True,
-        type="radio", name="eeo_gender", question=QUESTION, required=True,
-        in_form=False, form_selector="", form_action="",
+        type="radio", native_type="radio", name="eeo_gender",
+        question=QUESTION, required=True, in_form=False, form_selector="", form_action="",
         value_attr_present=False, checked=False)
     second = _field(
         selector="#affirm", label=AFFIRM, value="on", has_value=True,
-        type="radio", name="eeo_gender", question=QUESTION, required=True,
-        in_form=False, form_selector="", form_action="",
+        type="radio", native_type="radio", name="eeo_gender",
+        question=QUESTION, required=True, in_form=False, form_selector="", form_action="",
         value_attr_present=False, checked=False)
     page = _page(first, second, rooted=True)
     assert len(forms._radio_group(page, first)) == 2

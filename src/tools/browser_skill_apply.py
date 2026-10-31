@@ -5766,7 +5766,14 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
                     continue
             except Gate:
                 pass
-        if rootless and kind in {'radio', 'button'}:
+        # Issue #283: a root-proven Ashby page also owns a required Yes/No
+        # button pair; only a pair that _boolean_pair resolves is writable.
+        rooted_ashby_pair = (
+            kind == 'button' and item.get('tag') == 'button'
+            and bool(structural and structural.get('root'))
+            and isinstance(provenance, ApplicationEntryProvenance)
+            and provenance.ats == 'ashby')
+        if (rootless and kind in {'radio', 'button'}) or rooted_ashby_pair:
             try:
                 _radio_group(current, item) if kind == 'radio' else _boolean_pair(
                     current, item, witness=witness)
@@ -5776,7 +5783,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         writable = (_native_answer(item)
                     or kind == 'combobox' and item.get('tag') in {'input', 'div'}
                     or kind in {'radio', 'checkbox'} and item.get('tag') == 'input'
-                    or rootless and kind == 'button' and item.get('tag') == 'button')
+                    or (rootless or rooted_ashby_pair)
+                    and kind == 'button' and item.get('tag') == 'button')
         if not writable or (rootless and _closed_material_combobox(item)):
             return Gate('The guarded executor cannot write this required control; '
                         'operator inspection is required.',

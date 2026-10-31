@@ -29,6 +29,8 @@ class Unavailable(RuntimeError):
     effect_state = ""
     file_access_required = False
     code: str | None = None
+    # Every well-formed identifier the CLI reported (code, reason, nested ones).
+    identifiers: frozenset = frozenset()
 
 
 def _env() -> dict:
@@ -66,12 +68,35 @@ def _result(raw: str, code: int) -> dict | list:
             if (codes and all(type(c) is str and re.fullmatch(r'[a-z_]{1,40}', c)
                               for c in codes) and len(set(codes)) == 1):
                 problem.code = codes[0]
+            inner = data if isinstance(data, dict) else {}
+            ids = (value.get("code"), value.get("reason"),
+                   inner.get("code"), inner.get("reason"))
+            # Unknown or malformed identifiers stay in the set so they block a retry.
+            problem.identifiers = frozenset(
+                v if type(v) is str and re.fullmatch(r'[a-z_]{1,40}', v) else "?"
+                for v in ids if v is not None)
             if isinstance(data, dict):
                 problem.effect_state = str(data.get("effect_state") or "")
             problem.file_access_required = (
                 "allow access to file urls" in str(value.get("hint") or "").lower())
         raise problem
     return value
+
+
+# BrowserSkill 0.4 shared-tab actions need the latest `cooperate sync` context.
+_SYNC_REQUIRED = "cooperation_sync_required"
+_SYNC_REFUSAL = frozenset({_SYNC_REQUIRED, "permission_denied"})
+# Lifecycle commands act on no shared tab and take no observation context.
+_NO_CONTEXT = frozenset({"session", "cooperate"})
+# After one of these the page changed, so the held context is stale: sync again.
+_NAVIGATES = frozenset({"navigate", "navigate-back", "navigate-forward", "reload"})
+
+
+def _sync_required(problem: "Unavailable") -> bool:
+    """True only for a refusal that provably changed nothing and asks for a sync."""
+    return (_SYNC_REQUIRED in problem.identifiers
+            and problem.identifiers <= _SYNC_REFUSAL
+            and problem.effect_state == "none")
 
 
 def _sync(*args: str, timeout: int = 10) -> dict:
@@ -189,6 +214,11 @@ class Session:
         self.id = ""
         self.owner = None
         self._application_controller = None
+        self._context = ""
+        # A fresh session has no shared tab: `cooperate sync` is refused until the
+        # first navigation, which itself needs no context.
+        self._tab_ready = False
+        self._lock = asyncio.Lock()
 
     def bind_application_controller(self, controller):
         """Bind once to the actual application controller; raw calls gain no authority."""
@@ -205,7 +235,7 @@ class Session:
         await self._application_controller.before_ipc(self, args, kwargs)
         succeeded = False
         try:
-            result = await command(*args, "--session", self.id, **kwargs)
+            result = await self._run(args, kwargs)
             succeeded = True
             return result
         finally:
@@ -213,6 +243,50 @@ class Session:
             # completed. The final guard cannot accept a failed CLI transfer.
             await self._application_controller.after_ipc(
                 self, args, kwargs, succeeded=succeeded)
+
+    async def sync_context(self) -> str:
+        """Fetch the latest cooperation context; absent or malformed fails closed."""
+        result = await command("cooperate", "sync", "--session", self.id)
+        data = result.get("data")
+        value = result.get("context_id")
+        if value is None and isinstance(data, dict):
+            value = data.get("context_id")
+        if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', value):
+            self._context = ""
+            raise Unavailable("BrowserSkill operation unavailable: cooperation_sync_failed")
+        self._context = value
+        self._tab_ready = True
+        return value
+
+    async def _run(self, args, kwargs) -> dict:
+        """One CLI action under a fresh cooperation context.
+
+        BrowserSkill 0.4 accepts only the latest `cooperate sync` context and any
+        action, evaluate included, spends it. So each action uses the context
+        held from the last navigation, or syncs first. A refusal that reports
+        effect_state none is synced and retried once; every other failure, a
+        second refusal and a failed sync are final."""
+        wants = bool(args) and args[0] not in _NO_CONTEXT
+        async with self._lock:
+            for attempt in (0, 1):
+                extra = ()
+                if wants:
+                    if not self._context and self._tab_ready:
+                        await self.sync_context()
+                    if self._context:
+                        extra = ("--context", self._context)
+                    # Spent whether or not the action succeeds: never reuse it.
+                    self._context = ""
+                try:
+                    result = await command(*args, *extra, "--session", self.id, **kwargs)
+                except Unavailable as exc:
+                    if not wants or attempt or not _sync_required(exc):
+                        raise
+                    await self.sync_context()
+                    continue
+                if wants and args[0] in _NAVIGATES:
+                    await self.sync_context()
+                return result
 
     async def __aenter__(self):
         from tools.browser_runtime import configuration
@@ -276,7 +350,7 @@ class Session:
                     or not isinstance(args[1], str)
                     or not any(args[1] == reader for reader in readers)):
                 raise Unavailable("Raw application IPC refused before BrowserSkill CLI.")
-        return await command(*args, "--session", self.id, **kwargs)
+        return await self._run(args, kwargs)
 
     async def page(self) -> dict:
         result = await self.call("evaluate", PAGE)

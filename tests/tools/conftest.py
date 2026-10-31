@@ -75,3 +75,25 @@ def answer_bank_table(aws):
 def artifacts_bucket(aws):
     boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="appliedin-artifacts")
     return "appliedin-artifacts"
+
+
+@pytest.fixture(autouse=True)
+def _legacy_cli_without_cooperation_context(request, monkeypatch):
+    """Most browser tests fake `bsk.command` and assert the exact argv they expect.
+
+    BrowserSkill 0.4 cooperation sync is exercised by test_browser_skill_cooperation,
+    which sets REAL_COOPERATION; every other module keeps the pre-0.4 argv here."""
+    if getattr(request.module, "REAL_COOPERATION", False):
+        yield
+        return
+    from tools import browser_skill as bsk
+
+    async def sync_context(self):
+        return ""
+
+    async def run(self, args, kwargs):
+        return await bsk.command(*args, "--session", self.id, **kwargs)
+
+    monkeypatch.setattr(bsk.Session, "sync_context", sync_context)
+    monkeypatch.setattr(bsk.Session, "_run", run)
+    yield

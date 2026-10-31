@@ -108,53 +108,66 @@ async def test_stale_row_cannot_bypass_shared_dispatch_or_worker_exception(world
 
 
 @pytest.mark.parametrize('failure', ['mark', 'readback', 'missing', 'cloud'])
-@pytest.mark.parametrize('verb,button', [('submit', 'Submit application'), ('click', 'Continue')])
-async def test_failed_mark_or_readback_means_gate_and_zero_clicks(world, monkeypatch, failure, verb, button):
+@pytest.mark.parametrize('button', ['Submit application', 'Continue'])
+async def test_failed_mark_or_readback_refuses_raw_submit_without_click(
+        world, monkeypatch, tmp_path, failure, button):
+    """Exercise the actual final controller, not an unbound pre-redesign Session."""
     stores, _ = world
-    current = {'url': URL, 'text': '', 'inventory_verified': True,
-               'controls': [{'selector': '#resume', 'type': 'file', 'tag': 'input',
-                             'label': 'Resume', 'files': ['Resume.pdf'],
-                             'in_form': True, 'form_action': URL},
-                            {'selector': '#submit', 'type': 'submit', 'tag': 'button',
-                             'label': button, 'submit': True,
-                             'form_selector': '#application', 'native_form_owner_selector': '#application',
-                             'in_form': True, 'form_action': URL}]}
-    calls = []
-    class Session:
-        def __init__(self, kind):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            return False
-        async def navigate(self, url):
-            return current
-        async def page(self):
-            return current
-        async def call(self, *args, **kwargs):
-            calls.append(args[0])
-            if args[0] == 'click':
-                pytest.fail('Failed hold cannot reach browser IPC')
+    pdf = tmp_path / 'Test User.pdf'
+    pdf.write_bytes(b'%PDF-1.4\nsynthetic only\n')
+    current = {
+        'url': URL, 'title': 'Test Engineer', 'inventory_verified': True,
+        'truncated': False, 'opaque_controls': False,
+        'unsupported_frames': False, 'shadow_roots': False,
+        'controls': [
+            {'selector': '#resume', 'tag': 'input', 'type': 'file',
+             'label': 'Resume', 'question': 'Resume',
+             'files': [pdf.name], 'required': True,
+             'in_form': True, 'form_selector': '#application',
+             'form_action': URL},
+            {'selector': '#submit', 'tag': 'button', 'type': 'submit',
+             'native_type': 'submit', 'label': button, 'submit': True,
+             'form_selector': '#application', 'in_form': True,
+             'native_form_owner_selector': '#application',
+             'form_action': URL, 'formaction': ''},
+        ],
+    }
+    row = stores.tracking.get(PK)
+    attempts = []
+    guard = forms.ApplicationIPCController(
+        PK, 'example-co', URL, str(pdf), {}, {}, [],
+        {'url': URL, 'last_button': ''}, lambda: attempts.append('click'))
+    guard.upload_completed = True
+    guard.upload_identity = ('synthetic-pdf',)
+    monkeypatch.setattr(guard, '_row', lambda: row)
+    monkeypatch.setattr(guard, '_row_pdf', lambda: ('synthetic-pdf',))
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'scoped_identity_conflict', lambda *a, **kw: False)
+
+    async def fresh(_session):
+        return current
+
+    monkeypatch.setattr(guard, '_page', fresh)
     if failure == 'cloud':
-        original = stores.tracking
-        stores.tracking = SimpleNamespace(get=original.get, set_status=original.set_status)
+        original_tracking = stores.tracking
+        stores.tracking = SimpleNamespace(get=original_tracking.get,
+                                          set_status=original_tracking.set_status)
     elif failure == 'mark':
-        monkeypatch.setattr(submit_hold, 'mark', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('synthetic SET failure')))
+        monkeypatch.setattr(
+            submit_hold, 'mark',
+            lambda *a, **kw: (_ for _ in ()).throw(
+                RuntimeError('Synthetic SET failure')))
     else:
-        def read(*a, **k):
+        def read(*a, **kw):
             if failure == 'readback':
-                raise RuntimeError('synthetic GET failure')
+                raise RuntimeError('Synthetic GET failure')
             return False
         monkeypatch.setattr(submit_hold, 'is_held', read)
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
-    monkeypatch.setattr(bsk, 'Session', Session)
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        {'action': 'upload', 'selector': '#resume'}, {'action': verb, 'selector': '#submit'}]))
-    result = await forms.apply(URL, 'example-co', {}, 'synthetic', pk=PK, resume_path='Resume.pdf')
-    assert result['status'] == 'gate'
-    assert 'no click is safe' in result['question']
-    assert calls == ['upload']
+
+    with pytest.raises(forms.Gate, match='no click is safe'):
+        await guard.before_ipc(None, ('click', '#submit'), {})
+    assert attempts == []
+    assert guard.committed is False
 
 
 @pytest.mark.parametrize('path', ['/actions/reopen/{pk:path}', '/actions/queue-apply/{pk}',

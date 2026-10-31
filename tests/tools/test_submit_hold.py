@@ -394,85 +394,70 @@ def test_manual_outcome_lease_wins_barrier_before_worker_claim(world, monkeypatc
 
 @pytest.mark.parametrize('human_change', ['applied_manual', 'hold_cleared'])
 async def test_leased_worker_rereads_manual_outcome_at_last_click_boundary(
-        world, monkeypatch, human_change):
-    """Even a late human reconciliation cannot be overwritten by click IPC."""
+        world, monkeypatch, tmp_path, human_change):
+    """A human reconciliation after our own hold still refuses before raw Submit.
+
+    Drive the single current controller boundary rather than the removed
+    pre-write approval flow or a fake unbound BrowserSkill session.
+    """
     stores, queue = world
     assert queue.put(PK, 'example-co')
     item = queue.next(only='example-co')
     assert item is not None
-    current = {'url': URL, 'text': '', 'inventory_verified': True,
-               'controls': [
-                   {'selector': '#resume', 'type': 'file', 'tag': 'input',
-                    'label': 'Resume', 'files': ['Resume.pdf'], 'in_form': True,
-                    'form_action': URL},
-                   {'selector': '#submit', 'type': 'submit', 'tag': 'button',
-                    'label': 'Submit application', 'submit': True, 'in_form': True,
-                    'form_selector': '#application', 'native_form_owner_selector': '#application',
-                    'form_action': URL}]}
-    calls = []
+    pdf = tmp_path / 'Test User.pdf'
+    pdf.write_bytes(b'%PDF-1.4\\nsynthetic only\\n')
+    current = {
+        'url': URL, 'title': 'Test Engineer', 'inventory_verified': True,
+        'truncated': False, 'opaque_controls': False,
+        'unsupported_frames': False, 'shadow_roots': False,
+        'controls': [
+            {'selector': '#resume', 'type': 'file', 'tag': 'input',
+             'label': 'Resume', 'question': 'Resume',
+             'files': [pdf.name], 'in_form': True,
+             'form_selector': '#application', 'form_action': URL},
+            {'selector': '#submit', 'type': 'submit', 'native_type': 'submit',
+             'tag': 'button', 'label': 'Submit application', 'submit': True,
+             'in_form': True, 'form_selector': '#application',
+             'native_form_owner_selector': '#application',
+             'form_action': URL, 'formaction': ''},
+        ],
+    }
+    started = []
+    guard = forms.ApplicationIPCController(
+        PK, 'example-co', URL, str(pdf), {}, {}, [],
+        {'url': URL, 'last_button': ''}, lambda: started.append('click'))
+    guard.upload_completed = True
+    guard.upload_identity = ('synthetic-pdf',)
+    monkeypatch.setattr(guard, '_row_pdf', lambda: ('synthetic-pdf',))
+    monkeypatch.setattr(guard, '_row', lambda: stores.tracking.get(PK))
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    monkeypatch.setattr(forms, 'scoped_identity_conflict', lambda *a, **kw: False)
 
-    class Session:
-        def __init__(self, kind):
-            pass
+    async def page(_session):
+        return current
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def navigate(self, url):
-            return current
-
-        async def page(self):
-            return current
-
-        async def call(self, *args, **kwargs):
-            calls.append(args[0])
-            if args[0] == 'click':
-                pytest.fail('Changed human outcome reached browser click IPC')
-
+    monkeypatch.setattr(guard, '_page', page)
     original_hold = forms.hold_possible_submission
 
-    def interleave_human_change(pk, step):
-        original_hold(pk, step)
+    def interleave_human_change(pk, step, **kwargs):
+        original_hold(pk, step, **kwargs)
         if human_change == 'applied_manual':
-            stores.tracking.set_status(pk, Status.APPLIED_MANUAL,
-                                       confirmation_id='Synthetic proof')
+            stores.tracking.set_status(
+                pk, Status.APPLIED_MANUAL, confirmation_id='Synthetic proof')
         submit_hold.clear(pk, tracking=stores.tracking)
 
     monkeypatch.setattr(forms, 'hold_possible_submission', interleave_human_change)
-    monkeypatch.setattr(forms, 'check_dispatch', lambda *a: None)
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda *a: 'Resume.pdf')
-    monkeypatch.setattr(bsk, 'Session', Session)
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        {'action': 'upload', 'selector': '#resume'},
-        {'action': 'submit', 'selector': '#submit'}]))
     try:
-        result = await forms.apply(URL, 'example-co', {}, 'synthetic',
-                                   pk=PK, resume_path='Resume.pdf')
-        assert result['status'] == 'gate'
-        assert 'no click is safe' in result['question']
-        assert calls == ['upload']
-        # The old fake raw Session has no bound r06 click controller; it
-        # correctly refuses this model Submit *before* acquiring a hold.
-        assert stores.tracking.get(PK)['status'] == 'submitting'
+        with pytest.raises(forms.Gate, match='no click is safe'):
+            await guard.before_ipc(None, ('click', '#submit'), {})
+        assert not started
+        assert guard.committed is False
         assert not submit_hold.is_held(PK, tracking=stores.tracking)
-        # Exercise the REAL final JIT hold/readback with the already-leased
-        # synthetic row. This is where a human change may race the click.
-        forms.hold_possible_submission(
-            PK, {'url': URL, 'last_button': 'Submit application'})
-        assert not submit_hold.is_held(PK, tracking=stores.tracking)
-        if human_change == 'applied_manual':
-            assert stores.tracking.get(PK)['status'] == 'applied_manual'
-        else:
-            assert stores.tracking.get(PK)['status'] == 'needs_human'
-        with pytest.raises(forms.Gate, match='Human outcome changed'):
-            forms.check_before_committing_click(PK)
-        assert calls == ['upload']
+        assert stores.tracking.get(PK)['status'] == (
+            'applied_manual' if human_change == 'applied_manual'
+            else 'needs_human')
     finally:
         queue.done(item)
-
 
 
 @pytest.mark.parametrize('route', ['mark', 'resolve'])

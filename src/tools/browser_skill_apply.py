@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from collections import UserDict
+from copy import deepcopy
 from functools import wraps
 import ipaddress
 import json
@@ -3822,89 +3823,84 @@ def _group_ref(grant: dict) -> str:
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
 
 
-def _group_plan(page: dict, row: dict) -> tuple[dict, frozenset]:
-    """The derived per-option grants this row implies for this page.
+def _derived_checkbox_member_grant(page: dict, member: dict, grant: dict) -> dict:
+    """Record both choices of each option: selected yes or explicitly unchecked no.
 
-    Pure: additions for every selected option of every CURRENT group grant,
-    removals for every derived grant whose group grant is gone, stale or
-    no longer selects that option.
+    An unchecked member gets a current, inert derived record so a new answer
+    can atomically overwrite its old positive record without deleting keys.
+    Only a selected yes may satisfy the ordinary exact approval check.
     """
-    grants = row.get('human_approved_answers') or {}
-    additions, removals, seen = {}, set(), set()
-    for item in page.get('controls', []):
-        group = _checkbox_group(page, item)
-        if group is None or group[0]['selector'] in seen:
-            continue
-        seen.update(c['selector'] for c in group)
-        current = _current_group_grant(page, group, row)
-        for member in group:
-            key = _member_key(member)
-            if current is not None and member['label'] in current['selected']:
-                additions[key] = {
-                    'value': 'yes', 'selector': member['selector'],
-                    'url': current['url'], 'label': member['label'],
-                    'question': member['question'], 'tag': 'input',
-                    'type': 'checkbox', 'form_selector': member['form_selector'],
-                    'form_action': member['form_action'],
-                    'visible_text': member['label'], 'source': 'checkbox-group',
-                    'group_ref': _group_ref(current),
-                    **({'verified_redirect_url': current['verified_redirect_url']}
-                       if current.get('verified_redirect_url') else {}),
-                }
-            elif (isinstance(grants.get(key), dict)
-                  and grants[key].get('source') == 'checkbox-group'):
-                removals.add(key)
-    return additions, frozenset(removals)
-
-
-def _plan_applied(grants: dict, plan: tuple[dict, frozenset]) -> bool:
-    additions, removals = plan
-    return (all(grants.get(k) == v for k, v in additions.items())
-            and not any(k in grants for k in removals))
+    selected = member['label'] in grant['selected']
+    return {
+        'value': 'yes' if selected else 'no',
+        'selector': member['selector'], 'url': page['url'],
+        'label': member['label'], 'question': member['question'],
+        'tag': 'input', 'type': 'checkbox',
+        'form_selector': member['form_selector'],
+        'form_action': member['form_action'],
+        'visible_text': member['label'], 'source': 'checkbox-group',
+        'group_ref': _group_ref(grant),
+        **({'verified_redirect_url': grant['verified_redirect_url']}
+           if grant.get('verified_redirect_url') else {}),
+    }
 
 
 def _derive_group_member_grants(page: dict, pk: str, *, fixture_context=None) -> None:
-    """Issue 278: per-option 'yes' grants derived from the one verified group grant.
+    """Atomically rebind the stored owner group answer and every option grant.
 
-    The single-checkbox exact approval (check_form, execute, the IPC click
-    guard) is unchanged; it only needs a grant that binds one control. No
-    atomic compare-and-set exists for `human_approved_answers`, so the write is
-    fail-closed instead: the plan is recomputed from the commit-time row and
-    any difference aborts, the write is re-read and verified, and every
-    consumer separately revalidates the live group grant (see
-    `_group_member_grant_state`), so a derived grant is never authority alone.
+    The pending owner gate first records the full group answer. Once the row
+    becomes submitting, the existing tracking compare-and-replace primitive
+    validates that exact answer and every current member key together before
+    writing the group and all derived records. A stale positive member is
+    replaced with an inert no, never deleted. No derived member is authority
+    without the current group grant at final Submit.
     """
     row = _group_row(pk, fixture_context)
     if (row.get('pk') != pk or row.get('status') != 'submitting'
             or row.get('possible_submission')):
         return
-    grants = row.get('human_approved_answers') or {}
+    grants = row.get('human_approved_answers')
+    if grants is None:
+        grants = {}
     if not isinstance(grants, dict):
-        return
-    plan = _group_plan(page, row)
-    if _plan_applied(grants, plan):
-        return
-    commit = _group_row(pk, fixture_context)
-    if (commit.get('pk') != pk or commit.get('status') != 'submitting'
-            or commit.get('possible_submission')
-            or not isinstance(commit.get('human_approved_answers') or {}, dict)
-            or _group_plan(page, commit) != plan):
-        raise Gate('Tracked row or checkbox group approval changed before it was recorded.')
-    merged = {k: v for k, v in (commit.get('human_approved_answers') or {}).items()
-              if k not in plan[1]}
-    merged.update(plan[0])
-    if fixture_context is not None:
-        fixture_context.set_status(pk, 'submitting', human_approved_answers=merged)
-    else:
+        raise Gate('Checkbox group approval map is not current; ask the owner again.')
+    seen = set()
+    for item in page.get('controls', []):
+        group = _checkbox_group(page, item)
+        if group is None or group[0]['selector'] in seen:
+            continue
+        seen.update(member['selector'] for member in group)
+        current = _current_group_grant(page, group, row)
+        if current is None:
+            continue  # Bootstrap asks the owner; stale derived keys stay inert.
+        group_key = group[0]['question']
+        new_members = {
+            _member_key(member): _derived_checkbox_member_grant(page, member, current)
+            for member in group
+        }
+        if (group_key in new_members or len(new_members) != len(group)):
+            raise Gate('Checkbox group member identities are ambiguous.')
+        new = {group_key: deepcopy(current), **new_members}
+        expected = {
+            key: deepcopy(grants[key]) if key in grants else None
+            for key in new
+        }
+        if any(key in grants and not isinstance(grants[key], dict) for key in new):
+            raise Gate('Checkbox group approval map changed; ask the owner again.')
+        if all(grants.get(key) == value for key, value in new.items()):
+            continue
         from core.stores import make_stores
-        make_stores().tracking.set_status(
-            pk, 'submitting', human_approved_answers=merged)
-    after = _group_row(pk, fixture_context)
-    if (after.get('status') != 'submitting' or after.get('possible_submission')
-            or after.get('human_approved_answers') != merged
-            or _group_plan(page, after) != (plan[0], frozenset())):
-        raise Gate('The checkbox group approval did not record exactly; inspect it again.')
-
+        store = fixture_context if fixture_context is not None else make_stores().tracking
+        if not store.replace_grants_if_unchanged(pk, expected, new):
+            raise Gate('Checkbox group approval changed before atomic recording; ask the owner again.')
+        after = _group_row(pk, fixture_context)
+        after_grants = after.get('human_approved_answers')
+        if (after.get('pk') != pk or after.get('status') != 'submitting'
+                or after.get('possible_submission')
+                or not isinstance(after_grants, dict)
+                or any(after_grants.get(key) != value for key, value in new.items())):
+            raise Gate('The checkbox group approval did not record exactly; inspect it again.')
+        row, grants = after, after_grants
 
 def _group_member_grant_state(page: dict, target: dict, pk: str, *,
                               fixture_context=None) -> str:
@@ -3929,13 +3925,11 @@ def _group_member_grant_state(page: dict, target: dict, pk: str, *,
 
 def _bound_checkbox_group_member(page: dict, target: dict, filled,
                                  receipts: list | None = None) -> bool:
-    """Final Submit proof for EVERY checked or unchecked native group member.
+    """Current group authority and exact member state on the raw final PAGE.
 
-    The current owner grant must bind the complete option/member census on
-    this raw page. All member states must match one nonempty selection, and
-    every selected member must carry an exact derived grant referring to that
-    same current group answer. Old derived grants cannot revive an unselected
-    option or replace a revoked group answer.
+    Every member, including an unchecked one, must have a derived record tied
+    to the same currently bound group answer. An unchecked record has value no
+    and can never become a positive individual approval.
     """
     if (target.get('type') != 'checkbox'
             or not isinstance(filled, _ApprovedFormValues) or not filled.pk):
@@ -3958,18 +3952,15 @@ def _bound_checkbox_group_member(page: dict, target: dict, filled,
     group_ref = _group_ref(grant)
     for member in group:
         derived = grants.get(_member_key(member))
-        if member['label'] not in selected:
-            if isinstance(derived, dict) and derived.get('source') == 'checkbox-group':
-                return False
-            continue
         if (not isinstance(derived, dict)
                 or derived.get('source') != 'checkbox-group'
                 or derived.get('group_ref') != group_ref
                 or any(derived.get(k) != expected for k, expected in (
-                    ('value', 'yes'), ('selector', member['selector']),
-                    ('url', page['url']), ('label', member['label']),
-                    ('question', member['question']), ('tag', 'input'),
-                    ('type', 'checkbox'), ('form_selector', member['form_selector']),
+                    ('value', 'yes' if member['label'] in selected else 'no'),
+                    ('selector', member['selector']), ('url', page['url']),
+                    ('label', member['label']), ('question', member['question']),
+                    ('tag', 'input'), ('type', 'checkbox'),
+                    ('form_selector', member['form_selector']),
                     ('form_action', member['form_action']),
                     ('visible_text', member['label']))):
             return False

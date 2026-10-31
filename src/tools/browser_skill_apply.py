@@ -939,7 +939,8 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                     guarded_value(target, answer)
                 elif target.get('type') == 'radio':
                     group = _radio_group(page, target)
-                    matches = _radio_answer_matches(group, answer)
+                    matches = [c for c in group
+                               if _same(answer, c['label']) or _same(answer, c['value'])]
                     if (len(matches) != 1 or matches[0]['selector'] != target['selector']
                             or not target.get('checked')
                             or sum(bool(c.get('checked')) for c in group) != 1):
@@ -1270,18 +1271,8 @@ def _final_exact_grant(page: dict, target: dict, answer: str,
         if not isinstance(stored_answer, str) or not stored_answer.strip():
             raise Gate('An exact human-approved answer is needed for this control.')
         if typ == 'radio':
-            members = _radio_group(page, target)
-            if _implicit_on_radios(members):
-                selected = [c for c in members if c.get('checked') is True]
-                approved = _radio_answer_matches(members, stored_answer)
-                if (len(selected) != 1 or len(approved) != 1
-                        or selected[0]['selector'] != target.get('selector')
-                        or approved[0]['selector'] != target.get('selector')
-                        or _same_key(approved[0]['label'])
-                           != _same_key(target.get('label', ''))):
-                    raise Gate('The native selected member is not the approved answer.')
-            elif not (_same(stored_answer, target.get('label', ''))
-                      or _same(stored_answer, target.get('value', ''))):
+            if not (_same(stored_answer, target.get('label', ''))
+                    or _same(stored_answer, target.get('value', ''))):
                 raise Gate('The native selected member is not the approved answer.')
         elif typ == 'button':
             if not isinstance(answer, str) or not _same(stored_answer, answer):

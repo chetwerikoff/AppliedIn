@@ -96,6 +96,7 @@ def test_implicit_on_group_is_accepted_but_on_is_never_a_choice():
     ("target_question", "target.question"),
     ("too_few", "members.count"),
     ("member_tag", "member.tag"),
+    ("foreign_form", "members.count"),
     ("member_not_in_form", "member.in_form"),
     ("member_question", "member.question"),
     ("member_action", "member.form_action"),
@@ -126,6 +127,8 @@ def test_every_other_radio_predicate_still_refuses_with_name_only(
         page["controls"].remove(second)
     elif change == "member_tag":
         second["tag"] = "div"
+    elif change == "foreign_form":
+        second["form_selector"] = "#foreign"
     elif change == "member_not_in_form":
         second["in_form"] = False
     elif change == "member_question":
@@ -184,6 +187,31 @@ def test_rooted_formless_radio_group_keeps_complete_bound_identity():
     assert bound["form_selector"] == "#application-root"
     assert [(m["selector"], m["caption"]) for m in bound["radio_members"]] == [
         ("#decline", DECLINE), ("#affirm", AFFIRM)]
+
+
+def test_rootless_group_requires_independent_structural_member_proof(caplog):
+    page = native_radios()
+    page["entry"] = {
+        "root": None,
+        "formless": {"root": "", "container": "#container",
+                     "submit": "#submit", "error": "", "excluded": []},
+        "root_evidence": [],
+    }
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(forms.Gate):
+            forms._radio_group(page, page["controls"][0])
+    assert [r.getMessage() for r in caplog.records
+            if "radio group failed predicate=" in r.getMessage()] == [
+                "radio group failed predicate=member.root"]
+
+
+def test_owner_grant_cannot_override_protected_characteristic_guard(monkeypatch):
+    page = native_radios()
+    browser, _ = install_grant(monkeypatch, page, AFFIRM)
+    with pytest.raises(forms.Gate, match="Decline or leave unanswered"):
+        forms._approved_native_choice(page, page["controls"][0], PK)
+    assert not any(call[0] in {"click", "fill", "select", "upload"}
+                   for call in browser.calls)
 
 
 @pytest.mark.asyncio

@@ -1433,9 +1433,15 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
-    # An approved group cannot silently shrink to a standalone optional
-    # control: the surviving receiver still names an owner-bound question.
-    if isinstance(filled, _ApprovedFormValues) and filled.pk:
+    # Only current groups need persisted group authority. A vanished filled
+    # selector beside a surviving native checkbox can also signal a collapsed
+    # previously approved group; standalone forms need no unrelated row read.
+    if (isinstance(filled, _ApprovedFormValues) and filled.pk
+            and (any(c.get('type') == 'checkbox'
+                     and _checkbox_group(page, c) is not None for c in controls)
+                 or (any(selector not in selectors for selector in filled)
+                     and any(c.get('type') == 'checkbox'
+                             and c.get('in_form') is True for c in controls)))):
         stored = _group_row(filled.pk, filled.fixture_context)
         grants = stored.get('human_approved_answers')
         if isinstance(grants, dict):

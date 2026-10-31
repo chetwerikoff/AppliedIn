@@ -462,6 +462,29 @@ def run_final(page, filled):
     forms.check_form(page, filled, True, 'Resume.pdf', [])
 
 
+def test_non_group_final_check_does_not_read_persisted_group_row(row, monkeypatch):
+    # Neither ordinary standalone controls nor rejected legal checkbox
+    # collisions need the unrelated group ledger or a running Redis server.
+    def unexpected_group_read(*args, **kwargs):
+        pytest.fail('A non-group form read the persisted checkbox-group row')
+
+    monkeypatch.setattr(forms, '_group_row', unexpected_group_read)
+    optional = page_of(box('Optional updates', '#updates', required=False,
+                           question='Receive updates?'))
+    run_final(optional, forms._ApprovedFormValues({}, PK, {}))
+
+    required = page_of(box('I agree', '#agree', question='Agreement'))
+    with pytest.raises(forms.Gate, match=REQUIRED):
+        run_final(required, forms._ApprovedFormValues({}, PK, {}))
+
+    malformed = page_of(
+        box('I certify the information is accurate', '#legal-0'),
+        box('I waive arbitration rights', '#legal-1'))
+    assert forms._checkbox_group(malformed, by(malformed, '#legal-0')) is None
+    with pytest.raises(forms.Gate, match=REQUIRED):
+        run_final(malformed, forms._ApprovedFormValues({}, PK, {}))
+
+
 def test_standalone_required_checkbox_keeps_the_existing_gate(row):
     page = page_of(box('I agree', '#agree', question='Agreement'))
     filled = forms._ApprovedFormValues({}, PK, {})

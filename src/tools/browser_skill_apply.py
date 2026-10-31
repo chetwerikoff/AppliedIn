@@ -2674,8 +2674,6 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         key = action.get('fact')
         value = (str(facts[key]).strip() if isinstance(key, str) and key in facts
                  else str(action.get('value') or '').strip())
-        if not value and verb == 'choose':
-            value = str(target.get('label') or target.get('value') or '').strip()
         if not value:
             raise Gate('This application question needs an owner answer.',
                        form_question=_ordinary_owner_question(page, target, pk),

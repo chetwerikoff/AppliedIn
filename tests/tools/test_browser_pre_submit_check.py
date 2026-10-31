@@ -244,3 +244,49 @@ async def test_ordinary_accessible_fill_does_not_issue_a_grant_or_final_check(
     assert session.calls == [
         (('fill', '#email', '--value', 'test@example.test'), {})]
     assert not fixture.held
+
+
+@pytest.mark.asyncio
+async def test_missing_choice_fact_asks_owner_without_inventing_consent(
+        monkeypatch, tmp_path):
+    """An empty choose cannot turn a checkbox caption into an owner answer."""
+    controller, page, _, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, {
+        'selector': '#consent', 'label': 'I agree',
+        'question': 'Optional synthetic acknowledgment',
+        'tag': 'input', 'type': 'checkbox', 'checked': False,
+        'required': False, 'disabled': False,
+        'in_form': True, 'form_selector': '#app', 'form_action': URL,
+    })
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {}
+
+    session = FakeSession()
+    filled = {}
+    args = dict(facts={}, filled=filled, resume_path=controller.resume_path,
+                company='example-co', jd_text='Synthetic role',
+                resume_tex='', github='', pk=PK, job_url=URL)
+    with pytest.raises(forms.Gate) as error:
+        await forms.execute(
+            session, page, {'action': 'choose', 'selector': '#consent'},
+            **args)
+    assert error.value.reason == 'owner_question'
+    assert error.value.form_question['selector'] == '#consent'
+    assert session.calls == []
+    assert filled == {}
+    assert not fixture.held
+
+    # A supplied ordinary answer may prepare this field without a grant.
+    await forms.execute(
+        session, page, {'action': 'choose', 'selector': '#consent',
+                        'value': 'Yes'},
+        **args)
+    assert session.calls == [(('click', '#consent'), {})]
+    assert filled == {'#consent': 'Yes'}
+    assert not fixture.held

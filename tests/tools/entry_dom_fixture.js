@@ -219,6 +219,17 @@ if(spec.formless) {
     const group=node('div',{class:'ashby-application-form-input-yesno'},entry);
     for(const text of ['Yes','No']) {const b=node('button',{text},group); b.type='submit'; delete b.required;}
   }
+  if(spec.mainRadio) {
+    // Issue 282 review: opacity-0 radios with visible labels in the MAIN container.
+    const choiceEntry=node('div',{class:'ashby-application-form-field-entry'},container);
+    node('label',{class:'ashby-application-form-question-title',
+      text:'Synthetic main choice question'},choiceEntry);
+    for(const n of [0,1]) {
+      node('input',{id:'main-choice-'+n,name:'main-choice',type:'radio',
+        style:{opacity:'0'}},choiceEntry);
+      node('label',{'for':'main-choice-'+n,text:'Synthetic main option '+n},choiceEntry);
+    }
+  }
   if(spec.hiddenAttestation) {
     const parent=node('div',{class:'ashby-application-form-field-entry'},container);
     const first=node('label',{id:'hidden-attestation-label',

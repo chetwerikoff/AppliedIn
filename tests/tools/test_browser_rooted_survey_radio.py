@@ -266,3 +266,37 @@ def test_page_reader_only_flags_a_radio_inside_the_single_survey_container():
     from tools.browser_skill_dom import PAGE
     assert "e.type==='radio' && pageSurveyWrappers.length===1" in PAGE
     assert "querySelector('.ashby-application-form-container')?.contains(e)" in PAGE
+
+
+# ARCH 20:45 narrowing: main-container admission stays checkbox-only.
+
+def _main_flags(**changes):
+    from tests.tools.test_browser_application_entry import dom, entry
+    out = {}
+    for name, reader in (('ENTRY', forms.ENTRY_PAGE),
+                         ('FIXED', forms._ENTRY_FIXED_CONTROL_WITNESS)):
+        snapshot = dom(dict(root=False, formless=True, url=entry('ashby'), **changes), reader)
+        out[name] = {c['selector']: c.get('ashby_hidden_choice')
+                     for c in snapshot['controls']
+                     if c['selector'].startswith(('#main-choice', '#hidden-attestation'))}
+        if name == 'ENTRY':
+            out['EVIDENCE'] = {e['selector']: e.get('ashby_hidden_choice')
+                               for e in snapshot['entry']['root_evidence']
+                               if e['selector'].startswith(('#main-choice', '#hidden-attestation'))}
+    return out
+
+
+@pytest.mark.parametrize('survey', [False, True], ids=['no-survey', 'with-survey'])
+def test_hidden_radio_in_the_main_container_is_not_flagged(survey):
+    flags = _main_flags(mainRadio=True, **(dict(survey=True) if survey else {}))
+    for reader in ('ENTRY', 'FIXED', 'EVIDENCE'):
+        assert {s for s in flags[reader] if s.startswith('#main-choice')} == {
+            '#main-choice-0', '#main-choice-1'}, (reader, flags)
+        assert not any(v for s, v in flags[reader].items()
+                       if s.startswith('#main-choice')), (reader, flags)
+
+
+def test_hidden_main_container_checkbox_is_still_flagged():
+    flags = _main_flags(hiddenAttestation=True)
+    assert flags['FIXED']['#hidden-attestation'] is True
+    assert flags['EVIDENCE']['#hidden-attestation'] is True

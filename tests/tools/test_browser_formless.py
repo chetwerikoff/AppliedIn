@@ -3590,7 +3590,7 @@ def _issue218_main_reader_scripts():
         (
             """        return ashbyNative && !forms.length && containers.length===1 &&
           (!surveyWrappers.length || surveyValid) &&
-          (container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
+          (e.type==='checkbox' && container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
           e.tagName""",
             """        return ashbyNative && !forms.length && containers.length===1 &&
           container?.contains(e) && e.tagName""",
@@ -3723,7 +3723,7 @@ def _issue218_main_reader_scripts():
     source = source.replace(
         overlay_filter, "    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == '540d130dfd157346b32ba18a4bd4b80a3f465e56'  # Issue 282: + value_attr_present, hidden radio predicate, survey radio clause
+    assert hashlib.sha1(git_blob).hexdigest() == 'bdcf6838e5450588fd012a386064b88810913929'  # Issue 282: + value_attr_present, hidden radio predicate, survey radio clause
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
     # The fixed witness's own #252 survey census reads entry bindings that the

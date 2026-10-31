@@ -201,7 +201,7 @@ PAGE = r"""(() => {
     const labels=Array.from(e.labels || []);
     return pageAshbyNative && !document.querySelector('form') &&
       pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&
-      (ashbyContainers[0].contains(e) || e.type==='radio' && pageSurveyWrappers.length===1 &&
+      (e.type==='checkbox' && ashbyContainers[0].contains(e) || e.type==='radio' && pageSurveyWrappers.length===1 &&
         pageSurveyWrappers[0].querySelector('.ashby-application-form-container')?.contains(e)) &&
       e.tagName==='INPUT' &&
       ['checkbox','radio'].includes(e.type) && !e.form && !e.closest('form') &&
@@ -735,7 +735,7 @@ _ASHBY_ROOT = r"""
         const ls=Array.from(e.labels || []);
         return ashbyNative && !forms.length && containers.length===1 &&
           (!surveyWrappers.length || surveyValid) &&
-          (container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
+          (e.type==='checkbox' && container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
           e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type) &&
           !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
           !entryEvidenceVisible(e) && !e.closest('[inert]') &&

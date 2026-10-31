@@ -1004,3 +1004,30 @@ def test_collapsed_group_with_surviving_optional_control_fails_final_check(row):
     assert forms._checkbox_group(page, second) is None
     with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
+
+
+@pytest.mark.parametrize(('selected', 'prechecked', 'cleared'), [
+    (OPTIONS, OPTIONS, []),
+    (['Europe'], OPTIONS, ['#region-0', '#region-2']),
+])
+async def test_bootstrap_reconciles_prechecks_without_a_model_choose(
+        row, selected, prechecked, cleared):
+    from tests.tools.test_browser_bootstrap import URL as RAW_URL
+
+    page = secure_inventory(*group_controls(form_action=RAW_URL))
+    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
+               title=page['title'], ats='custom')
+    row['human_approved_answers'][QUESTION] = grant_for(page, selected)
+    forms._derive_group_member_grants(page, PK)
+    for member in page['controls'][:3]:
+        member['checked'] = member['label'] in prechecked
+    browser = ToggleBrowser(page)
+    filled = {}
+    await forms._bootstrap(
+        browser, page, PK, {}, SECURE_URL, filled=filled, history=[],
+        job_url=SECURE_URL, company='example-co')
+    assert browser.clicks == cleared
+    assert set(filled) == {member['selector'] for member in page['controls'][:3]
+                           if member['label'] in selected}
+    assert [member['checked'] for member in page['controls'][:3]] == [
+        label in selected for label in OPTIONS]

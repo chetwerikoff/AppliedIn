@@ -40,13 +40,11 @@ LISTS_Q = ('Are you, or is any entity you own, subject to sanctions or listed '
 LISTS = ['I am listed on a sanctions list',
          'An entity I own is a restricted party',
          'No, none of these apply to me',
-         'Not applicable, I answered none of the above to the prior question']
+         'Not applicable (i.e., I selected “none of the above” for the prior question)']
 
 SHAPES = {
     'countries': (COUNTRIES_Q, COUNTRIES, ['None of the above']),
-    'lists': (LISTS_Q, LISTS, ['No, none of these apply to me',
-                               'Not applicable, I answered none of the above '
-                               'to the prior question']),
+    'lists': (LISTS_Q, LISTS, LISTS[2:]),
 }
 
 
@@ -205,3 +203,32 @@ async def test_bootstrap_accounts_a_prechecked_safe_negative_group(row, shape):
     assert browser.clicks == []
     assert set(filled) == {m['selector'] for m in members(page)
                            if m['label'] in selected}
+
+
+@pytest.mark.parametrize(('answer', 'gates'), [('Yes', True), ('No', False)])
+def test_standalone_sanctions_radio_guard_is_unchanged(answer, gates):
+    """Radios never take the group caption route: answer and caption are guarded."""
+    page = page_of(*[field(label, f'#r-{label}', type='radio', value=label,
+                           has_value=True, name='sanctioned', question=LISTS_Q,
+                           form_action=URL) for label in ('Yes', 'No')])
+    radio = by(page, f'#r-{answer}')
+    if gates:
+        with pytest.raises(forms.Gate, match=SANCTIONS):
+            forms._guard_checkbox_choice(page, radio, answer)
+    else:
+        forms._guard_checkbox_choice(page, radio, answer)
+
+
+def test_group_route_only_for_an_explicit_yes(row):
+    """A non-yes group answer keeps the current guard: here the sanctions gate."""
+    page = sanctions_page(COUNTRIES_Q, COUNTRIES)
+    none = by(page, f'#opt-{COUNTRIES.index("None of the above")}')
+    forms._guard_checkbox_choice(page, none, 'yes')
+    with pytest.raises(forms.Gate, match=SANCTIONS):
+        forms._guard_checkbox_choice(page, none, 'on')
+
+
+def test_exact_follow_up_caption_needs_no_regex_change():
+    caption = LISTS[3]
+    assert forms._SAFE_OPTION_RX.match(caption)
+    assert not forms._SAFE_OPTION_RX.match(LISTS[0])

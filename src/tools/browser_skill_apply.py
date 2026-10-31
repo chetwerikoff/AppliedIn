@@ -4299,9 +4299,8 @@ def _guard_checkbox_choice(page: dict, selected: dict, answer: str) -> None:
     same value the final check guards. A sanctions group then passes only with
     safe negative captions checked. Every other control keeps its guard.
     """
-    if selected.get('type') == 'checkbox' and _checkbox_group(page, selected) is not None:
-        if not _same(answer, 'yes'):
-            raise Gate('Only an explicit owner yes can check a checkbox group option.')
+    if (selected.get('type') == 'checkbox' and _same(answer, 'yes')
+            and _checkbox_group(page, selected) is not None):
         guarded_value(selected, selected['label'])
         return
     _guard_native_choice_answer(selected, answer)

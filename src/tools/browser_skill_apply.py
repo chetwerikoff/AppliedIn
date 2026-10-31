@@ -1384,6 +1384,11 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     seen_boolean = set()
     for target in controls:
         typ = target.get('type', '')
+        # Checked members must not bypass the group owner grant via their own
+        # derived exact grant; unchecked (even optional) members require it too.
+        if (typ == 'checkbox' and _checkbox_group(page, target) is not None
+                and not _bound_checkbox_group_member(page, target, filled, receipts)):
+            raise Gate('Checkbox group answer is not bound to the current group grant.')
         if typ == 'hidden':
             if (target.get('required') or target.get('has_value')
                     or bool(target.get('value'))):
@@ -3718,6 +3723,7 @@ def _current_group_grant(page: dict, group: list[dict], row: dict) -> dict | Non
         return None
     bound, selected = grant.get('group_members'), grant.get('selected')
     offered = [c['label'] for c in group]
+    options = grant.get('options')
     if (grant.get('url') != page.get('url')
             or grant.get('question') != first['question']
             or grant.get('tag') != 'input'
@@ -3725,6 +3731,9 @@ def _current_group_grant(page: dict, group: list[dict], row: dict) -> dict | Non
                 (c['selector'], c['label']) for c in group}
             or grant.get('form_selector') != first['form_selector']
             or grant.get('form_action') != first['form_action']
+            or not isinstance(options, list) or len(options) != len(group)
+            or any(not isinstance(option, str) for option in options)
+            or set(options) != set(offered)
             or not isinstance(bound, list) or len(bound) != len(group)
             or any(not isinstance(m, dict) for m in bound)
             or {(m.get('selector'), m.get('label'), m.get('form_selector'))
@@ -3859,33 +3868,51 @@ def _group_member_grant_state(page: dict, target: dict, pk: str, *,
 
 def _bound_checkbox_group_member(page: dict, target: dict, filled,
                                  receipts: list | None = None) -> bool:
-    """Issue 278: may check_form leave this UNCHECKED required option unchecked?
+    """Final Submit proof for EVERY checked or unchecked native group member.
 
-    True only when `target` is an unchecked native member of a checkbox group
-    whose CURRENT owner grant binds the exact option-label set and every
-    member's selector and form_selector on this very page read, at least one
-    granted member is checked in this same read, and every member's checked
-    state equals the grant (each checked member also carries a derived grant
-    minted from this exact answer). Anything else is False, so check_form
-    keeps its original refusal.
+    The current owner grant must bind the complete option/member census on
+    this raw page. All member states must match one nonempty selection, and
+    every selected member must carry an exact derived grant referring to that
+    same current group answer. Old derived grants cannot revive an unselected
+    option or replace a revoked group answer.
     """
-    if (target.get('type') != 'checkbox' or target.get('checked') is True
+    if (target.get('type') != 'checkbox'
             or not isinstance(filled, _ApprovedFormValues) or not filled.pk):
         return False
     group = _checkbox_group(page, target)
     if group is None:
         return False
-    ctx = filled.fixture_context
-    grant = _current_group_grant(page, group, _group_row(filled.pk, ctx))
+    row = _group_row(filled.pk, filled.fixture_context)
+    grant = _current_group_grant(page, group, row)
     if grant is None:
         return False
-    checked = {c['label'] for c in group if c.get('checked') is True}
-    if not checked or checked != set(grant['selected']):
+    selected = set(grant['selected'])
+    if (not any(member.get('checked') is True for member in group)
+            or any(member.get('checked') is not (member['label'] in selected)
+                   for member in group)):
         return False
-    return all(_group_member_grant_state(page, member, filled.pk, fixture_context=ctx
-                                         ) == 'granted'
-               for member in group if member.get('checked') is True)
-
+    grants = row.get('human_approved_answers')
+    if not isinstance(grants, dict):
+        return False
+    group_ref = _group_ref(grant)
+    for member in group:
+        derived = grants.get(_member_key(member))
+        if member['label'] not in selected:
+            if isinstance(derived, dict) and derived.get('source') == 'checkbox-group':
+                return False
+            continue
+        if (not isinstance(derived, dict)
+                or derived.get('source') != 'checkbox-group'
+                or derived.get('group_ref') != group_ref
+                or any(derived.get(k) != expected for k, expected in (
+                    ('value', 'yes'), ('selector', member['selector']),
+                    ('url', page['url']), ('label', member['label']),
+                    ('question', member['question']), ('tag', 'input'),
+                    ('type', 'checkbox'), ('form_selector', member['form_selector']),
+                    ('form_action', member['form_action']),
+                    ('visible_text', member['label']))):
+            return False
+    return True
 
 def _group_uncheck_allowed(page: dict, target: dict, pk: str, *,
                            fixture_context=None) -> bool:

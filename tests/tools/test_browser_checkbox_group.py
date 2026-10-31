@@ -28,6 +28,7 @@ from tools import browser_skill_apply as forms
 URL = SECURE_URL
 QUESTION = 'Which regions can you work in?'
 OPTIONS = ['North America', 'Europe', 'Asia Pacific']
+REQUIRED = 'Required acknowledgement not completed'
 SHARED = 'More than one control uses the same approval question'
 
 
@@ -336,50 +337,49 @@ def run_final(page, filled):
     forms.check_form(page, filled, True, 'Resume.pdf', [])
 
 
-def test_unmodified_check_form_still_rejects_an_unchecked_required_option(row):
-    page = group_page()
-    filled = final_state(row, page, ['Europe'], ['Europe'])
-    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
-        forms._pinned_check_form(page, filled, True, 'Resume.pdf', [])
+def test_standalone_required_checkbox_keeps_the_existing_gate(row):
+    page = page_of(box('I agree', '#agree', question='Agreement'))
+    filled = forms._ApprovedFormValues({}, PK, {})
+    with pytest.raises(forms.Gate, match='Required acknowledgement not completed: I agree'):
+        forms.check_form(page, filled, True, 'Resume.pdf', [])
 
 
 def test_exactly_granted_group_passes_the_final_check(row):
     page = group_page()
     filled = final_state(row, page, ['North America', 'Asia Pacific'],
                          ['North America', 'Asia Pacific'])
+    before = deepcopy(page)
     run_final(page, filled)
-    shown = forms._group_final_page(page, PK)
-    assert [c['required'] for c in shown['controls'][:3]] == [True, False, True]
-    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]  # copy only
-    assert all(a == b for a, b in zip(shown['controls'][3:], page['controls'][3:]))
+    assert page == before          # no copy, no mutation: every flag is the real one
+    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]
 
 
 def test_final_check_rejects_without_a_current_binding_grant(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], ['Europe'])
     del row['human_approved_answers'][QUESTION]
-    with pytest.raises(forms.Gate):
+    with pytest.raises(forms.Gate, match=REQUIRED):
         run_final(page, filled)
 
 
 def test_final_check_rejects_zero_checked_members(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], [])
-    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
+    with pytest.raises(forms.Gate, match=REQUIRED):
         run_final(page, filled)
 
 
 def test_final_check_rejects_a_checked_member_the_owner_did_not_grant(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], ['Europe', 'North America'])
-    with pytest.raises(forms.Gate):
+    with pytest.raises(forms.Gate, match='exact human-approved answer is needed'):
         run_final(page, filled)
 
 
 def test_final_check_rejects_a_granted_member_that_is_not_checked(row):
     page = group_page()
     filled = final_state(row, page, ['Europe', 'North America'], ['Europe'])
-    with pytest.raises(forms.Gate):
+    with pytest.raises(forms.Gate, match=REQUIRED):
         run_final(page, filled)
 
 
@@ -396,7 +396,7 @@ def test_final_check_rejects_option_or_selector_drift(row, drift):
             c['form_selector'] = '#changed'
     else:
         page['controls'].insert(3, box('Africa', '#region-3'))
-    with pytest.raises(forms.Gate):
+    with pytest.raises(forms.Gate, match=REQUIRED):
         run_final(page, filled)
 
 
@@ -463,16 +463,9 @@ async def test_settle_fails_when_the_ungranted_member_stays_checked(row):
 # ------------------------------------------------------------- end to end
 
 
-async def test_only_check_form_sees_the_bounded_copy(row, monkeypatch):
+async def test_controller_page_and_other_consumers_keep_required(row):
     page = group_page()
-    filled = final_state(row, page, ['Europe'], ['Europe'])
-    seen = []
-    monkeypatch.setattr(forms, '_pinned_check_form',
-                        lambda p, *a: seen.append(p))
-    forms.check_form(page, filled, True, 'Resume.pdf', [])
-    assert [c['required'] for c in seen[0]['controls'][:3]] == [False, True, False]
-    # The caller's page, and every other consumer of it, keep the real flags.
-    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]
+    final_state(row, page, ['Europe'], ['Europe'])
 
     class Raw:
         async def call(self, command, script):
@@ -484,7 +477,7 @@ async def test_only_check_form_sees_the_bounded_copy(row, monkeypatch):
         PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
     shown = await controller._page(Raw())
     assert [c['required'] for c in shown['controls'][:3]] == [True, True, True]
-    assert forms._unanswered(shown, by(shown, '#region-0'))   # other logic still sees required
+    assert forms._unanswered(shown, by(shown, '#region-0'))
 
 
 async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
@@ -640,7 +633,7 @@ def test_a_checked_option_needs_a_derived_grant_minted_from_the_current_answer(r
                  if v.get('source') == 'checkbox-group'}
     row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
     row['human_approved_answers'].update(leftovers)
-    with pytest.raises(forms.Gate, match='not part of the current owner answer'):
+    with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
         run_final(page, filled)
 
     # A leftover minted from an EARLIER answer for a still-selected option too.

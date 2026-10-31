@@ -1548,7 +1548,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             elif expected is not None:
                 raise Gate('A previously verified checkbox/radio choice has changed.')
             elif target.get('required') and typ == 'checkbox':
-                raise Gate(f'Required acknowledgement not completed: {target["label"]}')
+                if not _bound_checkbox_group_member(page, target, filled, receipts):
+                    raise Gate(f'Required acknowledgement not completed: {target["label"]}')
             elif typ == 'radio' and target.get('required'):
                 group = target.get('name') or target.get('question')
                 if not group or not any(
@@ -3856,61 +3857,34 @@ def _group_member_grant_state(page: dict, target: dict, pk: str, *,
     return 'granted'
 
 
-def _group_final_page(page: dict, pk: str, *, fixture_context=None) -> dict:
-    """The copy ONLY `check_form` is shown, with ONE bounded adjustment.
+def _bound_checkbox_group_member(page: dict, target: dict, filled,
+                                 receipts: list | None = None) -> bool:
+    """Issue 278: may check_form leave this UNCHECKED required option unchecked?
 
-    check_form (pinned) has no negative-receipt path: an unchecked required
-    checkbox raises with or without a filled value. A native option group marks
-    every option required although the owner chose a subset. So, solely for the
-    UNSELECTED members of a group whose stored grant binds this exact option set
-    and every selector/form_selector (read in this same pass), and only when
-    exactly the granted members are checked in this same read, those members are
-    shown as required=False. Every other control and field is passed through
-    untouched. A checked member the current owner answer does not grant, or
-    whose derived grant is not minted from it, fails closed here. Any other
-    mismatch leaves the original unchecked required checkbox to fail check_form.
+    True only when `target` is an unchecked native member of a checkbox group
+    whose CURRENT owner grant binds the exact option-label set and every
+    member's selector and form_selector on this very page read, at least one
+    granted member is checked in this same read, and every member's checked
+    state equals the grant (each checked member also carries a derived grant
+    minted from this exact answer). Anything else is False, so check_form
+    keeps its original refusal.
     """
-    relax, seen, row = set(), set(), None
-    for item in page.get('controls', []):
-        group = _checkbox_group(page, item)
-        if group is None or group[0]['selector'] in seen:
-            continue
-        seen.update(c['selector'] for c in group)
-        row = _group_row(pk, fixture_context) if row is None else row
-        grant = _current_group_grant(page, group, row)
-        checked = [c for c in group if c.get('checked') is True]
-        for member in checked:
-            if _group_member_grant_state(page, member, pk, fixture_context=fixture_context
-                                         ) != 'granted':
-                raise Gate('A checked checkbox option is not part of the current owner answer.')
-        if grant is None or not checked or {c['label'] for c in checked} != set(
-                grant['selected']):
-            continue
-        relax.update(c['selector'] for c in group if c.get('checked') is not True)
-    if not relax:
-        return page
-    return {**page, 'controls': [
-        {**c, 'required': False} if c.get('selector') in relax else c
-        for c in page['controls']]}
-
-
-_pinned_check_form = check_form
-
-
-def _check_form_with_groups(page: dict, filled: dict, uploaded: bool,
-                            attachment: str = '', receipts: list | None = None) -> None:
-    """The final guard's entry: the bounded group copy goes ONLY to check_form.
-
-    The byte-pinned check_form and authorize_final_submit are unchanged; the
-    latter resolves `check_form` by module name, so every other consumer of
-    the page (identity, approvals, controller reads) keeps the real flags.
-    """
-    if isinstance(filled, _ApprovedFormValues):
-        page = _group_final_page(page, filled.pk, fixture_context=filled.fixture_context)
-    _pinned_check_form(page, filled, uploaded, attachment, receipts)
-
-
-check_form = _check_form_with_groups
+    if (target.get('type') != 'checkbox' or target.get('checked') is True
+            or not isinstance(filled, _ApprovedFormValues) or not filled.pk):
+        return False
+    group = _checkbox_group(page, target)
+    if group is None:
+        return False
+    ctx = filled.fixture_context
+    grant = _current_group_grant(page, group, _group_row(filled.pk, ctx))
+    if grant is None:
+        return False
+    checked = {c['label'] for c in group if c.get('checked') is True}
+    if not checked or checked != set(grant['selected']):
+        return False
+    return all(_group_member_grant_state(page, member, filled.pk, fixture_context=ctx
+                                         ) == 'granted'
+               for member in group if member.get('checked') is True)
 
 
 def _group_uncheck_allowed(page: dict, target: dict, pk: str, *,

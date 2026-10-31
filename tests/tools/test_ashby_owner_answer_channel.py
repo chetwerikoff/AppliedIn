@@ -17,7 +17,7 @@ from core.apply_queue import ApplyQueue
 from core.models import JobRecord, Status
 from core.storage.local import RedisTracking
 from tests.tools.test_browser_application_entry import COMPANY, JOB, PK, posting
-from tests.tools.test_browser_ashby_survey import _ATTESTATIONS, _FACTS, _LIVE
+from tests.tools.test_browser_ashby_survey import _LIVE
 from tests.tools.test_browser_formless import no_mutations, root_world
 from tools import browser_skill_apply as forms
 
@@ -42,7 +42,7 @@ class _Bank:
 
 def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
            attestations=False, tmp_path=None):
-    spec = ({**_LIVE[shape], **_ATTESTATIONS}
+    spec = ({**_LIVE[shape], 'liveAttestations': True}
             if attestations else dict(_LIVE[shape]))
     _, raw, decision, _ = root_world(monkeypatch, **spec)
     if tmp_path is not None:
@@ -198,7 +198,8 @@ async def test_existing_legacy_grant_cannot_replace_a_fresh_owner_answer(
 async def test_material_checkbox_uses_an_owner_question_not_a_seventh_submit_item(
         monkeypatch, tmp_path):
     stores, raw, decision = _world(
-        monkeypatch, "openai", dict(_FACTS), attestations=True, tmp_path=tmp_path)
+        monkeypatch, "openai", {'Name': 'Test User', 'Email': 'test@example.test'},
+        attestations=True, tmp_path=tmp_path)
     row, tokens = await _owner_gate(stores, decision, raw,
                                     selector="#attestation-0")
     question = row["gate_pending"]["form_question"]

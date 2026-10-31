@@ -244,7 +244,7 @@ async def test_default_on_readback_rejects_the_other_checked_selector(monkeypatc
         return response
 
     browser.call = wrong_click
-    with pytest.raises(forms.Gate, match="readback"):
+    with pytest.raises(forms.Gate, match="did not read back exactly"):
         await forms.execute(
             browser, page, {"action": "choose", "selector": "#decline",
                             "fact": QUESTION}, facts={}, filled={},

@@ -3384,21 +3384,41 @@ class ApplicationIPCController:
                         page, field, self.pk,
                         label_override='Minimum salary floor'))
             if stated[2] < minimum[2]:
-                raise PreSubmitGate(4, 'The stated salary is below the owner floor.')
+                raise PreSubmitGate(
+                    4, 'The stated salary is below the owner floor.',
+                    form_question=_ordinary_owner_question(page, field, self.pk))
 
+        # Every observed restricted-country question must have a checked
+        # negative/decline option, not merely lack a checked affirmative.
+        sanctions_groups: dict[tuple, list[dict]] = {}
         for field in page.get('controls', []):
-            if not _SANCTIONS_RX.search(label(field)):
+            if (field.get('type') == 'hidden'
+                    or not _SANCTIONS_RX.search(label(field))):
                 continue
-            if field.get('type') in {'radio', 'checkbox'}:
-                caption = str(field.get('label') or '') if field.get('checked') else ''
-            elif field.get('tag') == 'select':
-                chosen = [o.get('label') for o in field.get('options') or []
-                          if o.get('value') == field.get('value')]
-                caption = str(chosen[0]) if len(chosen) == 1 else ''
-            else:
-                caption = ''
-            if caption and not _SAFE_OPTION_RX.match(caption):
-                raise PreSubmitGate(5, 'The checked restricted-country answer is not a safe decline.')
+            key = (field.get('form_selector'), field.get('question')
+                   or field.get('label'), field.get('type')
+                   if field.get('type') not in {'radio', 'checkbox', 'button'}
+                   else 'choice')
+            sanctions_groups.setdefault(key, []).append(field)
+        for group in sanctions_groups.values():
+            selected: list[str] = []
+            for field in group:
+                if field.get('type') in {'radio', 'checkbox', 'button'}:
+                    if field.get('checked') is True:
+                        selected.append(str(field.get('label') or ''))
+                elif field.get('tag') == 'select':
+                    chosen = [o.get('label') for o in field.get('options') or []
+                              if o.get('value') == field.get('value')]
+                    if len(chosen) == 1:
+                        selected.append(str(chosen[0] or ''))
+                else:
+                    # A free-text claim is not an observed checked caption.
+                    if str(field.get('value') or '').strip():
+                        selected.append(str(field['value']))
+            if not selected or any(
+                    not _SAFE_OPTION_RX.match(caption) for caption in selected):
+                raise PreSubmitGate(
+                    5, 'The restricted-country question needs a checked safe decline.')
 
         # Own hold is acquired only after all five items pass. It is not prior
         # submission evidence. Preserve the existing post-hold drift checks.

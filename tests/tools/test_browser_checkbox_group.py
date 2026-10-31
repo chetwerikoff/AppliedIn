@@ -333,14 +333,14 @@ def final_state(row, page, selected, checked):
 
 
 def run_final(page, filled):
-    forms.check_form(forms._group_final_page(page, PK), filled, True, 'Resume.pdf', [])
+    forms.check_form(page, filled, True, 'Resume.pdf', [])
 
 
 def test_unmodified_check_form_still_rejects_an_unchecked_required_option(row):
     page = group_page()
     filled = final_state(row, page, ['Europe'], ['Europe'])
     with pytest.raises(forms.Gate, match='Required acknowledgement not completed'):
-        forms.check_form(page, filled, True, 'Resume.pdf', [])
+        forms._pinned_check_form(page, filled, True, 'Resume.pdf', [])
 
 
 def test_exactly_granted_group_passes_the_final_check(row):
@@ -463,10 +463,16 @@ async def test_settle_fails_when_the_ungranted_member_stays_checked(row):
 # ------------------------------------------------------------- end to end
 
 
-async def test_controller_page_shows_the_final_guard_only_the_bounded_copy(row):
+async def test_only_check_form_sees_the_bounded_copy(row, monkeypatch):
     page = group_page()
-    answered(row, page, ['Europe'])
-    by(page, '#region-1')['checked'] = True
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    seen = []
+    monkeypatch.setattr(forms, '_pinned_check_form',
+                        lambda p, *a: seen.append(p))
+    forms.check_form(page, filled, True, 'Resume.pdf', [])
+    assert [c['required'] for c in seen[0]['controls'][:3]] == [False, True, False]
+    # The caller's page, and every other consumer of it, keep the real flags.
+    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]
 
     class Raw:
         async def call(self, command, script):
@@ -477,8 +483,8 @@ async def test_controller_page_shows_the_final_guard_only_the_bounded_copy(row):
     controller = forms.ApplicationIPCController(
         PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
     shown = await controller._page(Raw())
-    assert [c['required'] for c in shown['controls'][:3]] == [False, True, False]
-    assert [c['required'] for c in page['controls'][:3]] == [True, True, True]
+    assert [c['required'] for c in shown['controls'][:3]] == [True, True, True]
+    assert forms._unanswered(shown, by(shown, '#region-0'))   # other logic still sees required
 
 
 async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
@@ -585,3 +591,63 @@ async def test_raw_click_guard_allows_only_the_exact_clearing_click(monkeypatch,
     row['human_approved_answers'].pop(QUESTION)
     with pytest.raises(forms.Gate):                                      # no grant: no clearing
         await controller.before_ipc(Raw(), ('click', '#region-0'), {})
+
+
+def test_grant_revoked_or_changed_between_reads_writes_nothing(row, monkeypatch):
+    page = group_page()
+    row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
+    first = deepcopy(row)
+    revoked = deepcopy(row)
+    revoked['human_approved_answers'].pop(QUESTION)
+    changed = deepcopy(row)
+    changed['human_approved_answers'][QUESTION] = grant_for(page, ['North America'])
+    writes = []
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace(set_status=lambda *a, **k: writes.append((a, k)))))
+    for later in (revoked, changed):
+        reads = iter([first, later])
+        monkeypatch.setattr(forms, '_row', lambda pk, *a, **kw: next(reads))
+        with pytest.raises(forms.Gate):
+            forms._derive_group_member_grants(page, PK)
+        assert writes == []
+    # A row that moved out of 'submitting' between the reads is also refused.
+    moved = deepcopy(first)
+    moved['status'] = 'needs_human'
+    reads = iter([first, moved])
+    monkeypatch.setattr(forms, '_row', lambda pk, *a, **kw: next(reads))
+    with pytest.raises(forms.Gate):
+        forms._derive_group_member_grants(page, PK)
+    assert writes == []
+
+
+def test_a_write_that_does_not_read_back_exactly_fails_closed(row, monkeypatch):
+    page = group_page()
+    row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
+    monkeypatch.setattr('core.stores.make_stores', lambda: SimpleNamespace(
+        tracking=SimpleNamespace(set_status=lambda *a, **k: None)))   # silently dropped
+    with pytest.raises(forms.Gate, match='did not record exactly'):
+        forms._derive_group_member_grants(page, PK)
+
+
+def test_a_checked_option_needs_a_derived_grant_minted_from_the_current_answer(row):
+    page = group_page()
+    filled = final_state(row, page, ['Europe', 'North America'],
+                         ['Europe', 'North America'])
+    run_final(page, filled)
+    # The owner narrows the answer, but a leftover derived grant for the dropped
+    # option still sits in the row (a missed removal): it is never authority.
+    leftovers = {k: deepcopy(v) for k, v in row['human_approved_answers'].items()
+                 if v.get('source') == 'checkbox-group'}
+    row['human_approved_answers'][QUESTION] = grant_for(page, ['Europe'])
+    row['human_approved_answers'].update(leftovers)
+    with pytest.raises(forms.Gate, match='not part of the current owner answer'):
+        run_final(page, filled)
+
+    # A leftover minted from an EARLIER answer for a still-selected option too.
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    run_final(page, filled)
+    row['human_approved_answers'][forms._member_key(by(page, '#region-1'))][
+        'group_ref'] = 'old-answer'
+    with pytest.raises(forms.Gate, match='does not match the current owner answer'):
+        run_final(page, filled)

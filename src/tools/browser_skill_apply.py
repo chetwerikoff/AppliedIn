@@ -3742,23 +3742,23 @@ def _group_row(pk: str, fixture_context=None) -> dict:
     return _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
 
 
-def _derive_group_member_grants(page: dict, pk: str, *, fixture_context=None) -> None:
-    """Issue 278: per-option 'yes' grants derived from the one verified group grant.
+def _group_ref(grant: dict) -> str:
+    """Opaque digest of the exact group grant a derived member grant came from."""
+    import hashlib
+    canonical = json.dumps({k: grant.get(k) for k in (
+        'value', 'question', 'url', 'form_selector', 'form_action', 'group_members')},
+        sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
 
-    The single-checkbox exact approval (check_form, execute, the IPC click
-    guard) is unchanged; it only needs a grant that binds one control. Each
-    selected member gets one, written from the CURRENT group grant after the
-    live page matched it. A derived grant whose group is no longer current,
-    or whose option is no longer selected, is removed so it cannot outlive the
-    owner's answer.
+
+def _group_plan(page: dict, row: dict) -> tuple[dict, frozenset]:
+    """The derived per-option grants this row implies for this page.
+
+    Pure: additions for every selected option of every CURRENT group grant,
+    removals for every derived grant whose group grant is gone, stale or
+    no longer selects that option.
     """
-    row = _group_row(pk, fixture_context)
-    if (row.get('pk') != pk or row.get('status') != 'submitting'
-            or row.get('possible_submission')):
-        return
     grants = row.get('human_approved_answers') or {}
-    if not isinstance(grants, dict):
-        return
     additions, removals, seen = {}, set(), set()
     for item in page.get('controls', []):
         group = _checkbox_group(page, item)
@@ -3776,42 +3776,99 @@ def _derive_group_member_grants(page: dict, pk: str, *, fixture_context=None) ->
                     'type': 'checkbox', 'form_selector': member['form_selector'],
                     'form_action': member['form_action'],
                     'visible_text': member['label'], 'source': 'checkbox-group',
+                    'group_ref': _group_ref(current),
                     **({'verified_redirect_url': current['verified_redirect_url']}
                        if current.get('verified_redirect_url') else {}),
                 }
             elif (isinstance(grants.get(key), dict)
                   and grants[key].get('source') == 'checkbox-group'):
                 removals.add(key)
-    if all(grants.get(k) == v for k, v in additions.items()) and not removals:
-        return
+    return additions, frozenset(removals)
+
+
+def _plan_applied(grants: dict, plan: tuple[dict, frozenset]) -> bool:
+    additions, removals = plan
+    return (all(grants.get(k) == v for k, v in additions.items())
+            and not any(k in grants for k in removals))
+
+
+def _derive_group_member_grants(page: dict, pk: str, *, fixture_context=None) -> None:
+    """Issue 278: per-option 'yes' grants derived from the one verified group grant.
+
+    The single-checkbox exact approval (check_form, execute, the IPC click
+    guard) is unchanged; it only needs a grant that binds one control. No
+    atomic compare-and-set exists for `human_approved_answers`, so the write is
+    fail-closed instead: the plan is recomputed from the commit-time row and
+    any difference aborts, the write is re-read and verified, and every
+    consumer separately revalidates the live group grant (see
+    `_group_member_grant_state`), so a derived grant is never authority alone.
+    """
     row = _group_row(pk, fixture_context)
     if (row.get('pk') != pk or row.get('status') != 'submitting'
-            or row.get('possible_submission')
-            or not isinstance(row.get('human_approved_answers') or {}, dict)):
-        raise Gate('Tracked row changed before the checkbox group approval.')
-    merged = {k: v for k, v in (row.get('human_approved_answers') or {}).items()
-              if k not in removals}
-    merged.update(additions)
+            or row.get('possible_submission')):
+        return
+    grants = row.get('human_approved_answers') or {}
+    if not isinstance(grants, dict):
+        return
+    plan = _group_plan(page, row)
+    if _plan_applied(grants, plan):
+        return
+    commit = _group_row(pk, fixture_context)
+    if (commit.get('pk') != pk or commit.get('status') != 'submitting'
+            or commit.get('possible_submission')
+            or not isinstance(commit.get('human_approved_answers') or {}, dict)
+            or _group_plan(page, commit) != plan):
+        raise Gate('Tracked row or checkbox group approval changed before it was recorded.')
+    merged = {k: v for k, v in (commit.get('human_approved_answers') or {}).items()
+              if k not in plan[1]}
+    merged.update(plan[0])
     if fixture_context is not None:
         fixture_context.set_status(pk, 'submitting', human_approved_answers=merged)
     else:
         from core.stores import make_stores
         make_stores().tracking.set_status(
             pk, 'submitting', human_approved_answers=merged)
+    after = _group_row(pk, fixture_context)
+    if (after.get('status') != 'submitting' or after.get('possible_submission')
+            or after.get('human_approved_answers') != merged
+            or _group_plan(page, after) != (plan[0], frozenset())):
+        raise Gate('The checkbox group approval did not record exactly; inspect it again.')
+
+
+def _group_member_grant_state(page: dict, target: dict, pk: str, *,
+                              fixture_context=None) -> str:
+    """'none' (no current group grant / not granted) or 'granted'; else a Gate.
+
+    A granted option must also carry a derived grant minted from THIS exact
+    group grant; a leftover from an earlier answer fails closed.
+    """
+    group = _checkbox_group(page, target)
+    if group is None:
+        return 'none'
+    row = _group_row(pk, fixture_context)
+    current = _current_group_grant(page, group, row)
+    if current is None or target['label'] not in current['selected']:
+        return 'none'
+    derived = (row.get('human_approved_answers') or {}).get(_member_key(target))
+    if (not isinstance(derived, dict) or derived.get('source') != 'checkbox-group'
+            or derived.get('group_ref') != _group_ref(current)):
+        raise Gate('The checkbox option approval does not match the current owner answer.')
+    return 'granted'
 
 
 def _group_final_page(page: dict, pk: str, *, fixture_context=None) -> dict:
-    """Issue 278: the page `check_form` judges, with ONE bounded adjustment.
+    """The copy ONLY `check_form` is shown, with ONE bounded adjustment.
 
-    check_form (pinned) accepts an unchecked required checkbox only through
-    no path at all: with or without a filled value it raises. A native option
-    group marks every option required although the owner chose a subset. So,
-    solely for the UNSELECTED members of a group whose stored grant binds this
-    exact option set and every selector/form_selector (read in this same
-    pass), and only when exactly the granted members are verified checked in
-    this same read, those members are shown to check_form as required=False.
-    Every other control and field is passed through untouched. Any mismatch
-    leaves the original unchecked required checkbox to fail check_form.
+    check_form (pinned) has no negative-receipt path: an unchecked required
+    checkbox raises with or without a filled value. A native option group marks
+    every option required although the owner chose a subset. So, solely for the
+    UNSELECTED members of a group whose stored grant binds this exact option set
+    and every selector/form_selector (read in this same pass), and only when
+    exactly the granted members are checked in this same read, those members are
+    shown as required=False. Every other control and field is passed through
+    untouched. A checked member the current owner answer does not grant, or
+    whose derived grant is not minted from it, fails closed here. Any other
+    mismatch leaves the original unchecked required checkbox to fail check_form.
     """
     relax, seen, row = set(), set(), None
     for item in page.get('controls', []):
@@ -3821,10 +3878,13 @@ def _group_final_page(page: dict, pk: str, *, fixture_context=None) -> dict:
         seen.update(c['selector'] for c in group)
         row = _group_row(pk, fixture_context) if row is None else row
         grant = _current_group_grant(page, group, row)
-        if grant is None:
-            continue
-        checked = {c['label'] for c in group if c.get('checked') is True}
-        if not checked or checked != set(grant['selected']):
+        checked = [c for c in group if c.get('checked') is True]
+        for member in checked:
+            if _group_member_grant_state(page, member, pk, fixture_context=fixture_context
+                                         ) != 'granted':
+                raise Gate('A checked checkbox option is not part of the current owner answer.')
+        if grant is None or not checked or {c['label'] for c in checked} != set(
+                grant['selected']):
             continue
         relax.update(c['selector'] for c in group if c.get('checked') is not True)
     if not relax:
@@ -3832,6 +3892,25 @@ def _group_final_page(page: dict, pk: str, *, fixture_context=None) -> dict:
     return {**page, 'controls': [
         {**c, 'required': False} if c.get('selector') in relax else c
         for c in page['controls']]}
+
+
+_pinned_check_form = check_form
+
+
+def _check_form_with_groups(page: dict, filled: dict, uploaded: bool,
+                            attachment: str = '', receipts: list | None = None) -> None:
+    """The final guard's entry: the bounded group copy goes ONLY to check_form.
+
+    The byte-pinned check_form and authorize_final_submit are unchanged; the
+    latter resolves `check_form` by module name, so every other consumer of
+    the page (identity, approvals, controller reads) keeps the real flags.
+    """
+    if isinstance(filled, _ApprovedFormValues):
+        page = _group_final_page(page, filled.pk, fixture_context=filled.fixture_context)
+    _pinned_check_form(page, filled, uploaded, attachment, receipts)
+
+
+check_form = _check_form_with_groups
 
 
 def _group_uncheck_allowed(page: dict, target: dict, pk: str, *,
@@ -4076,6 +4155,11 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     if not _unanswered(page, target, owner_all=_owner_asks_every_receiver(page)):
         raise Gate('Only required, unanswered native choices can use a grant.')
     key = _key(page, target)
+    if (target.get('type') == 'checkbox' and pk
+            and _group_member_grant_state(page, target, pk,
+                                          fixture_context=fixture_context) == 'none'
+            and _checkbox_group(page, target) is not None):
+        return None  # No current owner answer grants this option.
     if target.get('type') == 'checkbox':
         scope = _assent_scope(target)
         if scope == 'owner':
@@ -7371,9 +7455,7 @@ class ApplicationIPCController:
             page = result.get('value') if isinstance(result, dict) else None
         if not isinstance(page, dict) or not isinstance(page.get('url'), str):
             raise Gate('Fresh application page observation is unavailable.')
-        # Issue 278: the byte-pinned final guard judges THIS page, so the one
-        # bounded adjustment for an answered checkbox group is made here.
-        return _group_final_page(page, self.pk, fixture_context=self.fixture_context)
+        return page
 
     async def _reversible_receiver(self, session, page: dict, target: dict):
         # The raw producer independently rereads ENTRY_PAGE and its fixed

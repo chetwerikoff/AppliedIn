@@ -3843,3 +3843,139 @@ def test_hidden_attestation_with_interactive_label_is_not_admitted(reader, inter
                     if c['selector'] == '#hidden-attestation']
         assert len(evidence) == 1
         assert evidence[0]['ashby_hidden_choice'] is False
+
+
+# Issue #276: sanitized shape captured from two public Ashby applications. PAGE
+# ignores opacity, so a certified hidden attestation reaches the rooted bootstrap
+# with no hidden-choice flag; only the root evidence and the fixed witness carry it.
+_HIDDEN_ATTESTATION = '#hidden-attestation'
+_OWNER_ATTESTATION = 'I certify that these synthetic statements are true'
+
+
+async def _opacity_blind_attestation_world(monkeypatch):
+    row, raw, decision, provenance = root_world(
+        monkeypatch, hiddenAttestation=True, attestationText=_OWNER_ATTESTATION)
+    for snapshot in (raw.current, raw.fixed):
+        for c in snapshot['controls']:
+            if c['selector'] != _HIDDEN_ATTESTATION and c.get('type') != 'file':
+                c.update(required=False)
+        for e in snapshot['entry']['root_evidence']:
+            if e['selector'] != _HIDDEN_ATTESTATION and e.get('type') != 'file':
+                e.update(required=False)
+    page_control = next(c for c in raw.current['controls']
+                        if c['selector'] == _HIDDEN_ATTESTATION)
+    for key in ('ashby_hidden_choice', 'associated_label_selector', 'visible'):
+        page_control.pop(key, None)
+    evidence = next(e for e in raw.current['entry']['root_evidence']
+                    if e['selector'] == _HIDDEN_ATTESTATION)
+    witness = next(c for c in raw.fixed['controls']
+                   if c['selector'] == _HIDDEN_ATTESTATION)
+    assert evidence['ashby_hidden_choice'] is True
+    assert witness['ashby_hidden_choice'] is True and witness['visible'] is False
+    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
+                                  resume_path='Resume.pdf')
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=asyncio.get_running_loop().time() + 10)
+    return row, session, page, provenance
+
+
+async def test_rooted_hidden_attestation_with_stale_grant_is_asked_again(monkeypatch):
+    """A grant that no longer binds must re-ask the hidden checkbox, not gate it."""
+    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
+    assert 'ashby_hidden_choice' not in next(
+        c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
+    row['human_approved_answers'][_OWNER_ATTESTATION] = {
+        'value': 'yes', 'label': _OWNER_ATTESTATION, 'visible_text': _OWNER_ATTESTATION,
+        'selector': _HIDDEN_ATTESTATION, 'url': page['url'],
+        'question': _OWNER_ATTESTATION, 'tag': 'input', 'type': 'checkbox',
+        'form_selector': '#drifted-root', 'form_action': '#drifted-submit'}
+    with pytest.raises(forms.Gate) as gate:
+        await forms._bootstrap(session, page, PK, {}, provenance=provenance)
+    assert gate.value.reason == 'owner_question', str(gate.value)
+    assert 'no longer binds' in str(gate.value)
+    question = gate.value.form_question
+    assert question['selector'] == _HIDDEN_ATTESTATION
+    assert question['ashby_hidden_choice'] is True
+    assert question['visible'] is False
+    assert question['associated_label_selector'] == '#hidden-attestation-label'
+
+
+async def test_hidden_choice_flag_needs_root_evidence_and_witness(monkeypatch, caplog):
+    """Only a choice both independent readers saw hidden behind its label is restored."""
+    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
+    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
+    witness = {c['selector']: c for c in session.raw.fixed['controls']}
+    assert forms._disclosure_question(
+        page, target, witness, posting('ashby'),
+        provenance=provenance)['ashby_hidden_choice'] is True
+    for damage in ('evidence', 'witness-flag', 'witness-label', 'witness-visible'):
+        broken_page, broken_witness = deepcopy(page), deepcopy(witness)
+        if damage == 'evidence':
+            for e in broken_page['entry']['root_evidence']:
+                if e['selector'] == _HIDDEN_ATTESTATION:
+                    e['ashby_hidden_choice'] = False
+        elif damage == 'witness-flag':
+            broken_witness[_HIDDEN_ATTESTATION]['ashby_hidden_choice'] = False
+        elif damage == 'witness-label':
+            broken_witness[_HIDDEN_ATTESTATION]['associated_label_selector'] = '#other'
+        else:
+            broken_witness[_HIDDEN_ATTESTATION]['visible'] = True
+            broken_witness[_HIDDEN_ATTESTATION]['visible_text'] = 'Different caption'
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=forms._LOG.name):
+            with pytest.raises(forms.Gate) as gate:
+                forms._disclosure_question(
+                    broken_page, deepcopy(target), broken_witness, posting('ashby'),
+                    provenance=provenance)
+        assert gate.value.reason == 'defect_witness', damage
+        messages = [r.getMessage() for r in caplog.records
+                    if 'disclosure member witness failed' in r.getMessage()]
+        assert len(messages) == 1, damage
+        assert messages[0].startswith(
+            'disclosure member witness failed type=checkbox hidden_choice=False '
+            'predicate='), messages[0]
+        assert _OWNER_ATTESTATION not in messages[0]
+
+
+@pytest.mark.parametrize('damage,token', [
+    ('flag', 'hidden_flag'),
+    ('association', 'hidden_association'),
+    ('text', 'hidden_text'),
+])
+async def test_hidden_choice_member_witness_logs_only_failed_subpredicate_token(
+        monkeypatch, caplog, damage, token):
+    """Issue #276 ARCH delta: a hidden member names its first failed subpredicate."""
+    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
+    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
+    witness = deepcopy({c['selector']: c for c in session.raw.fixed['controls']})
+    flagged = {**target, 'ashby_hidden_choice': True, 'visible': False,
+               'associated_label_selector': witness[_HIDDEN_ATTESTATION][
+                   'associated_label_selector']}
+    dom = witness[_HIDDEN_ATTESTATION]
+    secret = 'Synthetic unlogged caption'
+    if damage == 'flag':
+        dom['ashby_hidden_choice'] = False
+    elif damage == 'association':
+        dom['associated_label_selector'] = '#' + secret.replace(' ', '-')
+    else:
+        dom['visible_text'] = secret
+    with caplog.at_level(logging.INFO, logger=forms._LOG.name):
+        with pytest.raises(forms.Gate) as gate:
+            forms._disclosure_question(page, flagged, witness, posting('ashby'),
+                                       provenance=provenance)
+    assert gate.value.reason == 'defect_witness'
+    messages = [r.getMessage() for r in caplog.records
+                if 'disclosure member witness failed' in r.getMessage()]
+    assert messages == ['disclosure member witness failed type=checkbox '
+                        f'hidden_choice=True predicate={token}']
+    assert secret not in messages[0] and _OWNER_ATTESTATION not in messages[0]
+    assert secret.replace(' ', '-') not in messages[0]
+
+
+def test_non_hidden_member_keeps_visible_predicate():
+    member = {'type': 'checkbox', 'label': 'x', 'disabled': False}
+    dom = {'visible': False, 'ashby_hidden_choice': False,
+           'associated_label_selector': '', 'visible_text': 'x'}
+    assert forms._member_witness_predicate(
+        member, dom, choice=True, hidden_attestation=False) == 'visible'

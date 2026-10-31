@@ -1,17 +1,10 @@
-"""FF-224e: the server-owned résumé upload runs before the first model decision.
+"""Issue #293: one server-owned Ashby PDF upload and ungated preparation.
 
-Live, every model-intent trigger for the one guarded upload (an upload
-decision, a click on the upload control, Submit) waited for the model, and the
-model kept finding another route to the final PDF guard first: a click on an
-answer button, a click on a field. Each fix closed one route and the next run
-found another. The upload now runs right after the owner gate and before the
-first decision, under the same one-upload terms, so no model route precedes it.
-
-A Yes/No answer button clicked directly was one of those routes: it reached the
-final guard as an unclassified click. It now takes the guarded Boolean choice.
-
-The production cases run the real raw producer and controller (no fixture
-context) on the reversible Ashby route; nothing is clicked or committed.
+The raw application producer permits one staged résumé file set and records
+its result from current input readback. Ordinary fields, Yes/No buttons and
+other non-Submit clicks have no per-control approval; only the final
+code-owned Submit check can reject substantive form evidence.
+The tests use synthetic offline fixtures, never a real application.
 """
 from pathlib import Path
 
@@ -73,7 +66,7 @@ async def test_an_incomplete_upload_tree_no_longer_stops_the_upload(monkeypatch,
     for page in (raw.current, raw.fixed):
         page['entry']['upload_tree']['complete'] = False
     result = await run_apply([STOP])
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question'], result
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable', result
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)] and guard.upload_completed
     _no_production_commit(raw, transport, row)
@@ -125,8 +118,9 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     run; after the upload it never reaches the chooser again."""
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
-    later = {'upload-decision': [UPLOAD, click],
-             'upload-control-click': [{'action': 'click', 'selector': '#dropzone'}],
+    later = {'upload-decision': [UPLOAD],
+             'upload-control-click': [
+                 {'action': 'click', 'selector': '#dropzone'}, STOP],
              'submit-click': [click]}[intent]
     result = await run_apply(later)
     assert result['status'] == 'gate', result
@@ -134,7 +128,13 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     assert decide.await_count == len(later)
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
-    _no_production_commit(raw, transport, row)
+    # A helper click is ordinary preparation; unlike a classified Submit, it
+    # may reach the page without authorizing a new application outcome.
+    guard = transport._application_controller
+    assert not guard.committed
+    assert not row.get('possible_submission')
+    assert not any(c[0] == 'click' and c[1] == click['selector']
+                   for c in raw.calls)
 
 
 async def test_missing_owner_name_is_asked_without_per_field_grant(
@@ -162,6 +162,7 @@ async def test_missing_owner_name_is_asked_without_per_field_grant(
     assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed
     _no_production_commit(raw, transport, row)
+
 
 async def test_field_rendered_after_the_first_decision_is_left_to_the_fallbacks(
         monkeypatch, tmp_path):

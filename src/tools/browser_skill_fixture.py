@@ -748,6 +748,17 @@ class _SyntheticRun:
     def is_held(self, pk: str) -> bool:
         return pk == PK and self.hold
 
+    def replace_grants_if_unchanged(self, pk: str, expected: dict, new: dict) -> bool:
+        from core.storage.base import grants_replace_patch
+
+        if pk != PK:
+            raise ValueError("No synthetic row for this job.")
+        merged = None if self.hold else grants_replace_patch(self.row, expected, new)
+        if merged is None:
+            return False
+        self.row["human_approved_answers"] = merged
+        return True
+
     def set_status(self, pk: str, status, **attrs) -> None:
         if pk != PK:
             raise ValueError("No synthetic row for this job.")

@@ -780,6 +780,58 @@ def _missing_answer_reason(target: dict) -> str:
     return 'agent_review_unavailable'
 
 
+# Ashby checkbox ids carry a per-page-load UUID before a fixed "_" separator
+# ("<load uuid>_<field uuid>-labeled-checkbox-N"); a CSS-escaped leading digit
+# replaces the first hex digit of that UUID. Only that leading token is dropped.
+_CHECKBOX_LOAD_PREFIX = re.compile(
+    r'^#(?:\\3[0-9] [0-9a-f]{7}|[0-9a-f]{8})(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}_(?=\S)')
+
+
+def _checkbox_identity_of(control: dict) -> str:
+    selector = control.get('selector')
+    if control.get('type') != 'checkbox' or not isinstance(selector, str):
+        return ''
+    match = _CHECKBOX_LOAD_PREFIX.match(selector)
+    return '#' + selector[match.end():] if match else ''
+
+
+def _checkbox_control_identity(page: dict, target: dict) -> str:
+    """Load-stable checkbox identity, only when exactly one current receiver has it."""
+    identity = _checkbox_identity_of(target)
+    if not identity:
+        return ''
+    yielding = [c for c in page.get('controls', [])
+                if isinstance(c, dict) and _could_receive_an_answer(c)
+                and _checkbox_identity_of(c) == identity]
+    return identity if len(yielding) == 1 else ''
+
+
+def _grant_selector_binds(grant: dict, target: dict) -> bool:
+    """Exact selector, or the same unique load-stable identity the grant recorded."""
+    identity = grant.get('control_identity')
+    return (grant.get('selector') == target.get('selector')
+            or (isinstance(identity, str) and bool(identity)
+                and target.get('control_identity') == identity))
+
+
+def _log_grant_mismatch(grant: dict, target: dict | None, url: str, value: str) -> None:
+    """Names of failed binding components only; never a value, label or page text."""
+    observed = target or {}
+    names = [name for name, same in (
+        ('value', grant.get('value') == value),
+        ('selector', _grant_selector_binds(grant, observed)),
+        ('url', grant.get('url') == url),
+        ('label', grant.get('label') == observed.get('label')),
+        ('question', grant.get('question') == observed.get('question', '')),
+        ('tag', grant.get('tag') == observed.get('tag')),
+        ('type', grant.get('type') == observed.get('type')),
+        ('form_selector', grant.get('form_selector') == observed.get('form_selector')),
+        ('form_action', grant.get('form_action') == observed.get('form_action')),
+    ) if not same]
+    _LOG.info('exact grant binding mismatch: fields=%s grant_has_control_identity=%s',
+             ','.join(names) or 'none', 'control_identity' in grant)
+
+
 def exact_approval(pk: str, key: str, value: str, *,
                    target: dict | None = None, url: str = '', provenance=None,
                    fixture_context=None, witnessed_options=None) -> None:
@@ -803,8 +855,8 @@ def exact_approval(pk: str, key: str, value: str, *,
             or row.get('possible_submission') or not key or not value or not url
             or not target or not isinstance(grant, dict)
             or grant.get('value') != value
+            or not _grant_selector_binds(grant, target)
             or any(grant.get(k) != observed for k, observed in (
-                ('selector', target.get('selector')),
                 ('url', url),
                 ('label', target.get('label')),
                 ('question', target.get('question', '')),
@@ -835,6 +887,8 @@ def exact_approval(pk: str, key: str, value: str, *,
                         {key: option[key] for key in ('selector', 'label', 'value')}
                         for option in _combobox_options(target)]))):
         # Old label-only grants have no control identity and always gate.
+        if isinstance(grant, dict) and target:
+            _log_grant_mismatch(grant, target, url, value)
         raise Gate('An exact human-approved answer is needed for this control.')
     if (isinstance(provenance, VendorRedirectProvenance)
             and (not _alias_current(provenance, fixture_context=ctx)
@@ -3462,6 +3516,13 @@ def _validate_rooted_boolean_groups(page: dict) -> None:
 
 
 def _bound_target(page: dict, target: dict) -> dict:
+    """Exact grant identity, plus a unique load-stable checkbox identity when present."""
+    bound = _bound_target_base(page, target)
+    identity = _checkbox_control_identity(page, target)
+    return {**bound, 'control_identity': identity} if identity else bound
+
+
+def _bound_target_base(page: dict, target: dict) -> dict:
     """Exact grant identity includes the entire choice pair on formless roots."""
     structural = _formless_root(page)
     if target.get('type') == 'button' and structural:
@@ -4223,6 +4284,9 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
             for option in _combobox_options(target)]
     if target.get('type') == 'checkbox':
         question['visible_text'] = witness[target['selector']]['visible_text']
+        identity = _checkbox_control_identity(page, target)
+        if identity:
+            question['control_identity'] = identity
     if target.get('type') == 'radio':
         bound = _bound_target(page, target)
         question['radio_name'] = bound['radio_name']
@@ -4586,7 +4650,10 @@ def _bootstrap_grant_state(grant, item: dict, question: dict, value: str) -> str
     elif item.get('type') == 'combobox' and _material_form_choice(item):
         if not _closed_material_combobox(item):
             expected['options'] = question.get('options')
-    if any(grant[key] != seen for key, seen in expected.items() if key in grant):
+    if (any(grant[key] != seen for key, seen in expected.items()
+            if key in grant and key != 'selector')
+            or ('selector' in grant and not _grant_selector_binds(
+                grant, {**item, 'control_identity': question.get('control_identity', '')}))):
         return 'stale'
     if any(key not in grant for key in expected):
         return 'incomplete'
@@ -4659,6 +4726,33 @@ def _bank_auto_log_skip(pk: str, item: dict, why: str, key: str | None = None) -
     _LOG.info('bank-auto skip pk=%s key=%s why=%s', pk, name, why)
 
 
+def _stale_bank_grant_replaceable(existing: object, fresh: dict, bound: dict) -> bool:
+    """A code-written bank grant that fails exact binding ONLY on empty form fields.
+
+    `fresh` is the grant this call would write from the final-route question;
+    `bound` is the same final-route `_bound_target`. Owner, lead and any other
+    non-bank grant never qualifies, and no label or other field is normalized.
+    """
+    if (not isinstance(existing, dict) or existing.get('source') != 'bank-auto'
+            or fresh.get('source') != 'bank-auto'
+            or existing.get('value') != fresh.get('value')):
+        return False
+    form_selector, form_action = bound.get('form_selector'), bound.get('form_action')
+    if (existing.get('form_selector') != '' or existing.get('form_action') != ''
+            or not isinstance(form_selector, str) or not form_selector
+            or not isinstance(form_action, str) or not form_action
+            or fresh.get('form_selector') != form_selector
+            or fresh.get('form_action') != form_action):
+        return False
+    if not _grant_selector_binds(existing, {
+            'selector': fresh.get('selector'),
+            'control_identity': fresh.get('control_identity', '')}):
+        return False
+    ignored = {'form_selector', 'form_action', 'selector', 'control_identity'}
+    return all(existing.get(k) == fresh.get(k)
+               for k in (set(existing) | set(fresh)) - ignored)
+
+
 def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
                             global_facts: dict, *origins: str,
                             provenance=None, fixture_context=None,
@@ -4677,7 +4771,7 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
     grants = row.get('human_approved_answers') or {}
     if not isinstance(grants, dict):
         return
-    pending = {}
+    pending, replacements = {}, {}
     for item in page['controls']:
         if (reversible_scope is not None and (
                 item.get('in_form') is not False
@@ -4703,7 +4797,12 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         except Gate:
             _bank_auto_log_skip(pk, item, 'no_key')
             continue
-        if key in grants or key in pending:
+        # Only the final route may replace a stale code-written bank grant; an
+        # owner/lead or any other existing grant, and any reversible write, wins.
+        stale = grants.get(key) if key in grants else None
+        if key in pending or (key in grants and (
+                reversible_scope is not None or not isinstance(stale, dict)
+                or stale.get('source') != 'bank-auto')):
             _bank_auto_log_skip(pk, item, 'not_eligible', key)
             continue
         global_key = _fact_key(global_facts, key)
@@ -4754,11 +4853,19 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             grant['options'] = question['options']
         if item.get('type') == 'checkbox':
             grant['visible_text'] = question['visible_text']
+            if question.get('control_identity'):
+                grant['control_identity'] = question['control_identity']
         if item.get('type') == 'radio':
             grant['radio_name'] = question['radio_name']
             grant['radio_members'] = question['radio_members']
+        if key in grants:
+            if not _stale_bank_grant_replaceable(stale, grant, _bound_target(page, item)):
+                _bank_auto_log_skip(pk, item, 'not_eligible', key)
+                continue
+            replacements[key] = (stale, grant)
+            continue
         pending[key] = grant
-    if not pending:
+    if not pending and not replacements:
         return
     # Re-read immediately before persistence. Existing explicit grants win.
     row = (_row(pk, fixture_context=fixture_context) if fixture_context is not None
@@ -4770,18 +4877,30 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
     if not isinstance(current, dict):
         raise Gate('Stored approval shape is invalid.')
     additions = {k: v for k, v in pending.items() if k not in current}
-    if not additions:
-        return
-    if fixture_context is not None:
-        fixture_context.set_status(pk, 'submitting',
-                                   human_approved_answers={**current, **additions})
-    else:
+    if additions:
+        if fixture_context is not None:
+            fixture_context.set_status(pk, 'submitting',
+                                       human_approved_answers={**current, **additions})
+        else:
+            from core.stores import make_stores
+            make_stores().tracking.set_status(
+                pk, 'submitting', human_approved_answers={**current, **additions})
+    replaced = {}
+    if replacements:
+        # One guarded atomic update: nothing is written if any stale grant, the
+        # status or the possible-submission mark changed since it was read.
         from core.stores import make_stores
-        make_stores().tracking.set_status(
-            pk, 'submitting', human_approved_answers={**current, **additions})
+        store = fixture_context if fixture_context is not None else make_stores().tracking
+        if store.replace_grants_if_unchanged(
+                pk, {k: old for k, (old, _) in replacements.items()},
+                {k: new for k, (_, new) in replacements.items()}):
+            replaced = replacements
+        else:
+            _LOG.info('bank-auto stale grant replacement skipped: row changed')
     reported = _BOOTSTRAP_BANK_GRANTS.get()
     if reported is not None:
         reported.extend(additions)
+        reported.extend(replaced)
 
 
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:

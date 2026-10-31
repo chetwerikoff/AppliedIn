@@ -282,6 +282,35 @@ def direct_gate_patch(current: dict | None, expected_pending: dict, disposition:
     return patch
 
 
+def grants_replace_patch(row: dict | None, expected: dict, new: dict) -> dict | None:
+    """The merged approval map for a guarded grant replacement, else None.
+
+    `expected` maps each guarded key to its exact current grant, or None for a
+    key that must be absent. `new` maps the only keys that may change; each must
+    also be guarded. Any other key of the approval map is carried over untouched.
+    """
+    if (not isinstance(expected, dict) or not isinstance(new, dict) or not new
+            or not set(new) <= set(expected)
+            or any(not isinstance(v, dict) for v in new.values())
+            or any(v is not None and not isinstance(v, dict) for v in expected.values())):
+        raise ValueError("Grant replacement needs guarded keys and dict grants")
+    if (not isinstance(row, dict) or row.get("status") != Status.SUBMITTING.value
+            or row.get("possible_submission")):
+        return None
+    grants = row.get("human_approved_answers")
+    if grants is None:
+        grants = {}
+    if not isinstance(grants, dict):
+        return None
+    for key, grant in expected.items():
+        if grant is None:
+            if key in grants:
+                return None
+        elif grants.get(key) != grant:
+            return None
+    return {**grants, **new}
+
+
 _GUARD_COMPARE = (
     "pk", "company", "jd_url", "status", "jd_text", "posting_guard",
     "reviewed_guard_generation", "confirmation_id", "possible_submission",
@@ -495,6 +524,17 @@ class AbstractTracking(ABC):
         """Atomically patch an existing row whose status and exact reader
         witness match. An absent witness key requires attribute absence.
         Conditional mismatch returns False; storage exceptions propagate.
+        """
+
+    @abstractmethod
+    def replace_grants_if_unchanged(self, pk: str, expected: dict, new: dict) -> bool:
+        """Atomically replace approval-map keys only while their premise holds.
+
+        Requires status ``submitting`` and no possible submission. Every key of
+        `expected` must still hold exactly the given grant (None: still absent).
+        Only the keys of `new` are written; the status and every other approval
+        key stay as stored. Any mismatch writes nothing and returns False;
+        storage errors propagate.
         """
 
     @abstractmethod

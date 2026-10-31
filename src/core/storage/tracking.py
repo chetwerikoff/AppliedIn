@@ -18,7 +18,7 @@ from .base import (
     legacy_repair_row_allowed, tenant_pin_row_allowed,
     tenant_pin_witness_fields, tenant_pin_same_witness,
     guard_observation_matches, guard_patch, _GUARD_COMPARE,
-    DIRECT_GATE_COMPARE, direct_gate_patch,
+    DIRECT_GATE_COMPARE, direct_gate_patch, grants_replace_patch,
     canonical_repair_row_allowed, canonical_repair_same_witness,
     canonical_repair_witness_fields, canonical_repair_patch,
 )
@@ -204,6 +204,53 @@ class TrackingStore(AbstractTracking):
             self._table.update_item(
                 Key={"pk": pk},
                 UpdateExpression="SET " + ", ".join(sets),
+                ConditionExpression=" AND ".join(conditions),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+            )
+            return True
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
+    def replace_grants_if_unchanged(self, pk: str, expected: dict, new: dict) -> bool:
+        """One conditional UpdateItem that sets only the `new` keys of the grant map.
+
+        Every `expected` key is compared in the same condition as the write, so a
+        concurrent grant change (or a status/possible_submission change) writes
+        nothing; unrelated approval keys are never rewritten.
+        """
+        current = self.get_current(pk)
+        merged = grants_replace_patch(current, expected, new)
+        if merged is None:
+            return False
+        names = {"#pk": "pk", "#s": "status", "#ps": "possible_submission",
+                 "#g": "human_approved_answers"}
+        values = {":submitting": "submitting", ":no": False}
+        conditions = ["attribute_exists(#pk)", "#s = :submitting",
+                      "(attribute_not_exists(#ps) OR #ps = :no)"]
+        if current.get("human_approved_answers") is None:
+            # No map yet: every guarded key is absent; create it whole, once.
+            conditions.append("attribute_not_exists(#g)")
+            sets = ["#g = :grants"]
+            values[":grants"] = dict(new)
+        else:
+            conditions.append("attribute_exists(#g)")
+            sets = []
+            for i, (key, grant) in enumerate(expected.items()):
+                names[f"#k{i}"] = key
+                if grant is None:
+                    conditions.append(f"attribute_not_exists(#g.#k{i})")
+                else:
+                    values[f":e{i}"] = grant
+                    conditions.append(f"#g.#k{i} = :e{i}")
+                if key in new:
+                    values[f":n{i}"] = new[key]
+                    sets.append(f"#g.#k{i} = :n{i}")
+        try:
+            self._table.update_item(
+                Key={"pk": pk}, UpdateExpression="SET " + ", ".join(sets),
                 ConditionExpression=" AND ".join(conditions),
                 ExpressionAttributeNames=names,
                 ExpressionAttributeValues=values,

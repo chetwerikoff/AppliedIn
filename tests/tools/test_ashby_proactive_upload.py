@@ -137,22 +137,31 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     _no_production_commit(raw, transport, row)
 
 
-async def test_pending_owner_question_keeps_priority(monkeypatch, tmp_path):
-    """The owner gate runs first. An unanswered receiver is asked of the owner
-    with no upload and no decision, never turned into an uncertain upload."""
+async def test_missing_owner_name_is_asked_without_per_field_grant(
+        monkeypatch, tmp_path):
+    """Preparation may upload once; an observed missing fact is still owner-only.
+
+    A model points at the exact current Name receiver. No historic grant is
+    issued, and the file is never submitted or uploaded a second time.
+    """
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     for page in (raw.current, raw.fixed):
         for c in page['controls'] + page['entry']['root_evidence']:
             if c['selector'] == '#_systemfield_name':
                 c.update(value='', has_value=False)
-    result = await run_apply([STOP])
+    result = await run_apply([{
+        'action': 'gate', 'selector': '#_systemfield_name',
+        'question': 'What is the synthetic applicant name?',
+    }])
     assert result['status'] == 'gate' and result['reason'] == 'owner_question', result
     assert result['form_question']['selector'] == '#_systemfield_name'
-    assert uploads == [] and decide.await_count == 0
-    assert not transport._application_controller.upload_attempted
+    assert result['review_route'] == 'owner'
+    assert decide.await_count == 1
+    guard = transport._application_controller
+    assert uploads == [('set', Path(guard.resume_path).name)]
+    assert guard.upload_attempted and guard.upload_completed
     _no_production_commit(raw, transport, row)
-
 
 async def test_field_rendered_after_the_first_decision_is_left_to_the_fallbacks(
         monkeypatch, tmp_path):

@@ -26,25 +26,25 @@ QUESTION = 'Gender'
 FIRST, SECOND = '#survey-choice-0', '#survey-choice-1'
 
 
-def _prepare(snapshot):
+def _prepare(snapshot, required=True):
     for c in snapshot['controls']:
         if c['selector'] in _CHOICES:
-            c.update(value='on', has_value=True, question=QUESTION, required=True)
+            c.update(value='on', has_value=True, question=QUESTION, required=required)
             if c['label'] == 'Synthetic option 1':
                 c['label'] = DECLINE
             if c.get('visible_text') == 'Synthetic option 1':
                 c['visible_text'] = DECLINE
     for e in snapshot['entry']['root_evidence']:
         if e['selector'] in _CHOICES:
-            e.update(value='on', required=True)
+            e.update(value='on', required=required)
             if e['label'] == 'Synthetic option 1':
                 e['label'] = DECLINE
 
 
-async def survey_world(monkeypatch):
+async def survey_world(monkeypatch, required=True):
     row, raw, decision, provenance = root_world(monkeypatch, **_LIVE['openai'])
     for snapshot in (raw.current, raw.fixed):
-        _prepare(snapshot)
+        _prepare(snapshot, required)
     session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance,
                                   resume_path='Resume.pdf')
     page = await forms._stable_application_form(
@@ -210,6 +210,25 @@ async def test_write_of_another_member_than_the_grant_is_refused(monkeypatch):
             facts={}, filled={}, resume_path='', company=provenance.company, jd_text='',
             resume_tex='', github='', pk=PK, job_url=provenance.wrapper, provenance=provenance)
     assert not [c for c in raw.calls if c[0] == 'click']
+
+
+async def test_optional_group_is_recognised_left_unanswered_and_never_clicked(monkeypatch):
+    # ARCH 20:01: the captured EEOC radios are required=False. Such a group is
+    # recognised, needs no answer, and is neither asked nor declined for the owner.
+    row, raw, page, witness, provenance = await survey_world(monkeypatch, required=False)
+    members = forms._radio_group(page, radio(page, FIRST))
+    assert [m['selector'] for m in members] == [FIRST, SECOND]
+    assert not any(m['required'] or m['checked'] for m in members)
+    question = ask(page, witness, provenance)
+    assert question['radio_name'] == 'survey-choice'
+    assert not any(forms._unanswered(page, radio(page, s)) for s in _CHOICES)
+    row['human_approved_answers'] = {}
+    radios = [c for c in page['controls'] if c['selector'] in _CHOICES]
+    forms.check_form(dict(page, controls=radios), {}, True)
+    forms.check_approvals(PK, [], page)
+    assert not [c for c in raw.calls if c[0] in {'click', 'fill', 'select', 'set'}]
+    assert not any(radio(page, s)['checked'] for s in _CHOICES)
+    assert row['human_approved_answers'] == {}
 
 
 # Reader proof: the flag exists only for a radio inside the one validated survey.

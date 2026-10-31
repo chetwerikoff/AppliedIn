@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -31,6 +32,49 @@ class Unavailable(RuntimeError):
     code: str | None = None
     # Every well-formed identifier the CLI reported (code, reason, nested ones).
     identifiers: frozenset = frozenset()
+    reason: str | None = None
+    # The bsk verb that raised it, set where the argv is known (`command`, `_sync`).
+    verb: str = ""
+
+
+# Only these two-token bsk verbs name a subcommand. Any other second token is an
+# argument (a URL, script, selector, session id) and must never reach a log.
+_SUBCOMMANDS = {
+    "session": frozenset({"start", "stop", "list", "status"}),
+    "cooperate": frozenset({"sync", "status"}),
+    "daemon": frozenset({"start", "stop", "status"}),
+}
+_SAFE_TOKEN = re.compile(r'[a-z_]{1,40}')
+
+
+def _verb(args) -> str:
+    """The bsk verb for diagnostics: the command, plus a subcommand only when known."""
+    first = args[0] if args and isinstance(args[0], str) else ""
+    if not re.fullmatch(r'[a-z][a-z-]{0,30}', first):
+        return "?"
+    second = args[1] if len(args) > 1 and isinstance(args[1], str) else ""
+    return f"{first} {second}" if second in _SUBCOMMANDS.get(first, ()) else first
+
+
+def _log_unavailable(args, problem: "Unavailable") -> None:
+    """Log which call failed and the CLI's own structured reasons, never values."""
+    state = problem.effect_state
+    problem.verb = _verb(args)
+    # A no-effect "sync again" refusal is expected after every navigation.
+    level = logging.INFO if _sync_refusal(problem) else logging.WARNING
+    log.log(level, "bsk unavailable: verb=%s code=%s reason=%s effect_state=%s",
+                _verb(args), problem.code or "-", problem.reason or "-",
+                state if _SAFE_TOKEN.fullmatch(state) else ("-" if not state else "?"))
+
+
+def _failed(args, message: str, reason: str) -> Unavailable:
+    """An Unavailable built outside `_result`, logged like every other bsk failure.
+
+    The reason is a fixed token chosen here, never exception text or an argument."""
+    problem = Unavailable(message)
+    problem.reason = reason
+    _log_unavailable(args, problem)
+    return problem
 
 
 def _env() -> dict:
@@ -72,6 +116,9 @@ def _result(raw: str, code: int) -> dict | list:
             ids = (value.get("code"), value.get("reason"),
                    inner.get("code"), inner.get("reason"))
             # Unknown or malformed identifiers stay in the set so they block a retry.
+            reason = inner.get("reason", value.get("reason"))
+            problem.reason = reason if type(reason) is str and _SAFE_TOKEN.fullmatch(reason) else (
+                None if reason is None else "?")
             problem.identifiers = frozenset(
                 v if type(v) is str and re.fullmatch(r'[a-z_]{1,40}', v) else "?"
                 for v in ids if v is not None)
@@ -105,6 +152,22 @@ def _sync_refusal(problem: Unavailable) -> bool:
             and problem.effect_state == "none")
 
 
+def _sync_cdp_failed(problem: Unavailable) -> bool:
+    """True for a bare `cdp_failed` raised by the `cooperate sync` verb itself.
+
+    Right after navigating to a Greenhouse embed route the CLI answers the sync
+    with code cdp_failed (no reason, no effect_state) and the next sync, under a
+    second later, succeeds. The sync only reads the tab, so it cannot have changed
+    anything. The verb is checked, so the same error from an action is never matched."""
+    return (problem.verb == "cooperate sync" and problem.code == "cdp_failed"
+            and problem.identifiers == {"cdp_failed"}
+            and problem.effect_state in {"", "none"})
+
+
+def _sync_transient(problem: Unavailable) -> bool:
+    return _sync_refusal(problem) or _sync_cdp_failed(problem)
+
+
 def _sync_required(problem: "Unavailable") -> bool:
     """True only for a refusal that provably changed nothing and asks for a sync."""
     return _SYNC_REQUIRED in problem.identifiers and _sync_refusal(problem)
@@ -117,12 +180,21 @@ def _sync(*args: str, timeout: int = 10) -> dict:
         result = _result(p.stdout, p.returncode)
         return {"browsers": result} if isinstance(result, list) else result
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise Unavailable(f"BrowserSkill unavailable: {type(exc).__name__}") from None
+        reason = "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "os_error"
+        raise _failed(args, f"BrowserSkill unavailable: {type(exc).__name__}", reason) from None
+    except Unavailable as exc:
+        _log_unavailable(args, exc)
+        raise
 
 
 async def command(*args: str, timeout: int = 35) -> dict:
+    try:
+        executable = _executable()
+    except Unavailable as exc:
+        _log_unavailable(args, exc)
+        raise
     proc = await asyncio.create_subprocess_exec(
-        _executable(), *args, "--json", env=_env(), stdin=asyncio.subprocess.DEVNULL,
+        executable, *args, "--json", env=_env(), stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -134,6 +206,9 @@ async def command(*args: str, timeout: int = 35) -> dict:
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
+        raise
+    except Unavailable as exc:
+        _log_unavailable(args, exc)
         raise
 
 
@@ -268,7 +343,7 @@ class Session:
                 break
             except Unavailable as exc:
                 self._context = ""
-                if (not settle or not self._tab_ready or not _sync_refusal(exc)
+                if (not settle or not self._tab_ready or not _sync_transient(exc)
                         or time.monotonic() + _SYNC_POLL >= deadline):
                     raise
                 await asyncio.sleep(_SYNC_POLL)
@@ -278,7 +353,9 @@ class Session:
             value = data.get("context_id")
         if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', value):
             self._context = ""
-            raise Unavailable("BrowserSkill operation unavailable: cooperation_sync_failed")
+            raise _failed(("cooperate", "sync"),
+                          "BrowserSkill operation unavailable: cooperation_sync_failed",
+                          "cooperation_sync_failed")
         self._context = value
         self._tab_ready = True
         return value
@@ -317,7 +394,7 @@ class Session:
                     try:
                         await self.sync_context(settle=False)
                     except Unavailable as exc:
-                        if not _sync_refusal(exc):
+                        if not _sync_transient(exc):
                             raise
                         self._context = ""  # the next action performs the bounded sync
                 return result
@@ -340,7 +417,9 @@ class Session:
                                    "--name", f"AppliedIn {self.kind}", "--no-focus")
             self.id = result["session_id"]
             if result.get("browser_instance_id") != configuration()["browser"]:
-                raise Unavailable("BrowserSkill unavailable: session profile mismatch")
+                raise _failed(("session", "start"),
+                              "BrowserSkill unavailable: session profile mismatch",
+                              "session_profile_mismatch")
             log.info("BrowserSkill session started (kind=%s, browser=%s, session=%s)",
                      self.kind, result.get("browser_instance_id"), self.id)
             return self

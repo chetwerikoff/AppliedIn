@@ -712,9 +712,13 @@ _ASHBY_ROOT = r"""
     });
     return owners.length===1;
   };
+  // A form answer census is confined to the owned application/survey
+  // container. A separate sign-in, subscribe, autofill, description link or
+  // unrelated page control does not become an application answer receiver.
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
-    .filter(e=>!excluded.has(e));
+    .filter(e=>!excluded.has(e) && e.tagName!=='A' &&
+      (!!controlContainer(e) || e===exactSubmit));
   const entryVisible=e => {
     if (!entryEvidenceVisible(e)) return false;
     // Clipping can hide a text recipient despite a positive layout rectangle.

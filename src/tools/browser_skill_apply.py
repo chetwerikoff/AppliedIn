@@ -3999,12 +3999,56 @@ def _same_key(value: str) -> str:
     return ' '.join(value.casefold().split())
 
 
+def _witnessed_hidden_choice(page: dict, target: dict, witness: dict) -> dict:
+    """Issue #276: restore the hidden Ashby choice identity PAGE cannot carry.
+
+    PAGE ignores opacity, so a certified hidden choice can reach a disclosure
+    without its flag. The independent root evidence and the fixed witness must
+    both have seen this exact checkbox hidden behind its one visible label.
+    """
+    if (target.get('ashby_hidden_choice') is True or target.get('type') != 'checkbox'
+            or target.get('tag') != 'input'):
+        return target
+    evidence = [e for e in ((page.get('entry') or {}).get('root_evidence') or [])
+                if isinstance(e, dict) and e.get('selector') == target.get('selector')]
+    dom = witness.get(target.get('selector'))
+    if (len(evidence) == 1 and evidence[0].get('ashby_hidden_choice') is True
+            and isinstance(dom, dict) and dom.get('ashby_hidden_choice') is True
+            and dom.get('visible') is False
+            and dom.get('associated_label_selector')
+                == evidence[0].get('label_selector')):
+        return {**target, 'ashby_hidden_choice': True, 'visible': False,
+                'associated_label_selector': dom['associated_label_selector']}
+    return target
+
+
+def _member_witness_predicate(member: dict, dom, *, choice: bool,
+                              hidden_attestation: bool) -> str:
+    """Name the first failed editability predicate; never any DOM text or value."""
+    if not isinstance(dom, dict):
+        return 'witness_missing'
+    if dom.get('visible') is not True and not hidden_attestation:
+        return 'visible'
+    if dom.get('readonly') is True:
+        return 'readonly'
+    if dom.get('disabled') is True or member.get('disabled'):
+        return 'disabled'
+    if dom.get('inert') is True:
+        return 'inert'
+    if choice and not hidden_attestation and dom.get('visible_text') != member['label']:
+        return 'visible_text'
+    if member.get('type') == 'combobox' and dom.get('combobox') != member.get('combobox'):
+        return 'combobox'
+    return 'unknown'
+
+
 def _disclosure_question(page: dict, target: dict, witness: dict,
                          *origins: str, bootstrap: bool = False,
                          provenance: Provenance | None = None,
                          lever_location: bool = False,
                          closed_witness: bool = False,
                          reversible_scope: frozenset[str] | None = None) -> dict:
+    target = _witnessed_hidden_choice(page, target, witness)
     structural = _formless_root(page)
     reversible = (reversible_scope is not None
                   and target.get('selector') in reversible_scope)
@@ -4090,6 +4134,13 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                     and dom.get('visible_text') != member['label'])
                 or (member.get('type') == 'combobox'
                     and dom.get('combobox') != member.get('combobox'))):
+            kind = member.get('type')
+            _LOG.info('disclosure member witness failed type=%s hidden_choice=%s '
+                      'predicate=%s', kind if isinstance(kind, str)
+                      and kind in _MATERIAL_DIAGNOSTIC_TYPES else 'other', member.get('ashby_hidden_choice') is True,
+                      _member_witness_predicate(
+                          member, dom, choice=choice,
+                          hidden_attestation=hidden_attestation))
             raise Gate('This control is not visibly editable.',
                        reason='defect_witness')
     subject = label(target)

@@ -223,7 +223,7 @@ if(spec.formless) {
     const parent=node('div',{class:'ashby-application-form-field-entry'},container);
     const first=node('label',{id:'hidden-attestation-label',
       ...(spec.attestationLabels===0 ? {} : {'for':'hidden-attestation'}),
-      text:'Synthetic legal attestation'},parent);
+      text:spec.attestationText||'Synthetic legal attestation'},parent);
     const input=node('input',{id:'hidden-attestation',type:'checkbox',required:false},parent);
     input.getClientRects=()=>[];
     // A policy link/button in a label must never become a fallback click target.

@@ -2904,9 +2904,35 @@ async def _bootstrap_observe_controls(session, page: dict, *, site: str):
         _BOOTSTRAP_OBSERVATION_SITE.reset(token)
 
 
+def _unrelated_header_button(page: dict, original: dict, observed: dict,
+                             site: str, target: str | None) -> bool:
+    """Issue 288: may execute skip this control's disabled comparison only?
+
+    Only at the execute site, only for a native button that is not the action
+    target, is not submission-classified, does not commit the application, and
+    is outside every form on both reads of a page with no formless structural
+    root (Greenhouse's header "Autofill my application" button). Its presence,
+    selector, form ownership and every other compared key stay exact, and the
+    page identity reread still sees its state. The target, every submission
+    button and every in-form control keep the exact disabled comparison.
+    """
+    return (site == 'execute' and isinstance(target, str) and bool(target)
+            and original.get('selector') != target
+            and original.get('tag') == 'button' and observed.get('tag') == 'button'
+            and not is_submission(original)
+            and not original.get('submit') and not observed.get('submit')
+            and not original.get('commits_application')
+            and not observed.get('commits_application')
+            and all(c.get('in_form') is False and not c.get('form_selector')
+                    and not c.get('native_form_owner_selector')
+                    for c in (original, observed))
+            and not _formless_root(page))
+
+
 async def _observe_controls(session, page: dict, *, readiness: bool = False,
                             site: str = '', _identity_try: int = 1,
-                            _previous_identity=None) -> tuple[dict, dict]:
+                            _previous_identity=None,
+                            execute_target: str | None = None) -> tuple[dict, dict]:
     """A missing or malformed real evaluate result never authorizes disclosure."""
     _inventory_ok(page, complete=False)
     if not site:
@@ -2955,11 +2981,15 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             require(observed.get('selector') == sel, 'selector.equal')
             for key in ('unique', 'unique_form'):
                 require(observed.get(key) is True, key + '.true')
+            unrelated = _unrelated_header_button(page, original, observed, site,
+                                                 execute_target)
             for key in ('tag', 'type', 'native_type', 'in_form', 'form_selector',
                         'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
                         'form_action_attr_present', 'form_action_raw',
                         'formaction_attr_present', 'formaction_raw',
                         'commits_application'):
+                if key == 'disabled' and unrelated:
+                    continue
                 require((original.get(key, False) == observed.get(key, False)
                          if key == 'commits_application' else
                          original.get(key) == observed.get(key)), key + '.equal')
@@ -3008,7 +3038,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
                 return await _observe_controls(
                     session, await session.page(), readiness=readiness,
                     site=site, _identity_try=_identity_try + 1,
-                    _previous_identity=identity if same_read else None)
+                    _previous_identity=identity if same_read else None, execute_target=execute_target)
             require(False, 'inventory.identity.equal')
         # A diagnostic site must not turn an ordinary observation into a retry.
         # Keep the PR #173 identity-retry sites and their original bounds.
@@ -3023,7 +3053,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             return await _observe_controls(
                 session, await session.page(), readiness=readiness,
                 site=site, _identity_try=_identity_try + 1,
-                _previous_identity=identity)
+                _previous_identity=identity, execute_target=execute_target)
         require(same_read and (not identity_retry or _identity_try == 1),
                 'inventory.identity.equal')
         # Generic independent witness parity is required for each action.
@@ -3040,7 +3070,7 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             return await _observe_controls(
                 session, await session.page(), readiness=readiness,
                 site=site, _identity_try=_identity_try + 1,
-                _previous_identity=None)
+                _previous_identity=None, execute_target=execute_target)
         if isinstance(session, _GreenhouseSession) and readiness and session._readiness:
             if isinstance(exc, (asyncio.CancelledError, OSError, bsk.Unavailable)):
                 raise
@@ -6769,12 +6799,14 @@ async def _execute_combobox(session, page: dict, action: dict, *, facts: dict,
 _PRODUCTION_OBSERVE_CONTROLS = _observe_controls
 
 
-async def _execute_observe_controls(session, page: dict) -> tuple[dict, dict]:
+async def _execute_observe_controls(session, page: dict,
+                                    target: str | None = None) -> tuple[dict, dict]:
     """Name the production site without breaking two-argument fixture doubles."""
     token = _EXECUTE_OBSERVATION_SITE.set(True)
     try:
         if _observe_controls is _PRODUCTION_OBSERVE_CONTROLS:
-            return await _observe_controls(session, page, site='execute')
+            return await _observe_controls(session, page, site='execute',
+                                           execute_target=target)
         # Existing offline guard-order tests replace this function with a
         # two-argument witness. Only that substituted seam uses positional args.
         # Test doubles intentionally expose the historic two-argument seam;
@@ -6908,7 +6940,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
     if verb in {'fill', 'select', 'choose'}:
         if verb == 'choose':
             _require_guarded_choice(page, target)
-        observed, witness = await _execute_observe_controls(session, page)
+        observed, witness = await _execute_observe_controls(
+            session, page, action.get('selector'))
         if provenance is not None and (
                 not _preparation_current(provenance, fixture_context=ctx)
                 or not _preparation_destination_allowed(observed.get('url', ''),
@@ -7037,7 +7070,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             else:
                 write_value = value
         # A second independent PAGE and fixed witness precede every browser write.
-        latest, latest_witness = await _execute_observe_controls(session, page)
+        latest, latest_witness = await _execute_observe_controls(
+            session, page, action.get('selector'))
         current = control(latest, action, 'execute-prewrite')
         if verb == 'choose':
             _require_guarded_choice(latest, current)

@@ -404,3 +404,95 @@ def test_possible_submission_blocks_the_replacement(monkeypatch):
     monkeypatch.setattr(store, "replace_grants_if_unchanged", marked)
     run()
     assert _grants(store)[key] == stale
+
+
+# --- mixed batch: new bank grant + stale replacement commit in one guarded write
+
+def _mixed_world(monkeypatch):
+    page, a = _rooted_text_page()
+    a.update(selector="#_systemfield_name", label="Name", question="Name")
+    b = deepcopy(a)
+    b.update(selector="#_systemfield_email", label="Email", question="Email")
+    page["controls"] = [a, b]
+    page["entry"]["root_evidence"][0]["selector"] = "#_systemfield_name"
+    evidence_b = deepcopy(page["entry"]["root_evidence"][0])
+    evidence_b["selector"] = "#_systemfield_email"
+    page["entry"]["root_evidence"].append(evidence_b)
+    key_a, key_b = forms._key(page, a), forms._key(page, b)
+    bound = {item["selector"]: forms._bound_target(page, item) for item in (a, b)}
+    stale = {"value": "answer", "url": page["url"], "source": "bank-auto",
+             **{k: bound[a["selector"]].get(k) for k in (
+                 "selector", "label", "question", "tag", "type")},
+             "form_selector": "", "form_action": ""}
+    store = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    store.set_status(PK, Status.SUBMITTING, human_approved_answers={key_a: stale},
+                     possible_submission=False)
+    monkeypatch.setattr("core.stores.make_stores", lambda: SimpleNamespace(tracking=store))
+    monkeypatch.setattr(forms, "_disclosure_question", lambda page_, item, *args, **kwargs: {
+        "selector": item["selector"], "url": page["url"], "control_label": item["label"],
+        "question": item["question"], "tag": item["tag"], "type": item["type"],
+        "form_selector": bound[item["selector"]]["form_selector"],
+        "form_action": bound[item["selector"]]["form_action"]})
+    real_row = forms._row
+    state = {"reads": 0, "change": None}
+
+    def row(pk, **kwargs):
+        value = real_row(pk, **kwargs)
+        state["reads"] += 1
+        if state["reads"] == 2 and state["change"]:  # between final reread and write
+            raw = store.get(PK)
+            state["change"](raw)
+            store._write(PK, raw, prev_status=raw["status"])
+        return value
+    monkeypatch.setattr(forms, "_row", row)
+    scope = frozenset({a["selector"], b["selector"]})
+
+    def run():
+        forms._auto_grant_from_global(
+            page, {}, PK, {"Name": "answer", "Email": "answer"},
+            {"Name": "answer", "Email": "answer"}, "https://jobs.ashbyhq.com",
+            formless_selectors=scope)
+    return store, key_a, key_b, stale, state, run
+
+
+def test_mixed_batch_writes_addition_and_replacement_together(monkeypatch):
+    store, key_a, key_b, stale, state, run = _mixed_world(monkeypatch)
+    run()
+    grants = _grants(store)
+    assert grants[key_a]["form_selector"] == "#application-root"
+    assert grants[key_b]["source"] == "bank-auto" and grants[key_b]["form_action"] == "#submit"
+
+
+@pytest.mark.parametrize("change", [
+    lambda raw: raw["human_approved_answers"].update(
+        {k: {"value": "OWNER", "source": "dashboard"} for k in list(
+            raw["human_approved_answers"])}),
+    lambda raw: raw.update(status="needs_human"),
+    lambda raw: raw.update(possible_submission=True),
+], ids=["grant-changed", "not-submitting", "possible-submission"])
+def test_mixed_batch_race_writes_nothing(monkeypatch, change):
+    store, key_a, key_b, stale, state, run = _mixed_world(monkeypatch)
+    state["change"] = change
+    run()
+    after = store.get(PK)
+    expected_grants = {key_a: stale}
+    if change is not None:
+        probe = {"status": "submitting", "possible_submission": False,
+                 "human_approved_answers": {key_a: dict(stale)}}
+        change(probe)
+        expected_grants = probe["human_approved_answers"]
+        assert after["status"] == probe["status"]
+        assert after["possible_submission"] == probe["possible_submission"]
+    # Nothing of the batch is written: no addition B, no replacement of A.
+    assert key_b not in after["human_approved_answers"]
+    assert after["human_approved_answers"] == expected_grants
+
+
+def test_mixed_batch_preserves_an_unrelated_concurrent_grant(monkeypatch):
+    store, key_a, key_b, stale, state, run = _mixed_world(monkeypatch)
+    state["change"] = lambda raw: raw["human_approved_answers"].update(
+        {"added-by-owner": {"value": "x", "source": "dashboard"}})
+    run()
+    grants = _grants(store)
+    assert grants["added-by-owner"] == {"value": "x", "source": "dashboard"}
+    assert key_b in grants and grants[key_a]["form_selector"] == "#application-root"

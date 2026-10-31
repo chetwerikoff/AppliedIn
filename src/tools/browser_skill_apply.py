@@ -4877,7 +4877,19 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
     if not isinstance(current, dict):
         raise Gate('Stored approval shape is invalid.')
     additions = {k: v for k, v in pending.items() if k not in current}
-    if additions:
+    if replacements:
+        # One guarded atomic update for the whole batch: every stale grant must
+        # be unchanged and every new key still absent, with the row still
+        # submitting, or nothing is written. No full-map write precedes it.
+        from core.stores import make_stores
+        store = fixture_context if fixture_context is not None else make_stores().tracking
+        if not store.replace_grants_if_unchanged(
+                pk, {**{k: None for k in additions},
+                     **{k: old for k, (old, _) in replacements.items()}},
+                {**additions, **{k: new for k, (_, new) in replacements.items()}}):
+            _LOG.info('bank-auto grant batch skipped: row changed')
+            return
+    elif additions:
         if fixture_context is not None:
             fixture_context.set_status(pk, 'submitting',
                                        human_approved_answers={**current, **additions})
@@ -4885,22 +4897,11 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             from core.stores import make_stores
             make_stores().tracking.set_status(
                 pk, 'submitting', human_approved_answers={**current, **additions})
-    replaced = {}
-    if replacements:
-        # One guarded atomic update: nothing is written if any stale grant, the
-        # status or the possible-submission mark changed since it was read.
-        from core.stores import make_stores
-        store = fixture_context if fixture_context is not None else make_stores().tracking
-        if store.replace_grants_if_unchanged(
-                pk, {k: old for k, (old, _) in replacements.items()},
-                {k: new for k, (_, new) in replacements.items()}):
-            replaced = replacements
-        else:
-            _LOG.info('bank-auto stale grant replacement skipped: row changed')
+    else:
+        return
     reported = _BOOTSTRAP_BANK_GRANTS.get()
     if reported is not None:
         reported.extend(additions)
-        reported.extend(replaced)
 
 
 def _advertised_grant_keys(pk: str, facts: dict, *, fixture_context=None) -> list[str]:

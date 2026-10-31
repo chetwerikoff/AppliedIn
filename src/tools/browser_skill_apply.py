@@ -3962,7 +3962,7 @@ def _bound_checkbox_group_member(page: dict, target: dict, filled,
                     ('tag', 'input'), ('type', 'checkbox'),
                     ('form_selector', member['form_selector']),
                     ('form_action', member['form_action']),
-                    ('visible_text', member['label']))):
+                    ('visible_text', member['label'])))):
             return False
     return True
 

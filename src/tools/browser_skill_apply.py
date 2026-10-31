@@ -3801,6 +3801,19 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             context = handoff('A possibly committing application action was interrupted; '
                               'inspect the employer portal before retrying.', step)
             return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
+        if (producer_guard is not None and producer_guard.upload_attempted
+                and not producer_guard.upload_completed
+                and not isinstance(exc, Gate)):
+            # The raw file-set/upload call started, but its outcome is unknown.
+            # A lost reply (including cancellation) cannot permit replay of
+            # this attachment. No raw page text, path or exception message is
+            # safe for diagnostics.
+            _LOG.info('upload interrupted exc=%s at=%s',
+                      type(exc).__name__, _innermost_src_frame(exc))
+            context = handoff('Résumé upload interrupted after the browser command; '
+                              'inspect manually', step)
+            return {'status': 'uncertain', 'detail': context['text'],
+                    'step': context['step']}
         if isinstance(exc, PreSubmitGate):
             return {'status': 'gate', 'reason': exc.reason,
                     'item': exc.item,

@@ -3324,6 +3324,7 @@ def _implicit_on_radios(members: list[dict]) -> bool:
     """The HTML default 'on' is not a distinct native radio option value."""
     return bool(members) and all(
         c.get('tag') == 'input' and c.get('type') == 'radio'
+        and c.get('native_type') == 'radio'
         and c.get('value_attr_present') is False and c.get('value') == 'on'
         for c in members)
 

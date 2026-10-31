@@ -152,7 +152,7 @@ async def _owner_gate(stores, decision, raw, label=None, *, selector=None):
 @pytest.mark.parametrize("shape", ["airwallex", "openai"])
 async def test_missing_name_is_owner_question_then_fact_and_requeue_without_grant(
         monkeypatch, tmp_path, shape):
-    stores, raw, decision = _world(monkeypatch, shape, {})
+    stores, raw, decision = _world(monkeypatch, shape, {}, tmp_path=tmp_path)
     row, tokens = await _owner_gate(stores, decision, raw, "Name")
     assert not row.get("human_approved_answers")
     assert stores.answer_bank.writes == []

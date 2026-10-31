@@ -92,11 +92,22 @@ _NO_CONTEXT = frozenset({"session", "cooperate"})
 _NAVIGATES = frozenset({"navigate", "navigate-back", "navigate-forward", "reload"})
 
 
+# BrowserSkill 0.4 refuses `cooperate sync` itself for a few seconds right after a
+# navigation ("Page changed while synchronizing; sync again after it settles"):
+# code permission_denied, data.reason cooperation_sync_required, effect_state none.
+_SYNC_WINDOW = 10.0
+_SYNC_POLL = 0.5
+
+
+def _sync_refusal(problem: Unavailable) -> bool:
+    """True only for a refusal that provably changed nothing and only asks to sync later."""
+    return (bool(problem.identifiers) and problem.identifiers <= _SYNC_REFUSAL
+            and problem.effect_state == "none")
+
+
 def _sync_required(problem: "Unavailable") -> bool:
     """True only for a refusal that provably changed nothing and asks for a sync."""
-    return (_SYNC_REQUIRED in problem.identifiers
-            and problem.identifiers <= _SYNC_REFUSAL
-            and problem.effect_state == "none")
+    return _SYNC_REQUIRED in problem.identifiers and _sync_refusal(problem)
 
 
 def _sync(*args: str, timeout: int = 10) -> dict:
@@ -244,9 +255,23 @@ class Session:
             await self._application_controller.after_ipc(
                 self, args, kwargs, succeeded=succeeded)
 
-    async def sync_context(self) -> str:
-        """Fetch the latest cooperation context; absent or malformed fails closed."""
-        result = await command("cooperate", "sync", "--session", self.id)
+    async def sync_context(self, *, settle: bool = True) -> str:
+        """Fetch the latest cooperation context; absent or malformed fails closed.
+
+        Right after a navigation the sync may be refused while the page settles.
+        With a tab bound and settle on, only that no-effect refusal is retried for
+        a bounded window; everything else, and a session without a tab, is final."""
+        deadline = time.monotonic() + _SYNC_WINDOW
+        while True:
+            try:
+                result = await command("cooperate", "sync", "--session", self.id)
+                break
+            except Unavailable as exc:
+                self._context = ""
+                if (not settle or not self._tab_ready or not _sync_refusal(exc)
+                        or time.monotonic() + _SYNC_POLL >= deadline):
+                    raise
+                await asyncio.sleep(_SYNC_POLL)
         data = result.get("data")
         value = result.get("context_id")
         if value is None and isinstance(data, dict):
@@ -264,8 +289,10 @@ class Session:
         BrowserSkill 0.4 accepts only the latest `cooperate sync` context and any
         action, evaluate included, spends it. So each action uses the context
         held from the last navigation, or syncs first. A refusal that reports
-        effect_state none is synced and retried once; every other failure, a
-        second refusal and a failed sync are final."""
+        effect_state none is synced (with a bounded settle window) and retried
+        once; every other failure and a second refusal are final. A navigation that
+        succeeded never fails because its own sync was refused: the next action
+        syncs instead."""
         wants = bool(args) and args[0] not in _NO_CONTEXT
         async with self._lock:
             for attempt in (0, 1):
@@ -285,7 +312,14 @@ class Session:
                     await self.sync_context()
                     continue
                 if wants and args[0] in _NAVIGATES:
-                    await self.sync_context()
+                    # The page changed; the tab is bound whether or not the sync lands.
+                    self._tab_ready = True
+                    try:
+                        await self.sync_context(settle=False)
+                    except Unavailable as exc:
+                        if not _sync_refusal(exc):
+                            raise
+                        self._context = ""  # the next action performs the bounded sync
                 return result
 
     async def __aenter__(self):

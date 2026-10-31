@@ -3693,6 +3693,33 @@ def _issue218_main_reader_scripts():
     assert source.count(composed) == 1
     source = source.replace(composed, "    script = script.replace(_WIDGET_GRAPH, "
                             "_GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)\n", 1)
+    # BrowserSkill 0.4 overlay census (Issue #272) replaced the 'Interrupt'-button
+    # shadow exemption in ordinary PAGE, which both compared readers carry; it is
+    # reverted in the hashed source only.
+    census_start = "  // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay"
+    census_end = "  const siteShadow = shadowRoots.some(e => e !== overlayHost);\n"
+    assert source.count(census_start) == source.count(census_end) == 1
+    assert old.count(census_start) == old.count(census_end) == 0  # not in _ENTRY_OBSERVATION
+    start = source.index(census_start)
+    end = source.index(census_end) + len(census_end)
+    assert start < end
+    source = source[:start] + (
+        "  // BrowserSkill injects its own Interrupt button in a shadow root. Treating\n"
+        "  // that overlay as an uninspected employer form gated every normal page.\n"
+        "  // Exempt only that exact, button-only overlay; site shadow controls still gate.\n"
+        "  const shadowRoots = Array.from(document.querySelectorAll('*')).filter(e=>e.shadowRoot);\n"
+        "  const siteShadow = shadowRoots.some(e => {\n"
+        "    const nested = Array.from(e.shadowRoot.querySelectorAll(query));\n"
+        "    const ownOverlay = e.tagName === 'BROWSER-SKILL-OVERLAY' && nested.length > 0 &&\n"
+        "      !e.shadowRoot.querySelector('iframe') && nested.every(n =>\n"
+        "        n.tagName === 'BUTTON' && n.type === 'button' && label(n) === 'Interrupt');\n"
+        "    return !ownOverlay;\n"
+        "  });\n") + source[end:]
+    overlay_filter = "    e !== overlayHost && !pickerParts.has(e) &&\n"
+    assert source.count(overlay_filter) == 1
+    assert old.count(overlay_filter) == 0
+    source = source.replace(
+        overlay_filter, "    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
     assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1

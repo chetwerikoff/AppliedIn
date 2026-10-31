@@ -295,17 +295,29 @@ PAGE = r"""(() => {
   const title = document.querySelector('[data-automation-id="jobPostingHeader"]')?.innerText
     || document.querySelector('h1')?.innerText || document.title;
   const text = document.body?.innerText || '';
-  // BrowserSkill injects its own Interrupt button in a shadow root. Treating
-  // that overlay as an uninspected employer form gated every normal page.
-  // Exempt only that exact, button-only overlay; site shadow controls still gate.
+  // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay data-bsk-overlay>
+  // host (Pause Agent / Stop task buttons) as the child of <html> that directly
+  // follows <body>. Treating it as an uninspected employer form gated every
+  // normal page. Exempt only that host, matched by tag, marker attribute and
+  // injection position, and nothing inside it is a control. A second such host, any other
+  // position, light-DOM children, an iframe or a nested shadow root inside it,
+  // and every other shadow root still gate.
   const shadowRoots = Array.from(document.querySelectorAll('*')).filter(e=>e.shadowRoot);
-  const siteShadow = shadowRoots.some(e => {
-    const nested = Array.from(e.shadowRoot.querySelectorAll(query));
-    const ownOverlay = e.tagName === 'BROWSER-SKILL-OVERLAY' && nested.length > 0 &&
-      !e.shadowRoot.querySelector('iframe') && nested.every(n =>
-        n.tagName === 'BUTTON' && n.type === 'button' && label(n) === 'Interrupt');
-    return !ownOverlay;
-  });
+  const overlayHost = (() => {
+    const named = Array.from(document.querySelectorAll('*'))
+      .filter(e => e.tagName === 'BROWSER-SKILL-OVERLAY');
+    if (named.length !== 1 || !named[0].shadowRoot) return null;
+    const host = named[0];
+    const inside = Array.from(host.shadowRoot.querySelectorAll('*'));
+    // Whatever the buttons say, nothing but plain buttons may act inside it.
+    const acting = Array.from(host.shadowRoot.querySelectorAll(query));
+    return host.hasAttribute('data-bsk-overlay') &&
+      host.parentElement === document.documentElement && !!document.body &&
+      host.previousElementSibling === document.body && host.childNodes.length === 0 &&
+      !inside.some(n => n.shadowRoot || n.tagName === 'IFRAME') &&
+      acting.every(n => n.tagName === 'BUTTON' && n.type === 'button') ? host : null;
+  })();
+  const siteShadow = shadowRoots.some(e => e !== overlayHost);
   // A closed shadow root cannot be inspected. Detect visible custom hosts and
   // opaque widgets instead of treating 'no open shadow root' as completeness.
   const linkedParts = new Set();
@@ -344,7 +356,7 @@ PAGE = r"""(() => {
     });
   const opaqueNodes = Array.from(document.querySelectorAll('*')).filter(e =>
     (visible(e) || e.closest('form') || e.getAttribute('aria-required') === 'true') &&
-    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&
+    e !== overlayHost && !pickerParts.has(e) &&
     (
       (e.matches('[role="combobox"]') && !linkedComboboxes.includes(e)) ||
       (e.matches('[role="listbox"],[role="option"]') && !linkedParts.has(e)) ||

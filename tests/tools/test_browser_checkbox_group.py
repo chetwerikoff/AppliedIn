@@ -425,6 +425,7 @@ def test_atomic_derived_grants_cover_every_member_and_follow_the_answer(row):
     # A narrower owner answer overwrites the old positive key with an inert no,
     # rather than deleting it or keeping authority from a previous group_ref.
     answered(row, page, ['North America'])
+    grants = row['human_approved_answers']
     assert grants[keys['Asia Pacific']]['value'] == 'no'
     assert grants[keys['Europe']]['value'] == 'no'
     assert grants[keys['Asia Pacific']]['group_ref'] == forms._group_ref(grants[QUESTION])
@@ -589,6 +590,22 @@ def test_selected_derived_member_needs_current_ref_and_identity(row, drift):
         derived['selector'] = '#stale'
     else:
         derived['form_selector'] = '#stale'
+    with pytest.raises(forms.Gate, match=GROUP_BOUND):
+        run_final(page, filled)
+
+
+@pytest.mark.parametrize('drift', ['missing', 'stale_ref', 'positive'])
+def test_unchecked_option_requires_current_inert_member_proof(row, drift):
+    page = group_page()
+    filled = final_state(row, page, ['Europe'], ['Europe'])
+    key = forms._member_key(by(page, '#region-0'))
+    grants = row['human_approved_answers']
+    if drift == 'missing':
+        grants.pop(key)
+    elif drift == 'stale_ref':
+        grants[key]['group_ref'] = 'prior-answer'
+    else:
+        grants[key]['value'] = 'yes'
     with pytest.raises(forms.Gate, match=GROUP_BOUND):
         run_final(page, filled)
 

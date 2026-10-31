@@ -1773,7 +1773,9 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
     const labels=Array.from(e.labels || []);
     return fixedAshbyNative && !document.querySelector('form') &&
       containers.length===1 && (!surveyWrappers.length || surveyValid) &&
-      container && container.contains(e) && e.tagName==='INPUT' && e.type==='checkbox' &&
+      (container && container.contains(e) ||
+        e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
+      e.tagName==='INPUT' && ['checkbox','radio'].includes(e.type) &&
       !e.form && !e.closest('form') && !e.disabled && !e.matches(':disabled') &&
       !entryEvidenceVisible(e) && !e.closest('[inert]') &&
       !e.closest('div.ashby-application-form-input-yesno') && labels.length===1 &&
@@ -3592,16 +3594,24 @@ def _bound_target_base(page: dict, target: dict) -> dict:
                          form_selector=structural['root'],
                          form_action=structural['submit'])
         return bound
-    if structural and (structural.get('root') or target.get('in_form') is not False):
+    rooted = bool(structural and (structural.get('root')
+                                  or target.get('in_form') is not False))
+    if rooted and target.get('type') != 'radio':
         return {**target, 'owner_kind': 'ashby-formless-root',
                 'form_selector': structural['root'], 'form_action': structural['submit']}
     if target.get('type') != 'radio':
         return target
+    # Issue 282: a rooted radio binds its whole group as the native path does,
+    # under the structural owner, so exact_approval can compare its members.
     members = _radio_group(page, target)
-    return {**members[0], 'radio_name': members[0]['name'],
-            'radio_members': [
-                {'selector': c['selector'], 'caption': c['label'], 'label': c['label'],
-                 'value': c['value']} for c in members]}
+    bound = {**members[0], 'radio_name': members[0]['name'],
+             'radio_members': [
+                 {'selector': c['selector'], 'caption': c['label'], 'label': c['label'],
+                  'value': c['value']} for c in members]}
+    if rooted:
+        bound.update(owner_kind='ashby-formless-root',
+                     form_selector=structural['root'], form_action=structural['submit'])
+    return bound
 
 
 def _non_receiver(candidate: dict) -> bool:
@@ -4121,9 +4131,11 @@ def _witnessed_hidden_choice(page: dict, target: dict, witness: dict) -> dict:
 
     PAGE ignores opacity, so a certified hidden choice can reach a disclosure
     without its flag. The independent root evidence and the fixed witness must
-    both have seen this exact checkbox hidden behind its one visible label.
+    both have seen this exact checkbox or radio hidden behind its one visible
+    label (Issue 282 extends the same strict conditions to a radio member).
     """
-    if (target.get('ashby_hidden_choice') is True or target.get('type') != 'checkbox'
+    if (target.get('ashby_hidden_choice') is True
+            or target.get('type') not in {'checkbox', 'radio'}
             or target.get('tag') != 'input'):
         return target
     evidence = [e for e in ((page.get('entry') or {}).get('root_evidence') or [])
@@ -4213,6 +4225,10 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
             raise Gate('A grantable choice must be a native input.')
         members = (_radio_group(page, target)
                    if target.get('type') == 'radio' else [target])
+        if target.get('type') == 'radio':
+            # Each member needs its own exact hidden-choice evidence; the group
+            # is only as visible as its least witnessed member.
+            members = [_witnessed_hidden_choice(page, m, witness) for m in members]
         target = members[0]
     elif target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
@@ -4245,7 +4261,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     for member in members:
         dom = witness.get(member['selector'])
         hidden_attestation = (member.get('ashby_hidden_choice') is True
-                              and member.get('type') == 'checkbox'
+                              and member.get('type') in {'checkbox', 'radio'}
                               and isinstance(dom, dict)
                               and dom.get('ashby_hidden_choice') is True
                               and dom.get('visible') is False
@@ -6685,6 +6701,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                          'checked')
             elif actual.get('value') != write_value or not actual.get('has_value'):
                 raise _readback_gate(pk, verb, current, actual, write_value)
+            if (current.get('type') == 'radio' and current.get('ashby_hidden_choice') is True):
+                # A hidden radio skips the value check above; its own checked flag
+                # is not the group's. Exactly one member is checked: the granted one.
+                if not _default_radio_choice_read_back(readback, actual, current, value):
+                    raise _readback_gate(pk, verb, current, actual, write_value,
+                                         'checked')
             # The DOM readback uses the machine value (e.g. "remote"), while
             # the row grant binds the owner's answer (e.g. "Remote").
             exact_approval(pk, form_question['label'], value, target=_bound_target(readback, actual),

@@ -61,27 +61,39 @@ def _world(monkeypatch, tmp_path, *, case='ready'):
         row['job_id'] = '2'
     if case == 'pdf':
         file_field['files'] = []
-    if case == 'protected':
+    if case == 'pdf_extra':
+        page['controls'].append({
+            'selector': '#other-file', 'label': 'Additional attachment',
+            'type': 'file', 'files': ['unrelated.pdf'],
+            'in_form': True, 'form_selector': '#app',
+        })
+    if case in {'protected', 'protected_decline'}:
         page['controls'].insert(1, {
-            'selector': '#gender', 'label': 'Female',
+            'selector': '#gender',
+            'label': ('Prefer not to answer' if case == 'protected_decline'
+                      else 'Female'),
             'question': 'Gender', 'tag': 'input', 'type': 'radio',
             'checked': True, 'required': False, 'in_form': True,
             'form_selector': '#app',
         })
-    if case in {'salary', 'incomparable'}:
+    if case in {'salary', 'incomparable', 'salary_above'}:
         facts['Minimum salary floor'] = (
-            'USD 100000 yearly' if case == 'salary' else 'EUR 100000 yearly')
+            'EUR 100000 yearly' if case == 'incomparable'
+            else 'USD 80000 yearly' if case == 'salary_above'
+            else 'USD 100000 yearly')
         page['controls'].insert(1, {
             'selector': '#pay', 'label': 'Salary (USD/year)',
             'question': 'Desired salary (USD/year)',
             'tag': 'input', 'type': 'text', 'value': '90000',
             'required': True, 'in_form': True, 'form_selector': '#app',
         })
-    if case == 'sanctions':
+    if case in {'sanctions', 'sanctions_missing', 'sanctions_decline'}:
         page['controls'].insert(1, {
-            'selector': '#restricted', 'label': 'Yes',
+            'selector': '#restricted',
+            'label': 'No' if case == 'sanctions_decline' else 'Yes',
             'question': 'Are you from a restricted country?',
-            'tag': 'input', 'type': 'radio', 'checked': True,
+            'tag': 'input', 'type': 'radio',
+            'checked': case != 'sanctions_missing',
             'required': False, 'in_form': True, 'form_selector': '#app',
         })
 
@@ -114,8 +126,9 @@ def _world(monkeypatch, tmp_path, *, case='ready'):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('case', 'item'), [
-    ('job', 1), ('pdf', 2), ('protected', 3),
-    ('salary', 4), ('incomparable', 4), ('sanctions', 5),
+    ('job', 1), ('pdf', 2), ('pdf_extra', 2), ('protected', 3),
+    ('salary', 4), ('incomparable', 4),
+    ('sanctions', 5), ('sanctions_missing', 5),
 ])
 async def test_five_substantive_pre_submit_items_refuse_before_ipc(
         monkeypatch, tmp_path, case, item):
@@ -174,3 +187,60 @@ async def test_no_preparation_op_checks_commit_but_enter_does(
         await controller.before_ipc(None, ('press', 'Enter'), {})
     assert len(calls) == 2
     assert not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', [
+    'ready', 'salary_above', 'sanctions_decline', 'protected_decline',
+])
+async def test_safe_readback_examples_pass_the_same_final_check(
+        monkeypatch, tmp_path, case):
+    controller, page, target, fixture = _world(
+        monkeypatch, tmp_path, case=case)
+    await controller.check_pre_submit(None, page, target)
+    assert fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', [
+    ('click', '#submit'), ('press', 'Enter'),
+])
+async def test_successful_commit_classification_cannot_be_replayed(
+        monkeypatch, tmp_path, operation):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    calls = []
+    controller.mark_click_started = lambda: calls.append('attempt')
+    await controller.before_ipc(None, operation, {})
+    assert controller.committed
+    assert calls == ['attempt']
+    assert fixture.held
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(None, operation, {})
+    assert calls == ['attempt']
+
+
+@pytest.mark.asyncio
+async def test_ordinary_accessible_fill_does_not_issue_a_grant_or_final_check(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {}
+
+    session = FakeSession()
+    filled = {}
+    result = await forms.execute(
+        session, page, {'action': 'fill', 'selector': '#email',
+                        'value': 'test@example.test'},
+        facts={}, filled=filled, resume_path=controller.resume_path,
+        company='example-co', jd_text='Synthetic job',
+        resume_tex='', github='', pk=PK, job_url=URL)
+    assert result['action'] == 'fill'
+    assert filled == {'#email': 'test@example.test'}
+    assert session.calls == [
+        (('fill', '#email', '--value', 'test@example.test'), {})]
+    assert not fixture.held

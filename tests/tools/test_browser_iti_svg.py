@@ -125,5 +125,9 @@ async def test_non_submit_svg_or_picker_click_is_ordinary_preparation(
     session.id = 'synthetic-offline'
     session.bind_application_controller(controller)
     await session.application_effect('click', selector)
-    assert emitted == [((('click', selector)), {})]
+    assert len(emitted) == 1
+    args, kwargs = emitted[0]
+    assert args[:2] == ('click', selector)
+    assert args[-2:] == ('--session', 'synthetic-offline')
+    assert kwargs == {}
     assert controller.committed is False

@@ -85,9 +85,9 @@ async def test_set_that_does_not_read_back_is_a_gate_not_uncertain(monkeypatch, 
     async def unread():
         return {'value': {'set': True, 'files': []}}
 
-    run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
+    run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path, upload=unread)
-    result = await run_apply([{'action': 'click', 'selector': '#submit'}])
+    result = await run_apply([click])
     assert result['status'] == 'gate' and result.get('item') == 2, result
     assert result['reason'] == 'defect_pre_submit_item_2'
     guard = transport._application_controller

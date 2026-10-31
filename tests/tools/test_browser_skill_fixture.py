@@ -965,15 +965,31 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
             async def wait(self):
                 return 0
 
+        _context = {"count": 0, "tab": False}
         async def fake_async(*argv, **kwargs):
             assert argv[0] == "/synthetic/bsk" and argv[-1] == "--json"
             checked_env(kwargs["env"])
             operation = argv[1]
-            assert operation in ("session", "navigate", "evaluate", "fill")
-            if operation == "session":
+            assert operation in ("session", "cooperate", "navigate", "evaluate", "fill")
+            if operation in ("navigate", "evaluate", "fill"):
+                # BrowserSkill 0.4: an action carries the latest sync context once.
+                if _context["tab"]:
+                    assert argv[argv.index("--context") + 1] == _context.pop("latest", None)
+                else:  # a fresh session has no tab: its first navigation needs no context
+                    assert operation == "navigate" and "--context" not in argv
+                    _context["tab"] = True
+            if operation == "cooperate":
+                assert argv[2] == "sync" and argv[3:5] == ("--session", "fixture-only-session")
+                assert _context["tab"], "sync before the first navigation is refused by bsk"
+                _context["count"] += 1
+                _context["latest"] = "ctx-%d" % _context["count"]
+                event("async_bsk", operation="cooperate_sync")
+                payload = {"context_id": _context["latest"], "kind": "sync"}
+            elif operation == "session":
                 subcommand = argv[2]
                 assert subcommand in ("start", "stop")
                 if subcommand == "start":
+                    _context.update(tab=False, latest=None)  # every session starts tab-less
                     assert "--browser" in argv
                     assert argv[argv.index("--browser") + 1] == "synthetic-pin"
                     payload = {"ok": True, "session_id": "fixture-only-session",
@@ -992,8 +1008,9 @@ def test_fresh_daemon_synthetic_cli_fails_closed_on_unwitnessed_page(
                 event("async_bsk", operation="evaluate_page")
                 payload = {"ok": True, "value": _page}
             else:
-                assert argv[2:6] == ("#name", "--value", "Test User", "--session")
-                assert argv[6] == "fixture-only-session"
+                assert argv[2:5] == ("#name", "--value", "Test User")
+                assert argv[5] == "--context" and argv[7] == "--session"
+                assert argv[8] == "fixture-only-session"
                 _field["has_value"], _field["value"] = True, "Test User"
                 event("async_bsk", operation="fill_name")
                 payload = {"ok": True}

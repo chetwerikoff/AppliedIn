@@ -823,11 +823,11 @@ class _SyntheticRun:
                     # The production raw apply Session is intentionally read-only.
                     # Only this daemon-minted, exact loopback fixture GET can use
                     # the CLI directly; real application IPC remains producer-guarded.
-                    from tools.browser_skill import Session as BrowserSkillSession, command
+                    from tools.browser_skill import Session as BrowserSkillSession
                     if type(raw) is BrowserSkillSession:
                         if raw.kind != 'apply' or not raw.id or not authorized(state, url=URL):
                             raise PermissionError('Synthetic fixture session authority expired.')
-                        return await command('navigate', URL, '--session', raw.id)
+                        return await raw._run(('navigate', URL), {})
                     return await raw.call(*args)
                 if not state.navigations or not authorized(state, pk=PK, url=URL):
                     raise PermissionError("Fixture denies this browser operation.")

@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from collections import UserDict
+from copy import deepcopy
 from functools import wraps
 import ipaddress
+import json
 import socket
 import re
 from dataclasses import dataclass
@@ -1431,12 +1433,46 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     selectors = [c.get('selector') for c in controls]
     if not selectors or any(not x for x in selectors) or len(selectors) != len(set(selectors)):
         raise Gate('The current form controls are not uniquely inventoried.')
+    # Only current groups need persisted group authority. A vanished filled
+    # selector beside a surviving native checkbox can also signal a collapsed
+    # previously approved group; standalone forms need no unrelated row read.
+    if (isinstance(filled, _ApprovedFormValues) and filled.pk
+            and (any(c.get('type') == 'checkbox'
+                     and _checkbox_group(page, c) is not None for c in controls)
+                 or (any(selector not in selectors for selector in filled)
+                     and any(c.get('type') == 'checkbox'
+                             and c.get('in_form') is True for c in controls)))):
+        stored = _group_row(filled.pk, filled.fixture_context)
+        grants = stored.get('human_approved_answers')
+        if isinstance(grants, dict):
+            for grant in grants.values():
+                if (not isinstance(grant, dict)
+                        or grant.get('type') != CHECKBOX_GROUP
+                        or not isinstance(grant.get('question'), str)
+                        or not grant['question']):
+                    continue
+                surviving = [
+                    c for c in controls if c.get('in_form') is True
+                    and _could_receive_an_answer(c)
+                    and _same(grant['question'],
+                              c.get('question') or c.get('label') or '')
+                ]
+                if surviving:
+                    current_group = _checkbox_group(page, surviving[0])
+                    if (current_group is None
+                            or _current_group_grant(page, current_group, stored) is None):
+                        raise Gate('Checkbox group answer is not bound to the current group grant.')
     root = _formless_root(page)
     if root and root.get('root'):
         _validate_rooted_boolean_groups(page)
     seen_boolean = set()
     for target in controls:
         typ = target.get('type', '')
+        # Checked members must not bypass the group owner grant via their own
+        # derived exact grant; unchecked (even optional) members require it too.
+        if (typ == 'checkbox' and _checkbox_group(page, target) is not None
+                and not _bound_checkbox_group_member(page, target, filled, receipts)):
+            raise Gate('Checkbox group answer is not bound to the current group grant.')
         if typ == 'hidden':
             if (target.get('required') or target.get('has_value')
                     or bool(target.get('value'))):
@@ -1601,7 +1637,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             elif expected is not None:
                 raise Gate('A previously verified checkbox/radio choice has changed.')
             elif target.get('required') and typ == 'checkbox':
-                raise Gate(f'Required acknowledgement not completed: {target["label"]}')
+                if not _bound_checkbox_group_member(page, target, filled, receipts):
+                    raise Gate(f'Required acknowledgement not completed: {target["label"]}')
             elif typ == 'radio' and target.get('required'):
                 group = target.get('name') or target.get('question')
                 if not group or not any(
@@ -3706,6 +3743,391 @@ def _phone_fieldset_key(page: dict, target: dict, conflicts: list[dict]) -> str 
     return key
 
 
+CHECKBOX_GROUP = 'checkbox_group'
+
+
+def _option_label(text) -> str:
+    return ' '.join(text.casefold().split()) if isinstance(text, str) else ''
+
+
+def _checkbox_group(page: dict, target: dict) -> list[dict] | None:
+    """Issue 278: the native checkbox option group that `target` belongs to.
+
+    A group is two or more native input checkboxes of ONE form that share one
+    non-empty question (fieldset legend) and carry distinct non-empty option
+    labels. Any other control of that form under the same question (a picker,
+    proxy, hidden receiver, radio, mixed type), a disabled or attestation
+    member, or a duplicate label leaves the existing collision Gate in force:
+    this returns None. Ashby's formless controls are never in_form, so they
+    never group.
+    """
+    question = target.get('question')
+    form = target.get('form_selector')
+    action = target.get('form_action')
+    if (target.get('type') != 'checkbox' or target.get('tag') != 'input'
+            or target.get('in_form') is not True or not form or not action
+            or not isinstance(question, str) or not question.strip()):
+        return None
+    # Match the existing approval-collision census: a competing receiver with
+    # the same normalized question cannot be hidden by case or spacing.
+    peers = [c for c in page.get('controls', [])
+             if c.get('form_selector') == form
+             and _same(question, c.get('question') or c.get('label') or '')
+             and (_could_receive_an_answer(c)
+                  or c.get('selector') == target.get('selector'))]
+    if len(peers) < 2 or not any(c.get('selector') == target.get('selector')
+                                 for c in peers):
+        return None
+    labels = [_option_label(c.get('label')) for c in peers]
+    selectors = [c.get('selector') for c in peers]
+    if (any(c.get('type') != 'checkbox' or c.get('tag') != 'input'
+            or c.get('in_form') is not True or c.get('form_action') != action
+            or c.get('question') != question
+            or c.get('ashby_hidden_choice') is True or c.get('disabled')
+            or _assent_scope(c) != 'fact'
+            or _material_assent_match(label(c))
+            or not isinstance(c.get('label'), str) for c in peers)
+            or not all(labels) or len(set(labels)) != len(labels)
+            or any(not isinstance(s, str) or not s for s in selectors)
+            or len(set(selectors)) != len(selectors)):
+        return None
+    return peers
+
+
+def _group_binding(group: list[dict]) -> list[dict]:
+    """The exact members an owner grant binds, in page order."""
+    return [{'selector': c['selector'], 'label': c['label'],
+             'form_selector': c['form_selector']} for c in group]
+
+
+def _member_key(target: dict) -> str:
+    """The per-option approval key; the group's own key is its question."""
+    return f"{target['question']} → {target['label']}"
+
+
+def _current_group_grant(page: dict, group: list[dict], row: dict) -> dict | None:
+    """The stored group grant when it still binds exactly THIS group, else None.
+
+    The grant must carry the question, url, form owner, the full option set
+    (order-insensitively) with every member's selector and form_selector, and a
+    non-empty, duplicate-free selection of exactly offered labels. Any drift
+    in options or selectors makes it stale, which re-asks the owner.
+    """
+    grants = row.get('human_approved_answers')
+    first = group[0]
+    grant = grants.get(first['question']) if isinstance(grants, dict) else None
+    if not isinstance(grant, dict) or grant.get('type') != CHECKBOX_GROUP:
+        return None
+    bound, selected = grant.get('group_members'), grant.get('selected')
+    offered = [c['label'] for c in group]
+    options = grant.get('options')
+    if (grant.get('url') != page.get('url')
+            or grant.get('question') != first['question']
+            or grant.get('tag') != 'input'
+            or (grant.get('selector'), grant.get('label')) not in {
+                (c['selector'], c['label']) for c in group}
+            or grant.get('form_selector') != first['form_selector']
+            or grant.get('form_action') != first['form_action']
+            or not isinstance(options, list) or len(options) != len(group)
+            or any(not isinstance(option, str) for option in options)
+            or set(options) != set(offered)
+            or not isinstance(bound, list) or len(bound) != len(group)
+            or any(not isinstance(m, dict) for m in bound)
+            or {(m.get('selector'), m.get('label'), m.get('form_selector'))
+                for m in bound} != {(m['selector'], m['label'], m['form_selector'])
+                                    for m in _group_binding(group)}
+            or not isinstance(selected, list) or not selected
+            or any(not isinstance(s, str) for s in selected)
+            or len(set(selected)) != len(selected)
+            or any(s not in offered for s in selected)
+            or grant.get('value') != json.dumps(selected)):
+        return None
+    return grant
+
+
+def _group_row(pk: str, fixture_context=None) -> dict:
+    return _row(pk, fixture_context=fixture_context) if fixture_context else _row(pk)
+
+
+def _group_ref(grant: dict) -> str:
+    """Opaque digest of the exact group grant a derived member grant came from."""
+    import hashlib
+    canonical = json.dumps({k: grant.get(k) for k in (
+        'value', 'question', 'url', 'form_selector', 'form_action', 'group_members')},
+        sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
+
+
+def _derived_checkbox_member_grant(page: dict, member: dict, grant: dict) -> dict:
+    """Record both choices of each option: selected yes or explicitly unchecked no.
+
+    An unchecked member gets a current, inert derived record so a new answer
+    can atomically overwrite its old positive record without deleting keys.
+    Only a selected yes may satisfy the ordinary exact approval check.
+    """
+    selected = member['label'] in grant['selected']
+    return {
+        'value': 'yes' if selected else 'no',
+        'selector': member['selector'], 'url': page['url'],
+        'label': member['label'], 'question': member['question'],
+        'tag': 'input', 'type': 'checkbox',
+        'form_selector': member['form_selector'],
+        'form_action': member['form_action'],
+        'visible_text': member['label'], 'source': 'checkbox-group',
+        'group_ref': _group_ref(grant),
+        **({'verified_redirect_url': grant['verified_redirect_url']}
+           if grant.get('verified_redirect_url') else {}),
+    }
+
+
+def _derive_group_member_grants(page: dict, pk: str, *, fixture_context=None) -> None:
+    """Atomically rebind the stored owner group answer and every option grant.
+
+    The pending owner gate first records the full group answer. Once the row
+    becomes submitting, the existing tracking compare-and-replace primitive
+    validates that exact answer and every current member key together before
+    writing the group and all derived records. A stale positive member is
+    replaced with an inert no, never deleted. No derived member is authority
+    without the current group grant at final Submit.
+    """
+    row = _group_row(pk, fixture_context)
+    if (row.get('pk') != pk or row.get('status') != 'submitting'
+            or row.get('possible_submission')):
+        return
+    grants = row.get('human_approved_answers')
+    if grants is None:
+        grants = {}
+    if not isinstance(grants, dict):
+        raise Gate('Checkbox group approval map is not current; ask the owner again.')
+    seen = set()
+    for item in page.get('controls', []):
+        group = _checkbox_group(page, item)
+        if group is None or group[0]['selector'] in seen:
+            continue
+        seen.update(member['selector'] for member in group)
+        current = _current_group_grant(page, group, row)
+        if current is None:
+            continue  # Bootstrap asks the owner; stale derived keys stay inert.
+        group_key = group[0]['question']
+        new_members = {
+            _member_key(member): _derived_checkbox_member_grant(page, member, current)
+            for member in group
+        }
+        if (group_key in new_members or len(new_members) != len(group)):
+            raise Gate('Checkbox group member identities are ambiguous.')
+        new = {group_key: deepcopy(current), **new_members}
+        expected = {
+            key: deepcopy(grants[key]) if key in grants else None
+            for key in new
+        }
+        if any(key in grants and not isinstance(grants[key], dict) for key in new):
+            raise Gate('Checkbox group approval map changed; ask the owner again.')
+        if all(grants.get(key) == value for key, value in new.items()):
+            continue
+        from core.stores import make_stores
+        store = fixture_context if fixture_context is not None else make_stores().tracking
+        if not store.replace_grants_if_unchanged(pk, expected, new):
+            raise Gate('Checkbox group approval changed before atomic recording; ask the owner again.')
+        after = _group_row(pk, fixture_context)
+        after_grants = after.get('human_approved_answers')
+        if (after.get('pk') != pk or after.get('status') != 'submitting'
+                or after.get('possible_submission')
+                or not isinstance(after_grants, dict)
+                or any(after_grants.get(key) != value for key, value in new.items())):
+            raise Gate('The checkbox group approval did not record exactly; inspect it again.')
+        row, grants = after, after_grants
+
+def _group_member_grant_state(page: dict, target: dict, pk: str, *,
+                              fixture_context=None) -> str:
+    """'none' (no current group grant / not granted) or 'granted'; else a Gate.
+
+    A granted option must also carry a derived grant minted from THIS exact
+    group grant; a leftover from an earlier answer fails closed.
+    """
+    group = _checkbox_group(page, target)
+    if group is None:
+        return 'none'
+    row = _group_row(pk, fixture_context)
+    current = _current_group_grant(page, group, row)
+    if current is None or target['label'] not in current['selected']:
+        return 'none'
+    derived = (row.get('human_approved_answers') or {}).get(_member_key(target))
+    if (not isinstance(derived, dict) or derived.get('source') != 'checkbox-group'
+            or derived.get('group_ref') != _group_ref(current)):
+        raise Gate('The checkbox option approval does not match the current owner answer.')
+    return 'granted'
+
+
+def _bound_checkbox_group_member(page: dict, target: dict, filled,
+                                 receipts: list | None = None) -> bool:
+    """Current group authority and exact member state on the raw final PAGE.
+
+    Every member, including an unchecked one, must have a derived record tied
+    to the same currently bound group answer. An unchecked record has value no
+    and can never become a positive individual approval.
+    """
+    if (target.get('type') != 'checkbox'
+            or not isinstance(filled, _ApprovedFormValues) or not filled.pk):
+        return False
+    group = _checkbox_group(page, target)
+    if group is None:
+        return False
+    row = _group_row(filled.pk, filled.fixture_context)
+    grant = _current_group_grant(page, group, row)
+    if grant is None:
+        return False
+    selected = set(grant['selected'])
+    if (not any(member.get('checked') is True for member in group)
+            or any(member.get('checked') is not (member['label'] in selected)
+                   for member in group)):
+        return False
+    grants = row.get('human_approved_answers')
+    if not isinstance(grants, dict):
+        return False
+    group_ref = _group_ref(grant)
+    for member in group:
+        derived = grants.get(_member_key(member))
+        if (not isinstance(derived, dict)
+                or derived.get('source') != 'checkbox-group'
+                or derived.get('group_ref') != group_ref
+                or any(derived.get(k) != expected for k, expected in (
+                    ('value', 'yes' if member['label'] in selected else 'no'),
+                    ('selector', member['selector']), ('url', page['url']),
+                    ('label', member['label']), ('question', member['question']),
+                    ('tag', 'input'), ('type', 'checkbox'),
+                    ('form_selector', member['form_selector']),
+                    ('form_action', member['form_action']),
+                    ('visible_text', member['label'])))):
+            return False
+    return True
+
+def _group_uncheck_allowed(page: dict, target: dict, pk: str, *,
+                           fixture_context=None) -> bool:
+    """May the controller click this CHECKED checkbox? Only to clear an
+    option the owner did NOT grant, inside a group whose current grant binds
+    this exact option set. Every other checked-checkbox click stays refused."""
+    if (target.get('type') != 'checkbox' or target.get('tag') != 'input'
+            or target.get('checked') is not True or target.get('disabled')):
+        return False
+    group = _checkbox_group(page, target)
+    if group is None:
+        return False
+    grant = _current_group_grant(page, group, _group_row(pk, fixture_context))
+    return grant is not None and target['label'] not in grant['selected']
+
+
+async def _reconcile_checkbox_group(session, page: dict, original: dict,
+                                    pk: str, ctx, filled: dict, *,
+                                    provenance=None) -> tuple[dict, dict]:
+    """Settle prechecked native group options without requiring a model click.
+
+    Fresh PAGE and fixed witness precede any clearing action. The existing IPC
+    controller independently authorizes each unselected checked member; selected
+    prechecks require an exact current yes grant before ledger admission.
+    """
+    async def observed():
+        fresh, witness = await _observe_controls(
+            session, await session.page(), site='group-prechecked-readback')
+        if (fresh.get('url') != page.get('url')
+                or (provenance is not None
+                    and not _preparation_current(provenance, fixture_context=ctx))):
+            raise Gate('The checkbox group origin changed during reconciliation.')
+        matched = [c for c in fresh['controls']
+                   if c.get('selector') == original['selector']]
+        group = _checkbox_group(fresh, matched[0]) if len(matched) == 1 else None
+        grant = (_current_group_grant(fresh, group, _group_row(pk, ctx))
+                 if group is not None else None)
+        if grant is None:
+            raise Gate('The checkbox group changed during reconciliation; ask the owner again.')
+        return fresh, witness, group, grant
+
+    fresh, witness, group, grant = await observed()
+    # No new owner decision or toggle of a selected member: clear only the
+    # existing current-grant-bound unselected prechecks.
+    for member in group:
+        if member['label'] not in grant['selected'] and member.get('checked') is True:
+            if not _group_uncheck_allowed(fresh, member, pk, fixture_context=ctx):
+                raise Gate('The unselected checkbox is not cleared by the current grant.')
+            await _effect_call(session, 'click', member['selector'])
+            fresh, witness, group, grant = await observed()
+
+    values = {}
+    for member in group:
+        selected = member['label'] in grant['selected']
+        checked = member.get('checked')
+        if type(checked) is not bool or (not selected and checked):
+            raise Gate('The checkbox group state does not match the owner answer.')
+        if selected and checked:
+            value = member.get('value')
+            if not isinstance(value, str) or not value:
+                raise Gate('The checked group member has no form-own value.')
+            exact_approval(
+                pk, _member_key(member), 'yes', target=_bound_target(fresh, member),
+                url=fresh['url'], provenance=provenance,
+                **({'fixture_context': ctx} if ctx is not None else {}))
+            _guard_native_choice_answer(member, 'yes')
+            values[member['selector']] = value
+    filled.update(values)  # Only after every current member has passed readback.
+    return fresh, witness
+
+
+async def _settle_checkbox_group(session, written: dict, pk: str, ctx) -> None:
+    """Issue 278: after a granted option is checked, clear every ungranted one.
+
+    Rereads the live page, requires the group grant to still bind it exactly,
+    requires the written option to read checked, unchecks only ungranted
+    options (the controller re-authorizes each click), then rereads again and
+    requires every ungranted option unchecked and every checked option granted.
+    """
+    def read(fresh: dict) -> tuple[list[dict], dict]:
+        members = [c for c in fresh['controls']
+                   if c.get('selector') == written['selector']]
+        group = _checkbox_group(fresh, members[0]) if len(members) == 1 else None
+        grant = (_current_group_grant(fresh, group, _group_row(pk, ctx))
+                 if group is not None else None)
+        if group is None or grant is None:
+            raise Gate('The checkbox group changed after the write; inspect it again.')
+        return group, grant
+
+    fresh, _ = await _observe_controls(session, await session.page(),
+                                       site='group-readback')
+    group, grant = read(fresh)
+    mine = next(c for c in group if c['selector'] == written['selector'])
+    if mine.get('checked') is not True:
+        raise Gate('The granted checkbox option did not read back as checked.')
+    for member in group:
+        if member['label'] not in grant['selected'] and member.get('checked') is True:
+            await _effect_call(session, 'click', member['selector'])
+    fresh, _ = await _observe_controls(session, await session.page(),
+                                       site='group-readback')
+    group, grant = read(fresh)
+    for member in group:
+        granted = member['label'] in grant['selected']
+        if (not granted and member.get('checked') is not False) or (
+                granted and member['selector'] == written['selector']
+                and member.get('checked') is not True):
+            raise Gate('The checkbox group state does not match the owner answer.')
+
+
+_COLLISION_TYPES = frozenset({
+    'checkbox', 'radio', 'text', 'email', 'tel', 'url', 'number', 'textarea',
+    'select', 'combobox', 'file', 'button', 'hidden'})
+_COLLISION_TAGS = frozenset({'input', 'textarea', 'select', 'div', 'button', 'a'})
+
+
+def _log_collision_shape(target: dict, conflicts: list[dict]) -> None:
+    """Issue 278: the collision shape only, never a label, question or value."""
+    def shape(control: dict) -> dict:
+        return {'type': control.get('type') if control.get('type') in _COLLISION_TYPES
+                else 'other',
+                'tag': control.get('tag') if control.get('tag') in _COLLISION_TAGS
+                else 'other',
+                'in_form': control.get('in_form') is True}
+    _LOG.info('approval question collision %s', {
+        'size': 1 + len(conflicts),
+        'controls': [shape(target), *(shape(c) for c in conflicts)][:8]})
+
+
 def _key(page: dict, target: dict) -> str:
     key = target.get('question') or target.get('label')
     if not isinstance(key, str) or not key.strip():
@@ -3713,6 +4135,8 @@ def _key(page: dict, target: dict) -> str:
     if _mismatch_question_twins(page, target):
         raise Gate('Several application receivers share this question; '
                    'inspect the application manually.', reason='defect_receiver')
+    if _checkbox_group(page, target) is not None:
+        return _member_key(target)
     # Hidden machine-value inputs cannot receive a separate human grant.
     conflicts = [c for c in _approval_question_collisions(page, target)
                  if c.get('type') != 'hidden']
@@ -3745,6 +4169,7 @@ def _key(page: dict, target: dict) -> str:
             if not any(_same(selected, c.get('question') or c.get('label') or '')
                        for c in others):
                 return selected
+    _log_collision_shape(target, conflicts)
     raise Gate('More than one control uses the same approval question; review manually.')
 
 
@@ -3783,7 +4208,8 @@ def _unanswered(page: dict, target: dict, *, owner_all: bool = False) -> bool:
                               and target.get('tag') == 'input'
                               and bool(target.get('associated_label_selector'))
                               and not _formless_root(page).get('root'))
-        return (hidden_attestation or required(target)) and not target.get('checked')
+        return (hidden_attestation or required(target)
+                or _checkbox_group(page, target) is not None) and not target.get('checked')
     if target.get('type') == 'radio':
         try:
             members = _radio_group(page, target)
@@ -3825,6 +4251,11 @@ def _choice_prompt(target: dict, question: dict) -> str:
         observed += ('\nOptions:\n' + '\n'.join(
                     option['label'] for option in options) if options else
                     '\nOpen the linked picker to load available options.')
+    elif question['type'] == CHECKBOX_GROUP:
+        observed += ('\nOptions:\n' + '\n'.join(question['options'])
+                     + '\nAnswer with a JSON array of one or more exact option labels, '
+                       'for example ["First option", "Second option"]. '
+                       'Only the options you list will be checked.')
     elif question['type'] == 'checkbox':
         observed += '\nAnswer yes or no. Only yes authorizes this required checkbox.'
     elif question['type'] == 'button' and question.get('boolean_members'):
@@ -3868,6 +4299,11 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     if not _unanswered(page, target, owner_all=_owner_asks_every_receiver(page)):
         raise Gate('Only required, unanswered native choices can use a grant.')
     key = _key(page, target)
+    if (target.get('type') == 'checkbox' and pk
+            and _group_member_grant_state(page, target, pk,
+                                          fixture_context=fixture_context) == 'none'
+            and _checkbox_group(page, target) is not None):
+        return None  # No current owner answer grants this option.
     if target.get('type') == 'checkbox':
         scope = _assent_scope(target)
         if scope == 'owner':
@@ -4117,7 +4553,8 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                          provenance: Provenance | None = None,
                          lever_location: bool = False,
                          closed_witness: bool = False,
-                         reversible_scope: frozenset[str] | None = None) -> dict:
+                         reversible_scope: frozenset[str] | None = None,
+                         pk: str = '', fixture_context=None) -> dict:
     target = _witnessed_hidden_choice(page, target, witness)
     structural = _formless_root(page)
     reversible = (reversible_scope is not None
@@ -4147,6 +4584,7 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
                          and _boolean_pair(page, target))):
             raise Gate('Only witnessed text-entry controls may request a structural grant.')
     choice = target.get('type') in {'radio', 'checkbox'}
+    group_question = False
     boolean_choice = bool((reversible or (structural and structural.get('root')))
                           and target.get('type') == 'button')
     if boolean_choice:
@@ -4155,8 +4593,25 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
     elif choice:
         if target.get('tag') != 'input':
             raise Gate('A grantable choice must be a native input.')
-        members = (_radio_group(page, target)
-                   if target.get('type') == 'radio' else [target])
+        group = (_checkbox_group(page, target)
+                 if target.get('type') == 'checkbox' else None)
+        if group is not None:
+            # Issue 278: one logical question. Without a current owner grant it
+            # is asked as a whole; with one, a selected option is an ordinary
+            # single checkbox bound to its derived grant and no other option
+            # may be touched.
+            granted = (_current_group_grant(page, group, _group_row(pk, fixture_context))
+                       if pk else None)
+            if granted is None:
+                members, group_question = group, True
+            elif target['label'] in granted['selected']:
+                members = [target]
+            else:
+                raise Gate('This option is not part of the approved checkbox group answer.',
+                           reason='defect_receiver')
+        else:
+            members = (_radio_group(page, target)
+                       if target.get('type') == 'radio' else [target])
         target = members[0]
     elif target.get('type') == 'combobox':
         combo = target.get('combobox') or {}
@@ -4224,12 +4679,15 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         if target.get('type') == 'combobox' and not closed_witness:
             _combobox_options(target)
     key = _key(page, target)
+    if group_question:
+        key = target['question']
     if not reversible:
         _form_subject(page, target)
-    if bootstrap and (not _unanswered(page, target,
-                                      owner_all=_owner_asks_every_receiver(page))
-                      or (not choice and target.get('type') != 'combobox'
-                          and bool(str(target.get('value') or '').strip()))):
+    if bootstrap and not group_question and (
+            not _unanswered(page, target,
+                            owner_all=_owner_asks_every_receiver(page))
+            or (not choice and target.get('type') != 'combobox'
+                and bool(str(target.get('value') or '').strip()))):
         raise Gate('This is not a required unanswered field.')
     # No root proof exists on the reversible raw route, but the fresh
     # control witness and tracked preparation destination are still required.
@@ -4282,7 +4740,11 @@ def _disclosure_question(page: dict, target: dict, witness: dict,
         question['options'] = [
             {key: option[key] for key in ('selector', 'label', 'value')}
             for option in _combobox_options(target)]
-    if target.get('type') == 'checkbox':
+    if group_question:
+        question['type'] = CHECKBOX_GROUP
+        question['options'] = [c['label'] for c in members]
+        question['group_members'] = _group_binding(members)
+    elif target.get('type') == 'checkbox':
         question['visible_text'] = witness[target['selector']]['visible_text']
         identity = _checkbox_control_identity(page, target)
         if identity:
@@ -4787,6 +5249,10 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
         if item.get('type') in {'radio', 'checkbox'}:
             if item.get('checked'):
                 _bank_auto_log_skip(pk, item, 'has_value')
+                continue
+            if _checkbox_group(page, item) is not None:
+                # Issue 278: a group is only ever answered by the owner.
+                _bank_auto_log_skip(pk, item, 'not_eligible')
                 continue
         elif item.get('has_value') or (item.get('type') == 'combobox' and
                                       (item.get('combobox') or {}).get('selected_text')):
@@ -5294,7 +5760,10 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
                          and initial.get('form_selector') else [initial])
         required = (any(c.get('required') for c in radio_members)
                     if kind == 'radio' else bool(initial.get('required')))
-        if not required:
+        option_group = _checkbox_group(page, initial) if kind == 'checkbox' else None
+        # A group is one owner question even when none of its options is
+        # individually required. Standalone optional controls still skip.
+        if not required and option_group is None:
             continue
         # Observation already proved selector uniqueness. Read this control
         # without prematurely treating a disabled *optional* sibling as a Gate.
@@ -5327,6 +5796,27 @@ async def _bootstrap(session, page: dict, pk: str, facts: dict,
         def record(decision):
             if eligible:
                 _bootstrap_log(item, ordinal, decision, required=required)
+
+        option_group = _checkbox_group(page, item) if kind == 'checkbox' else None
+        if option_group is not None:
+            # Issue 278: one owner decision for the whole option group, never a
+            # bank or fact answer. Every member is traversed exactly once here.
+            seen.update(c['selector'] for c in option_group)
+            if _current_group_grant(page, option_group,
+                                    _group_row(pk, fixture_context)) is None:
+                question = _disclosure_question(
+                    page, option_group[0], witness, *origins, bootstrap=True,
+                    provenance=provenance, pk=pk, fixture_context=fixture_context)
+                question['pk'] = pk
+                record('needs-human')
+                raise Gate(_choice_prompt(option_group[0], question),
+                           form_question=question, reason='owner_question')
+            _derive_group_member_grants(page, pk, fixture_context=fixture_context)
+            page, witness = await _reconcile_checkbox_group(
+                session, page, item, pk, fixture_context, filled,
+                provenance=provenance)
+            record('left-to-model')
+            continue
 
         if not settlement_route or not eligible:
             # A missing ordinary answer is not a per-step admission gate.
@@ -5801,7 +6291,8 @@ async def _required_owner_gate(session, page: dict, pk: str, *origins: str,
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=not census_fallback,
             closed_witness=_closed_material_combobox(item),
-            reversible_scope=scope, provenance=provenance)
+            reversible_scope=scope, provenance=provenance,
+            pk=pk, fixture_context=fixture_context)
         question['pk'] = pk
         if (every or census_fallback) and _owner_skip_applies(
                 row, pk, question, current, item):
@@ -5920,11 +6411,19 @@ async def _current_approved_choices(session, page: dict, pk: str,
                      or not _preparation_current(provenance, fixture_context=fixture_context)))):
         raise Gate('The same-job choice PAGE changed before model disclosure.')
     choices = []
+    _derive_group_member_grants(current, pk, fixture_context=fixture_context)
     for item in current['controls']:
         kind = item.get('type')
         if (kind not in {'radio', 'checkbox', 'button'}
                 or item.get('disabled') or not _unanswered(current, item)):
             continue
+        if kind == 'checkbox':
+            option_group = _checkbox_group(current, item)
+            if option_group is not None:
+                granted = _current_group_grant(
+                    current, option_group, _group_row(pk, fixture_context))
+                if granted is None or item['label'] not in granted['selected']:
+                    continue  # Only an owner-granted member is ever offered.
         if kind == 'button':
             if not isinstance(session, _ReversibleEntryReader):
                 continue
@@ -5949,7 +6448,8 @@ async def _current_approved_choices(session, page: dict, pk: str,
             continue
         question = _disclosure_question(
             current, item, witness, *origins, bootstrap=True,
-            provenance=provenance, reversible_scope=reversible_scope)
+            provenance=provenance, reversible_scope=reversible_scope,
+            pk=pk, fixture_context=fixture_context)
         approved = (_approved_boolean_pair(
             current, item, pk, provenance=provenance,
             fixture_context=fixture_context) if kind == 'button' else
@@ -6409,11 +6909,14 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         if _identity(target) != _identity(control(page, action, 'execute-identity')):
             raise Gate('The selected field changed before human authorization.')
         page = observed
+        if verb == 'choose' and target.get('type') == 'checkbox':
+            _derive_group_member_grants(page, pk, fixture_context=ctx)
         form_question = _disclosure_question(
             page, target, witness, job_url or page['url'],
             provenance=provenance, reversible_scope=_execute_reversible_scope(
                 session, page, witness, target, pk, facts,
-                provenance=provenance, fixture_context=ctx))
+                provenance=provenance, fixture_context=ctx),
+            pk=pk, fixture_context=ctx)
         form_question['pk'] = pk
         gate_prompt = (_choice_prompt(target, form_question)
                        if verb in {'choose', 'select'}
@@ -6538,7 +7041,8 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             latest, current, latest_witness, job_url or latest['url'],
             provenance=provenance, reversible_scope=_execute_reversible_scope(
                 session, latest, latest_witness, current, pk, facts,
-                provenance=provenance, fixture_context=ctx))
+                provenance=provenance, fixture_context=ctx),
+            pk=pk, fixture_context=ctx)
         fresh_question['pk'] = pk
         if fresh_question != form_question:
             raise Gate('The original authorized control identity is no longer current.')
@@ -6582,6 +7086,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
             # off (live probe), so an exact prior press goes to readback.
             if not _boolean_already_chosen(latest, current):
                 await _effect_call(session, 'click', current['selector'])
+            if (current['type'] == 'checkbox'
+                    and _checkbox_group(latest, current) is not None):
+                await _settle_checkbox_group(session, current, pk, ctx)
         if _formless_root(page):
             readback, _ = await _observe_controls(session, await session.page(), site='execute-readback')
             actual = control(readback, action, 'execute-readback')
@@ -7452,6 +7959,9 @@ class ApplicationIPCController:
             self.mark_click_started()
             return
         if target.get('type') in {'radio', 'checkbox'}:
+            if _group_uncheck_allowed(page, target, self.pk,
+                                      fixture_context=self.fixture_context):
+                return
             if (_formless_root(page) and not _formless_root(page).get('root')
                     and self._row().get('ats') in _APPLICATION_ENTRY):
                 page, target = await self._reversible_receiver(session, page, target)

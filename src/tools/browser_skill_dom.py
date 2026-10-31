@@ -249,6 +249,7 @@ PAGE = r"""(() => {
       disabled:!!e.disabled || e.getAttribute('aria-disabled') === 'true',
       required:!!e.required || e.getAttribute('aria-required') === 'true',
       value:type === 'password' ? '' : (e.value || e.getAttribute('data-value') || ''),
+      ...(e.tagName === 'INPUT' ? {value_attr_present:e.hasAttribute('value')} : {}),
       // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a
       // probe: Yes and No alike); no other button's aria-pressed is an answer.
       has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'

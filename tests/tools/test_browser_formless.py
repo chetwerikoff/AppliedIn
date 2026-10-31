@@ -3721,7 +3721,7 @@ def _issue218_main_reader_scripts():
     source = source.replace(
         overlay_filter, "    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&\n", 1)
     git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == '6190a462e9d5d4180b8fcc289e9ef0088fd82cc0'
+    assert hashlib.sha1(git_blob).hexdigest() == 'c6d384932b2167aee17669372ac5cfbd0b443949'  # Issue 282: + value_attr_present
     assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
     assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
     # The fixed witness's own #252 survey census reads entry bindings that the

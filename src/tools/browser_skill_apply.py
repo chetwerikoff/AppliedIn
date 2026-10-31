@@ -939,8 +939,7 @@ def check_approvals(pk: str, history: list, page: dict | None = None, *,
                     guarded_value(target, answer)
                 elif target.get('type') == 'radio':
                     group = _radio_group(page, target)
-                    matches = [c for c in group
-                               if _same(answer, c['label']) or _same(answer, c['value'])]
+                    matches = [c for c in group if _radio_answer_matches(answer, c)]
                     if (len(matches) != 1 or matches[0]['selector'] != target['selector']
                             or not target.get('checked')
                             or sum(bool(c.get('checked')) for c in group) != 1):
@@ -1271,8 +1270,7 @@ def _final_exact_grant(page: dict, target: dict, answer: str,
         if not isinstance(stored_answer, str) or not stored_answer.strip():
             raise Gate('An exact human-approved answer is needed for this control.')
         if typ == 'radio':
-            if not (_same(stored_answer, target.get('label', ''))
-                    or _same(stored_answer, target.get('value', ''))):
+            if not _radio_answer_matches(stored_answer, target):
                 raise Gate('The native selected member is not the approved answer.')
         elif typ == 'button':
             if not isinstance(answer, str) or not _same(stored_answer, answer):
@@ -2048,8 +2046,8 @@ def _identity(target: dict) -> tuple:
         'form_selector', 'form_action', 'formaction', 'form_action_attr_present',
         'form_action_raw', 'formaction_attr_present', 'formaction_raw',
         'options', 'combobox', 'disabled',
-        'required', 'has_value', 'value', 'checked', 'name', 'files',
-        'submit', 'navigates', 'href', 'native_form_owner_selector'))
+        'required', 'has_value', 'value', 'value_attr_present', 'checked', 'name',
+        'files', 'submit', 'navigates', 'href', 'native_form_owner_selector'))
 
 def _page_identity(page: dict) -> tuple:
     entry = page.get('entry')
@@ -3320,6 +3318,72 @@ async def _ashby_resume_upload(session, page: dict, *, resume_path: str,
             'uploaded': True}
 
 
+def _default_radio_value(control: dict) -> bool:
+    """Issue 282: a native radio with no value attribute reports the HTML default.
+
+    The browser answers "on" for every such member, so that value names no
+    option. Only the reader's own attribute-presence fact proves this shape.
+    """
+    return (control.get('tag') == 'input' and control.get('type') == 'radio'
+            and control.get('value_attr_present') is False
+            and control.get('value') == 'on')
+
+
+def _radio_answer_matches(answer: str, member: dict) -> bool:
+    """An approved answer names a member by caption, or by an explicit value.
+
+    A member of an attribute-less group is named by its caption only: its
+    selector is checked by every caller, and its "on" value names no option.
+    """
+    if _default_radio_value(member):
+        return _same_key(str(answer)) == _same_key(str(member.get('label', '')))
+    return (_same(answer, member.get('label', ''))
+            or _same(answer, member.get('value', '')))
+
+
+def _default_radio_choice_read_back(readback: dict, actual: dict, current: dict,
+                                     answer: str) -> bool:
+    """Exactly one member is checked and it is the granted one, by selector and caption."""
+    checked = [c for c in _radio_group(readback, actual) if c.get('checked') is True]
+    return (len(checked) == 1 and checked[0]['selector'] == current['selector']
+            and _radio_answer_matches(answer, checked[0]))
+
+
+def _radio_group_failure(page: dict, target: dict, members: list[dict],
+                         structural) -> str:
+    """The name of the first failed membership subpredicate, or ''."""
+    if len(members) < 2:
+        return 'members.count'
+    checks = (
+        ('tag.input', lambda c: c.get('tag') != 'input'),
+        ('in_form', lambda c: not structural and c.get('in_form') is not True),
+        ('question.equal', lambda c: c.get('question') != target['question']),
+        ('form_action.equal', lambda c: c.get('form_action') != target.get('form_action')),
+        ('selector.present', lambda c: not isinstance(c.get('selector'), str)
+                                       or not c['selector']),
+        ('label.present', lambda c: not isinstance(c.get('label'), str)
+                                    or not c['label'].strip()),
+        ('value.present', lambda c: not isinstance(c.get('value'), str)
+                                    or not c['value'].strip()),
+    )
+    for predicate, failed in checks:
+        if any(failed(c) for c in members):
+            return predicate
+    if len({c['selector'] for c in members}) != len(members):
+        return 'selectors.distinct'
+    defaults = [_default_radio_value(c) for c in members]
+    if any(defaults) and not all(defaults):
+        # A mixed group cannot rest identity on selector and caption alone.
+        return 'values.mixed'
+    # An attribute-less group has no machine values; each member is identified
+    # by its distinct selector and distinct caption instead.
+    if not all(defaults) and len({c['value'] for c in members}) != len(members):
+        return 'values.distinct'
+    if len({_same_key(c['label']) for c in members}) != len(members):
+        return 'captions.distinct'
+    return ''
+
+
 def _radio_group(page: dict, target: dict) -> list[dict]:
     """One native form/name group, with distinct observed captions and values."""
     name, form = target.get('name'), target.get('form_selector')
@@ -3338,17 +3402,10 @@ def _radio_group(page: dict, target: dict) -> list[dict]:
         # would change the meaning of the owner's approved choice.
         for member in members:
             _reversible_entry_recipient(page, member)
-    if (len(members) < 2 or any(
-            c.get('tag') != 'input' or (not structural and c.get('in_form') is not True)
-            or c.get('question') != target['question']
-            or c.get('form_action') != target.get('form_action')
-            or not isinstance(c.get('selector'), str) or not c['selector']
-            or not isinstance(c.get('label'), str) or not c['label'].strip()
-            or not isinstance(c.get('value'), str) or not c['value'].strip()
-            for c in members)
-            or len({c['selector'] for c in members}) != len(members)
-            or len({c['value'] for c in members}) != len(members)
-            or len({_same_key(c['label']) for c in members}) != len(members)):
+    failed = _radio_group_failure(page, target, members, structural)
+    if failed:
+        # The predicate name only: never a value, caption or selector.
+        _LOG.info('radio group refused: predicate=%s', failed)
         raise Gate('Radio group members or captions are incomplete or ambiguous.')
     return members
 
@@ -3896,8 +3953,7 @@ def _approved_native_choice(page: dict, target: dict, pk: str, *,
     answer = grant['value']
     if target['type'] == 'radio':
         members = _radio_group(page, target)
-        matches = [c for c in members
-                   if _same(answer, c['label']) or _same(answer, c['value'])]
+        matches = [c for c in members if _radio_answer_matches(answer, c)]
         if len(matches) != 1:
             raise Gate('The previously approved radio answer is ambiguous or changed.')
         selected = matches[0]
@@ -4832,7 +4888,8 @@ def _auto_grant_from_global(page: dict, witness: dict, pk: str, facts: dict,
             try:
                 members = _radio_group(page, item)
                 matches = [m for m in members if value.casefold() in {
-                    m['label'].casefold(), str(m.get('value') or '').casefold()}]
+                    m['label'].casefold(),
+                    '' if _default_radio_value(m) else str(m.get('value') or '').casefold()}]
                 if len(matches) != 1:
                     _bank_auto_log_skip(pk, item, 'radio_mismatch', key)
                     continue
@@ -6501,8 +6558,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                 write_value = target['label'].casefold()
             else:
                 members = _radio_group(page, target)
-                chosen = [c for c in members
-                          if (_same(value, c['label']) or _same(value, c['value']))]
+                chosen = [c for c in members if _radio_answer_matches(value, c)]
                 if len(chosen) != 1 or chosen[0]['selector'] != target['selector']:
                     raise Gate('The selected radio does not match the exact owner answer.')
                 _guard_native_choice_answer(target, value)
@@ -6573,8 +6629,7 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                                reason='defect_button')
             else:
                 matches = [c for c in _radio_group(latest, current)
-                           if (_same(value, c['label'])
-                               or _same(value, c['value']))]
+                           if _radio_answer_matches(value, c)]
                 if len(matches) != 1 or matches[0]['selector'] != current['selector']:
                     raise Gate('The bound radio answer no longer matches this member.')
             _guard_native_choice_answer(current, value)
@@ -6622,6 +6677,12 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                             or not isinstance(dom, dict)
                             or dom.get('checked') is not True):
                         raise _readback_gate(pk, verb, current, actual, write_value, 'checked')
+            elif _default_radio_value(current):
+                # Issue 282: "on" names no option, so the value cannot prove the
+                # choice. Exactly one member is checked and it is the granted one.
+                if not _default_radio_choice_read_back(readback, actual, current, value):
+                    raise _readback_gate(pk, verb, current, actual, write_value,
+                                         'checked')
             elif actual.get('value') != write_value or not actual.get('has_value'):
                 raise _readback_gate(pk, verb, current, actual, write_value)
             # The DOM readback uses the machine value (e.g. "remote"), while

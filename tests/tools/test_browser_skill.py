@@ -466,9 +466,11 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
             raise bsk.Unavailable('BrowserSkill unavailable: offline')
         return await command(*args, **kwargs)
     monkeypatch.setattr(bsk, 'command', fail_submit)
+    # The application loop stages/uploads the unique PDF receiver itself.
+    # A second model upload is correctly rejected; it is not the Submit path
+    # whose one-shot uncertain outcome this regression exercises.
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'upload', 'selector': '#resume'},
         {'action': verb, 'selector': '#submit'},
     ]))
     result = await forms.apply(URL, 'example-co', {'Email': 'test@example.test'},

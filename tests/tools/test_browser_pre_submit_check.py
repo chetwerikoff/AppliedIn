@@ -978,3 +978,75 @@ def test_removed_file_display_keeps_existing_formless_root_binding(
     else:
         with pytest.raises(forms.Gate, match='committing form'):
             forms.check_form(page, {}, True, 'Test-User-Resume.pdf', **args)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('scenario', 'accepted'), [
+    ('resume_empty_cover', True),
+    ('resume_other_cover', True),
+    ('staged_cover_only', False),
+    ('two_resume', False),
+    ('resume_and_cover_staged', False),
+    ('cover_without_resume', False),
+])
+async def test_final_resume_display_candidates_ignore_unrelated_upload_fields(
+        monkeypatch, tmp_path, scenario, accepted):
+    """An ATS can show multiple attached-file groups. Only the Resume/CV
+    field proves the staged PDF; an empty or differently named Cover Letter
+    must not block it, and a staged filename in Cover Letter must not pass.
+    """
+    observed = _read_current_file_upload_group()
+    resume_displays = observed['attached_file_displays']
+    assert len(resume_displays) == 1
+    resume = deepcopy(resume_displays[0])
+    assert resume['valid'] is True
+    assert resume['field_label'] == 'Resume/CV'
+    assert resume['filename'] == 'Test-User-Resume.pdf'
+
+    # Both displays are synthetic projections of the same observed, scoped
+    # file-upload shape. They differ only in their question and filename.
+    cover = deepcopy(resume)
+    cover['field_label'] = 'Cover Letter'
+    cover['filename'] = 'Unrelated-Cover.pdf'
+    if scenario == 'resume_empty_cover':
+        cover.update(filename='', valid=False)
+        displays = [resume, cover]
+    elif scenario == 'resume_other_cover':
+        displays = [resume, cover]
+    elif scenario == 'staged_cover_only':
+        resume.update(filename='', valid=False)
+        cover['filename'] = 'Test-User-Resume.pdf'
+        displays = [resume, cover]
+    elif scenario == 'two_resume':
+        displays = [resume, deepcopy(resume)]
+    elif scenario == 'resume_and_cover_staged':
+        cover['filename'] = 'Test-User-Resume.pdf'
+        displays = [resume, cover]
+    else:
+        assert scenario == 'cover_without_resume'
+        cover['filename'] = 'Test-User-Resume.pdf'
+        displays = [cover]
+
+    controller, page, target, fixture = _world(
+        monkeypatch, tmp_path, resume_name='Test-User-Resume.pdf')
+    # The synthetic reader owns #application-form, matching the Submit's
+    # proven native owner. The upload input is deliberately removed.
+    target['form_selector'] = '#application-form'
+    target['native_form_owner_selector'] = '#application-form'
+    page['controls'] = [
+        c for c in page['controls'] if c.get('type') != 'file']
+    for c in page['controls']:
+        if c.get('in_form') is True:
+            c['form_selector'] = '#application-form'
+    assert all(d.get('form_selector') == '#application-form' for d in displays)
+    page['attached_file_displays'] = displays
+
+    if accepted:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held and not controller.committed
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 2
+        assert refused.value.reason == 'defect_pre_submit_item_2'
+        assert not fixture.held and not controller.committed

@@ -1137,7 +1137,19 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
         evidence_ok = len(matching) == 1 and owned_attachment
     else:
         displays = page.get('attached_file_displays', [])
-        display = displays[0] if isinstance(displays, list) and len(displays) == 1 else {}
+        displays = displays if isinstance(displays, list) else []
+        resume_displays = [
+            d for d in displays if isinstance(d, dict)
+            and isinstance(d.get('field_label'), str)
+            and re.search(r'resume|résumé|cv', d['field_label'], re.I)]
+        # A filename shown only on Cover Letter (or another non-resume field)
+        # is not an attached résumé. Different/empty foreign filenames are
+        # unrelated, but reusing the staged name outside Resume is ambiguous.
+        staged_elsewhere = any(
+            isinstance(d, dict) and d not in resume_displays
+            and d.get('filename') == attachment for d in displays)
+        display = (resume_displays[0] if len(resume_displays) == 1
+                   and not staged_elsewhere else {})
         # A complete independent upload-tree observation cannot still claim
         # a live file-input receiver when the final control census omits it.
         # Genuine input removal leaves no such complete input tree.

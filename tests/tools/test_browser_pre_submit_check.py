@@ -1161,3 +1161,111 @@ async def test_required_nonprotected_local_react_select_final_readback(
         assert refused.value.item == 2
         assert refused.value.reason == 'defect_pre_submit_item_2'
         assert not fixture.held
+
+
+def _read_greenhouse_phone_country_react_select(state, reader):
+    """Production reader over a synthetic Greenhouse-style phone-country field.
+
+    The phone-country #country search input remains blank. Only its own one
+    visible select__single-value in the same selected value-container counts.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    injection = r"""
+const countryState=COUNTRY_STATE;
+const phoneField=node('fieldset',{class:'phone-input'},form);
+node('label',{'for':'phone',text:'Phone'},phoneField);
+const phone=node('input',{
+  id:'phone',name:'phone',type:'tel',required:true,
+},phoneField);
+phone.value='+15550101010';
+node('label',{'for':'country',id:'phone-country-label',text:'Phone country'},phoneField);
+const countryWrap=node('div',{class:'phone-input__country'},phoneField);
+const selectRoot=node('div',{class:'select__container'},countryWrap);
+const valueBox=node('div',{
+  class:countryState==='placeholder'
+    ? 'select__value-container'
+    : 'select__value-container select__value-container--has-value',
+},selectRoot);
+if(countryState==='selected' || countryState==='ambiguous')
+  node('div',{class:'select__single-value',text:'+1'},valueBox);
+if(countryState==='ambiguous')
+  node('div',{class:'select__single-value',text:'+99'},valueBox);
+if(countryState==='placeholder')
+  node('div',{class:'select__placeholder',text:'Select...'},valueBox);
+const inputBox=node('div',{
+  class:'select__input-container','data-value':'',
+},valueBox);
+const country=node('input',{
+  id:'country',type:'text',role:'combobox',required:true,
+  'aria-required':'true','aria-labelledby':'phone-country-label',
+  'aria-expanded':'false',
+},inputBox);
+country.value='';
+"""
+    injection = injection.replace('COUNTRY_STATE', json.dumps(state))
+    script = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', script, 'synthetic', json.dumps({'url': URL}), reader],
+        check=True, capture_output=True, text=True, timeout=30)
+    observed = json.loads(completed.stdout)
+    field = next(c for c in observed['controls']
+                 if c.get('selector') == '#country')
+    return observed, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('state', 'passes_item_two'), [
+    ('selected', True),
+    ('placeholder', False),
+    ('ambiguous', False),
+])
+async def test_greenhouse_phone_country_local_choice_item_two(
+        monkeypatch, tmp_path, state, passes_item_two):
+    """Selected +1 must survive both independent reads on #application-form;
+    blank placeholders and two local captions never satisfy required item 2.
+    """
+    from tools.browser_skill_dom import PAGE
+
+    observed, country = _read_greenhouse_phone_country_react_select(state, PAGE)
+    _, fixed = _read_greenhouse_phone_country_react_select(
+        state, forms._FIXED_CONTROL_WITNESS)
+    assert country['combobox'] == fixed['combobox']
+    assert {'#country', '#phone'} <= {
+        c['selector'] for c in observed['controls']}
+    assert country['form_selector'] == '#application-form'
+    assert country['in_form'] is True and country['required'] is True
+    assert country['type'] == 'combobox' and country['tag'] == 'input'
+    assert country['value'] == '' and country['has_value'] is False
+    assert not country['combobox'].get('selected_value')
+    if passes_item_two:
+        assert country['combobox']['selected_text'] == '+1'
+        assert country['combobox']['displayed_text'] == '+1'
+        assert country['combobox']['local_selected_proven'] is True
+        assert country['combobox']['selected_caption_unreadable'] is False
+    else:
+        assert not country['combobox'].get('selected_text')
+        assert country['combobox'].get('local_selected_proven') is not True
+        if state == 'ambiguous':
+            assert country['combobox']['selected_caption_unreadable'] is True
+
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    for existing in page['controls']:
+        if existing.get('in_form') is True:
+            existing['form_selector'] = '#application-form'
+    target['native_form_owner_selector'] = '#application-form'
+    page['controls'].insert(0, country)
+    if passes_item_two:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held and not controller.committed
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 2
+        assert refused.value.reason == 'defect_pre_submit_item_2'
+        assert not fixture.held and not controller.committed

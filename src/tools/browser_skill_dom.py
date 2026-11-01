@@ -56,9 +56,6 @@ _WIDGET_GRAPH = r"""
   function localReactSelectChoice(e) {
     if (e.tagName!=='INPUT' || e.type!=='text' ||
         e.getAttribute('role')!=='combobox') return null;
-    // Phone-country is a separate dial-code display (greenhouse.phone_country),
-    // not a named application-answer receiver. Preserve that existing witness.
-    if (e.closest('div.phone-input__country')) return null;
     const valueBox=e.closest('div.select__value-container');
     const inputBox=e.closest('div.select__input-container');
     const selectRoot=valueBox?.closest('div.select__container');

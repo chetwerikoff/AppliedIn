@@ -31,9 +31,10 @@ def _admit_ashby_without_field_grants(monkeypatch):
 
     monkeypatch.setattr(fixture._SyntheticRun, 'entry_admitted', admit)
 
-    # The sealed fixture's former sequence put file set after two fills. An
-    # already visible receiver is now prepared before the first model decision.
-    # Keep exact IPC sequence accounting for both early and late receivers.
+    # The sealed fixture still limits IPC to the original two synthetic fills
+    # and one exact staged PDF set. Under ungated preparation the first effect,
+    # not mere file-input visibility, determines whether proactive or later
+    # upload came first. Never admit a second upload or a Submit IPC.
     original_ipc = fixture._SyntheticRun._positive_ipc
     scenarios = {}
 
@@ -48,16 +49,31 @@ def _admit_ashby_without_field_grants(monkeypatch):
     original_facade = fixture._SyntheticRun.facade
 
     def current_facade(self, raw):
-        # The actual first offline PAGE determines whether the receiver is
-        # present before model decisions; a later receiver keeps the old order.
-        if self.ashby_upload and self.ipc_index == 0:
-            sequence = original_ipc(self)
-            visible = any(
-                control.get('selector') == forms._ASHBY_RESUME_SELECTOR
-                for control in getattr(raw, 'current', {}).get('controls', []))
-            scenarios[id(self)] = (
-                (sequence[-1], *sequence[:-1]) if visible else sequence)
-        return original_facade(self, raw)
+        sealed = original_facade(self, raw)
+        if not self.ashby_upload or self.ipc_index != 0:
+            return sealed
+        state = self
+
+        class _SealedFirstEffect:
+            async def call(self, *args, **kwargs):
+                sequence = original_ipc(state)
+                # PAGE/witness reads cannot predict whether the first effect
+                # is the early PDF set or the model's first ordinary fill.
+                # Admit only the same three exact synthetic effects, in their
+                # observed first-effect order, through the original closed
+                # fixture (which still refuses all Submit IPC).
+                if (state.ipc_index == 0 and id(state) not in scenarios
+                        and (args == sequence[-1] or
+                             args and args[0] in {'fill', 'click', 'select', 'upload'})):
+                    scenarios[id(state)] = (
+                        (sequence[-1], *sequence[:-1])
+                        if args == sequence[-1] else sequence)
+                return await sealed.call(*args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(sealed, name)
+
+        return _SealedFirstEffect()
 
     monkeypatch.setattr(fixture._SyntheticRun, 'facade', current_facade)
 
@@ -275,6 +291,14 @@ def _update_read_values(raw, pair):
 WAIT = {'action': 'wait'}
 
 
+def _canonical_final_row(authority, page):
+    # The current Item 1 must pass so a receiver failure is actually proved
+    # by Item 2. A grant-era fixture row had no canonical tracked identity.
+    authority.row.update(
+        jd_url=fixture.URL, job_id='synthetic-job',
+        ats='ashby', title=page['title'])
+
+
 def _late_resume_field(pages):
     """FF-224e: the résumé field renders after the first decision.
 
@@ -442,6 +466,7 @@ async def test_submit_without_current_run_upload_recovers_one_empty_ashby_receiv
 async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
         authority, monkeypatch, kind, refusal):
     raw = FixtureRaw(authority)
+    _canonical_final_row(authority, raw.current)
 
     def late_receiver_change():
         for page in (raw.current, raw.fixed):
@@ -470,11 +495,17 @@ async def test_late_submit_receiver_selection_rejects_ambiguous_or_wrong_label(
                             c['type'] = 'text'
 
     result, _, seen = await _run_recovery(
-        authority, monkeypatch, raw=raw, on_submit=late_receiver_change)
+        authority, monkeypatch, raw=raw, on_submit=late_receiver_change,
+        admit_owner=True)
     assert [action for action, _, _ in seen] == ['fill', 'fill', 'submit']
     assert result['status'] == 'gate', result
-    assert refusal in result['question']
-    assert authority.upload_ipc == len(raw.uploads) == 0
+    # The current row PDF was uploaded exactly once, then its live receiver
+    # was mutated before Submit. Item 2 must reject ALL five variants.
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
+        forms.check_form(raw.current, {}, True, Path(authority.resume_path).name)
+    assert result['item'] == 2 and result['reason'] == 'defect_pre_submit_item_2'
+    assert 'exact staged PDF or final form readback is incomplete' in result['question']
+    assert authority.upload_ipc == len(raw.uploads) == 1 and authority.uploaded
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
 
@@ -520,6 +551,7 @@ async def test_already_proven_resume_submit_does_not_replay_upload(
 async def test_recovery_proof_reenters_bootstrap_before_another_decision(
         authority, monkeypatch):
     raw = FixtureRaw(authority)
+    _canonical_final_row(authority, raw.current)
     original_upload = forms._ashby_resume_upload
     proven = []
 
@@ -537,11 +569,13 @@ async def test_recovery_proof_reenters_bootstrap_before_another_decision(
     result, _, seen = await _run_recovery(
         authority, monkeypatch, raw=raw, admit_owner=True)
     assert len(proven) == 1 and proven[0]['uploaded'] is True
-    # Changed structural receiver is refused before another model decision,
-    # rather than requesting a legacy model Submit and refusing later.
-    assert [action for action, _, _ in seen] == ['fill', 'fill']
+    # Ordinary preparation is ungated. The model may next request Submit,
+    # but the single fresh final checker refuses the drifted structural root
+    # before a raw click; no legacy mid-step bootstrap gate is reinstated.
+    assert [action for action, _, _ in seen] == ['fill', 'fill', 'submit']
     assert result['status'] == 'gate', result
-    assert 'exact structural submit changed; inspect manually.' in result['question']
+    assert result['item'] == 2 and result['reason'] == 'defect_pre_submit_item_2'
+    assert 'exact staged PDF or final form readback is incomplete' in result['question']
     assert len(raw.uploads) == authority.upload_ipc == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0

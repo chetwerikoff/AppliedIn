@@ -3267,18 +3267,20 @@ class ApplicationIPCController:
         page = await self._page(session)
         target = None
         ambiguous = False
-        if op == 'click' and len(args) == 2 and not kwargs:
+        if op == 'click' and len(args) >= 2 and isinstance(args[1], str):
             matching = [c for c in page.get('controls', [])
                         if c.get('selector') == args[1]]
             committing = [c for c in matching
                           if is_submission(c) or native_submit(c)]
-            if len(matching) == 1 and len(committing) == 1:
-                target = committing[0]
-            elif committing:
-                # Conflicting current Submit receivers cannot select a
-                # committing target. Ordinary non-Submit preparation remains
-                # free of a raw per-action gate, including nested choices.
-                ambiguous = True
+            if committing:
+                # A known Submit selector does not become ordinary preparation
+                # merely because extra CLI arguments or multiple receivers
+                # make the raw command malformed. Nested non-Submit choices
+                # still need no action-level grant or Submit check.
+                if len(args) == 2 and not kwargs and len(matching) == 1:
+                    target = committing[0]
+                else:
+                    ambiguous = True
         elif op == 'press' and len(args) >= 2 and args[1] in {'Enter', 'Return'}:
             if len(args) == 2 and not kwargs:
                 inside_form = any(c.get('in_form')

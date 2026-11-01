@@ -3849,16 +3849,22 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'question': str(exc), 'step': step,
                     'form_question': exc.form_question}
         if isinstance(exc, Gate):
-            context = handoff(str(exc), step,
-                              captcha_artifact=isinstance(exc, CaptchaArtifactGate))
-            return {'status': 'gate', 'reason': exc.reason,
-                    'review_route': 'owner' if exc.reason == 'owner_question'
-                                    else 'hard_refusal' if
-                                    isinstance(exc, CaptchaGate)
-                                    or exc.reason.startswith('defect_')
-                                    else 'luna',
-                    'question': context['text'], 'step': context['step'],
-                    'form_question': exc.form_question}
+            artifact = isinstance(exc, CaptchaArtifactGate)
+            context = handoff(str(exc), step, captcha_artifact=artifact)
+            result = {'status': 'gate', 'reason': exc.reason,
+                      'review_route': 'owner' if exc.reason == 'owner_question'
+                                      else 'hard_refusal' if
+                                      isinstance(exc, CaptchaGate)
+                                      or exc.reason.startswith('defect_')
+                                      else 'luna',
+                      'question': context['text'], 'step': context['step'],
+                      'form_question': exc.form_question}
+            # The unchanged direct caller needs this code-owned marker to
+            # persist a CAPTCHA-artifact owner gate without logging or
+            # surfacing the page's raw provider/query evidence.
+            if artifact:
+                result['captcha_artifact_diagnostic'] = True
+            return result
         if isinstance(exc, asyncio.CancelledError):
             raise
         return {'status': 'unknown', 'detail':

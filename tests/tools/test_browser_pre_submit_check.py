@@ -242,6 +242,67 @@ async def test_successful_commit_classification_cannot_be_replayed(
     assert calls == ['attempt']
 
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', ['Enter', 'Return'])
+async def test_selector_targeted_in_form_enter_uses_the_same_final_check(
+        monkeypatch, tmp_path, key):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    starts = []
+    controller.mark_click_started = lambda: starts.append('raw-commit')
+    await controller.before_ipc(
+        None, ('press', key, '--selector', '#email'), {})
+    assert fixture.held and controller.committed
+    assert starts == ['raw-commit']
+    with pytest.raises(forms.Gate):
+        await controller.before_ipc(
+            None, ('press', key, '--selector', '#email'), {})
+    assert starts == ['raw-commit']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', [
+    ('click', '#not-in-fresh-page'),
+    ('click', '#submit', '--unclassified-argument'),
+    ('press', 'Enter', '--selector', '#not-in-fresh-page'),
+])
+async def test_unclassified_raw_click_or_enter_cannot_bypass_final_boundary(
+        monkeypatch, tmp_path, operation):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.before_ipc(None, operation, {})
+    assert refusal.value.item == 1
+    assert not fixture.held
+    assert not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_duplicate_submit_selector_cannot_skip_raw_check(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].append({**target, 'label': 'Duplicate Submit'})
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.before_ipc(None, ('click', '#submit'), {})
+    assert refusal.value.item == 1
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_nested_accessible_option_click_remains_ungated_preparation(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].append({
+        'selector': '#picker', 'label': 'Location',
+        'type': 'combobox', 'tag': 'input', 'in_form': True,
+        'form_selector': '#app', 'combobox': {
+            'options': [{'selector': '#picker-option',
+                         'label': 'Example', 'submit': False}],
+        },
+    })
+    await controller.before_ipc(None, ('click', '#picker-option'), {})
+    assert not fixture.held and not controller.committed
+
+
 @pytest.mark.asyncio
 async def test_ordinary_accessible_fill_does_not_issue_a_grant_or_final_check(
         monkeypatch, tmp_path):

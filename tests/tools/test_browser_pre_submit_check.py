@@ -313,3 +313,63 @@ async def test_missing_choice_fact_asks_owner_without_inventing_consent(
     assert session.calls == [(('click', '#consent'), {})]
     assert filled == {'#consent': 'Yes'}
     assert not fixture.held
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('selected,accepted', [
+    ('Yes', False), ('No', True), ('', False),
+])
+async def test_checked_yes_no_sanctions_caption_is_final_item_five(
+        monkeypatch, tmp_path, selected, accepted):
+    """Actual checked buttons, not historical grants, decide restricted choice."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    question = 'Are you from a restricted country?'
+    for answer in ('Yes', 'No'):
+        page['controls'].insert(0, {
+            'selector': '#restricted-' + answer.lower(), 'label': answer,
+            'question': question, 'tag': 'button', 'type': 'button',
+            'checked': selected == answer, 'required': True, 'disabled': False,
+            'in_form': True, 'form_selector': '#app', 'form_action': URL,
+            'submit': False,
+        })
+    if accepted:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+    else:
+        with pytest.raises(forms.PreSubmitGate) as error:
+            await controller.check_pre_submit(None, page, target)
+        assert error.value.item == 5
+        assert not fixture.held
+
+
+@pytest.mark.asyncio
+async def test_yes_no_button_preparation_uses_no_widget_grant(
+        monkeypatch, tmp_path):
+    """An ordinary button answer is a direct click, not a permission token."""
+    controller, page, _, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].append({
+        'selector': '#decline', 'label': 'No',
+        'question': 'Synthetic preference', 'type': 'button',
+        'tag': 'button', 'checked': False, 'disabled': False,
+        'in_form': True, 'form_selector': '#app', 'submit': False,
+    })
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {}
+
+    session = Session()
+    filled = {}
+    await forms.execute(
+        session, page, {'action': 'choose', 'selector': '#decline',
+                        'value': 'No'},
+        facts={}, filled=filled, resume_path=controller.resume_path,
+        company='example-co', jd_text='Synthetic role', resume_tex='',
+        github='', pk=PK, job_url=URL)
+    assert session.calls == [(('click', '#decline'), {})]
+    assert filled == {'#decline': 'No'}
+    assert not fixture.held

@@ -137,10 +137,10 @@ async def test_preprivate_js_apply_on_code_owned_ats_host_is_preparation(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("private,explicit_submit", [(True, False), (False, True)])
-async def test_commit_candidate_calls_same_final_guard_before_cli(
+@pytest.mark.parametrize("private,explicit_submit", [(True, False), (False, True), (True, True)])
+async def test_only_classified_submit_calls_final_guard_before_cli(
         monkeypatch, private, explicit_submit):
-    """r06: a private JS continuation or known native Submit cannot bypass hold."""
+    """Private form data never turns ordinary Continue into a per-step gate."""
     target = _control(private=private, label="Submit application" if explicit_submit else "Continue",
                       kind="submit" if explicit_submit else "button",
                       submit=explicit_submit)
@@ -152,15 +152,23 @@ async def test_commit_candidate_calls_same_final_guard_before_cli(
     page = {"url": "https://jobs.ashbyhq.com/example-co/synthetic",
             "controls": controls}
     controller = _controller()
+    checked = []
 
     async def refuse(_session, _page, _target):
-        raise forms.Gate("synthetic final guard refused")
+        checked.append("final")
+        raise forms.PreSubmitGate(1, "synthetic final refusal")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", refuse)
     session, calls = await _setup(monkeypatch, page, controller)
-    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
+    if explicit_submit:
+        with pytest.raises(forms.PreSubmitGate, match="synthetic final refusal"):
+            await session.application_effect("click", "#next")
+        assert calls == [] and checked == ["final"]
+    else:
         await session.application_effect("click", "#next")
-    assert calls == []
+        assert len(calls) == 1 and calls[0][0][:2] == ("click", "#next")
+        assert checked == []
+    assert controller.committed is False
 
 
 @pytest.mark.asyncio
@@ -267,21 +275,17 @@ async def test_postprivate_approved_selection_and_pdf_upload_are_preparation(
         {"selector": "#resume", "type": "file", "tag": "input",
          "label": "Resume", "disabled": False, "files": []},
     ]}
-    accepted_values = []
-    monkeypatch.setattr(controller, "_approved",
-                        lambda _page, _target, value: accepted_values.append(value))
     identity = ("row-bound", controller.expected_digest)
     monkeypatch.setattr(controller, "_row_pdf", lambda: identity)
 
     async def no_early_submit(*_args):
-        pytest.fail("The full final guard must not run for an approved change/upload")
+        pytest.fail("The final Submit check must not run for ordinary select/upload")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", no_early_submit)
+    monkeypatch.setattr(controller, "check_pre_submit", no_early_submit)
     session, calls = await _setup(monkeypatch, page, controller)
     await session.application_effect("select", "#location", "--value", "remote")
     await session.application_effect("upload", "#resume", "--file",
                                      str(pdf), timeout=130)
-    assert accepted_values == ["Remote"]
     assert [c[0][0] for c in calls] == ["select", "upload"]
     assert controller.upload_completed is True
 
@@ -404,8 +408,9 @@ async def test_one_final_guard_rejects_independent_contradictory_job_id(
     monkeypatch.setattr(forms, "hold_possible_submission", forbid_hold)
     final_page = {"url": "https://jobs.ashbyhq.com/example-co/" + bad
                   + "/application", "title": "Synthetic Role"}
-    with pytest.raises(forms.Gate, match="contradictory job ID"):
-        await controller.authorize_final_submit(None, final_page, {})
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, final_page, {})
+    assert error.value.item == 1
 
 
 @pytest.mark.asyncio
@@ -421,7 +426,7 @@ async def test_raw_application_get_commit_bypass_refuses_before_cli(monkeypatch,
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": []}, controller)
-    with pytest.raises(forms.Gate, match="committing GET navigation"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect("navigate", href)
     assert calls == []
 
@@ -482,32 +487,31 @@ def test_final_standard_acknowledgement_checks_display_and_form_receiver(
             forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
 
 
-@pytest.mark.parametrize("approved,actual,valid", [
-    ("Remote", "remote", True),
-    ("On-site", "remote", False),
-    ("Remote", "unexpected", False),
+@pytest.mark.parametrize("stated,valid", [
+    ("remote", True),
+    ("office", True),
+    ("", False),
 ])
-def test_native_select_receives_exact_option_value_and_approved_caption(
-        approved, actual, valid):
-    """ARCH01:58: native select's opaque submitted value maps to approved text."""
+def test_native_select_required_final_readback_is_not_a_writer_grant(stated, valid):
+    """The final page value matters; an old approval receipt is not authority."""
     target = {"selector": "#location", "tag": "select", "type": "select",
               "label": "Work location", "required": True, "disabled": False,
-              "value": actual, "has_value": True,
+              "value": stated, "has_value": bool(stated),
               "options": [{"label": "Remote", "value": "remote"},
                           {"label": "On-site", "value": "office"}]}
     pdf = {"selector": "#pdf", "tag": "input", "type": "file",
            "label": "Resume", "files": ["Test User Resume.pdf"]}
     page = {"url": "https://example.test/application",
             "inventory_verified": True, "controls": [target, pdf]}
-    receipts = [{"selector": "#location", "action": "select",
-                 "approved_value": approved}]
+    stale_receipt = [{"selector": "#location", "action": "select",
+                      "approved_value": "Other"}]
     if valid:
-        forms.check_form(page, {"#location": "remote"}, True,
-                         "Test User Resume.pdf", receipts)
+        forms.check_form(page, {"#location": "incorrect"}, True,
+                         "Test User Resume.pdf", stale_receipt)
     else:
-        with pytest.raises(forms.Gate):
+        with pytest.raises(forms.Gate, match="required application field"):
             forms.check_form(page, {"#location": "remote"}, True,
-                             "Test User Resume.pdf", receipts)
+                             "Test User Resume.pdf", stale_receipt)
 
 
 @pytest.mark.asyncio

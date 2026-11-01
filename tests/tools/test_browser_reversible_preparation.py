@@ -72,7 +72,7 @@ def _page():
 ])
 async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_refuses(
         monkeypatch, tmp_path, legacy_error, missing_evidence):
-    """ARCH 07:34: prepare with approved writes, never use shape as Submit proof."""
+    """Ordinary preparation is ungated; only final form evidence blocks Submit."""
     pdf = tmp_path / "Test User Resume.pdf"
     pdf.write_bytes(b"%PDF-1.4\nsynthetic row-specific content\n")
     page = _page()
@@ -89,19 +89,8 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
 
     row = {"pk": PK, "company": COMPANY, "job_id": JOB, "jd_url": POSTING,
            "ats": "ashby", "title": "Synthetic Role", "status": "submitting",
-           "resume_seed": "synthetic-seed", "human_approved_answers": {
-               "Relocation preference": {"value": "No"}}}
-    approvals = {"Full name": "Test User", "Work location": "Remote",
-                 "Work arrangement": "Hybrid", PRIVACY: "yes",
-                 "Relocation preference": "No"}
+           "resume_seed": "synthetic-seed"}
     monkeypatch.setattr(forms, "_row", lambda *_args, **_kw: row)
-
-    def exact_approval(pk, question, value, **_kw):
-        assert pk == PK
-        if approvals.get(question) != value:
-            raise forms.Gate("The exact synthetic approved answer changed.")
-
-    monkeypatch.setattr(forms, "exact_approval", exact_approval)
     monkeypatch.setattr(forms, "check_dispatch", lambda *_args, **_kw: None)
     monkeypatch.setattr(forms, "_configured_alias", lambda *_args, **_kw: object())
     monkeypatch.setattr(forms, "_alias_current", lambda *_args, **_kw: True)
@@ -187,21 +176,11 @@ async def test_legacy_shape_does_not_stop_ordered_preparation_but_final_guard_re
             ("autosave", "#name"), ("autosave", "#remote"),
             ("autosave", "#native"), ("autosave", "#privacy"),
             ("autosave", "#radio-no"), ("upload-endpoint", "#pdf")]
-        # Controller receipts are normally populated by execute(), not by raw
-        # producer IPC. Supply the synthetic readbacks to reach the *unchanged*
-        # production final verdict rather than manufacturing a second guard.
-        controller.filled.update({
-            "#name": "Test User", "#picker": "Remote", "#native": "hybrid",
-            "#privacy": "on", "#radio-no": "no"})
-        controller.history.extend([
-            {"action": "select", "selector": "#native",
-             "approved_value": "Hybrid"},
-            {"action": "choose", "selector": "#privacy",
-             "approved_value": "yes"}])
-        expected = ("Unsupported custom control" if missing_evidence is None
-                    else "form inventory|uninspectable")
-        with pytest.raises(forms.Gate, match=expected):
+        # The model's filled ledger and historical per-field approvals are not
+        # Submit authority. Only the current final inventory may accept a click.
+        with pytest.raises(forms.PreSubmitGate, match="final form readback") as error:
             await raw.application_effect("click", "#submit")
+        assert error.value.item == 2
         assert not committing
         assert not any(op == "click" and selector == "#submit"
                        for op, selector in effects)
@@ -278,6 +257,7 @@ async def test_native_ashby_preparation_does_not_require_old_owner_certificate(
     controller = forms.ApplicationIPCController(
         PK, COMPANY, POSTING, str(pdf), {}, {}, [], {},
         lambda: submitted.append(True))
-    with pytest.raises(forms.Gate, match="Competing native Submit owners"):
-        await controller.authorize_final_submit(None, page, first)
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, page, first)
+    assert error.value.item == 1
     assert submitted == []

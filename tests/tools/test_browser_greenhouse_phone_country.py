@@ -109,8 +109,8 @@ def test_greenhouse_reader_reports_the_shown_country_only_beside_the_tel_input()
             'selector': '#country', 'display': 'Synthetic Country',
             'single_values': 1, 'expanded': False, 'flags': [], 'option_flags': {}}
         country = _by(reader, '#country')
-        # Never a caption, form value or Submit authority on the control.
-        assert country['combobox']['selected_text'] == ''
+        # F7 reads the local caption but cannot manufacture a machine value.
+        assert country['combobox']['selected_text'] == 'Synthetic Country'
         assert country['combobox']['selected_value'] == ''
         assert not country.get('name') and not country.get('has_value')
     assert _by(selected['page'], '#country')['type'] == 'combobox'
@@ -138,7 +138,7 @@ def test_greenhouse_reader_reports_the_shown_flag_and_dial_code(mutation, flags)
         assert reader['greenhouse']['phone_country'] == {
             'selector': '#country', 'display': '+99', 'single_values': 1,
             'expanded': False, 'flags': flags, 'option_flags': {}}
-        assert _by(reader, '#country')['combobox']['selected_text'] == ''
+        assert _by(reader, '#country')['combobox']['selected_text'] == '+99'
 
 
 # Ordinary input/combobox preparation has no phone-country grant layer.

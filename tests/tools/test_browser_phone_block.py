@@ -124,7 +124,9 @@ def test_exact_phone_inventory_uses_both_production_readers(phase):
     independent = next(c for c in witness['controls'] if c['selector'] == '#country')
     assert owner['combobox'] == independent['combobox']
     for graph in (owner['combobox'], independent['combobox']):
-        assert graph['selected_text'] == graph['selected_value'] == ''
+        # The C2 branch has one local caption, but no submitted machine value.
+        assert graph['selected_text'] == ('Approved country' if phase == 'C2' else '')
+        assert graph['selected_value'] == ''
         assert graph['hidden_selector'] == graph['hidden_value'] == ''
     assert owner['type'] == 'combobox' and not owner['name']
     assert not owner['has_value']

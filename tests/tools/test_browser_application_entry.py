@@ -189,6 +189,14 @@ def no_mutations(session):
     assert all(c[0] in {'navigate', 'evaluate'} for c in session.calls)
 
 
+async def _assert_final_tenant_refusal(guard, session, page, target):
+    """The one raw pre-Submit item-1 decision, not a preparation approval."""
+    with pytest.raises(forms.PreSubmitGate) as stopped:
+        await guard.check_pre_submit(session, page, target)
+    assert stopped.value.item == 1
+    assert stopped.value.reason == 'defect_pre_submit_item_1'
+
+
 def _stop_after_stable_entry(monkeypatch, refusal):
     """Inject an offline result after the real admission and bounded reads.
 
@@ -326,9 +334,9 @@ async def test_invalid_current_authority_gates_before_navigation(monkeypatch, pr
                        for c in session.calls)
         guard = forms.ApplicationIPCController(
             PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(
-                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, {'url': entry('ashby'), 'controls': []},
+            {'label': 'Submit'})
     if tracked_mismatch:
         assert not decision.await_count
     else:
@@ -375,8 +383,8 @@ async def test_ambiguous_posting_spelling_gates(monkeypatch, ats, change):
         assert ('navigate', row['jd_url']) in session.calls
         guard = forms.ApplicationIPCController(
             PK, COMPANY, row['jd_url'], '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(session, application(ats), {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, application(ats), {'label': 'Submit'})
         no_mutations(session)
     else:
         assert session.calls == []
@@ -412,8 +420,7 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     assert decide.await_count == 1
     guard = forms.ApplicationIPCController(
         PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-    with pytest.raises(forms.Gate, match='Final submit receiver'):
-        await guard.authorize_final_submit(session, page, page['controls'][-1])
+    await _assert_final_tenant_refusal(guard, session, page, page['controls'][-1])
     no_mutations(session)
 
 
@@ -573,9 +580,9 @@ async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, 
         # leave an approved field question available, but cannot pass Submit.
         guard = forms.ApplicationIPCController(
             PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(
-                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, {'url': entry('ashby'), 'controls': []},
+            {'label': 'Submit'})
     else:
         assert report.get('form_question') is None
     if drift in {'board', 'ats'}:
@@ -736,7 +743,7 @@ async def test_mapping_drift_during_final_receiver_read_forbids_ipc(monkeypatch,
             # current tenant equality belongs to the ONE final guard only.
             guard = forms.ApplicationIPCController(
                 PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-            await guard.authorize_final_submit(session, page, page['controls'][-1])
+            await guard.check_pre_submit(session, page, page['controls'][-1])
         else:
             await forms.execute(
                 session, page, {'action': verb, 'selector': page['controls'][0]['selector'],
@@ -816,8 +823,8 @@ async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
             assert drifted
             guard = forms.ApplicationIPCController(
                 PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-            with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-                await guard.authorize_final_submit(session, committed, {'label': 'Submit'})
+            await _assert_final_tenant_refusal(
+                guard, session, committed, {'label': 'Submit'})
             assert ('click', '#submit') not in session.calls
 
 
@@ -1327,8 +1334,8 @@ async def test_partial_first_read_cannot_hide_authority_drift(monkeypatch, drift
         assert session.pages > 1
         guard = forms.ApplicationIPCController(
             PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant|different job/ATS tenant'):
-            await guard.authorize_final_submit(session, session.current, {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, session.current, {'label': 'Submit'})
     assert not decide.await_count
     no_mutations(session)
 
@@ -2870,7 +2877,7 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     authorized = []
-    final_guard = forms.ApplicationIPCController.authorize_final_submit
+    final_guard = forms.ApplicationIPCController.check_pre_submit
 
     async def drift_then_final_guard(self, *args, **kwargs):
         # Every earlier check has passed. The tenant witness drifts
@@ -2879,7 +2886,7 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
         monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: False)
         return await final_guard(self, *args, **kwargs)
 
-    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit',
+    monkeypatch.setattr(forms.ApplicationIPCController, 'check_pre_submit',
                         drift_then_final_guard)
 
     async def decisions(*args, **kwargs):

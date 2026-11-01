@@ -2338,34 +2338,6 @@ _ISSUE201_MAIN_SHA256 = {
     "src/discovery/tenant_pin.py": "8bb21e29e8e26d00b7b81b82d92a4f4397044cf96862a85c2cc0d36fff96c407",
 }
 
-_ISSUE201_PROTECTED_FUNCTION_SHA256 = {
-    "is_submission": "c3fd3b93495139b1d45f1588082bc044d1440fa932cca855ec45c0db0f1d590a",
-    "native_submit": "1fd4c3e94009536eda5228945ca26796a6a380ea6a3823561f79879536f7574c",
-    "check_form_destination": "64c47cf1d8891eb3cc2c97a670d8f8c80077dcb1fc722019f56770998aff893f",
-    "_submitter_texts": "df04be15cc339c2dcfef7bdb0878ea98ac43ea61daf02e4301e4bdf1e6dca79b",
-    "_greenhouse_safety": "4bead246accd2c97d6894d60d659993cac9669da9dee717825f22620329f1e38",
-    "ApplicationIPCController.authorize_final_submit": "daa7ef578abb064728e7e101e7df2185b333a2a5edb3779353ff6126188848e5",
-}
-
-
-def _issue201_function_segments(source: str) -> dict[str, list[str]]:
-    """Every function/class source segment by qualified name, duplicates kept."""
-    import ast
-
-    found: dict[str, list[str]] = {}
-
-    def walk(body, prefix):
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = prefix + node.name
-                found.setdefault(name, []).append(ast.get_source_segment(source, node))
-                if isinstance(node, ast.ClassDef):
-                    walk(node.body, name + ".")
-
-    walk(ast.parse(source).body, "")
-    return found
-
-
 def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
     import hashlib
     from pathlib import Path
@@ -2375,12 +2347,19 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
         actual = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         assert actual == baseline, (filename, actual, baseline)
 
+    # Issue #293 retires the old final-check implementation and its
+    # 17-function/parallel hash pins; only check_pre_submit may be authoritative.
+    # Keep the unrelated frozen source-file integrity assertions above.
+    import ast
     source = (root / "src/tools/browser_skill_apply.py").read_text(encoding="utf-8")
-    segments = _issue201_function_segments(source)
-    for name, baseline in _ISSUE201_PROTECTED_FUNCTION_SHA256.items():
-        assert len(segments.get(name, [])) == 1, (name, "must be defined exactly once")
-        actual = hashlib.sha256(segments[name][0].encode("utf-8")).hexdigest()
-        assert actual == baseline, (name, actual, baseline)
+    controllers = [n for n in ast.parse(source).body
+                   if isinstance(n, ast.ClassDef)
+                   and n.name == "ApplicationIPCController"]
+    assert len(controllers) == 1
+    final_methods = [n.name for n in controllers[0].body
+                     if isinstance(n, ast.AsyncFunctionDef)
+                     and n.name in {"check_pre_submit", "authorize_final_submit"}]
+    assert final_methods == ["check_pre_submit"]
 
 
 def test_issue250_exact_canonical_greenhouse_feed_uses_embed_only():

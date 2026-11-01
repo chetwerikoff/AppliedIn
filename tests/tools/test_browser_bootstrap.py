@@ -2637,7 +2637,7 @@ async def test_scoped_facts_reach_runtime_and_decision_keys_on_regional_hosts(
     assert report['status'] == 'gate' and decide.await_count == 1
     prompt, model_page, history = decide.await_args.args
     advertised = "['Contact detail']" if expect else '[]'
-    assert f'Exact human-authorized fact KEYS on this tracked job: {advertised}' in prompt
+    assert f'Available fact keys: {advertised}' in prompt
     assert model_page['controls'][0]['label'] == 'Contact detail'
     assert history == []
     assert not any(secret in str((prompt, model_page, history))

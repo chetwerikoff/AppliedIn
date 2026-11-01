@@ -833,11 +833,11 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
     assert result['status'] == 'gate'
     assert result['reason'] == 'agent_review_unavailable'
     assert 'observed form needs human inspection' in result['question']
-    # Only the first upload request performs the guarded set. Three repeat
-    # requests observe its count without issuing another raw upload.
+    # The guarded set completes before the first model decision. All four
+    # upload requests see its count without issuing another raw upload.
     assert [action for action, _, _ in seen] == [
         'fill', 'fill', 'upload', 'upload', 'upload', 'upload', 'gate']
-    assert [count for action, count, _ in seen if action == 'upload'] == [0, 1, 1, 1]
+    assert [count for action, count, _ in seen if action == 'upload'] == [1, 1, 1, 1]
     assert authority.decisions == len(seen) == 7
     assert authority.fills == 2 and authority.upload_ipc == 1
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]

@@ -3937,7 +3937,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'form_question': exc.form_question}
         if isinstance(exc, Gate):
             artifact = isinstance(exc, CaptchaArtifactGate)
-            context = handoff(str(exc), step, captcha_artifact=artifact)
+            context = (_control_gate_handoff(exc, step)
+                       if isinstance(exc, ControlGate)
+                       else handoff(str(exc), step, captcha_artifact=artifact))
             result = {'status': 'gate', 'reason': exc.reason,
                       'review_route': 'owner' if exc.reason == 'owner_question'
                                       else 'hard_refusal' if

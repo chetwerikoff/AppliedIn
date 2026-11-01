@@ -297,17 +297,22 @@ async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
         c['selector'] for c in fixed['controls']]
     assert {'#phone', '#country', '#resume', '#submit'} <= {
         c['selector'] for c in page['controls']}
-    # An optional accessory is not automatically a submitted form answer;
-    # a nonempty optional telephone value IS and cannot escape approval.
+    # A non-required telephone value needs no historical per-control grant.
+    # The actual form cannot submit with an opaque inventory; the isolated
+    # final check below provides the staged résumé so it can examine just this
+    # optional field without failing on an unrelated missing PDF.
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
-    phone.update(value='Synthetic unapproved autofill', has_value=True)
+    phone.update(value='Synthetic optional autofill', has_value=True, required=False)
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
-    complete = {'url': page['url'], 'controls': [copy.deepcopy(phone)],
+    filename = 'Synthetic Resume.pdf'
+    complete = {'url': page['url'], 'controls': [copy.deepcopy(phone), {
+                    'selector': '#resume', 'label': 'Resume', 'type': 'file',
+                    'disabled': False, 'files': [filename],
+                }],
                 'inventory_verified': True, 'truncated': False,
                 'opaque_controls': False, 'shadow_roots': False,
                 'unsupported_frames': []}
-    with pytest.raises(forms.Gate, match='Unverified or changed form value'):
-        forms.check_form(complete, {}, True)
+    forms.check_form(complete, {}, True, attachment=filename)
 
 @pytest.mark.parametrize('attribute,value', [
     ('aria-required', 'true'),

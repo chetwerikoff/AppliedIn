@@ -2319,68 +2319,33 @@ async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(mo
     assert forms._formless_boundary(plain.current, provenance)
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize('render', [
     {},
     {'additionalCaption': 'Synthetic re-rendered caption'},
     {'additionalCaption': 'Synthetic re-rendered caption', 'additionalRequired': True},
 ], ids=['same-caption', 'changed-caption', 'changed-caption-now-required'])
-async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_rooted(
-        monkeypatch, tmp_path, render):
-    """Issue #202 AC2 (ARCH21:26): a SKIP taken while requiredness was unknown
-    is not an OPTIONAL answer. Once the root is proven every rootless SKIP is
-    void, so the still-blank field is asked again as a normal owner question,
-    before the final Submit decision and with no write to that field. This
-    holds when a conditional render changed its caption, and when it also made
-    the field required."""
-    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 2)
+async def test_prior_rootless_skip_does_not_authorize_missing_owner_fact(
+        monkeypatch, render):
+    """A stale SKIP cannot turn an unanswered ordinary form field into assent."""
     row, raw, decide, _ = root_world(monkeypatch, **render)
-    extra = next(c for c in raw.current['controls'] if c['selector'] == '#additional')
+    extra = next(c for c in raw.current['controls']
+                 if c['selector'] == '#additional')
     assert extra['required'] is render.get('additionalRequired', False)
     assert not extra.get('has_value')
-    row['owner_gate_skips'] = {'q1_synthetic': {
-        'identity': 'q1_synthetic', 'route': 'ashby-sibling-mismatch', 'kind': 'textarea',
-        'label': 'Additional information', 'generation': 'synthetic-generation'}}
-    # Name/Email carry exact owner grants, so only the skipped field is left.
-    row['human_approved_answers'] = {}
-    for c in raw.current['controls']:
-        value = {'text': 'Synthetic Name', 'email': 'synthetic@example.com'}.get(c['type'])
-        if value:
-            t = forms._bound_target(raw.current, c)
-            row['human_approved_answers'][forms._key(raw.current, c)] = {
-                'value': value, 'url': raw.current['url'],
-                **{k: t.get(k, '' if k == 'question' else None) for k in (
-                    'selector', 'label', 'question', 'tag', 'type',
-                    'form_selector', 'form_action')}}
-    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-    file = next(c for c in raw.current['controls']
-                if c['type'] == 'file' and c['label'] == 'Resume')
-    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
-    original_call = raw.call
-
-    async def call(method, *args, **kwargs):
-        if method == 'upload':
-            raw.calls.append((method, *args))
-            name = Path(args[2]).name
-            raw.current, raw.fixed = observed(attached=True, files=[name], displayName=name,
-                                              **render)
-            return {}
-        return await original_call(method, *args, **kwargs)
-    raw.call = call
-    decide.side_effect = [dict(action='upload', selector=file['selector']),
-                          dict(action='submit', selector=button['selector'])]
-    facts = {'Name': 'Synthetic Name', 'Email': 'synthetic@example.com'}
-    result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
-                               pk=PK, resume_path=pdf)
-    assert result['status'] == 'gate', result
-    # Issue #262 makes a required unanswered fact an exact owner-answer gate.
-    assert result['reason'] == 'owner_question'
-    assert result['form_question']['selector'] == extra['selector']
-    assert result['form_question'].get('route') != 'ashby-sibling-mismatch'  # no SKIP offered
-    assert decide.await_count <= 1  # asked before the Submit decision
-    assert not [c for c in raw.calls if extra['selector'] in c[1:2]]
-    assert not [c for c in raw.calls if c[0] == 'click']
-    assert not transport._application_controller.committed
+    row['owner_gate_skips'] = {'synthetic-old-skip': {
+        'route': 'ashby-sibling-mismatch', 'generation': 'retired'}}
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            raw, raw.current,
+            {'action': 'fill', 'selector': extra['selector'],
+             'fact': 'Additional information'},
+            facts={}, filled={}, resume_path='', company=COMPANY,
+            jd_text='', resume_tex='', github='', pk=PK,
+            job_url=posting('ashby'))
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == extra['selector']
+    assert not decide.await_count
+    no_mutations(raw)
 
 
 @pytest.mark.parametrize('spec_change', [

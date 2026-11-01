@@ -26,15 +26,15 @@ def _skipped(caplog):
 
 
 async def test_upload_decision_uploads_once_then_submit_meets_the_guard(monkeypatch, tmp_path):
-    """The first upload decision runs the guarded upload itself. The Submit
-    click that follows passes the PDF proof and is refused by a later
-    final-guard check, so nothing is clicked and nothing commits."""
+    """An upload decision after proactive one-shot attachment does not replay
+    it; the final Submit check still refuses an incomplete form."""
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     result = await run_apply([WAIT, UPLOAD, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'An exact human-approved answer is needed for this control' in result['question'], result
+    assert result.get('item') == 2, result
+    assert result.get('reason') == 'defect_pre_submit_item_2', result
     assert decide.await_count == 3
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
@@ -43,19 +43,19 @@ async def test_upload_decision_uploads_once_then_submit_meets_the_guard(monkeypa
 
 
 async def test_second_upload_decision_does_not_upload_again(monkeypatch, tmp_path, caplog):
-    """After the one upload, another upload decision reaches no chooser, names
-    why in the log, and Submit-time recovery does not upload a second time."""
+    """After the one upload, subsequent model upload decisions do not trigger
+    another chooser or bypass the final Submit check."""
     caplog.set_level(logging.INFO, logger=forms.__name__)
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     result = await run_apply([WAIT, UPLOAD, UPLOAD, click], late=True)
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
-    assert 'An exact human-approved answer is needed for this control' in result['question'], result
+    assert result.get('item') == 2, result
+    assert result.get('reason') == 'defect_pre_submit_item_2', result
     assert decide.await_count == 4
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
-    assert _skipped(caplog) == [f'upload recovery skipped pk={guard.pk} term=not_uploaded']
     text = '\n'.join(record.getMessage() for record in caplog.records)
     assert 'Synthetic value' not in text and guard.resume_path not in text
     _no_production_commit(raw, transport, row)

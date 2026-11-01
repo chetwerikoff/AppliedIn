@@ -1500,14 +1500,16 @@ def form_gate_world(monkeypatch, tmp_path):
 @pytest.mark.parametrize('field,value', [('Email', 'test@example.test'),
     ('Name', 'Test User'), ('Phone', '555-0100')])
 @pytest.mark.parametrize('banked', [False, True])
-async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_write(
+async def test_direct_observed_single_word_question_uses_existing_owner_fact(
         monkeypatch, form_gate_world, field, value, banked):
+    """Missing facts ask the owner; available ones fill without field grants."""
     from core.models import AnswerScope
     run, stores, pk = form_gate_world
     if banked:
         stores.answer_bank.put(field, value, AnswerScope.GLOBAL, source='writer')
     current = page(target(label=field), application_marker=True)
     writes = AsyncMock()
+
     class Session:
         def __init__(self, kind):
             pass
@@ -1520,37 +1522,37 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
         async def page(self):
             return current
         call = writes
+
     monkeypatch.setattr(bsk, 'Session', Session)
     action = {'action': 'fill', 'selector': '#field', 'fact': field}
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        action, action, {'action': 'gate', 'question': 'Stop after the verified write'}]))
+    stop = {'action': 'gate', 'question': 'Stop after the supplied-fact fill'}
+    monkeypatch.setattr(bsk, 'decision',
+                        AsyncMock(side_effect=[action, action, stop]))
     first = await run._apply_direct(pk, stores)
     assert first['result'] == 'gated'
-    writes.assert_not_awaited()
-    pending = stores.tracking.get(pk)
-    question = pending['gate_pending']['form_question']
-    # ARCH21:26 / binding 7: ordinary missing facts go agent-first. A raw
-    # owner reply to an unsupported review route cannot mint a control grant.
-    assert pending['gate_pending']['review_route'] == 'agent_unavailable'
-    assert pending.get('gate_call_id') is None
-    run.resume_job(pk, value, stores)
+    if not banked:
+        writes.assert_not_awaited()
+        pending = stores.tracking.get(pk)
+        question = pending['gate_pending']['form_question']
+        assert question['selector'] == '#field'
+        assert pending['gate_pending']['review_route'] == 'owner'
+        assert pending['gate_call_id'] == 'direct'
+        # The existing Luna/owner correction path consumes the exact current
+        # question and banks a fact, not a per-control approval.
+        from tools.browser_skill_apply import owner_question_identity
+        replied = run.resume_job(
+            pk, value, stores, disposition='answer',
+            expected_gate_generation=pending['gate_pending']['generation'],
+            expected_question_identity=owner_question_identity(pk, question))
+        assert replied['result'] == 'queued'
+        assert stores.answer_bank.all_facts('example-co')[field] == value
+        monkeypatch.setattr(bsk, 'decision',
+                            AsyncMock(side_effect=[action, action, stop]))
+        second = await run._apply_direct(pk, stores)
+        assert second['result'] == 'gated'
+    assert [entry.args for entry in writes.await_args_list] == [
+        ('fill', '#field', '--value', value)] * 2
     assert not stores.tracking.get(pk).get('human_approved_answers')
-    writes.assert_not_awaited()
-    # Offline post-triage owner-answer transition, explicitly allowed by
-    # binding 7. This supplies no reviewer override or live transport claim;
-    # the unchanged owner consumer still binds the exact observed control.
-    from core.models import Status
-    stores.tracking.set_status(
-        pk, Status.NEEDS_HUMAN, gate_source='applier', gate_call_id='direct',
-        gate_pending=run._direct_gate_pending(
-            'Synthetic post-triage owner answer', question, 'owner'))
-    run.resume_job(pk, value, stores, disposition='answer',
-                   expected_gate_generation=stores.tracking.get(pk)['gate_pending']['generation'],
-                   expected_question_identity=forms.owner_question_identity(pk, question))
-    assert stores.tracking.get(pk)['human_approved_answers'] == {
-        field: grant(field, value)}
-    await run._apply_direct(pk, stores)
-    writes.assert_awaited_once_with('fill', '#field', '--value', value)
 
 
 @pytest.mark.parametrize('source,call_id', [('tailor', 'adk'), ('critic', 'adk'),

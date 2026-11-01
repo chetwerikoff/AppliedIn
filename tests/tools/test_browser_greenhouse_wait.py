@@ -107,13 +107,17 @@ async def test_each_read_retries_safe_nonqualifying_observation(fast, at, flag, 
     # The absent ordinary answer does not create a historic per-step human
     # gate. Preparation may continue; the final guard must reject the current
     # required form value rather than infer an approval from PAGE text.
-    prepared = await forms._bootstrap(
-        scoped, result, ALIAS.pk, {}, provenance=ALIAS)
+    prepared = deepcopy(result)  # _bootstrap was a removed per-action grant stage.
     assert prepared['controls'][0]['label'] == 'Additional question'
     assert prepared['controls'][0]['value'] == ''
     assert not prepared['controls'][0]['has_value']
-    with pytest.raises(forms.Gate, match='Required field is empty: Additional question'):
-        forms.check_form(prepared, {}, uploaded=True)
+    # Supply only a synthetic readback of the separate row-PDF receiver to
+    # reach the surviving final required-field check. No upload IPC occurs.
+    prepared['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=URL))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(prepared, {}, uploaded=True, attachment='Resume.pdf')
     assert all(kind in {'page', 'witness'} for kind in raw.reads)
 
 

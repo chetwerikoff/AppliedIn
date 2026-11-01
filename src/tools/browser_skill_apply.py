@@ -3217,20 +3217,55 @@ class ApplicationIPCController:
             return
         page = await self._page(session)
         target = None
-        if op == 'click' and len(args) == 2 and not kwargs:
-            matching = [c for c in page.get('controls', [])
-                        if c.get('selector') == args[1]]
-            if len(matching) == 1 and (is_submission(matching[0])
-                                       or native_submit(matching[0])):
-                target = matching[0]
-        elif op == 'press' and len(args) == 2 and not kwargs:
-            if args[1] in {'Enter', 'Return'} and any(
-                    c.get('in_form') for c in page.get('controls', [])):
-                submits = [c for c in page['controls'] if c.get('in_form')
+        ambiguous = False
+        if op == 'click':
+            if len(args) != 2 or kwargs or not isinstance(args[1], str):
+                ambiguous = True
+            else:
+                matching = [c for c in page.get('controls', [])
+                            if c.get('selector') == args[1]]
+                if len(matching) == 1:
+                    if is_submission(matching[0]) or native_submit(matching[0]):
+                        target = matching[0]
+                elif not matching:
+                    # Accessible combobox options are nested under their
+                    # picker, not represented as top-level controls. Their
+                    # clicks remain ordinary preparation, but an unclassified
+                    # selector must not become an unguarded raw Submit.
+                    options = [
+                        option for c in page.get('controls', [])
+                        for option in ((c.get('combobox') or {}).get('options') or [])
+                        if isinstance(option, dict)
+                        and option.get('selector') == args[1]
+                    ]
+                    ambiguous = (len(options) != 1
+                                 or is_submission(options[0])
+                                 or native_submit(options[0]))
+                else:
+                    ambiguous = True
+        elif op == 'press' and len(args) >= 2 and args[1] in {'Enter', 'Return'}:
+            if len(args) == 2 and not kwargs:
+                inside_form = any(c.get('in_form')
+                                  for c in page.get('controls', []))
+            elif (len(args) == 4 and args[2] == '--selector'
+                  and isinstance(args[3], str) and not kwargs):
+                pressed = [c for c in page.get('controls', [])
+                           if c.get('selector') == args[3]]
+                ambiguous = len(pressed) != 1
+                inside_form = len(pressed) == 1 and bool(pressed[0].get('in_form'))
+            else:
+                inside_form = False
+                ambiguous = True
+            if inside_form:
+                submits = [c for c in page.get('controls', [])
+                           if c.get('in_form')
                            and (is_submission(c) or native_submit(c))]
                 if len(submits) != 1:
-                    raise PreSubmitGate(1, 'The form has no unique implicit Submit receiver.')
-                target = submits[0]
+                    ambiguous = True
+                else:
+                    target = submits[0]
+        if ambiguous:
+            raise PreSubmitGate(1, 'Raw application click or implicit Submit receiver is ambiguous.')
         if target is None:
             return
         await self.check_pre_submit(session, page, target)

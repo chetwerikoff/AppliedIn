@@ -2499,12 +2499,19 @@ async def _ashby_resume_upload(session, page: dict, *, resume_path: str,
     session.upload_attempted = True
     result = await _effect_call(session.raw, 'evaluate', script)
     value = result.get('value') if isinstance(result, dict) else None
-    readback = await session.page()
+    try:
+        readback = await session.page()
+    except Gate:
+        # The file set already crossed the effect edge. A failed independent
+        # read is not a retryable pre-effect refusal: the attachment may exist.
+        raise RuntimeError('The staged PDF readback is unconfirmed after upload.') from None
     current = [c for c in readback.get('controls', [])
                if c.get('selector') == _ASHBY_RESUME_SELECTOR and c.get('type') == 'file']
     if (not isinstance(value, dict) or value.get('files') != [filename]
             or len(current) != 1 or current[0].get('files') != [filename]):
-        raise Gate('The uploaded résumé was not proven in the current file input.')
+        # Raw file bytes are not available from the ATS. Without this current
+        # receiver proof the upload may have landed, so never retry it.
+        raise RuntimeError('The staged PDF readback is unconfirmed after upload.')
     return {'action': 'upload', 'label': receivers[0].get('label') or 'Resume',
             'uploaded': True}
 
@@ -3319,7 +3326,9 @@ class ApplicationIPCController:
             # and digest after CLI consumption, even on an interrupted command.
             if self.upload_identity != self._row_pdf():
                 self.upload_completed = False
-                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.')
+                # Browser IPC has already been attempted; even a source-digest
+                # mismatch cannot prove the remote upload did not commit.
+                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')
             # A failed or cancelled transport cannot prove a file attachment,
             # regardless of unchanged local bytes and prior upload history.
             self.upload_completed = succeeded
@@ -3328,7 +3337,8 @@ class ApplicationIPCController:
             identity, self._resume_set_identity = self._resume_set_identity, None
             if identity != self._row_pdf():
                 self.upload_completed = False
-                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.')
+                # Never retry a file set whose effect may already have occurred.
+                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')
             if not succeeded:
                 return
             # The producer's own fresh read, not the set script's reply, is

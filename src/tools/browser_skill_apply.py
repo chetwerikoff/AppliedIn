@@ -2501,17 +2501,20 @@ async def _ashby_resume_upload(session, page: dict, *, resume_path: str,
     value = result.get('value') if isinstance(result, dict) else None
     try:
         readback = await session.page()
-    except Gate:
-        # The file set already crossed the effect edge. A failed independent
-        # read is not a retryable pre-effect refusal: the attachment may exist.
-        raise RuntimeError('The staged PDF readback is unconfirmed after upload.') from None
+    except Gate as exc:
+        # An independently refused read after file-set cannot establish that
+        # the upload never landed. Retain the original Gate for direct callers,
+        # but classify it as uncertain at the apply boundary.
+        exc.reason = 'defect_upload_uncertain'
+        raise
     current = [c for c in readback.get('controls', [])
                if c.get('selector') == _ASHBY_RESUME_SELECTOR and c.get('type') == 'file']
     if (not isinstance(value, dict) or value.get('files') != [filename]
             or len(current) != 1 or current[0].get('files') != [filename]):
-        # Raw file bytes are not available from the ATS. Without this current
-        # receiver proof the upload may have landed, so never retry it.
-        raise RuntimeError('The staged PDF readback is unconfirmed after upload.')
+        # The set may have landed even when the current receiver cannot
+        # prove it. The apply boundary persists terminal uncertain.
+        raise Gate('The uploaded résumé was not proven in the current file input.',
+                   reason='defect_upload_uncertain')
     return {'action': 'upload', 'label': receivers[0].get('label') or 'Resume',
             'uploaded': True}
 
@@ -3326,14 +3329,16 @@ class ApplicationIPCController:
             # and digest after CLI consumption, even on an interrupted command.
             try:
                 current_identity = self._row_pdf()
-            except Gate:
-                # Local PDF proof can fail after the browser has consumed an
-                # upload command; a failed hash check does not undo its effect.
+            except Gate as exc:
+                # Retain the specific local proof failure for direct callers;
+                # the raw command has crossed its effect edge.
                 self.upload_completed = False
-                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.') from None
+                exc.reason = 'defect_upload_uncertain'
+                raise
             if self.upload_identity != current_identity:
                 self.upload_completed = False
-                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')
+                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.',
+                           reason='defect_upload_uncertain')
             # A failed or cancelled transport cannot prove a file attachment,
             # regardless of unchanged local bytes and prior upload history.
             self.upload_completed = succeeded
@@ -3342,13 +3347,15 @@ class ApplicationIPCController:
             identity, self._resume_set_identity = self._resume_set_identity, None
             try:
                 current_identity = self._row_pdf()
-            except Gate:
+            except Gate as exc:
                 self.upload_completed = False
-                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.') from None
+                exc.reason = 'defect_upload_uncertain'
+                raise
             if identity != current_identity:
                 self.upload_completed = False
                 # Never retry a file set whose effect may already have occurred.
-                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')
+                raise Gate('The staged PDF changed during upload IPC; inspect the attachment.',
+                           reason='defect_upload_uncertain')
             if not succeeded:
                 return
             # The producer's own fresh read, not the set script's reply, is
@@ -3902,21 +3909,17 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                             # Only the single existing final check may
                             # authorize the current classified receiver.
                             current_page = await session.page()
-                            current_targets = [c for c in current_page.get('controls', [])
-                                               if c.get('selector') == target['selector']
-                                               and (is_submission(c) or native_submit(c))]
-                            if len(current_targets) != 1:
-                                raise PreSubmitGate(
-                                    1, 'Current Submit receiver is unavailable or ambiguous.')
+                            current_target = control(
+                                current_page, action, 'decision-action')
                             offline_guard = ApplicationIPCController(
                                 pk, company, url, resume_path, facts, filled, history,
                                 step, mark_click_started, fixture_context=ctx)
                             offline_guard.upload_completed = uploaded
                             offline_guard.upload_identity = offline_guard._row_pdf()
                             await offline_guard.check_pre_submit(
-                                session, current_page, current_targets[0])
+                                session, current_page, current_target)
                             mark_click_started()
-                            await session.call('click', current_targets[0]['selector'])
+                            await session.call('click', current_target['selector'])
                         else:
                             if (producer_guard is None or
                                     getattr(raw_session, '_application_controller', None)
@@ -3990,7 +3993,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             or (transport_guard is not None and transport_guard.upload_attempted
                 and not transport_guard.upload_completed)
             or (not uploaded and bool(getattr(session, 'upload_attempted', False))))
-        if unsettled_upload and not isinstance(exc, Gate):
+        if unsettled_upload and (
+                not isinstance(exc, Gate)
+                or exc.reason == 'defect_upload_uncertain'):
             # The raw file-set/upload call started, but its outcome is unknown.
             # A lost reply (including cancellation) cannot permit replay of
             # this attachment. No raw page text, path or exception message is

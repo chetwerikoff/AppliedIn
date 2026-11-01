@@ -1558,7 +1558,7 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
 
 @pytest.mark.parametrize('source,call_id', [('tailor', 'adk'), ('critic', 'adk'),
     ('applier', 'direct')])
-async def test_unrelated_or_model_quoted_gate_never_creates_form_disclosure_grant(
+async def test_unrelated_question_banked_fact_is_ordinary_ungated_preparation(
         monkeypatch, form_gate_world, source, call_id):
     from core.models import Status
     run, stores, pk = form_gate_world
@@ -1569,12 +1569,13 @@ async def test_unrelated_or_model_quoted_gate_never_creates_form_disclosure_gran
     assert stores.answer_bank.all_facts('example-co')[field] == value
     stores.tracking.set_status(pk, Status.SUBMITTING)
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page(target(label=field)),
-            {'action': 'fill', 'selector': '#field', 'fact': field},
-            facts=stores.answer_bank.all_facts('example-co'), filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk=pk)
-    session.call.assert_not_awaited()
+    receipt = await forms.execute(session, page(target(label=field)),
+        {'action': 'fill', 'selector': '#field', 'fact': field},
+        facts=stores.answer_bank.all_facts('example-co'), filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='', pk=pk)
+    assert receipt['action'] == 'fill'
+    session.call.assert_awaited_once_with('fill', '#field', '--value', value)
+    # A bank fact does not recreate any retired per-field grant.
     assert not stores.tracking.get(pk).get('human_approved_answers')
 
 
@@ -3014,12 +3015,12 @@ def test_missing_independent_visible_control_witness_is_defect_not_owner_answer(
     assert question['control_label'] == 'Location'
 
 
-@pytest.mark.parametrize('error,cause', [
-    ('ambiguous application roots', 'defect_ashby_root_identity'),
-    ('application root sibling identity mismatch', 'defect_ashby_root_identity'),
-    ('unsupported synthetic root evidence', 'defect_structural'),
+@pytest.mark.parametrize('error', [
+    'ambiguous application roots',
+    'application root sibling identity mismatch',
+    'unsupported synthetic root evidence',
 ])
-def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
+def test_ashby_root_reader_errors_still_refuse_final_container(error):
     job_id = '12345678-1234-1234-1234-123456789012'
     pk = 'example-co#' + job_id
     posting = 'https://jobs.ashbyhq.com/example-co/' + job_id
@@ -3028,9 +3029,10 @@ def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
         wrapper=posting, board='example-co', url=posting+'/application')
     observed = {'url': provenance.url,
                 'entry': {'formless': {'root': '#application', 'error': error}}}
-    with pytest.raises(forms.Gate) as gated:
+    # Exact pre-step defect taxonomy belonged to removed widget gates;
+    # malformed final form identity must still refuse the committing boundary.
+    with pytest.raises(forms.Gate, match='final Ashby application container is unavailable'):
         forms._formless_boundary(observed, provenance)
-    assert gated.value.reason == cause
 
 
 def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, tmp_path):
@@ -3132,7 +3134,7 @@ async def test_greenhouse_missing_or_stale_board_prepares_but_cannot_submit(
     assert not guard.committed
 
 
-async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
+async def test_missing_fact_uses_owner_question_without_prewrite_provenance_gate():
     target_url = 'https://jobs.ashbyhq.com/example-co/12345678-1234-1234-1234-123456789012/application'
     provenance = forms.ApplicationEntryProvenance(
         pk='example-co#synthetic', company='example-co', ats='ashby', job_id='synthetic',
@@ -3144,7 +3146,10 @@ async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
                             facts={}, filled={}, resume_path='', company='example-co',
                             jd_text='', resume_tex='', github='', pk='example-co#wrong',
                             job_url=target_url, provenance=provenance)
-    assert gated.value.reason == 'defect_provenance'
+    # Per-write provenance refusal was removed; a missing value is still
+    # an ordinary unanswered owner question, not authorization to write.
+    assert gated.value.reason == 'owner_question'
+    assert gated.value.form_question is not None
     session.call.assert_not_awaited()
 
 

@@ -135,7 +135,10 @@ def _world(monkeypatch, tmp_path, *, drift=None, ats=''):
 @pytest.mark.parametrize('drift', [None, 'approval', 'job', 'url', 'ats', 'lease', 'posting',
                                  'answer', 'attachment', 'receiver'])
 async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, tmp_path, drift):
-    """A valid own hold permits one IPC; hold-time authority changes permit none."""
+    """After the own hold, real job/tenant/lease/page changes prevent IPC.
+
+    A stale per-control human approval is inert in the final-only design.
+    """
     def change(row, page, redis, configs):
         if drift == 'approval':
             row['human_approved_answers']['Email']['value'] = 'other@example.test'
@@ -159,9 +162,10 @@ async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, 
 
     row, page, tracking, raw, effects, pdf = _world(
         monkeypatch, tmp_path, drift=change if drift else None)
+    # apply() itself stages and uploads the unique current PDF before asking
+    # the model; it must never request a second upload for the same attempt.
     actions = iter([
         {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'upload', 'selector': '#resume'},
         {'action': 'submit', 'selector': '#submit'},
     ])
 
@@ -175,9 +179,10 @@ async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, 
     monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
-    assert result['status'] == ('gate' if drift else 'applied'), result
-    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')] + (
-        [] if drift else [('click', '#submit')])
+    real_drift = drift not in {None, 'approval'}
+    assert result['status'] == ('gate' if real_drift else 'applied'), result
+    assert effects == [('navigate', URL), ('upload', '#resume'), ('fill', '#email')] + (
+        [] if real_drift else [('click', '#submit')])
     assert submit_hold.is_held(PK, tracking=tracking)
     assert row['status'] == 'needs_human'
     # Session teardown owns only the per-attempt snapshot, never the row PDF.
@@ -267,7 +272,7 @@ async def test_raw_final_guard_rechecks_tenant_after_own_hold(monkeypatch, tmp_p
         await raw.application_effect('upload', '#resume', '--file',
                                      controller.resume_path, timeout=130)
         if drift:
-            with pytest.raises(forms.Gate, match='tenant or board changed after the hold'):
+            with pytest.raises(forms.Gate, match='ATS tenant changed after the own submission hold'):
                 await raw.application_effect('click', '#submit')
         else:
             await raw.application_effect('click', '#submit')
@@ -289,8 +294,9 @@ async def test_final_receiver_change_never_creates_hold_or_click(monkeypatch, tm
         PK, COMPANY, URL, pdf, {}, {}, [], {}, lambda: None)
     raw.id = 'synthetic-session'
     raw.bind_application_controller(controller)
-    with pytest.raises(forms.Gate, match='Final submit receiver'):
+    with pytest.raises(forms.PreSubmitGate) as error:
         await raw.application_effect('click', '#submit')
+    assert error.value.item == 1
     assert effects == []
     assert not submit_hold.is_held(PK, tracking=tracking)
 

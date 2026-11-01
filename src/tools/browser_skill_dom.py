@@ -296,9 +296,13 @@ PAGE = r"""(() => {
         const valueBox=e.closest('div.select__value-container');
         const inputBox=e.closest('div.select__input-container');
         const selectRoot=valueBox?.closest('div.select__container');
-        const localSelected=!!valueBox && (
-          valueBox.matches('div.select__value-container--has-value') ||
-          !!valueBox.querySelector('div.select__single-value'));
+        // The final protection concerns self-identification. Ordinary
+        // closed country/location graphs retain their independent C2 and
+        // error-IDREF witnesses; a nearby display cannot upgrade them.
+        const localSelected=!!valueBox &&
+          /disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|sexual orientation|transgender|religion/i.test(label(e)) &&
+          (valueBox.matches('div.select__value-container--has-value') ||
+           !!valueBox.querySelector('div.select__single-value'));
         const localSingle=localSelected ? Array.from(
           valueBox.querySelectorAll('div.select__single-value')) : [];
         const localOwned=!!inputBox && inputBox.parentElement===valueBox &&

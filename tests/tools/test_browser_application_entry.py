@@ -1501,7 +1501,12 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # retired. None of these contradictory observed roots can be treated as
         # an approved final application or trigger a writing IPC.
         assert result['form_question'] is None
-        assert 'observed form needs human inspection' in result['question'].lower()
+        # A definite foreign posting must identify the wrong route; no
+        # preparation mutation or Submit may follow that observation.
+        if case == 'contrary-job':
+            assert 'page/action posting id drift' in result['question'].lower()
+        else:
+            assert 'observed form needs human inspection' in result['question'].lower()
         # A definite foreign posting ID refuses before the model or any effectful IPC.
         assert decide.await_count == (0 if case == 'contrary-job' else 1)
     no_mutations(raw)
@@ -1861,7 +1866,8 @@ async def test_tracked_ats_literal_route_gate_identifies_predicate_without_secre
                                resume_path='Resume.pdf')
     assert report['status'] == 'gate'
     assert report['reason'] == 'defect_provenance'
-    assert report['navigation_provenance_diagnostic'] is True
+    # Keep the security-bearing predicate and sanitized route evidence, not
+    # the removed intermediate diagnostic flag.
     assert 'The tracked ATS posting is not a literal canonical job route.' in report['question']
     assert 'Failed predicate: ' + failed in report['question']
     assert 'Tracked host/path: ' + forms._APPLICATION_ENTRY[ats][0] in report['question']
@@ -2256,9 +2262,13 @@ async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
     state = raised.value.wait_predicates
     assert state['read.page_available'] == 'true'
     assert state[stage] == 'false'
-    for other in forms._SAFETY_STAGES:
+    # Earlier predicates were actually evaluated and passed; only later
+    # stages are unknown. Do not erase observed safety evidence.
+    failed_index = forms._SAFETY_STAGES.index(stage)
+    for index, other in enumerate(forms._SAFETY_STAGES):
         if other != stage:
-            assert state[other] == 'unknown/unavailable', other
+            assert state[other] == ('true' if index < failed_index
+                                    else 'unknown/unavailable'), other
     text = str(raised.value)
     assert _wait_map(text) == state
     logged = [r.getMessage() for r in caplog.records if 'application wait exit' in r.getMessage()]

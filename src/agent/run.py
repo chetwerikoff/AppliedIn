@@ -1767,8 +1767,12 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         # Keep full details in the owner row/reply only, never INFO/queued/event.
         material_assent = (configuration()['engine'] == 'browser_skill'
                            and result.get('material_assent_diagnostic') is True)
+        # BrowserSkill now reports the code-owned provenance refusal by
+        # reason instead of exporting a separate legacy diagnostic flag.
+        # An owner-only URL/path must never reach INFO or public event data.
         navigation_detail = (configuration()['engine'] == 'browser_skill'
-                             and result.get('navigation_provenance_diagnostic') is True)
+                             and (result.get('reason') == 'defect_provenance'
+                                  or result.get('navigation_provenance_diagnostic') is True))
         captcha_artifact = (configuration()['engine'] == 'browser_skill'
                             and result.get('captcha_artifact_diagnostic') is True)
         routine_detail = ("navigation-provenance: human inspection required"

@@ -2018,6 +2018,22 @@ class _EntrySession:
             return result
         result = await self.raw.call(*args, **kwargs)
         page = result.get('value') if isinstance(result, dict) else None
+        if (args in {('evaluate', ENTRY_PAGE),
+                     ('evaluate', _ENTRY_FIXED_CONTROL_WITNESS)}
+                and isinstance(self.provenance, ApplicationEntryProvenance)
+                and self.provenance.ats == 'ashby' and isinstance(page, dict)
+                and isinstance(page.get('entry'), dict)
+                and page['entry'].get('formless') is None
+                and isinstance(page.get('controls'), list)):
+            # Project each independent raw reader through the SAME native
+            # owner census. Otherwise PAGE is filtered to the tracked form
+            # while the fixed witness and the subsequent fresh PAGE retain
+            # foreign siblings; parity then times out as "unstable".
+            # This is read-only shape normalization, never a write permission.
+            from copy import deepcopy
+            page = deepcopy(page)
+            _ashby_native_classify(page, self.provenance)
+            result = {**result, 'value': page}
         if self.step is not None and isinstance(page, dict):
             self.step['url'] = page.get('url', '')
         return result

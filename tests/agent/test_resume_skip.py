@@ -162,7 +162,7 @@ def test_owner_answer_consumes_once_and_banks_only_after_winning(world):
     # The owner answer still consumes a single gate and reaches the ordinary
     # answer bank, but no BrowserSkill per-field grant is minted.
     assert "human_approved_answers" not in after
-    assert after["gate_disposition"]["answer"] == "Synthetic Name"
+    assert after["gate_disposition"]["identity"] == _tokens(row)["expected_question_identity"]
     assert stores.answer_bank.puts == [("Synthetic display name", " Synthetic Name ")]
     assert _queued(queue) == [PK]
 

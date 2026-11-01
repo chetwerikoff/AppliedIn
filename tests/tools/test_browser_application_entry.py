@@ -189,11 +189,37 @@ def no_mutations(session):
     assert all(c[0] in {'navigate', 'evaluate'} for c in session.calls)
 
 
+def _stop_after_stable_entry(monkeypatch, refusal):
+    """Inject an offline result after the real admission and bounded reads.
+
+    No retired bootstrap grant: this intercept leaves all entry/frame and
+    raw producer protections intact and records only completed admission.
+    """
+    original = forms._entry_or_reversible_page
+
+    class CompletedEntry:
+        await_count = 0
+        last_page = None
+
+        async def __call__(self, *args, **kwargs):
+            _session, page = await original(*args, **kwargs)
+            self.await_count += 1
+            self.last_page = page
+            raise refusal
+
+        def assert_awaited_once(self):
+            assert self.await_count == 1
+
+    intercept = CompletedEntry()
+    monkeypatch.setattr(forms, '_entry_or_reversible_page', intercept)
+    return intercept
+
+
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 async def test_direct_entry_two_fresh_forms_before_bootstrap(monkeypatch, ats):
     _, _, session, decision = world(monkeypatch, ats)
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready for human review'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready for human review'))
     result = await attempt(ats)
     assert result['status'] == 'gate'
     assert 'ready for human review' in result['question']
@@ -210,8 +236,7 @@ async def test_direct_entry_gate_keeps_existing_question_payload(monkeypatch, at
     question = {'label': 'Synthetic question', 'type': 'text'}
     rejection = forms.Gate('Exact synthetic owner question', form_question=question,
                            reason='owner_question')
-    bootstrap = AsyncMock(side_effect=rejection)
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(monkeypatch, rejection)
     report = await attempt(ats)
     assert report['status'] == 'gate'
     assert report['reason'] == 'owner_question'
@@ -225,8 +250,8 @@ async def test_direct_entry_gate_keeps_existing_question_payload(monkeypatch, at
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 async def test_direct_entry_unexpected_exception_stays_unknown(monkeypatch, ats):
     _, _, session, decision = world(monkeypatch, ats)
-    bootstrap = AsyncMock(side_effect=RuntimeError('Synthetic unexpected fault'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, RuntimeError('Synthetic unexpected fault'))
     report = await attempt(ats)
     assert report == {'status': 'unknown',
                       'detail': 'BrowserSkill operation unavailable: RuntimeError'}
@@ -240,14 +265,12 @@ async def test_final_submit_gate_keeps_existing_question_without_click(
     from tests.tools.test_browser_controller_support import install_controller_session
     row, _, endpoint, decide = world(monkeypatch, 'lever')
     _, _, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _session, current, *a, **k: current))
+    # The stable page is already usable for ungated preparation.
     decide.return_value = {'action': 'submit', 'selector': '#submit'}
     report = await forms.apply(posting('lever'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert report['status'] == 'gate'
-    assert report['question'].startswith(
-        'This row’s protected tailored PDF has not been verified.')
+    assert report.get('reason') == 'defect_pre_submit_item_2', report
     assert report['form_question'] is None
     assert not any(call[0] == 'click' for call in endpoint.calls)
     assert not row.get('possible_submission')
@@ -437,12 +460,11 @@ async def test_shell_then_late_changing_form_needs_own_equal_fresh_pair(monkeypa
     # Three shell reads, one first pair, and two equal second pairs.
     _, _, session, _ = world(monkeypatch, 'lever',
                             [shell, shell, shell, first, first, second, second, second, second])
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(monkeypatch, forms.Gate('ready'))
     report = await attempt('lever')
     assert 'ready' in report['question']
     assert session.pages == 9
-    assert bootstrap.call_args.args[1]['controls'][0]['label'] == 'Email address'
+    assert bootstrap.last_page['controls'][0]['label'] == 'Email address'
     no_mutations(session)
 
 
@@ -1196,8 +1218,8 @@ async def test_ashby_native_form_and_valid_token_after_sixty_seconds_stabilize(m
                 'responses':[{'selector':'#token','name':'g-recaptcha-response','form':''}],
                 'response_error':False,'helper_challenge':False})
     session.on_page = hydrate
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready after late native hydration'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready after late native hydration'))
     report = await attempt()
     assert 'ready after late native hydration' in report['question']
     assert 61 < clock[0] - start < 90
@@ -1222,7 +1244,8 @@ async def test_later_unsafe_observation_gates_before_next_ipc(monkeypatch, chang
     unsafe = deepcopy(base)
     unsafe['entry'].update(change)
     _, _, session, decide = world(monkeypatch, 'lever', [base]*4+[unsafe])
-    monkeypatch.setattr(forms, '_bootstrap', AsyncMock(side_effect=lambda s,p,*a,**kw:p))
+    # Entry-frame admission, not an obsolete field-grant bootstrap, must
+    # refuse an unsafe later frame before the next IPC.
     decide.return_value = {'action':verb,'selector':'#email-input' if verb=='fill' else '#submit','fact':'Email'}
     report = await attempt('lever')
     assert cause in report['question']
@@ -1430,14 +1453,17 @@ async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypat
     assert {c['selector'] for c in admitted['controls']} == {'#email', '#submit'}
     assert admitted['entry']['quarantined_native_owners'] == (
         ['#foreign-application'] if pair else [])
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
     assert not prepared['controls'][0]['has_value']
     # No early question or write, but the final-form decision still rejects
     # the missing required answer before any committing click.
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(prepared, {}, uploaded=True)
+    with_pdf = deepcopy(prepared)
+    with_pdf['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=proof.url))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(with_pdf, {}, uploaded=True, attachment='Resume.pdf')
     no_mutations(raw)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -1508,8 +1534,7 @@ async def test_native_hidden_machine_control_remains_separate_from_visible_recei
     fixed_machine = next(c for c in raw.fixed['controls'] if c['selector'] == '#native-machine')
     assert candidate_machine['visible'] is False
     assert fixed_machine['visible'] is False
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} >= {
         '#native-machine', '#email', '#submit'}
     assert prepared['controls'][0]['selector'] != '#native-machine'
@@ -1641,11 +1666,14 @@ async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positio
         deadline=asyncio.get_running_loop().time() + 10)
     assert admitted['entry']['selected_native_owner'] == '#application-form'
     assert admitted['entry']['quarantined_native_owners'] == ['#foreign-application']
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(prepared, {}, uploaded=True)
+    with_pdf = deepcopy(prepared)
+    with_pdf['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=proof.url))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(with_pdf, {}, uploaded=True, attachment='Resume.pdf')
     result = await attempt()
     assert result['status'] == 'gate', result
     assert not any(reason in result['question'] for reason in (
@@ -1848,8 +1876,7 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     _, tracking, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
     # Only skip field bootstrap. The stable-entry producer and actual raw
     # application guard remain unmocked.
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     decide.side_effect = [
         {'action': 'click', 'selector': '#continue'},
         {'action': 'submit', 'selector': '#submit'},
@@ -2594,8 +2621,8 @@ async def _issue214_apply(monkeypatch, frame):
         frame, root={'selector': '#application-form', 'action': entry('ashby')})
     _, _, session, decide = world(monkeypatch, pages=[page])
     fake_clock(monkeypatch)
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready for human review'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready for human review'))
     return await attempt(), session, decide, bootstrap
 
 
@@ -2862,8 +2889,7 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
         deadline=asyncio.get_running_loop().time() + 10)
     _issue214_approve_email(row, admitted, raw, provenance)
     _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     authorized = []
     final_guard = forms.ApplicationIPCController.authorize_final_submit
 

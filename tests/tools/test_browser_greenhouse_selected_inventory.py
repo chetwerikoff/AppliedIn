@@ -160,16 +160,31 @@ def _unproven_final_inventory(page, opaque=0):
     assert page['opaque_count'] == opaque == len(page['opaque_locators'])
     assert page['opaque_controls'] is (opaque > 0)
     assert page['inventory_verified'] is (opaque == 0)
-    with pytest.raises(forms.Gate, match='inventory is incomplete' if opaque else
-                       'Unverified or changed combobox value'):
-        forms.check_form(page, {}, uploaded=True)
+    # Item 2 uses the current staged file-input readback, not an old widget
+    # receipt. Supply that independent synthetic file so these scenarios
+    # exercise incomplete inventory and required choices rather than a
+    # missing attachment unrelated to the selected country.
+    from copy import deepcopy
+    final = deepcopy(page)
+    files = [c for c in final['controls']
+             if c.get('type') == 'file' and re.search(r'resume|résumé|cv',
+                                                     forms.label(c), re.I)]
+    assert len(files) == 1
+    files[0]['files'] = ['Test User Resume.pdf']
+    with pytest.raises(forms.Gate) as error:
+        forms.check_form(final, {}, True, 'Test User Resume.pdf')
     if opaque:
+        assert 'inventory is incomplete' in str(error.value)
         return
-    # Country is bound per field: a visually selected Country with its exact
-    # approved answer still has no proven form value, so Submit refuses it.
-    alone = dict(page, controls=[_control(page, '#country')])
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value: Country'):
-        forms.check_form(alone, {'#country': 'Synthetic Country'}, uploaded=True)
+    assert 'staged résumé was not attached' not in str(error.value)
+    # Visual Country text without any native value cannot satisfy a required
+    # receiver, even if an older writer ledger claimed it was selected.
+    country = deepcopy(_control(final, '#country'))
+    country['required'] = True
+    alone = dict(final, controls=[country, files[0]])
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(alone, {'#country': 'Synthetic Country'}, True,
+                         'Test User Resume.pdf')
 
 
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():

@@ -264,17 +264,23 @@ async def test_selector_targeted_in_form_enter_uses_the_same_final_check(
 @pytest.mark.parametrize('operation', [
     ('click', '#not-in-fresh-page'),
     ('click', '#submit', '--unclassified-argument'),
-    ('press', 'Enter', '--selector', '#not-in-fresh-page'),
 ])
-async def test_unclassified_raw_click_or_enter_cannot_bypass_final_boundary(
+async def test_unclassified_non_submit_click_stays_ungated_preparation(
         monkeypatch, tmp_path, operation):
     controller, page, target, fixture = _world(monkeypatch, tmp_path)
-    with pytest.raises(forms.PreSubmitGate) as refusal:
-        await controller.before_ipc(None, operation, {})
-    assert refusal.value.item == 1
-    assert not fixture.held
-    assert not controller.committed
+    await controller.before_ipc(None, operation, {})
+    assert not fixture.held and not controller.committed
 
+
+@pytest.mark.asyncio
+async def test_unknown_targeted_form_enter_fails_closed_before_implicit_submit(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.before_ipc(
+            None, ('press', 'Enter', '--selector', '#not-in-fresh-page'), {})
+    assert refusal.value.item == 1
+    assert not fixture.held and not controller.committed
 
 @pytest.mark.asyncio
 async def test_duplicate_submit_selector_cannot_skip_raw_check(

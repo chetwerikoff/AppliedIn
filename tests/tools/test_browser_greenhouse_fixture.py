@@ -74,10 +74,16 @@ def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():
     # Satisfy the separate staged-PDF and ordinary required-field proofs
     # synthetically; missing picker commitment must independently deny Submit.
     current = deepcopy(later['page'])
-    resumes = [c for c in current['controls'] if c.get('type') == 'file'
-               and 'resume' in forms.label(c).lower()]
-    assert len(resumes) == 1
-    resumes[0]['files'] = ['Synthetic-Resume.pdf']
+    # This Greenhouse hydration fixture has no résumé input. Add exactly one
+    # synthetic staged receiver so the assertion isolates the surviving
+    # required picker rule, rather than failing on the independent PDF item.
+    assert not any(c.get('type') == 'file' for c in current['controls'])
+    current['controls'].append({
+        'selector': '#synthetic-resume', 'label': 'Resume', 'question': '',
+        'tag': 'input', 'type': 'file', 'disabled': False, 'required': False,
+        'in_form': True, 'form_selector': '#application-form',
+        'form_action': current['url'], 'files': ['Synthetic-Resume.pdf'],
+    })
     for control in current['controls']:
         if control.get('required') and control.get('type') in {
                 'text', 'email', 'tel', 'textarea'}:

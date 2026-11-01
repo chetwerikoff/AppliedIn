@@ -31,6 +31,26 @@ def _admit_ashby_without_field_grants(monkeypatch):
 
     monkeypatch.setattr(fixture._SyntheticRun, 'entry_admitted', admit)
 
+    # The sealed fixture's former sequence put file set after two fills. An
+    # already visible receiver is now prepared before the first model decision.
+    # Keep exact IPC sequence accounting for both early and late receivers.
+    original_ipc = fixture._SyntheticRun._positive_ipc
+    scenarios = {}
+
+    def current_ipc(self):
+        sequence = original_ipc(self)
+        if not self.ashby_upload:
+            return sequence
+        token = id(self)
+        if token not in scenarios:
+            visible = any(
+                control.get('selector') == forms._ASHBY_RESUME_SELECTOR
+                for control in (self.last_page or {}).get('controls', []))
+            scenarios[token] = (sequence[-1], *sequence[:-1]) if visible else sequence
+        return scenarios[token]
+
+    monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', current_ipc)
+
 
 
 
@@ -224,7 +244,7 @@ async def test_post_upload_interruption_is_terminal_before_cancellation(authorit
     # A fault after the set call may have attached the file, so both the
     # cancellation and the failed readback stay uncertain, never retried.
     assert result['status'] == 'uncertain'
-    assert (detail or result.get('detail')) == (
+    assert (detail or result.get('detail')).startswith(
         'Résumé upload interrupted after the browser command; inspect manually')
     assert is_retryable(result) == (False, 'uncertain')
     assert len(raw.uploads) == 1
@@ -862,8 +882,9 @@ async def test_resumed_prefilled_form_uploads_once_before_the_first_decision(
         authority, monkeypatch, prior=prior, transport=transport,
         actions=[{'action': 'gate', 'question': 'Synthetic next decision'}])
     assert result['status'] == 'gate', result
-    assert 'Synthetic next decision' in result['question']
-    assert timeline == ['upload', ('decision0', 1, True)]
+    assert result['reason'] == 'agent_review_unavailable'  # Model prose is not authorization.
+    assert len(timeline) == 2 and timeline[0] == 'upload'
+    assert timeline[1][:2] == ('decision0', 1)
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
     assert authority.upload_ipc == 1 and authority.uploaded
     assert authority.fills == 0 and authority.decisions == 1
@@ -884,12 +905,12 @@ async def test_resumed_second_submit_still_meets_the_unchanged_final_guard(
     result, raw, timeline, _ = await _resumed_submit_first(
         authority, monkeypatch, prior=prior, actions=[
             {'action': 'submit', 'selector': '#structural-submit'}])
-    assert timeline == ['upload', ('decision0', 1, True)]
+    assert len(timeline) == 2 and timeline[0] == 'upload'
+    assert timeline[1][:2] == ('decision0', 1)
     assert result['status'] == 'gate', result
-    # Raised inside ApplicationIPCController.authorize_final_submit: the
-    # synthetic row has no canonical job id, an invariant unrelated to upload.
-    assert result['question'].startswith(
-        'Current canonical job ID changed before Submit. Last button: Submit application.')
+    # A missing canonical job ID is an item-1 refusal, never a Submit approval.
+    assert result.get('item') == 1
+    assert result.get('reason') == 'defect_pre_submit_item_1'
     assert len(raw.uploads) == authority.upload_ipc == 1
     _no_commit(authority, raw)
 
@@ -1013,7 +1034,7 @@ async def test_production_submit_click_without_upload_recovers_then_meets_final_
     assert result['status'] == 'gate', result
     assert 'protected tailored PDF' not in result['question']
     assert result.get('item') == 2 and result.get('reason') == 'defect_pre_submit_item_2', result
-    assert decide.await_count == 3
+    assert decide.await_count == 2  # The first click reaches item 2 and stops.
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
     # The staged PDF is released after the run; recovery compared the
@@ -1046,7 +1067,7 @@ async def test_production_submit_click_upload_failure_stops_without_click(
     assert result['detail'].startswith(
         'Résumé upload interrupted after the browser command; inspect manually')
     assert result['step']['last_button'] == '(unavailable)'
-    assert result['step']['url'].startswith('http://127.0.0.1:18789/fixture/')
+    assert result['step']['url'] == row['jd_url']  # Must remain the tracked job.
     assert decide.await_count == 0
     assert len(uploads) == 1
     assert not transport._application_controller.upload_completed

@@ -1361,7 +1361,7 @@ async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch, t
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
     assert result.get('item') == 2 and result.get('reason') == 'defect_pre_submit_item_2'
-    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
+    assert effects == [('navigate', URL), ('upload', '#resume'), ('fill', '#email')]
     assert not raw._application_controller.committed
 
 

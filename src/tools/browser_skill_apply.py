@@ -3244,14 +3244,15 @@ class ApplicationIPCController:
         if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'} and not resume_set:
             raise Gate('Executable or unsupported raw application IPC is forbidden.')
         if resume_set:
-            if self.upload_attempted:
+            if self.upload_attempted or self.upload_identity is not None:
                 raise Gate('The staged PDF was already uploaded in this attempt.')
             self._resume_set_identity = self._row_pdf()
             self.upload_attempted = self.upload_pending = True
             self.upload_completed = False
             return
         if op == 'upload':
-            if (self.upload_attempted or len(args) != 4 or args[2] != '--file'
+            if (self.upload_attempted or self.upload_identity is not None
+                    or len(args) != 4 or args[2] != '--file'
                     or not isinstance(args[3], str)
                     or str(Path(args[3]).resolve()) != self.resume_path
                     or kwargs != {'timeout': 130}):

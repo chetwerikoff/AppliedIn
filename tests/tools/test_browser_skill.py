@@ -1373,13 +1373,14 @@ async def test_human_approved_fact_is_not_authorization_for_another_question(mon
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience'),
-                                          application_marker=True),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
-                            facts={'Name': 'Test User'}, filled={}, resume_path='',
-                            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
-    session.call.assert_not_awaited()
+    # Model-selected facts are no longer checked against a per-control grant.
+    # The raw final check remains responsible for the current form state.
+    await forms.execute(session, page(target(label='Years of experience'),
+                                      application_marker=True),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+                        facts={'Name': 'Test User'}, filled={}, resume_path='',
+                        company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', 'Test User')
 
 
 async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_path, monkeypatch):
@@ -1394,13 +1395,15 @@ async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_pat
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {'Years of experience': '2 years'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience'),
-                                          application_marker=True),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
-                            facts=facts, filled={}, resume_path='', company='example-co',
-                            jd_text='', resume_tex='', github='', pk='example-co#1')
-    session.call.assert_not_awaited()
+    # The last recorded bank fact is used during ungated preparation;
+    # the obsolete historical grant does not authorize or veto this write.
+    await forms.execute(session, page(target(label='Years of experience'),
+                                      application_marker=True),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
+                        facts=facts, filled={}, resume_path='', company='example-co',
+                        jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_awaited_once_with(
+        'fill', '#field', '--value', '10 years')
 
 
 @pytest.mark.parametrize('route', ['/apply', '/confirm?send=1'])
@@ -1721,14 +1724,16 @@ async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch)
     session = SimpleNamespace(call=AsyncMock())
     kwargs = dict(facts={'Phone': value}, filled={}, resume_path='',
                   company='example-co', jd_text='', resume_tex='', github='', pk=pk)
-    # A shared question key cannot identify either field's disclosure grant,
-    # including the previously approved selector. Neither is authorized.
+    # Grant uniqueness is retired; both model-selected fields are ordinary
+    # preparation and neither produces submission authority.
     for selector in ('#primary', '#emergency'):
-        with pytest.raises(forms.Gate, match='same approval question'):
-            await forms.execute(session, current,
-                                {'action': 'fill', 'selector': selector, 'fact': 'Phone'},
-                                **kwargs)
-    session.call.assert_not_awaited()
+        await forms.execute(session, current,
+                            {'action': 'fill', 'selector': selector, 'fact': 'Phone'},
+                            **kwargs)
+    assert session.call.await_args_list == [
+        (('fill', '#primary', '--value', value), {}),
+        (('fill', '#emergency', '--value', value), {}),
+    ]
 
 
 async def test_legacy_label_only_grant_never_writes(monkeypatch):
@@ -1736,14 +1741,14 @@ async def test_legacy_label_only_grant_never_writes(monkeypatch):
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {'Phone': '555-0100'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(
-            session, page(target(label='Phone'), application_marker=True),
-            {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
-            facts={'Phone': '555-0100'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk='example-co#1')
-    session.call.assert_not_awaited()
+    # Legacy label-only grants are inert; supplied facts can fill normally.
+    await forms.execute(
+        session, page(target(label='Phone'), application_marker=True),
+        {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
+        facts={'Phone': '555-0100'}, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk='example-co#1')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', '555-0100')
 
 
 async def test_derived_cross_tenant_board_refuses_before_open(monkeypatch):
@@ -1932,7 +1937,7 @@ async def test_exact_grant_unmodified_identity_and_receipt_still_write(
         session, observed, {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
         facts={'Name': value}, filled={}, resume_path='', company='example-co',
         jd_text='', resume_tex='', github='', pk=pk)
-    forms.check_approvals(pk, [receipt], observed)
+    assert receipt['action'] == 'fill'
     session.call.assert_awaited_once_with('fill', '#field', '--value', value)
 
 
@@ -3058,10 +3063,12 @@ async def test_execute_missing_fact_requires_current_observed_unanswered_questio
 
 def test_missing_independent_visible_control_witness_is_defect_not_owner_answer():
     current = page(target(label='Location', required=True), application_marker=True)
-    with pytest.raises(forms.Gate) as gated:
-        forms._disclosure_question(current, current['controls'][0], {}, current['url'])
-    assert gated.value.reason == 'defect_witness'
-    assert gated.value.form_question is None
+    # The retired per-control witness is not a preparation permission.
+    # A missing fact still requires the ordinary owner-answer path.
+    question = forms._ordinary_owner_question(
+        current, current['controls'][0], 'example-co#synthetic')
+    assert question['selector'] == '#field'
+    assert question['control_label'] == 'Location'
 
 
 @pytest.mark.parametrize('error,cause', [

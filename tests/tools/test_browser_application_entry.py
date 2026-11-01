@@ -1555,7 +1555,7 @@ async def native_admitted_with_one_safe_fill(monkeypatch):
 
 
 @pytest.mark.parametrize('at', ['before-next-fill', 'before-submit'])
-async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkeypatch, at):
+async def test_ashby_native_drift_is_ungated_until_final_raw_submit(monkeypatch, at):
     raw, session, filled = await native_admitted_with_one_safe_fill(monkeypatch)
     assert filled == {'#email': 'test@example-co.test'}
     foreign_route = (
@@ -1563,18 +1563,41 @@ async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkey
     for snapshot in (raw.current, raw.fixed):
         candidate = snapshot['entry']['native_candidates'][0]
         candidate['action_attr'] = candidate['action'] = foreign_route
-        # Model the complete observed DOM changing rather than only one
-        # correlated witness slot; the earlier safe fill stays recorded.
+        # Independently observed receiver and control owners drift together.
         for control_item in snapshot['controls']:
             if control_item['form_selector'] == candidate['selector']:
                 control_item['form_action'] = foreign_route
                 control_item['form_action_raw'] = foreign_route
     before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}])
-    next_verb, selector = ('fill', '#email') if at == 'before-next-fill' else ('click', '#submit')
-    with pytest.raises(forms.Gate, match='native form receiver not proven|tracked job binding|root identity drift'):
-        await session.call(next_verb, selector, '--value', 'another' if at == 'before-next-fill' else '')
-    assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}]) == before == 1
-    assert not [c for c in raw.calls if c[0] == 'click']
+    assert before == 1
+    if at == 'before-next-fill':
+        # ARCH R1: changed page state cannot reinstate the retired pre-fill
+        # witness gate. The raw Submit check is the sole committing decision.
+        await session.call('fill', '#email', '--value', 'another')
+        assert len([c for c in raw.calls
+                    if c[0] in {'fill', 'upload', 'click', 'select'}]) == 2
+        assert not [c for c in raw.calls if c[0] == 'click']
+    else:
+        # The production raw IPC checks the changed native receiver before
+        # any Submit effect, rather than relying on _EntrySession's old gate.
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting('ashby'), '', {}, filled, [],
+            {'url': entry('ashby')}, lambda: None,
+            entry_provenance=session.provenance)
+
+        async def fresh(_session):
+            return deepcopy(raw.current)
+
+        monkeypatch.setattr(guard, '_page', fresh)
+        monkeypatch.setattr(forms, 'check_dispatch', lambda *_args, **_kwargs: None)
+        with pytest.raises(
+                forms.PreSubmitGate,
+                match='Tracked job, tenant, form or duplicate proof is unavailable'):
+            await guard.before_ipc(raw, ('click', '#submit'), {})
+        assert not guard.committed
+        assert len([c for c in raw.calls
+                    if c[0] in {'fill', 'upload', 'click', 'select'}]) == before
+        assert not [c for c in raw.calls if c[0] == 'click']
 
 
 async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positional_choice(

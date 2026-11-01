@@ -746,10 +746,10 @@ def _seed_mismatch_synthetic_fields(authority, raw):
                 control['has_value'] = True
 
 @pytest.mark.parametrize('transport', ['effect', 'call'])
-async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate(
+async def test_reversible_submit_recovers_one_native_input_upload_then_raw_submit_refusal(
         authority, monkeypatch, transport):
-    """Submit-time fallback: the résumé field rendered after the first
-    decision, so the Submit decision takes the one guarded upload."""
+    """A late native-input upload precedes raw Submit IPC's item-1 refusal.
+    That fresh check stops before a fourth model decision."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
@@ -773,7 +773,7 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
-    assert authority.decisions == 4
+    assert authority.decisions == 3
     assert not any(call[0] == 'click' for call in raw.calls)
 
 
@@ -792,9 +792,8 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
     _seed_mismatch_synthetic_fields(authority, raw)
-    tasks = []
-    _script_recovery_decisions(
-        monkeypatch, first='upload', after_upload='gate', tasks=tasks,
+    seen = _script_recovery_decisions(
+        monkeypatch, first='upload', after_upload='gate',
         on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
@@ -802,8 +801,7 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
     assert 'observed form needs human inspection' in result['question']
-    assert 'résumé attachment verified=True' in tasks[3]
-    assert 'runs before Submit' not in tasks[3]
+    assert [action for action, _, _ in seen] == ['fill', 'fill', 'upload', 'gate']
     assert authority.fills == 2 and authority.upload_ipc == 1 and authority.uploaded
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
     assert authority.decisions == 4
@@ -825,9 +823,8 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
     _bind_mismatch_fixture_producer(authority, monkeypatch, transport=transport)
     raw = MismatchFixtureRaw(authority)
     _seed_mismatch_synthetic_fields(authority, raw)
-    tasks = []
-    _script_recovery_decisions(
-        monkeypatch, first='upload', upload_decisions=4, after_upload='gate', tasks=tasks,
+    seen = _script_recovery_decisions(
+        monkeypatch, first='upload', upload_decisions=4, after_upload='gate',
         on_first_decision=_late_resume_field((raw.current, raw.fixed)))
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_: raw)
     result = await forms.apply(
@@ -836,13 +833,14 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
     assert result['status'] == 'gate'
     assert result['reason'] == 'agent_review_unavailable'
     assert 'observed form needs human inspection' in result['question']
-    # Removing the per-action refusal lets all four harmless repeat
-    # decisions reach the model before its final review request. Neither
-    # decision replays the one protected upload or reaches Submit IPC.
-    assert authority.decisions == 7 and len(tasks) == 7
-    assert 'The résumé is already attached by the server' in tasks[4]
+    # Only the first upload request performs the guarded set. Three repeat
+    # requests observe its count without issuing another raw upload.
+    assert [action for action, _, _ in seen] == [
+        'fill', 'fill', 'upload', 'upload', 'upload', 'upload', 'gate']
+    assert [count for action, count, _ in seen if action == 'upload'] == [0, 1, 1, 1]
+    assert authority.decisions == len(seen) == 7
     assert authority.fills == 2 and authority.upload_ipc == 1
-    assert len(raw.uploads) == 1
+    assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert not any(call[0] == 'click' for call in raw.calls)
 

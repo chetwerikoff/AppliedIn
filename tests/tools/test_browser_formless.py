@@ -853,8 +853,15 @@ def test_final_formless_boundary_does_not_borrow_unproven_roots(monkeypatch, pro
         page['entry']['root_evidence'].append(
             {'selector': '#synthetic-extra', 'type': 'text'})
     elif problem == 'no-resume':
+        # The final PDF check, rather than the root witness's per-input
+        # admission, rejects a missing actual staged file receiver.
         page['entry']['root_evidence'] = [
             c for c in page['entry']['root_evidence'] if c.get('type') != 'file']
+        page['controls'] = [
+            c for c in page['controls'] if c.get('type') != 'file']
+        with pytest.raises(forms.Gate, match='résumé input'):
+            forms.check_form(page, {}, True, 'Synthetic.pdf')
+        return
     elif problem == 'root-error':
         root['error'] = 'ambiguous application roots'
     elif problem == 'root-missing':

@@ -226,7 +226,9 @@ async def test_safe_readback_examples_pass_the_same_final_check(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('operation', [
-    ('click', '#submit'), ('press', 'Enter'),
+    ('click', '#submit'),
+    *[('press', key) for key in ('Enter', 'Return', 'NumpadEnter', ' ',
+                                 'Space', 'Spacebar')],
 ])
 async def test_successful_commit_classification_cannot_be_replayed(
         monkeypatch, tmp_path, operation):
@@ -244,8 +246,10 @@ async def test_successful_commit_classification_cannot_be_replayed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('key', ['Enter', 'Return'])
-async def test_selector_targeted_in_form_enter_uses_the_same_final_check(
+@pytest.mark.parametrize('key', [
+    'Enter', 'Return', 'NumpadEnter', ' ', 'Space', 'Spacebar',
+])
+async def test_selector_targeted_in_form_press_uses_the_same_final_check(
         monkeypatch, tmp_path, key):
     controller, page, target, fixture = _world(monkeypatch, tmp_path)
     starts = []
@@ -468,3 +472,174 @@ async def test_dispatch_stage_and_duplicate_failures_keep_substantive_item(
     assert refused.value.item == item
     assert refused.value.reason == f'defect_pre_submit_item_{item}'
     assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', [
+    'Enter', 'Return', 'NumpadEnter', ' ', 'Space', 'Spacebar',
+])
+async def test_focused_submit_key_uses_single_refusing_pre_submit_check(
+        monkeypatch, tmp_path, key):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    calls = []
+
+    async def refusal(_session, observed, receiver):
+        calls.append((observed, receiver))
+        raise forms.PreSubmitGate(2, 'Synthetic row PDF check failed.')
+
+    monkeypatch.setattr(controller, 'check_pre_submit', refusal)
+    await controller.before_ipc(None, ('focus', '#submit'), {})
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.before_ipc(None, ('press', key), {})
+    assert refused.value.item == 2
+    assert calls == [(page, target)]
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', [
+    'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+    'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete',
+])
+async def test_navigation_and_editing_keys_stay_ungated(
+        monkeypatch, tmp_path, key):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    calls = []
+
+    async def refusal(*args):
+        calls.append(args)
+        raise AssertionError('Ordinary keyboard preparation ran final Submit check.')
+
+    monkeypatch.setattr(controller, 'check_pre_submit', refusal)
+    await controller.before_ipc(None, ('focus', '#submit'), {})
+    await controller.before_ipc(None, ('press', key), {})
+    assert not calls and not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', [
+    'F5', 'a', 'Control+Enter', 'ArrowUp+Enter', '', 'Shift',
+])
+async def test_unsupported_application_key_is_refused_exactly(
+        monkeypatch, tmp_path, key):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    with pytest.raises(forms.Gate, match=r'^Unsupported key for application IPC\.$'):
+        await controller.before_ipc(None, ('press', key), {})
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_pdf_attached_to_different_form_cannot_satisfy_item_two(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    file_input = next(c for c in page['controls'] if c.get('type') == 'file')
+    # The unrelated profile form has no Submit; the application Submit is
+    # unique but its form does not have the PDF.
+    file_input['form_selector'] = '#profile'
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.check_pre_submit(None, page, target)
+    assert refused.value.item == 2
+    assert not fixture.held and not controller.committed
+
+
+def test_formless_pdf_requires_membership_in_proven_application_root(
+        monkeypatch, tmp_path):
+    controller, page, target, _fixture = _world(monkeypatch, tmp_path)
+    file_input = next(c for c in page['controls'] if c.get('type') == 'file')
+    other_input = next(c for c in page['controls'] if c.get('type') == 'email')
+    target['in_form'] = False
+    file_input['in_form'] = False
+    # The production caller obtains these members from _formless_boundary.
+    forms.check_form(
+        page, {}, True, file_input['files'][0],
+        submit_target=target, formless_members=[file_input])
+    with pytest.raises(forms.Gate, match='committing form'):
+        forms.check_form(
+            page, {}, True, file_input['files'][0],
+            submit_target=target, formless_members=[other_input])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('caption', 'machine', 'blocked'), [
+    ('Male', 'male', True),
+    ('Prefer not to answer', 'skip', False),
+])
+async def test_selected_protected_combobox_caption_is_checked(
+        monkeypatch, tmp_path, caption, machine, blocked):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, {
+        'selector': '#gender-picker', 'label': 'Gender', 'question': 'Gender',
+        'tag': 'input', 'type': 'combobox', 'required': True, 'value': '',
+        'in_form': True, 'form_selector': '#app',
+        'combobox': {
+            'selected_text': caption, 'selected_value': machine,
+            'hidden_selector': '#gender-value', 'hidden_value': machine,
+        },
+    })
+    page['controls'].insert(1, {
+        'selector': '#gender-value', 'tag': 'input', 'type': 'hidden',
+        'value': machine, 'in_form': True, 'form_selector': '#app',
+    })
+    if blocked:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 3
+        assert not fixture.held
+    else:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+
+
+@pytest.mark.asyncio
+async def test_optional_protected_combobox_hidden_receiver_drift_fails_closed(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, {
+        'selector': '#gender-picker', 'label': 'Gender', 'question': 'Gender',
+        'tag': 'input', 'type': 'combobox', 'required': False, 'value': '',
+        'in_form': True, 'form_selector': '#app',
+        'combobox': {
+            'selected_text': 'Prefer not to answer', 'selected_value': 'skip',
+            'hidden_selector': '#gender-value', 'hidden_value': 'skip',
+        },
+    })
+    page['controls'].insert(1, {
+        'selector': '#gender-value', 'tag': 'input', 'type': 'hidden',
+        'value': 'male', 'in_form': True, 'form_selector': '#app',
+    })
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.check_pre_submit(None, page, target)
+    assert refused.value.item == 3
+    assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('value', 'blocked'), [
+    ('90000', True), ('110000', False),
+])
+async def test_salary_label_numeric_example_never_overrides_entered_amount(
+        monkeypatch, tmp_path, value, blocked):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path, case='salary')
+    pay = next(c for c in page['controls'] if c.get('selector') == '#pay')
+    pay.update(question='Desired salary (USD/year; example 150000)',
+               label='Salary (USD/year; example 150000)', value=value)
+    if blocked:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 4
+        assert not fixture.held
+    else:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+
+
+@pytest.mark.asyncio
+async def test_same_job_committing_get_navigation_is_refused_without_submit(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    with pytest.raises(forms.Gate, match='Navigation outside'):
+        await controller.before_ipc(
+            None, ('navigate', URL + '/submit'), {})
+    await controller.before_ipc(
+        None, ('navigate', URL + '/application'), {})
+    assert not fixture.held and not controller.committed

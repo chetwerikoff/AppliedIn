@@ -1094,7 +1094,8 @@ def check_dispatch(pk: str, resume_path: str, *, fixture_context=None) -> None:
 
 
 def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
-               receipts: list | None = None) -> None:
+               receipts: list | None = None, *, submit_target: dict | None = None,
+               formless_members: list[dict] | None = None) -> None:
     """One fresh, final readback of the actual form, never a writer grant.
 
     The model ledger and optional action receipts are not submission authority.
@@ -1117,9 +1118,23 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 and not c.get('disabled')
                 and re.search(r'resume|résumé|cv', label(c), re.I)
                 and c.get('files') == [attachment]]
+    # A matching filename on a separate profile form is not attached to the
+    # committing application form. Ashby formless members come only from the
+    # existing proven final application root.
+    owned_attachment = submit_target is None
+    if submit_target is not None and len(matching) == 1:
+        if submit_target.get('in_form') is True:
+            owned_attachment = bool(
+                submit_target.get('form_selector')
+                and matching[0].get('in_form') is True
+                and matching[0].get('form_selector') == submit_target['form_selector'])
+        else:
+            owned_attachment = (formless_members is not None
+                                and any(c is matching[0] for c in formless_members))
     if (len(matching) != 1 or any(c is not matching[0]
-            and c.get('type') == 'file' and c.get('files') for c in controls)):
-        raise Gate('Exactly one current résumé input must hold the staged PDF.')
+            and c.get('type') == 'file' and c.get('files') for c in controls)
+            or not owned_attachment):
+        raise Gate('Exactly one current résumé input must hold the staged PDF on the committing form.')
     # Readback is source-of-truth; controls need no historical per-field grant.
     for c in controls:
         typ = c.get('type')
@@ -3063,6 +3078,14 @@ def _protected_resume_snapshot(staged: str) -> str:
         raise Gate('Cannot protect a stable per-attempt PDF upload snapshot.') from exc
 
 
+_UNGATED_APPLICATION_KEYS = frozenset({
+    'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+    'Home', 'End', 'PageUp', 'PageDown', 'Backspace', 'Delete',
+})
+_IMPLICIT_SUBMIT_KEYS = frozenset({
+    'Enter', 'Return', 'NumpadEnter', ' ', 'Space', 'Spacebar',
+})
+
 _LABEL_CLASSES = (
     ('autofill', re.compile(r'auto-?fill', re.I)),
     ('upload', re.compile(r'\bupload', re.I)),
@@ -3242,17 +3265,25 @@ class ApplicationIPCController:
         if op == 'navigate':
             if len(args) != 2 or kwargs or not isinstance(args[1], str):
                 raise Gate('Unknown application navigation operation.')
-            if (not _job_preparation_route(
-                    args[1], self.url, provenance=(self.greenhouse_provenance or self.entry_provenance),
-                    pk=self.pk, company=self.company,
-                    fixture_context=self.fixture_context)
-                    and not self._verified_redirect_url(args[1])):
+            # Same-job /submit GET routes are committing, never preparation.
+            if (_committing_get_route(args[1])
+                    or (not _job_preparation_route(
+                        args[1], self.url,
+                        provenance=(self.greenhouse_provenance or self.entry_provenance),
+                        pk=self.pk, company=self.company,
+                        fixture_context=self.fixture_context)
+                        and not self._verified_redirect_url(args[1]))):
                 raise Gate('Navigation outside the tracked application route is forbidden.')
             return
         resume_set = (op == 'evaluate' and len(args) == 2 and not kwargs
                       and args[1] == self._resume_set_script())
-        if op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'} and not resume_set:
-            raise Gate('Executable or unsupported raw application IPC is forbidden.')
+        if ((op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'}
+             and not resume_set)
+                or (op == 'press' and (
+                    len(args) < 2 or not isinstance(args[1], str)
+                    or args[1] not in _UNGATED_APPLICATION_KEYS | _IMPLICIT_SUBMIT_KEYS))):
+            raise Gate('Unsupported key for application IPC.' if op == 'press'
+                       else 'Executable or unsupported raw application IPC is forbidden.')
         if resume_set:
             if self.upload_attempted or self.upload_identity is not None:
                 raise Gate('The staged PDF was already uploaded in this attempt.')
@@ -3275,6 +3306,9 @@ class ApplicationIPCController:
         # is placed on fill/select/choose/focus/blur/ordinary clicks here.
         if op not in {'click', 'press'}:
             return
+        # Only these navigation/editing keys cannot activate a Submit.
+        if op == 'press' and args[1] in _UNGATED_APPLICATION_KEYS:
+            return
         page = await self._page(session)
         target = None
         ambiguous = False
@@ -3292,23 +3326,33 @@ class ApplicationIPCController:
                     target = committing[0]
                 else:
                     ambiguous = True
-        elif op == 'press' and len(args) >= 2 and args[1] in {'Enter', 'Return'}:
+        elif op == 'press' and args[1] in _IMPLICIT_SUBMIT_KEYS:
+            owner = None
             if len(args) == 2 and not kwargs:
-                inside_form = any(c.get('in_form')
-                                  for c in page.get('controls', []))
+                # A key may activate a focused native or formless Submit.
+                inside_form = any(
+                    c.get('in_form') or is_submission(c) or native_submit(c)
+                    for c in page.get('controls', []))
             elif (len(args) == 4 and args[2] == '--selector'
                   and isinstance(args[3], str) and not kwargs):
                 pressed = [c for c in page.get('controls', [])
                            if c.get('selector') == args[3]]
                 ambiguous = len(pressed) != 1
-                inside_form = len(pressed) == 1 and bool(pressed[0].get('in_form'))
+                inside_form = (len(pressed) == 1 and bool(
+                    pressed[0].get('in_form')
+                    or is_submission(pressed[0]) or native_submit(pressed[0])))
+                if inside_form and pressed[0].get('in_form'):
+                    owner = pressed[0].get('form_selector')
             else:
                 inside_form = False
                 ambiguous = True
             if inside_form:
+                formless = bool(_formless_root(page))
                 submits = [c for c in page.get('controls', [])
-                           if c.get('in_form')
-                           and (is_submission(c) or native_submit(c))]
+                           if (is_submission(c) or native_submit(c))
+                           and ((c.get('in_form')
+                                 and (owner is None or c.get('form_selector') == owner))
+                                or (formless and not c.get('in_form')))]
                 if len(submits) != 1:
                     ambiguous = True
                 else:
@@ -3471,12 +3515,14 @@ class ApplicationIPCController:
             if (not self.upload_completed
                     or self.upload_identity != self._row_pdf()):
                 raise Gate('Staged PDF upload is not current.')
+            formless_members = None
             if _formless_root(page):
-                # Compare the exact raw committing target, not a different
-                # page-owned button with a similarly plausible caption.
-                _formless_boundary(
+                # Bind the submitting target and file input to the same proven
+                # root, never a similarly labelled sibling outside it.
+                formless_members = _formless_boundary(
                     page, fresh_alias, submit_selector=target.get('selector'))
-            check_form(page, self.filled, True, Path(self.resume_path).name)
+            check_form(page, self.filled, True, Path(self.resume_path).name,
+                       submit_target=target, formless_members=formless_members)
         except Gate:
             raise PreSubmitGate(2, 'The exact staged PDF or final form readback is incomplete.') from None
 
@@ -3484,6 +3530,7 @@ class ApplicationIPCController:
             subject = label(field)
             if not _SENSITIVE.search(subject):
                 continue
+            combo_verified = True
             if field.get('type') in {'radio', 'checkbox', 'button'}:
                 # The final readback also exposes selected ARIA Yes/No buttons.
                 # A checked button is not a per-widget grant or permission.
@@ -3492,13 +3539,47 @@ class ApplicationIPCController:
                 matches = [o for o in field.get('options') or []
                            if o.get('value') == field.get('value')]
                 answer = matches[0].get('label', '') if len(matches) == 1 else ''
+            elif field.get('type') == 'combobox':
+                combo = field.get('combobox') or {}
+                selected = str(combo.get('selected_text') or '').strip()
+                machine = str(combo.get('selected_value') or '').strip()
+                current = str(field.get('value') or '').strip()
+                hidden = combo.get('hidden_selector')
+                if selected or machine or current:
+                    if hidden:
+                        receivers = [c for c in page.get('controls', [])
+                                     if c.get('selector') == hidden]
+                        combo_verified = (
+                            bool(selected and machine) and len(receivers) == 1
+                            and receivers[0].get('type') == 'hidden'
+                            and receivers[0].get('in_form') is True
+                            and receivers[0].get('form_selector') == field.get('form_selector')
+                            and str(receivers[0].get('value') or '').strip() == machine
+                            and str(combo.get('hidden_value') or '').strip() == machine)
+                    elif machine:
+                        combo_verified = (
+                            bool(selected and field.get('name'))
+                            and field.get('in_form') is True
+                            and field.get('has_value') is True
+                            and current == machine)
+                    elif selected:
+                        options = combo.get('options') or field.get('options') or []
+                        combo_verified = (
+                            bool(current) and sum(
+                                1 for option in options if isinstance(option, dict)
+                                and str(option.get('value') or '').strip() == current
+                                and str(option.get('label') or '').strip() == selected
+                            ) == 1)
+                answer = selected or current
             else:
                 answer = field.get('value') or ''
-            if not str(answer).strip():
-                continue
             try:
+                if not combo_verified:
+                    raise ValueError('Protected combobox selection is unverified.')
+                if not str(answer).strip():
+                    continue
                 guarded_value(field, str(answer))
-            except Gate:
+            except (Gate, ValueError):
                 raise PreSubmitGate(3, 'A protected-characteristic answer is not a decline.') from None
 
         # Use only explicit comparable amount/currency/period literals. A model
@@ -3511,25 +3592,36 @@ class ApplicationIPCController:
                          if re.search(r'\b(?:salary|compensation|pay expectation|'
                                       r'remuneration|wage)\b', label(c), re.I)
                          and str(c.get('value') or '').strip()]
-        def parse_salary(raw):
-            currency = re.search(r'\b(?:USD|EUR|GBP|VND)\b|[$€£₫]', raw, re.I)
-            period = re.search(r'\b(?:annual|annually|year|yearly|yr|'
-                               r'month|monthly|mo|hour|hourly|hr)\b', raw, re.I)
-            amount = re.search(r'\b(\d{2,3}(?:,\d{3})+|\d{4,9}|'
-                               r'\d{2,3}(?:\.\d+)?)\s*([kKmM])?\b', raw)
-            if not currency or not period or not amount:
-                return None
+        def parse_salary(raw, *, context=''):
+            # Labels identify units only: their examples and market figures
+            # must never become the applicant's offered salary amount.
+            metadata = f'{raw} {context}'
             cur = {'$': 'USD', '€': 'EUR', '£': 'GBP', '₫': 'VND'}
-            code = cur.get(currency.group().upper(), currency.group().upper())
-            unit = period.group().lower()
-            unit = ('year' if unit in {'annual','annually','year','yearly','yr'}
-                    else 'month' if unit in {'month','monthly','mo'} else 'hour')
+            currencies = {
+                cur.get(match.group().upper(), match.group().upper())
+                for match in re.finditer(r'\b(?:USD|EUR|GBP|VND)\b|[$€£₫]',
+                                         metadata, re.I)
+            }
+            periods = set()
+            for match in re.finditer(
+                    r'\b(?:annual|annually|year|yearly|yr|'
+                    r'month|monthly|mo|hour|hourly|hr)\b', metadata, re.I):
+                unit = match.group().lower()
+                periods.add('year' if unit in {'annual','annually','year','yearly','yr'}
+                            else 'month' if unit in {'month','monthly','mo'}
+                            else 'hour')
+            amounts = list(re.finditer(
+                r'\b(\d{2,3}(?:,\d{3})+|\d{4,9}|'
+                r'\d{2,3}(?:\.\d+)?)\s*([kKmM])?\b', raw))
+            if len(currencies) != 1 or len(periods) != 1 or len(amounts) != 1:
+                return None
+            amount = amounts[0]
             number = float(amount.group(1).replace(',', ''))
             if amount.group(2):
                 number *= 1000 if amount.group(2).lower() == 'k' else 1000000
-            return code, unit, number
+            return next(iter(currencies)), next(iter(periods)), number
         for field in salary_fields:
-            stated = parse_salary(label(field) + ' ' + str(field['value']))
+            stated = parse_salary(str(field['value']), context=label(field))
             minimum = parse_salary(floor) if floor else None
             if not stated or not minimum or stated[:2] != minimum[:2]:
                 raise PreSubmitGate(

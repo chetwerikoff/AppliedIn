@@ -241,9 +241,10 @@ criterion. Normal Next/Continue, focus, blur and other non-Submit operations do
 not acquire a final submission hold.
 
 The raw application IPC controller performs **one fresh `check_pre_submit`**
-before a classified Submit click or in-form Enter/implicit submission. It checks
+before a classified Submit click or in-form Enter/Space/implicit submission. It checks
 the tracked job/ATS/tenant and duplicate state, the seed-valid staged PDF and its
-single matching current file input, protected-characteristic non-affirmation,
+single matching current file input on the committing form (or the proven
+formless application root), protected-characteristic non-affirmation,
 stated salary versus a comparable owner floor (otherwise an owner question),
 and the checked safe negative/decline sanctions caption. Failure persists the
 item ID and a sanitized reason in the existing `NEEDS_HUMAN` flow for Luna;
@@ -266,7 +267,8 @@ fill and read back controls without obtaining a per-control permission token.
 Unanswered facts and account/login challenges use the existing human question
 path; the agent does not sign in, solve CAPTCHAs or invent missing facts.
 
-Navigation stays on the approved tracked application route. A missing or stale
+Navigation stays on the approved tracked application route; explicitly committing
+GET destinations are refused even when they are on that route. A missing or stale
 configured ATS tenant is rejected by the final Submit decision, not by a
 per-field gate. The final check uses a fresh complete application inventory,
 observed current field values and exact current file input; a prior model receipt

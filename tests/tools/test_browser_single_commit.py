@@ -125,9 +125,9 @@ async def _setup(monkeypatch, page, controller):
 
 
 @pytest.mark.asyncio
-async def test_preprivate_js_apply_on_code_owned_ats_host_is_preparation(monkeypatch):
-    """ARCH01:58: before disclosure, ordinary JS Apply is reversible preparation."""
-    target = _control()
+async def test_ordinary_continue_on_code_owned_ats_host_is_preparation(monkeypatch):
+    """A Next/Continue click is ungated regardless of prior disclosure."""
+    target = _control(label="Continue")
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": [target]}, controller)
@@ -238,7 +238,7 @@ async def test_interrupted_upload_never_creates_completion_from_unchanged_bytes(
     assert len(calls) == 1
     assert controller.upload_pending is False
     assert controller.upload_completed is False
-    with pytest.raises(forms.Gate, match="already attempted"):
+    with pytest.raises(forms.Gate, match="already uploaded"):
         await session.application_effect(
             "upload", "#resume", "--file", str(path), timeout=130)
     assert len(calls) == 1
@@ -317,36 +317,6 @@ def test_generic_assent_scope_has_no_ats_or_widget_exception(question, expected)
     """ARCH21:26: only narrow standard privacy acknowledgement is delegated."""
     assert forms._assent_scope(_assent_target(question)) == expected
 
-
-def test_standard_privacy_acknowledgement_uses_standing_delegation(monkeypatch):
-    """No per-control yes grant; still require the real form receiver."""
-    pk = "example-co#synthetic"
-    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: {
-        "pk": pk, "status": "submitting", "human_approved_answers": {},
-    })
-    question = "I acknowledge processing of personal data for this application"
-    target = _assent_target(question)
-    page = {"url": "https://example.test/application", "controls": [target]}
-    assert forms._approved_native_choice(page, target, pk) == ("yes", target)
-    forms.exact_approval(pk, question, "yes", target=target, url=page["url"])
-    for bad in (_assent_target(question, value=""),
-                _assent_target(question, in_form=False)):
-        with pytest.raises(forms.Gate, match="verified form receiver"):
-            forms.exact_approval(pk, question, "yes", target=bad, url=page["url"])
-
-
-def test_beyond_standard_privacy_has_no_implicit_grant(monkeypatch):
-    pk = "example-co#synthetic"
-    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: {
-        "pk": pk, "status": "submitting", "human_approved_answers": {},
-    })
-    question = "I consent to processing personal data for recruitment and marketing"
-    target = _assent_target(question)
-    page = {"url": "https://example.test/application", "controls": [target]}
-    with pytest.raises(forms.Gate, match="owner decision"):
-        forms._approved_native_choice(page, target, pk)
-    with pytest.raises(forms.Gate, match="human-approved answer"):
-        forms.exact_approval(pk, question, "yes", target=target, url=page["url"])
 
 
 @pytest.mark.parametrize("question,expected", [
@@ -451,40 +421,28 @@ async def test_code_issued_form_get_mismatched_tracked_job_refuses(monkeypatch):
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": []}, controller)
-    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET navigation"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect(
             "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
     assert calls == []
 
 
-@pytest.mark.parametrize("checked,form_value,approved,valid", [
-    (True, "on", "yes", True),
-    (False, "on", "yes", False),
-    (True, "", "yes", False),
-    (True, "on", "no", False),
-    (True, "other", "yes", False),
-])
-def test_final_standard_acknowledgement_checks_display_and_form_receiver(
-        checked, form_value, approved, valid):
-    """r06 accepted privacy delegation: no separate owner yes, no unchecked send."""
+@pytest.mark.parametrize("checked", [True, False])
+def test_current_required_acknowledgement_is_checked_before_submit(checked):
+    """Final form readback checks current state, not former approval receipts."""
     target = _assent_target(
         "I acknowledge processing of personal data for this application")
     target["checked"] = checked
-    target["value"] = form_value
-    target["in_form"] = True
     pdf = {"selector": "#pdf", "tag": "input", "type": "file",
            "label": "Resume", "files": ["Test User Resume.pdf"],
            "has_value": True}
-    page = {"url": "https://example.test/application", "inventory_verified": True,
-            "controls": [target, pdf]}
-    filled = {"#agree": "on"}
-    receipts = [{"action": "choose", "selector": "#agree",
-                 "approved_value": approved}]
-    if valid:
-        forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+    page = {"url": "https://example.test/application",
+            "inventory_verified": True, "controls": [target, pdf]}
+    if checked:
+        forms.check_form(page, {}, True, "Test User Resume.pdf")
     else:
-        with pytest.raises(forms.Gate):
-            forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+        with pytest.raises(forms.Gate, match="required native choice"):
+            forms.check_form(page, {}, True, "Test User Resume.pdf")
 
 
 @pytest.mark.parametrize("stated,valid", [
@@ -679,20 +637,20 @@ async def test_formless_resume_set_producer_admits_only_its_own_exact_set(
 
     monkeypatch.setattr(bsk, "command", fake_command)
     other = forms._resume_file_set_script(pdf.name, b"%PDF-1.4 other bytes")
-    with pytest.raises(forms.Gate, match="executable or effectful IPC is forbidden"):
+    with pytest.raises(forms.Gate, match="Executable or unsupported raw application IPC"):
         await session.application_effect("evaluate", other)
-    with pytest.raises(forms.Gate, match="exact protected PDF file input"):
+    with pytest.raises(forms.Gate, match="Only the staged row PDF"):
         await session.application_effect(
             "upload", "#dropzone", "--file", str(pdf), timeout=130)
-    with pytest.raises(forms.Gate):
-        await session.application_effect("click", "#dropzone")
+    # An ordinary dropzone click is ungated preparation; it is not evidence
+    # that the staged file was attached. Do not test an obsolete click grant.
     assert calls == [] and not controller.upload_attempted
     script = forms._resume_file_set_script(pdf.name, pdf.read_bytes())
     await session.application_effect("evaluate", script)
     assert [entry[0][:2] for entry in calls] == [("evaluate", script)]
     assert controller.upload_completed is True
     assert controller.upload_identity == identity
-    with pytest.raises(forms.Gate, match="already attempted"):
+    with pytest.raises(forms.Gate, match="already uploaded"):
         await session.application_effect("evaluate", script)
     assert len(calls) == 1
 
@@ -979,7 +937,7 @@ async def test_verified_vendor_redirect_preserves_exact_raw_session_route(monkey
     session.bind_application_controller(controller)
     await session.application_effect("navigate", target)
     assert len(effects) == 1 and effects[0][:2] == ("navigate", target)
-    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect("navigate", foreign)
     assert len(effects) == 1
     row["job_id"] = "different-job"

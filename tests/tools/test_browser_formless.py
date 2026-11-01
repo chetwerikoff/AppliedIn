@@ -595,25 +595,23 @@ async def test_rootless_hidden_recap_keeps_visible_challenge_precedence(monkeypa
     no_mutations(raw)
 
 
-async def test_unknown_frames_gate_after_readiness_and_on_every_post_commit_read(monkeypatch):
+async def test_unknown_frames_are_not_a_reversible_per_read_gate(monkeypatch):
     first = _synthetic_enterprise_pair(missing_root=True)
     second = _synthetic_enterprise_pair()
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(
         monkeypatch, first, second)
     await forms._stable_application_form(
-        session, session.allowed, provenance, deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
+        session, session.allowed, provenance,
+        deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
     assert session._readiness is False
     raw.current, raw.fixed = deepcopy(first)
-    # Issue #214 category (a): the hidden exact-origin frame is frame-only
-    # admitted before commit; the untouched post-commit branch still refuses it.
     assert (await session.page())['entry']['frames'][0]['status'] == 'unknown'
     session.committing = True
+    # Preparation/readback cannot restore the retired per-action frame gate.
     for _ in range(2):
-        with pytest.raises(forms.Gate, match='Untrusted frame after a committing click'):
-            await session.page()
+        assert (await session.page())['entry']['frames'][0]['status'] == 'unknown'
     assert not decision.await_count
     no_mutations(raw)
-
 
 def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     page, fixed = observed()
@@ -1459,26 +1457,17 @@ _LIVE_SIBLING = dict(inertSibling=True, inertBeforeContainer=True, highlight=Tru
     ({'inertDescendant': 'onclick'}, _UNSAFE),
     ({'inertDescendant': 'summary'}, _UNSAFE),
 ])
-def test_styled_inert_sibling_keeps_reversible_scope_without_wrapper_authority(
+def test_styled_inert_sibling_keeps_current_reader_scope_without_grants(
         changes, error):
-    # Live Ashby (Issue #222) puts an inert div carrying class + data-highlight
-    # beside the pane, container and Submit. After #220 that sibling was
-    # labelled "unsafe sibling", which is not a tolerated reversible root error,
-    # so every reversible scope came back empty and no row could be filled.
-    # class and data-* are styling: the page returns to the container-scoped
-    # mismatch, still never certifies the wrapper, and any other attribute or
-    # real interactivity on the sibling still refuses.
+    # Styling does not certify a root, nor create a per-widget admission gate.
     page, fixed = observed(**{**_LIVE_SIBLING, **changes})
     for current in (page, fixed):
         assert current['entry']['formless']['error'] == error
         assert current['entry']['root'] is None
-    scope = forms._reversible_entry_scope(
-        page, {c['selector']: c for c in fixed['controls']})
-    if error == _UNSAFE:
-        assert not scope
-    else:
-        assert scope
-
+        if error != _UNSAFE:
+            for key in ('container', 'submit', 'pane'):
+                assert current['entry']['formless'][key]
+    assert page['entry'] == fixed['entry']
 
 async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
         monkeypatch):
@@ -2221,48 +2210,6 @@ def _issue184_add_name_phone_controls(raw):
             snapshot['entry']['root_evidence'].append(evidence)
 
 
-async def test_issue184_reversible_observation_gate_returns_original_page(
-        monkeypatch, bootstrap_caplog):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    observe = AsyncMock(side_effect=forms.Gate('Synthetic changed witness'))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
-        result = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=facts)
-    assert result is raw.current and row['human_approved_answers'] == {}
-    observe.assert_awaited_once()
-    assert writes == []
-    messages = [r.getMessage() for r in bootstrap_caplog.records if 'bootstrap pk=' in r.getMessage()]
-    assert len(messages) == 1 and 'route=reversible' in messages[0]
-    assert 'bank-auto-granted=[]' in messages[0]
-    for value in facts.values():
-        assert value not in messages[0]
-    no_mutations(raw)
-
-
-async def test_issue184_reversible_disallowed_fresh_origin_returns_page(monkeypatch):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    _issue182_tracking(monkeypatch, row)
-    foreign = deepcopy(raw.current)
-    foreign['url'] = 'https://unrelated.example.test/foreign'
-    observe = AsyncMock(return_value=(foreign, {}))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    result = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=facts)
-    assert result is raw.current and row['human_approved_answers'] == {}
-    observe.assert_awaited_once()
-    no_mutations(raw)
-
-
 def _issue184_real_producer(monkeypatch, facts):
     """Real raw Session/IPC guard, synthetic command transport and generic PAGE."""
     row, endpoint, provenance = _issue184_reversible_session(monkeypatch)
@@ -2328,51 +2275,6 @@ _ISSUE188_LONG_WITNESS = (
 )
 
 
-@pytest.mark.parametrize('message,expected_text', [
-    ('The reversible observation left the preparation origin.',
-     'The reversible observation left the preparation origin.'),
-    (_ISSUE188_LONG_WITNESS, _ISSUE188_LONG_WITNESS[:200]),
-    ('Private page says Test User, synthetic@example.test; token=private-synthetic',
-     '[redacted]'),
-])
-async def test_issue188_swallowed_reversible_gate_uses_safe_production_stdout(
-        monkeypatch, capsys, message, expected_text):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    observer = AsyncMock(side_effect=forms.Gate(message, reason='defect_witness'))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observer)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        result = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=facts)
-        output = capsys.readouterr().out
-
-    assert result is raw.current
-    assert row['human_approved_answers'] == {} and writes == []
-    observer.assert_awaited_once()
-    lines = [line for line in output.splitlines()
-             if 'reversible bootstrap gate pk=' in line]
-    assert len(lines) == 1
-    message = (f'reversible bootstrap gate pk={PK} reason=defect_witness '
-               f'text={expected_text}')
-    assert re.fullmatch(
-        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
-        lines[0])
-    assert len(expected_text) <= 200
-    assert 'bank-auto-granted=[]' in output
-    for secret in ('Test User', 'synthetic@example.test', 'private-synthetic'):
-        assert secret not in output
-    no_mutations(raw)
-
-
-_ISSUE190_PRIVATE_ENTRY = 'SYNTHETIC_ENTRY_VALUE_NOT_FOR_LOGS'
-
-
 def _issue190_entry_witness_reads(raw, *, unstable):
     original_call = raw.call
     reads = []
@@ -2388,82 +2290,6 @@ def _issue190_entry_witness_reads(raw, *, unstable):
 
     raw.call = call
     return reads
-
-
-async def test_issue190_reversible_bootstrap_recovers_after_first_entry_mismatch(monkeypatch):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    reads = _issue190_entry_witness_reads(raw, unstable={1})
-    reached_auto_grant = []
-    real_auto_grant = forms._auto_grant_from_global
-
-    def auto_grant(*args, **kwargs):
-        reached_auto_grant.append(True)
-        return real_auto_grant(*args, **kwargs)
-
-    monkeypatch.setattr(forms, '_auto_grant_from_global', auto_grant)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    returned = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=dict(facts))
-
-    assert returned is raw.current
-    assert reads == [1, 2, 3]  # Read 1 differs; complete reads 2 and 3 agree.
-    assert reached_auto_grant == [True]
-    assert len(writes) == 1
-    assert set(row['human_approved_answers']) == set(facts)
-    no_mutations(raw)
-
-
-async def test_issue190_persistent_frames_gate_names_key_on_production_stdout(
-        monkeypatch, capsys):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4, 5})
-    original_observe = forms._bootstrap_observe_controls
-    gates = []
-
-    async def record_gate(*args, **kwargs):
-        try:
-            return await original_observe(*args, **kwargs)
-        except forms.Gate as gate:
-            gates.append(str(gate))
-            raise
-
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', record_gate)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        returned = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=dict(facts))
-        output = capsys.readouterr().out
-
-    assert returned is raw.current and reads == [1, 2, 3, 4]
-    assert len(gates) == 1
-    predicate = 'predicate=entry.equal.frames; control=unavailable; site=bootstrap-formless'
-    assert predicate in gates[0]
-    lines = [line for line in output.splitlines() if 'reversible bootstrap gate pk=' in line]
-    assert len(lines) == 1
-    assert predicate in lines[0] and '[redacted]' not in lines[0]
-    assert _ISSUE190_PRIVATE_ENTRY not in gates[0] + output
-    assert all(value not in output for value in facts.values())
-    assert row['human_approved_answers'] == {} and writes == []
-    no_mutations(raw)
-
-
-async def test_issue190_execute_entry_mismatch_gates_on_first_read(monkeypatch):
-    _row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4})
-    with pytest.raises(forms.Gate, match=r'predicate=entry\.equal\.frames; control=unavailable; site=execute'):
-        await forms.execute(
-            raw._reversible_session, raw.current,
-            dict(action='fill', selector='#_systemfield_name', fact='Name'),
-            facts={'Name': 'Test User'}, filled={}, resume_path='',
-            company=COMPANY, jd_text='', resume_tex='', github='',
-            pk=PK, job_url=posting('ashby'), provenance=provenance)
-    assert reads == [1]
-    no_mutations(raw)
 
 
 @pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
@@ -2505,8 +2331,6 @@ async def test_issue190_diagnostic_names_only_top_level_entry_key(monkeypatch, k
     text = str(failure.value)
     assert f'predicate=entry.equal.{key}; control=unavailable; site=execute' in text
     assert _ISSUE190_PRIVATE_ENTRY not in text
-    assert _ISSUE190_PRIVATE_ENTRY not in forms._reversible_bootstrap_gate_text(
-        failure.value)
     no_mutations(raw)
 
 
@@ -2536,20 +2360,15 @@ async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
     no_mutations(raw)
 
 
-def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
-    """A newly owner-answerable date must not expand the prior GLOBAL grant scope."""
+def test_issue196_date_is_a_normal_answerable_input_without_bank_grants():
     target = {
         'selector': '#synthetic-date', 'tag': 'input', 'type': 'date',
         'in_form': False, 'disabled': False, 'required': True,
         'label': 'Start date', 'question': '', 'value': '', 'has_value': False,
     }
     assert forms._native_answer(target)
-    # The obsolete per-step native-action helper is gone; bank admission is not.
+    assert not hasattr(forms, '_bank_auto_eligible')
     assert not hasattr(forms, '_require_native_action')
-    assert not forms._bank_auto_eligible(
-        target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
-
-
 
 async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(monkeypatch):
     """#241: rooted Yes/No can be inspected and prepared, not silently approved.
@@ -2642,426 +2461,30 @@ async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_roo
     assert not transport._application_controller.committed
 
 
-def _issue218_main_reader_scripts():
-    """Reconstruct and hash-pin this reader baseline, not a hand-built tree."""
-    import hashlib
-    from tools import browser_skill_dom as producer
-
-    source = Path(producer.__file__).read_text()
-    old = producer._ENTRY_OBSERVATION
-    # Keep the Issue #218 historical byte/hash oracle unchanged. Remove only
-    # Issue #252's precisely bounded survey delta from both live readers
-    # before reconstructing the old baseline; re-pinning the hash would
-    # silently weaken the original non-survey regression.
-    # Issue #252 ARCH 17:33: the one shared caption rule. Invert it first.
-    caption_delta = [
-        ("  // Issue #252: one caption rule for PAGE, both witnesses and the root census\n  // (declarations, so the entry root code above may call them). On Ashby a\n  // placeholder is never a label. An id-less, formless text-like input takes\n  // only the single question title of its own field entry inside the one main\n  // or one survey container; zero or several titles, or a title owned by\n  // another live control, give no caption.\n  function ashbyFieldTitle(e) {\n    if (!(location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com') ||\n        e.tagName!=='INPUT' || e.id || e.form || e.closest('form') ||\n        document.querySelector('form') || ['checkbox','radio','file','hidden','submit',\n          'button','image','reset'].includes(e.type)) return null;\n    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));\n    const main=all.filter(c=>!c.closest('.ashby-survey-form-container'));\n    const inner=surveys.length===1 ? all.filter(c=>surveys[0].contains(c)) : [];\n    const regions=main.length!==1 || surveys.length>1 ? [] :\n      [main[0], ...(inner.length===1 ? inner : [])];\n    const region=regions.find(r=>r.contains(e));\n    const entry=region ? e.closest('div.ashby-application-form-field-entry') : null;\n    if (!entry || !region.contains(entry)) return null;\n    const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));\n    const owner=titles.length===1 ? titles[0].getAttribute('for') : null;\n    return titles.length===1 && !(owner && document.getElementById(owner)) ? titles[0] : null;\n  }\n  function controlCaption(e) {\n    const title=ashbyFieldTitle(e);\n    if (title) return clean(title.innerText);\n    const ashby=location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com';\n    return clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n      (e.getAttribute('aria-labelledby') || '').split(' ')\n        .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n      e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||\n      e.innerText || e.name);\n  }\n",
-         '',
-         False),
-        ('  const label = e => controlCaption(e);\n',
-         "  const label = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n    (e.getAttribute('aria-labelledby') || '').split(' ')\n      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);\n",
-         False),
-        ('  const entryLabel = e => controlCaption(e);\n',
-         "  const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n    (e.getAttribute('aria-labelledby') || '').split(' ')\n      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);\n",
-         True),
-        ("      // The shared caption rule; association also needs this census's own\n      // field-entry proof to name the same title.\n      const titleLabel=ashbyFieldTitle(e), titled=!!titleLabel && field?.title===titleLabel;\n",
-         '',
-         True),
-        ("      // ARCH 17:40: a native choice is captioned by its own single label[for]\n      // in the same application container, the caption PAGE reads for it.\n      const choiceLabel=!hiddenLabel && !linked && !!id && e.tagName==='INPUT' &&\n        ['radio','checkbox'].includes(e.type) && labels.length===1 &&\n        actualLabels.length===1 && actualLabels[0]===labels[0] &&\n        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&\n        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&\n        !!clean(labels[0].innerText) &&\n        !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+\n          'area[href],audio[controls],video[controls],object,embed,iframe,'+\n          '[role],[tabindex],[contenteditable],[onclick]') ? labels[0] : null;\n      const ownLabel=linked ? labels[0] : hiddenLabel || (titled ? titleLabel : null) || choiceLabel;\n",
-         '',
-         True),
-        ("        id,label:titleLabel ? clean(titleLabel.innerText) : linked ? clean(labels[0].innerText) :\n          hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) :\n          choiceLabel ? clean(choiceLabel.innerText) : '',\n        label_selector:titleLabel ? selector(titleLabel) : linked ? selector(labels[0]) :\n          hiddenLabel ? selector(hiddenLabel) : choiceLabel ? selector(choiceLabel) : '',\n        name:e.name || '',associated:linked || !!hiddenLabel || titled || !!choiceLabel,\n        // A reported fact: is the one associated label itself visible?\n        label_visible:!!ownLabel && entryEvidenceVisible(ownLabel),\n",
-         "        id,label:linked ? clean(labels[0].innerText) : hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) : '',\n        label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',\n        name:e.name || '',associated:linked || !!hiddenLabel,\n",
-         True),
-    ]
-    for updated, previous, shared in caption_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    # Issue #252 amendment 16:29: the live div#form wrapper, quarantined
-    # uploader and link-only siblings. Invert only that exact delta first.
-    div_form_delta = [
-        ("    // One survey's single nested container is not a second application root.\n    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));\n    const main=all.filter(e=>!e.closest('.ashby-survey-form-container'));\n    const containers=surveys.length===1 && all.length-main.length===1 ? main : all;\n    if(containers.length===1",
-         "    const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    if(containers.length===1",
-         False),
-        ("  // Live Ashby renders the same quarantined autofill helper as an uploader.\n  const panes=Array.from(document.querySelectorAll(\n    '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader'));",
-         "  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));",
-         True),
-        ('  // A styled DIV, SPAN or P sibling whose only controls, if any, are plain\n  // description links. Links are never receivers, targets or click authority.\n  const linkOnlySibling=e=>{\n    if(![\'DIV\',\'SPAN\',\'P\'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n       !(a.name===\'class\' || /^data-/i.test(a.name)))) return false;\n    const nodes=[e,...Array.from(e.querySelectorAll(\'*\'))];\n    const interactive=query+\',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label,[autofocus],[controls],[form],[formaction]\';\n    const links=Array.from(e.querySelectorAll(\'a[href]\'));\n    return Array.from(e.querySelectorAll(interactive)).every(n=>\n      links.includes(n) && Array.from(n.attributes).every(a=>\n        [\'href\',\'target\',\'rel\',\'class\'].includes(a.name) || /^data-/i.test(a.name))) &&\n      nodes.every(n=>!n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));\n  };\n  // The quarantined helper is never a receiver; it may not carry Submit.\n  const paneArmed=panes.length===1 && !!panes[0].querySelector(\n    \'form,button.ashby-application-form-submit-button,button[type="submit"],\'+\n    \'input[type="submit"],input[type="image"],[form],[formaction],\'+\n    \'.ashby-application-form-container,.ashby-survey-form-container\');\n  const paneSafe=panes.length===1 && panes[0].tagName===\'DIV\' &&\n    panes[0].parentElement===wrapper && !paneArmed;\n', '', True),
-        ("!(surveyValid && n===survey) && !inertSibling(n,true) && !linkOnlySibling(n));",
-         "!(surveyValid && n===survey) && !inertSibling(n,true));", True),
-        ("  // Issue #252: the live div#form wrapper. Its direct children are exactly one\n  // quarantined helper, the main container, the exact Submit, at most one valid\n  // survey, and only inert or link-only siblings. It has the pane shape's\n  // authority and no more; any other child leaves the wrapper unowned.\n  const formShape=!!wrapper && wrapper.tagName==='DIV' && wrapper.id==='form' &&\n    !wrapper.getAttribute('class') && container?.tagName==='DIV' &&\n    exactSubmit?.tagName==='BUTTON' && exactSubmit.parentElement===wrapper && paneSafe &&\n    (!surveyWrappers.length || surveyValid) &&\n    siblings.every(n=>n===container || n===panes[0] || n===exactSubmit ||\n      (surveyValid && n===survey) || inertSibling(n,true) || linkOnlySibling(n));\n  const structuralRoot=!forms.length && (formShape || (ordered && paneSafe &&\n    (!surveyWrappers.length || surveyValid))) ? wrapper : null;",
-         '  const structuralRoot=!forms.length && ordered &&\n    (!surveyWrappers.length || surveyValid) ? wrapper : null;',
-         True),
-        ("      paneArmed || (surveyWrappers.length>0 && !surveyValid)))",
-         "      (surveyWrappers.length>0 && !surveyValid)))", True),
-        ("!ordered && !formShape &&\n      !surveyPane && !(",
-         "!ordered && !surveyPane && !(", True),
-        ("style,'+\n            '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader')",
-         "style,.ashby-application-form-autofill-pane')", True),
-    ]
-    for updated, previous, shared in div_form_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    survey_delta = [
-        (
-            """    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]') &&
-    !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
-      .some(b=>!b.hasAttribute('type')));""",
-            """    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]'));""",
-            False,
-        ),
-        (
-            """      in_form:!!form, form_selector:form ? selector(form) : '',
-      ...(pageAshbyNative && e.closest('div.ashby-survey-form-container')
-        ? {ashby_survey:true} : {}),
-      native_form_owner_selector:e.form ? selector(e.form) : '',""",
-            """      in_form:!!form, form_selector:form ? selector(form) : '',
-      native_form_owner_selector:e.form ? selector(e.form) : '',""",
-            False,
-        ),
-        (
-            """    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]') &&
-    !Array.from(survey.querySelectorAll('button')).some(b=>!b.hasAttribute('type'));""",
-            """    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]');""",
-            True,
-        ),
-        (
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),
-        ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),""",
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),""",
-            True,
-        ),
-        (
-            """  // A valid survey beside the pane is not an unknown sibling, but it does
-  // not extend the historic three-child certificate to final Submit.
-  const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&
-    panes[0].parentElement===wrapper && exactSubmit?.parentElement===wrapper &&
-    siblings.every(n=>n===container || n===panes[0] || n===survey ||
-      n===exactSubmit || inertSibling(n));
-  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            """  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            True,
-        ),
-        (
-            """  else if (!forms.length && container && exactSubmit && !ordered && !surveyPane && !(""",
-            """  else if (!forms.length && container && exactSubmit && !ordered && !(""",
-            True,
-        ),
-        (
-            """  const containerUploadRoot=(structuralError==='application root sibling identity mismatch' ||
-    (surveyPane && !structuralError)) &&
-    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
-            """  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
-    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
-            True,
-        ),
-        (
-            """  // Standalone PAGE must count only the main form, just like both entry readers.
-  const pageSurveyWrappers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-survey-form-container')) : [];
-  const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!e.closest('.ashby-survey-form-container')) : [];
-  const pageSurveyValid=pageSurveyWrappers.length===0 || (
-    pageSurveyWrappers.length===1 && ashbyContainers.length===1 &&
-    pageSurveyWrappers[0].tagName==='DIV' &&
-    pageSurveyWrappers[0].parentElement===ashbyContainers[0].parentElement &&
-    pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
-    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]'));""",
-            """  const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container')) : [];""",
-            False,
-        ),
-        (
-            """    return pageAshbyNative && !document.querySelector('form') &&
-      pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
-            """    return pageAshbyNative && !document.querySelector('form') &&
-      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
-            False,
-        ),
-        (
-            """  const surveyWrappers=ashbyNative ?
-    Array.from(document.querySelectorAll('.ashby-survey-form-container')) : [];
-  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!(ashbyNative && e.closest('.ashby-survey-form-container')));""",
-            """  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));""",
-            True,
-        ),
-        (
-            """  const wrapper=container?.parentElement;
-  const survey=surveyWrappers.length===1 ? surveyWrappers[0] : null;
-  const surveyContainers=survey ? Array.from(
-    survey.querySelectorAll('.ashby-application-form-container')) : [];
-  const surveyContainer=surveyContainers.length===1 ? surveyContainers[0] : null;
-  // Only one direct sibling section is a survey. Never elevate it to a new
-  // Submit certificate or treat its controls as bank-approved answers.
-  const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
-    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]');
-  // Layout order is decoration, not authority.""",
-            """  const wrapper=container?.parentElement;
-  // Layout order is decoration, not authority.""",
-            True,
-        ),
-        (
-            """  const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit &&
-    !(surveyValid && n===survey) && !inertSibling(n,true));""",
-            """  const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));""",
-            True,
-        ),
-        (
-            """  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            """  const structuralRoot=!forms.length && ordered ? wrapper : null;""",
-            True,
-        ),
-        (
-            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
-      (surveyWrappers.length>0 && !surveyValid)))
-    structuralError='ambiguous application roots';""",
-            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
-    structuralError='ambiguous application roots';""",
-            True,
-        ),
-        (
-            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && (
-      (wrapper.children.length===2 &&
-       wrapper.children[0]===container && wrapper.children[1]===exactSubmit) ||
-      (surveyValid && wrapper.children.length===3 &&
-       siblings.includes(container) && siblings.includes(survey) &&
-       siblings.includes(exactSubmit)))))""",
-            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
-    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))""",
-            True,
-        ),
-        (
-            """  const controlContainer=e=>container?.contains(e) ? container :
-    (surveyValid && surveyContainer?.contains(e) ? surveyContainer : null);
-  const fieldEntry = e => {
-    const region=controlContainer(e);
-    if (forms.length || !region || e.id) return null;
-    const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !region.contains(entry)) return null;""",
-            """  const fieldEntry = e => {
-    if (forms.length || !container || !container.contains(e) || e.id) return null;
-    const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !container.contains(entry)) return null;""",
-            True,
-        ),
-        (
-            """        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&""",
-            """        !!container && container.contains(labels[0]) && container.contains(e) &&""",
-            True,
-        ),
-        (
-            """        return ashbyNative && !forms.length && containers.length===1 &&
-          (!surveyWrappers.length || surveyValid) &&
-          (e.type==='checkbox' && container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
-          e.tagName""",
-            """        return ashbyNative && !forms.length && containers.length===1 &&
-          container?.contains(e) && e.tagName""",
-            True,
-        ),
-        (
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),""",
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!container && container.contains(e),""",
-            True,
-        ),
-    ]
-    for updated, previous, shared in survey_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    changes = [
-        (
-            "  // The exact sibling mismatch loses wrapper ownership but retains one bounded,\n"
-            "  // independently observed application container. It has no Submit authority.\n"
-            "  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&\n"
-            "    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&\n"
-            "    !!container && !!exactSubmit;\n"
-            "  const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);\n"
-            "  let passiveDelete=null;\n",
-            "",
-        ),
-        ("  if (uploadRoot) try {\n    const source=[], stack=[[uploadRoot,-1]];",
-         "  if (structuralRoot) try {\n    const source=[], stack=[[structuralRoot,-1]];"),
-        ("uploadRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')",
-         "structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')"),
-        ("    const items=Array.from(uploadRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n\n",
-         "    const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n"),
-        ("        passiveDelete=del;\n", ""),
-        ("    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector).concat(\n"
-         "      containerUploadRoot && passiveDelete ? [selector(passiveDelete)] : []),",
-         "    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),"),
-        ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
-         "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
-         "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
-        ("  // class and data-* are styling: they may not certify the wrapper, but must\n"
-         "  // not turn the container-scoped mismatch into \"unsafe sibling\" either. Live\n"
-         "  // Ashby decorates an inert sibling with data-highlight, and that label\n"
-         "  // emptied every reversible scope after #220. Any other attribute is unsafe.\n"
-         "  const inertSibling=(e,styled=false)=>{\n"
-         "    if(!['DIV','SPAN'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n"
-         "       !(styled && (a.name==='class' || /^data-/i.test(a.name))))) return false;",
-         "  const inertSibling=e=>{\n"
-         "    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;"),
-        ("!inertSibling(n,true));", "!inertSibling(n));"),
-        ("  const unsafeSibling=!!wrapper && siblings.some(n=>\n"
-         "    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));\n", ""),
-        ("    structuralError=unsafeSibling ?\n"
-         "      'application root sibling identity mismatch: unsafe sibling' :\n"
-         "      'application root sibling identity mismatch';",
-         "    structuralError='application root sibling identity mismatch';"),
-    ]
-    for updated, previous in changes:
-        assert source.count(updated) == old.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        old = old.replace(updated, previous, 1)
-    # FF-243a changed the controls reader, outside _ENTRY_OBSERVATION, so it
-    # is reverted in the hashed source only; both compared readers carry it.
-    # FF-247a scoped that aria-pressed read to Ashby Yes/No groups.
-    pressed = (
-        "      // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a\n"
-        "      // probe: Yes and No alike); no other button's aria-pressed is an answer.\n"
-        "      has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'\n"
-        "        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'\n"
-        "          && !!e.closest('div.ashby-application-form-input-yesno')),\n")
-    assert source.count(pressed) == 1 and old.count(pressed) == 0
-    source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
-                            "e.getAttribute('aria-checked') === 'true',\n", 1)
-    # The #248 interactive-label admission is not part of the Issue #218
-    # historical source witness; remove only those exact new predicates.
-    def hidden_label_guard(label, indent):
-        return (f"{indent}!{label}.querySelector("
-                "'a[href],button,input,select,textarea,summary,details,'+\n"
-                f"{indent}  'area[href],audio[controls],video[controls],object,embed,iframe,'+\n"
-                f"{indent}  '[role],[tabindex],[contenteditable],[onclick]') &&\n")
-
-    for guard in (hidden_label_guard('labels[0]', '      '),
-                  hidden_label_guard('ls[0]', '          ')):
-        assert source.count(guard) == 1
-        source = source.replace(guard, '', 1)
-    root_guard = hidden_label_guard('ls[0]', '          ')
-    assert old.count(root_guard) == 1
-    old = old.replace(root_guard, '', 1)
-    # The #256 Greenhouse-only phone-picker proof lives outside both Ashby
-    # entry readers; remove only that exact block and its one composition.
-    start = source.index('# Issue 256: every live Greenhouse embed read')
-    end = source.index('def greenhouse_reader(script: str) -> str:')
-    assert source.count('_GREENHOUSE_PHONE_PICKER') == 2 and start < end
-    assert producer._GREENHOUSE_PHONE_PICKER not in forms.ENTRY_PAGE
-    assert producer._GREENHOUSE_PHONE_PICKER not in forms._ENTRY_FIXED_CONTROL_WITNESS
-    source = source[:start] + source[end:]
-    composed = ("    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH +\n"
-                "                            _GREENHOUSE_PHONE_PICKER)\n")
-    assert source.count(composed) == 1
-    source = source.replace(composed, "    script = script.replace(_WIDGET_GRAPH, "
-                            "_GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)\n", 1)
-    # BrowserSkill 0.4 overlay census (Issue #272) replaced the 'Interrupt'-button
-    # shadow exemption in ordinary PAGE, which both compared readers carry; it is
-    # reverted in the hashed source only.
-    census_start = "  // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay"
-    census_end = "  const siteShadow = shadowRoots.some(e => e !== overlayHost);\n"
-    assert source.count(census_start) == source.count(census_end) == 1
-    assert old.count(census_start) == old.count(census_end) == 0  # not in _ENTRY_OBSERVATION
-    start = source.index(census_start)
-    end = source.index(census_end) + len(census_end)
-    assert start < end
-    source = source[:start] + (
-        "  // BrowserSkill injects its own Interrupt button in a shadow root. Treating\n"
-        "  // that overlay as an uninspected employer form gated every normal page.\n"
-        "  // Exempt only that exact, button-only overlay; site shadow controls still gate.\n"
-        "  const shadowRoots = Array.from(document.querySelectorAll('*')).filter(e=>e.shadowRoot);\n"
-        "  const siteShadow = shadowRoots.some(e => {\n"
-        "    const nested = Array.from(e.shadowRoot.querySelectorAll(query));\n"
-        "    const ownOverlay = e.tagName === 'BROWSER-SKILL-OVERLAY' && nested.length > 0 &&\n"
-        "      !e.shadowRoot.querySelector('iframe') && nested.every(n =>\n"
-        "        n.tagName === 'BUTTON' && n.type === 'button' && label(n) === 'Interrupt');\n"
-        "    return !ownOverlay;\n"
-        "  });\n") + source[end:]
-    overlay_filter = "    e !== overlayHost && !pickerParts.has(e) &&\n"
-    assert source.count(overlay_filter) == 1
-    assert old.count(overlay_filter) == 0
-    source = source.replace(
-        overlay_filter, "    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&\n", 1)
-    git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == 'bdcf6838e5450588fd012a386064b88810913929'  # Issue 282: + value_attr_present, hidden radio predicate, survey radio clause
-    assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
-    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
-    # The fixed witness's own #252 survey census reads entry bindings that the
-    # historical observation lacks; invert only that exact clause there.
-    fixed_survey = "      containers.length===1 && (!surveyWrappers.length || surveyValid) &&\n"
-    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(fixed_survey) == 1
-    return [
-        forms.ENTRY_PAGE.replace(producer._ENTRY_OBSERVATION, old, 1),
-        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(producer._ENTRY_OBSERVATION, old, 1)
-        .replace(fixed_survey, "      containers.length===1 &&\n", 1),
-    ]
-
-
-def _without_label_visible(snapshot):
-    # ARCH 17:40 adds exactly one reported census fact, label_visible; every
-    # other byte stays identical to main.
-    for e in snapshot['entry'].get('root_evidence') or []:
-        e.pop('label_visible', None)
-    return snapshot
-
-
-@pytest.mark.parametrize('reader_index', [0, 1])
 @pytest.mark.parametrize('spec_change', [
     {}, {'duplicateSubmit': True}, {'duplicatePane': True},
     {'secondFormlessComplete': True}, {'missingPane': True},
 ])
-def test_issue218_non_mismatch_readers_stay_byte_identical_to_main(reader_index, spec_change):
-    main = _issue218_main_reader_scripts()[reader_index]
-    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
+def test_formless_current_readers_agree_on_independent_entry_evidence(spec_change):
+    # Historical byte identity to main is intentionally invalid after #293.
+    # Compare the two active production readers on the same synthetic DOM.
     spec = dict(root=False, formless=True, url=entry('ashby'), **spec_change)
-    from json import dumps
-    assert dumps(_without_label_visible(dom(spec, reader)), ensure_ascii=False,
-                 separators=(',', ':')) == dumps(
-        dom(spec, main), ensure_ascii=False, separators=(',', ':'))
+    page = dom(spec, forms.ENTRY_PAGE)
+    fixed = dom(spec, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    assert page['entry'] == fixed['entry']
+    assert [(c['selector'], c['type']) for c in page['controls']] == [
+        (c['selector'], c['type']) for c in fixed['controls']]
 
 
-@pytest.mark.parametrize('reader_index', [0, 1])
+@pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 @pytest.mark.parametrize('attached', [False, True])
-def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, attached):
-    from json import dumps
-    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
-    main = _issue218_main_reader_scripts()[reader_index]
+def test_formless_current_upload_tree_reports_staged_file_and_passive_delete(
+        reader, attached):
     filename = 'Synthetic-Resume.pdf'
     spec = dict(root=False, formless=True, movePane=True, url=entry('ashby'),
                 **({'attached': True, 'files': [filename], 'displayName': filename}
                    if attached else {}))
-    current, baseline = _without_label_visible(dom(spec, reader)), dom(spec, main)
+    current = dom(spec, reader)
     root = current['entry']['formless']
     tree = current['entry']['upload_tree']
     assert root['error'] == 'application root sibling identity mismatch'
@@ -3073,33 +2496,15 @@ def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, att
     assert tree['nodes'][tree['input']]['target_selector'] == '#_systemfield_resume'
     assert tree['nodes'][tree['dropzone']]['target_selector'] == '#dropzone'
     assert tree['attached'] is attached
-    assert baseline['entry']['upload_tree'] is None
-    normalized = deepcopy(current)
-    normalized['entry']['upload_tree'] = None
     if attached:
         assert tree['filename'] == filename and len(tree['items']) == 1
-        deleted = '#delete-0'  # masked id in tree; real CSS in excluded
+        deleted = '#delete-0'
         assert tree['nodes'][tree['delete']]['selector'] != deleted
         assert deleted not in {c['selector'] for c in current['controls']}
         assert deleted not in {c['selector'] for c in current['entry']['root_evidence']}
         assert deleted in root['excluded']
-        assert root['excluded'] == [*baseline['entry']['formless']['excluded'], deleted]
-        for section in ('controls',):
-            assert current[section] == [
-                c for c in baseline[section] if c['selector'] != deleted]
-            normalized[section] = baseline[section]
-        assert current['entry']['root_evidence'] == [
-            c for c in baseline['entry']['root_evidence']
-            if c['selector'] != deleted]
-        normalized['entry']['root_evidence'] = baseline['entry']['root_evidence']
-        normalized['entry']['formless']['excluded'] = baseline['entry']['formless']['excluded']
-        assert deleted not in {c['selector'] for c in
-                               forms._reversible_entry_scope(current, {})}
     else:
         assert tree['items'] == [] and not tree.get('attached')
-        assert root['excluded'] == baseline['entry']['formless']['excluded']
-    assert dumps(normalized, ensure_ascii=False, separators=(',', ':')) == dumps(
-        baseline, ensure_ascii=False, separators=(',', ':'))
 
 @pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 def test_hidden_ashby_attestation_requires_one_visible_label_and_hidden_input(reader):
@@ -3173,81 +2578,17 @@ async def _opacity_blind_attestation_world(monkeypatch):
     return row, session, page, provenance
 
 
-async def test_hidden_choice_flag_needs_root_evidence_and_witness(monkeypatch, caplog):
-    """Only a choice both independent readers saw hidden behind its label is restored."""
+async def test_hidden_attestation_remains_independently_observed_without_member_grant(
+        monkeypatch):
     row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
-    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
-    witness = {c['selector']: c for c in session.raw.fixed['controls']}
-    assert forms._disclosure_question(
-        page, target, witness, posting('ashby'),
-        provenance=provenance)['ashby_hidden_choice'] is True
-    for damage in ('evidence', 'witness-flag', 'witness-label', 'witness-visible'):
-        broken_page, broken_witness = deepcopy(page), deepcopy(witness)
-        if damage == 'evidence':
-            for e in broken_page['entry']['root_evidence']:
-                if e['selector'] == _HIDDEN_ATTESTATION:
-                    e['ashby_hidden_choice'] = False
-        elif damage == 'witness-flag':
-            broken_witness[_HIDDEN_ATTESTATION]['ashby_hidden_choice'] = False
-        elif damage == 'witness-label':
-            broken_witness[_HIDDEN_ATTESTATION]['associated_label_selector'] = '#other'
-        else:
-            broken_witness[_HIDDEN_ATTESTATION]['visible'] = True
-            broken_witness[_HIDDEN_ATTESTATION]['visible_text'] = 'Different caption'
-        caplog.clear()
-        with caplog.at_level(logging.INFO, logger=forms._LOG.name):
-            with pytest.raises(forms.Gate) as gate:
-                forms._disclosure_question(
-                    broken_page, deepcopy(target), broken_witness, posting('ashby'),
-                    provenance=provenance)
-        assert gate.value.reason == 'defect_witness', damage
-        messages = [r.getMessage() for r in caplog.records
-                    if 'disclosure member witness failed' in r.getMessage()]
-        assert len(messages) == 1, damage
-        assert messages[0].startswith(
-            'disclosure member witness failed type=checkbox hidden_choice=False '
-            'predicate='), messages[0]
-        assert _OWNER_ATTESTATION not in messages[0]
-
-
-@pytest.mark.parametrize('damage,token', [
-    ('flag', 'hidden_flag'),
-    ('association', 'hidden_association'),
-    ('text', 'hidden_text'),
-])
-async def test_hidden_choice_member_witness_logs_only_failed_subpredicate_token(
-        monkeypatch, caplog, damage, token):
-    """Issue #276 ARCH delta: a hidden member names its first failed subpredicate."""
-    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
-    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
-    witness = deepcopy({c['selector']: c for c in session.raw.fixed['controls']})
-    flagged = {**target, 'ashby_hidden_choice': True, 'visible': False,
-               'associated_label_selector': witness[_HIDDEN_ATTESTATION][
-                   'associated_label_selector']}
-    dom = witness[_HIDDEN_ATTESTATION]
-    secret = 'Synthetic unlogged caption'
-    if damage == 'flag':
-        dom['ashby_hidden_choice'] = False
-    elif damage == 'association':
-        dom['associated_label_selector'] = '#' + secret.replace(' ', '-')
-    else:
-        dom['visible_text'] = secret
-    with caplog.at_level(logging.INFO, logger=forms._LOG.name):
-        with pytest.raises(forms.Gate) as gate:
-            forms._disclosure_question(page, flagged, witness, posting('ashby'),
-                                       provenance=provenance)
-    assert gate.value.reason == 'defect_witness'
-    messages = [r.getMessage() for r in caplog.records
-                if 'disclosure member witness failed' in r.getMessage()]
-    assert messages == ['disclosure member witness failed type=checkbox '
-                        f'hidden_choice=True predicate={token}']
-    assert secret not in messages[0] and _OWNER_ATTESTATION not in messages[0]
-    assert secret.replace(' ', '-') not in messages[0]
-
-
-def test_non_hidden_member_keeps_visible_predicate():
-    member = {'type': 'checkbox', 'label': 'x', 'disabled': False}
-    dom = {'visible': False, 'ashby_hidden_choice': False,
-           'associated_label_selector': '', 'visible_text': 'x'}
-    assert forms._member_witness_predicate(
-        member, dom, choice=True, hidden_attestation=False) == 'visible'
+    target = next(c for c in page['controls']
+                  if c['selector'] == _HIDDEN_ATTESTATION)
+    witness = next(c for c in session.raw.fixed['controls']
+                   if c['selector'] == _HIDDEN_ATTESTATION)
+    evidence = next(e for e in page['entry']['root_evidence']
+                    if e['selector'] == _HIDDEN_ATTESTATION)
+    assert target['ashby_hidden_choice'] is True
+    assert witness['ashby_hidden_choice'] is True
+    assert evidence['ashby_hidden_choice'] is True
+    assert not hasattr(forms, '_disclosure_question')
+    assert not hasattr(forms, '_member_witness_predicate')

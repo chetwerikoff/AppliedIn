@@ -625,7 +625,7 @@ async def test_submit_confirmation_needs_exact_route_and_independent_new_proof(
     assert len(hold) == 1
     assert [c for c in session.calls if c[0] == 'click'] == [('click', '#submit')]
     if redirect:
-        assert 'Check the employer portal before retrying' in result['detail']
+        assert 'without fresh independent employer confirmation' in result['detail']
 
 
 @pytest.mark.parametrize('board', ['example-co.test', 'a_b', 'a/b', 'a%20b',
@@ -1428,7 +1428,7 @@ async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw
     # Raw action attributes remain independently absent/empty above. The
     # removed pre-step native certificate is not the submission authority.
     assert result['form_question'] is None
-    assert 'not been submitted' in result['question']
+    assert 'observed form needs human inspection' in result['question'].lower()
     assert decide.await_count == 1
     no_mutations(raw)
 
@@ -1505,7 +1505,7 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # retired. None of these contradictory observed roots can be treated as
         # an approved final application or trigger a writing IPC.
         assert result['form_question'] is None
-        assert 'not been submitted' in result['question']
+        assert 'observed form needs human inspection' in result['question'].lower()
         # A definite foreign posting ID refuses before the model or any effectful IPC.
         assert decide.await_count == (0 if case == 'contrary-job' else 1)
     no_mutations(raw)
@@ -1829,7 +1829,7 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'uncertain', result
-    assert 'check the employer portal before retrying' in result['detail'].lower()
+    assert 'unclassified page transition may have submitted' in result['detail'].lower()
     assert decide.await_count == 1
     assert [c for c in endpoint.calls if c[0] == 'click'] == [
         ('click', '#continue')]

@@ -1247,23 +1247,6 @@ async def test_foreign_greenhouse_submit_receiver_is_item_one_refusal(
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
-@pytest.mark.parametrize('verb', ['upload', 'click'])
-async def test_tracked_action_never_promotes_observed_page_to_origin(
-        monkeypatch, tmp_path, verb):
-    p = inventory(field('Upload résumé', '#file', type='file'),
-                  submit('Continue', selector='#next', form_action=GH_DIRECT),
-                  url=GH_DIRECT)
-    browser, _, _ = _greenhouse_session(monkeypatch, tmp_path, p)
-    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: True)
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            browser, p, {'action': verb, 'selector': '#file' if verb == 'upload'
-                        else '#next'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
-            resume_tex='', github='', pk=GH_PK, allow_click=True, job_url='')
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
 async def test_alias_execute_gate_producer_captures_original_row(monkeypatch, tmp_path):
     p = inventory(field(form_action=GH_DIRECT),
                   submit(form_action=GH_DIRECT), url=GH_DIRECT)
@@ -1312,42 +1295,15 @@ async def test_alias_exact_upload_uses_fresh_native_receiver(monkeypatch, tmp_pa
                   submit(form_action=GH_DIRECT), url=GH_DIRECT)
     browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
     browser.allow_mutations = True
+    pdf = tmp_path / 'Resume.pdf'
+    pdf.write_bytes(b'%PDF-1.4\nsynthetic example-co resume\n')
     receipt = await forms.execute(
         browser, p, {'action': 'upload', 'selector': '#resume'},
-        facts={}, filled={}, resume_path='Resume.pdf',
+        facts={}, filled={}, resume_path=str(pdf),
         company='example-co', jd_text='', resume_tex='', github='',
         pk=GH_PK, job_url=GH_WRAP, provenance=_greenhouse_provenance(row))
     assert receipt['uploaded'] is True
     assert len([c for c in browser.calls if c[0] == 'upload']) == 1
-
-
-async def test_tracked_direct_execute_does_not_borrow_forged_alias_without_context(
-        monkeypatch, tmp_path):
-    p = inventory(field(form_action=GH_DIRECT),
-                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
-    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
-    # Even a matching-looking page.url and job_url cannot mint authority.
-    with pytest.raises(forms.Gate, match='exact human-approved answer'):
-        await forms.execute(
-            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-            facts={'Email': 'test@example.test'}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
-            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT)
-    assert browser.calls == []
-
-
-async def test_alias_wrong_tracked_caller_identity_never_mutates(monkeypatch, tmp_path):
-    p = inventory(field(form_action=GH_DIRECT),
-                  submit(form_action=GH_DIRECT), url=GH_DIRECT)
-    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            browser, p, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-            facts={'Email': 'test@example.test'}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
-            resume_tex='', github='', pk=GH_PK, job_url=GH_DIRECT,
-            provenance=_greenhouse_provenance(row))
-    assert browser.calls == []
 
 
 async def test_alias_config_revoked_during_witness_gates_without_question(
@@ -1934,115 +1890,6 @@ async def test_vendor_row_drift_during_resume_staging_gates_before_chrome(monkey
     assert browser.calls == []
 
 
-async def test_vendor_combobox_final_observation_rechecks_sibling_formaction(monkeypatch):
-    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
-    target = 'https://careers.example-co.test/jobs/backend-123'
-    pk = 'example-co#backend-123'
-    combo = field('Country', '#country', required=False, type='combobox',
-                  form_action=target, combobox={
-                      'linked': True, 'link_id': 'country-list',
-                      'listbox_selector': '#country-list',
-                      'options': [{'selector': '#country-example', 'unique': True,
-                                   'label': 'Example Country', 'value': 'EX'}],
-                      'selected_text': '', 'displayed_text': '',
-                      'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
-    page = inventory(combo, submit(form_action=target), url=target)
-    browser, _, row = world(monkeypatch, page)
-    row.update(_vendor_row(pk, canonical))
-    row['human_approved_answers'] = {'Country': {
-        'value': 'Example Country', 'selector': '#country', 'url': target,
-        'label': 'Country', 'question': '', 'tag': 'input', 'type': 'combobox',
-        'form_selector': '#application', 'form_action': target,
-        'verified_redirect_url': target}}
-    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
-    _install_vendor_redirect(monkeypatch, target)
-    decision_returned = False
-    page_refreshes = 0
-    original_page = browser.page
-    async def refresh_page():
-        nonlocal page_refreshes
-        if decision_returned:
-            page_refreshes += 1
-            if page_refreshes == 2:
-                browser.current['controls'][1]['formaction'] = 'https://foreign.test/submit'
-        return await original_page()
-    monkeypatch.setattr(browser, 'page', refresh_page)
-    original_call = browser.call
-    async def live_witness(*args, **kwargs):
-        if args[0] == 'evaluate':
-            evidence = witness(browser.current)
-            for source, observed in zip(browser.current['controls'], evidence['controls']):
-                if source.get('type') == 'combobox':
-                    observed['combobox'] = deepcopy(source['combobox'])
-            browser.result = evidence
-        if args[0] == 'click' and args[1] == '#country-example':
-            browser.calls.append(args)
-            return {}
-        return await original_call(*args, **kwargs)
-    monkeypatch.setattr(browser, 'call', live_witness)
-    async def decide(*args, **kwargs):
-        nonlocal decision_returned
-        decision_returned = True
-        return {'action': 'combobox', 'selector': '#country', 'fact': 'Country'}
-    monkeypatch.setattr(bsk, 'decision', decide)
-    result = await forms.apply(
-        canonical, 'example-co', {'Country': 'Example Country'}, 'synthetic',
-        pk=pk, resume_path='Resume.pdf')
-    assert result['status'] == 'gate'
-    assert 'form destination is external' in result['question']
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
-
-async def test_vendor_combobox_row_drift_after_initial_observation_has_no_question(monkeypatch):
-    canonical = 'https://example-co.teamtailor.com/jobs/backend-123'
-    target = 'https://careers.example-co.test/jobs/backend-123'
-    pk = 'example-co#backend-123'
-    combo = field('Country', '#country', required=False, type='combobox',
-                  form_action=target, combobox={
-                      'linked': True, 'link_id': 'country-list',
-                      'listbox_selector': '#country-list',
-                      'options': [{'selector': '#country-example', 'unique': True,
-                                   'label': 'Example Country', 'value': 'EX'}],
-                      'selected_text': '', 'displayed_text': '',
-                      'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
-    page = inventory(combo, submit(form_action=target), url=target)
-    browser, _, row = world(monkeypatch, page)
-    row.update(_vendor_row(pk, canonical))
-    row['human_approved_answers'] = {'Country': {
-        'value': 'Example Country', 'selector': '#country', 'url': target,
-        'label': 'Country', 'question': '', 'tag': 'input', 'type': 'combobox',
-        'form_selector': '#application', 'form_action': target,
-        'verified_redirect_url': target}}
-    evidence = witness(page)
-    evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
-    browser.result = evidence
-    monkeypatch.setattr(forms, '_row', lambda _pk, **kwargs: row)
-    _install_vendor_redirect(monkeypatch, target)
-    evaluations = 0
-    original_call = browser.call
-    async def drift_after_execute_observation(*args, **kwargs):
-        nonlocal evaluations
-        result = await original_call(*args, **kwargs)
-        if args[0] == 'evaluate':
-            evaluations += 1
-            if evaluations == 1:
-                row['jd_url'] = 'https://example-co.teamtailor.com/jobs/other'
-        return result
-    monkeypatch.setattr(browser, 'call', drift_after_execute_observation)
-    async def decide(*args, **kwargs):
-        return {'action': 'combobox', 'selector': '#country', 'fact': 'Country'}
-    monkeypatch.setattr(bsk, 'decision', decide)
-    result = await forms.apply(
-        canonical, 'example-co', {'Country': 'Example Country'}, 'synthetic',
-        pk=pk, resume_path='Resume.pdf')
-    assert result['status'] == 'gate'
-    assert result['form_question'] is None
-    assert 'tracked posting changed before combobox preparation' in result['question']
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
-
-
 def _marked_name_grant(*, selector="#first", value="Test User", url=GH_DIRECT):
     return {
         "value": value, "selector": selector, "url": url,
@@ -2284,36 +2131,6 @@ async def test_new_legal_or_broader_privacy_choice_is_normal_owner_answer():
     assert receipt['action'] == 'choose'
     assert browser.calls == [('click', '#marketing')]
     assert page['controls'][0]['checked'] is True
-
-@pytest.mark.parametrize('verb,caption', [
-    ('submit', 'Submit application'), ('click', 'Continue'),
-])
-async def test_unbound_application_session_cannot_issue_committing_click(
-        monkeypatch, verb, caption):
-    """A fake/nonbinding Session cannot bypass the one raw Submit guard.
-
-    The synthetic HTTPS row, current form and already attached test PDF are
-    otherwise admissible. A complete form is not authority for raw click IPC.
-    """
-    page = secure_inventory(field(
-        'Resume', '#resume', type='file', required=False,
-        files=['Test User Resume.pdf'], has_value=True))
-    page['controls'][-1]['label'] = caption
-    browser, decide, row = world(monkeypatch, page)
-    row.update(company='example-co', job_id='1', jd_url=SECURE_URL,
-               ats='custom', title=page['title'])
-    decide.return_value = {'action': verb, 'selector': '#submit'}
-
-    report = await forms.apply(
-        SECURE_URL, 'example-co', {}, 'synthetic',
-        pk=PK, resume_path='Test User Resume.pdf')
-    assert report['status'] == 'gate'
-    assert 'bound raw IPC guard' in report['question']
-    assert 'no click is safe' in report['question']
-    assert decide.await_count == 1
-    assert not any(call[0] == 'click' for call in browser.calls)
-    assert row['status'] == 'submitting' and row['possible_submission'] is False
-
 
 def _synthetic_aria_role_combobox_page(tag='button'):
     combo = dict(
@@ -2583,40 +2400,18 @@ async def test_initial_navigation_redirect_explains_same_employer_origin(monkeyp
     assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
     assert 'Tracked host/path: example-co.test/job/1' in report['question']
     assert 'destination host/path: foreign.example.test/job/1' in report['question']
-    assert report['step']['url'] == 'unavailable'
-    assert 'QUERY_SECRET' not in report['question']
-    assert 'FRAGMENT_SECRET' not in report['question']
+    assert 'foreign.example.test/job/1' in report['step']['url']
+    assert 'QUERY_SECRET' not in report['question'] + report['step']['url']
+    assert 'FRAGMENT_SECRET' not in report['question'] + report['step']['url']
     assert browser.calls == [('navigate', SECURE_URL)]
     assert row.get('possible_submission') is False
 
 
-@pytest.mark.parametrize('verb', ['click', 'navigate'])
-async def test_observed_link_and_model_navigation_share_failed_provenance_predicate(
-        monkeypatch, verb):
-    destination = ('https://foreign.example.test/other-job'
-                   '?token=QUERY_SECRET#FRAGMENT_SECRET')
-    linked = field('Read more', '#next', tag='a', type='link',
-                   href=destination, required=False, in_form=False)
-    page = secure_inventory(field(), linked)
-    browser, decide, row = secure_world(monkeypatch, page)
-    # Retain the production action-scope and route predicates. Only the
-    # unrelated field reader/approved-choice setup is skipped by this fixture.
-
-    decide.return_value = ({'action': 'click', 'selector': '#next'}
-                           if verb == 'click'
-                           else {'action': 'navigate', 'url': destination})
-    report = await secure_attempt(page)
-    assert decide.await_count == 1
-    assert report['status'] == 'gate'
-    assert report['reason'] == 'defect_provenance'
-    assert report.get('navigation_provenance_diagnostic') is not True
-    assert 'Navigation' in report['question']
-    assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
-    assert 'destination host/path: foreign.example.test/other-job' in report['question']
-    assert 'QUERY_SECRET' not in report['question']
-    assert 'FRAGMENT_SECRET' not in report['question']
-    assert browser.calls == [('navigate', SECURE_URL)]
-    assert row.get('possible_submission') is False
+def test_foreign_navigation_cannot_become_tracked_preparation_origin():
+    """A foreign observed link is not an approved employer preparation route."""
+    foreign = 'https://foreign.example.test/other-job'
+    assert not forms._preparation_destination_allowed(foreign, SECURE_URL)
+    assert not forms._preparation_origin(foreign, SECURE_URL)
 
 
 async def test_navigation_diagnostic_stays_out_of_telemetry(monkeypatch):

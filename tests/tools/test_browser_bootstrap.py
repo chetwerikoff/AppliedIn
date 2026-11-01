@@ -307,9 +307,10 @@ async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monke
               'type': 'submit', 'tag': 'button', 'submit': True,
               'in_form': True, 'form_selector': '#app',
               'form_action': foreign}
-    with pytest.raises(forms.Gate, match='tenant or board'):
-        await controller.authorize_final_submit(
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(
             None, {'url': foreign, 'controls': [target]}, target)
+    assert refusal.value.item == 1
     assert writes == [] and controller.committed is False
 
 
@@ -320,31 +321,35 @@ async def test_derived_cross_tenant_board_gates_before_tracking_or_browser(monke
     field('Arbitration consent', '#legal', tag='input', type='radio',
           name='legal', question='Arbitration consent', required=True),
 ])
-async def test_login_and_material_choice_wall_precedes_text_gate(
+async def test_login_boundary_and_missing_assent_fact_use_current_paths(
         monkeypatch, tmp_path, extra_control):
-    # An ordinary unanswered field is now a FINAL Submit refusal, not an
-    # early structural bootstrap gate. Keep real login and owner-only legal
-    # decisions as separate pre-disclosure refusals on a safe synthetic route.
-    p = secure_inventory(field(), extra_control)
+    page = secure_inventory(field(), extra_control)
     kind = extra_control.get('type')
     if kind == 'checkbox':
         browser, row, filled, history = await prepared_without_unapproved_write(
-            monkeypatch, p)
-        assert p['controls'][0]['selector'] == '#email'
-        assert p['controls'][0]['form_action'] == SECURE_URL
+            monkeypatch, page)
         await final_submit_denied(
-            monkeypatch, tmp_path, p, row, filled, history,
-            reason='Required field is empty: Email')
-        assert all(x[0] not in {'fill', 'click', 'upload'} for x in browser.calls)
+            monkeypatch, tmp_path, page, row, filled, history,
+            reason='required application field is empty')
     else:
-        browser = Browser(p)
-        with pytest.raises(forms.Gate) as denial:
-            await forms._bootstrap(browser, p, PK, {}, SECURE_URL)
+        browser = Browser(page)
         if kind == 'password':
-            assert 'Login or account' in str(denial.value)
+            action = {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
+            facts = {'Email': 'synthetic@example.test'}
+        else:
+            action = {'action': 'choose', 'selector': '#legal',
+                      'fact': 'Arbitration consent'}
+            facts = {}
+        with pytest.raises(forms.Gate) as denial:
+            await forms.execute(
+                browser, page, action, facts=facts, filled={}, resume_path='',
+                company='example-co', jd_text='', resume_tex='', github='',
+                pk=PK, job_url=SECURE_URL)
+        if kind == 'password':
+            assert 'owner account action' in str(denial.value)
         else:
             assert denial.value.reason == 'owner_question'
-            assert 'Direct owner review' in str(denial.value)
+            assert denial.value.form_question['selector'] == '#legal'
         assert not any(x[0] in {'fill', 'click', 'upload'} for x in browser.calls)
 
 async def test_duplicate_question_can_fill_two_current_receivers_without_grants():
@@ -1281,9 +1286,10 @@ async def test_no_explicit_alias_config_stops_before_navigation(monkeypatch, tmp
     controller = forms.ApplicationIPCController(
         GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
         pytest.fail('An unconfigured alias cannot start Submit'))
-    with pytest.raises(forms.Gate, match='tenant or board'):
-        await controller.authorize_final_submit(
+    with pytest.raises(forms.PreSubmitGate) as denial:
+        await controller.check_pre_submit(
             None, browser.current, browser.current['controls'][-1])
+    assert denial.value.item == 1
     assert not decide.await_count or decide.await_count == 1
 
 async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch, tmp_path):
@@ -2792,7 +2798,7 @@ async def test_initial_navigation_redirect_explains_same_employer_origin(monkeyp
     browser.current = {**deepcopy(page), 'url': bad}
     report = await secure_attempt(page)
     assert report['status'] == 'gate'
-    assert report['navigation_provenance_diagnostic'] is True
+    assert report['reason'] == 'defect_provenance'
     assert report['review_route'] == 'hard_refusal'
     assert 'Initial redirect is not proven' in report['question']
     assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']

@@ -121,25 +121,30 @@ class FixtureRaw(RootSession):
         return {'value': {'set': True, 'files': [name]}}
 
 
-async def test_separate_sealed_grants_reach_existing_next_human_gate(authority, monkeypatch):
+async def test_sealed_ashby_preparation_uploads_once_before_model_review(
+        authority, monkeypatch):
+    """Ungated known answers need no former per-field grant or owner question."""
     Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
     authority.ashby = authority.ashby_upload = True
     authority.enable_positive_fixture()
     raw = FixtureRaw(authority)
+    seen = _script_recovery_decisions(
+        monkeypatch, first='upload', after_upload='gate')
     monkeypatch.setattr(forms.bsk, 'Session', lambda *_args: raw)
     result = await forms.apply(fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
                                'synthetic-fixture', pk=fixture.PK,
                                resume_path=authority.resume_path, fixture_context=authority)
-    assert result['status'] == 'gate', result
-    assert result['form_question']['selector'] == '#additional', result
-    assert result['form_question']['owner_kind'] == 'ashby-formless-root'
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
+    assert result['form_question'] is None
+    assert [action for action, _, _ in seen] == ['fill', 'fill', 'upload', 'gate']
     assert authority.entry_wait == 'PASS'
     assert authority.fills == 2 and authority.ipc_index == 3
     assert authority.upload_ipc == 1 and authority.uploaded
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
-    assert not authority.row.get('human_approved_answers')  # No retired per-field grants.
+    assert not any(call[0] == 'click' for call in raw.calls)
+    assert not authority.row.get('human_approved_answers')
 
 
 @pytest.mark.parametrize('attempt', ['chooser', 'other-file', 'click', 'repeat'])

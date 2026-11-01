@@ -3324,10 +3324,15 @@ class ApplicationIPCController:
             self.upload_pending = False
             # Same path/filename is not byte provenance; recheck inode, times
             # and digest after CLI consumption, even on an interrupted command.
-            if self.upload_identity != self._row_pdf():
+            try:
+                current_identity = self._row_pdf()
+            except Gate:
+                # Local PDF proof can fail after the browser has consumed an
+                # upload command; a failed hash check does not undo its effect.
                 self.upload_completed = False
-                # Browser IPC has already been attempted; even a source-digest
-                # mismatch cannot prove the remote upload did not commit.
+                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.') from None
+            if self.upload_identity != current_identity:
+                self.upload_completed = False
                 raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')
             # A failed or cancelled transport cannot prove a file attachment,
             # regardless of unchanged local bytes and prior upload history.
@@ -3335,7 +3340,12 @@ class ApplicationIPCController:
         elif args and args[0] == 'evaluate' and self.upload_pending:
             self.upload_pending = False
             identity, self._resume_set_identity = self._resume_set_identity, None
-            if identity != self._row_pdf():
+            try:
+                current_identity = self._row_pdf()
+            except Gate:
+                self.upload_completed = False
+                raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.') from None
+            if identity != current_identity:
                 self.upload_completed = False
                 # Never retry a file set whose effect may already have occurred.
                 raise RuntimeError('The staged PDF changed during upload IPC; inspect the attachment.')

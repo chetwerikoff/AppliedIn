@@ -76,6 +76,27 @@ def _world(monkeypatch, tmp_path, *, case='ready'):
             'checked': True, 'required': False, 'in_form': True,
             'form_selector': '#app',
         })
+    if case in {'protected_button', 'protected_button_decline'}:
+        page['controls'].insert(1, {
+            'selector': '#gender-button',
+            'label': ('Prefer not to answer' if case == 'protected_button_decline'
+                      else 'Female'),
+            'question': 'Gender', 'tag': 'button', 'type': 'button',
+            'checked': True, 'required': False, 'in_form': True,
+            'form_selector': '#app', 'submit': False,
+        })
+    if case in {'protected_select', 'protected_select_decline'}:
+        page['controls'].insert(1, {
+            'selector': '#gender-select',
+            'label': 'Gender', 'question': 'Gender',
+            'tag': 'select', 'type': 'select', 'required': False,
+            'value': 'skip' if case == 'protected_select_decline' else 'female',
+            'options': [
+                {'value': 'female', 'label': 'Female'},
+                {'value': 'skip', 'label': 'Prefer not to answer'},
+            ],
+            'in_form': True, 'form_selector': '#app',
+        })
     if case in {'salary', 'incomparable', 'salary_above'}:
         facts['Minimum salary floor'] = (
             'EUR 100000 yearly' if case == 'incomparable'
@@ -127,6 +148,7 @@ def _world(monkeypatch, tmp_path, *, case='ready'):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('case', 'item'), [
     ('job', 1), ('pdf', 2), ('pdf_extra', 2), ('protected', 3),
+    ('protected_button', 3), ('protected_select', 3),
     ('salary', 4), ('incomparable', 4),
     ('sanctions', 5), ('sanctions_missing', 5),
 ])
@@ -192,6 +214,7 @@ async def test_no_preparation_op_checks_commit_but_enter_does(
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', [
     'ready', 'salary_above', 'sanctions_decline', 'protected_decline',
+    'protected_button_decline', 'protected_select_decline',
 ])
 async def test_safe_readback_examples_pass_the_same_final_check(
         monkeypatch, tmp_path, case):

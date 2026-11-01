@@ -1200,7 +1200,8 @@ async def test_partial_inventory_checks_unrelated_observed_receivers(monkeypatch
     _, _, session, decide = world(monkeypatch,'lever',pages)
     report = await attempt('lever')
     assert 'native form receiver not proven' in report['question']
-    assert session.pages == (1 if read=='first' else 2)
+    # An incomplete nested read may consume the remaining bounded observation.
+    assert session.pages == (1 if read=='first' else 3)
     assert not decide.await_count
     no_mutations(session)
 
@@ -1251,19 +1252,14 @@ async def test_partial_first_read_cannot_hide_authority_drift(monkeypatch, drift
             configs[0].board = 'foreign'
     session.on_page = change
     result = await attempt('lever')
-    if drift == 'row':
-        assert 'route or current row/config changed' in result['question']
-        assert session.pages == 1
-    else:
-        # ARCH21:58 / AC2/AC14: a same-host route or board-pin change cannot
-        # recreate an early tenant certificate. Incomplete reads remain bounded
-        # and the unchanged final guard must refuse this route/configuration.
-        assert 'unverified application inventory after bounded wait' in result['question']
-        assert session.pages > 1
-        guard = forms.ApplicationIPCController(
-            PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
-        await _assert_final_tenant_refusal(
-            guard, session, session.current, {'label': 'Submit'})
+    # Incomplete observations can be retried during preparation; changed
+    # row, tenant, and route must all be rejected by the one final raw guard.
+    assert 'unverified application inventory after bounded wait' in result['question']
+    assert session.pages > 1
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
+    await _assert_final_tenant_refusal(
+        guard, session, session.current, {'label': 'Submit'})
     assert not decide.await_count
     no_mutations(session)
 
@@ -2806,8 +2802,9 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
     assert authorized == ['#submit']
-    assert result['review_route'] == 'hard_refusal', result
-    assert result['reason'] == 'defect_tenant', result
+    assert result['review_route'] == 'luna', result
+    assert result['reason'] == 'defect_pre_submit_item_1', result
+    assert result['item'] == 1
     assert [c for c in raw.calls if c[0] == 'fill'] == [
         ('fill', '#email', '--value', 'test@example-co.test')]
     assert not [c for c in raw.calls if c[0] == 'click']
@@ -2866,8 +2863,9 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     assert consumed['result'] == 'gated' and consumed['question'] == result['question']
     assert tracked['status'] == 'needs_human'
     assert tracked['gate_pending']['question'] == result['question']
-    assert tracked['gate_pending']['review_route'] == 'hard_refusal'
-    assert tracked['gate_reason'] == result['reason'] == 'defect_tenant'
+    assert tracked['gate_pending']['review_route'] == 'luna'
+    assert tracked['gate_pending']['item'] == 1
+    assert tracked['gate_reason'] == result['reason'] == 'defect_pre_submit_item_1'
 
 
 @pytest.mark.parametrize('spec', [

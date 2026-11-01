@@ -31,49 +31,48 @@ def _admit_ashby_without_field_grants(monkeypatch):
 
     monkeypatch.setattr(fixture._SyntheticRun, 'entry_admitted', admit)
 
-    # The sealed fixture still limits IPC to the original two synthetic fills
-    # and one exact staged PDF set. Under ungated preparation the first effect,
-    # not mere file-input visibility, determines whether proactive or later
-    # upload came first. Never admit a second upload or a Submit IPC.
+    # Keep the original closed fixture's three exact effects: two synthetic
+    # fills and one staged PDF set. A receiver can hydrate between those fills,
+    # so only the observed order changes; no new mutation or second upload is
+    # admitted, and the underlying fixture still forbids Submit.
     original_ipc = fixture._SyntheticRun._positive_ipc
     scenarios = {}
 
     def current_ipc(self):
         sequence = original_ipc(self)
-        if not self.ashby_upload:
-            return sequence
-        token = id(self)
-        return scenarios.get(token, sequence)
+        return scenarios.get(id(self), sequence) if self.ashby_upload else sequence
 
     monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', current_ipc)
     original_facade = fixture._SyntheticRun.facade
 
     def current_facade(self, raw):
         sealed = original_facade(self, raw)
-        if not self.ashby_upload or self.ipc_index != 0:
+        if not self.ashby_upload:
             return sealed
         state = self
+        seen = []
 
-        class _SealedFirstEffect:
+        class _SealedObservedOrder:
             async def call(self, *args, **kwargs):
-                sequence = original_ipc(state)
-                # PAGE/witness reads cannot predict whether the first effect
-                # is the early PDF set or the model's first ordinary fill.
-                # Admit only the same three exact synthetic effects, in their
-                # observed first-effect order, through the original closed
-                # fixture (which still refuses all Submit IPC).
-                if (state.ipc_index == 0 and id(state) not in scenarios
-                        and (args == sequence[-1] or
-                             args and args[0] in {'fill', 'click', 'select', 'upload'})):
-                    scenarios[id(state)] = (
-                        (sequence[-1], *sequence[:-1])
-                        if args == sequence[-1] else sequence)
-                return await sealed.call(*args, **kwargs)
+                allowed = original_ipc(state)
+                # Reading does not grant an effect. Only an exact, unused
+                # synthetic operation can take the next sealed IPC slot.
+                if (not kwargs and state.ipc_index == len(seen)
+                        and args in allowed and args not in seen
+                        and (args != allowed[1] or allowed[0] in seen)):
+                    remaining = [op for op in allowed
+                                 if op not in seen and op != args]
+                    scenarios[id(state)] = (*seen, args, *remaining)
+                result = await sealed.call(*args, **kwargs)
+                if (state.ipc_index == len(seen) + 1 and args in allowed
+                        and args not in seen):
+                    seen.append(args)
+                return result
 
             def __getattr__(self, name):
                 return getattr(sealed, name)
 
-        return _SealedFirstEffect()
+        return _SealedObservedOrder()
 
     monkeypatch.setattr(fixture._SyntheticRun, 'facade', current_facade)
 

@@ -348,10 +348,10 @@ def _script_recovery_decisions(monkeypatch, *, first='submit',
         action = actions[index]
         if index == 0 and on_first_decision:
             on_first_decision()
-        if index == 2 and first == 'submit':
-            assert self.ipc_index == 2 and not self.uploaded
-            if on_submit:
-                on_submit()
+        if index == 2 and first == 'submit' and on_submit:
+            # The chooser can now be prepared before decisions. Do not use a
+            # retired per-action IPC position as a prerequisite for this test.
+            on_submit()
         if index == 3 and first == 'submit':
             assert any(item.get('action') == 'upload' and item.get('uploaded') is True
                        for item in history)
@@ -537,7 +537,9 @@ async def test_recovery_proof_reenters_bootstrap_before_another_decision(
     result, _, seen = await _run_recovery(
         authority, monkeypatch, raw=raw, admit_owner=True)
     assert len(proven) == 1 and proven[0]['uploaded'] is True
-    assert [action for action, _, _ in seen] == ['fill', 'fill', 'submit']
+    # Changed structural receiver is refused before another model decision,
+    # rather than requesting a legacy model Submit and refusing later.
+    assert [action for action, _, _ in seen] == ['fill', 'fill']
     assert result['status'] == 'gate', result
     assert 'exact structural submit changed; inspect manually.' in result['question']
     assert len(raw.uploads) == authority.upload_ipc == 1

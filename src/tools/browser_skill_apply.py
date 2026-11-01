@@ -2746,8 +2746,18 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
         return {'action': 'upload', 'label': target.get('label', ''),
                 'selector': target['selector'], 'uploaded': len(attached) == 1}
     elif verb == 'click' and target is not None:
-        if not allow_click:
-            raise Gate('Model click must be issued by the tracked application loop.')
+        # A link click is a navigation request, not a form control write.
+        # Preserve the established tracked-job route boundary without adding
+        # a per-widget grant or gating ordinary Next/Continue buttons.
+        href = target.get('href')
+        unsafe_link = (isinstance(href, str) and bool(href)
+                       and not _job_preparation_route(
+                           href, job_url, provenance=provenance, pk=pk,
+                           company=company, fixture_context=fixture_context))
+        if not allow_click or unsafe_link:
+            raise Gate('An external link cannot leave the tracked job and tenant.'
+                       if unsafe_link else
+                       'Model click must be issued by the tracked application loop.')
         await _effect_call(session, 'click', target['selector'])
     elif verb == 'focus' and target is not None:
         await _effect_call(session, 'focus', target['selector'])

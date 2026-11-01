@@ -3731,6 +3731,12 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     if verb == 'wait':
                         await asyncio.sleep(0.25)
                         continue
+                    if verb == 'upload' and uploaded:
+                        # A model may repeat a decision already completed by
+                        # the producer's proactive one-shot attachment. Do not
+                        # replay the browser upload or treat this as another
+                        # approval; the fresh final check still proves the PDF.
+                        continue
                     if verb in {'gate', 'finish'}:
                         field = (control(page, action, 'decision-action')
                                  if action.get('selector') else None)

@@ -50,13 +50,15 @@ _WIDGET_GRAPH = r"""
       e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||
       e.innerText || e.name);
   }
-  // The two independent readers use this same local-candidate shape for
-  // protected self-identification. A page-wide option announcement is never
-  // selection evidence, and country/location graphs remain unchanged.
-  function localProtectedChoice(e) {
+  // A React-select search input may stay blank after the page renders its
+  // chosen caption. Both independent readers inspect only the input's own
+  // value-container; no global option/live-region text is submission evidence.
+  function localReactSelectChoice(e) {
     if (e.tagName!=='INPUT' || e.type!=='text' ||
-        !/disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|sexual orientation|transgender|religion/i.test(controlCaption(e)))
-      return null;
+        e.getAttribute('role')!=='combobox') return null;
+    // Phone-country is a separate dial-code display (greenhouse.phone_country),
+    // not a named application-answer receiver. Preserve that existing witness.
+    if (e.closest('div.phone-input__country')) return null;
     const valueBox=e.closest('div.select__value-container');
     const inputBox=e.closest('div.select__input-container');
     const selectRoot=valueBox?.closest('div.select__container');
@@ -73,6 +75,9 @@ _WIDGET_GRAPH = r"""
       visible(singles[0]) ? clean(singles[0].innerText) : '';
     return {caption,unreadable:!caption};
   }
+  // The existing independent fixed-witness script still calls this name;
+  // preserve compatibility without editing its authoritative readback source.
+  const localProtectedChoice=localReactSelectChoice;
   const graphNodes = new WeakMap(), newGraphs = new Map();
   const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
@@ -316,7 +321,7 @@ PAGE = r"""(() => {
         // The React-select input can be blank after selection. Read only the
         // single-value in this input's own selected value-container; never a
         // page-wide caption or an accessibility live-region announcement.
-        const localChoice=localProtectedChoice(e);
+        const localChoice=localReactSelectChoice(e);
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,

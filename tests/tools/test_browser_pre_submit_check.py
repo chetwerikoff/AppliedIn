@@ -1050,3 +1050,114 @@ async def test_final_resume_display_candidates_ignore_unrelated_upload_fields(
         assert refused.value.item == 2
         assert refused.value.reason == 'defect_pre_submit_item_2'
         assert not fixture.held and not controller.committed
+
+
+def _read_greenhouse_style_react_select_choice(question, caption, state, reader):
+    """Actual PAGE/fixed reader over one offline, form-owned React-select shape.
+
+    The search input stays empty. Selected evidence exists only in exactly one
+    local div.select__single-value beside it; no hidden value or live-region
+    message grants submission authority.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    injection = r"""
+const state=SCENARIO, question=QUESTION, chosen=CAPTION;
+const field=node('div',{class:'form-group'},form);
+node('label',{id:'work-choice-label','for':'work-choice',text:question},field);
+const selectRoot=node('div',{class:'select__container'},field);
+const valueBox=node('div',{class:state==='placeholder' ?
+  'select__value-container' :
+  'select__value-container select__value-container--has-value'},selectRoot);
+if(state==='selected' || state==='ambiguous' || state==='hidden')
+  node('div',{class:'select__single-value',text:chosen,
+    ...(state==='hidden' ? {rect:null} : {})},valueBox);
+if(state==='ambiguous')
+  node('div',{class:'select__single-value',text:'Synthetic second choice'},valueBox);
+if(state==='placeholder')
+  node('div',{class:'select__placeholder',text:'Select...'},valueBox);
+const inputBox=node('div',{class:'select__input-container','data-value':''},valueBox);
+const fieldInput=node('input',{
+  id:'work-choice',type:'text',name:'work_choice',role:'combobox',required:true,
+  'aria-required':'true','aria-labelledby':'work-choice-label',
+  'aria-expanded':'false',
+},inputBox);
+fieldInput.value='';
+"""
+    injection = (injection.replace('SCENARIO', json.dumps(state))
+                 .replace('QUESTION', json.dumps(question))
+                 .replace('CAPTION', json.dumps(caption)))
+    script = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', script, 'synthetic',
+         json.dumps({'url': URL}), reader],
+        check=True, capture_output=True, text=True, timeout=30)
+    observed = json.loads(completed.stdout)
+    field = next(c for c in observed['controls']
+                 if c.get('selector') == '#work-choice')
+    return observed, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('question', 'caption'), [
+    ('Country', 'Synthetic Country'),
+    ('Work authorization', 'Authorized for synthetic work'),
+])
+@pytest.mark.parametrize(('state', 'passes_item_2'), [
+    ('selected', True),
+    ('placeholder', False),
+    ('ambiguous', False),
+    ('hidden', False),
+])
+async def test_required_nonprotected_local_react_select_final_readback(
+        monkeypatch, tmp_path, question, caption, state, passes_item_2):
+    """A required form-owned country/work-authorization picker can submit
+    only a unique visible same-field selection, never its blank search input
+    or a placeholder/ambiguous or invisible local caption.
+    """
+    from tools.browser_skill_dom import PAGE
+
+    _, chosen = _read_greenhouse_style_react_select_choice(
+        question, caption, state, PAGE)
+    _, fixed = _read_greenhouse_style_react_select_choice(
+        question, caption, state, forms._FIXED_CONTROL_WITNESS)
+    assert chosen['combobox'] == fixed['combobox']
+    assert chosen['tag'] == 'input' and chosen['type'] == 'combobox'
+    assert chosen['required'] is True
+    assert chosen['value'] == '' and chosen['has_value'] is False
+    assert chosen['in_form'] is True
+    assert chosen['form_selector'] == '#application-form'
+    if passes_item_2:
+        assert chosen['combobox']['selected_text'] == caption
+        assert chosen['combobox']['displayed_text'] == caption
+        assert chosen['combobox']['local_selected_proven'] is True
+        assert chosen['combobox']['selected_caption_unreadable'] is False
+    else:
+        assert not chosen['combobox'].get('selected_text')
+        assert chosen['combobox'].get('local_selected_proven') is not True
+        # A selected-looking but missing/ambiguous/hidden caption is unreadable;
+        # an unselected placeholder has no claimed selection in the first place.
+        if state != 'placeholder':
+            assert chosen['combobox']['selected_caption_unreadable'] is True
+
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    target['form_selector'] = '#application-form'
+    target['native_form_owner_selector'] = '#application-form'
+    for control in page['controls']:
+        if control.get('in_form') is True:
+            control['form_selector'] = '#application-form'
+    page['controls'].insert(0, chosen)
+    if passes_item_2:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 2
+        assert refused.value.reason == 'defect_pre_submit_item_2'
+        assert not fixture.held

@@ -118,7 +118,9 @@ async def test_no_later_intent_uploads_a_second_time(monkeypatch, tmp_path, inte
     run; after the upload it never reaches the chooser again."""
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
-    later = {'upload-decision': [UPLOAD],
+    # A repeated model upload is inert, so give the model a subsequent
+    # inspection decision rather than expecting a removed per-action Gate.
+    later = {'upload-decision': [UPLOAD, STOP],
              'upload-control-click': [
                  {'action': 'click', 'selector': '#dropzone'}, STOP],
              'submit-click': [click]}[intent]

@@ -152,16 +152,17 @@ def test_explicit_skip_consumes_once_without_bank_or_grant_then_continues(world)
     assert _queued(queue) == [PK]
 
 
-def test_answer_grant_rides_the_consume_and_banks_only_after_winning(world):
+def test_owner_answer_consumes_once_and_banks_only_after_winning(world):
     stores, queue = world
     row = _gate(stores)
     _, results = _post({"disposition": "answer", "answer": " Synthetic Name ", **_tokens(row)})
     assert [r["result"] for r in results] == ["queued"]
     after = stores.tracking.get(PK)
     assert after["status"] == "tailored" and after["gate_disposition"]["kind"] == "answer"
-    grant = after["human_approved_answers"]["Synthetic display name"]
-    assert grant["value"] == "Synthetic Name" and grant["selector"] == row[
-        "gate_pending"]["form_question"]["selector"]
+    # The owner answer still consumes a single gate and reaches the ordinary
+    # answer bank, but no BrowserSkill per-field grant is minted.
+    assert "human_approved_answers" not in after
+    assert after["gate_disposition"]["answer"] == "Synthetic Name"
     assert stores.answer_bank.puts == [("Synthetic display name", " Synthetic Name ")]
     assert _queued(queue) == [PK]
 
@@ -351,7 +352,8 @@ def test_checkbox_yes_and_no_for_one_generation_have_one_winner(world, winner):
     assert stores.tracking.get(PK) == won
     if winner == "yes":
         assert won["status"] == "tailored" and _queued(queue) == [PK]
-        assert "Synthetic acknowledgement" in won["human_approved_answers"]
+        assert won["gate_disposition"]["kind"] == "answer"
+        assert "human_approved_answers" not in won
     else:
         assert first["reason"] == "cannot_proceed"
         assert won["status"] == "needs_human" and won["gate_reason"] == "cannot_proceed"

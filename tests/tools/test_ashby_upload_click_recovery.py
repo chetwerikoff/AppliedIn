@@ -34,13 +34,16 @@ async def test_second_actual_resume_upload_is_rejected_without_repeat_or_submit(
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     repeated_upload = {'action': 'upload', 'selector': '#_systemfield_resume'}
-    result = await run_apply([repeated_upload])
-    assert result['status'] == 'gate', result
+    # The producer has already uploaded once. Model repetition is a no-op;
+    # the next explicit owner inspection must still prohibit any Submit.
+    result = await run_apply([
+        repeated_upload, {'action': 'gate', 'question': 'Synthetic next decision'}])
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable', result
     guard = transport._application_controller
     assert uploads == [('set', Path(guard.resume_path).name)]
     assert guard.upload_attempted and guard.upload_completed
     assert not guard.upload_pending
-    assert decide.await_count == 1
+    assert decide.await_count == 2
     _no_production_commit(raw, transport, row)
 
 

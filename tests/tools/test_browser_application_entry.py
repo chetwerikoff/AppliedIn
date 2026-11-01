@@ -132,9 +132,7 @@ class Session:
                     # Synthetic readers use the current native Submit
                     # classification, never a retired per-step marker helper.
                     owners = {c.get('form_selector') for c in controls
-                              if isinstance(c, dict) and forms.native_submit(c)
-                              and any(forms._same_key(text) in forms._APP_SUBMIT_LABELS
-                                      for text in forms._submitter_texts(c))}
+                              if isinstance(c, dict) and forms.native_submit(c)}
                     owner = next(iter(owners)) if len(owners) == 1 else None
                     value['entry'] = dict(frames=[], responses=[], response_error=False,
                                           helper_challenge=False, root=(

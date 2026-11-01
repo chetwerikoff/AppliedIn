@@ -164,17 +164,18 @@ async def test_missing_owner_name_is_asked_without_per_field_grant(
     _no_production_commit(raw, transport, row)
 
 
-async def test_field_rendered_after_the_first_decision_is_left_to_the_fallbacks(
+async def test_late_resume_receiver_is_uploaded_once_on_first_observation(
         monkeypatch, tmp_path):
-    """The upload runs once, before the first decision only. A résumé field
-    that renders later is not uploaded by the server on its own; the model's
-    upload, upload-control or Submit intent takes the same one upload."""
+    """The form may mount its file receiver after a Wait; prepare it once
+    when observed, without inventing a new per-control grant or extra upload."""
     run_apply, _, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path)
     result = await run_apply([WAIT, STOP], late=True)
     assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
-    assert decide.await_count == 2 and uploads == []
-    assert not transport._application_controller.upload_attempted
+    guard = transport._application_controller
+    assert decide.await_count == 2
+    assert uploads == [('set', Path(guard.resume_path).name)]
+    assert guard.upload_attempted and guard.upload_completed and not guard.upload_pending
     _no_production_commit(raw, transport, row)
 
 

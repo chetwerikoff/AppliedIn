@@ -3946,9 +3946,18 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             context = handoff('A possibly committing application action was interrupted; '
                               'inspect the employer portal before retrying.', step)
             return {'status': 'uncertain', 'detail': context['text'], 'step': context['step']}
-        if (producer_guard is not None and producer_guard.upload_attempted
-                and not producer_guard.upload_completed
-                and not isinstance(exc, Gate)):
+        # The production controller owns upload state; sealed offline readers
+        # can instead carry the same one-shot attempt on their scoped facade.
+        # Neither path may treat an interrupted file-set as a retryable outage.
+        transport = getattr(session, 'raw', session)
+        transport_guard = getattr(transport, '_application_controller', None)
+        unsettled_upload = (
+            (producer_guard is not None and producer_guard.upload_attempted
+             and not producer_guard.upload_completed)
+            or (transport_guard is not None and transport_guard.upload_attempted
+                and not transport_guard.upload_completed)
+            or (not uploaded and bool(getattr(session, 'upload_attempted', False))))
+        if unsettled_upload and not isinstance(exc, Gate):
             # The raw file-set/upload call started, but its outcome is unknown.
             # A lost reply (including cancellation) cannot permit replay of
             # this attachment. No raw page text, path or exception message is

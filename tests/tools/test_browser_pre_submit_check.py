@@ -643,3 +643,21 @@ async def test_same_job_committing_get_navigation_is_refused_without_submit(
     await controller.before_ipc(
         None, ('navigate', URL + '/application'), {})
     assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', [
+    'Enter', 'Return', 'NumpadEnter', ' ', 'Space', 'Spacebar',
+])
+async def test_implicit_submit_key_without_proven_receiver_fails_closed(
+        monkeypatch, tmp_path, key):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'] = [{
+        'selector': '#outside', 'label': 'Outside the application',
+        'tag': 'input', 'type': 'text', 'in_form': False,
+        'value': 'synthetic', 'required': False,
+    }]
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.before_ipc(None, ('press', key), {})
+    assert refused.value.item == 1
+    assert not fixture.held and not controller.committed

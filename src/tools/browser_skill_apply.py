@@ -3346,7 +3346,11 @@ class ApplicationIPCController:
             else:
                 inside_form = False
                 ambiguous = True
-            if inside_form:
+            if not inside_form:
+                # A committing key with no proven receiver must not fall
+                # through as an ordinary ungated press.
+                ambiguous = True
+            else:
                 formless = bool(_formless_root(page))
                 submits = [c for c in page.get('controls', [])
                            if (is_submission(c) or native_submit(c))

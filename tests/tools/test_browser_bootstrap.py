@@ -2403,7 +2403,9 @@ async def test_initial_navigation_redirect_explains_same_employer_origin(monkeyp
     assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
     assert 'Tracked host/path: example-co.test/job/1' in report['question']
     assert 'destination host/path: foreign.example.test/job/1' in report['question']
-    assert 'foreign.example.test/job/1' in report['step']['url']
+    # An unverified page URL is not promoted to durable step authority.
+    # Its bounded host/path appears only in the sanitized owner explanation.
+    assert report['step']['url'] == 'unavailable'
     assert 'QUERY_SECRET' not in report['question'] + report['step']['url']
     assert 'FRAGMENT_SECRET' not in report['question'] + report['step']['url']
     assert browser.calls == [('navigate', SECURE_URL)]

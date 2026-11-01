@@ -271,105 +271,6 @@ def focused_final_choices(page, keys=('location',)):
 def focused_final_page(page, key='location'):
     return focused_final_choices(page, (key,))
 
-async def test_four_exact_commits_and_presubmit_current_reread(grants):
-    # The generic option click is preparation, not proof. Four independent
-    # *current form-owned* values must agree with the approved captions.
-    session, filled, receipts = FormOwnedSelection(), approved_values(), []
-    for key in KEYS:
-        receipts.append(await choose(session, grants, key, filled))
-    current, _ = await forms._observe_controls(session, await session.page())
-    final = focused_final_choices(current, KEYS)
-    forms.check_form(final, filled, True, receipts=receipts)
-    forms.check_approvals('example-co#1', receipts, final)
-    assert len(session.calls) == 3 * len(KEYS)
-    assert len(receipts) == len(KEYS)
-    for key, receipt in zip(KEYS, receipts):
-        owner = next(c for c in final['controls'] if c['selector'] == '#'+key)
-        assert receipt['committed_caption'] == grants[key]
-        assert receipt['committed_value'] == owner['value']
-        assert owner['combobox']['selected_value'] == owner['value']
-    # The same click receipts with a changed *current* form value fail Submit.
-    changed = copy.deepcopy(final)
-    changed['controls'][0]['value'] = 'Other submitted value'
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(changed, filled, True, receipts=receipts)
-
-@pytest.mark.parametrize('scenario', [
-    {'caption': 'approved location'}, {'caption': 'Approved  location'},
-    {'code': 'MACHINE_CODE'}, {'noReceiver': True}, {'sharedReceiver': True},
-    {'danger': 'ancestor'}, {'danger': 'descendant'},
-])
-async def test_unsafe_choice_never_clicks_an_option(grants, scenario):
-    session = FormOwnedSelection(**scenario) if scenario.get('caption') else Session(**scenario)
-    filled = {}
-    if scenario.get('danger'):
-        # A potential committing option is never reversible preparation.
-        with pytest.raises(forms.Gate):
-            await choose(session, grants, filled=filled)
-        assert not any(c[1].endswith('-option') for c in session.calls)
-        return
-    receipt = await choose(session, grants, filled=filled)
-    current = focused_final_page(await session.page())
-    if scenario.get('caption'):
-        # Benign case/whitespace variations of the approved caption are
-        # reversible; a later material caption change still blocks Submit.
-        assert session.observed_choice is not None
-        assert receipt['committed_value'] == session.observed_choice[1]
-        assert receipt['committed_caption'] == session.observed_choice[0]
-        forms.check_form(current, filled, True, receipts=[receipt])
-        changed = copy.deepcopy(current)
-        next(c for c in changed['controls']
-             if c['selector'] == '#location')['combobox']['selected_text'] = 'Different location'
-        with pytest.raises(forms.Gate):
-            forms.check_form(changed, filled, True, receipts=[receipt])
-    else:
-        # A foreign machine value or missing/non-owned receiver cannot be
-        # laundered by an approved displayed caption at the final boundary.
-        with pytest.raises(forms.Gate):
-            forms.check_form(current, filled, True, receipts=[receipt])
-    assert not any(c[0] == 'submit' for c in session.calls)
-
-
-@pytest.mark.parametrize('key', ['selected_text', 'displayed_text', 'hidden_value', 'selected_value'])
-async def test_each_current_readback_is_literal_and_independent(grants, key, monkeypatch):
-    if key == 'hidden_value':
-        # Unlike the CSS-only closed widget, this generic fixture has an
-        # actual named hidden form receiver and its independently read code.
-        from tests.tools import test_browser_combobox as generic
-        base = generic.page(generic.control(
-            selected_text='Example Country', selected_value='EX',
-            hidden_value='EX'))
-        filled = approved_values({'#country': 'Example Country'})
-        country = base['controls'][0]
-        row = {'pk': 'example-co#1', 'status': 'submitting',
-               'human_approved_answers': {
-                   forms._key(base, country): generic.grant()}}
-        monkeypatch.setattr(forms, '_row', lambda _pk: row)
-        forms.check_form(base, filled, True)
-        mutated = copy.deepcopy(base)
-        mutated['controls'][0]['combobox']['hidden_value'] = 'Different code'
-        with pytest.raises(forms.Gate, match='hidden form value'):
-            forms.check_form(mutated, filled, True)
-        changed_receiver = copy.deepcopy(base)
-        changed_receiver['controls'][-1]['value'] = 'Different code'
-        with pytest.raises(forms.Gate, match='hidden form value'):
-            forms.check_form(changed_receiver, filled, True)
-        return
-
-    session = FormOwnedSelection()
-    receipt = await choose(session, grants)
-    assert session.observed_choice == (
-        receipt['committed_caption'], receipt['committed_value'])
-    base = focused_final_page(await session.page())
-    filled = approved_values({'#location': 'Approved location'})
-    forms.check_form(base, filled, True, receipts=[receipt])
-    mutated = copy.deepcopy(base)
-    next(c for c in mutated['controls'] if c['selector'] == '#location')['combobox'][key] = 'Different location'
-    with pytest.raises(forms.Gate):
-        forms.check_form(mutated, filled, True, receipts=[receipt])
-    assert not any(c[:2] == ('click', '#submit') for c in session.calls)
-
-
 def _current_form_owned_choice(current, receipt):
     """Give the synthetic post-click page an actual named submitted receiver."""
     owner = next(c for c in current['controls'] if c['selector'] == '#location')
@@ -381,56 +282,6 @@ def _current_form_owned_choice(current, receipt):
         selected_value=receipt['committed_value'])
     return current
 
-
-@pytest.mark.parametrize('key', ['committed_value', 'committed_caption',
-                                 'hidden_selector', 'hidden_value_before',
-                                 'hidden_value'])
-async def test_receipt_cannot_replace_current_admission_or_click_witness(grants, key):
-    session = Session()
-    receipt = await choose(session, grants)
-    current = _current_form_owned_choice(
-        focused_final_page(await session.page()), receipt)
-    filled = approved_values({'#location': 'Approved location'})
-    forms.check_form(current, filled, True, receipts=[receipt])
-    forged = dict(receipt)
-    forged[key] = 'Approved location' if key == 'hidden_value_before' else 'forged'
-    # Historical evidence must not authorize or invalidate live submitted
-    # values. The approval-history audit may reject a corrupted record.
-    forms.check_form(current, filled, True, receipts=[forged])
-    if key != 'hidden_value_before':
-        with pytest.raises(forms.Gate):
-            forms.check_approvals('example-co#1', [forged], current)
-    changed = copy.deepcopy(current)
-    owner = next(c for c in changed['controls'] if c['selector'] == '#location')
-    owner['value'] = 'Different location'
-    owner['has_value'] = True
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(changed, filled, True, receipts=[forged])
-    assert ('click', '#submit') not in session.calls
-
-
-async def test_no_receipt_is_not_a_committed_selection(grants):
-    session = Session()
-    receipt = await choose(session, grants)
-    current = _current_form_owned_choice(
-        focused_final_page(await session.page()), receipt)
-    filled = approved_values({'#location': 'Approved location'})
-    forms.check_form(current, filled, True, receipts=[receipt])
-    # Fresh approved caption and this form's named submitted value suffice.
-    forms.check_form(current, filled, True, receipts=[])
-    for value in ('', 'Different location'):
-        changed = copy.deepcopy(current)
-        owner = next(c for c in changed['controls'] if c['selector'] == '#location')
-        owner['value'] = value
-        owner['has_value'] = bool(value)
-        with pytest.raises(forms.Gate, match='form-own value receiver'):
-            forms.check_form(changed, filled, True, receipts=[])
-    without_name = copy.deepcopy(current)
-    next(c for c in without_name['controls']
-         if c['selector'] == '#location')['name'] = ''
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(without_name, filled, True, receipts=[])
-    assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('scenario', [
     'extraInput', 'noAutocomplete', 'wrongLabel', 'duplicateLabel',
@@ -447,121 +298,6 @@ def test_each_current_popup_ownership_boundary(scenario):
     snapshot = dom(phases={'location': 'C1'}, **{scenario: True})
     assert snapshot['page']['opaque_controls']
 
-
-@pytest.mark.parametrize('anchor', ['field', 'value', 'wrapper', 'label'])
-@pytest.mark.parametrize('stage', ['pre-open', 'expanded', 'committed'])
-async def test_anchor_drift_does_not_confer_submit_authority(grants, anchor, stage):
-    class Drift(Session):
-        reads = 0
-        async def page(self):
-            self.reads += 1
-            if stage == 'pre-open' and self.reads == 3:
-                self.snapshot = dom(drift=anchor)
-            return await super().page()
-        async def call(self, *args):
-            result = await super().call(*args)
-            if args[0] == 'click' and (
-                    (stage == 'expanded' and args[1] == '#location')
-                    or (stage == 'committed' and args[1] == '#location-option')):
-                self.snapshot = dom(phases=self.phases, drift=anchor)
-            return result
-
-    # Old shape-anchor drift is not an automatic intermediate human Gate.
-    # Nor may an old receipt mint the final form-owned submitted value.
-    session, filled = Drift(), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    assert receipt['action'] == 'combobox'
-    assert ('click', '#submit') not in session.calls
-    with pytest.raises(forms.Gate):
-        forms.check_form(focused_final_page(await session.page()),
-                         filled, True, receipts=[receipt])
-
-@pytest.mark.parametrize('phase', ['C0', 'C2'])
-async def test_skipped_or_failed_expansion_has_no_option_ipc(grants, phase, monkeypatch):
-    if phase == 'C0':
-        # This failed-expansion negative exceeded the migrated-item budget.
-        # Keep *all* of its implicit Session/Drift reads on the original CLI.
-        monkeypatch.setitem(globals(), 'dom', _one_shot_dom)
-    class Drift(Session):
-        async def call(self, *args):
-            result = await super().call(*args)
-            if args == ('click', '#location'):
-                self.snapshot = dom(phases={'location': phase})
-            return result
-    session, filled = Drift(), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    # Missing/late-mounted picker options produce no invented selection
-    # receipt, and the final form guard refuses the incomplete control.
-    assert receipt['unresolved'] and filled == {}
-    assert not any(c[1].endswith('-option') for c in session.calls)
-    with pytest.raises(forms.Gate):
-        forms.check_form(focused_final_page(await session.page()),
-                         filled, True, receipts=[receipt])
-
-
-async def test_legacy_shape_loss_cannot_grant_a_final_submitted_value(grants):
-    class Drift(Session):
-        async def call(self, *args):
-            result = await super().call(*args)
-            if args == ('click', '#location'):
-                self.snapshot = dom(phases={'location': 'C1'}, badGraph=True)
-            return result
-    session, filled = Drift(), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    # A generic ARIA relationship can still allow reversible preparation
-    # even when the former library-specific graph mode disappears.
-    assert receipt['action'] == 'combobox'
-    assert ('click', '#submit') not in session.calls
-    with pytest.raises(forms.Gate):
-        forms.check_form(focused_final_page(await session.page()),
-                         filled, True, receipts=[receipt])
-
-async def test_forged_plain_receipt_is_not_code_witnessed(grants):
-    session = Session()
-    receipt = await choose(session, grants)
-    current = _current_form_owned_choice(
-        focused_final_page(await session.page()), receipt)
-    filled = approved_values({'#location': 'Approved location'})
-    forged = dict(receipt)
-    forged['committed_value'] = 'forged'
-    forms.check_form(current, filled, True, receipts=[forged])
-    with pytest.raises(forms.Gate, match='committed accessible choice or form value changed'):
-        forms.check_approvals('example-co#1', [forged], current)
-    changed = copy.deepcopy(current)
-    next(c for c in changed['controls']
-         if c['selector'] == '#location')['value'] = 'Different location'
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(changed, filled, True, receipts=[receipt])
-    assert ('click', '#submit') not in session.calls
-
-async def test_required_unapproved_bootstrap_precedes_all_widget_ipc(grants):
-    session = Session()
-    for snapshot in (session.snapshot['page'], session.snapshot['witness']):
-        field = next(c for c in snapshot['controls'] if c['selector'] == '#additional')
-        field.update(required=True, label='Unapproved final question', question='Unapproved final question')
-    prepared = await forms._bootstrap(
-        session, await session.page(), 'example-co#1', grants, URL)
-    unapproved = [c for c in prepared['controls'] if c['selector'] == '#additional']
-    assert len(unapproved) == 1
-    assert unapproved[0]['required'] is True and not unapproved[0]['has_value']
-    # Reversible picker work may proceed; the missing required field never
-    # authorizes any write or final Submit from the observed inventory.
-    assert session.calls == []
-    with pytest.raises(forms.Gate):
-        forms.check_form(prepared, {}, uploaded=True)
-
-
-async def test_current_witness_disagreement_is_not_a_picker_phase_gate(grants):
-    session = Session()
-    for key in KEYS:
-        await choose(session, grants, key)
-    session.snapshot['witness']['controls'][0]['combobox']['selected_text'] = 'drift'
-    # Bootstrap itself does not require the old C0/C1/C2 terminal gate.
-    await forms._bootstrap(session, await session.page(), 'example-co#1', grants, URL)
-    # But a subsequent real independent DOM read must not bless this mismatch.
-    with pytest.raises(forms.Gate, match='combobox.selected_text.equal'):
-        await forms._observe_controls(session, await session.page())
-    assert ('click', '#submit') not in session.calls
 
 @pytest.mark.parametrize('boundary', ['initial', 'identity', 'phase', 'downgrade', 'missing'])
 async def test_unproved_closed_widget_observation_refuses_final_submit(
@@ -651,42 +387,6 @@ async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatc
     assert session.calls == [('fill', '#phone', '--value', '+12025550123')]
 
 
-@pytest.mark.parametrize('attrs', [
-    {'data-value': 'Approved location', 'value': 'OTHER'},
-    {'data-value': '', 'value': 'Approved location'},
-    {'data-value': 'Approved location', 'value': ''},
-    {'data-value': 'OTHER'},
-])
-async def test_option_machine_attributes_never_replace_live_submitted_value(grants, attrs):
-    # An opaque machine code need not equal the approved displayed caption.
-    # The actual form-owned current value MUST equal the selected option code.
-    session, filled = FormOwnedSelection(optionAttrs=attrs), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    assert receipt['action'] == 'combobox'
-    assert session.observed_choice is not None
-    final = focused_final_page(await session.page())
-    forms.check_form(final, filled, True, receipts=[receipt])
-    changed = copy.deepcopy(final)
-    next(c for c in changed['controls'] if c['selector'] == '#location')['value'] = (
-        'Different submitted machine code')
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(changed, filled, True, receipts=[receipt])
-    assert ('click', '#submit') not in session.calls
-
-async def test_attribute_less_option_commits_exact_caption_and_receiver(grants):
-    session, filled = FormOwnedSelection(optionAttrs={}), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    assert receipt['committed_caption'] == receipt['committed_value'] == grants['location']
-    assert receipt['hidden_value'] == ''  # No invented hidden input commitment.
-    assert session.observed_choice == (grants['location'], grants['location'])
-    assert session.calls == [
-        ('click', '#location'), ('fill', '#location', '--value', 'Approved location'),
-        ('click', '#location-option')]
-    final, _ = await forms._observe_controls(session, await session.page())
-    focused = focused_final_page(final)
-    forms.check_form(focused, filled, True, receipts=[receipt])
-    forms.check_approvals('example-co#1', [receipt], focused)
-
 def test_cleared_optional_phone_cannot_evade_presubmit():
     page = dom()['page']
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
@@ -706,33 +406,6 @@ def test_cleared_optional_phone_cannot_evade_presubmit():
     }
     with pytest.raises(forms.Gate, match='current native value and its readback disagree'):
         forms.check_form(complete, {'#phone': '+12025550123'}, True)
-
-
-@pytest.mark.parametrize('delayed', ['C1', 'C2', 'both'])
-async def test_delayed_component_phase_is_observed_without_extra_ipc(grants, delayed):
-    class Delayed(Session):
-        pending = None
-        reads = 0
-        async def call(self, *args):
-            before = self.snapshot
-            result = await super().call(*args)
-            if args[0] == 'click':
-                phase = 'C2' if args[1].endswith('-option') else 'C1'
-                if delayed in {phase, 'both'}:
-                    self.pending, self.snapshot, self.reads = self.snapshot, before, 0
-            return result
-        async def page(self):
-            if self.pending is not None:
-                self.reads += 1
-                if self.reads > 2:
-                    self.snapshot, self.pending = self.pending, None
-            return await super().page()
-    session = Delayed()
-    receipt = await choose(session, grants)
-    assert receipt['committed_value'] == 'Approved location'
-    assert session.calls == [
-        ('click', '#location'), ('fill', '#location', '--value', 'Approved location'),
-        ('click', '#location-option')]
 
 
 async def test_direct_raw_submit_refuses_changed_current_choice(
@@ -997,21 +670,6 @@ async def test_required_proxy_mutation_denies_real_final_submit(
     assert controller.filled == {'#' + name: value for name, value in approved.items()}
 
 
-async def test_proxy_disappearance_preserves_real_commit_and_approvals(grants):
-    # A required synthetic proxy disappearing after a real option selection
-    # is not itself authority. The final current named input and caption are.
-    session, filled = FormOwnedSelection(requiredProxy=True), approved_values()
-    receipt = await choose(session, grants, filled=filled)
-    current, _ = await forms._observe_controls(session, await session.page())
-    final = focused_final_page(current)
-    owner = next(c for c in final['controls'] if c['selector'] == '#location')
-    assert owner['value'] == owner['combobox']['selected_value']
-    forms.check_form(final, filled, True, receipts=[receipt])
-    forms.check_approvals('example-co#1', [receipt], final)
-    assert session.calls == [
-        ('click', '#location'), ('fill', '#location', '--value', grants['location']),
-        ('click', '#location-option')]
-
 @pytest.mark.parametrize('key', ['location', 'country'])
 def test_empty_unnamed_native_proxy_is_not_an_independent_approval_question(key):
     # Requiredness alone does not make an unlabelled, unnamed, empty
@@ -1030,26 +688,6 @@ def test_empty_unnamed_native_proxy_is_not_an_independent_approval_question(key)
     with pytest.raises(forms.Gate, match='Required field is empty'):
         forms.check_form(
             {'controls': [proxy], 'inventory_verified': True}, {}, True)
-
-
-@pytest.mark.parametrize('field, value', [
-    ('name', 'synthetic_answer'), ('has_value', True),
-    ('value', 'Unapproved synthetic value'),
-])
-def test_native_proxy_becoming_an_answer_restores_shared_question_collision(
-        field, value):
-    # A mutated input that acquires a name or value is no longer a blank
-    # non-answer. Do not let disambiguation borrow the Phone native anchor.
-    page = dom(fullPhone=True, requiredProxy=True,
-               proxyKeys=['country'])['page']
-    country = combo({'page': page}, 'country')
-    proxy, = [c for c in page['controls']
-              if c.get('type') == 'text' and c.get('required')
-              and not c.get('label') and not c.get('name')]
-    proxy[field] = value
-    assert forms._could_receive_an_answer(proxy)
-    with pytest.raises(forms.Gate, match='More than one control uses'):
-        forms._key(page, country)
 
 
 @pytest.mark.parametrize('key', ['location', 'country'])

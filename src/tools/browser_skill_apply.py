@@ -3998,8 +3998,9 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             # surfacing the page's raw provider/query evidence.
             if artifact:
                 result['captcha_artifact_diagnostic'] = True
-            if navigation:
-                result['navigation_provenance_diagnostic'] = True
+            # Navigation provenance is already a code-owned reason; the
+            # direct caller classifies defect_provenance without an additional
+            # producer flag or copying private owner detail into telemetry.
             return result
         if isinstance(exc, asyncio.CancelledError):
             raise

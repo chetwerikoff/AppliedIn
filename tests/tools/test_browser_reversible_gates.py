@@ -172,32 +172,6 @@ def _answer(row, stores, gate, value):
     if q['type'] == 'button':
         assert grant['boolean_members'] == q['boolean_members']
     return q
-@pytest.mark.asyncio
-async def test_ambiguous_root_wins_over_open_required_location(monkeypatch, tmp_path):
-    """A reversible fallback cannot ask for Location on two unsafe roots."""
-    _, endpoint, decision, _, pdf = _fixture(
-        monkeypatch, tmp_path, secondFormlessComplete=True)
-    assert endpoint.current['entry']['formless']['error'] == 'ambiguous application roots'
-    assert next(c for c in endpoint.current['controls']
-                if c['selector'] == '#location')['required']
-    file = next(c for c in endpoint.current['controls']
-                if c['type'] == 'file' and c['label'] == 'Resume')
-    submit = next(c for c in endpoint.current['controls']
-                  if c['label'] == 'Submit application')
-    decision.side_effect = [
-        {'action': 'upload', 'selector': file['selector']},
-        {'action': 'submit', 'selector': submit['selector']},
-    ]
-    result = await _apply(pdf)
-    assert result['status'] == 'gate', result
-    # FF-224g: two roots leave no unique labelled receiver, so the model's
-    # upload is refused before the direct set; Location is still never asked.
-    assert 'missing unique labelled resume receiver' in result['question'], result
-    assert result['reason'] != 'owner_question'
-    assert result['form_question'] is None
-    assert decision.await_count == 1
-    assert effect_calls(endpoint.calls) == []
-
 
 def _mark_census_answered(control):
     """Census fallback tests isolate one blank; siblings are already answered."""

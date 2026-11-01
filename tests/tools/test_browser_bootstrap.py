@@ -788,15 +788,18 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
         if material:
             assert "'question': 'material-assent: human inspection required'" in queued_lines[0]
         else:
-            assert 'OTHER_GATE_SENTINEL' in queued_lines[0]
+            assert gate['question'] in queued_lines[0]
+            assert 'OTHER_GATE_SENTINEL' not in queued_lines[0]
     if material:
         assert 'OWNER_VISIBLE_LOG_SENTINEL' in row['gate_pending']['question']
         assert 'gated pk=' + PK + ': material-assent: human inspection required' in gated_lines[0]
         assert 'OWNER_VISIBLE_LOG_SENTINEL' not in log_output
         assert all('OWNER_VISIBLE_LOG_SENTINEL' not in text for text in ordinary)
     else:
-        assert 'OTHER_GATE_SENTINEL' in ordinary[0]
-        assert 'OTHER_GATE_SENTINEL' in gated_lines[0]
+        # Model prose is sanitized before both event and INFO logs.
+        assert 'The observed form needs human inspection' in ordinary[0]
+        assert 'OTHER_GATE_SENTINEL' not in ordinary[0]
+        assert 'OTHER_GATE_SENTINEL' not in gated_lines[0]
 
 
 def test_fixed_read_only_script_contains_effective_dom_predicates():

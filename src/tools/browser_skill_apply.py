@@ -1137,9 +1137,32 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                 raise Gate('A required native choice has no current selection.')
         elif typ == 'combobox':
             combo = c.get('combobox') or {}
-            if not (str(combo.get('selected_text') or '').strip()
-                    or str(c.get('value') or '').strip()):
-                raise Gate('A required accessible picker has no current selection.')
+            selected = str(combo.get('selected_text') or c.get('value') or '').strip()
+            hidden = combo.get('hidden_selector')
+            machine = str(combo.get('selected_value') or '').strip()
+            if hidden:
+                # A visible selected caption is not the value submitted by
+                # the form. Verify its current form-owned hidden receiver, not
+                # the model's historical selection or a removed widget grant.
+                receivers = [p for p in controls if p.get('selector') == hidden]
+                value_proven = (len(receivers) == 1
+                    and receivers[0].get('type') == 'hidden'
+                    and receivers[0].get('in_form') is True
+                    and receivers[0].get('form_selector') == c.get('form_selector')
+                    and bool(machine)
+                    and str(receivers[0].get('value') or '').strip() == machine
+                    and str(combo.get('hidden_value') or '').strip() == machine)
+            elif machine:
+                # For a receiverless picker, the actual named form control
+                # must itself carry the independently observed selected value.
+                value_proven = (bool(c.get('name'))
+                    and c.get('in_form') is True
+                    and c.get('has_value') is True
+                    and str(c.get('value') or '').strip() == machine)
+            else:
+                value_proven = bool(str(c.get('value') or '').strip())
+            if not selected or not value_proven:
+                raise Gate('A required accessible picker lacks a current form-owned value.')
         elif not str(c.get('value') or '').strip():
             raise Gate('A required application field is empty on final readback.')
 

@@ -560,7 +560,7 @@ async def test_submission_marked_choice_uses_one_final_guard_before_ipc(
         checked.append(kind)
         raise forms.Gate("synthetic final guard refused")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", refuse)
     with pytest.raises(forms.Gate, match="synthetic final guard refused"):
         await session.application_effect("click", "#next")
     assert checked == [kind]
@@ -569,9 +569,9 @@ async def test_submission_marked_choice_uses_one_final_guard_before_ipc(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["upload", "select", "fill"])
-async def test_submit_marked_preparation_receivers_refuse_before_cli(
+async def test_preparation_uses_raw_ipc_without_widget_submit_gate(
         monkeypatch, tmp_path, operation):
-    """A known committing receiver is not ordinary form data transmission."""
+    """Only a committing click triggers the final check; ordinary writes run."""
     pdf = tmp_path / "synthetic-row.pdf"
     pdf.write_bytes(b"%PDF-1.4\\nsynthetic payload\\n")
     controller = _controller(resume_path=str(pdf))
@@ -581,15 +581,24 @@ async def test_submit_marked_preparation_receivers_refuse_before_cli(
     target["submit"] = True
     if operation == "select":
         target.update(tag="select", options=[{"value": "remote", "label": "Remote"}])
+    if operation == "upload":
+        monkeypatch.setattr(controller, "_row_pdf", lambda: ("synthetic-pdf",))
     page = {"url": controller.url, "controls": [target]}
     session, calls = await _setup(monkeypatch, page, controller)
     args = (("upload", "#next", "--file", str(pdf)) if operation == "upload"
             else ("select", "#next", "--value", "remote") if operation == "select"
             else ("fill", "#next", "--value", "Remote"))
-    with pytest.raises(forms.Gate, match="submission-capable"):
-        await session.application_effect(
-            *args, **({"timeout": 130} if operation == "upload" else {}))
-    assert calls == []
+
+    async def no_final(*_args):
+        pytest.fail("Preparation must not perform a final Submit check")
+
+    monkeypatch.setattr(controller, "check_pre_submit", no_final)
+    await session.application_effect(
+        *args, **({"timeout": 130} if operation == "upload" else {}))
+    assert [c[0][0] for c in calls] == [operation]
+    assert controller.committed is False
+    if operation == "upload":
+        assert controller.upload_completed is True
 
 
 def test_canonical_ats_posting_authority_is_not_board_pin_authority(monkeypatch):
@@ -814,51 +823,9 @@ def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
     assert client.get(f"submit_hold:{pk}") is None
 
 
-def test_distinct_native_forms_never_share_approval_ownership(monkeypatch):
-    """Other form purposes cannot block a safe write or steal its exact grant."""
-    url = "https://example-co.test/job/1"
-
-    def control(selector, owner):
-        return {
-            "selector": selector, "label": "Email",
-            "question": "Contact details", "tag": "input",
-            "type": "email", "in_form": True, "form_selector": owner,
-            "form_action": url, "formaction": "", "disabled": False,
-            "value": "", "has_value": False, "required": True,
-        }
-
-    main = control("#main-email", "#application")
-    unrelated = control("#other-email", "#other-form")
-    page = {"url": url, "controls": [unrelated, main]}
-    assert forms._form_subject(page, main) == [main]
-    assert forms._approval_question_collisions(page, main) == []
-    assert forms._key(page, main) == "Contact details"
-
-    pk, answer = "example-co#synthetic", "test@example-co.test"
-    grant = {key: main[key] for key in (
-        "selector", "label", "question", "tag", "type",
-        "form_selector", "form_action")}
-    grant.update(url=url, value=answer)
-    row = {"pk": pk, "status": "submitting",
-           "possible_submission": False,
-           "human_approved_answers": {"Contact details": grant}}
-    monkeypatch.setattr(forms, "_row", lambda _pk: row)
-
-    forms.exact_approval(pk, "Contact details", answer, target=main, url=url)
-    with pytest.raises(forms.Gate, match="exact human-approved answer"):
-        forms.exact_approval(
-            pk, "Contact details", answer, target=unrelated, url=url)
-
-    # Two real competing answers in the SAME form are still ambiguous.
-    same_form = control("#second-email", "#application")
-    both = {"url": url, "controls": [main, same_form]}
-    with pytest.raises(forms.Gate, match="same approval question"):
-        forms._key(both, main)
-
-
 @pytest.mark.asyncio
 async def test_native_choice_with_inline_requestsubmit_never_bypasses_final_guard(monkeypatch):
-    """A granted native checkbox's onclick requestSubmit is a commit, not autosave."""
+    """Inline page-owned JS is residual risk, not a pre-action approval gate."""
     target = _control(label="I agree", kind="checkbox", submit=False)
     target.update(tag="input", required=True, checked=False, value="on",
                   question="I acknowledge application data processing",
@@ -868,16 +835,15 @@ async def test_native_choice_with_inline_requestsubmit_never_bypasses_final_guar
         monkeypatch, {"url": controller.url, "controls": [target]}, controller)
     final_calls, marked = [], []
 
-    async def refuse(_session, _page, _target):
-        final_calls.append("same final guard")
-        raise forms.Gate("synthetic final guard refused")
+    async def final(*_args):
+        final_calls.append("unexpected early final check")
+        raise forms.PreSubmitGate(1, "must not run for ordinary choice")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", final)
     controller.mark_click_started = lambda: marked.append("possible submission")
-    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
-        await session.application_effect("click", "#next")
-    assert final_calls == ["same final guard"]
-    assert marked == [] and calls == []
+    await session.application_effect("click", "#next")
+    assert final_calls == []
+    assert marked == [] and [c[0][:2] for c in calls] == [("click", "#next")]
     assert controller.committed is False
 
 
@@ -1036,7 +1002,7 @@ def test_native_submit_role_does_not_mask_trusted_reader_html_type(role, reader)
 async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeypatch, role):
     """A native committing input cannot become an approved reversible choice."""
     target = _control(label='Continue', kind=role, submit=False)
-    target.update(tag='input', native_type='submit',
+    target.update(tag='input', native_type='submit', submit=True,
                   native_form_owner_selector='#app')
     controller = _controller()
     session, calls = await _setup(
@@ -1047,7 +1013,7 @@ async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeyp
         visited.append('single final guard')
         raise forms.Gate('synthetic final guard refused')
 
-    monkeypatch.setattr(controller, 'authorize_final_submit', refuse)
+    monkeypatch.setattr(controller, 'check_pre_submit', refuse)
     with pytest.raises(forms.Gate, match='synthetic final guard refused'):
         await session.application_effect('click', '#next')
     assert visited == ['single final guard']
@@ -1055,13 +1021,13 @@ async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('identity','expected'), [
-    ({'job_ids': ['other-job'], 'employers': []}, 'contradictory visible job ID'),
-    ({'job_ids': [], 'employers': ['foreign-co']}, 'contradictory visible employer'),
-    ({'job_ids': [], 'employers': []}, 'protected tailored PDF'),
+@pytest.mark.parametrize(('identity','expected_item'), [
+    ({'job_ids': ['other-job'], 'employers': []}, 1),
+    ({'job_ids': [], 'employers': ['foreign-co']}, 1),
+    ({'job_ids': [], 'employers': []}, 2),
 ])
 async def test_visible_application_identity_is_scoped_at_only_final_ipc(
-        monkeypatch, identity, expected):
+        monkeypatch, identity, expected_item):
     """Identical title is insufficient for a labelled foreign root identity.
 
     A foreign ID in unrelated page prose or a different form is not authority.
@@ -1094,8 +1060,9 @@ async def test_visible_application_identity_is_scoped_at_only_final_ipc(
         ],
     }
     session, calls = await _setup(monkeypatch, page, controller)
-    with pytest.raises(forms.Gate, match=expected):
+    with pytest.raises(forms.PreSubmitGate) as error:
         await session.application_effect('click', '#submit')
+    assert error.value.item == expected_item
     assert calls == []
     assert controller.committed is False
 

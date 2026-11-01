@@ -373,3 +373,24 @@ async def test_yes_no_button_preparation_uses_no_widget_grant(
     assert session.calls == [(('click', '#decline'), {})]
     assert filled == {'#decline': 'No'}
     assert not fixture.held
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure,item', [
+    ('The tailored résumé is missing or its base changed; re-tailor before applying.', 2),
+    ('The tailored PDF is missing; nothing may be submitted without it.', 2),
+    ('This job is already applied; no duplicate is permitted.', 1),
+])
+async def test_dispatch_stage_and_duplicate_failures_keep_substantive_item(
+        monkeypatch, tmp_path, failure, item):
+    """Existing dispatch evidence maps PDF/seed to 2, duplicate/job to 1."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    def refuse_dispatch(*_args, **_kwargs):
+        raise forms.Gate(failure)
+    monkeypatch.setattr(forms, 'check_dispatch', refuse_dispatch)
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.check_pre_submit(None, page, target)
+    assert refused.value.item == item
+    assert refused.value.reason == f'defect_pre_submit_item_{item}'
+    assert not fixture.held

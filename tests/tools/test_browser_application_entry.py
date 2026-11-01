@@ -538,58 +538,34 @@ async def test_entry_incomplete_waits_but_malformed_is_immediate(monkeypatch, un
 
 @pytest.mark.parametrize('drift', ['board', 'ats', 'pk', 'company', 'job_id', 'jd_url', 'route'])
 @pytest.mark.parametrize('when', ['read', 'resume'])
-async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, drift, when):
-    row, configs, session, decide = world(monkeypatch)
+async def test_current_identity_rechecked_at_final_submit_after_preparation(
+        monkeypatch, drift, when):
+    row, configs, session, decision = world(monkeypatch)
+    original = application('ashby', entry={
+        'root': {'selector': '#application-form', 'action': entry('ashby')},
+        'frames': [], 'responses': [], 'response_error': False,
+        'helper_challenge': False,
+    })
+    proof = forms._configured_alias(PK, COMPANY, posting('ashby'))
+    assert proof is not None
     if when == 'resume':
-        first = await attempt()
-        assert first['status'] == 'gate' and first['form_question'] is None
-        assert decide.await_count == 1
-        # Re-entry retains a real exact approved-control grant, without
-        # inventing the removed early per-step human question.
-        email = application('ashby')['controls'][0]
-        row['human_approved_answers'] = {'Email': {
-            'value': 'test@example.test', 'selector': email['selector'],
-            'url': entry('ashby'), 'label': email['label'],
-            'question': email['question'], 'tag': email['tag'],
-            'type': email['type'], 'form_selector': email['form_selector'],
-            'form_action': email['form_action']}}
-        decide.reset_mock()
-        session.calls.clear()
-    def change():
-        if drift in {'board', 'ats'}:
-            setattr(configs[0], drift, 'other')
-        elif drift == 'route':
-            session.current['url'] = entry('ashby') + '/other'
-        else:
-            row[drift] = 'other'
-    if when == 'read' or drift == 'route':
-        async def after(s):
-            change()
-        session.on_evaluate = after
-    else:
-        change()
-    if drift == 'route':
-        # Only the permanently drifted synthetic route needs a short waiter.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-    report = await attempt()
-    assert report['status'] == 'gate'
+        # A prior read is preparation, not durable Submit permission.
+        session.current = deepcopy(original)
+    current = deepcopy(original)
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
     if drift in {'board', 'ats'}:
-        # Current tenant pins are *not* a preparation certificate. They may
-        # leave an approved field question available, but cannot pass Submit.
-        guard = forms.ApplicationIPCController(
-            PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-        await _assert_final_tenant_refusal(
-            guard, session, {'url': entry('ashby'), 'controls': []},
-            {'label': 'Submit'})
+        setattr(configs[0], drift, 'other')
+    elif drift == 'route':
+        current['url'] += '/other'
     else:
-        assert report.get('form_question') is None
-    if drift in {'board', 'ats'}:
-        assert decide.await_count == 1
-    else:
-        assert not decide.await_count
+        row[drift] = 'other'
+    with pytest.raises(forms.PreSubmitGate) as stopped:
+        await guard.check_pre_submit(session, current, current['controls'][-1])
+    assert stopped.value.item == 1
+    assert not guard.committed and not decision.await_count
     no_mutations(session)
-    if when == 'resume' and drift not in {'route', 'board', 'ats'}:
-        assert session.calls == []
 
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])

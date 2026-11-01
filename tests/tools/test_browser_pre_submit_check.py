@@ -775,3 +775,25 @@ def test_file_display_readback_drifts_across_own_hold_identity():
     changed = deepcopy(page)
     changed['attached_file_displays'][0]['filename'] = 'other.pdf'
     assert forms._page_identity(page) != forms._page_identity(changed)
+
+
+@pytest.mark.asyncio
+async def test_missing_file_input_cannot_borrow_stale_complete_upload_tree(
+        monkeypatch, tmp_path):
+    """A form display alone cannot contradict an independent complete tree
+    that still observes a live file receiver absent from controls.
+    """
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    page['attached_file_displays'] = [{
+        'filename': 'Test User.pdf', 'field_label': 'Resume',
+        'valid': True, 'in_form': True, 'form_selector': '#app',
+    }]
+    page['entry'] = {'upload_tree': {
+        'complete': True, 'input': 0,
+        'nodes': [{'target_selector': '#resume'}],
+    }}
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(None, page, target)
+    assert refusal.value.item == 2
+    assert not fixture.held

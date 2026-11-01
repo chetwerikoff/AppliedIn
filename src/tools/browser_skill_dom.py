@@ -319,7 +319,11 @@ PAGE = r"""(() => {
   // form-owned filename display. Inventory the existing Ashby file-item
   // structure; the final check also binds it to the committing receiver.
   const attachedFileDisplays = Array.from(document.querySelectorAll(
-    'div.ashby-application-form-input-file-item')).map(item => {
+    'div.ashby-application-form-input-file-item'))
+    // A deliberately minimal synthetic read may return nonmatching nodes
+    // for any query. Do not treat them as employer file displays.
+    .filter(item => item.matches?.('div.ashby-application-form-input-file-item') === true)
+    .map(item => {
     const fileBox=item.closest('div.ashby-application-form-input-file');
     const field=item.closest('div.ashby-application-form-field-entry');
     const names=item.querySelectorAll('p.ashby-application-form-input-file-item-name');

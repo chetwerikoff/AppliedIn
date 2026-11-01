@@ -1138,7 +1138,21 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
     else:
         displays = page.get('attached_file_displays', [])
         display = displays[0] if isinstance(displays, list) and len(displays) == 1 else {}
-        evidence_ok = (isinstance(display, dict)
+        # A complete independent upload-tree observation cannot still claim
+        # a live file-input receiver when the final control census omits it.
+        # Genuine input removal leaves no such complete input tree.
+        tree = (page.get('entry') or {}).get('upload_tree') or {}
+        nodes = tree.get('nodes', []) if isinstance(tree, dict) else []
+        index = tree.get('input') if isinstance(tree, dict) else None
+        missing_live_input = (
+            tree.get('complete') is True and isinstance(nodes, list)
+            and type(index) is int and 0 <= index < len(nodes)
+            and isinstance(nodes[index], dict)
+            and bool(nodes[index].get('target_selector'))
+            and not any(c.get('selector') == nodes[index]['target_selector']
+                        for c in controls))
+        evidence_ok = (not missing_live_input
+                       and isinstance(display, dict)
                        and display.get('valid') is True
                        and display.get('filename') == attachment
                        and isinstance(display.get('field_label'), str)

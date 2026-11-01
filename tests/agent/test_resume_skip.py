@@ -359,7 +359,10 @@ def test_checkbox_yes_and_no_for_one_generation_have_one_winner(world, winner):
         assert won["status"] == "needs_human" and won["gate_reason"] == "cannot_proceed"
         assert won["gate_call_id"] is None and won["gate_disposition"]["kind"] == "refuse"
         assert "human_approved_answers" not in won and _queued(queue) == []
-    assert stores.answer_bank.puts == []
+    # A consumed affirmative answer is now an ordinary reusable owner fact,
+    # not a selector-bound BrowserSkill grant. The losing reply never banks.
+    assert stores.answer_bank.puts == (
+        [('Synthetic acknowledgement', 'yes')] if winner == 'yes' else [])
 
 
 def test_checkbox_no_that_loses_the_consume_has_no_row_effect(world, monkeypatch):

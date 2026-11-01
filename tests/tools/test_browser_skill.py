@@ -660,16 +660,17 @@ async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact(mo
     control = target(type='checkbox', label='I certify I am a US citizen', required=True)
     # A new legal/citizenship attestation routes directly to the owner even
     # without an application marker; it cannot mint an unapproved fact answer.
-    with pytest.raises(forms.Gate, match='new legal attestation needs an owner decision'):
+    with pytest.raises(forms.Gate) as refusal:
         await forms.execute(session, page(control),
                             {'action': 'choose', 'selector': '#field'}, facts={}, filled={},
                             resume_path='', company='Company', jd_text='',
                             resume_tex='', github='')
+    assert refusal.value.reason == 'owner_question'
     session.call.assert_not_awaited()
 
 
 def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
-    with pytest.raises(forms.Gate, match='no longer present'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(page(), {}, True, 'Resume.pdf')
     control = target(type='radio', label='Yes', question='Authorized to work?',
                      checked=True, name='work_auth', value='yes', has_value=True)
@@ -906,7 +907,7 @@ def test_verified_file_input_is_not_mistaken_for_unapproved_text():
                     value='C:\\fakepath\\Resume.pdf', files=['Resume.pdf'])
     forms.check_form(page(resume), {}, True, 'Resume.pdf')
     resume['files'] = []
-    with pytest.raises(forms.Gate, match='no longer present'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(page(resume), {}, True, 'Resume.pdf')
 
 
@@ -950,21 +951,22 @@ async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
 def test_opaque_and_hidden_form_values_block_final_click():
     attachment = target(selector='#resume', type='file', label='Resume',
                         files=['Resume.pdf'])
-    with pytest.raises(forms.Gate, match='uninspectable'):
+    with pytest.raises(forms.Gate, match='incomplete or unreadable'):
         forms.check_form({**page(attachment), 'opaque_controls': True}, {}, True, 'Resume.pdf')
     with pytest.raises(forms.Gate, match='incomplete'):
         forms.check_form({**page(attachment), 'inventory_verified': False},
                          {}, True, 'Resume.pdf')
-    with pytest.raises(forms.Gate, match='hidden'):
-        forms.check_form(page(attachment, target(selector='#private', type='hidden',
-                                                value='unverified', has_value=True)),
-                         {}, True, 'Resume.pdf')
+    # Hidden machine inputs are not protected-characteristic answers by mere
+    # existence; do not restore the removed blanket per-field witness Gate.
+    forms.check_form(page(attachment, target(selector='#private', type='hidden',
+                                             value='synthetic', has_value=True)),
+                     {}, True, 'Resume.pdf')
 
 
 def test_stale_page_text_and_fakepath_never_prove_uploaded_pdf():
     attachment = target(selector='#resume', type='file', label='Resume',
                         value='C:\\fakepath\\Resume.pdf', has_value=True, files=[])
-    with pytest.raises(forms.Gate, match='no longer present'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(page(attachment, text='Resume.pdf upload completed'),
                          {}, True, 'Resume.pdf')
 
@@ -1192,8 +1194,9 @@ console.log(JSON.stringify(eval(process.argv[2])));
         assert observed['controls'][0]['type'] == 'hidden'
         resume = target(selector='#resume', type='file', label='Resume', files=['Resume.pdf'])
         observed['controls'].append(resume)
-        with pytest.raises(forms.Gate, match='hidden'):
-            forms.check_form(observed, {}, True, 'Resume.pdf')
+        # A hidden machine input does not prove a protected-characteristic
+        # response; final readback still requires the exact staged PDF.
+        forms.check_form(observed, {}, True, 'Resume.pdf')
     else:
         assert observed['opaque_controls']
         assert not observed['inventory_verified']

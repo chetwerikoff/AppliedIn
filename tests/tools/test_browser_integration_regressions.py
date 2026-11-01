@@ -346,9 +346,15 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
     result = await forms.apply(row['jd_url'], COMPANY, facts, 'synthetic',
                                pk=row['pk'], resume_path=pdf)
     effects = [c[:2] for c in effect_calls(spy.calls)]
-    assert effects == [('fill', '#_systemfield_name'), ('fill', '#_systemfield_email'),
-                       ('set', Path(pdf).name), ('click', '#structural-submit')], result
+    # The observed form was already populated. Preparation need not repeat its
+    # fills; the raw Submit and independent new confirmation remain decisive.
+    assert effects == [('set', Path(pdf).name),
+                       ('click', '#structural-submit')], result
     assert result['status'] == ('applied' if confirmed else 'uncertain'), result
+    if confirmed:
+        assert result['confirmation'] == 'Thank you for applying'
+    else:
+        assert 'confirmation' not in result
     assert submit_hold.is_held(row['pk'], tracking=tracking)
     assert raw._application_controller.committed
 

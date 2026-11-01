@@ -172,7 +172,7 @@ async def test_required_greenhouse_owner_question_is_tokened_and_requeued(
         expected_question_identity=tokens['gate_question_identity'])
     assert accepted['result'] == 'queued', accepted
     assert stores.answer_bank.writes == [(observed['label'], answer)]
-    # Stored historical answer data is inert for reversible BrowserSkill fill.
-    assert stores.tracking.get(case.pk)['human_approved_answers'][
-        observed['label']]['value'] == answer
+    # Owner answers are facts in the bank, not new per-field permission grants.
+    assert observed['label'] not in (
+        stores.tracking.get(case.pk).get('human_approved_answers') or {})
     assert not any(c[0] == 'click' and c[1] == '#submit' for c in raw.calls)

@@ -560,16 +560,17 @@ def test_formless_pdf_requires_membership_in_proven_application_root(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('tag', ['input', 'select'])
 @pytest.mark.parametrize(('caption', 'machine', 'blocked'), [
     ('Male', 'male', True),
     ('Prefer not to answer', 'skip', False),
 ])
 async def test_selected_protected_combobox_caption_is_checked(
-        monkeypatch, tmp_path, caption, machine, blocked):
+        monkeypatch, tmp_path, caption, machine, blocked, tag):
     controller, page, target, fixture = _world(monkeypatch, tmp_path)
     page['controls'].insert(0, {
         'selector': '#gender-picker', 'label': 'Gender', 'question': 'Gender',
-        'tag': 'input', 'type': 'combobox', 'required': True, 'value': '',
+        'tag': tag, 'type': 'combobox', 'required': True, 'value': '',
         'in_form': True, 'form_selector': '#app',
         'combobox': {
             'selected_text': caption, 'selected_value': machine,

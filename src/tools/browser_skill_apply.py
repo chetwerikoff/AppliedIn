@@ -3539,10 +3539,6 @@ class ApplicationIPCController:
                 # The final readback also exposes selected ARIA Yes/No buttons.
                 # A checked button is not a per-widget grant or permission.
                 answer = field.get('label') if field.get('checked') else ''
-            elif field.get('tag') == 'select':
-                matches = [o for o in field.get('options') or []
-                           if o.get('value') == field.get('value')]
-                answer = matches[0].get('label', '') if len(matches) == 1 else ''
             elif field.get('type') == 'combobox':
                 combo = field.get('combobox') or {}
                 selected = str(combo.get('selected_text') or '').strip()
@@ -3575,6 +3571,10 @@ class ApplicationIPCController:
                                 and str(option.get('label') or '').strip() == selected
                             ) == 1)
                 answer = selected or current
+            elif field.get('tag') == 'select':
+                matches = [o for o in field.get('options') or []
+                           if o.get('value') == field.get('value')]
+                answer = matches[0].get('label', '') if len(matches) == 1 else ''
             else:
                 answer = field.get('value') or ''
             try:

@@ -2716,7 +2716,7 @@ async def test_issue214_passive_frames_allow_fill_but_final_submit_refuses_drift
     with pytest.raises((forms.CaptchaGate, forms.CaptchaArtifactGate)):
         await guard.check_pre_submit(raw, unsafe, unsafe['controls'][-1])
     assert not guard.committed
-    assert not [c for c in raw.calls if c[0] == 'click')
+    assert not [c for c in raw.calls if c[0] == 'click']
 
 @pytest.mark.parametrize('drift', ['unknown-frame', 'response-error'])
 async def test_issue214_raw_producer_fill_is_ungated_but_submit_is_not(

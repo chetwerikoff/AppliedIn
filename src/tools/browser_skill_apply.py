@@ -301,6 +301,7 @@ _GATE_DIAGNOSTICS = frozenset({
     'agent_review_unavailable', 'owner_question', 'defect_structural', 'defect_provenance',
     'defect_tenant', 'defect_witness', 'defect_ashby_root_identity',
     'defect_greenhouse_tenant_alias', 'posting_guard_review_required',
+    'captcha',
 })
 
 class Gate(ValueError):
@@ -457,7 +458,10 @@ class MaterialAssentGate(Gate):
 
 
 class CaptchaGate(Gate):
-    """Only an already-visible, positively identified challenge is a CAPTCHA Gate."""
+    """A reader-positive challenge is an explicit manual CAPTCHA boundary."""
+
+    def __init__(self, message: str):
+        super().__init__(message, reason='captcha')
 
 
 class CaptchaArtifactGate(Gate):

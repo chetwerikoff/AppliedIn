@@ -535,6 +535,32 @@ async def test_recovery_set_transport_error_is_uncertain_without_replay(
     assert authority.post_attempts == authority.post_count == 0
 
 
+async def test_file_set_reply_without_current_file_readback_is_uncertain(
+        authority, monkeypatch):
+    """A successful command reply is not an attached PDF: never retry or Submit."""
+    raw = FixtureRaw(authority)
+    original = raw.call
+
+    async def unconfirmed(method, *args, **kwargs):
+        if is_set(method, args):
+            name = resume_set_name(args[0])
+            raw.uploads.append((('set', name), kwargs))
+            # Simulate a browser file-set reply while the independently read
+            # current input still has no attachment (lost/unstable readback).
+            return {'value': {'set': True, 'files': [name]}}
+        return await original(method, *args, **kwargs)
+
+    raw.call = unconfirmed
+    result, _, seen = await _run_recovery(authority, monkeypatch, raw=raw)
+    assert seen == []
+    assert result['status'] == 'uncertain', result
+    assert 'Résumé upload interrupted after the browser command' in result['detail']
+    assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
+    assert authority.upload_ipc == 1
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+    assert authority.post_attempts == authority.post_count == 0
+
+
 async def test_already_proven_resume_submit_does_not_replay_upload(
         authority, monkeypatch):
     result, raw, seen = await _run_recovery(

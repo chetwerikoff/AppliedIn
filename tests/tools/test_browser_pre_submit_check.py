@@ -661,3 +661,24 @@ async def test_implicit_submit_key_without_proven_receiver_fails_closed(
         await controller.before_ipc(None, ('press', key), {})
     assert refused.value.item == 1
     assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('value', 'blocked'), [
+    ('1,500,000', True), ('2,500,000', False),
+])
+async def test_comma_grouped_salary_keeps_its_leading_millions_digit(
+        monkeypatch, tmp_path, value, blocked):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path, case='salary')
+    controller.facts['Minimum salary floor'] = 'VND 2,000,000 monthly'
+    pay = next(c for c in page['controls'] if c.get('selector') == '#pay')
+    pay.update(question='Desired salary (VND/month)',
+               label='Salary (VND/month)', value=value)
+    if blocked:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 4
+        assert not fixture.held
+    else:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held

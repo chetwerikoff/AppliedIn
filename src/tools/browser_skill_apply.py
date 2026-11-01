@@ -3615,7 +3615,7 @@ class ApplicationIPCController:
                             else 'month' if unit in {'month','monthly','mo'}
                             else 'hour')
             amounts = list(re.finditer(
-                r'\b(\d{2,3}(?:,\d{3})+|\d{4,9}|'
+                r'\b(\d{1,3}(?:,\d{3})+|\d{4,9}|'
                 r'\d{2,3}(?:\.\d+)?)\s*([kKmM])?\b', raw))
             if len(currencies) != 1 or len(periods) != 1 or len(amounts) != 1:
                 return None

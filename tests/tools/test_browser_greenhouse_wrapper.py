@@ -83,10 +83,13 @@ async def _must_final_tenant_deny(state, *, url=URL):
         PK, COMPANY, url, "synthetic.pdf", {}, {}, [], {},
         lambda: clicks.append("submitted"))
     prior_starts = len(state.browser_starts)
-    with pytest.raises(forms.Gate):
-        await controller.authorize_final_submit(
-            None, {"url": HOSTED, "title": "Synthetic role"},
+    # Tenant/posting safety is item 1 of the single code-owned final check.
+    # Do not restore the deleted authorize_final_submit compatibility layer.
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(
+            None, {"url": HOSTED, "title": "Synthetic role", "controls": []},
             {"label": "Submit application"})
+    assert refusal.value.item == 1
     assert clicks == []
     assert len(state.browser_starts) == prior_starts
 

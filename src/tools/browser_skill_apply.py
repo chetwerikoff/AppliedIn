@@ -3897,14 +3897,26 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 is_submission(target) or native_submit(target)):
                             raise Gate('Submit requires a current classified Submit control.')
                         if ctx is not None:
+                            # Mirror the production raw-IPC boundary: the
+                            # decision may have outlived its preceding PAGE.
+                            # Only the single existing final check may
+                            # authorize the current classified receiver.
+                            current_page = await session.page()
+                            current_targets = [c for c in current_page.get('controls', [])
+                                               if c.get('selector') == target['selector']
+                                               and (is_submission(c) or native_submit(c))]
+                            if len(current_targets) != 1:
+                                raise PreSubmitGate(
+                                    1, 'Current Submit receiver is unavailable or ambiguous.')
                             offline_guard = ApplicationIPCController(
                                 pk, company, url, resume_path, facts, filled, history,
                                 step, mark_click_started, fixture_context=ctx)
                             offline_guard.upload_completed = uploaded
                             offline_guard.upload_identity = offline_guard._row_pdf()
-                            await offline_guard.check_pre_submit(session, page, target)
+                            await offline_guard.check_pre_submit(
+                                session, current_page, current_targets[0])
                             mark_click_started()
-                            await session.call('click', target['selector'])
+                            await session.call('click', current_targets[0]['selector'])
                         else:
                             if (producer_guard is None or
                                     getattr(raw_session, '_application_controller', None)

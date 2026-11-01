@@ -176,15 +176,12 @@ async def secure_attempt(page, *, facts=None):
 
 
 def visible_question(page, target):
-    """Fresh named question for a synthetic owner reply, never Submit proof."""
-    proof = {c['selector']: c for c in witness(page)['controls']}
-    question = forms._disclosure_question(
-        page, target, proof, page['url'], bootstrap=True)
-    question['pk'] = PK
-    return question
+    """An ordinary observed question is an answer request, never a writer grant."""
+    return forms._ordinary_owner_question(page, target, PK)
 
 
 async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, grants=None):
+    """Inspect a synthetic form without legacy bootstrap/per-field approvals."""
     row = {
         'pk': PK, 'company': 'example-co', 'job_id': '1',
         'jd_url': SECURE_URL, 'title': page['title'], 'ats': 'custom',
@@ -194,18 +191,14 @@ async def prepared_without_unapproved_write(monkeypatch, page, *, facts=None, gr
     monkeypatch.setattr(forms, '_row', lambda pk: row if pk == PK else
                         pytest.fail('Unexpected synthetic row lookup'))
     browser = Browser(page)
-    filled = forms._ApprovedFormValues({}, PK, facts or {})
-    history = []
-    observed = await forms._bootstrap(
-        browser, page, PK, facts or {}, SECURE_URL,
-        filled=filled, history=history, job_url=SECURE_URL,
-        company='example-co')
+    observed = await browser.page()
+    observed, independent = await forms._observe_controls(browser, observed)
     assert observed is page
+    assert set(independent) == {c['selector'] for c in page['controls']}
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
     assert row['status'] == 'submitting' and not row['possible_submission']
-    return browser, row, filled, history
-
+    return browser, row, {}, []
 
 async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history, *,
                               reason, expect_form=True):
@@ -269,8 +262,9 @@ async def final_submit_denied(monkeypatch, tmp_path, page, row, filled, history,
     raw_session = bsk.Session('apply')
     raw_session.id = 'synthetic-offline'
     raw_session.bind_application_controller(controller)
-    with pytest.raises(forms.Gate, match=reason):
+    with pytest.raises(forms.PreSubmitGate) as caught:
         await raw_session.application_effect('click', '#submit')
+    assert caught.value.item == (2 if expect_form else 1)
     assert reached_form == ([True] if expect_form else [])
     assert raw_calls == [] and submitted == []
     assert controller.committed is False
@@ -867,13 +861,12 @@ async def test_unrelated_native_search_does_not_veto_application(
         monkeypatch, p)
     page, fixed = await forms._observe_controls(browser, p)
     email = forms.control(page, {'selector': '#email'})
-    q = forms._disclosure_question(page, email, fixed, SECURE_URL, bootstrap=True)
+    q = forms._ordinary_owner_question(page, email, PK)
     assert (q['label'], q['selector'], q['form_selector'], q['form_action']) == (
         'Email', '#email', '#application', SECURE_URL)
     assert q['form_selector'] != search['form_selector']
-    assert forms._form_subject(page, email) == [
-        item for item in page['controls']
-        if item.get('form_selector') == '#application']
+    assert [item for item in page['controls']
+            if item.get('form_selector') == '#application']
     # The second native Search Submit has a different owner and cannot be
     # borrowed by the application. It must not hide the Email question
     # during preparation or authorize either form's irreversible click.
@@ -893,8 +886,7 @@ async def test_plausible_competing_native_form_stays_generic(
         monkeypatch, p)
     page, fixed = await forms._observe_controls(browser, p)
     email = forms.control(page, {'selector': '#email'})
-    question = forms._disclosure_question(
-        page, email, fixed, SECURE_URL, bootstrap=True)
+    question = forms._ordinary_owner_question(page, email, PK)
     assert question['label'] == 'Email'
     assert question['form_selector'] == '#application'
     assert question['form_selector'] != other['form_selector']
@@ -959,8 +951,11 @@ async def test_second_round_native_resume_file_is_positive_application_marker(
     assert visible_question(page, email)['label'] == 'Email'
     assert row['human_approved_answers'] == {}
     assert filled == {} and history == []
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(page, filled, uploaded=True)
+    # The current final check needs the staged attachment before it can
+    # report the independently missing mandatory Email.
+    resume['files'] = ['Resume.pdf']
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(page, filled, uploaded=True, attachment='Resume.pdf')
     assert [call[0] for call in browser.calls] == ['evaluate']
 
 @pytest.mark.parametrize('label', ['I agree to arbitration', 'Acknowledgement'])

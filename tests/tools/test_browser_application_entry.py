@@ -741,78 +741,32 @@ async def test_mapping_drift_at_final_submit_refuses_before_ipc(monkeypatch):
     no_mutations(session)
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
-@pytest.mark.parametrize('drift', ['board', 'job_id', 'pk', None])
-@pytest.mark.parametrize('refresh', ['page', 'evaluate'])
-async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
-        monkeypatch, ats, drift, refresh):
-    from tests.tools import test_browser_combobox as combo
+@pytest.mark.parametrize('drift', ['board', 'job_id', 'pk'])
+async def test_final_submit_checks_current_ats_authority_after_ungated_preparation(
+        monkeypatch, ats, drift):
+    """A removed combobox pre-write grant never substitutes for final identity.
 
-    row, configs, _, _ = world(monkeypatch, ats)
-    initial_target = combo.control()
-    initial_target['combobox']['options'] = []
-    initial = combo.page(initial_target)
-    opened = combo.page()
-    committed = combo.page(combo.control(
-        selected_text='Example Country', selected_value='EX', hidden_value='EX'))
-    for page in (initial, opened, committed):
-        page['url'] = entry(ats)
-        for c in page['controls']:
-            c['form_action'] = entry(ats)
-    row['human_approved_answers'] = {'What country?': {
-        **combo.grant(), 'url': entry(ats), 'form_action': entry(ats)}}
-    session = combo.DynamicSession(initial, opened, committed)
-    original_page, original_call = session.page, session.call
-    drifted = False
-    def change():
-        nonlocal drifted
-        if drift and session.stage == 1 and not drifted:
-            drifted = True
-            if drift == 'board':
-                configs[0].board = 'other-co'
-            else:
-                row[drift] = 'foreign-job'
-    async def page_read():
-        if refresh == 'page':
-            change()
-        return await original_page()
-    async def ipc(*args, **kwargs):
-        if refresh == 'evaluate' and args[0] == 'evaluate':
-            change()
-        return await original_call(*args, **kwargs)
-    session.page, session.call = page_read, ipc
-    filled = {}
+    The current tracked row and tenant are checked by the single final
+    controller even when preparation was allowed to mutate a form earlier.
+    """
+    row, configs, session, decision = world(monkeypatch, ats)
+    current = application(ats)
+    session.current = current
     proof = forms._configured_alias(PK, COMPANY, posting(ats))
-    async def execute():
-        return await forms.execute(
-            session, initial, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-            company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
-            job_url=posting(ats), provenance=proof)
-    if drift and drift != 'board':
-        # The read changes no DOM/grant/receiver bytes: only independent current
-        # authority is revoked. A later pre-option Gate cannot undo filter fill.
-        with pytest.raises(forms.Gate):
-            await execute()
-        assert drifted
-        assert not [call for call in session.calls if call[0] == 'fill']
-        assert ('click', '#country-example') not in session.calls
-        assert filled == {}
+    assert proof is not None
+    if drift == 'board':
+        configs[0].board = 'foreign-co'
     else:
-        receipt = await execute()
-        assert receipt['committed_value'] == 'EX'
-        assert ('fill', '#country', '--value', 'Example Country') in session.calls
-        assert ('click', '#country-example') in session.calls
-        if drift == 'board':
-            # ARCH21:58 / AC14: pin drift cannot block approved selection.
-            # Preserve the negative guarantee at the same final guard.
-            assert drifted
-            guard = forms.ApplicationIPCController(
-                PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-            await _assert_final_tenant_refusal(
-                guard, session, committed, {'label': 'Submit'})
-            assert ('click', '#submit') not in session.calls
-
+        row[drift] = 'foreign-job'
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting(ats), '', {}, {}, [],
+        {'url': posting(ats)}, lambda: None, entry_provenance=proof)
+    with pytest.raises(forms.PreSubmitGate) as denied:
+        await guard.check_pre_submit(session, current, current['controls'][-1])
+    assert denied.value.item == 1
+    assert denied.value.reason == 'defect_pre_submit_item_1'
+    assert not guard.committed and not decision.await_count
+    no_mutations(session)
 
 def dom(spec, script=None):
     import json

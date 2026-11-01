@@ -360,55 +360,60 @@ async def test_foreign_or_nested_listbox_never_authorizes_final_submit(
 
 
 @pytest.mark.parametrize('cleared', [False, True])
-async def test_full_phone_readback_mismatch_gates_after_only_tel_fill(monkeypatch, cleared):
+async def test_optional_phone_fill_is_ungated_even_when_readback_differs(monkeypatch, cleared):
+    """Reversible input writes are not independently approved."""
     session = Session()
-    phone = next(c for c in session.snapshot['page']['controls'] if c['selector']=='#phone')
+    phone = next(c for c in session.snapshot['page']['controls']
+                 if c['selector'] == '#phone')
     phone.update(label='Phone', question='Phone')
-    grant = {k: phone[k] for k in (
-        'selector', 'label', 'question', 'tag', 'type', 'form_selector', 'form_action')}
-    grant.update(value='+12025550123', url=URL)
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'pk':pk, 'status':'submitting', 'human_approved_answers':{'Phone':grant}})
     original = session.call
+
     async def transport(*args):
         if args[0] == 'fill':
             session.calls.append(args)
-            # PAGE can retain approved-looking data-value while native value is empty.
             phone.update(value='+12025550123' if cleared else '+12025550124',
                          has_value=not cleared)
             return {}
         return await original(*args)
+
     session.call = transport
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, await session.page(), {'action':'fill','selector':'#phone','fact':'Phone'},
-            facts={'Phone':'+12025550123'}, filled={}, resume_path='', company='example-co',
-            jd_text='', resume_tex='', github='', pk='example-co#1', job_url=URL)
+    filled = {}
+    result = await forms.execute(
+        session, await session.page(),
+        {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
+        facts={'Phone': '+12025550123'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk='example-co#1', job_url=URL)
+    assert result['action'] == 'fill'
+    assert filled['#phone'] == '+12025550123'
     assert session.calls == [('fill', '#phone', '--value', '+12025550123')]
 
-
-def test_cleared_optional_phone_cannot_evade_presubmit():
+def test_optional_phone_does_not_require_a_removed_value_grant():
     page = dom()['page']
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
     phone.update(value='+12025550123', has_value=False, required=False)
-    # A partially inspectable page must fail closed before individual values.
     assert page['inventory_verified'] is False and page['opaque_controls']
-    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
-        forms.check_form(page, {'#phone': '+12025550123'}, True)
+    with pytest.raises(forms.Gate, match='final application inventory'):
+        forms.check_form(page, {'#phone': '+12025550123'}, True,
+                         attachment='Synthetic Resume.pdf')
 
-    # Independently prove the phone-specific negative with a complete current
-    # native form. Opaque unrelated widgets cannot mask this checked value.
-    complete = {
-        'url': URL, 'controls': [copy.deepcopy(phone)],
+    # The final check requires one matching staged PDF, but no legacy
+    # approval/witness for a non-required phone value.
+    filename = 'Synthetic Resume.pdf'
+    final = {
+        'url': URL,
+        'controls': [copy.deepcopy(phone), {
+            'selector': '#resume', 'label': 'Resume', 'type': 'file',
+            'disabled': False, 'files': [filename],
+        }],
         'inventory_verified': True, 'truncated': False,
         'opaque_controls': False, 'shadow_roots': False,
         'unsupported_frames': [],
     }
-    with pytest.raises(forms.Gate, match='current native value and its readback disagree'):
-        forms.check_form(complete, {'#phone': '+12025550123'}, True)
+    forms.check_form(final, {'#phone': '+12025550123'}, True,
+                     attachment=filename)
 
-
-async def test_direct_raw_submit_refuses_changed_current_choice(
+async def test_raw_submit_does_not_restore_old_choice_grants(
         monkeypatch, tmp_path, grants):
     """One production raw application click, no fake model-level submit gate."""
     from tools import browser_skill as bsk
@@ -450,14 +455,22 @@ async def test_direct_raw_submit_refuses_changed_current_choice(
 
     monkeypatch.setattr(controller, '_page', reread)
     monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    reached_hold = []
+    def stop_before_synthetic_submit(*args, **kwargs):
+        reached_hold.append(True)
+        raise RuntimeError('synthetic hold reached')
+
     monkeypatch.setattr(forms, 'hold_possible_submission',
-                        lambda *a, **kw: pytest.fail('Unapproved choice reached Submit hold'))
+                        stop_before_synthetic_submit)
     monkeypatch.setattr(bsk, 'command', command)
     raw = bsk.Session('apply')
     raw.id = 'synthetic-session'
     raw.bind_application_controller(controller)
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
+    # A changed ordinary caption is not a per-widget authorization item.
+    # Stop at the existing hold boundary without dispatching raw Submit.
+    with pytest.raises(RuntimeError, match='synthetic hold reached'):
         await raw.application_effect('click', '#submit')
+    assert reached_hold == [True]
     assert raw_commands == [] and started == []
     assert controller.committed is False
     assert ('click', '#submit') not in session.calls
@@ -483,7 +496,8 @@ async def test_never_committed_component_refuses_final_submit(
         ('fill', '#location', '--value', 'Approved location'),
         ('click', '#location-option'),
     ]
-    assert receipt['committed_value'] == 'Approved location'
+    assert receipt['action'] == 'combobox'
+    assert receipt['selector'] == '#location'
     # The reversible click returned, but this DOM never committed a selected
     # caption/receiver. Isolate this real field from unrelated required fields
     # to prove the exact final-form failure, not just an incomplete page.
@@ -496,11 +510,13 @@ async def test_never_committed_component_refuses_final_submit(
     final['controls'] = [c for c in final['controls'] if c['selector'] in keep]
     assert {'#location', '#resume', '#submit'} <= {
         c['selector'] for c in final['controls']}
+    filename = 'Synthetic Resume.pdf'
+    next(c for c in final['controls'] if c['selector'] == '#resume')['files'] = [filename]
     final.update(inventory_verified=True, truncated=False,
                  opaque_controls=False, shadow_roots=False,
                  unsupported_frames=[])
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(final, filled, True, receipts=[receipt])
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(final, filled, True, attachment=filename, receipts=[receipt])
     # The production raw-click seam independently refuses this minimal
     # incomplete selection with zero Submit IPC and no irreversible hold.
     await assert_unapproved_submit_is_refused(
@@ -683,11 +699,15 @@ def test_empty_unnamed_native_proxy_is_not_an_independent_approval_question(key)
     assert len(proxies) == 1
     proxy = proxies[0]
     assert proxy['in_form'] is True and not proxy['value']
-    assert forms._could_receive_an_answer(proxy) is False
-    assert forms._key(page, target) == ('Country' if key == 'country' else key)
-    with pytest.raises(forms.Gate, match='Required field is empty'):
-        forms.check_form(
-            {'controls': [proxy], 'inventory_verified': True}, {}, True)
+    assert not proxy.get('label') and not proxy.get('name')
+    assert target['type'] == 'combobox'
+    filename = 'Synthetic Resume.pdf'
+    final = {'controls': [proxy, {
+        'selector': '#resume', 'label': 'Resume', 'type': 'file',
+        'disabled': False, 'files': [filename],
+    }], 'inventory_verified': True}
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(final, {}, True, attachment=filename)
 
 
 @pytest.mark.parametrize('key', ['location', 'country'])
@@ -710,25 +730,24 @@ def test_untouched_required_proxy_and_other_required_field_cannot_submit(key):
     snapshot = dom(fullPhone=True, requiredProxy=True)
     target = combo(snapshot, key)
     assert target['type'] == 'combobox'
-    # Neither a mounted proxy nor an old C0/C1 certificate is a submitted
-    # value. Focus just this required field to test its final refusal.
-    with pytest.raises(forms.Gate):
-        forms.check_form(focused_final_page(snapshot['page'], key), {}, True)
+    # The required native proxy is not satisfied by the visible combobox.
+    # Supply the staged PDF, so the test reaches the required-field rule.
+    filename = 'Synthetic Resume.pdf'
+    resume = {'selector': '#synthetic-resume', 'label': 'Resume',
+              'type': 'file', 'disabled': False, 'files': [filename]}
     outside = dom(fullPhone=True, requiredProxy=True,
                   proxyMutation={'key': key, 'parent': 'outside'})
-    ordinary = [c for c in outside['page']['controls']
-                if c.get('required') and c['type'] == 'text' and not c['has_value']]
-    # The generic reader retains all five required text inputs, not only
-    # the one whose proxy was moved. Each empty native receiver independently
-    # blocks final Submit; an old proxy-specific inventory exemption cannot
-    # hide the four peers.
-    assert len(ordinary) == 5
-    assert len({c['selector'] for c in ordinary}) == len(ordinary)
-    for field in ordinary:
-        assert field['tag'] == 'input' and field['in_form'] is True
-        with pytest.raises(forms.Gate, match='Required field is empty'):
-            forms.check_form(
-                {'controls': [field], 'inventory_verified': True}, {}, True)
+    for view in (snapshot['page'], outside['page']):
+        fields = [c for c in view['controls'] if c.get('required')
+                  and c.get('type') == 'text' and not c.get('label')
+                  and not c.get('value')]
+        assert fields
+        for field in fields:
+            assert field['tag'] == 'input' and field['in_form'] is True
+            with pytest.raises(forms.Gate, match='required application field is empty'):
+                forms.check_form(
+                    {'controls': [field, resume], 'inventory_verified': True},
+                    {}, True, attachment=filename)
 
 def _diagnostic_paths(page, final_segment):
     # The fixture has unrelated unmatched ARIA picker parts, which remain
@@ -936,23 +955,17 @@ async def test_real_observation_preserves_genuine_gate_and_question(monkeypatch,
     assert caught.value.form_question == {'synthetic': boundary}
     assert session.calls == []
 
-@pytest.mark.parametrize('cause', ['inventory', 'approval', 'destination', 'phase timeout'])
-async def test_country_wrapper_preserves_noncommit_Gates(monkeypatch, cause):
+async def test_country_picker_missing_fact_uses_owner_question():
+    """Missing facts are answer requests, never an extra per-widget grant."""
     session = Session(fullPhone=True)
-    sentinel = forms.Gate('safe synthetic ' + cause,
-                          form_question={'synthetic': cause})
-    async def refused(*args, **kwargs):
-        raise sentinel
-    # There is no retired shape-specific picker wrapper. The generic
-    # independently witnessed observation must propagate genuine pre-click
-    # refusals without replacing or silently losing the form question.
-    monkeypatch.setattr(forms, '_observe_controls', refused)
     with pytest.raises(forms.Gate) as caught:
-        await forms._execute_combobox(session, await session.page(),
-            {'action': 'combobox', 'selector': '#country'}, facts={}, filled={},
-            pk='example-co#1', job_url=URL, ctx=None, provenance=None)
-    assert caught.value is sentinel
-    assert caught.value.form_question == {'synthetic': cause}
+        await forms._execute_combobox(
+            session, await session.page(),
+            {'action': 'combobox', 'selector': '#country'},
+            facts={}, filled={}, pk='example-co#1', job_url=URL,
+            ctx=None, provenance=None)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question is not None
     assert session.calls == []
 
 @pytest.mark.parametrize('scenario', [

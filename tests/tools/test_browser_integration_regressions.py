@@ -307,14 +307,16 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
         monkeypatch, tmp_path, confirmed):
     """The real formless facade must reach the same production raw-IPC verdict."""
     from tests.tools.test_browser_formless import (
-        RootSession, observed, approve_fields, action_sequence, effect_calls,
+        RootSession, observed, action_sequence, effect_calls,
     )
 
     row, _, tracking, raw, _, pdf = _world(monkeypatch, tmp_path, ats='ashby')
     current, fixed = observed()
     spy = RootSession(current, fixed)
     provenance = forms._configured_alias(row['pk'], COMPANY, row['jd_url'])
-    facts = approve_fields(row, current, fixed, provenance)
+    # Owner facts are ordinary preparation inputs; the removed per-receiver
+    # approval/witness synthesizer is neither needed nor valid here.
+    facts = {'Name': 'Test User', 'Email': 'test@example-co.test'}
     if confirmed:
         after, after_fixed = deepcopy(current), deepcopy(fixed)
         for snapshot in (after, after_fixed):
@@ -398,8 +400,9 @@ async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
     for control in page['controls']:
         control['form_action'] = url
     row['human_approved_answers']['Email'].update(url=url, form_action=url)
+    # apply() already attaches the unique PDF; a second model upload is not
+    # an authorization step and would intentionally be refused by raw IPC.
     actions = iter([dict(action='fill', selector='#email', fact='Email'),
-                    dict(action='upload', selector='#resume'),
                     dict(action='submit', selector='#submit')])
     async def decide(*args, **kwargs):
         return next(actions)
@@ -407,8 +410,9 @@ async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
     result = await forms.apply(url, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert result['reason'] == 'defect_tenant'
-    assert effects == [('navigate', url), ('fill', '#email'), ('upload', '#resume')]
+    assert result.get('item') == 1
+    assert result['reason'] == 'defect_pre_submit_item_1'
+    assert effects == [('navigate', url), ('upload', '#resume'), ('fill', '#email')]
     assert not raw._application_controller.committed
     assert not submit_hold.is_held(PK, tracking=tracking)
 

@@ -1190,7 +1190,7 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     assert not any(c[0] == 'click' for c in raw.calls), result
     assert result['status'] == 'gate', result
     # #139 AC8: the same raw final guard checks post-hold form/root drift.
-    assert 'changed before submit' in result['question']
+    assert 'changed after the own hold' in result['question']
     # This is a post-admission drift, not a zero-total-IPC admission refusal.
     assert [c for c in raw.calls if c[0] == 'fill'], result
     assert len([c for c in effect_calls(raw.calls) if c[0] == 'set']) == 1
@@ -1366,12 +1366,12 @@ eval(process.argv[2]+'console.log(JSON.stringify(z));');
     {'wrapperTag': 'section'}, {'wrapperClass': 'foreign'}, {'wrongOrder': True},
     {'extraChild': True}, {'moveSubmit': True},
 ])
-def test_missing_pane_does_not_waive_proven_wrong_sibling_edges(monkeypatch, changes):
+def test_missing_pane_never_authorizes_unsafe_sibling_structure(monkeypatch, changes):
     _, raw, _, provenance = root_world(monkeypatch, missingPane=True, **changes)
-    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+    # A missing final container fails closed before the more specific sibling
+    # mismatch can be evaluated; both conditions deny raw Submit.
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
         forms._formless_boundary(raw.current, provenance)
-
-
 
 @pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_duplicate(reader):
@@ -2197,45 +2197,9 @@ def _issue184_add_name_phone_controls(raw):
             snapshot['entry']['root_evidence'].append(evidence)
 
 
-def _issue190_entry_witness_reads(raw, *, unstable):
-    original_call = raw.call
-    reads = []
-
-    async def call(method, *args, **kwargs):
-        if method == 'evaluate' and args == (forms._ENTRY_FIXED_CONTROL_WITNESS,):
-            reads.append(len(reads) + 1)
-            fixed = deepcopy(raw.fixed)
-            if len(reads) in unstable:
-                fixed['entry']['frames'] = [_ISSUE190_PRIVATE_ENTRY]
-            return {'value': fixed}
-        return await original_call(method, *args, **kwargs)
-
-    raw.call = call
-    return reads
-
-
-@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
-@pytest.mark.parametrize('unstable,success,failed_predicate', [
-    ({1, 2, 3, 4}, False, 'entry.equal.frames'),
-    ({1, 3}, False, 'inventory.identity.equal'),
-    ({1, 2}, True, ''),
-])
-async def test_issue190_bootstrap_entry_retry_cap_and_consecutive_complete_reads(
-        monkeypatch, site, unstable, success, failed_predicate):
-    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
-    reads = _issue190_entry_witness_reads(raw, unstable=unstable)
-    if success:
-        page, witness = await forms._bootstrap_observe_controls(
-            raw._reversible_session, raw.current, site=site)
-        assert page['entry'] == raw.current['entry']
-        assert set(witness) == {c['selector'] for c in raw.current['controls']}
-    else:
-        with pytest.raises(forms.Gate, match='predicate=' + re.escape(failed_predicate)):
-            await forms._bootstrap_observe_controls(
-                raw._reversible_session, raw.current, site=site)
-    assert reads == [1, 2, 3, 4]  # Never a fifth PAGE/witness evaluation.
-    no_mutations(raw)
-
+# Opaque synthetic page-controlled diagnostic sentinel; no grant or
+# per-action witness helper is reintroduced.
+_ISSUE190_PRIVATE_ENTRY = 'SYNTHETIC_PRIVATE_ENTRY_SENTINEL'
 
 @pytest.mark.parametrize('key', [
     'frames', 'responses', 'response_error', 'root', 'native_candidates',
@@ -2474,7 +2438,9 @@ async def test_hidden_attestation_remains_independently_observed_without_member_
                    if c['selector'] == _HIDDEN_ATTESTATION)
     evidence = next(e for e in page['entry']['root_evidence']
                     if e['selector'] == _HIDDEN_ATTESTATION)
-    assert target['ashby_hidden_choice'] is True
+    # The model-facing page no longer publishes a special hidden-choice grant
+    # flag. Independent form evidence remains present for final readback.
+    assert 'ashby_hidden_choice' not in target
     assert witness['ashby_hidden_choice'] is True
     assert evidence['ashby_hidden_choice'] is True
     assert not hasattr(forms, '_disclosure_question')

@@ -555,6 +555,11 @@ async def test_current_identity_rechecked_at_final_submit_after_preparation(
     guard = forms.ApplicationIPCController(
         PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
         entry_provenance=proof)
+    # Prove the undrifted job and tenant pass item 1 before testing drift.
+    # Missing staged-PDF evidence is an independent final item-2 refusal.
+    with pytest.raises(forms.PreSubmitGate) as clean:
+        await guard.check_pre_submit(session, deepcopy(original), original['controls'][-1])
+    assert clean.value.item == 2
     if drift in {'board', 'ats'}:
         setattr(configs[0], drift, 'other')
     elif drift == 'route':
@@ -2585,7 +2590,7 @@ async def test_issue214_final_raw_submit_classifies_passive_and_untrusted_frames
         assert forms._entry_artifacts(page['entry'], proof) is False
         with pytest.raises(forms.PreSubmitGate) as stopped:
             await guard.check_pre_submit(raw, page, page['controls'][-1])
-        assert stopped.value.item in {1, 2}
+        assert stopped.value.item == 2
     else:
         with pytest.raises(forms.CaptchaArtifactGate,
                            match='unknown/untrusted application frame'):

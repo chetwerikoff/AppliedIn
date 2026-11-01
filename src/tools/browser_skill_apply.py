@@ -3760,15 +3760,24 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  if c.get('type') == 'file' and not c.get('disabled')
                                  and re.search(r'resume|résumé|cv', label(c), re.I)]
                     if not uploaded and len(receivers) == 1:
-                        if (producer_guard is not None
-                                and isinstance(provenance, ApplicationEntryProvenance)
+                        if (isinstance(provenance, ApplicationEntryProvenance)
                                 and provenance.ats == 'ashby'
                                 and _formless_root(page)):
-                            await raw_session.application_effect(
-                                'evaluate', producer_guard._resume_set_script())
-                            uploaded = producer_guard.upload_completed
-                            history.append({'action': 'upload', 'uploaded': uploaded,
-                                            'selector': receivers[0]['selector']})
+                            if producer_guard is not None:
+                                await raw_session.application_effect(
+                                    'evaluate', producer_guard._resume_set_script())
+                                uploaded = producer_guard.upload_completed
+                                result = {'action': 'upload', 'uploaded': uploaded,
+                                          'selector': receivers[0]['selector']}
+                            else:
+                                # The sealed offline fixture uses the same
+                                # single direct file-set path, without a chooser
+                                # and without an application Submit.
+                                result = await _ashby_resume_upload(
+                                    session, page, resume_path=resume_path,
+                                    verify_dispatch=verify_dispatch)
+                                uploaded = bool(result.get('uploaded'))
+                            history.append(result)
                         else:
                             result = await execute(
                                 session, page,

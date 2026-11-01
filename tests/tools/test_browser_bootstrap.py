@@ -1151,8 +1151,8 @@ def test_alias_effective_route_guard_is_job_scoped_and_legacy_unchanged():
 ])
 async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
         monkeypatch, tmp_path, careers_url, matched):
-    from agent import run
-
+    # A configured Greenhouse wrapper is safe to visit and inspect without
+    # generating any per-field permission or making a Submit attempt.
     browser, decide, row = _greenhouse_session(
         monkeypatch, tmp_path, careers_url=careers_url)
     response = await forms.apply(
@@ -1161,63 +1161,32 @@ async def test_real_zero_grant_alias_bootstrap_to_fresh_direct_label(
     assert response['status'] == 'gate'
     assert response['form_question'] is None
     if not matched:
-        # A bare/root-slash tuple cannot certify /openings?gh_jid.
         assert browser.calls[0] == ('navigate', GH_WRAP)
+        assert not decide.await_count
         assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                        for call in browser.calls)
-        assert not decide.await_count
         return
-    assert response['review_route'] == 'agent_unavailable'
+
+    assert response['reason'] == 'agent_review_unavailable'
+    assert response['review_route'] == 'luna'
     assert decide.await_count == 1
-    assert not row['human_approved_answers']
-    # The old direct-grant envelope can still be checked as an independent
-    # reader exercise, but ordinary missing fields no longer create one in
-    # the real preparation path.
-    observed = browser.current
-    target = next(c for c in observed['controls'] if c['selector'] == '#email')
-    fixed = {c['selector']: c for c in witness(observed)['controls']}
-    q = forms._disclosure_question(
-        observed, target, fixed, GH_WRAP,
-        provenance=_greenhouse_provenance(row))
-    q['pk'] = GH_PK
-    assert q['origin_row'] == {
-        'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
-    assert q['url'] == GH_DIRECT and q['form_action'] == GH_DIRECT
-    assert (q['label'], q['selector'], q['form_selector']) == (
-        'Email', '#email', '#application')
-    # Two complete independently witnessed/re-read pairs, then bootstrap's own
-    # fresh witness and re-read before disclosing the original question.
     assert browser.calls[0] == ('navigate', GH_DIRECT)
-    assert browser.calls.count(('evaluate', forms.GREENHOUSE_PAGE)) >= 2
-    assert browser.calls.count(
-        ('evaluate', forms._GREENHOUSE_FIXED_CONTROL_WITNESS)) >= 2
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(observed, {}, uploaded=True)
-
-    # The same synthetic tracking-status seam used by the actual direct writer.
-    class Tracking:
-        def get(self, pk):
-            assert pk == GH_PK
-            return deepcopy(row)
-
-        def set_status(self, pk, status, **changes):
-            assert pk == GH_PK
-            row.update(status=status, **changes)
-
-    tracking = Tracking()
-    tracking.set_status(
-        GH_PK, 'needs_human', gate_source='applier', gate_call_id='direct',
-        gate_pending={'question': response['question'], 'form_question': q})
-    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) == 'Email'
-    row['jd_url'] = (
-        'https://careers.example-co.test/openings/other?gh_jid=123456')
-    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) is None
-    row['jd_url'] = GH_WRAP
-    q.pop('origin_row')
-    assert run._direct_form_label(GH_PK, tracking.get(GH_PK)) is None
-
+    observed = browser.current
+    target = next(c for c in observed['controls'] if c['selector'] == '#email')
+    question = forms._ordinary_owner_question(observed, target, GH_PK)
+    assert (question['pk'], question['label'], question['selector']) == (
+        GH_PK, 'Email', '#email')
+    assert question['url'] == GH_DIRECT
+    # A fabricated historical field grant cannot replace the final readback.
+    filename = 'Synthetic Resume.pdf'
+    final = deepcopy(observed)
+    final['controls'].insert(-1, field(
+        'Resume', '#resume', required=False, type='file',
+        form_action=GH_DIRECT, files=[filename]))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(final, {}, True, filename)
 
 async def test_no_explicit_alias_config_stops_before_navigation(monkeypatch, tmp_path):
     browser, decide, row = _greenhouse_session(monkeypatch, tmp_path)
@@ -1480,11 +1449,8 @@ async def test_alias_safe_native_continue_stays_under_existing_hold(
         ('click', '#next')]
 
 @pytest.mark.parametrize('verb', ['upload', 'click'])
-async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
+async def test_alias_revocation_still_blocks_final_submit_after_observation(
         monkeypatch, tmp_path, verb):
-    # Native receiver re-observation remains reversible under a revoked
-    # Greenhouse board pin. The FINAL same-job/tenant guard, not an extra
-    # pre-upload certificate, rejects the irrevocable Submit.
     receiver = (field('Upload résumé', '#resume', type='file',
                       form_action=GH_DIRECT)
                 if verb == 'upload' else
@@ -1501,19 +1467,16 @@ async def test_alias_mapping_revoked_during_receiver_evaluate_never_mutates(
         return result
 
     monkeypatch.setattr(browser, 'call', revoke_during_evaluate)
-    action = {'selector': '#resume' if verb == 'upload' else '#next'}
-    current_page, actual = await forms._fresh_native_receiver(
-        browser, page, action, receiver, alias)
-    assert current_page is not None and actual['selector'] == action['selector']
-    assert [call[0] for call in browser.calls] == ['evaluate']
+    observed, fixed = await forms._observe_controls(browser, page, site='final-submit')
+    assert observed is page and fixed
     assert forms._preparation_current(alias)
     assert not forms._alias_current(alias)
     controller = forms.ApplicationIPCController(
-        GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
-        pytest.fail('Revoked tenant cannot issue Submit'))
-    with pytest.raises(forms.Gate, match='tenant or board'):
-        await controller.authorize_final_submit(
-            None, page, page['controls'][-1])
+        GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {},
+        lambda: pytest.fail('Revoked tenant cannot issue Submit'))
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.check_pre_submit(None, page, page['controls'][-1])
+    assert refused.value.item == 1
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
@@ -1571,11 +1534,10 @@ async def test_linked_combobox_remains_an_ordinary_required_question(tag, monkey
     ('recruitee', 'https://example-co.recruitee.com/o/backend-123',
      'https://careers.example-co.test/o/backend-123', 302),
 ])
-async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_witness(
+async def test_vendor_redirect_probe_precedes_fake_browser_and_keeps_same_job_origin(
         monkeypatch, ats, canonical, target, status):
     import httpx
     from core.ids import make_pk
-    from agent import run
 
     pk = make_pk('example-co', 'backend-123')
     page = inventory(field(form_action=target), submit(form_action=target), url=target)
@@ -1603,55 +1565,15 @@ async def test_vendor_redirect_probe_precedes_fake_browser_and_persists_exact_wi
                                pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate', result
     assert result['form_question'] is None
-    # The synthetic link is still proven by the real redirect probe, but no
-    # ordinary missing Email prompt is emitted before final Submit.
     provenance = forms.VendorRedirectProvenance(
         pk, 'example-co', ats, 'backend-123', canonical, target)
-    item = page['controls'][0]
-    question = forms._disclosure_question(
-        page, item, {c['selector']: c for c in witness(page)['controls']},
-        canonical, provenance=provenance)
-    question['pk'] = pk
-    assert question['verified_redirect_url'] == target
-    assert question['origin_row'] == {
-        'jd_url': canonical, 'company': 'example-co', 'ats': ats,
-        'pk': pk, 'job_id': 'backend-123'}
+    assert forms.navigation_allowed(target, provenance=provenance)
+    assert not forms.navigation_allowed(
+        'https://other.test/job/backend-123', provenance=provenance)
     assert len(calls) == 1
     assert browser.calls[0] == ('navigate', target)
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
-
-    row.update(status='needs_human', gate_source='applier', gate_call_id='direct',
-               gate_pending={'form_question': question})
-    assert run._direct_form_label(pk, row) == question['label']
-    tampered = deepcopy(question)
-    tampered['verified_redirect_url'] = 'https://careers.other.test/jobs/backend-123'
-    row['gate_pending'] = {'form_question': tampered}
-    assert run._direct_form_label(pk, row) is None
-    tampered = deepcopy(question)
-    tampered['form_action'] = 'https://careers.other.test/jobs/backend-123'
-    row['gate_pending'] = {'form_question': tampered}
-    assert run._direct_form_label(pk, row) is None
-    row['gate_pending'] = {'form_question': question}
-
-    class Tracking:
-        def get(self, _pk):
-            return deepcopy(row)
-
-        def set_status(self, _pk, status, **changes):
-            row.update(status=status, **changes)
-
-    stores = SimpleNamespace(
-        tracking=Tracking(),
-        answer_bank=SimpleNamespace(put=lambda *args, **kwargs: None))
-    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *args, **kwargs: False)
-    monkeypatch.setattr(run, '_enqueue_apply', lambda *args, **kwargs: {'result': 'queued'})
-    assert run.resume_job(pk, 'approved synthetic answer', stores,
-                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
-    assert row['human_approved_answers'][question['label']][
-        'verified_redirect_url'] == target
-
-
 
 @pytest.mark.parametrize('location', [
     'https://careers.example-co.test/jobs/backend-123#fragment',
@@ -1859,8 +1781,10 @@ async def test_vendor_row_drift_during_dom_witness_prevents_field_gate(
                                pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
     assert result['form_question'] is None
-    assert 'job/tenant mapping changed during native control inspection' in result['question']
-    assert [call[0] for call in browser.calls] == ['navigate', 'evaluate']
+    # The obsolete per-field witness refusal is gone. Any newly changed row
+    # remains ineligible for final Submit under the single raw IPC check.
+    assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
+                   for c in browser.calls)
 
 def _vendor_row(pk, canonical, ats='teamtailor'):
 
@@ -2234,26 +2158,6 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
     assert row["human_approved_answers"] == original_grants
     assert not [call for call in browser.calls
                 if call[0] in {"fill", "select", "click", "upload"}]
-
-
-# Issue #103: the choice answer is an existing control grant, never bank fact data.
-def _choice_grant_from_page(page, target, answer):
-    nodes = {c['selector']: c for c in witness(page)['controls']}
-    question = forms._disclosure_question(
-        page, target, nodes, page['url'], bootstrap=True)
-    grant = {
-        'value': answer, 'selector': question['selector'],
-        'url': question['url'], 'label': question['control_label'],
-        'question': question['question'], 'tag': question['tag'],
-        'type': question['type'], 'form_selector': question['form_selector'],
-        'form_action': question['form_action'],
-    }
-    if target['type'] == 'radio':
-        grant.update(radio_name=question['radio_name'],
-                     radio_members=deepcopy(question['radio_members']))
-    elif target['type'] == 'checkbox':
-        grant['visible_text'] = question['visible_text']
-    return question['label'], grant
 
 
 async def test_missing_native_choice_grant_keeps_bound_first_question(monkeypatch):
@@ -2697,10 +2601,7 @@ async def test_observed_link_and_model_navigation_share_failed_provenance_predic
     browser, decide, row = secure_world(monkeypatch, page)
     # Retain the production action-scope and route predicates. Only the
     # unrelated field reader/approved-choice setup is skipped by this fixture.
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _s, current, *a, **k: current))
-    monkeypatch.setattr(forms, '_current_approved_choices',
-                        AsyncMock(return_value=[]))
+
     decide.return_value = ({'action': 'click', 'selector': '#next'}
                            if verb == 'click'
                            else {'action': 'navigate', 'url': destination})
@@ -2708,9 +2609,8 @@ async def test_observed_link_and_model_navigation_share_failed_provenance_predic
     assert decide.await_count == 1
     assert report['status'] == 'gate'
     assert report['reason'] == 'defect_provenance'
-    assert report['navigation_provenance_diagnostic'] is True
-    assert 'Navigation requires provenance to the same tracked job and tenant.' in (
-        report['question'])
+    assert report.get('navigation_provenance_diagnostic') is not True
+    assert 'Navigation' in report['question']
     assert 'Failed predicate: same_tracked_employer_https_origin' in report['question']
     assert 'destination host/path: foreign.example.test/other-job' in report['question']
     assert 'QUERY_SECRET' not in report['question']

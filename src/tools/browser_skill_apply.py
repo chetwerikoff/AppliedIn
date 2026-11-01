@@ -3218,31 +3218,18 @@ class ApplicationIPCController:
         page = await self._page(session)
         target = None
         ambiguous = False
-        if op == 'click':
-            if len(args) != 2 or kwargs or not isinstance(args[1], str):
+        if op == 'click' and len(args) == 2 and not kwargs:
+            matching = [c for c in page.get('controls', [])
+                        if c.get('selector') == args[1]]
+            committing = [c for c in matching
+                          if is_submission(c) or native_submit(c)]
+            if len(matching) == 1 and len(committing) == 1:
+                target = committing[0]
+            elif committing:
+                # Conflicting current Submit receivers cannot select a
+                # committing target. Ordinary non-Submit preparation remains
+                # free of a raw per-action gate, including nested choices.
                 ambiguous = True
-            else:
-                matching = [c for c in page.get('controls', [])
-                            if c.get('selector') == args[1]]
-                if len(matching) == 1:
-                    if is_submission(matching[0]) or native_submit(matching[0]):
-                        target = matching[0]
-                elif not matching:
-                    # Accessible combobox options are nested under their
-                    # picker, not represented as top-level controls. Their
-                    # clicks remain ordinary preparation, but an unclassified
-                    # selector must not become an unguarded raw Submit.
-                    options = [
-                        option for c in page.get('controls', [])
-                        for option in ((c.get('combobox') or {}).get('options') or [])
-                        if isinstance(option, dict)
-                        and option.get('selector') == args[1]
-                    ]
-                    ambiguous = (len(options) != 1
-                                 or is_submission(options[0])
-                                 or native_submit(options[0]))
-                else:
-                    ambiguous = True
         elif op == 'press' and len(args) >= 2 and args[1] in {'Enter', 'Return'}:
             if len(args) == 2 and not kwargs:
                 inside_form = any(c.get('in_form')

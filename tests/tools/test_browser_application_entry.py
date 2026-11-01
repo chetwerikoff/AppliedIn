@@ -721,36 +721,24 @@ async def test_native_application_ownership_is_positive_not_page_text(monkeypatc
     no_mutations(session)
 
 
-@pytest.mark.parametrize('verb', ['fill', 'upload', 'submit'])
-async def test_mapping_drift_during_final_receiver_read_forbids_ipc(monkeypatch, verb):
+async def test_mapping_drift_at_final_submit_refuses_before_ipc(monkeypatch):
     row, configs, session, decide = world(monkeypatch)
     page = application('ashby')
-    if verb == 'upload':
-        page['controls'][0] = field('Résumé', '#resume', type='file',
-                                    form_action=entry('ashby'))
     session.current = page
     proof = forms._configured_alias(PK, COMPANY, posting('ashby'))
-    async def drift(s):
-        configs[0].board = 'other-co'
-    session.on_evaluate = drift
-    with pytest.raises(forms.Gate):
-        if verb == 'submit':
-            await forms._fresh_native_receiver(
-                session, page, {'selector': '#submit'}, page['controls'][-1], proof)
-            # ARCH21:58 / binding 3: receiver observation is preparation;
-            # current tenant equality belongs to the ONE final guard only.
-            guard = forms.ApplicationIPCController(
-                PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-            await guard.check_pre_submit(session, page, page['controls'][-1])
-        else:
-            await forms.execute(
-                session, page, {'action': verb, 'selector': page['controls'][0]['selector'],
-                                'fact': 'Email'},
-                facts={'Email': 'test@example.test'}, filled={}, resume_path='Resume.pdf',
-                company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
-                job_url=posting('ashby'), provenance=proof)
+    assert proof is not None
+    # No pre-step tenant grant exists; the final raw IPC must still refuse
+    # a changed tenant board before an application Submit can be clicked.
+    configs[0].board = 'other-co'
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await guard.check_pre_submit(session, page, page['controls'][-1])
+    assert refused.value.item == 1
+    assert refused.value.reason == 'defect_pre_submit_item_1'
+    assert not guard.committed and not decide.await_count
     no_mutations(session)
-
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 @pytest.mark.parametrize('drift', ['board', 'job_id', 'pk', None])
@@ -1612,14 +1600,6 @@ async def native_admitted_with_one_safe_fill(monkeypatch):
     page = await forms._stable_application_form(
         session, session.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
-    item = next(c for c in page['controls'] if c['selector'] == '#email')
-    fresh = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, item, fresh, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'test@example-co.test', 'label': question['control_label'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
@@ -1702,17 +1682,9 @@ async def test_ashby_approved_native_checkbox_is_not_mistaken_for_submit(monkeyp
     committing = []
     session.on_committing_click = lambda: committing.append(True)
     target = next(c for c in page['controls'] if c['selector'] == '#native-choice')
-    witness = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, target, witness, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'yes', 'label': question['control_label'],
-        'visible_text': question['visible_text'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
     receipt = await forms.execute(
         session, page, {'action': 'choose', 'selector': '#native-choice',
-                        'fact': question['label']},
+                        'value': 'yes'},
         facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
         jd_text='', resume_tex='', github='', pk=PK,
         job_url=posting('ashby'), provenance=provenance)
@@ -2769,17 +2741,6 @@ def _issue214_native_passive_world(monkeypatch, *, pair=True):
     return row, raw, decide, provenance
 
 
-def _issue214_approve_email(row, page, raw, provenance):
-    item = next(c for c in page['controls'] if c['selector'] == '#email')
-    fresh = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, item, fresh, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'test@example-co.test', 'label': question['control_label'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
-
-
 @pytest.mark.parametrize('drift', ['unknown-frame', 'response-error', 'visible-challenge'])
 async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift_refuses(
         monkeypatch, drift):
@@ -2788,7 +2749,7 @@ async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift
     page = await forms._stable_application_form(
         session, session.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
-    _issue214_approve_email(row, page, raw, provenance)
+    # Owner fact is supplied directly; no retired grant-bank setup.
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
@@ -2871,7 +2832,7 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     admitted = await forms._stable_application_form(
         scoped, scoped.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
-    _issue214_approve_email(row, admitted, raw, provenance)
+    # Owner fact is supplied directly; no retired grant-bank setup.
     _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
     # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     authorized = []
@@ -3001,7 +2962,7 @@ async def test_issue214_protected_response_survives_parent_fill_and_fresh_readba
         session, session.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
     assert [c['selector'] for c in page['controls']] == ['#email', '#submit']
-    _issue214_approve_email(row, page, raw, provenance)
+    # Owner fact is supplied directly; no retired grant-bank setup.
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},

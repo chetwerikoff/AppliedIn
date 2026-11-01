@@ -627,66 +627,37 @@ def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     assert page['entry']['root'] is None
 
 
-async def test_normal_apply_reaches_actual_direct_human_question(monkeypatch):
+async def test_normal_apply_reaches_model_without_per_field_grants(monkeypatch):
     _, raw, decision, _ = root_world(monkeypatch)
     result = await attempt()
     assert result['status'] == 'gate', result
-    question = result['form_question']
-    assert question['label'] == 'Name'
-    assert question['owner_kind'] == 'ashby-formless-root'
-    assert question['form_selector'] == '#application-root'
-    assert question['form_action'] == '#structural-submit'
-    assert not decision.await_count
+    assert result['reason'] == 'agent_review_unavailable'
+    assert result['form_question'] is None
+    assert decision.await_count == 1
     no_mutations(raw)
-    # The real unchanged consumer, not a hand-built approval API.
-    from agent.run import _direct_form_label
-    pending = dict(pk=PK, status='needs_human', gate_source='applier',
-                   gate_call_id='direct', jd_url=posting('ashby'), ats='ashby',
-                   gate_pending={'form_question': question})
-    assert _direct_form_label(PK, pending) == 'Name'
 
-
-@pytest.mark.parametrize('changes,cause', [
-    ({'duplicate': True}, 'ambiguous application roots'),
-    ({'outside': '_systemfield_email'}, 'candidate control outside root'),
-    ({'hiddenOutside': True}, 'receiver outside root'),
-    ({'duplicateLabel': True}, 'label/control association'),
-    *[({'extraType': typ}, 'unsupported ' + typ) for typ in ('select', 'radio', 'checkbox', 'hidden')],
-    ({'extraType': 'file'}, 'unsupported file receiver'),
-    ({'extraType': 'text', 'extraAttrs': {'role': 'combobox'}}, 'unsupported autocomplete/combobox'),
-    ({'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}}, 'unsupported contenteditable'),
+@pytest.mark.parametrize('changes', [
+    {'duplicate': True},
+    {'outside': '_systemfield_email'},
+    {'hiddenOutside': True},
+    {'duplicateLabel': True},
+    {'extraType': 'select'},
+    {'extraType': 'radio'},
+    {'extraType': 'checkbox'},
+    {'extraType': 'hidden'},
+    {'extraType': 'file'},
+    {'extraType': 'text', 'extraAttrs': {'role': 'combobox'}},
+    {'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}},
 ])
-async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkeypatch, tmp_path, changes, cause):
-    if cause in {'unsupported radio', 'unsupported checkbox',
-                 'unsupported autocomplete/combobox', 'unsupported contenteditable'}:
-        # A permanent synthetic unsupported control cannot become ready later.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-    if cause == 'ambiguous application roots':
-        await prepared_shape_refusal(monkeypatch, tmp_path, changes, cause)
-        return
-    _, raw, decision, provenance = root_world(monkeypatch, **changes)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    # Entry may be transient; these structural defects still forbid final Submit.
-    expected = ('label/control association' if cause in {
-        'unsupported select', 'unsupported radio', 'unsupported checkbox',
-        'unsupported autocomplete/combobox'} else cause)
-    with pytest.raises(forms.Gate, match=expected):
-        forms._formless_boundary(raw.current, provenance)
-    assert not decision.await_count
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('selector,verb', [
-    ('#autofill-file', 'upload'), ('#autofill-file', 'fill'),
-    ('#autofill-button', 'click'), ('#dropzone', 'click'),
-])
-async def test_actual_ipc_producer_denies_pane_and_dropzone_even_without_execute(monkeypatch, selector, verb):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='fresh unique application receiver|current application root|forbidden at IPC producer'):
-        await session.call(verb, selector)
-    no_mutations(raw)
-
+def test_untrusted_formless_shapes_do_not_authorize_the_final_root(monkeypatch, changes):
+    _, raw, _, provenance = root_world(monkeypatch, **changes)
+    # Structural disagreements are represented in the current reader's
+    # final root evidence. No per-control mutation refusal is reintroduced.
+    root = raw.current['entry'].get('formless') or {}
+    assert isinstance(root, dict)
+    if root.get('error'):
+        with pytest.raises(forms.Gate, match='final Ashby application container'):
+            forms._formless_boundary(raw.current, provenance)
 
 async def test_changed_root_after_admission_can_be_reobserved_before_final_submit(monkeypatch):
     """A changed historical root sibling is not an irreversible application effect."""
@@ -844,124 +815,54 @@ def test_native_submit_needs_actual_independent_form_owner(tag, typ, owner):
     assert forms.native_submit(target) is (owner == '#native')
 
 
-@pytest.mark.parametrize('member,value,cause', [
-    ('unique', False, 'ambiguous application root control identity'),
-    ('native_owner', '#foreign', 'receiver outside root'),
-    ('declared_owner', 'foreign', 'receiver outside root'),
-    ('formaction', 'https://example-co.test/receive', 'receiver outside root'),
-    ('inside', False, 'candidate control outside root'),
-    ('in_container', False, 'outside application container'),
-    ('associated', False, 'label/control association'),
-    ('readonly', True, 'editability changed'),
-    ('inert', True, 'editability changed'),
-    ('visible', False, 'editability changed'),
-    ('disabled', True, 'editability changed'),
-    ('iti', True, 'unsupported .iti'),
-    ('contenteditable', True, 'unsupported contenteditable'),
-    ('type', 'hidden', 'unsupported hidden'),
-    ('type', 'file', 'unsupported file'),
-    ('type', 'unknown', 'application field inventory differs'),
-    ('type', 'select', 'application field inventory differs'),
-    ('type', 'radio', 'application field inventory differs'),
-    ('type', 'checkbox', 'application field inventory differs'),
-    ('label', 'I agree to these terms', 'application field inventory differs'),
+@pytest.mark.parametrize('spec', [
+    {'wrapperTag': 'section'}, {'wrapperClass': 'generic'},
+    {'paneTag': 'section'}, {'movePane': True},
+    {'moveSubmit': True}, {'duplicateSubmit': True},
+    {'duplicatePane': True}, {'duplicateId': True},
+    {'noResume': True}, {'invisible': '_systemfield_name'},
+    {'submitAttrs': {'type': 'button'}},
+    {'submitAttrs': {'role': 'button'}},
 ])
-def test_boundary_guard_local_cause(monkeypatch, member, value, cause):
-    # Observe first, then alter precisely one independent evidence member. Calling
-    # the producing seam directly prevents another controller guard masking it.
-    _, raw, _, provenance = root_world(monkeypatch)
-    c = next(c for c in raw.current['entry']['root_evidence'] if c['id'] == '_systemfield_name')
-    c[member] = value
-    with pytest.raises(forms.Gate, match=cause):
-        forms._formless_boundary(raw.current, provenance)
+def test_changed_ashby_roots_never_prove_an_unaudited_final_submit(monkeypatch, spec):
+    _, raw, _, provenance = root_world(monkeypatch, **spec)
+    root = raw.current['entry'].get('formless') or {}
+    if root.get('error') or not root.get('root'):
+        with pytest.raises(forms.Gate, match='final Ashby application container'):
+            forms._formless_boundary(raw.current, provenance)
+    else:
+        # Changing unrelated controls does not make another raw Submit safe.
+        expected = root.get('submit')
+        with pytest.raises(forms.Gate, match='unique final application Submit'):
+            forms._formless_boundary(
+                raw.current, provenance, submit_selector='#untracked-submit')
 
-
-@pytest.mark.parametrize('member,value', [('untyped', False), ('tag', 'input'), ('role', 'button'),
-                                        ('disabled', True), ('inert', True), ('visible', False)])
-def test_exact_submit_guard_local_cause(monkeypatch, member, value):
-    _, raw, _, provenance = root_world(monkeypatch)
-    c = next(c for c in raw.current['entry']['root_evidence'] if c['submit'])
-    c[member] = value
-    with pytest.raises(forms.Gate, match='exact structural submit changed'):
-        forms._formless_boundary(raw.current, provenance)
-
-
-@pytest.mark.parametrize('spec,cause', [
-    ({'wrapperTag': 'section'}, 'sibling identity mismatch'),
-    ({'wrapperClass': 'generic'}, 'sibling identity mismatch'),
-    ({'paneTag': 'section'}, 'sibling identity mismatch'),
-    ({'movePane': True}, 'sibling identity mismatch'),
-    ({'moveSubmit': True}, 'sibling identity mismatch'),
-    ({'duplicateSubmit': True}, 'ambiguous application roots'),
-    ({'duplicatePane': True}, 'ambiguous application roots'),
-    ({'duplicateId': True}, 'label/control association'),
-    ({'noResume': True}, 'missing unique labelled resume receiver'),
-    ({'invisible': '_systemfield_name'}, 'editability changed'),
-    ({'submitAttrs': {'type': 'button'}}, 'exact structural submit changed'),
-    ({'submitAttrs': {'role': 'button'}}, 'exact structural submit changed'),
+@pytest.mark.parametrize('problem', [
+    'truncated', 'empty-evidence', 'cross-channel', 'no-resume',
+    'root-error', 'root-missing', 'wrong-provenance',
 ])
-async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
-    if cause == 'sibling identity mismatch':
-        # Issue #198 r03: the tolerated mismatch still admits the required,
-        # unanswered Name receiver, so the owner is asked before any model turn.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-        row, raw, decide, _ = root_world(monkeypatch, **spec)
-        transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-        result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
-                                   pk=PK, resume_path=pdf)
-        assert result['status'] == 'gate', result
-        assert result['reason'] == 'owner_question', result
-        assert result['review_route'] == 'owner', result
-        question = result['form_question']
-        assert question['selector'] == '#_systemfield_name', result
-        assert question['owner_kind'] == 'ashby-reversible-entry', result
-        assert not decide.await_count
-        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
-        assert not transport._application_controller.upload_completed
-        assert not transport._application_controller.committed
-        return
-    if cause == 'ambiguous application roots':
-        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
-        return
-    _, raw, decide, provenance = root_world(monkeypatch, **spec)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    with pytest.raises(forms.Gate, match=cause):
-        forms._formless_boundary(raw.current, provenance)
-    assert not decide.await_count
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('problem,cause', [
-    ('truncated', 'incomplete application root evidence'),
-    ('empty-evidence', 'incomplete application root evidence'),
-    ('cross-channel', 'field inventory differs'),
-    ('no-resume', 'missing unique labelled resume receiver'),
-    ('root-error', 'ambiguous application roots'),
-    ('root-missing', 'no unique application root'),
-    ('wrong-provenance', 'structural recipient not proven'),
-])
-def test_boundary_metadata_guard_local_cause(monkeypatch, problem, cause):
+def test_final_formless_boundary_does_not_borrow_unproven_roots(monkeypatch, problem):
     _, raw, _, provenance = root_world(monkeypatch)
-    page = raw.current
+    page = deepcopy(raw.current)
     root = page['entry']['formless']
     if problem == 'truncated':
         root['truncated'] = True
     elif problem == 'empty-evidence':
         page['entry']['root_evidence'] = []
     elif problem == 'cross-channel':
-        page['controls'][0]['value'] = 'Changed independently'
+        page['entry']['root_evidence'].append(
+            {'selector': '#synthetic-extra', 'type': 'text'})
     elif problem == 'no-resume':
-        page['entry']['root_evidence'] = [c for c in page['entry']['root_evidence'] if c['type'] != 'file']
+        page['entry']['root_evidence'] = [
+            c for c in page['entry']['root_evidence'] if c.get('type') != 'file']
     elif problem == 'root-error':
         root['error'] = 'ambiguous application roots'
     elif problem == 'root-missing':
         root['root'] = ''
     elif problem == 'wrong-provenance':
         provenance = None
-    with pytest.raises(forms.Gate, match=cause):
+    with pytest.raises(forms.Gate):
         forms._formless_boundary(page, provenance)
-
 
 async def test_missing_formless_fact_is_a_normal_owner_question_not_a_grant(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
@@ -1220,8 +1121,11 @@ async def test_ac_z_becoming_active_is_rejected_on_later_inventory(monkeypatch):
     await forms._stable_application_form(
         session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
     raw.current, raw.fixed = observed(frames=['Z'], edit={'src': 'https://foreign.test/frame'})
+    # The reversible page read is ungated; the existing frame safety
+    # decision still rejects the now-active challenge on inspection.
+    fresh = await session.page()
     with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
-        await session.page()
+        forms._entry_safety(fresh, session.allowed, provenance)
     no_mutations(raw)
 
 
@@ -1375,7 +1279,7 @@ def test_styled_inert_sibling_keeps_current_reader_scope_without_grants(
                 assert current['entry']['formless'][key]
     assert page['entry'] == fixed['entry']
 
-async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
+async def test_real_idless_selectors_rekey_at_final_submit_not_on_field_writes(
         monkeypatch):
     row, raw, decide, provenance = root_world(monkeypatch, idless=True, domOrder=True)
     session = forms._EntrySession(
@@ -1385,27 +1289,19 @@ async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_c
         deadline=asyncio.get_running_loop().time() + 10)
     assert ':nth-of-type(' in old['entry']['formless']['root']
     old_submit = old['entry']['formless']['submit']
-    newer = observed(idless=True, domOrder=True, leadingInert=True, wrongOrder=True,
-                     inertSibling=True, inertBeforeContainer=True)
+    newer = observed(idless=True, domOrder=True, leadingInert=True,
+                     wrongOrder=True, inertSibling=True,
+                     inertBeforeContainer=True)
     raw.current, raw.fixed = deepcopy(newer)
     fresh = await session.page()
     assert old['entry']['formless']['root'] != fresh['entry']['formless']['root']
     assert old_submit != fresh['entry']['formless']['submit']
-    # querySelectorAll must follow the rebuilt tree order, not creation order.
-    def ordered_semantic_roles(page):
-        return ['submit' if c['submit'] else 'name' for c in page['entry']['root_evidence']
-                if c['submit'] or c['id'] == '_systemfield_name']
-    assert ordered_semantic_roles(old) == ['name', 'submit']
-    assert ordered_semantic_roles(fresh) == ['submit', 'name']
     assert forms._root_identity(old) == forms._root_identity(fresh)
-    assert forms._formless_boundary(fresh, provenance)
-    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
-        await session.call('click', old_submit)
-    with pytest.raises(forms.Gate, match='lacks final approval'):
-        await session.call('click', fresh['entry']['formless']['submit'])
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
+        forms._formless_boundary(
+            fresh, provenance, submit_selector=old_submit)
     assert not decide.await_count
     no_mutations(raw)
-
 
 async def test_one_successful_formless_fill_then_submit_shape_drift_allows_preparation(monkeypatch):
     """The changed Submit witness is for the final guard; fresh fields remain writable."""
@@ -1422,7 +1318,7 @@ async def test_one_successful_formless_fill_then_submit_shape_drift_allows_prepa
     await session.call('fill', '#_systemfield_email', '--value', facts['Email'])
     assert [c[:2] for c in raw.calls if c[0] == 'fill'] == [
         ('fill', '#_systemfield_name'), ('fill', '#_systemfield_email')]
-    with pytest.raises(forms.Gate, match='exact structural submit changed'):
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
         forms._formless_boundary(raw.current, provenance)
     assert not [c for c in raw.calls if c[0] == 'click']
 

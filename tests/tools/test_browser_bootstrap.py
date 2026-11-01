@@ -2648,22 +2648,33 @@ async def test_scoped_facts_reach_runtime_and_decision_keys_on_regional_hosts(
                    for call in browser.calls)
 
 @pytest.mark.parametrize('optional', [True, False])
-async def test_material_select_optional_and_required_are_both_owner_decisions(
-        monkeypatch, optional):
-    consent = field('Data privacy agreement', '#consent-optional',
-                    required=not optional, tag='select', type='select',
-                    options=[{'value': '', 'label': 'Please choose'},
-                             {'value': 'yes', 'label': 'I agree'},
-                             {'value': 'no', 'label': 'I decline'}])
-    p = secure_inventory(consent)
-    browser, decide, _ = secure_world(monkeypatch, p)
-    report = await secure_attempt(p, facts={'Data privacy agreement': 'I agree'})
-    assert report['reason'] == 'owner_question'
-    assert report['review_route'] == 'owner'
-    assert report['form_question']['options'] == consent['options']
-    assert report['material_assent_diagnostic'] is True
-    assert decide.await_count == 0
-    assert not any(call[0] in {'select', 'fill', 'click'} for call in browser.calls)
+async def test_material_select_uses_fact_or_owner_question_not_widget_gate(optional):
+    consent = field(
+        'Data privacy agreement', '#consent-optional',
+        required=not optional, tag='select', type='select',
+        options=[{'value': '', 'label': 'Please choose'},
+                 {'value': 'yes', 'label': 'I agree'},
+                 {'value': 'no', 'label': 'I decline'}])
+    page = secure_inventory(consent)
+    browser = Browser(page)
+    action = {'action': 'select', 'selector': consent['selector'],
+              'fact': 'Data privacy agreement'}
+    with pytest.raises(forms.Gate) as denied:
+        await forms.execute(browser, page, action, facts={}, filled={},
+                            resume_path='', company='example-co', jd_text='',
+                            resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    assert denied.value.reason == 'owner_question'
+    assert denied.value.form_question['selector'] == consent['selector']
+    assert browser.calls == []
+    browser.allow_mutations = True
+    filled = {}
+    receipt = await forms.execute(
+        browser, page, action, facts={'Data privacy agreement': 'I decline'},
+        filled=filled, resume_path='', company='example-co', jd_text='',
+        resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'select'
+    assert filled == {consent['selector']: 'no'}
+    assert browser.calls == [('select', consent['selector'], '--value', 'no')]
 
 @pytest.mark.parametrize('label', [
     'Are you legally authorized to work in the country…',
@@ -2717,24 +2728,36 @@ async def test_ordinary_work_eligibility_uses_bank_fact_preparation(
     'Work authorization and Candidate Privacy Notice acknowledgement',
     'Authorization to work and agreement to legal terms',
 ])
-async def test_work_eligibility_never_hides_independent_material_assent(
+async def test_work_eligibility_and_consent_are_ordinary_answerable_fields(
         monkeypatch, label):
+    """Mixed legal answers use supplied facts, not a seventh pre-Submit gate."""
     material = field(label, '#material', tag='select', type='select',
                      options=[{'value': '', 'label': 'Choose'},
                               {'value': 'yes', 'label': 'I agree'},
                               {'value': 'no', 'label': 'I decline'}])
     page = secure_inventory(material)
-    browser, decide, _ = secure_world(monkeypatch, page)
-    result = await secure_attempt(page, facts={label: 'Yes'})
-    assert result['status'] == 'gate'
-    assert result['material_assent_diagnostic'] is True
-    assert result['review_route'] == 'owner'
-    assert result['form_question'] is not None
-    assert decide.await_count == 0
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
+    browser = Browser(page)
+    action = {'action': 'select', 'selector': '#material', 'fact': label}
 
+    with pytest.raises(forms.Gate) as missing:
+        await forms.execute(browser, page, action, facts={}, filled={},
+                            resume_path='', company='example-co',
+                            jd_text='', resume_tex='', github='', pk=PK,
+                            job_url=SECURE_URL)
+    assert missing.value.reason == 'owner_question'
+    assert missing.value.form_question['selector'] == '#material'
+    assert browser.calls == []
 
+    browser.allow_mutations = True
+    filled = {}
+    receipt = await forms.execute(
+        browser, page, action, facts={label: 'I agree'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'select'
+    assert browser.calls == [('select', '#material', '--value', 'yes')]
+    assert page['controls'][0]['value'] == 'yes'
+    assert filled == {'#material': 'yes'}
 
 def test_navigation_diagnostic_has_bounded_host_path_and_unavailable_evidence():
     """No URL text, userinfo, query, fragment or path payload escapes the Gate."""
@@ -2831,7 +2854,9 @@ async def test_navigation_diagnostic_stays_out_of_telemetry(monkeypatch):
                 '?token=QUERY_SECRET#FRAGMENT_SECRET')}
     navigation = await secure_attempt(nav_page)
     assert navigation['status'] == 'gate'
-    assert navigation['navigation_provenance_diagnostic'] is True
+    # BrowserSkill reports the code-owned reason; run.py must redact it
+    # without relying on the removed producer-side diagnostic flag.
+    assert navigation.get('navigation_provenance_diagnostic') is not True
     assert navigation['reason'] == 'defect_provenance'
 
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
@@ -3077,70 +3102,29 @@ async def test_other_witness_predicates_remain_single_read(monkeypatch):
     assert not delays
     assert len([call for call in browser.calls if call[0] == 'evaluate']) == 1
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('point', ['first', 'prewrite'])
-@pytest.mark.parametrize('stabilizes', [True, False])
-async def test_execute_inventory_retry_at_actual_observation_points(
-        monkeypatch, point, stabilizes):
-    """Real execute() inventory gates retain the legacy two-arg observer seam."""
+async def test_reversible_fill_has_no_obsolete_prewrite_inventory_retry(monkeypatch):
     page = secure_inventory(field())
-    browser, _, row = secure_world(monkeypatch, page)
-    answer = 'test@example.test'
-    row['human_approved_answers'] = {
-        'Email': {
-            'value': answer, 'selector': '#email', 'url': SECURE_URL,
-            'label': 'Email', 'question': '', 'tag': 'input', 'type': 'email',
-            'form_selector': '#application', 'form_action': SECURE_URL,
-        },
-    }
+    browser, _, _ = secure_world(monkeypatch, page)
     browser.allow_mutations = True
-    reads, evaluations, delays = 0, 0, []
-    original_call, original_page = browser.call, browser.page
+    witness_calls = []
+    original_call = browser.call
 
-    async def no_wait(seconds):
-        delays.append(seconds)
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
-
-    async def observe(*args, **kwargs):
-        nonlocal evaluations
+    async def transport(*args, **kwargs):
         if args[0] == 'evaluate':
-            evaluations += 1
+            witness_calls.append(args)
         return await original_call(*args, **kwargs)
 
-    async def changing_page():
-        nonlocal reads
-        reads += 1
-        fresh = deepcopy(await original_page())
-        # In the prewrite variant the first independent read stays stable;
-        # otherwise the first observation mismatches immediately.
-        local_round = reads if point == 'first' else reads - 1
-        if point == 'prewrite' and reads == 1:
-            return fresh
-        if local_round == 1 or (not stabilizes and local_round >= 1):
-            fresh['controls'][0]['label'] = 'Flapping synthetic receiver ' + str(
-                local_round if not stabilizes else 1)
-        return fresh
-
-    monkeypatch.setattr(browser, 'call', observe)
-    monkeypatch.setattr(browser, 'page', changing_page)
-    kwargs = dict(
-        facts={'Email': answer}, filled={}, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='',
-        pk=PK, job_url=SECURE_URL)
-    action = {'action': 'fill', 'selector': '#email', 'fact': 'Email'}
-    if stabilizes:
-        receipt = await forms.execute(browser, page, action, **kwargs)
-        assert receipt['action'] == 'fill'
-        assert ('fill', '#email', '--value', answer) in browser.calls
-    else:
-        with pytest.raises(forms.Gate) as exc:
-            await forms.execute(browser, page, action, **kwargs)
-        assert 'predicate=inventory.identity.equal' in str(exc.value)
-        assert 'site=execute' in str(exc.value)
-        assert not any(call[0] == 'fill' for call in browser.calls)
-    assert 0 < evaluations <= (5 if point == 'prewrite' else 4)
-    assert len(delays) == (1 if stabilizes else 3)
-    assert all(delay == 0.25 for delay in delays)
+    monkeypatch.setattr(browser, 'call', transport)
+    filled = {}
+    receipt = await forms.execute(
+        browser, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+        facts={'Email': 'synthetic@example.test'}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'fill'
+    assert filled == {'#email': 'synthetic@example.test'}
+    assert browser.calls == [('fill', '#email', '--value', 'synthetic@example.test')]
+    assert witness_calls == []  # final Submit, not reversible fill, re-reads
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
@@ -3277,34 +3261,19 @@ async def test_bootstrap_initially_stable_witness_never_rereads(monkeypatch, sit
 
 
 @pytest.mark.asyncio
-async def test_execute_observer_preserves_two_argument_witness_seam(monkeypatch):
-    """Synthetic guard-order tests patch the observer with exactly two arguments."""
-    page = inventory(field(), submit())
-    called = []
-    async def two_argument_witness(session, current):
-        called.append((session, current))
-        return current, {}
-    monkeypatch.setattr(forms, '_observe_controls', two_argument_witness)
-    browser = Browser(page)
-    observed, controls = await forms._execute_observe_controls(browser, page)
-    assert observed is page and controls == {}
-    assert called == [(browser, page)]
-
-
-@pytest.mark.asyncio
-async def test_execute_production_observer_has_literal_gate_site(monkeypatch):
-    """The real observer carries execute's literal without changing fixture doubles."""
+async def test_final_readback_observer_reports_mismatched_current_selector(monkeypatch):
+    # The independent DOM reader is still meaningful at final Submit. Only
+    # the old per-write _execute_observe_controls wrapper was removed.
     page = inventory(field(), submit())
     browser = Browser(page)
     bad = witness(page)
     bad['controls'][0]['selector'] = '#changed'
     browser.result = bad
     with pytest.raises(forms.Gate) as error:
-        await forms._execute_observe_controls(browser, page)
+        await forms._observe_controls(browser, page, site='execute')
     assert 'predicate=selector.equal' in str(error.value)
     assert 'site=execute' in str(error.value)
     assert [call[0] for call in browser.calls] == ['evaluate']
-
 
 @pytest.mark.parametrize('case,expected', [
     ('passive', ('yes', '1', '1', 'yes', 'yes')),

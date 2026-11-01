@@ -3861,7 +3861,7 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                 href not in {c.get('href') for c in page.get('controls', [])}
                                 or not allowed(href)):
                             raise _navigation_gate(
-                                'Navigation outside the current tracked form was requested.',
+                                'Navigation outside the current tracked job and tenant was requested.',
                                 url, href, provenance=provenance)
                         await _effect_call(session, 'navigate', href)
                         continue
@@ -3965,9 +3965,15 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                     'form_question': exc.form_question}
         if isinstance(exc, Gate):
             artifact = isinstance(exc, CaptchaArtifactGate)
-            context = (_control_gate_handoff(exc, step)
+            navigation = isinstance(exc, NavigationProvenanceGate)
+            # For an unproven redirect, retain only an independently
+            # observed canonical URL. Never echo a model or raw candidate
+            # URL into a status record.
+            safe_step = ({**step, 'url': _navigation_observed_step_url(page, url)}
+                         if navigation else step)
+            context = (_control_gate_handoff(exc, safe_step)
                        if isinstance(exc, ControlGate)
-                       else handoff(str(exc), step, captcha_artifact=artifact))
+                       else handoff(str(exc), safe_step, captcha_artifact=artifact))
             result = {'status': 'gate', 'reason': exc.reason,
                       'review_route': 'owner' if exc.reason == 'owner_question'
                                       else 'hard_refusal' if
@@ -3981,6 +3987,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
             # surfacing the page's raw provider/query evidence.
             if artifact:
                 result['captcha_artifact_diagnostic'] = True
+            if navigation:
+                result['navigation_provenance_diagnostic'] = True
             return result
         if isinstance(exc, asyncio.CancelledError):
             raise

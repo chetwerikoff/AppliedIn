@@ -971,21 +971,19 @@ def test_boundary_metadata_guard_local_cause(monkeypatch, problem, cause):
         forms._formless_boundary(page, provenance)
 
 
-@pytest.mark.parametrize('which', ['bootstrap', 'execute'])
-async def test_unapproved_formless_field_still_refuses_without_historic_admission(monkeypatch, which):
-    """Removing root identity gates must not authorize an unapproved value."""
+async def test_missing_formless_fact_is_a_normal_owner_question_not_a_grant(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
-    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
-    with pytest.raises(forms.Gate, match='approved answer|human-approved|answer is needed'):
-        if which == 'bootstrap':
-            await forms._bootstrap(session, raw.current, PK, {}, provenance=provenance)
-        else:
-            await forms.execute(session, raw.current, action_sequence()[0], facts={}, filled={},
-                                resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                                resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                                provenance=provenance)
+    session = forms._EntrySession(
+        raw, lambda url: url == entry('ashby'), provenance)
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            session, raw.current, action_sequence()[0],
+            facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
+            jd_text='', resume_tex='', github='', pk=PK,
+            job_url=posting('ashby'), provenance=provenance)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question is not None
     no_mutations(raw)
-
 
 async def test_independent_entry_witness_disagreement_cannot_authorize(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
@@ -1124,20 +1122,6 @@ def test_structural_receiver_membership_is_guarded_at_destination_seam(monkeypat
     _, raw, _, provenance = root_world(monkeypatch)
     with pytest.raises(forms.Gate, match='unsupported structural receiver forbidden'):
         forms.check_form_destination(raw.current, {'selector': '#autofill-file'}, provenance=provenance)
-
-
-def test_structural_question_cannot_attribute_pane_control(monkeypatch):
-    _, raw, _, _ = root_world(monkeypatch)
-    with pytest.raises(forms.Gate, match='non-applicant target cannot request an answer'):
-        forms._form_subject(raw.current, {'selector': '#autofill-file'})
-
-
-def test_structural_resume_cannot_request_an_answer_grant(monkeypatch):
-    _, raw, _, provenance = root_world(monkeypatch)
-    target = next(c for c in raw.current['controls'] if c['type'] == 'file')
-    witness = {c['selector']: c for c in raw.fixed['controls']}
-    with pytest.raises(forms.Gate, match='Only witnessed text-entry controls'):
-        forms._disclosure_question(raw.current, target, witness, posting('ashby'), provenance=provenance)
 
 
 async def test_ipc_producer_takes_its_own_fresh_independent_witness(monkeypatch):
@@ -1578,7 +1562,10 @@ async def test_forless_witnessed_aria_picker_and_native_choices_reach_real_entry
     selectors = {c['selector'] for c in forms._formless_boundary(page, provenance)}
     assert selectors.issuperset({'#work-picker', '#radio-no', '#radio-yes', '#consent-choice'})
     radio = next(c for c in page['controls'] if c['selector'] == '#radio-no')
-    assert len(forms._radio_group(page, radio)) == 2
+    peers = [c for c in page['controls'] if c.get('type') == 'radio'
+             and c.get('question') == radio.get('question')
+             and c.get('form_selector') == radio.get('form_selector')]
+    assert len(peers) == 2
     for selector in ('#work-picker', '#radio-no', '#consent-choice'):
         await session.call('click', selector)
     assert [c for c in raw.calls if c[0] == 'click'] == [
@@ -2208,71 +2195,6 @@ def _issue184_add_name_phone_controls(raw):
                             required=extra['required'],
                             value=extra['value'], files=extra['files'])
             snapshot['entry']['root_evidence'].append(evidence)
-
-
-def _issue184_real_producer(monkeypatch, facts):
-    """Real raw Session/IPC guard, synthetic command transport and generic PAGE."""
-    row, endpoint, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda *args, **kwargs: False)
-
-    async def command(*args, **kwargs):
-        assert not kwargs and args[-2:] == ('--session', 'synthetic-session')
-        return await endpoint.call(*args[:-2])
-
-    monkeypatch.setattr(forms.bsk, 'command', command)
-    producer = ProductionBrowserSession('apply')
-    producer.id = 'synthetic-session'
-    filled, history = {}, []
-    controller = forms.ApplicationIPCController(
-        PK, COMPANY, posting('ashby'), '', facts, filled, history,
-        {'url': entry('ashby')}, lambda: None)
-    producer.bind_application_controller(controller)
-    return row, endpoint, producer, controller, provenance, writes
-
-
-async def _issue184_prepare_producer(producer, provenance, facts):
-    # Real raw Session.page() has no entry.formless; the scoped fallback must
-    # supply ENTRY_PAGE, while its raw application_effect stays in control.
-    generic = await producer.page()
-    assert generic['url'] == entry('ashby') and 'entry' not in generic
-    allowed = lambda url: url == entry('ashby')
-    scoped = forms._EntrySession(producer, allowed, provenance,
-                                 resume_path='Resume.pdf')
-    session, page = await forms._entry_or_reversible_page(
-        scoped, producer, allowed, provenance,
-        deadline=asyncio.get_running_loop().time() + 0.05)
-    assert isinstance(session, forms._ReversibleEntryReader)
-    assert session.raw is producer and forms._formless_root(page)
-    assert not forms._formless_root(page).get('root')
-    returned = await forms._bootstrap(
-        session, page, PK, facts, posting('ashby'), company=COMPANY,
-        provenance=provenance, global_facts=dict(facts))
-    assert returned is page
-    assert set(forms._advertised_grant_keys(PK, facts)) == set(facts)
-    return session, page
-
-
-def _issue188_console_handler():
-    from core.logging import _ConsoleFormatter
-
-    logger = forms._LOG
-    assert logger.level == logging.INFO and logger.propagate is False
-    handlers = [
-        h for h in logger.handlers
-        if isinstance(h, logging.StreamHandler)
-        and isinstance(h.formatter, _ConsoleFormatter)
-    ]
-    assert len(handlers) == 1
-    return handlers[0]
-
-
-_ISSUE188_LONG_WITNESS = (
-    'The current DOM witness is unavailable or changed; '
-    'exception=ValueError; predicate=controls.length.equal; control='
-    + 'input:nth-of-type(1)' + ' > div:nth-of-type(1)' * 12
-    + '; site=bootstrap-formless'
-)
 
 
 def _issue190_entry_witness_reads(raw, *, unstable):

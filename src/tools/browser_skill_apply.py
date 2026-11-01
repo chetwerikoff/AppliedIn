@@ -1352,6 +1352,9 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           form_action_raw:form ? form.getAttribute('action') : null,
           formaction_attr_present:e.hasAttribute('formaction'),
           formaction_raw:e.getAttribute('formaction')} : {}),
+        checked:!!e.checked || e.getAttribute('aria-checked') === 'true' ||
+          (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true' &&
+            !!e.closest('div.ashby-application-form-input-yesno')),
         disabled:!!e.disabled || e.matches(':disabled') ||
           e.getAttribute('aria-disabled') === 'true',
         readonly:!!e.readOnly || e.hasAttribute('readonly'),
@@ -3341,7 +3344,9 @@ class ApplicationIPCController:
             subject = label(field)
             if not _SENSITIVE.search(subject):
                 continue
-            if field.get('type') in {'radio', 'checkbox'}:
+            if field.get('type') in {'radio', 'checkbox', 'button'}:
+                # The final readback also exposes selected ARIA Yes/No buttons.
+                # A checked button is not a per-widget grant or permission.
                 answer = field.get('label') if field.get('checked') else ''
             elif field.get('tag') == 'select':
                 matches = [o for o in field.get('options') or []

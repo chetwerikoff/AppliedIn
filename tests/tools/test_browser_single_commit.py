@@ -238,7 +238,7 @@ async def test_interrupted_upload_never_creates_completion_from_unchanged_bytes(
     assert len(calls) == 1
     assert controller.upload_pending is False
     assert controller.upload_completed is False
-    with pytest.raises(forms.Gate, match="already uploaded"):
+    with pytest.raises(forms.Gate, match="Only the staged row PDF may be uploaded once"):
         await session.application_effect(
             "upload", "#resume", "--file", str(path), timeout=130)
     assert len(calls) == 1

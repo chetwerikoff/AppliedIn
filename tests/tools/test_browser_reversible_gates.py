@@ -559,11 +559,6 @@ def _live_census(monkeypatch, tmp_path, **dom_shape):
     return row, endpoint, decision, stores, pdf
 
 
-def _scope(endpoint):
-    witness = {c['selector']: c for c in endpoint.fixed['controls']}
-    return forms._reversible_entry_scope(endpoint.current, witness)
-
-
 def test_live_census_reports_the_sibling_mismatch_and_titled_idless_receivers():
     page, _ = _live_dom()
     assert page['entry']['formless']['error'] == 'application root sibling identity mismatch'
@@ -599,19 +594,19 @@ def test_title_marker_never_makes_a_receiver_required():
     assert location['required'] is False
     assert evidence[location['selector']]['required'] is False
 
-def test_live_census_admits_email_location_date_and_boolean(monkeypatch, tmp_path):
-    """Every live control was refused by the root error, not by its own evidence."""
-    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
-    page = endpoint.current
-    scope = _scope(endpoint)
-    admitted = {_by_locator(page, s)['selector'] for s in (_LOCATION, _DATE, _YES, _NO)}
-    assert admitted | {'#_systemfield_email'} <= scope
-    # The pane, the real Submit and the untitled toggle are never receivers.
-    assert '#structural-submit' not in scope
-    assert not scope & set(page['entry']['formless']['excluded'])
-    toggle = _by_locator(page, 'div:nth-of-type(4) > div:nth-of-type(1) > button:nth-of-type(1)')
-    assert toggle['selector'] not in scope
-
+def test_live_census_readers_retain_accessible_choices_without_admission_gates():
+    """Both production readers expose ordinary fields, not field-grant scopes."""
+    page, fixed = _live_dom()
+    assert page['entry']['formless']['error'] == 'application root sibling identity mismatch'
+    observed = {c['selector']: c for c in page['controls']}
+    independent = {c['selector']: c for c in fixed['controls']}
+    for suffix in (_LOCATION, _DATE, _YES, _NO):
+        selector = _by_locator(page, suffix)['selector']
+        assert selector in observed and selector in independent
+        assert observed[selector]['type'] == independent[selector]['type']
+    assert '#_systemfield_email' in observed and '#_systemfield_email' in independent
+    assert '#structural-submit' in observed
+    assert not hasattr(forms, '_reversible_entry_scope')
 
 async def _owner_order(row, endpoint, stores, pdf):
     facts, asked = {}, []
@@ -771,65 +766,26 @@ async def test_prevalued_receiver_is_never_owner_asked(monkeypatch, tmp_path):
     assert _by_locator(census, _DATE)['selector'] in asked
 
 
-def test_only_the_sibling_mismatch_route_asks_every_receiver():
-    page, _ = _live_dom()
-    assert forms._owner_asks_every_receiver(page)
-    for change in ({'error': 'ambiguous application roots'},
-                   {'root': '#application-root'}):
-        changed = deepcopy(page)
-        changed['entry']['formless'].update(change)
-        assert not forms._owner_asks_every_receiver(changed)
-
 @pytest.mark.parametrize('error', [
-    'ambiguous application roots', 'unsupported custom control', 'other'])
-def test_any_other_root_error_admits_no_live_receiver(monkeypatch, tmp_path, error):
-    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
-    endpoint.current['entry']['formless']['error'] = error
-    assert not _scope(endpoint)
-    email = next(c for c in endpoint.current['controls']
-                 if c['selector'] == '#_systemfield_email')
-    with pytest.raises(forms.Gate) as refusal:
-        forms._reversible_entry_recipient(endpoint.current, email)
-    assert refusal.value.reason == 'defect_receiver'
-    assert 'predicate=formless.error;' in str(refusal.value)
-
-
-@pytest.mark.parametrize('damage,predicate', [
-    ('pane', 'formless.pane'), ('container', 'formless.container'),
-    ('submit', 'formless.submit'), ('truncated', 'formless.truncated')])
-def test_tolerated_mismatch_still_needs_complete_structure(
-        monkeypatch, tmp_path, damage, predicate):
-    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
-    endpoint.current['entry']['formless'][damage] = damage == 'truncated'
-    assert not _scope(endpoint)
-    with pytest.raises(forms.Gate, match=f'predicate={predicate};'):
-        forms._reversible_entry_recipient(
-            endpoint.current, _by_locator(endpoint.current, _DATE))
-
-
-@pytest.mark.parametrize('mutate,suffix,predicate', [
-    # A second title in the entry leaves the caption unproven.
-    ("node('label',{class:'ashby-application-form-question-title',text:'Other'},"
-     "c.children[4]);", _DATE, 'label.associated'),
-    # A title owned by a different live control cannot caption this one.
-    ("c.children[4].children[0].setAttribute('for','_systemfield_name');",
-     _DATE, 'label.associated'),
-    # A third button makes the group no exact Yes/No pair.
-    ("untyped(group,{text:'Maybe'});", _YES, 'label.associated'),
-    # A form owner or override can submit: never a Boolean member.
-    ("group.children[0].setAttribute('formaction','/synthetic');", _YES, 'evidence.formaction'),
+    'ambiguous application roots', 'unsupported custom control', 'other',
 ])
-def test_unproven_idless_receivers_fail_closed_by_name(
-        monkeypatch, tmp_path, mutate, suffix, predicate):
-    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path, mutate=mutate)
-    target = _by_locator(endpoint.current, suffix)
-    assert target['selector'] not in _scope(endpoint)
-    with pytest.raises(forms.Gate) as refusal:
-        forms._reversible_entry_recipient(endpoint.current, target)
-    assert refusal.value.reason == 'defect_receiver'
-    assert (f"predicate={predicate}; control={target['diagnostic_locator']}; tag="
-            in str(refusal.value))
+def test_unproven_ashby_root_cannot_pass_final_submit_boundary(error):
+    page, _ = _live_dom()
+    page['entry']['formless']['error'] = error
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
+        forms._formless_boundary(page)
 
+
+@pytest.mark.parametrize('damage', ['pane', 'container', 'submit', 'truncated'])
+def test_incomplete_ashby_root_cannot_pass_final_submit_boundary(damage):
+    page, _ = _live_dom()
+    root = page['entry']['formless']
+    if damage == 'truncated':
+        root[damage] = True
+    else:
+        root[damage] = ''
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
+        forms._formless_boundary(page)
 
 def test_submit_text_or_exact_submit_is_never_a_boolean_member():
     page, _ = _live_dom(mutate=(
@@ -842,37 +798,18 @@ def test_submit_text_or_exact_submit_is_never_a_boolean_member():
 
 
 @pytest.mark.asyncio
-async def test_boolean_click_after_choose_reaches_final_submit_guard(monkeypatch, tmp_path):
-    """An untyped Yes/No is DOM submit: the raw producer never treats it as a write."""
+async def test_untyped_yes_no_choice_is_reversible_and_does_not_submit(monkeypatch, tmp_path):
+    """An ordinary Yes/No click must not be classified as committing Submit."""
     row, endpoint, decision, stores, pdf = _live_census(monkeypatch, tmp_path)
     controller = forms.ApplicationIPCController(
         PK, COMPANY, posting('ashby'), pdf, {}, {}, [], {}, lambda: None)
     monkeypatch.setattr(controller, '_page', AsyncMock(return_value=endpoint.current))
-    monkeypatch.setattr(controller, '_fresh_preparation', lambda url: None)
     final_guard = AsyncMock(side_effect=forms.Gate('final guard decided'))
-    monkeypatch.setattr(controller, 'authorize_final_submit', final_guard)
-    # The synthetic producer lacks an independent fixed-witness readback.
-    # The final path must reject it instead of treating a button label as proof.
-    with pytest.raises(forms.Gate, match='current DOM witness is unavailable or changed'):
-        await controller.before_ipc(
-            SimpleNamespace(), ('click', _by_locator(endpoint.current, _NO)['selector']), {})
+    monkeypatch.setattr(controller, 'check_pre_submit', final_guard)
+    await controller.before_ipc(
+        SimpleNamespace(), ('click', _by_locator(endpoint.current, _NO)['selector']), {})
     final_guard.assert_not_awaited()
     assert controller.committed is False
-
-
-def test_receiver_defect_names_structure_never_ids_or_values(monkeypatch, tmp_path):
-    _, endpoint, _, _, _ = _live_census(monkeypatch, tmp_path)
-    page = deepcopy(endpoint.current)
-    email = next(c for c in page['controls'] if c['selector'] == '#_systemfield_email')
-    email['value'] = 'PRIVATE_SYNTHETIC_VALUE'
-    with pytest.raises(forms.Gate) as refusal:
-        forms._reversible_entry_recipient(page, email)
-    text = str(refusal.value)
-    assert refusal.value.reason == 'defect_receiver'
-    assert f"predicate=value.equal; control={email['diagnostic_locator']}" in text
-    assert 'tag=input; type=email.' in text
-    assert 'PRIVATE_SYNTHETIC_VALUE' not in text and '_systemfield' not in text
-
 
 @pytest.mark.parametrize('spec', [
     {'wrapperTag': 'section'}, {'wrapperClass': 'generic'}, {'paneTag': 'section'},
@@ -915,7 +852,8 @@ async def test_tolerated_mismatch_with_nothing_unanswered_keeps_final_value_guar
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert 'An exact human-approved answer is needed for this control' in result['question'], result
+    assert result['reason'] == 'defect_pre_submit_item_2', result
+    assert result['item'] == 2
     assert decide.await_count == 1
     assert effect_calls(raw.calls) == [
         ('set', Path(transport._application_controller.resume_path).name)]
@@ -1030,38 +968,30 @@ async def test_same_question_key_entries_refuse_answer_skip_and_bank(
     assert not [c for c in endpoint.calls if c[0] in {'fill', 'click', 'upload', 'select'}]
 
 
-def test_location_toggle_shares_its_title_but_is_no_collision():
-    page, _ = _live_dom()
-    location = _by_locator(page, _LOCATION)
-    assert forms._mismatch_question_twins(page, location) == []
-    yes = _by_locator(page, _YES)
-    assert forms._mismatch_question_twins(page, yes) == []
+def test_distinct_named_required_radio_groups_are_checked_independently_at_final_submit():
+    """A checked radio in group A cannot satisfy required group B with same caption."""
+    def radio(selector, name, value, checked):
+        return {
+            'selector': selector, 'tag': 'input', 'type': 'radio',
+            'name': name, 'form_selector': '#synthetic-form',
+            'question': 'Synthetic choice', 'label': value.title(),
+            'value': value, 'checked': checked, 'required': True,
+            'disabled': False,
+        }
 
-
-def test_one_radio_group_is_one_receiver_but_two_groups_on_one_question_collide(
-        monkeypatch):
-    """Issue #202 AC7: members of one validated radio group are one logical
-    receiver; a second group sharing that question key still fails closed."""
-    monkeypatch.setattr(forms, '_owner_asks_every_receiver', lambda page: True)
-    monkeypatch.setattr(forms, '_formless_root', lambda page: {})
-
-    def radio(selector, name, value):
-        return dict(selector=selector, tag='input', type='radio', name=name,
-                    form_selector='#synthetic-form', form_action='', in_form=True,
-                    question='Synthetic choice', label=value.title(), value=value)
-
-    one = [radio('#a-yes', 'a', 'yes'), radio('#a-no', 'a', 'no')]
-    page = {'controls': one}
-    assert forms._mismatch_question_twins(page, one[0]) == []
-    assert forms._key(page, one[0]) == 'Synthetic choice'
-    other = [radio('#b-yes', 'b', 'yes'), radio('#b-no', 'b', 'no')]
-    page = {'controls': one + other}
-    assert {c['selector'] for c in forms._mismatch_question_twins(page, one[0])} == {
-        '#b-yes', '#b-no'}
-    with pytest.raises(forms.Gate) as refused:
-        forms._key(page, one[0])
-    assert refused.value.reason == 'defect_receiver'
-
+    controls = [
+        radio('#a-yes', 'a', 'yes', True), radio('#a-no', 'a', 'no', False),
+        radio('#b-yes', 'b', 'yes', False), radio('#b-no', 'b', 'no', False),
+        {'selector': '#resume', 'type': 'file', 'label': 'Resume',
+         'disabled': False, 'files': ['Synthetic.pdf']},
+    ]
+    page = {'controls': controls, 'inventory_verified': True,
+            'truncated': False, 'opaque_controls': False,
+            'shadow_roots': False, 'unsupported_frames': []}
+    with pytest.raises(forms.Gate, match='required native choice'):
+        forms.check_form(page, {}, uploaded=True, attachment='Synthetic.pdf')
+    controls[2]['checked'] = True
+    forms.check_form(page, {}, uploaded=True, attachment='Synthetic.pdf')
 
 # Issue #202 r08 / ARCH19:48 AC8 bounds on the rootless sibling-mismatch route,
 # where final Submit always refuses. A reload replaces every element and the

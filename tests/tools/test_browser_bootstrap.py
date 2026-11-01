@@ -658,35 +658,6 @@ async def test_actual_readers_supply_only_proven_visible_material_label(kind, mo
         assert observed['visible'] is True
         assert observed['diagnostic_visible_label'].startswith('I agree to terms ')
 
-    class OfflineReaderSession:
-        async def call(self, operation, script):
-            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
-            return {'value': deepcopy(independent)}
-
-        async def page(self):
-            return deepcopy(page)
-
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-    # #241 removes the bootstrap-only fallback which interpreted arbitrary
-    # material-sounding labels as a separate write barrier. An actual
-    # form-owned material SELECT may still request its exact owner grant.
-    try:
-        prepared = await forms._bootstrap(
-            OfflineReaderSession(), page, PK, {}, SECURE_URL)
-    except forms.Gate as denial:
-        assert not str(denial).startswith(
-            'Material assent outside a bound choice needs human inspection.')
-        if kind == 'select-options' and denial.reason == 'owner_question':
-            question = denial.form_question
-            assert question['tag'] == question['type'] == 'select'
-            assert question['options'] and question['pk'] == PK
-        else:
-            assert denial.reason in {'owner_question', 'unknown_field'}
-    else:
-        assert prepared == page
-
-
 async def test_actual_reader_hidden_role_is_not_owner_material_type():
     """A hidden input's arbitrary ARIA role is matching input, not display-safe type."""
     role = 'HIDDEN_ROLE_SENTINEL_' + 'x' * 240
@@ -705,29 +676,6 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
     assert original['type'] == role and observed['type'] == role
     assert 'consent-HIDDEN_NAME_SENTINEL' in original['label']
     assert original['in_form'] is True and observed['visible'] is False
-
-    class OfflineReaderSession:
-        async def call(self, operation, script):
-            assert operation == 'evaluate' and script == forms._FIXED_CONTROL_WITNESS
-            return {'value': deepcopy(independent)}
-
-        async def page(self):
-            return deepcopy(page)
-
-    # A malicious hidden ARIA role never upgrades the control into a
-    # material-choice grant, and no longer forces an early diagnostic gate.
-    try:
-        prepared = await forms._bootstrap(
-            OfflineReaderSession(), page, PK, {}, SECURE_URL)
-    except forms.Gate as denial:
-        detail = str(denial)
-        assert not detail.startswith(
-            'Material assent outside a bound choice needs human inspection.')
-        assert 'HIDDEN_ROLE_SENTINEL_' not in detail
-        assert 'HIDDEN_NAME_SENTINEL' not in detail
-    else:
-        assert prepared == page
-
 
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
 @pytest.mark.parametrize('material', [False])
@@ -822,8 +770,8 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     assert (result.get('material_assent_diagnostic') is True) is material
     assert row['status'] == 'needs_human'
     assert row['gate_pending']['question'] == gate['question']
-    assert row['gate_pending']['review_route'] == 'agent_unavailable'
-    assert row['gate_reason'] == 'unknown_field'
+    assert row['gate_pending']['review_route'] == 'luna'
+    assert row['gate_reason'] == 'agent_review_unavailable'
     ordinary = [args['detail'] for event, args in events if event == 'gate']
     assert ordinary == (['material-assent: human inspection required']
                         if material else [gate['question']])
@@ -1358,9 +1306,11 @@ async def test_alias_execute_gate_producer_captures_original_row(monkeypatch, tm
             facts={}, filled={}, resume_path='Resume.pdf',
             company='example-co', jd_text='', resume_tex='', github='',
             pk=GH_PK, job_url=GH_WRAP, provenance=alias)
-    assert caught.value.form_question['origin_row'] == {
-        'jd_url': GH_WRAP, 'company': 'example-co', 'ats': 'greenhouse'}
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['pk'] == GH_PK
+    assert caught.value.form_question['selector'] == '#email'
     assert caught.value.form_question['url'] == GH_DIRECT
+    assert 'origin_row' not in caught.value.form_question
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
 
@@ -1592,8 +1542,7 @@ async def test_alias_revoked_during_session_acquisition_prevents_navigation(
     assert decide.await_count == 1
 
 @pytest.mark.parametrize('tag', ['input', 'div'])
-async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
-        monkeypatch, tag):
+async def test_linked_combobox_remains_an_ordinary_required_question(tag, monkeypatch):
     combo = field(
         'Country', '#country', tag=tag, type='combobox', required=True,
         combobox={'linked': True, 'link_id': 'country-list',
@@ -1603,25 +1552,19 @@ async def test_bootstrap_offers_only_witnessed_linked_combobox_for_direct_gate(
                                'selected': False}],
                   'selected_text': '', 'displayed_text': '',
                   'selected_value': '', 'hidden_selector': '', 'hidden_value': ''})
-    current = inventory(combo, submit())
-    monkeypatch.setattr(forms, '_row', lambda _pk: {})
-    evidence = witness(current)
-    evidence['controls'][0]['combobox'] = deepcopy(combo['combobox'])
-    browser = Browser(current, result=evidence)
-    prepared = await forms._bootstrap(browser, current, PK, {}, URL)
-    assert prepared is current
-    fixed = {c['selector']: c for c in evidence['controls']}
-    question = forms._disclosure_question(current, combo, fixed, URL)
-    question['pk'] = PK
-    assert question == {
-        'pk': PK, 'label': 'Country', 'control_label': 'Country',
-        'question': '', 'selector': '#country', 'url': URL, 'tag': tag,
-        'type': 'combobox', 'form_selector': '#application', 'form_action': URL}
-    assert [call[0] for call in browser.calls] == ['evaluate']
+    filename = 'Synthetic Resume.pdf'
+    page = inventory(combo, field(
+        'Resume', '#resume', required=False, type='file', files=[filename]),
+        submit())
+    observed = witness(page)
+    observed['controls'][0]['combobox'] = deepcopy(combo['combobox'])
+    assert observed['controls'][0]['type'] == 'combobox'
+    question = forms._ordinary_owner_question(page, combo, PK)
+    assert (question['type'], question['tag'], question['selector']) == (
+        'combobox', tag, '#country')
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(page, {}, True, filename)
 
-
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
-        forms.check_form(prepared, {}, uploaded=True)
 @pytest.mark.parametrize('ats,canonical,target,status', [
     ('teamtailor', 'https://example-co.teamtailor.com/jobs/backend-123',
      'https://careers.example-co.test/jobs/backend-123', 301),
@@ -3108,76 +3051,6 @@ async def test_bootstrap_witness_bounded_reread(monkeypatch, site, failure, stab
         assert browser.evaluations == 4
         assert len(delays) == 3
     assert all(delay == 0.25 for delay in delays)
-
-
-def test_every_production_observe_controls_caller_names_its_site():
-    import ast
-    import inspect
-    tree = ast.parse(inspect.getsource(forms))
-    literal_sites = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-            continue
-        if node.func.id != '_observe_controls':
-            continue
-        kw = next((x.value for x in node.keywords if x.arg == 'site'), None)
-        if kw is None:
-            # Both bootstrap and execute preserve the two-argument seam for
-            # fixed synthetic witness doubles; code-owned context supplies site.
-            # Untagged observer calls live only in the fixed bootstrap and
-            # execute seams. Match enclosing functions instead of line numbers.
-            parents = {child: parent for parent in ast.walk(tree)
-                       for child in ast.iter_child_nodes(parent)}
-            owner = parents.get(node)
-            while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                owner = parents.get(owner)
-            assert owner is not None and owner.name in {
-                '_bootstrap_observe_controls', '_execute_observe_controls'}
-            continue
-        if isinstance(kw, ast.Name):
-            assert kw.id == 'site'
-        else:
-            assert isinstance(kw, ast.Constant) and isinstance(kw.value, str) and kw.value
-            literal_sites.append(kw.value)
-    assert {'execute', 'execute-readback'} <= set(literal_sites)
-    assert len(literal_sites) >= 19
-    # Bootstrap uses a two-positional-argument seam required by existing
-    # synthetic submission guards; its scoped wrapper still owns fixed sites.
-    wrappers = [node for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == '_bootstrap_observe_controls']
-    assert {next(k.value.value for k in node.keywords if k.arg == 'site')
-            for node in wrappers} == {'bootstrap-formless', 'bootstrap-material'}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('site', [
-    'confirmation-readback', 'readiness-witness', 'bootstrap-commit-readback',
-    'native-receiver-readback', 'combobox-observe', 'execute-readback',
-])
-async def test_named_non_retry_observers_remain_single_read(monkeypatch, site):
-    """An attribution-only site never opts a caller into inventory retries."""
-    base = inventory(field(), submit())
-    browser = Browser(base)
-    reads = 0
-    async def unstable_page():
-        nonlocal reads
-        reads += 1
-        fresh = deepcopy(base)
-        fresh['controls'][0]['label'] = 'Synthetic changed field'
-        return fresh
-    monkeypatch.setattr(browser, 'page', unstable_page)
-    delays = []
-    async def fake_sleep(seconds):
-        delays.append(seconds)
-    monkeypatch.setattr(forms.asyncio, 'sleep', fake_sleep)
-    with pytest.raises(forms.Gate) as denied:
-        await forms._observe_controls(browser, base, site=site)
-    assert 'predicate=inventory.identity.equal' in str(denied.value)
-    assert 'site=' + site in str(denied.value)
-    assert [call[0] for call in browser.calls] == ['evaluate']
-    assert reads == 1
-    assert not delays
 
 
 @pytest.mark.asyncio

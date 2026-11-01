@@ -2864,8 +2864,9 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     assert tracked['status'] == 'needs_human'
     assert tracked['gate_pending']['question'] == result['question']
     assert tracked['gate_pending']['review_route'] == 'luna'
-    assert tracked['gate_pending']['item'] == 1
-    assert tracked['gate_reason'] == result['reason'] == 'defect_pre_submit_item_1'
+    assert tracked['gate_pending']['pre_submit_item'] == 1
+    assert tracked['gate_reason'] == 'pre_submit_item_1'
+    assert result['reason'] == 'defect_pre_submit_item_1'
 
 
 @pytest.mark.parametrize('spec', [

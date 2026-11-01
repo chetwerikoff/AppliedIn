@@ -509,6 +509,9 @@ async def test_never_committed_component_refuses_final_submit(
     # editable picker text is not an additional approval item under #293.
     field['value'] = ''
     field['has_value'] = False
+    # The final required-field validator does not reject optional empty
+    # pickers; make the negative case genuinely required.
+    field['required'] = True
     keep = {'#location', '#resume', '#submit'}
     if field['combobox'].get('hidden_selector'):
         keep.add(field['combobox']['hidden_selector'])

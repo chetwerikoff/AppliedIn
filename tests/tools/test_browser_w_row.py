@@ -1,8 +1,8 @@
 """Exact W admission: real reader scripts, synthetic DOM, and no browser IPC.
 
-Each negative changes one property of the link-present positive. Reader
-admission and passive-frame quarantine remain covered. The deleted assertions
-required a per-action witness refusal; preparation no longer uses that gate.
+Each negative changes one property of the link-present positive. Guard sensitivity
+executes the same production reader with only the named predicate removed in
+memory; the removal is never written to production or used by the controller.
 """
 import pytest
 
@@ -169,6 +169,24 @@ async def test_w_negative_real_application_path_gates_without_target_ipc(monkeyp
     zero_target_ipc(session)
 
 
+@pytest.mark.parametrize('cause', NEGATIVES)
+@pytest.mark.parametrize('reader_index', [0, 1], ids=['fresh-PAGE', 'fresh-witness'])
+async def test_w_invalidating_later_read_revokes_before_next_action(monkeypatch, cause, reader_index):
+    world(monkeypatch, 'lever')
+    raw = DOMSession(later=NEGATIVES[cause], after=4+reader_index)
+    proof = forms._configured_alias(PK, COMPANY, posting('lever'))
+    scoped = forms._EntrySession(raw, lambda url: url == entry('lever'), proof)
+    # Two complete independent pairs precede the mutation. No initial grant is
+    # carried into any nested/pre-fill/pre-action/pre-submit/receipt observation.
+    for script in READERS * 2:
+        passive((await scoped.call('evaluate', script))['value'])
+    if reader_index:
+        passive(await scoped.page())
+    with pytest.raises(forms.Gate, match=GATE):
+        await scoped.call('evaluate', READERS[reader_index])
+    zero_target_ipc(raw)
+
+
 @pytest.mark.parametrize('before,after', [
     ({}, {'noLink': True}), ({'noLink': True}, {}),
     ({}, {'link': {'href': 'https://other-widgets.example-co.test/learn'}}),
@@ -247,3 +265,22 @@ async def test_w_positive_readiness_reaches_original_human_gate(monkeypatch):
     zero_target_ipc(raw)
 
 
+@pytest.mark.parametrize('cause', ['w_other_anchor_no_href', 'w_extra_tabbable_control',
+                                  'w_extra_inline_click_control', 'w_button_external_label'])
+async def test_w_actual_prefill_and_presubmit_witness_revokes(monkeypatch, cause):
+    world(monkeypatch, 'lever')
+    proof = forms._configured_alias(PK, COMPANY, posting('lever'))
+    raw = DOMSession(later=NEGATIVES[cause], after=4)
+    scoped = forms._EntrySession(raw, lambda url: url == entry('lever'), proof)
+    initial = await scoped.page()
+    for script in [READERS[1], *READERS]:
+        passive((await scoped.call('evaluate', script))['value'])
+    # execute uses the original independent pre-fill observer; the same observer
+    # also owns pre-submit and receipt rechecks. It must stop before any fill IPC.
+    with pytest.raises(forms.Gate, match=GATE):
+        await forms.execute(
+            scoped, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+            facts={'Email': 'synthetic@example-co.test'}, filled={}, resume_path='',
+            company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
+            job_url=posting('lever'), provenance=proof)
+    zero_target_ipc(raw)

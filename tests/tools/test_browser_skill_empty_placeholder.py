@@ -21,7 +21,7 @@ ZERO = {**RECT, 'height': 0}
 # picker no longer stops Submit first. The required Location placeholder must
 # now be refused itself, by the same single final guard.
 LOCATION_REFUSAL = dict(require_incomplete=False,
-                        reason='A required accessible picker lacks a current form-owned value.')
+                        reason='Unverified or changed combobox value: Where are you located?')
 
 
 def observe(*, changes=(), optional=False, original=False):
@@ -151,9 +151,7 @@ async def test_greenhouse_zero_height_single_value_gates(
     # ARIA option preparation. That visual shape also cannot prove an approved
     # form-owned submitted value at the ONE final Submit boundary.
     assert session.phases['location'] == 'C2'
-    # The retired widget receipt carries no machine-value authorization.
-    # The current DOM observation below, not this receipt, decides Submit.
-    assert receipt['action'] == 'combobox'
+    assert receipt['action'] == 'combobox' and receipt['committed_value'] == grants['location']
     assert filled['#location'] == grants['location']
     assert session.calls == [
         ('click', '#location'),

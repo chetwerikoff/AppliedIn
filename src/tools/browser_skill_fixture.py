@@ -1031,8 +1031,7 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 try:
                     # Imports only AFTER daemon sanitized its environment. The
                     # ordinary controller runs with its original F1-F5 checks.
-                    from tools.browser_skill_apply import (
-                        apply, _approval_question_collisions)
+                    from tools.browser_skill_apply import apply
                     result = asyncio.run(apply(
                         URL, COMPANY, dict(_FACTS), "synthetic-fixture", pk=PK,
                         resume_path=state.resume_path, fixture_context=state))
@@ -1141,34 +1140,6 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                     "field": "Résumé",
                     "outcome": "uploaded" if state.uploaded else "not_reached",
                 })
-                collisions = []
-                seen_collision_sets = set()
-                if isinstance(state.last_page, dict):
-                    for target in state.last_page.get("controls", []):
-                        if (not isinstance(target, dict)
-                                or target.get("type") in {"radio", "hidden"}):
-                            continue
-                        question = target.get("question") or target.get("label")
-                        if not isinstance(question, str) or not question.strip():
-                            continue
-                        others = [
-                            c for c in _approval_question_collisions(
-                                state.last_page, target)
-                            if c.get("type") != "hidden"]
-                        pair = [target, *others]
-                        selectors = tuple(sorted(
-                            c.get("selector", "") for c in pair))
-                        if len(pair) < 2 or selectors in seen_collision_sets:
-                            continue
-                        seen_collision_sets.add(selectors)
-                        collisions.append({
-                            "question": question,
-                            "controls": [{
-                                "selector": c.get("selector"),
-                                "label": c.get("label"),
-                                "type": c.get("type"),
-                            } for c in pair],
-                        })
                 gate = None if result.get("status") == "applied" else {
                     "kind": result.get("reason") or result.get("status"),
                     "field": {selector: field for field, selector in (

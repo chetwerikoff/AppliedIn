@@ -632,7 +632,7 @@ async def test_formless_apply_without_staged_pdf_stops_before_model(monkeypatch)
     result = await attempt()
     assert result['status'] == 'gate', result
     assert result['reason'] == 'unknown_field'
-    assert 'staged row résumé is missing' in result['question']
+    assert 'row-tailored staged PDF is missing' in result['question']
     assert result['form_question'] is None
     assert decision.await_count == 0
     no_mutations(raw)
@@ -1048,7 +1048,7 @@ async def test_css_clipped_text_is_not_an_applicant_target(monkeypatch, style, a
     # Clipping remains independently observable. Without a staged PDF,
     # no Submit can be attempted; this is not a per-control permission gate.
     assert result['status'] == 'gate', result
-    assert 'staged row résumé is missing' in result['question'], result
+    assert 'row-tailored staged PDF is missing' in result['question'], result
     assert not decide.await_count
     no_mutations(raw)
 

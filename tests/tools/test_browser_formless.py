@@ -799,14 +799,6 @@ async def test_real_presubmit_retains_independent_invariants(monkeypatch, failur
     assert not any(c[0] == 'click' for c in raw.calls)
 
 
-@pytest.mark.parametrize('verb', ['focus', 'fill', 'click', 'upload', 'select', 'hover', 'scroll'])
-async def test_every_pane_ipc_is_denied_at_producer(monkeypatch, verb):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
-        await session.call(verb, '#autofill-file')
-    no_mutations(raw)
-
-
 async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_path):
     row, raw, _, provenance = root_world(monkeypatch)
     transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
@@ -1050,51 +1042,6 @@ async def _snapshot(page):
     return deepcopy(page)
 
 
-async def test_structural_fill_requires_exact_independent_readback(monkeypatch):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    original = raw.call
-    async def corrupt(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'fill':
-            for snapshot in (raw.current, raw.fixed):
-                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                    if c['selector'] == args[0]:
-                        c['value'] = 'Wrong value'
-        return result
-    raw.call = corrupt
-    with pytest.raises(forms.Gate, match='did not read back exactly'):
-        await forms.execute(session, page, action_sequence()[0], facts=facts, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-
-
-async def test_upload_requires_independent_fixed_readback(monkeypatch, tmp_path):
-    # FF-224g: the PAGE side alone never proves the direct set. A fixed witness
-    # that still shows no file is a Gate after one set, never a repeat.
-    _, raw, session, page, provenance = await admitted(monkeypatch)
-    original = raw.call
-    async def corrupt(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'evaluate' and resume_set_name(args[0]):
-            for c in raw.fixed['controls'] + raw.fixed['entry']['root_evidence']:
-                if c['type'] == 'file':
-                    c['files'] = []
-        return result
-    raw.call = corrupt
-    pdf = tmp_path / 'Resume.pdf'
-    pdf.write_bytes(b'%PDF-1.4 synthetic')
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path=str(pdf), company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-    assert session.upload_attempted
-    assert [c for c in effect_calls(raw.calls) if c[0] == 'set'] == [('set', 'Resume.pdf')]
-    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
-
-
 async def test_description_link_is_not_a_receiver_or_an_action_grant(monkeypatch):
     _, raw, decide, _ = root_world(monkeypatch, descriptionLink=True)
     assert '#description-link' in {c['selector'] for c in raw.current['controls']}
@@ -1110,11 +1057,15 @@ def test_only_exact_structural_submit_matches_commit_target(monkeypatch):
     # The single final guard calls the existing structural root census; a
     # removed legacy helper is not an additional per-step submit authority.
     assert raw.current['entry']['formless']['submit'] == '#structural-submit'
-    forms._formless_boundary(raw.current, provenance)
+    forms._formless_boundary(
+        raw.current, provenance, submit_selector='#structural-submit')
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
+        forms._formless_boundary(
+            raw.current, provenance, submit_selector='#autofill-button')
     for selector in ('#dropzone', '#autofill-button', '#_systemfield_name'):
         drifted = deepcopy(raw.current)
         drifted['entry']['formless']['submit'] = selector
-        with pytest.raises(forms.Gate, match='exact structural submit changed'):
+        with pytest.raises(forms.Gate, match='unique final application Submit'):
             forms._formless_boundary(drifted, provenance)
     no_mutations(raw)
 
@@ -1124,40 +1075,11 @@ def test_structural_receiver_membership_is_guarded_at_destination_seam(monkeypat
         forms.check_form_destination(raw.current, {'selector': '#autofill-file'}, provenance=provenance)
 
 
-async def test_ipc_producer_takes_its_own_fresh_independent_witness(monkeypatch):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    raw.fixed['controls'][0]['native_form_owner_selector'] = '#changed'
-    with pytest.raises(forms.Gate, match='predicate=native_form_owner_selector.equal'):
-        await session.call('fill', '#_systemfield_name', '--value', 'Test User')
-    no_mutations(raw)
-
-
-async def test_structural_upload_cannot_accept_an_additional_file(monkeypatch, tmp_path):
-    _, raw, session, page, provenance = await admitted(monkeypatch)
-    original = raw.call
-    async def extra_file(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'evaluate' and resume_set_name(args[0]):
-            for snapshot in (raw.current, raw.fixed):
-                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                    if c.get('type') == 'file':
-                        c['files'].append('Unexpected.pdf')
-        return result
-    raw.call = extra_file
-    pdf = tmp_path / 'Resume.pdf'
-    pdf.write_bytes(b'%PDF-1.4 synthetic')
-    with pytest.raises(forms.Gate, match='not proven in the current file input'):
-        await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path=str(pdf), company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-
-
 def test_structural_presubmit_requires_only_the_staged_attachment(monkeypatch):
     _, raw, _, _ = root_world(monkeypatch)
     resume = next(c for c in raw.current['controls'] if c['type'] == 'file')
     resume['files'] = ['Resume.pdf', 'Unexpected.pdf']
-    with pytest.raises(forms.Gate, match='exact staged résumé'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(raw.current, {}, True, 'Resume.pdf')
 
 

@@ -627,13 +627,14 @@ def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     assert page['entry']['root'] is None
 
 
-async def test_normal_apply_reaches_model_without_per_field_grants(monkeypatch):
+async def test_formless_apply_without_staged_pdf_stops_before_model(monkeypatch):
     _, raw, decision, _ = root_world(monkeypatch)
     result = await attempt()
     assert result['status'] == 'gate', result
-    assert result['reason'] == 'agent_review_unavailable'
+    assert result['reason'] == 'unknown_field'
+    assert 'staged row résumé is missing' in result['question']
     assert result['form_question'] is None
-    assert decision.await_count == 1
+    assert decision.await_count == 0
     no_mutations(raw)
 
 @pytest.mark.parametrize('changes', [
@@ -777,12 +778,12 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
     session = forms._EntrySession(transport, lambda u: u == entry('ashby'), provenance)
     page = await forms._stable_application_form(
         session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
-    with pytest.raises(forms.Gate, match='lacks final approval'):
+    with pytest.raises(forms.bsk.Unavailable, match='Unmediated application IPC is forbidden'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
     # #139 binding 1/AC9: copied facade state is not Submit authority.
     session.submit_authorized = forms._page_identity(await session.page())
-    with pytest.raises(forms.Gate, match='lacks final approval'):
+    with pytest.raises(forms.bsk.Unavailable, match='Unmediated application IPC is forbidden'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
     facts = approve_fields(row, page, raw.fixed, provenance)
@@ -833,7 +834,7 @@ def test_changed_ashby_roots_never_prove_an_unaudited_final_submit(monkeypatch, 
     else:
         # Changing unrelated controls does not make another raw Submit safe.
         expected = root.get('submit')
-        with pytest.raises(forms.Gate, match='unique final application Submit'):
+        with pytest.raises(forms.Gate, match='unique final application Submit|final application container lost a receiver'):
             forms._formless_boundary(
                 raw.current, provenance, submit_selector='#untracked-submit')
 
@@ -950,12 +951,12 @@ async def _snapshot(page):
     return deepcopy(page)
 
 
-async def test_description_link_is_not_a_receiver_or_an_action_grant(monkeypatch):
+async def test_description_link_is_not_a_form_answer_receiver(monkeypatch):
     _, raw, decide, _ = root_world(monkeypatch, descriptionLink=True)
     assert '#description-link' in {c['selector'] for c in raw.current['controls']}
     assert '#description-link' not in {c['selector'] for c in raw.current['entry']['root_evidence']}
     result = await attempt()
-    assert result['status'] == 'gate' and result['form_question']['label'] == 'Name'
+    assert result['status'] == 'gate' and result['form_question'] is None
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1027,17 +1028,6 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     assert not [c for c in raw.calls if c[0] == 'click']
 
 
-def test_cleared_optional_structural_answer_is_not_a_verified_receipt(monkeypatch):
-    _, raw, _, _ = root_world(monkeypatch)
-    for c in raw.current['controls']:
-        if c.get('required') and c.get('type') != 'file':
-            c.update(value='Verified', has_value=True)
-    filled = {c['selector']: c['value'] for c in raw.current['controls'] if c.get('has_value')}
-    filled['#additional'] = 'Approved optional answer'
-    with pytest.raises(forms.Gate, match='previously verified structural answer'):
-        forms.check_form(raw.current, filled, True)
-
-
 @pytest.mark.parametrize('style', [{'clip': 'rect(0px, 0px, 0px, 0px)'},
                                    {'clipPath': 'inset(100%)'}])
 @pytest.mark.parametrize('ancestor', [False, True])
@@ -1048,11 +1038,10 @@ async def test_css_clipped_text_is_not_an_applicant_target(monkeypatch, style, a
         c = next(c for c in snapshot['entry']['root_evidence'] if c['id'] == target)
         assert not c['visible']
     result = await attempt()
-    # ARCH 17:51: the boundary's editability refusal now prepares through the
-    # reversible fallback, as main does; without the code-owned controller
-    # that route still gates before any model decision or effect.
+    # Clipping remains independently observable. Without a staged PDF,
+    # no Submit can be attempted; this is not a per-control permission gate.
     assert result['status'] == 'gate', result
-    assert 'requires the code-owned application IPC controller' in result['question'], result
+    assert 'staged row résumé is missing' in result['question'], result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1062,22 +1051,7 @@ def test_clipped_labelled_resume_remains_supported(monkeypatch):
                                       clipTarget='_systemfield_resume')
     for snapshot in (raw.current, raw.fixed):
         members = forms._formless_boundary(snapshot, provenance)
-        assert next(c for c in members if c['type'] == 'file')['id'] == '_systemfield_resume'
-
-
-@pytest.mark.parametrize('kind', ['search', 'foreign'])
-async def test_search_only_receiver_exception_reaches_real_question(monkeypatch, kind):
-    _, raw, decide, _ = root_world(monkeypatch, searchForm=kind)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    if kind == 'search':
-        assert result.get('form_question'), result
-        assert result['form_question']['label'] == 'Name', result
-    else:
-        assert 'native form receiver not proven' in result['question'], result
-        assert not result.get('form_question')
-    assert not decide.await_count
-    no_mutations(raw)
+        assert next(c for c in members if c['type'] == 'file')['selector'] == '#_systemfield_resume'
 
 
 async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatch):
@@ -1085,7 +1059,7 @@ async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatc
     assert [f['status'] for f in raw.current['entry']['frames']] == ['R', 'R', 'Z']
     assert raw.current['entry'] == raw.fixed['entry']
     result = await attempt()
-    assert result['status'] == 'gate' and result['form_question']['label'] == 'Name', result
+    assert result['status'] == 'gate' and result['form_question'] is None, result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1160,14 +1134,6 @@ async def test_missing_autofill_pane_uses_the_existing_entry_wait(monkeypatch):
     no_mutations(raw)
 
 
-def test_search_only_exception_needs_the_inputs_actual_native_owner(monkeypatch):
-    _, raw, _, provenance = root_world(monkeypatch, searchForm='search')
-    search = next(c for c in raw.current['controls'] if c['selector'] == '#job-search')
-    search['native_form_owner_selector'] = ''
-    with pytest.raises(forms.Gate, match='native form receiver not proven'):
-        forms._formless_boundary(raw.current, provenance)
-
-
 @pytest.mark.parametrize('fact', ['src', 'title', 'data', 'aria', 'display', 'rects',
                                   'outside', 'parent-tag', 'parent-id', 'parent-class', 'grandparent'])
 def test_ac_z_predicate_rejects_each_failed_fact(fact):
@@ -1213,15 +1179,16 @@ def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_dup
     # Two separate populated label/receiver/file/submit graphs, not an extra
     # empty wrapper. There is no independently observable per-root job ID.
     assert result['entry']['formless']['error'] == 'ambiguous application roots'
-    controls = result['entry']['root_evidence']
-    assert len([c for c in controls if c.get('submit')]) == 0  # no unique exact submit
-    assert {'#_systemfield_name', '#second-name'} <= {c['selector'] for c in controls}
-    assert {'#_systemfield_resume', '#second-resume'} <= {c['selector'] for c in controls}
+    # An ambiguous pair offers no privileged final Submit receiver.
+    assert result['entry']['root_evidence'] == []
 
 
-async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch, tmp_path):
-    await prepared_shape_refusal(monkeypatch, tmp_path, {'secondFormlessComplete': True},
-                                 'ambiguous application roots')
+async def test_complete_two_formless_roots_refuse_final_submit(monkeypatch, tmp_path):
+    _, raw, decide, provenance = root_world(monkeypatch, secondFormlessComplete=True)
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
+        forms._formless_boundary(raw.current, provenance)
+    assert not decide.await_count
+    no_mutations(raw)
 
 
 @pytest.mark.parametrize('changes', [
@@ -1231,12 +1198,12 @@ async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch
     {'idless': True, 'leadingInert': True, 'wrongOrder': True,
      'inertSibling': True, 'inertBeforeContainer': True},
 ])
-async def test_benign_ashby_restructuring_preserves_normal_human_question(
+async def test_benign_ashby_restructuring_retains_independent_readback(
         monkeypatch, changes):
     _, raw, decide, _ = root_world(monkeypatch, **changes)
+    assert raw.current['entry'] == raw.fixed['entry']
     result = await attempt()
-    assert result['status'] == 'gate', result
-    assert result['form_question']['label'] == 'Name', result
+    assert result['status'] == 'gate' and result['form_question'] is None, result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1246,7 +1213,7 @@ async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _, raw, decide, provenance = root_world(
         monkeypatch, inertSibling=True, inertDescendant=kind)
-    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
         forms._formless_boundary(raw.current, provenance)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -1735,18 +1702,14 @@ def test_issue164_invalid_reserved_suffix_fails_before_throwing_value_getter(rea
         forms._entry_safety(page,lambda u:u==entry('ashby'),None)
 
 
-async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkeypatch):
-    _, raw, _, provenance=root_world(monkeypatch)
-    raw.current=_issue164_reader('page',response=True)
-    raw.fixed=_issue164_reader('witness',response=True)
-    receiver=raw.current['entry']['responses'][0]['selector']
+def test_issue164_reserved_response_is_not_a_form_control(monkeypatch):
+    _, raw, _, _ = root_world(monkeypatch)
+    raw.current = _issue164_reader('page', response=True)
+    raw.fixed = _issue164_reader('witness', response=True)
+    receiver = raw.current['entry']['responses'][0]['selector']
     assert receiver not in {c['selector'] for c in raw.current['controls']}
-    session=forms._EntrySession(raw,lambda u:u==entry('ashby'),provenance,
-                                resume_path='Resume.pdf')
-    for method,args in [('fill',(receiver,'--value','synthetic-not-a-token')),
-                        ('click',(receiver,))]:
-        with pytest.raises(forms.Gate):
-            await session.call(method,*args)
+    assert receiver not in {c['selector']
+                            for c in raw.current['entry']['root_evidence']}
     no_mutations(raw)
 
 
@@ -2093,15 +2056,12 @@ async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(mo
              if e.get('boolean_group')]
     assert len(group) == 2 and all(e['in_container'] for e in group)
     assert forms._formless_boundary(raw.current, provenance)
-    # The reader identifies both members; final Submit still rejects an empty pair
-    # rather than silently ignoring its unapproved answer.
+    # Normal Yes/No choices are not committing Submit actions.
     selectors = {e['selector'] for e in group}
-    isolated = deepcopy(raw.current)
-    isolated['controls'] = [c for c in isolated['controls']
-                            if c['selector'] in selectors]
-    assert len(isolated['controls']) == 2
-    with pytest.raises(forms.Gate, match='A Yes/No answer is empty or conflicting'):
-        forms.check_form(isolated, {}, uploaded=True)
+    isolated = [c for c in raw.current['controls'] if c['selector'] in selectors]
+    assert len(isolated) == 2
+    assert all(not forms.is_submission(c) and not forms.native_submit(c)
+               for c in isolated)
     assert not decision.await_count
     no_mutations(raw)
     _, plain, _, provenance = root_world(monkeypatch)

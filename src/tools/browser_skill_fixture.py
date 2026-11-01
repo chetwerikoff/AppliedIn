@@ -727,6 +727,12 @@ class _SyntheticRun:
             {'action': 'fill', 'selector': '#phone', 'fact': 'Phone'},
             {'action': 'fill', 'selector': '#additional', 'fact': 'Additional question'},
         )
+        if self.custom_question:
+            # Read-only Lever question legs must address their current native
+            # receiver; the unanswered selection asks the owner before IPC.
+            selector = ('#custom-radio-first' if self.custom_question == 'radio'
+                        else '#custom-checkbox-updates')
+            actions = ({'action': 'choose', 'selector': selector},)
         if self.ashby_upload:
             actions = (
                 {'action': 'fill', 'selector': '#_systemfield_name', 'fact': 'Name'},

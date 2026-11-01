@@ -683,3 +683,95 @@ async def test_comma_grouped_salary_keeps_its_leading_millions_digit(
     else:
         await controller.check_pre_submit(None, page, target)
         assert fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('display_case', 'accepted'), [
+    ('matching', True), ('none', False), ('two', False),
+    ('wrong_filename', False), ('wrong_form', False), ('unproven', False),
+])
+async def test_removed_resume_input_uses_only_one_proven_current_file_display(
+        monkeypatch, tmp_path, display_case, accepted):
+    """After upload, a removed input is permitted only with the single exact
+    resume display from the committing form, never an unrelated profile form.
+    """
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    display = {
+        'filename': 'Test User.pdf', 'field_label': 'Resume',
+        'valid': True, 'in_form': True, 'form_selector': '#app',
+        'root_selector': '',
+    }
+    if display_case == 'wrong_filename':
+        display['filename'] = 'other.pdf'
+    elif display_case == 'wrong_form':
+        display['form_selector'] = '#profile'
+    elif display_case == 'unproven':
+        display['valid'] = False
+    page['attached_file_displays'] = (
+        [] if display_case == 'none'
+        else [display, deepcopy(display)] if display_case == 'two'
+        else [display])
+    if accepted:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refusal:
+            await controller.check_pre_submit(None, page, target)
+        assert refusal.value.item == 2
+        assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('uploaded', 'identity_ok'), [
+    (False, True), (True, False),
+])
+async def test_file_display_does_not_replace_upload_completion_or_pdf_identity(
+        monkeypatch, tmp_path, uploaded, identity_ok):
+    """Passive filename display does not prove a successful upload or row PDF."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    page['attached_file_displays'] = [{
+        'filename': 'Test User.pdf', 'field_label': 'Resume',
+        'valid': True, 'in_form': True, 'form_selector': '#app',
+        'root_selector': '',
+    }]
+    controller.upload_completed = uploaded
+    if not identity_ok:
+        controller.upload_identity = ('different-pdf',)
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(None, page, target)
+    assert refusal.value.item == 2
+    assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('caption', 'value'), [
+    ('Male', ''), ('Male', 'skip'), ('Prefer not to answer', ''),
+])
+async def test_unreadable_selected_protected_combobox_refuses_item_three(
+        monkeypatch, tmp_path, caption, value):
+    """A rendered non-placeholder answer without a proven selection is not a safe decline."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, {
+        'selector': '#gender-unknown', 'label': 'Gender', 'question': 'Gender',
+        'type': 'combobox', 'tag': 'select', 'required': False,
+        'in_form': True, 'form_selector': '#app', 'value': value,
+        'combobox': {'selected_text': '', 'selected_value': '',
+                     'displayed_text': caption, 'options': []},
+    })
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(None, page, target)
+    assert refusal.value.item == 3
+    assert not fixture.held
+
+
+def test_file_display_readback_drifts_across_own_hold_identity():
+    """Changing passive attached-file evidence after the hold is a changed form."""
+    page = {'url': URL, 'controls': [], 'attached_file_displays': [{
+        'filename': 'Test User.pdf', 'form_selector': '#app',
+        'field_label': 'Resume', 'valid': True,
+    }]}
+    changed = deepcopy(page)
+    changed['attached_file_displays'][0]['filename'] = 'other.pdf'
+    assert forms._page_identity(page) != forms._page_identity(changed)

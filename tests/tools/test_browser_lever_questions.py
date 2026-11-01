@@ -197,3 +197,24 @@ def test_role_override_is_read_as_role_not_authorized_native_choice(reader, kind
     witnessed = read(spec, forms._FIXED_CONTROL_WITNESS)
     by_selector = {c['selector']: c for c in witnessed['controls']}
     assert all(by_selector[c['selector']]['type'] == 'switch' for c in items)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('kind', 'selector'), [
+    ('radio', '#custom-radio-first'),
+    ('checkbox', '#custom-checkbox-updates'),
+])
+async def test_synthetic_lever_decisions_use_current_native_choice_selectors(
+        kind, selector):
+    """The custom-question fixture once scripted #name, which does not exist
+    on these forms. It must reach the actual unanswered native question,
+    without any applicant IPC or guessed consent value.
+    """
+    from tools import browser_skill_fixture as fixture
+
+    state = fixture._SyntheticRun('Synthetic-Resume.pdf')
+    state.custom_question = kind
+    action = await state.decision('', {}, [], model='synthetic-fixture')
+    assert action == {'action': 'choose', 'selector': selector}
+    assert f'id="{selector[1:]}"'.encode() in fixture._lever_question_form(kind)
+    assert state.choice_ipc == state.fills == state.ipc_index == 0

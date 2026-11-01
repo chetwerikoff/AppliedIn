@@ -1114,27 +1114,49 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
         raise Gate('The current form controls do not have unique selectors.')
     if not uploaded or not attachment:
         raise Gate('The staged résumé was not attached in this attempt.')
-    matching = [c for c in controls if c.get('type') == 'file'
-                and not c.get('disabled')
-                and re.search(r'resume|résumé|cv', label(c), re.I)
+    resume_inputs = [c for c in controls if c.get('type') == 'file'
+                     and re.search(r'resume|résumé|cv', label(c), re.I)]
+    matching = [c for c in resume_inputs if not c.get('disabled')
                 and c.get('files') == [attachment]]
-    # A matching filename on a separate profile form is not attached to the
-    # committing application form. Ashby formless members come only from the
-    # existing proven final application root.
-    owned_attachment = submit_target is None
-    if submit_target is not None and len(matching) == 1:
-        if submit_target.get('in_form') is True:
-            owned_attachment = bool(
-                submit_target.get('form_selector')
-                and matching[0].get('in_form') is True
-                and matching[0].get('form_selector') == submit_target['form_selector'])
-        else:
-            owned_attachment = (formless_members is not None
-                                and any(c is matching[0] for c in formless_members))
-    if (len(matching) != 1 or any(c is not matching[0]
-            and c.get('type') == 'file' and c.get('files') for c in controls)
-            or not owned_attachment):
-        raise Gate('Exactly one current résumé input must hold the staged PDF on the committing form.')
+    # A current file input wins over a decorative display: a failed/empty
+    # input may not be rescued by stale markup. A page may remove the input
+    # after attachment, leaving only its form-owned passive filename display.
+    owned_attachment = False
+    if resume_inputs:
+        if len(matching) == 1:
+            if submit_target is None:
+                owned_attachment = True
+            elif submit_target.get('in_form') is True:
+                owned_attachment = bool(
+                    submit_target.get('form_selector')
+                    and matching[0].get('in_form') is True
+                    and matching[0].get('form_selector') == submit_target['form_selector'])
+            else:
+                owned_attachment = (formless_members is not None
+                                    and any(c is matching[0] for c in formless_members))
+        evidence_ok = len(matching) == 1 and owned_attachment
+    else:
+        displays = page.get('attached_file_displays', [])
+        display = displays[0] if isinstance(displays, list) and len(displays) == 1 else {}
+        evidence_ok = (isinstance(display, dict)
+                       and display.get('valid') is True
+                       and display.get('filename') == attachment
+                       and isinstance(display.get('field_label'), str)
+                       and bool(re.search(r'resume|résumé|cv', display['field_label'], re.I))
+                       and submit_target is not None)
+        if evidence_ok and submit_target.get('in_form') is True:
+            evidence_ok = (display.get('in_form') is True
+                           and bool(submit_target.get('form_selector'))
+                           and display.get('form_selector') == submit_target['form_selector'])
+        elif evidence_ok:
+            root = _formless_root(page) or {}
+            evidence_ok = (formless_members is not None
+                           and display.get('in_form') is False
+                           and bool(root.get('container'))
+                           and display.get('root_selector') == root['container'])
+    if (not evidence_ok or any(c.get('type') == 'file'
+            and c.get('files') and c not in matching for c in controls)):
+        raise Gate('Exactly one current résumé input or attached display must hold the staged PDF on the committing form.')
     # Readback is source-of-truth; controls need no historical per-field grant.
     for c in controls:
         typ = c.get('type')
@@ -1565,7 +1587,8 @@ def _page_identity(page: dict) -> tuple:
         entry = {k: v for k, v in entry.items() if k != 'upload_tree'}
     return (page.get('url'), page.get('inventory_verified'), page.get('truncated'),
             page.get('opaque_controls'), page.get('shadow_roots'),
-            page.get('unsupported_frames'), repr(entry),
+            page.get('unsupported_frames'), repr(page.get('attached_file_displays')),
+            repr(entry),
             repr(page.get('greenhouse')), repr(page.get('application_identity')),
             tuple(repr(_identity(c)) for c in page.get('controls', [])))
 
@@ -1728,7 +1751,32 @@ def _formless_boundary(page: dict, provenance=None, *,
     controls = {c.get('selector'): c for c in page.get('controls', [])
                 if isinstance(c, dict)}
     members = [controls[x] for x in selectors if x in controls]
-    if len(members) != len(selectors):
+
+    def replaced_by_yes_no(backing: dict) -> bool:
+        # An inert checkbox/radio backing may disappear when its question is
+        # rendered as two real Yes/No buttons. The same proven field entry,
+        # question, root and both visible button receivers must still exist.
+        if (backing.get('type') not in {'checkbox', 'radio'}
+                or backing.get('visible') is not False
+                or backing.get('inside') is not True
+                or backing.get('in_container') is not True
+                or not backing.get('field_entry')
+                or not backing.get('entry_label')):
+            return False
+        buttons = [e for e in evidence if e.get('yes_no') is True
+                   and e.get('field_entry') == backing['field_entry']
+                   and e.get('entry_label') == backing['entry_label']
+                   and e.get('inside') is True and e.get('in_container') is True
+                   and e.get('visible') is True and e.get('selector') in controls
+                   and controls[e['selector']].get('type') == 'button'
+                   and controls[e['selector']].get('question') == backing['entry_label']]
+        return (len(buttons) == 2
+                and {e.get('caption') for e in buttons} == {'Yes', 'No'}
+                and {controls[e['selector']].get('label') for e in buttons}
+                    == {'Yes', 'No'})
+
+    if any(not replaced_by_yes_no(e) for e in evidence
+           if e['selector'] not in controls):
         raise Gate('The final application container lost a receiver.')
     submit = root.get('submit')
     if (not isinstance(submit, str) or not submit or submit not in selectors
@@ -3545,6 +3593,16 @@ class ApplicationIPCController:
                 machine = str(combo.get('selected_value') or '').strip()
                 current = str(field.get('value') or '').strip()
                 hidden = combo.get('hidden_selector')
+                displayed = str(combo.get('displayed_text') or '').strip()
+                placeholder = displayed.casefold() in {
+                    '', 'choose', 'select', 'choose...', 'select...',
+                    'choose an option', 'select an option',
+                }
+                # An unreadable selection with a visible non-placeholder
+                # caption is not proof of a safe decline. Optional protected
+                # pickers must fail closed too when they appear selected.
+                if not selected and (machine or current or not placeholder):
+                    combo_verified = False
                 if selected or machine or current:
                     if hidden:
                         receivers = [c for c in page.get('controls', [])

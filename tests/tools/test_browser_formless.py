@@ -2237,3 +2237,66 @@ async def test_hidden_attestation_remains_independently_observed_without_member_
     assert evidence['ashby_hidden_choice'] is True
     assert not hasattr(forms, '_disclosure_question')
     assert not hasattr(forms, '_member_witness_predicate')
+
+
+@pytest.mark.parametrize('problem', [
+    'permitted-backing', 'unrelated-missing', 'wrong-question',
+    'missing-button', 'foreign-root',
+])
+def test_final_formless_boundary_ignores_only_hidden_backing_with_real_yes_no(
+        monkeypatch, problem):
+    """A hidden native backing can disappear from controls when the same
+    proven Ashby question is answered by two visible Yes/No buttons. Nothing
+    else can disappear from the independent root receiver census.
+    """
+    _, raw, _, provenance = root_world(monkeypatch)
+    page = deepcopy(raw.current)
+    base_evidence = next(c for c in page['entry']['root_evidence']
+                         if c.get('selector') == '#_systemfield_name')
+    base_control = next(c for c in page['controls']
+                        if c.get('selector') == '#_systemfield_name')
+    entry_id = '#synthetic-boolean-entry'
+    question = 'Synthetic work preference'
+    backing = {
+        **deepcopy(base_evidence),
+        'selector': '#hidden-backing', 'type': 'checkbox',
+        'field_entry': entry_id, 'entry_label': question,
+        'inside': True, 'in_container': True, 'visible': False,
+        'yes_no': False,
+    }
+    for label in ('Yes', 'No'):
+        selector = '#synthetic-' + label.lower()
+        e = {
+            **deepcopy(base_evidence),
+            'selector': selector, 'type': 'button', 'tag': 'button',
+            'field_entry': entry_id, 'entry_label': question,
+            'inside': True, 'in_container': True, 'visible': True,
+            'yes_no': True, 'caption': label,
+        }
+        c = {
+            **deepcopy(base_control),
+            'selector': selector, 'type': 'button', 'tag': 'button',
+            'question': question, 'label': label,
+            'checked': label == 'No', 'required': True,
+        }
+        page['entry']['root_evidence'].append(e)
+        page['controls'].append(c)
+    page['entry']['root_evidence'].append(backing)
+    if problem == 'unrelated-missing':
+        page['entry']['root_evidence'].append({
+            **deepcopy(backing), 'selector': '#unrelated-missing', 'type': 'text'})
+    elif problem == 'wrong-question':
+        page['controls'][-1]['question'] = 'Another field'
+    elif problem == 'missing-button':
+        page['controls'].pop()
+    elif problem == 'foreign-root':
+        page['entry']['root_evidence'][-1]['inside'] = False
+
+    if problem == 'permitted-backing':
+        members = forms._formless_boundary(page, provenance)
+        assert {'#synthetic-yes', '#synthetic-no'} <= {
+            c['selector'] for c in members}
+        assert '#hidden-backing' not in {c['selector'] for c in members}
+    else:
+        with pytest.raises(forms.Gate, match='lost a receiver'):
+            forms._formless_boundary(page, provenance)

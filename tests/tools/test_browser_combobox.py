@@ -182,3 +182,103 @@ async def test_native_select_uses_current_accessible_option_not_approval_ledger(
         jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
     assert session.calls == [(('select', '#region', '--value', 'SR'), {})]
     assert filled['#region'] == 'SR'
+
+
+def _read_native_single_select(*, options_count, selected_caption, long_text):
+    """Run the production JS reader against an in-memory synthetic Node DOM.
+
+    The existing fixture file is not edited: this test injects one real-shaped
+    select before the fixture's ID census, with no network or browser.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    from tools.browser_skill_dom import PAGE
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    injection = """
+const chosenIndex = Number(process.env.TEST_SELECTION_INDEX || 0);
+const list = node('select', {
+  id:'gender-native', name:'gender', role:'combobox', required:true,
+  'aria-expanded':'false', 'data-value-input':'gender-code',
+},form);
+node('label',{'for':'gender-native',text:'Gender'},form);
+const hidden = node('input',{id:'gender-code',type:'hidden',name:'gender_machine'},form);
+const total = TOTAL;
+const currentCaption = CHOSEN;
+const values = [];
+for (let i=0;i<total;i++) {
+  const label = i===total-1 ? currentCaption : 'Synthetic choice '+i;
+  const option = node('option',{text:label},list);
+  option.value = i===total-1 ? (currentCaption==='Male' ? 'male' : 'skip') : 'choice-'+i;
+  option.selected = i===total-1;
+  values.push(option);
+}
+list.options=values;
+list.value=values[total-1].value;
+list.multiple=false;
+hidden.value=list.value;
+if (LONG_TEXT) node('p',{text:'Synthetic '.repeat(12000)},body);
+"""
+    injection = injection.replace('TOTAL', str(options_count))
+    injection = injection.replace('CHOSEN', json.dumps(selected_caption))
+    injection = injection.replace('LONG_TEXT', 'true' if long_text else 'false')
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    fixture = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', fixture, 'synthetic',
+         json.dumps({'url': 'https://employer.test/job/1'}), PAGE],
+        capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize('caption,machine', [
+    ('Male', 'male'),
+    ('Prefer not to answer', 'skip'),
+])
+def test_native_single_select_reader_captures_caption_and_hidden_machine(caption, machine):
+    """A native select with role=combobox must not look like an empty picker."""
+    page = _read_native_single_select(
+        options_count=3, selected_caption=caption, long_text=False)
+    field = next(c for c in page['controls'] if c['selector'] == '#gender-native')
+    combo = field['combobox']
+    assert combo['selected_text'] == caption
+    assert combo['selected_value'] == machine
+    assert combo['hidden_value'] == machine
+    assert combo['hidden_selector'] == '#gender-code'
+    assert field['value'] == machine
+    assert field['option_count'] == 3 and not field['options_capped']
+
+
+def test_3300_options_and_long_page_text_preserve_complete_control_readback():
+    """Text and option caps cannot turn an otherwise complete form inventory
+    into a truncated final-Submit item-2 failure.
+    """
+    page = _read_native_single_select(
+        options_count=3300, selected_caption='Prefer not to answer',
+        long_text=True)
+    assert page['inventory_verified'] is True
+    assert page['truncated'] is False
+    assert page['text_truncated'] is True
+    assert len(page['text']) == 100000
+    field = next(c for c in page['controls'] if c['selector'] == '#gender-native')
+    assert field['option_count'] == 3300
+    assert field['options_capped'] is True
+    assert len(field['options']) == 65
+    assert [o['value'] for o in field['options'][:64]] == [
+        'choice-'+str(i) for i in range(64)]
+    assert field['options'][-1] == {
+        'value': 'skip', 'label': 'Prefer not to answer'}
+    assert field['combobox']['selected_text'] == 'Prefer not to answer'
+    assert field['combobox']['selected_value'] == 'skip'
+    # check_form still needs the staged PDF and other real answers; its
+    # inventory-completeness predicate alone must not reject long page text.
+    pdf = {
+        'selector': '#resume', 'tag': 'input', 'type': 'file',
+        'label': 'Resume', 'question': 'Resume', 'required': True,
+        'files': ['Test User.pdf'], 'in_form': True,
+        'form_selector': '#application-form',
+    }
+    page['controls'].append(pdf)
+    forms.check_form(page, {}, True, 'Test User.pdf')

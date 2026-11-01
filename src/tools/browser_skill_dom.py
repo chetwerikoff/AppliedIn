@@ -235,6 +235,13 @@ PAGE = r"""(() => {
     const formAction = form?.action || '';
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     const hiddenLabel=hiddenAshbyChoice(e) ? hiddenAshbyLabel(e) : null;
+    // A long select list is a presentation bound, not an incomplete control.
+    // Keep the current selected option even when it lies beyond the first 64.
+    const nativeOptions=e.options ? Array.from(e.options) : [];
+    const chosenNative=nativeOptions.filter(o=>o.selected === true);
+    const shownNative=nativeOptions.slice(0,64);
+    for(const chosen of chosenNative)
+      if(!shownNative.includes(chosen)) shownNative.push(chosen);
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       ...(hiddenLabel ? {visible:false,associated_label_selector:selector(hiddenLabel),ashby_hidden_choice:true} : {}),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
@@ -258,8 +265,9 @@ PAGE = r"""(() => {
         || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
           && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
-      options:e.options ? Array.from(e.options)
-        .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
+      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent)})),
+      option_count:nativeOptions.length,
+      options_capped:shownNative.length<nativeOptions.length,
       combobox: type === 'combobox' ? (() => {
         const list = currentListbox(e);
         const options = list ? Array.from(list.querySelectorAll('[role="option"]'))
@@ -290,7 +298,16 @@ PAGE = r"""(() => {
           displayed_text:clean(e.value || e.innerText || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:receivers.length === 1 ? selector(receivers[0]) : '',
-          hidden_value:receivers.length === 1 ? receivers[0].value : '', ...(graph || {})};
+          hidden_value:receivers.length === 1 ? receivers[0].value : '',
+          ...(graph || {}),
+          // The native single-select caption is the current rendered choice,
+          // not an ARIA placeholder or a stale model-selected answer.
+          ...(e.tagName==='SELECT' && !e.multiple ? {
+            selected_text:chosenNative.length===1 ? clean(chosenNative[0].textContent) : '',
+          } : {}),
+          // A current form-owned hidden receiver is the submitted machine
+          // value even when the visible combobox has no data-selected-value.
+          ...(receivers.length===1 ? {selected_value:receivers[0].value} : {})};
       })() : null,
       href:e.tagName === 'A' ? e.href : ''};
   });
@@ -298,6 +315,33 @@ PAGE = r"""(() => {
   const title = document.querySelector('[data-automation-id="jobPostingHeader"]')?.innerText
     || document.querySelector('h1')?.innerText || document.title;
   const text = document.body?.innerText || '';
+  // An ATS may replace an input[type=file] after upload with a passive,
+  // form-owned filename display. Inventory the existing Ashby file-item
+  // structure; the final check also binds it to the committing receiver.
+  const attachedFileDisplays = Array.from(document.querySelectorAll(
+    'div.ashby-application-form-input-file-item')).map(item => {
+    const fileBox=item.closest('div.ashby-application-form-input-file');
+    const field=item.closest('div.ashby-application-form-field-entry');
+    const names=item.querySelectorAll('p.ashby-application-form-input-file-item-name');
+    const titles=field ? field.querySelectorAll(
+      'label.ashby-application-form-question-title') : [];
+    const owner=fileBox?.closest('form');
+    const container=field?.closest('.ashby-application-form-container');
+    const deletes=item.querySelectorAll(
+      'button.ashby-application-form-input-file-item-delete');
+    return {
+      filename:names.length===1 ? clean(names[0].innerText) : '',
+      field_label:titles.length===1 ? clean(titles[0].innerText) : '',
+      in_form:!!owner, form_selector:owner ? selector(owner) : '',
+      root_selector:container ? selector(container) : '',
+      valid:!!fileBox && item.parentElement===fileBox && !!field &&
+        field.contains(fileBox) && names.length===1 &&
+        titles.length===1 && deletes.length===1 &&
+        item.children.length===2 && names[0].parentElement===item &&
+        deletes[0].parentElement===item &&
+        !!(owner || container),
+    };
+  });
   // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay data-bsk-overlay>
   // host (Pause Agent / Stop task buttons) as the child of <html> that directly
   // follows <body>. Treating it as an uninspected employer form gated every
@@ -371,7 +415,8 @@ PAGE = r"""(() => {
     controls.length <= 500 && !opaqueControls && !siteShadow;
   return {url:location.href, title, text:text.slice(0,100000),
     description:description?.innerText || '', controls:controls.slice(0,500),
-    truncated:controls.length > 500 || text.length > 100000,
+    attached_file_displays:attachedFileDisplays,
+    truncated:controls.length > 500, text_truncated:text.length > 100000,
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,

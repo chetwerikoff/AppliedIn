@@ -2087,13 +2087,12 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         diagnostics.safety_passed()
                         reason = _greenhouse_not_ready(page)
                     else:
-                        # _EntrySession.page() already classified the complete raw
-                        # candidate census, then quarantined foreign PAGE targets.
-                        # Re-classifying that filtered copy mistakes quarantine
-                        # for a missing foreign control. Unchecked initial PAGE
-                        # inputs must still pass the full admission gate.
-                        if not (fresh_session_read and entry_session):
-                            _entry_safety(page, allowed, provenance, readiness=entry_session)
+                        # The raw entry reader returns an unclassified census.
+                        # Check the first read too: a positive observed CAPTCHA
+                        # must outrank incomplete/hydrating form structure.
+                        # This is the existing entry safety check, not an
+                        # extra per-action or per-widget permission layer.
+                        _entry_safety(page, allowed, provenance, readiness=entry_session)
                         diagnostics.safety_passed()
                         phase = 'structure'
                         reason = _entry_not_ready(page)

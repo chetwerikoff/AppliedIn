@@ -855,19 +855,16 @@ def test_handoff_preserves_step_but_never_reproduces_oauth_tickets():
     assert 'SECRET' not in result['text']
 
 
-async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_essay(monkeypatch):
+async def test_owner_fact_textarea_is_not_replaced_with_a_generated_essay(monkeypatch):
+    # A fact explicitly selected for the textarea is an ordinary preparation
+    # answer. No retired per-field grant is required or inferred from the bank.
     session = SimpleNamespace(call=AsyncMock())
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'pk': pk, 'status': 'submitting',
-        'human_approved_answers': {
-            'Motivation': {**grant('Motivation', 'Approved explanation'),
-                       'tag': 'textarea', 'type': 'textarea'}}})
     monkeypatch.setattr('tools.narrative.draft_answer',
-                        lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
+                        lambda *a, **kw: pytest.fail('The supplied owner fact must prevail'))
     await forms.execute(
         session, page(target(tag='textarea', type='textarea', label='Motivation'),
                       application_marker=True),
-        {'action': 'fill', 'selector': '#field', 'fact': '', 'essay': True},
+        {'action': 'fill', 'selector': '#field', 'fact': 'Motivation', 'essay': True},
         facts={'Motivation': 'Approved explanation'}, filled={}, resume_path='',
         company='Company', jd_text='', resume_tex='', github='', pk='Company#1')
     session.call.assert_awaited_once_with('fill', '#field', '--value', 'Approved explanation')
@@ -2955,7 +2952,8 @@ def test_diagnostic_gate_allowlist_never_infers_from_model_text():
     assert forms.Gate('random', reason='not-a-code').reason == 'unknown_field'
     assert forms.Gate('verified', reason='defect_provenance').reason == 'defect_provenance'
     assert forms.CaptchaGate('visible challenge').form_question is None
-    assert forms.CaptchaGate('visible challenge').reason == 'unknown_field'
+    # A code-observed CAPTCHA stays a human handoff, never model-text inference.
+    assert forms.CaptchaGate('visible challenge').reason == 'captcha'
 
 
 def test_required_unanswered_field_is_refused_at_final_form_readback():
@@ -2984,11 +2982,9 @@ def test_prior_answer_bank_cannot_replace_current_required_field_readback():
         forms.check_form(current, filled, uploaded=True, attachment='Resume.pdf')
 
 
-@pytest.mark.parametrize('required,expected', [
-    (True, 'agent_review_unavailable'), (False, 'unknown_field'),
-])
+@pytest.mark.parametrize('required', [True, False])
 async def test_execute_missing_fact_requires_current_observed_unanswered_question(
-        monkeypatch, required, expected):
+        monkeypatch, required):
     current = page(target(label='Location', required=required), application_marker=True)
     # Keep this witness test offline; _row otherwise reads the configured tracking store.
     monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: {
@@ -3000,7 +2996,8 @@ async def test_execute_missing_fact_requires_current_observed_unanswered_questio
                             facts={}, filled={}, resume_path='',
                             company='example-co', jd_text='', resume_tex='', github='',
                             pk='example-co#synthetic', job_url=current['url'])
-    assert gated.value.reason == expected
+    # Missing facts are ordinary owner questions, not per-control grants.
+    assert gated.value.reason == 'owner_question'
     assert gated.value.form_question['selector'] == '#field'
     session.call.assert_not_awaited()
 

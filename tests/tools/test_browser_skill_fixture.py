@@ -1275,10 +1275,9 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         authority, monkeypatch, verb, change):
     """Reach apply()'s native Submit/Continue JIT using full valid synthetic evidence.
 
-    The actual fixture cannot upload or fill its ungranted second field. For
-    this *late-guard-only* test, a test double supplies verified receipts and a
-    previously staged PDF (never BrowserSkill upload IPC). Name still uses the
-    real exact-grant controller and the closed facade permits its one fill.
+    The test double preserves a current staged PDF and readback values
+    (never a real BrowserSkill upload). The fixture accepts the first fill,
+    but no click is permitted beneath the final controller.
     Every click remains forbidden beneath the controller.
     """
     current = synthetic_page()
@@ -1304,18 +1303,8 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         button.update(selector="#continue", label="Continue")
     button_action = {"action": "submit" if verb == "submit" else "click",
                      "selector": button["selector"]}
-    # The second control is intentionally granted ONLY in this late-JIT test:
-    # the normal native-positive fixture still gates that exact second fill.
-    authority.row["human_approved_answers"]["Name"].update(
-        tag="input", type="text", form_selector="#synthetic-form",
-        form_action=fixture.URL)
-    authority.row["human_approved_answers"]["Additional question"] = {
-        "selector": "#additional", "label": "Additional question",
-        "question": "", "url": fixture.URL, "value": "Synthetic answer",
-        "tag": "textarea", "type": "textarea", "form_selector": "#synthetic-form",
-        "form_action": fixture.URL,
-    }
-    # This late JIT-order test supplies a separate, test-only control witness.
+    # The final submission test supplies a separate test-only current form
+    # observation; obsolete historical per-field grants are deliberately absent.
     # The production JS and any zero-grant fixture remain unverified by it.
     async def witnessed(_session, current):
         return current, {c["selector"]: {"visible": True, "readonly": False,
@@ -1348,9 +1337,6 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         if selector == "#additional" and kind == "fill":
             control = forms.control(page, action)
             value = "Synthetic answer"
-            forms.exact_approval(
-                fixture.PK, "Additional question", value, target=control,
-                url=page["url"], fixture_context=authority)
             forms.guarded_value(control, value)
             kwargs["filled"]["#additional"] = value
             staged.append("preverified_additional_receipt")
@@ -1395,7 +1381,6 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
     checks = [
         ("receiver", "check_form_destination"),
         ("inventory", "check_form"),
-        ("receipts", "check_approvals"),
         ("hold", "hold_possible_submission"),
         ("status", "check_before_committing_click"),
     ]
@@ -1428,9 +1413,6 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
     expected_filled = {"#name": "Test User", "#additional": "Synthetic answer"}
     forms.check_form(current, expected_filled, True, document_name)
     observed.clear()  # Precondition check is separate from apply() JIT ordering.
-    for field in ("Name", "Additional question"):
-        approval = authority.row["human_approved_answers"][field]
-        assert approval["url"] == fixture.URL
     assert Path(authority.resume_path).is_file()
 
     result = await forms.apply(
@@ -1462,11 +1444,10 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         # the facade denied it BEFORE raw BSK IPC. No submitted application.
         assert result["status"] == "uncertain", result
         assert "receiver" in observed and "inventory" in observed
-        assert "receipts" in observed and "hold" in observed
+        assert "hold" in observed
         assert "status" in observed
         assert observed.index("receiver") < observed.index("inventory")
-        assert observed.index("inventory") < observed.index("receipts")
-        assert observed.index("receipts") < observed.index("hold")
+        assert observed.index("inventory") < observed.index("hold")
         assert observed.index("hold") < observed.index("status")
         assert authority.hold and authority.row["status"] == "needs_human"
     elif change in {"form_action", "formaction"}:
@@ -1475,12 +1456,12 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         assert not authority.hold and authority.row["status"] == "submitting"
     elif change == "hold_readback":
         assert result["status"] == "gate" and "hold could not be confirmed" in result["question"]
-        assert "inventory" in observed and "receipts" in observed
+        assert "inventory" in observed
         assert "hold" in observed and "hold_readback" in observed
         assert "status" not in observed and authority.row["status"] == "submitting"
     else:
         assert result["status"] == "gate" and "Human outcome changed" in result["question"]
-        assert "inventory" in observed and "receipts" in observed
+        assert "inventory" in observed
         assert "hold" in observed and "status" in observed
         assert "synthetic_status_race" in observed
         assert authority.row["status"] == "applied_manual"

@@ -261,14 +261,21 @@ async def test_selector_targeted_in_form_enter_uses_the_same_final_check(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('operation', [
-    ('click', '#not-in-fresh-page'),
-    ('click', '#submit', '--unclassified-argument'),
-])
-async def test_unclassified_non_submit_click_stays_ungated_preparation(
-        monkeypatch, tmp_path, operation):
+async def test_unknown_non_submit_click_stays_ungated_preparation(
+        monkeypatch, tmp_path):
     controller, page, target, fixture = _world(monkeypatch, tmp_path)
-    await controller.before_ipc(None, operation, {})
+    await controller.before_ipc(None, ('click', '#not-in-fresh-page'), {})
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_malformed_known_raw_submit_does_not_bypass_final_check(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    with pytest.raises(forms.PreSubmitGate) as denied:
+        await controller.before_ipc(
+            None, ('click', '#submit', '--unclassified-argument'), {})
+    assert denied.value.item == 1
     assert not fixture.held and not controller.committed
 
 

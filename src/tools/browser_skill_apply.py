@@ -1131,7 +1131,8 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
             peers = [p for p in controls if p.get('type') == typ
                      and not p.get('disabled')
                      and p.get('question') == c.get('question')
-                     and p.get('form_selector') == c.get('form_selector')]
+                     and p.get('form_selector') == c.get('form_selector')
+                     and p.get('name') == c.get('name')]
             if not any(p.get('checked') is True for p in peers):
                 raise Gate('A required native choice has no current selection.')
         elif typ == 'combobox':

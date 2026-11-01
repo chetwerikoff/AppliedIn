@@ -794,6 +794,12 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
     transport.bind_application_controller(controller)
     session.resume_path = controller.resume_path
     try:
+        # The real raw producer needs its one staged PDF before final Submit.
+        # Ungated field fills cannot substitute for a verified attachment.
+        upload = await forms._ashby_resume_upload(
+            session, await session.page(), resume_path=controller.resume_path)
+        history.append(upload)
+        assert controller.upload_completed
         for action in action_sequence()[:-1]:
             receipt = await forms.execute(
                 session, await session.page(), action, facts=facts, filled=filled,
@@ -801,7 +807,8 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
                 resume_tex='', github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
             history.append(receipt)
         await session.call('click', '#structural-submit')
-        with pytest.raises(forms.Gate, match='cannot be retried'):
+        assert controller.committed
+        with pytest.raises(forms.Gate, match='cannot be repeated'):
             await session.call('click', '#structural-submit')
         assert [c for c in raw.calls if c[0] == 'click'] == [('click', '#structural-submit')]
     finally:

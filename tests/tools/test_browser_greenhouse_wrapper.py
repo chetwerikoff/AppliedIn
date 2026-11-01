@@ -291,7 +291,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     page = {
         "url": URL, "title": "Synthetic Role", "text": "Synthetic neutral posting. " * 30,
         "description": "", "controls": [
-            {"selector": "#apply", "label": "Apply", "question": "",
+            {"selector": "#continue", "label": "Continue", "question": "",
              "tag": "button", "type": "button", "submit": False,
              "disabled": False, "in_form": False, "href": "", "formaction": "",
              "form_selector": "", "form_action": "", "files": [],
@@ -325,7 +325,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aexit__", exit)
     monkeypatch.setattr(bsk, "command", command)
     decisions = AsyncMock(side_effect=[
-        {"action": "click", "selector": "#apply"},
+        {"action": "click", "selector": "#continue"},
         {"action": "gate", "question": "Synthetic inspection stop"},
     ])
     monkeypatch.setattr(bsk, "decision", decisions)
@@ -334,7 +334,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     assert result["status"] == "gate", result
     assert decisions.await_count == 2
     assert [cmd[:2] for cmd in ipc if cmd[0] in {"click", "navigate"}] == [
-        ("navigate", URL), ("click", "#apply")]
+        ("navigate", URL), ("click", "#continue")]
     # Reversible Apply click is not an authorized final Submit/possible hold.
     assert authority.tracking.rows[PK].get("possible_submission") is not True
     await _must_final_tenant_deny(authority)

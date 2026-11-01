@@ -3330,6 +3330,19 @@ class ApplicationIPCController:
             raise PreSubmitGate(1, 'A potentially submitted application cannot be retried.')
         try:
             check_dispatch(self.pk, self.resume_path, **self._ctx())
+            # A raw Submit must not inherit a stale safe-page observation.
+            # Reuse the existing application-entry/CAPTCHA classifier only at
+            # this final boundary; ordinary preparation stays ungated.
+            def same_job(href):
+                return _job_preparation_route(
+                    href, self.url,
+                    provenance=(self.entry_provenance or self.greenhouse_provenance),
+                    pk=self.pk, company=self.company,
+                    fixture_context=self.fixture_context)
+            if self.entry_provenance is not None:
+                _entry_safety(page, same_job, self.entry_provenance)
+            elif self.greenhouse_provenance is not None:
+                _greenhouse_safety(page, same_job, self.greenhouse_provenance)
             row = deepcopy(self._row())
             if (row.get('pk') != self.pk or row.get('company') != self.company
                     or row.get('jd_url') != self.url
@@ -3384,6 +3397,9 @@ class ApplicationIPCController:
                   or not isinstance(row.get('title'), str)
                   or page['title'].strip() != row['title'].strip()):
                 raise Gate('The current final job title is not the tracked role.')
+        except (CaptchaGate, CaptchaArtifactGate):
+            # Existing human CAPTCHA handoff is not a fabricated item-1 error.
+            raise
         except Gate as exc:
             # check_dispatch also verifies the staged résumé and seed. Those
             # failures are item 2, not an incorrect job/duplicate item 1.
@@ -3512,6 +3528,14 @@ class ApplicationIPCController:
         hold_possible_submission(self.pk, self.step, **self._ctx())
         check_before_committing_click(self.pk, **self._ctx())
         current_page = await self._page(session)
+        if (self.entry_provenance is not None
+                and self.entry_provenance.ats == 'ashby'
+                and isinstance(current_page.get('entry'), dict)
+                and current_page['entry'].get('formless') is None
+                and isinstance(current_page.get('controls'), list)):
+            # Compare the same read-only native-owner projection used above;
+            # neither PAGE nor witness can hide a changed tenant/receiver.
+            _ashby_native_classify(current_page, self.entry_provenance)
         if (_page_identity(current_page), current_page.get('title')) != expected_page:
             raise Gate('Final application form changed after the own hold; inspect manually.')
         latest = self._row()

@@ -529,7 +529,7 @@ async def test_input_submit_value_reveals_account_purpose(
 
 
 @pytest.mark.parametrize('kind', ['radio', 'checkbox'])
-async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
+def test_checked_ordinary_assent_choice_is_not_an_extra_submit_item(kind):
     bound = field('I agree to terms', '#bound-choice',
                   tag='input', type=kind, required=True,
                   checked=True, has_value=True, name='attestation',
@@ -541,10 +541,15 @@ async def test_material_assent_bound_checked_choice_skips_nonchoice_wall(kind):
             'I decline', '#decline-choice', tag='input', type='radio',
             required=True, checked=False, has_value=True, name='attestation',
             question='Arbitration consent', value='decline'))
-    await forms._bootstrap_wall(None, inventory(*members, submit()), {}, URL)
+    # Legal answers are normal answers, not a seventh pre-Submit item. A
+    # finished synthetic form satisfies the ordinary required-choice check.
+    filename = 'Synthetic Resume.pdf'
+    page = secure_inventory(
+        *members,
+        field('Resume', '#resume', type='file', required=False, files=[filename]))
+    forms.check_form(page, {}, uploaded=True, attachment=filename)
 
-
-async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
+async def test_material_radio_with_missing_fact_uses_ordinary_owner_question(monkeypatch):
     radio = field('Accept', '#legal-yes', tag='input', type='radio',
                   name='legal', question='Arbitration consent', required=True,
                   value='yes', has_value=True)
@@ -552,18 +557,18 @@ async def test_material_assent_radio_preserves_owner_review_route(monkeypatch):
                      name='legal', question='Arbitration consent', required=True,
                      value='no', has_value=True)
     page = secure_inventory(field(), radio, declined)
-    browser, decide, _ = secure_world(monkeypatch, page)
-    report = await secure_attempt(page)
-
-    assert report['status'] == 'gate'
-    assert report['review_route'] == 'owner'
-    assert report['reason'] == 'owner_question'
-    assert report['form_question'] is not None
-    assert 'Control type:' not in report['question']
-    assert decide.await_count == 0
+    browser = Browser(page)
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            browser, page,
+            {'action': 'choose', 'selector': '#legal-yes',
+             'fact': 'Arbitration consent'},
+            facts={}, filled={}, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == '#legal-yes'
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
-
 
 async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch):
     page = secure_inventory(field())
@@ -574,16 +579,15 @@ async def test_model_prerequisite_gate_question_origin_is_forwarded(monkeypatch)
 
     assert decide.await_count == 1
     prompt, model_page, model_history = decide.await_args.args
-    assert 'Exact human-authorized fact KEYS' in prompt
-    assert 'For the required résumé file input' in prompt
+    assert 'Available fact keys: []' in prompt
     assert model_page['controls'][0]['label'] == 'Email'
     assert model_history == []
     assert report['status'] == 'gate'
-    assert report['reason'] == 'unknown_field'
-    assert report['review_route'] == 'agent_unavailable'
+    assert report['reason'] == 'agent_review_unavailable'
+    assert report['review_route'] == 'luna'
     assert report['form_question'] is None
-    assert report['question'].startswith(model_question + ' Last button:')
-    assert 'Agent-first review is unavailable' in report['question']
+    assert 'Last button:' in report['question']
+    assert model_question not in report['question']
     assert row['status'] == 'submitting'
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
@@ -2359,30 +2363,26 @@ async def test_missing_native_choice_grant_keeps_bound_first_question(monkeypatc
     assert row['human_approved_answers'] == {}
     assert not any(call[0] == 'click' for call in browser.calls)
 
-async def test_optional_disabled_native_input_does_not_block_required_gate(
-        monkeypatch, tmp_path, caplog):
-    """Optional disabled siblings never satisfy an unanswered required choice."""
+async def test_optional_disabled_native_does_not_satisfy_required_choice(
+        monkeypatch, tmp_path):
     optional = field('Optional detail', '#optional', required=False, disabled=True)
     pending = field('Contact preference', '#choice', type='checkbox',
                     question='Preferred contact', value='on', has_value=True)
     page = secure_inventory(optional, pending)
-    with caplog.at_level('INFO', logger=forms.__name__):
-        browser, row, filled, history = await prepared_without_unapproved_write(
-            monkeypatch, page)
-    lines = [record.getMessage() for record in caplog.records
-             if record.name == forms.__name__ and
-             record.getMessage().startswith('bootstrap field decision ')]
-    assert len(lines) == 1 and "'decision': 'left-to-model'" in lines[0]
-    assert "'type': 'checkbox'" in lines[0]
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    assert page['controls'][0]['disabled'] is True
+    assert page['controls'][1]['required'] is True
+    assert page['controls'][1].get('checked') is not True
     await final_submit_denied(
         monkeypatch, tmp_path, page, row, filled, history,
-        reason='Required acknowledgement not completed: Contact preference')
+        reason='required native choice')
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
 
-async def test_required_radio_group_with_optional_leader_has_one_gate_record(
-        monkeypatch, tmp_path, caplog):
-    """Aggregate native-radio requiredness survives an optional first member."""
+
+async def test_required_radio_group_with_optional_leader_is_checked_at_submit(
+        monkeypatch, tmp_path):
     first = field('Morning', '#morning', type='radio', name='schedule',
                   question='Schedule preference', value='am',
                   required=False, has_value=True)
@@ -2390,21 +2390,18 @@ async def test_required_radio_group_with_optional_leader_has_one_gate_record(
                    question='Schedule preference', value='pm',
                    required=True, has_value=True)
     page = secure_inventory(first, second)
-    with caplog.at_level('INFO', logger=forms.__name__):
-        browser, row, filled, history = await prepared_without_unapproved_write(
-            monkeypatch, page)
-    assert [c['selector'] for c in forms._radio_group(
-        page, page['controls'][0])] == ['#morning', '#evening']
-    lines = [record.getMessage() for record in caplog.records
-             if record.name == forms.__name__ and
-             record.getMessage().startswith('bootstrap field decision ')]
-    assert len(lines) == 1
-    assert "'type': 'radio'" in lines[0]
-    assert "'required': True" in lines[0]
-    assert "'decision': 'left-to-model'" in lines[0]
+    browser, row, filled, history = await prepared_without_unapproved_write(
+        monkeypatch, page)
+    group = [c['selector'] for c in page['controls']
+             if c.get('type') == 'radio' and c.get('name') == 'schedule']
+    assert group == ['#morning', '#evening']
+    assert any(c['required'] for c in page['controls']
+               if c.get('type') == 'radio')
+    assert not any(c['checked'] for c in page['controls']
+                   if c.get('type') == 'radio')
     await final_submit_denied(
         monkeypatch, tmp_path, page, row, filled, history,
-        reason='Required choice is empty: Evening')
+        reason='required native choice')
     assert not any(c[0] in {'fill', 'select', 'click', 'upload'}
                    for c in browser.calls)
 
@@ -2427,38 +2424,48 @@ async def test_unassociated_radio_group_defers_authority_to_final_submit(monkeyp
                    for c in browser.calls)
     assert row['human_approved_answers'] == {}
     assert filled == {} and history == []
-    with pytest.raises(forms.Gate, match='visible question'):
-        forms._bound_target(page, page['controls'][0])
-    with pytest.raises(forms.Gate, match='Required choice is empty'):
-        forms.check_form(page, filled, True)
+    assert forms._ordinary_owner_question(
+        page, page['controls'][0], PK)['selector'] == '#answer-a'
+    filename = 'Synthetic Resume.pdf'
+    page['controls'].append(field(
+        'Resume', '#resume', type='file', required=False, files=[filename],
+        form_action=SECURE_URL))
+    with pytest.raises(forms.Gate, match='required native choice has no current selection'):
+        forms.check_form(page, filled, True, attachment=filename)
 
 
-async def test_new_legal_or_broader_privacy_choice_is_still_owner_only():
-    """A visible privacy choice needs the owner's exact current question."""
+async def test_new_legal_or_broader_privacy_choice_is_normal_owner_answer():
+    """Legal/consent questions use ordinary fact requests, not write gates."""
     question_text = 'I consent to sharing personal data with marketing partners'
-    page = secure_inventory(
-        field(question_text, '#marketing', tag='input', type='checkbox',
-              value='yes', required=True),
-    )
-    independent = {c['selector']: c for c in witness(page)['controls']}
-    with pytest.raises(forms.Gate) as exc:
-        await forms._bootstrap_wall(None, page, independent, SECURE_URL)
-    assert exc.value.reason == 'owner_question'
-    assert exc.value.form_question is not None
-    assert exc.value.form_question['control_label'] == question_text
-    assert exc.value.form_question['selector'] == '#marketing'
-    assert exc.value.form_question['form_action'] == SECURE_URL
-    assert question_text in str(exc.value)
-    # A missing independent accessibility witness never invents a question.
-    inaccessible = deepcopy(independent)
-    inaccessible['#marketing']['visible'] = False
-    with pytest.raises(forms.Gate) as blocked:
-        await forms._bootstrap_wall(None, page, inaccessible, SECURE_URL)
-    assert blocked.value.reason == 'owner_question'
-    assert blocked.value.form_question is None
-    assert 'Direct owner review' in str(blocked.value)
+    page = secure_inventory(field(
+        question_text, '#marketing', tag='input', type='checkbox',
+        value='yes', required=True))
+    browser = Browser(page)
+    action = {'action': 'choose', 'selector': '#marketing',
+              'fact': question_text}
+    with pytest.raises(forms.Gate) as missing:
+        await forms.execute(
+            browser, page, action, facts={}, filled={}, resume_path='',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=SECURE_URL)
+    assert missing.value.reason == 'owner_question'
+    question = missing.value.form_question
+    assert question['control_label'] == question_text
+    assert question['selector'] == '#marketing'
+    assert question['form_action'] == SECURE_URL
+    assert not browser.calls
 
-
+    # A supplied synthetic fact can be prepared normally. The final code
+    # decision still owns Submit; this reversible click never submits.
+    browser.allow_mutations = True
+    filled = {}
+    receipt = await forms.execute(
+        browser, page, action, facts={question_text: 'I agree'},
+        filled=filled, resume_path='', company='example-co',
+        jd_text='', resume_tex='', github='', pk=PK, job_url=SECURE_URL)
+    assert receipt['action'] == 'choose'
+    assert browser.calls == [('click', '#marketing')]
+    assert page['controls'][0]['checked'] is True
 
 @pytest.mark.parametrize('verb,caption', [
     ('submit', 'Submit application'), ('click', 'Continue'),

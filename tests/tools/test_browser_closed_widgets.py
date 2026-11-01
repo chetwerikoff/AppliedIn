@@ -504,6 +504,11 @@ async def test_never_committed_component_refuses_final_submit(
     final = copy.deepcopy(session.snapshot['page'])
     field = combo({'page': final})
     assert not field['combobox']['selected_text']
+    # The synthetic action returned without a committed option. Force the
+    # negative final-form case to have no readback value either: a nonempty
+    # editable picker text is not an additional approval item under #293.
+    field['value'] = ''
+    field['has_value'] = False
     keep = {'#location', '#resume', '#submit'}
     if field['combobox'].get('hidden_selector'):
         keep.add(field['combobox']['hidden_selector'])

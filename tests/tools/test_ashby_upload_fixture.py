@@ -582,8 +582,9 @@ async def test_file_bytes_drift_after_effect_never_becomes_retryable_gate(
         args = ('evaluate', controller._resume_set_script())
     # This changes the staged file only AFTER the hypothetical raw command.
     Path(authority.resume_path).write_bytes(b'%PDF-1.4\nchanged synthetic bytes\n')
-    with pytest.raises(RuntimeError, match='staged PDF changed during upload IPC'):
+    with pytest.raises(forms.Gate, match='staged PDF') as failure:
         await controller.after_ipc(None, args, {}, succeeded=True)
+    assert failure.value.reason == 'defect_upload_uncertain'
     assert not controller.upload_pending and not controller.upload_completed
     assert controller.upload_attempted and not controller.committed
     assert authority.submit_ipc == authority.submit_call_entered == 0
@@ -760,7 +761,8 @@ async def test_reversible_submit_recovers_one_native_input_upload_then_next_gate
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate', result
-    assert 'Synthetic inspection without a second click' in result['question'], result
+    assert result['item'] == 1 and result['reason'] == 'defect_pre_submit_item_1'
+    assert 'Tracked job, tenant, form or duplicate proof' in result['question']
     assert authority.fills == 2 and authority.upload_ipc == 1
     assert authority.ipc_index == 3 and authority.uploaded
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
@@ -793,7 +795,8 @@ async def test_reversible_model_upload_decision_runs_the_one_shot_recovery(
     result = await forms.apply(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
-    assert result['status'] == 'gate' and 'Synthetic next decision' in result['question']
+    assert result['status'] == 'gate' and result['reason'] == 'agent_review_unavailable'
+    assert 'observed form needs human inspection' in result['question']
     assert 'résumé attachment verified=True' in tasks[3]
     assert 'runs before Submit' not in tasks[3]
     assert authority.fills == 2 and authority.upload_ipc == 1 and authority.uploaded
@@ -826,8 +829,8 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
         fixture.URL, fixture.COMPANY, dict(fixture._FACTS), 'synthetic-fixture',
         pk=fixture.PK, resume_path=authority.resume_path, fixture_context=authority)
     assert result['status'] == 'gate'
-    assert ('Repeated model résumé upload decisions after the server-owned upload'
-            in result['question'])
+    assert result['reason'] == 'agent_review_unavailable'
+    assert 'observed form needs human inspection' in result['question']
     assert authority.decisions == 6 and len(tasks) == 6
     assert 'The résumé is already attached by the server' in tasks[4]
     assert authority.fills == 2 and authority.upload_ipc == 1

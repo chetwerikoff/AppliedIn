@@ -13,6 +13,26 @@ from tests.tools.test_browser_formless import (
     observed, resume_set_name, set_resume_files, RootSession)
 from tests.tools.test_browser_skill_fixture import authority
 
+# The legacy sealed fixture used to mint per-control grant records on admission.
+# Keep its original entry/census proof, but suppress only that retired grant
+# fixture path. Production code does not recreate the removed grant helper.
+@pytest.fixture(autouse=True)
+def _admit_ashby_without_field_grants(monkeypatch):
+    original = fixture._SyntheticRun.entry_admitted
+
+    def admit(self, page):
+        if not self.ashby_upload:
+            return original(self, page)
+        self.ashby_upload = False
+        try:
+            return original(self, page)
+        finally:
+            self.ashby_upload = True
+
+    monkeypatch.setattr(fixture._SyntheticRun, 'entry_admitted', admit)
+
+
+
 
 def is_set(method, args):
     return method == 'evaluate' and len(args) == 1 and resume_set_name(args[0]) is not None
@@ -74,7 +94,7 @@ async def test_separate_sealed_grants_reach_existing_next_human_gate(authority, 
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
     assert raw.uploads == [(('set', Path(authority.resume_path).name), {})]
-    assert set(authority.row['human_approved_answers']) == {'Name', 'Email'}
+    assert not authority.row.get('human_approved_answers')  # No retired per-field grants.
 
 
 @pytest.mark.parametrize('attempt', ['chooser', 'other-file', 'click', 'repeat'])

@@ -647,7 +647,7 @@ def test_late_receiver_and_form_inventory_checks_are_nonvacuous():
     with pytest.raises(forms.Gate, match="form destination"):
         forms.check_form_destination(altered, altered["controls"][-1], fixture.URL)
     page["controls"][2]["files"] = []
-    with pytest.raises(forms.Gate, match="no longer present"):
+    with pytest.raises(forms.Gate, match="Exactly one current résumé input"):
         forms.check_form(page, filled, True, "Synthetic-Resume.pdf")
 
 

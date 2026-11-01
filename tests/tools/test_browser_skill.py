@@ -240,14 +240,15 @@ def test_native_option_must_match_both_the_dom_and_the_approved_answer():
         forms.choose_value(control, 'Prefer not to say', '1')
 
 
-def test_submit_requires_verified_attachment_and_rechecks_autofill():
-    with pytest.raises(forms.Gate, match='attachment'):
-        forms.check_form(page(), {}, False)
-    with pytest.raises(forms.Gate, match='changed'):
-        forms.check_form(page(target(value='Changed', has_value=True)),
-                         {'#field': 'Approved'}, True)
-    with pytest.raises(forms.Gate, match='Decline'):
-        forms.check_form(page(target(label='Gender', value='Male', has_value=True)), {}, True)
+
+def test_final_form_requires_staged_attachment_and_current_required_readback():
+    with pytest.raises(forms.Gate, match='staged résumé'):
+        forms.check_form(page(target()), {}, False)
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        files=['Resume.pdf'])
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(page(target(required=True), attachment),
+                         {'#field': 'Model-only answer'}, True, 'Resume.pdf')
 
 
 def test_success_requires_new_page_evidence_and_no_remaining_submit_control():
@@ -669,22 +670,17 @@ async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact(mo
     session.call.assert_not_awaited()
 
 
-def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
+
+def test_removed_attachment_still_blocks_and_ordinary_preselected_radio_is_not_a_grant():
     with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
-        forms.check_form(page(), {}, True, 'Resume.pdf')
-    control = target(type='radio', label='Yes', question='Authorized to work?',
-                     checked=True, name='work_auth', value='yes', has_value=True)
-    with pytest.raises(forms.Gate, match='preselected'):
-        forms.check_form(page(control), {}, True)
-    # A preapproved checked radio still needs an independently observed
-    # second member: an orphan radio cannot become an authorized group.
-    with pytest.raises(forms.Gate, match='Radio group members'):
-        forms.check_form(page(control), {'#field': 'Yes'}, True)
-    decline = target(selector='#decline', type='radio', label='No',
-                     question='Authorized to work?', name='work_auth',
-                     value='no', has_value=True)
-    with pytest.raises(forms.Gate, match='row-bound approved form values'):
-        forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
+        forms.check_form(page(target()), {}, True, 'Resume.pdf')
+    radio = target(type='radio', label='Yes', question='Authorized to work?',
+                   checked=True, name='work_auth', value='yes',
+                   has_value=True, required=True)
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        files=['Resume.pdf'])
+    # Non-protected, current native choices no longer require a prior widget grant.
+    forms.check_form(page(radio, attachment), {}, True, 'Resume.pdf')
 
 
 def test_native_select_can_derive_the_option_without_a_model_guessed_value():
@@ -870,7 +866,8 @@ async def test_owner_fact_textarea_is_not_replaced_with_a_generated_essay(monkey
     session.call.assert_awaited_once_with('fill', '#field', '--value', 'Approved explanation')
 
 
-async def test_file_url_permission_error_is_a_human_gate_not_an_upload_retry():
+
+async def test_file_url_permission_error_propagates_once_for_terminal_upload_handoff(tmp_path):
     raw = json.dumps({'code': 'cdp_failed', 'message': 'PRIVATE CONTENT', 'exit_code': 3,
                       'hint': "check Chrome's Allow access to file URLs permission",
                       'data': {'effect_state': 'unknown'}})
@@ -878,25 +875,34 @@ async def test_file_url_permission_error_is_a_human_gate_not_an_upload_retry():
         bsk._result(raw, 3)
     error = caught.value
     assert error.file_access_required and 'PRIVATE CONTENT' not in str(error)
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='Allow access to file URLs'):
+    with pytest.raises(bsk.Unavailable) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='Company', jd_text='', resume_tex='', github='')
-    assert session.call.await_count == 1
+            resume_path=str(document), company='example-co', jd_text='',
+            resume_tex='', github='')
+    assert escaped.value is error
+    session.call.assert_awaited_once()
 
 
-async def test_unknown_upload_effect_never_triggers_an_automatic_repeat():
+
+async def test_unknown_upload_effect_is_not_retried_inside_preparation(tmp_path):
     error = bsk.Unavailable('BrowserSkill operation unavailable: transport')
     error.effect_state = 'unknown'
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='No automatic repeat'):
+    with pytest.raises(bsk.Unavailable) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='Company', jd_text='', resume_tex='', github='')
-    assert session.call.await_count == 1
+            resume_path=str(document), company='example-co', jd_text='',
+            resume_tex='', github='')
+    assert escaped.value is error
+    session.call.assert_awaited_once()
 
 
 def test_verified_file_input_is_not_mistaken_for_unapproved_text():
@@ -972,14 +978,18 @@ def test_stale_page_text_and_fakepath_never_prove_uploaded_pdf():
     TimeoutError('synthetic upload timeout'),
     bsk.Unavailable('BrowserSkill operation unavailable: synthetic transport'),
 ])
-async def test_unknown_or_timeout_upload_is_human_inspection_not_requeue(error):
+
+async def test_unknown_or_timeout_upload_propagates_without_retry(error, tmp_path):
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='No automatic repeat'):
+    with pytest.raises(type(error)) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_path=str(document), company='example-co', jd_text='',
             resume_tex='', github='')
+    assert escaped.value is error
     session.call.assert_awaited_once()
 
 
@@ -1350,7 +1360,7 @@ async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch, t
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert 'uninspectable' in result['question']
+    assert result.get('item') == 2 and result.get('reason') == 'defect_pre_submit_item_2'
     assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
     assert not raw._application_controller.committed
 
@@ -1610,7 +1620,7 @@ async def test_changed_hash_or_query_redirect_stops_before_any_later_form_write(
     result = await forms.apply(approved, 'example-co', {'Name': 'Test User'}, 'synthetic',
                                pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert decide.await_count == (0 if stage == 'initial' else 1)
+    decide.assert_not_awaited()  # Route drift stops before a new model write decision.
     writes.assert_not_awaited()
 
 
@@ -1682,6 +1692,7 @@ async def test_direct_form_grant_refuses_wrong_origin_or_scope(monkeypatch, form
     assert not stores.tracking.get(pk).get('human_approved_answers')
 
 
+
 async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, form_gate_world):
     run, stores, pk = form_gate_world
     current = page(target(label='Email'), application_marker=True)
@@ -1696,11 +1707,15 @@ async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, for
             return current
     monkeypatch.setattr(bsk, 'Session', Session)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
-        'action': 'gate', 'question': 'An exact human-approved answer is needed for "Email".',
-        'form_question': {'pk': pk, 'label': 'Email', 'selector': '#field', 'url': current['url']}}))
-    assert (await run._apply_direct(pk, stores))['result'] == 'gated'
-    run.resume_job(pk, 'test@example.test', stores)
+        'action': 'gate', 'question': 'A forged widget grant is needed for "Email".',
+        'form_question': {'pk': pk, 'label': 'Email', 'selector': '#field',
+                          'url': current['url']}}))
+    result = await run._apply_direct(pk, stores)
+    # Model-authored gate metadata must not create a code-owned owner question or
+    # resurrect per-field authorization. No owner answer is consumed here.
+    assert result['result'] == 'failed'
     assert not stores.tracking.get(pk).get('human_approved_answers')
+
 
 async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch):
     pk, value = 'example-co#1', '555-0100'
@@ -3153,9 +3168,9 @@ async def test_missing_fact_uses_owner_question_without_prewrite_provenance_gate
 
 
 @pytest.mark.asyncio
-async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
+
+async def test_unbound_model_gate_does_not_invent_owner_control_or_resumable_answer(
         monkeypatch, tmp_path):
-    """A real apply turn binds the next unanswered census receiver, not prose."""
     from tests.tools.test_browser_reversible_gates import (
         _apply, _fixture, _mark_census_answered)
     _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
@@ -3171,7 +3186,11 @@ async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
         {'action': 'gate', 'question': 'Synthetic unbound prose'}]
     result = await _apply(pdf)
     assert decision.await_count == 2
-    assert result['reason'] == 'owner_question'
-    assert result['review_route'] == 'owner'
-    assert result['form_question']['selector'] == '#additional'
+    # Only an observed selected field with missing facts takes the owner route.
+    # Free model prose is inspection, not a synthetic per-control grant.
+    assert result['reason'] == 'agent_review_unavailable'
+    assert result['review_route'] == 'luna'
+    assert result['form_question'] is None
     assert 'Synthetic unbound prose' not in result['question']
+
+

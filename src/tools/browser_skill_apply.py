@@ -2675,7 +2675,9 @@ async def execute(session, page: dict, action: dict, *, facts: dict, filled: dic
                  or any(
                      c.get('form_selector') == target.get('form_selector')
                      and (c.get('type') == 'password'
-                          or _ACCOUNT_PURPOSE.search(label(c)))
+                          or _ACCOUNT_PURPOSE.search(label(c))
+                          or (c.get('tag') == 'input' and c.get('type') == 'submit'
+                              and _ACCOUNT_PURPOSE.search(str(c.get('value') or ''))))
                      for c in page.get('controls', []) if isinstance(c, dict)))):
         # An account-purpose sibling makes this the sign-in/subscription form.
         # This is the surviving account boundary, not an approval for ordinary

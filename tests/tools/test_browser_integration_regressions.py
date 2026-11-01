@@ -353,31 +353,39 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('action', ['fill', 'upload'])
-@pytest.mark.parametrize('wall', ['password', 'challenge'])
-async def test_raw_preparation_never_bypasses_authentication_wall(
-        monkeypatch, tmp_path, action, wall):
-    """Generic fallback skips old shape certificates, never login/CAPTCHA safety."""
+async def test_normal_preparation_never_automates_an_account_form(
+        monkeypatch, tmp_path, action):
+    """The existing execute() account boundary blocks model-selected login work."""
     row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
-
-    controller = forms.ApplicationIPCController(
-        PK, COMPANY, URL, pdf, {'Email': 'test@example.test'}, {}, [], {}, lambda: None)
-    raw.bind_application_controller(controller)
-    raw.id = 'synthetic-session'
-    if wall == 'password':
-        page['controls'].append(field(selector='#password', label='Password', type='password'))
-    else:
-        page['entry'] = {'helper_challenge': True}
-    # Direct producer calls cannot borrow execute()/bootstrap's earlier checks.
-    with pytest.raises(forms.Gate, match='Sign in yourself' if wall == 'password' else 'challenge'):
-        await raw.application_effect(
-            action, '#email' if action == 'fill' else '#resume',
-            '--value' if action == 'fill' else '--file',
-            'test@example.test' if action == 'fill' else controller.resume_path,
-            **({} if action == 'fill' else {'timeout': 130}))
+    page['controls'].append(field(
+        selector='#password', label='Password', type='password'))
+    selected = '#email' if action == 'fill' else '#resume'
+    with pytest.raises(forms.Gate, match='An owner account action is required'):
+        await forms.execute(
+            raw, page, {'action': action, 'selector': selected,
+                        **({'fact': 'Email'} if action == 'fill' else {})},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path=pdf, company=COMPANY, jd_text='',
+            resume_tex='', github='', pk=PK, job_url=URL)
     assert effects == []
-    assert not controller.upload_completed
-    assert not controller.committed
     assert not submit_hold.is_held(PK, tracking=tracking)
+
+
+def test_entry_safety_precedes_any_captcha_form_preparation(monkeypatch, tmp_path):
+    """A reader-positive CAPTCHA has priority even without a stable form root."""
+    row, page, tracking, raw, effects, pdf = _world(
+        monkeypatch, tmp_path, ats='ashby')
+    page['entry'] = {
+        'root': None, 'frames': [{'status': 'visible-hcaptcha'}],
+        'responses': [], 'response_error': False, 'helper_challenge': False,
+    }
+    provenance = forms.ApplicationEntryProvenance(
+        row['pk'], COMPANY, 'ashby', row['job_id'],
+        row['jd_url'], COMPANY, page['url'])
+    with pytest.raises(forms.CaptchaGate, match='visible hCaptcha'):
+        forms._entry_safety(page, lambda href: href == page['url'],
+                            provenance, readiness=True)
+    assert effects == []
 
 
 @pytest.mark.asyncio
@@ -404,19 +412,3 @@ async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
     assert not raw._application_controller.committed
     assert not submit_hold.is_held(PK, tracking=tracking)
 
-
-@pytest.mark.asyncio
-async def test_upload_preserves_raw_challenge_refusal(monkeypatch, tmp_path):
-    """A raw no-IPC CAPTCHA refusal must retain its named manual next step."""
-    row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
-    async def decide(*args, **kwargs):
-        page['entry'] = {'helper_challenge': True}
-        return dict(action='upload', selector='#resume')
-    monkeypatch.setattr(bsk, 'decision', decide)
-    result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
-                               'synthetic', pk=PK, resume_path=pdf)
-    assert result['status'] == 'gate', result
-    assert 'Visible application challenge requires manual authentication' in result['question']
-    assert effects == [('navigate', URL)]
-    assert not raw._application_controller.upload_completed
-    assert not submit_hold.is_held(PK, tracking=tracking)

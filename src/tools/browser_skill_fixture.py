@@ -1046,39 +1046,33 @@ def _run_scenario(*, greenhouse=False, greenhouse_empty_placeholder=False,
                 phone = [c for c in (state.last_page or {}).get('controls', [])
                          if c.get('selector') == '#phone']
                 phone_ok = len(phone)==1 and phone[0].get('value')==_FACTS['Phone']
-                from tools.browser_skill_apply import check_form, Gate
-                # Old C0/C2 receipts cannot authorize a selected form value.
-                # Verify the four form-owned choice receivers from the *current*
-                # page through the production final-form checker. This isolated
-                # choice check does not assert the whole incomplete form is ready.
+                # Historical per-field approval receipts are no longer part
+                # of ordinary preparation. Preserve the fixture outcome proof
+                # against the current four independent form-owned choice pairs
+                # instead of running the final PDF checker on a partial form.
                 choice_selectors = set(_COMBO_SELECTORS.values())
                 receiver_selectors = set(_HIDDEN_SELECTORS.values())
                 choices = [c for c in (state.last_page or {}).get('controls', [])
                            if c.get('selector') in choice_selectors | receiver_selectors]
-                receipts = state.widget_receipts
+                choice_by_selector = {c.get('selector'): c for c in choices}
                 receipt_ok = (
-                    len(receipts) == len(_CHOICE_SELECTORS)
-                    and {r.get('selector') for r in receipts}
-                        == set(_CHOICE_SELECTORS.values())
-                    and all(any(r.get('action') == 'combobox'
-                                and r.get('selector') == selector
-                                and r.get('approved_value') == _FACTS[key]
-                                for r in receipts)
-                            for key, selector in _CHOICE_SELECTORS.items())
-                    and len(choices) == 2 * len(_COMBO_SELECTORS)
+                    len(choices) == 2 * len(_COMBO_SELECTORS)
+                    and len(choice_by_selector) == len(choices)
+                    and set(choice_by_selector) == choice_selectors | receiver_selectors
                     and (state.last_page or {}).get('inventory_verified') is True
                     and (state.last_page or {}).get('opaque_controls') is False
+                    and all(
+                        (choice_by_selector[selector].get('combobox') or {}).get(
+                            'selected_value') == _MACHINE_VALUES[key]
+                        and (choice_by_selector[selector].get('combobox') or {}).get(
+                            'hidden_selector') == _HIDDEN_SELECTORS[key]
+                        and (choice_by_selector[selector].get('combobox') or {}).get(
+                            'hidden_value') == _MACHINE_VALUES[key]
+                        and choice_by_selector[_HIDDEN_SELECTORS[key]].get('type') == 'hidden'
+                        and choice_by_selector[_HIDDEN_SELECTORS[key]].get('value')
+                            == _MACHINE_VALUES[key]
+                        for key, selector in _COMBO_SELECTORS.items())
                 )
-                if receipt_ok:
-                    try:
-                        check_form(
-                            {'controls': choices, 'inventory_verified': True,
-                             'opaque_controls': False},
-                            {selector: _FACTS[key]
-                             for key, selector in _COMBO_SELECTORS.items()},
-                            uploaded=True)
-                    except Gate:
-                        receipt_ok = False
                 ok = (result.get("status") == "gate"
                       and (state.visible_badge_anchor == 'PASS' if greenhouse else state.entry_wait == 'PASS')
                       and (not greenhouse or state.native_validity == dict.fromkeys(_CHOICE_SELECTORS.values(), True))

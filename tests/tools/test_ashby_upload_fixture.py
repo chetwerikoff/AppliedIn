@@ -1022,9 +1022,11 @@ async def test_production_submit_click_upload_failure_stops_without_click(
     run_apply, click, raw, decide, transport, uploads, row = _production_submit_click(
         monkeypatch, tmp_path, upload=broken)
     result = await run_apply([click])
-    assert result == {
-        'status': 'uncertain', 'step': result['step'],
-        'detail': 'Résumé upload interrupted after the browser command; inspect manually'}
+    assert result['status'] == 'uncertain', result
+    assert result['detail'].startswith(
+        'Résumé upload interrupted after the browser command; inspect manually')
+    assert result['step']['last_button'] == '(unavailable)'
+    assert result['step']['url'].startswith('http://127.0.0.1:18789/fixture/')
     assert decide.await_count == 0
     assert len(uploads) == 1
     assert not transport._application_controller.upload_completed

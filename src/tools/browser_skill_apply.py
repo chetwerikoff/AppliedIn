@@ -3783,6 +3783,11 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                                  if c.get('type') == 'file' and not c.get('disabled')
                                  and re.search(r'resume|résumé|cv', label(c), re.I)]
                     if not uploaded and len(receivers) == 1:
+                        # Preserve origin/destination proof for a form-owned
+                        # file receiver. This is not an answer grant: an
+                        # untrusted foreign form must not receive the row PDF.
+                        check_form_destination(page, receivers[0], url, direct_url,
+                                               provenance=provenance)
                         if (isinstance(provenance, ApplicationEntryProvenance)
                                 and provenance.ats == 'ashby'
                                 and _formless_root(page)):

@@ -338,9 +338,13 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
             selected_text='Approved location', displayed_text='Approved location',
             selected_value='location-code', hidden_selector='#receiver',
             hidden_value='location-code')
-        with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+        admitted['controls'].append(field(
+            'Resume', '#resume', type='file', required=False,
+            files=['Resume.pdf'], form_action=URL))
+        with pytest.raises(forms.Gate, match='current form-owned value'):
             forms.check_form(admitted, {
-                '#answer': 'Approved detail', '#location': 'Approved location'}, True)
+                '#answer': 'Approved detail', '#location': 'Approved location'},
+                True, 'Resume.pdf')
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
@@ -371,10 +375,33 @@ def test_absent_hidden_form_receiver_is_a_final_submit_negative():
         hidden_selector='#receiver', hidden_value='location-code')
     # All visible values are correct; no actual hidden input exists. A shape
     # phase is irrelevant, but the ONE final guard may not authorize Submit.
-    with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+    page['controls'].append(field(
+        'Resume', '#resume', type='file', required=False,
+        files=['Resume.pdf'], form_action=URL))
+    with pytest.raises(forms.Gate, match='current form-owned value'):
         forms.check_form(
             page, {'#answer': 'Approved detail', '#location': 'Approved location'},
-            uploaded=True)
+            uploaded=True, attachment='Resume.pdf')
+
+
+def test_current_form_owned_hidden_receiver_allows_selected_value():
+    page = combo_page()
+    page['controls'][0].update(value='Synthetic detail', has_value=True)
+    picker = page['controls'][1]
+    picker['combobox'].update(
+        linked=True, link_id='list', selected_text='Synthetic location',
+        displayed_text='Synthetic location', selected_value='loc-code',
+        hidden_selector='#receiver', hidden_value='loc-code')
+    page['controls'].append(field(
+        'Location machine value', '#receiver', type='hidden',
+        value='loc-code', has_value=True, required=False, form_action=URL))
+    page['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=URL))
+    forms.check_form(page, {}, True, 'Resume.pdf')
+    page['controls'][-2]['value'] = 'other-code'
+    with pytest.raises(forms.Gate, match='current form-owned value'):
+        forms.check_form(page, {}, True, 'Resume.pdf')
 
 
 @pytest.mark.parametrize('fault', [

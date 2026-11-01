@@ -561,6 +561,34 @@ async def test_file_set_reply_without_current_file_readback_is_uncertain(
     assert authority.post_attempts == authority.post_count == 0
 
 
+@pytest.mark.parametrize('operation', ['upload', 'evaluate'])
+async def test_file_bytes_drift_after_effect_never_becomes_retryable_gate(
+        authority, operation):
+    """The effect may have landed before the protected source failed its hash."""
+    Path(authority.resume_path).write_bytes(fixture._RESUME_BYTES)
+    authority.ashby = authority.ashby_upload = True
+    authority.enable_positive_fixture()
+    controller = forms.ApplicationIPCController(
+        fixture.PK, fixture.COMPANY, fixture.URL, authority.resume_path,
+        dict(fixture._FACTS), {}, [], {'url': fixture.URL}, lambda: None,
+        fixture_context=authority)
+    identity = controller._row_pdf()
+    controller.upload_attempted = controller.upload_pending = True
+    if operation == 'upload':
+        controller.upload_identity = identity
+        args = ('upload', '#_systemfield_resume', '--file', authority.resume_path)
+    else:
+        controller._resume_set_identity = identity
+        args = ('evaluate', controller._resume_set_script())
+    # This changes the staged file only AFTER the hypothetical raw command.
+    Path(authority.resume_path).write_bytes(b'%PDF-1.4\nchanged synthetic bytes\n')
+    with pytest.raises(RuntimeError, match='staged PDF changed during upload IPC'):
+        await controller.after_ipc(None, args, {}, succeeded=True)
+    assert not controller.upload_pending and not controller.upload_completed
+    assert controller.upload_attempted and not controller.committed
+    assert authority.submit_ipc == authority.submit_call_entered == 0
+
+
 async def test_already_proven_resume_submit_does_not_replay_upload(
         authority, monkeypatch):
     result, raw, seen = await _run_recovery(

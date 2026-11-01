@@ -587,7 +587,7 @@ async def test_file_bytes_drift_after_effect_never_becomes_retryable_gate(
         args = ('evaluate', controller._resume_set_script())
     # This changes the staged file only AFTER the hypothetical raw command.
     Path(authority.resume_path).write_bytes(b'%PDF-1.4\nchanged synthetic bytes\n')
-    with pytest.raises(forms.Gate, match='staged PDF') as failure:
+    with pytest.raises(forms.Gate, match='staged row-tailored PDF bytes were replaced') as failure:
         await controller.after_ipc(None, args, {}, succeeded=True)
     assert failure.value.reason == 'defect_upload_uncertain'
     assert not controller.upload_pending and not controller.upload_completed

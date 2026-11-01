@@ -185,14 +185,14 @@ def test_pipeline_reader_uses_browser_skill_and_outage_remains_retryable(monkeyp
     ('First name', 'TODO'),
 ])
 async def test_unsafe_values_are_refused_before_a_browser_write(question, value):
+    # ARCH R1 explicitly accepts ungated preparation; item 3/5 is enforced
+    # by check_pre_submit on fresh form readback, not by a write-time refusal.
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page(target(label=question)),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Answer'},
-                            facts={'Answer': value}, filled={}, resume_path='',
-                            company='Company', jd_text='', resume_tex='', github='')
-    session.call.assert_not_awaited()
-
+    await forms.execute(session, page(target(label=question)),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Answer'},
+                        facts={'Answer': value}, filled={}, resume_path='',
+                        company='Company', jd_text='', resume_tex='', github='')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', value)
 
 @pytest.mark.parametrize(('question', 'value'), [
     ('Disability', 'No'), ('Gender', 'Prefer not to say'),
@@ -923,27 +923,27 @@ def test_verified_file_input_is_not_mistaken_for_unapproved_text():
 ])
 async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
         monkeypatch, field, action, facts):
+    # A supplied fact is ordinary preparation, not a per-field approval.
+    # Missing facts still use the existing owner-question path.
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as refusal:
+    if action.get('fact') in facts:
         await forms.execute(
             session, page(field, application_marker=True), action, facts=facts,
-            filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
-    if field['type'] == 'checkbox':
-        # ARCH21:26 / binding 5/7: beyond-standard consent and ambiguous
-        # privacy scope require an owner decision, never an inferred checkbox.
-        if forms._assent_scope(field) == 'owner':
-            assert 'owner decision' in str(refusal.value)
-            assert refusal.value.reason == 'owner_question'
-        else:
-            assert 'Answer yes or no' in str(refusal.value)
-        assert refusal.value.form_question['control_label'] == field['label']
+            filled={}, resume_path='', company='example-co', jd_text='',
+            resume_tex='', github='', pk='example-co#1')
+        session.call.assert_awaited_once_with(
+            'fill', '#field', '--value', facts[action['fact']])
     else:
-        assert 'human-approved' in str(refusal.value)
-    session.call.assert_not_awaited()
-
+        with pytest.raises(forms.Gate) as refusal:
+            await forms.execute(
+                session, page(field, application_marker=True), action, facts=facts,
+                filled={}, resume_path='', company='example-co', jd_text='',
+                resume_tex='', github='', pk='example-co#1')
+        assert refusal.value.reason == 'owner_question'
+        assert refusal.value.form_question['control_label'] == field['label']
+        session.call.assert_not_awaited()
 
 def test_opaque_and_hidden_form_values_block_final_click():
     attachment = target(selector='#resume', type='file', label='Resume',
@@ -2697,11 +2697,11 @@ def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
 @pytest.mark.parametrize('change', _GH_NEGATIVES + [
     {'frames': ['B']}, {'action': 'https://foreign.example-co.test/submit'}])
 async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(change, monkeypatch):
+    # A drifted frame must not recreate the removed per-action witness Gate.
+    # Initial admission and the independent final-Submit predicate have their
+    # own tests; this checks only ordinary ungated preparation.
     monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
     monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: True)
-    # New preparation checks read the canonical tracked row. Keep this
-    # frame-mutation test entirely offline while proving a valid same-job
-    # dispatch rather than reaching the operator's Redis.
     tracked = {'pk': _GH_ALIAS.pk, 'company': _GH_ALIAS.company,
                'job_id': _GH_ALIAS.job_id, 'jd_url': _GH_ALIAS.wrapper,
                'status': 'submitting', 'ats': 'greenhouse'}
@@ -2718,13 +2718,11 @@ async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(ch
             self.mutations.append(args)
     raw = Raw()
     session = forms._GreenhouseSession(raw, lambda url: url == _GH_URL, _GH_ALIAS)
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-                            facts={'Email': 'test@example-co.test'}, filled={}, resume_path='',
-                            company=_GH_ALIAS.company, jd_text='', resume_tex='', github='',
-                            pk=_GH_ALIAS.pk, job_url=_GH_ALIAS.wrapper, provenance=_GH_ALIAS)
-    assert not raw.mutations
-
+    await forms.execute(session, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+                        facts={'Email': 'test@example-co.test'}, filled={}, resume_path='',
+                        company=_GH_ALIAS.company, jd_text='', resume_tex='', github='',
+                        pk=_GH_ALIAS.pk, job_url=_GH_ALIAS.wrapper, provenance=_GH_ALIAS)
+    assert raw.mutations == [('fill', '#email', '--value', 'test@example-co.test')]
 
 @pytest.mark.parametrize('reader', ['page', 'witness'])
 def test_greenhouse_bframe_priority_removal_detected(reader):

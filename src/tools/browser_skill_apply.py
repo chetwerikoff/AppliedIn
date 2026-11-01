@@ -3330,8 +3330,19 @@ class ApplicationIPCController:
                   or not isinstance(row.get('title'), str)
                   or page['title'].strip() != row['title'].strip()):
                 raise Gate('The current final job title is not the tracked role.')
-        except Gate:
-            raise PreSubmitGate(1, 'Tracked job, tenant, form or duplicate proof is unavailable.') from None
+        except Gate as exc:
+            # check_dispatch also verifies the staged résumé and seed. Those
+            # failures are item 2, not an incorrect job/duplicate item 1.
+            # These are code-owned fixed messages; never disclose raw page data.
+            pdf_failure = str(exc) in {
+                'The tailored résumé is missing or its base changed; re-tailor before applying.',
+                'The tailored PDF is missing; nothing may be submitted without it.',
+            }
+            raise PreSubmitGate(
+                2 if pdf_failure else 1,
+                'The staged row PDF or résumé seed is not current.'
+                if pdf_failure else
+                'Tracked job, tenant, form or duplicate proof is unavailable.') from None
 
         try:
             if (not self.upload_completed

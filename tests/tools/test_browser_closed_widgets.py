@@ -986,8 +986,10 @@ async def test_required_proxy_mutation_denies_real_final_submit(
     session.id = 'synthetic-session'
     session.bind_application_controller(controller)
 
-    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
+    with pytest.raises(forms.PreSubmitGate) as failure:
         await session.application_effect('click', '#submit')
+    assert failure.value.item == 2
+    assert failure.value.reason == 'defect_pre_submit_item_2'
     assert reached_form == [True]  # Same production guard and form reader.
     assert raw_commands == [] and began_click == []
     assert controller.committed is False and controller.history == []

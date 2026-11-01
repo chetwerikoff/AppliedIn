@@ -269,37 +269,6 @@ async def test_forged_context_refused_before_store_or_browser(monkeypatch, conte
                           resume_path="/fake/pdf", fixture_context=context)
 
 
-def test_positive_approval_grants_match_live_group_question(authority):
-    """The live PAGE inventory uses the exact form-group question."""
-    authority.ashby = True
-    authority.enable_positive_fixture()
-    page = synthetic_page()
-    target = next(item for item in page["controls"]
-                  if item["selector"] == "#name")
-    target.update(question="Name", form_selector="#application-form",
-                  form_action=fixture.URL)
-    # PRIMARY now stops before any grant; this native unit test supplies its
-    # own explicit synthetic answer rather than borrowing fixture authority.
-    assert authority.row['human_approved_answers'] == {}
-    authority.row['human_approved_answers']['Name'] = {
-        'value': fixture._FACTS['Name'], 'url': fixture.URL,
-        **{k: target[k] for k in ('selector','label','question','tag','type','form_selector','form_action')}}
-    forms.exact_approval(
-        fixture.PK, "Name", fixture._FACTS["Name"], target=target,
-        url=fixture.URL, fixture_context=authority)
-
-    stale_question = {**target, "question": ""}
-    with pytest.raises(forms.Gate, match="exact human-approved answer"):
-        forms.exact_approval(
-            fixture.PK, "Name", fixture._FACTS["Name"], target=stale_question,
-            url=fixture.URL, fixture_context=authority)
-
-
-def test_fixture_does_not_grant_the_additional_question(authority):
-    authority.enable_positive_fixture()
-    assert "Additional question" not in authority.row["human_approved_answers"]
-
-
 def test_served_form_hidden_machine_input_does_not_collide_with_approval_question():
     """Hidden receiver fields share group text but are not answerable controls."""
     import runpy
@@ -310,9 +279,8 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
     hidden = next(c for c in page["controls"]
                   if c["selector"] == "#location-code")
     assert location["question"] == hidden["question"] == "Where are you located?"
-    collisions = forms._approval_question_collisions(page, location)
-    # Two real required validation proxies (location and phone country)
-    # have no own approval identity. They cannot borrow this visible question.
+    # Two required validation proxies (location and phone country) are
+    # independent actual values, not historical per-control grants.
     anonymous = [c for c in page["controls"]
                  if c.get("type") == "text" and not c.get("label")
                  and not c.get("name") and c.get("required") is True]
@@ -323,24 +291,22 @@ def test_served_form_hidden_machine_input_does_not_collide_with_approval_questio
                and not c.get("has_value") and c.get("value") == ""
                for c in anonymous)
     assert hidden["type"] == "hidden" and hidden["name"] == "location_value"
-    assert collisions == []
-    assert forms._key(page, location) == "Where are you located?"
-    # Excluding a proxy from approval collision detection is not permission
-    # to submit: the original inventory is opaque, and each still-empty
-    # required proxy independently fails the one final form-value census.
+    assert location["question"] == "Where are you located?"
+    # No historical approval can make this opaque inventory pass Submit:
+    # each required proxy still needs a current nonempty native readback.
     assert page["inventory_verified"] is False and page["opaque_controls"] is True
     with pytest.raises(forms.Gate, match="incomplete"):
         forms.check_form(page, {}, uploaded=True)
     for proxy in anonymous:
-        probe = {**page, "controls": [proxy], "inventory_verified": True,
+        # Provide the exact current row-PDF attachment so the final readback
+        # reaches this required proxy rather than stopping at its PDF check.
+        resume = {"selector": "#synthetic-resume", "type": "file",
+                  "label": "Resume", "disabled": False, "files": ["Synthetic-Resume.pdf"]}
+        probe = {**page, "controls": [proxy, resume], "inventory_verified": True,
                  "truncated": False, "opaque_controls": False,
                  "shadow_roots": False, "unsupported_frames": []}
-        with pytest.raises(forms.Gate, match="Required field is empty"):
-            forms.check_form(probe, {}, uploaded=True)
-    without_proxies = {**page, "controls": [
-        c for c in page["controls"] if c not in anonymous]}
-    assert forms._approval_question_collisions(without_proxies, location) == []
-    assert forms._key(without_proxies, location) == "Where are you located?"
+        with pytest.raises(forms.Gate, match="required application field is empty"):
+            forms.check_form(probe, {}, uploaded=True, attachment="Synthetic-Resume.pdf")
 
 
 def test_served_form_does_not_add_an_unlinked_caption_hidden_value():
@@ -697,16 +663,8 @@ def test_fixture_manual_jit_and_hold_evidence_never_needs_owner_store(
     monkeypatch.setattr(forms.submit_hold, "mark", _source_denied)
     forms.check_dispatch(fixture.PK, authority.resume_path,
                          fixture_context=authority)
-    history = [{"action": "fill", "selector": "#name", "label": "Name",
-                "question": "", "fact": "Name", "approved_value": "Test User",
-                "url": fixture.URL}]
-    page = synthetic_page()
-    # This late JIT-only check uses a synthetic full-identity owner grant.
-    authority.row["human_approved_answers"]["Name"].update(
-        tag="input", type="text", form_selector="#synthetic-form",
-        form_action=fixture.URL)
-    forms.check_approvals(fixture.PK, history, page,
-                          fixture_context=authority)
+    # The retired per-field approval receipt is not an input to the existing
+    # hold and current human-outcome checks below.
     forms.hold_possible_submission(
         fixture.PK, {"last_button": "Continue", "url": fixture.URL},
         fixture_context=authority)
@@ -1126,27 +1084,9 @@ async def test_native_continue_jit_is_not_hidden_by_missing_pdf_or_approval(
     cont.update(selector="#continue", label="Continue", type="submit", tag="button",
                 submit=True)
     filled = {"#name": "Test User", "#additional": "Synthetic answer"}
-    authority.row["human_approved_answers"]["Name"].update(
-        tag="input", type="text", form_selector="#synthetic-form",
-        form_action=fixture.URL)
-    authority.row["human_approved_answers"]["Additional question"] = {
-        "selector": "#additional", "url": fixture.URL, "label": "Additional question",
-        "question": "", "value": "Synthetic answer",
-        "tag": "textarea", "type": "textarea", "form_selector": "#synthetic-form",
-        "form_action": fixture.URL,
-    }
-    history = [
-        {"selector": selector, "label": label, "question": "", "url": fixture.URL,
-         "fact": label, "approved_value": val}
-        for selector, label, val in (
-            ("#name", "Name", "Test User"),
-            ("#additional", "Additional question", "Synthetic answer"))]
-    # Production first validates the exact receipts in SUBMITTING, then records
-    # the possible-submission hold and moves to NEEDS_HUMAN at the JIT edge.
-    # Rechecking approval only after the hold would be a wrong-order test.
+    # The current form state and PDF readback still precede the existing
+    # possible-submission hold; removed per-field receipts do not participate.
     forms.check_form(current, filled, True, "Synthetic-Resume.pdf")
-    forms.check_approvals(fixture.PK, history, current,
-                          fixture_context=authority)
     forms.check_form_destination(current, cont, fixture.URL)
     authority.row["status"], authority.row["gate_reason"], authority.hold = (
         "needs_human", "submit_uncertain", True)
@@ -1724,14 +1664,14 @@ def test_greenhouse_fixture_required_proxy_is_five_names_and_search_is_not_requi
             in fixture._greenhouse_form())
 
 
-async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
-    """Ashby's intentional zero-grant Gate must not erase the native leg's grants."""
+async def test_greenhouse_fixture_location_readback_remains_unselected(authority):
+    """An unselected native location is not authorized by legacy answer grants."""
     import runpy
     helpers = runpy.run_path(str(Path(__file__).with_name('test_browser_phone_block.py')))
     snapshot = helpers['served_fixture_dom']()
     authority.greenhouse = True
     authority.enable_positive_fixture()
-    provenance = authority.entry_provenance()
+    authority.entry_provenance()
 
     # The real served native bytes and production readers still admit the
     # untouched hidden-receiver graph. The failure was before opening it:
@@ -1742,10 +1682,8 @@ async def test_greenhouse_fixture_keeps_existing_location_grant(authority):
     assert location['combobox']['options'] == []
     assert not location['combobox'].get('selected_value')
     assert not location['combobox'].get('hidden_value')
-    forms.exact_approval(
-        fixture.PK, 'Where are you located?', fixture._FACTS['Where are you located?'],
-        target=forms._bound_target(snapshot['page'], location), url=fixture.URL,
-        fixture_context=authority, provenance=provenance)
+    # No grant is needed: the final boundary must rely on these current,
+    # unselected machine values rather than assuming an authorized location.
     assert authority.ipc_index == authority.decisions == 0
     assert authority.submit_ipc == authority.post_attempts == 0
 

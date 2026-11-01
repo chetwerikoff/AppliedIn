@@ -23,8 +23,8 @@ class HoldFixture:
         return self.held
 
 
-def _world(monkeypatch, tmp_path, *, case='ready'):
-    resume = tmp_path / 'Test User.pdf'
+def _world(monkeypatch, tmp_path, *, case='ready', resume_name='Test User.pdf'):
+    resume = tmp_path / resume_name
     resume.write_bytes(b'%PDF-1.4\nsynthetic only\n')
     target = {
         'selector': '#submit', 'label': 'Submit application',
@@ -797,3 +797,184 @@ async def test_missing_file_input_cannot_borrow_stale_complete_upload_tree(
         await controller.check_pre_submit(None, page, target)
     assert refusal.value.item == 2
     assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('caption', 'mode', 'item'), [
+    ('Male', 'selected', 3),
+    ('Decline To Self Identify', 'selected', None),
+    ('Male', 'missing', 3),
+    ('Male', 'outside', 3),
+    ('Male', 'ambiguous', 3),
+])
+async def test_observed_local_gender_selection_uses_only_existing_final_item_three(
+        monkeypatch, tmp_path, caption, mode, item):
+    """Observed React-select markup has blank input and no hidden receiver.
+    A single same-field caption is the only selected answer; ambiguous,
+    outside-field and live-region-only captions cannot invent safe consent.
+    """
+    from tests.tools.test_browser_combobox import _read_local_react_select_gender
+
+    _, gender = _read_local_react_select_gender(caption, state=mode)
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    # A proven local selected caption must satisfy required readback so
+    # affirmative Gender reaches item 3; ambiguous selections remain optional
+    # here to isolate the protected-answer refusal from required-field item 2.
+    gender['required'] = mode == 'selected'
+    gender['form_selector'] = '#app'
+    gender['form_action'] = URL
+    page['controls'].insert(0, gender)
+    assert gender['value'] == ''
+    assert gender['combobox'].get('selected_value') == ''
+    if item is None:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == item
+        assert not fixture.held
+
+
+def _read_current_file_upload_group(*, case='matching'):
+    """Run production PAGE against the sanitized file-upload group, offline.
+
+    No file input remains after upload; the only surviving evidence is a
+    same-group filename and explicit Remove file control.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    from tools.browser_skill_dom import PAGE
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    injection = r"""
+const kind=MODE;
+const filename='Test-User-Resume.pdf';
+const makeUploadGroup=(key, targetForm) => {
+  const group=node('div',{
+    id:key+'-upload',class:'file-upload',role:'group',
+    'aria-labelledby':key+'-label',
+  },targetForm);
+  node('div',{id:key+'-label',text:kind==='other_label' ?
+    'Supporting documents' : 'Resume/CV'},group);
+  const placeName=parent => {
+    const file=node('div',{class:'file-upload__filename'},parent);
+    node('p',{class:'body body__secondary',
+      text:kind==='wrong_filename' ? 'Unrelated.pdf' : filename},file);
+  };
+  if(kind==='outside_caption')placeName(body);
+  else placeName(group);
+  if(kind==='duplicate_within')placeName(group);
+  if(kind!=='missing_remove')
+    node('button',{type:'button','aria-label':'Remove file'},group);
+};
+if(kind!=='none'){
+  const target=kind==='wrong_form' ?
+    node('form',{id:'profile-form'},body) : form;
+  makeUploadGroup('upload-resume',target);
+  if(kind==='multiple')makeUploadGroup('upload-second',form);
+}
+"""
+    script = fixture.replace(
+        marker, injection.replace('MODE', json.dumps(case)) + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', script, 'synthetic',
+         json.dumps({'url': URL}), PAGE],
+        capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('case', 'accepted'), [
+    ('matching', True),
+    ('none', False),
+    ('multiple', False),
+    ('duplicate_within', False),
+    ('wrong_filename', False),
+    ('outside_caption', False),
+    ('wrong_form', False),
+    ('other_label', False),
+    ('missing_remove', False),
+])
+async def test_real_file_upload_group_reader_requires_single_bound_removable_pdf(
+        monkeypatch, tmp_path, case, accepted):
+    """The observed post-upload group, not a stale file input or global text,
+    must prove one exact, removable attachment on the committing form.
+    """
+    observed = _read_current_file_upload_group(case=case)
+    assert not any(c.get('type') == 'file' for c in observed['controls'])
+    controller, page, target, fixture = _world(
+        monkeypatch, tmp_path, resume_name='Test-User-Resume.pdf')
+    # Only the isolated native application form is the submitting owner.
+    target['form_selector'] = '#application-form'
+    target['native_form_owner_selector'] = '#application-form'
+    for c in page['controls']:
+        if c.get('in_form') and c is not target:
+            c['form_selector'] = '#application-form'
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    page['attached_file_displays'] = observed['attached_file_displays']
+    if accepted:
+        assert len(page['attached_file_displays']) == 1
+        assert page['attached_file_displays'][0]['valid'] is True
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+    else:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 2
+        assert not fixture.held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('upload_completed', 'same_identity'), [
+    (False, True), (True, False),
+])
+async def test_real_file_group_cannot_waive_upload_or_staged_pdf_identity(
+        monkeypatch, tmp_path, upload_completed, same_identity):
+    """A valid visible filename never substitutes for the original code-owned
+    upload completion and unchanged row-PDF identity.
+    """
+    observed = _read_current_file_upload_group()
+    controller, page, target, fixture = _world(
+        monkeypatch, tmp_path, resume_name='Test-User-Resume.pdf')
+    target['form_selector'] = '#application-form'
+    target['native_form_owner_selector'] = '#application-form'
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    page['attached_file_displays'] = observed['attached_file_displays']
+    controller.upload_completed = upload_completed
+    if not same_identity:
+        controller.upload_identity = ('different-synthetic-pdf',)
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.check_pre_submit(None, page, target)
+    assert refused.value.item == 2
+    assert not fixture.held
+
+
+@pytest.mark.parametrize('root_selector,accepted', [
+    ('#proven-application', True), ('#unrelated-profile', False),
+])
+def test_removed_file_display_keeps_existing_formless_root_binding(
+        monkeypatch, tmp_path, root_selector, accepted):
+    """An attached filename may belong only to the proven committing root,
+    never an adjacent formless profile section.
+    """
+    controller, page, target, _fixture = _world(
+        monkeypatch, tmp_path, resume_name='Test-User-Resume.pdf')
+    target.update(in_form=False, form_selector='', native_form_owner_selector='')
+    page['entry'] = {'formless': {
+        'root': '#proven-application', 'container': '#proven-application'}}
+    page['controls'] = [c for c in page['controls'] if c.get('type') != 'file']
+    page['attached_file_displays'] = [{
+        'filename': 'Test-User-Resume.pdf', 'field_label': 'Resume/CV',
+        'valid': True, 'in_form': False, 'form_selector': '',
+        'root_selector': root_selector,
+    }]
+    args = dict(submit_target=target, formless_members=[page['controls'][0]])
+    if accepted:
+        forms.check_form(page, {}, True, 'Test-User-Resume.pdf', **args)
+    else:
+        with pytest.raises(forms.Gate, match='committing form'):
+            forms.check_form(page, {}, True, 'Test-User-Resume.pdf', **args)

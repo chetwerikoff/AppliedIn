@@ -1210,6 +1210,17 @@ def check_form(page: dict, filled: dict, uploaded: bool, attachment: str = '',
                     and c.get('in_form') is True
                     and c.get('has_value') is True
                     and str(c.get('value') or '').strip() == machine)
+            elif combo.get('local_selected_proven') is True:
+                # A closed React-select has a blank search input after a
+                # selection. Its exactly-one same-field visible caption is a
+                # current choice only when the field is in the committing form
+                # or the already-proven formless application root.
+                value_proven = (c.get('tag') == 'input'
+                    and combo.get('selected_caption_unreadable') is not True
+                    and bool(str(combo.get('selected_text') or '').strip())
+                    and ((c.get('in_form') is True and bool(c.get('form_selector')))
+                         or (formless_members is not None
+                             and any(p is c for p in formless_members))))
             else:
                 value_proven = bool(str(c.get('value') or '').strip())
             if not selected or not value_proven:
@@ -3635,13 +3646,25 @@ class ApplicationIPCController:
                             and field.get('has_value') is True
                             and current == machine)
                     elif selected:
-                        options = combo.get('options') or field.get('options') or []
-                        combo_verified = (
-                            bool(current) and sum(
-                                1 for option in options if isinstance(option, dict)
-                                and str(option.get('value') or '').strip() == current
-                                and str(option.get('label') or '').strip() == selected
-                            ) == 1)
+                        if combo.get('local_selected_proven') is True:
+                            # A current React-select single-value is a selected
+                            # caption, not a second machine-value witness.
+                            combo_verified = (
+                                field.get('tag') == 'input' and not current and
+                                ((field.get('in_form') is True and
+                                  bool(field.get('form_selector'))) or
+                                 (formless_members is not None and
+                                  any(c is field for c in formless_members))))
+                        else:
+                            options = combo.get('options') or field.get('options') or []
+                            combo_verified = (
+                                bool(current) and sum(
+                                    1 for option in options if isinstance(option, dict)
+                                    and str(option.get('value') or '').strip() == current
+                                    and str(option.get('label') or '').strip() == selected
+                                ) == 1)
+                if combo.get('selected_caption_unreadable') is True:
+                    combo_verified = False
                 answer = selected or current
             elif field.get('tag') == 'select':
                 matches = [o for o in field.get('options') or []

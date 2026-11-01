@@ -282,3 +282,78 @@ def test_3300_options_and_long_page_text_preserve_complete_control_readback():
     }
     page['controls'].append(pdf)
     forms.check_form(page, {}, True, 'Test User.pdf')
+
+
+def _read_local_react_select_gender(caption='Male', *, state='selected'):
+    """Run the production PAGE reader on the observed local React-select shape.
+
+    Synthetic DOM only. The input stays blank and no hidden field, native
+    select, or global live-region message can provide the chosen caption.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    from tools.browser_skill_dom import PAGE
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    injection = r"""
+const genderField=node('div',{class:'form-group'},form);
+node('label',{id:'gender-label','for':'gender',text:'Gender'},genderField);
+const shell=node('div',{class:'select__container'},genderField);
+const valueBox=node('div',{
+  class:'select__value-container select__value-container--has-value',
+},shell);
+if (MODE==='selected' || MODE==='ambiguous')
+  node('div',{class:'select__single-value',text:CAPTION},valueBox);
+if (MODE==='ambiguous')
+  node('div',{class:'select__single-value',text:'Decline To Self Identify'},valueBox);
+if (MODE==='outside')
+  node('div',{class:'select__single-value',text:CAPTION},shell);
+const inputBox=node('div',{class:'select__input-container','data-value':''},valueBox);
+const gender=node('input',{
+  id:'gender',type:'text',name:'gender',role:'combobox',
+  'aria-labelledby':'gender-label',
+  'aria-describedby':'gender-error','aria-errormessage':'gender-error',
+  'aria-expanded':'false',
+},inputBox);
+gender.value='';
+node('span',{id:'gender-error'},genderField);
+// This independent announcement must never become selected_text.
+node('div',{role:'status','aria-live':'polite',text:'option '+CAPTION+', selected.'},body);
+"""
+    injection = injection.replace('CAPTION', json.dumps(caption)).replace(
+        'MODE', json.dumps(state))
+    script = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', script, 'synthetic',
+         json.dumps({'url': 'https://employer.test/job/1'}), PAGE],
+        text=True, capture_output=True, check=True, timeout=30)
+    page = json.loads(completed.stdout)
+    field = next(c for c in page['controls'] if c['selector'] == '#gender')
+    return page, field
+
+
+@pytest.mark.parametrize('caption', ['Male', 'Decline To Self Identify'])
+def test_actual_react_select_local_caption_not_blank_search_input(caption):
+    """Read one local single-value after a select/blur, not the empty input."""
+    page, field = _read_local_react_select_gender(caption)
+    combo = field['combobox']
+    assert field['value'] == '' and field['has_value'] is False
+    assert combo['selected_text'] == caption
+    assert combo['displayed_text'] == caption
+    assert combo['selected_value'] == '' and combo['hidden_selector'] == ''
+    assert combo['local_selected_proven'] is True
+    assert combo['selected_caption_unreadable'] is False
+
+
+@pytest.mark.parametrize('state', ['missing', 'outside', 'ambiguous'])
+def test_actual_react_select_does_not_borrow_live_region_or_foreign_caption(state):
+    """A selected-looking but non-unique/foreign caption stays unreadable."""
+    _, field = _read_local_react_select_gender('Male', state=state)
+    combo = field['combobox']
+    assert field['value'] == ''
+    assert combo['selected_text'] == ''
+    assert combo['local_selected_proven'] is False
+    assert combo['selected_caption_unreadable'] is True

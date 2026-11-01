@@ -290,6 +290,23 @@ PAGE = r"""(() => {
           .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
+        // The React-select input can be blank after selection. Read only the
+        // single-value in this input's own selected value-container; never a
+        // page-wide caption or an accessibility live-region announcement.
+        const valueBox=e.closest('div.select__value-container');
+        const inputBox=e.closest('div.select__input-container');
+        const selectRoot=valueBox?.closest('div.select__container');
+        const localSelected=!!valueBox && (
+          valueBox.matches('div.select__value-container--has-value') ||
+          !!valueBox.querySelector('div.select__single-value'));
+        const localSingle=localSelected ? Array.from(
+          valueBox.querySelectorAll('div.select__single-value')) : [];
+        const localOwned=!!inputBox && inputBox.parentElement===valueBox &&
+          !!selectRoot && selectRoot.querySelectorAll('[role="combobox"]').length===1 &&
+          selectRoot.querySelector('[role="combobox"]')===e;
+        const localCaption=localSelected && localOwned && localSingle.length===1 &&
+          localSingle[0].closest('div.select__value-container')===valueBox &&
+          visible(localSingle[0]) ? clean(localSingle[0].innerText) : '';
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
@@ -307,7 +324,12 @@ PAGE = r"""(() => {
           } : {}),
           // A current form-owned hidden receiver is the submitted machine
           // value even when the visible combobox has no data-selected-value.
-          ...(receivers.length===1 ? {selected_value:receivers[0].value} : {})};
+          ...(receivers.length===1 ? {selected_value:receivers[0].value} : {}),
+          ...(localSelected ? {
+            selected_text:localCaption, displayed_text:localCaption,
+            local_selected_proven:!!localCaption,
+            selected_caption_unreadable:!localCaption,
+          } : {})};
       })() : null,
       href:e.tagName === 'A' ? e.href : ''};
   });
@@ -345,7 +367,38 @@ PAGE = r"""(() => {
         deletes[0].parentElement===item &&
         !!(owner || container),
     };
-  });
+  }).concat(Array.from(document.querySelectorAll(
+    'div.file-upload[role="group"][aria-labelledby]'))
+    .filter(group=>group.matches?.('div.file-upload[role="group"]')===true)
+    .map(group=>{
+      const owner=group.closest('form');
+      const container=group.closest('.ashby-application-form-container');
+      const labelId=(group.getAttribute('aria-labelledby') || '').trim();
+      const labels=labelId && !/\s/.test(labelId) ? Array.from(
+        document.querySelectorAll('#'+CSS.escape(labelId))) : [];
+      const names=Array.from(group.querySelectorAll('div.file-upload__filename'))
+        .filter(n=>n.closest('div.file-upload')===group);
+      const captions=names.length===1 ? Array.from(
+        names[0].querySelectorAll('p.body.body__secondary')) : [];
+      const remove=Array.from(group.querySelectorAll(
+        'button[aria-label="Remove file"]')).filter(b=>
+          b.closest('div.file-upload')===group);
+      const labelOwned=labels.length===1 && (
+        group.contains(labels[0]) ||
+        (!!owner && labels[0].closest('form')===owner) ||
+        (!owner && !!container && container.contains(labels[0])));
+      return {
+        filename:captions.length===1 ? clean(captions[0].innerText) : '',
+        field_label:labels.length===1 ? clean(labels[0].innerText) : '',
+        in_form:!!owner, form_selector:owner ? selector(owner) : '',
+        root_selector:container ? selector(container) : '',
+        valid:labelOwned && names.length===1 && captions.length===1 &&
+          captions[0].closest('div.file-upload__filename')===names[0] &&
+          remove.length===1 && !remove[0].disabled &&
+          remove[0].getAttribute('aria-disabled')!=='true' &&
+          !!(owner || container),
+      };
+    }));
   // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay data-bsk-overlay>
   // host (Pause Agent / Stop task buttons) as the child of <html> that directly
   // follows <body>. Treating it as an uninspected employer form gated every

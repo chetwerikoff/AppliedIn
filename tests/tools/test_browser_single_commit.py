@@ -641,7 +641,7 @@ async def test_formless_resume_set_producer_admits_only_its_own_exact_set(
         await session.application_effect("evaluate", other)
     with pytest.raises(forms.Gate, match="Only the staged row PDF"):
         await session.application_effect(
-            "upload", "#dropzone", "--file", str(pdf), timeout=130)
+            "upload", "#dropzone", "--file", str(pdf) + ".other", timeout=130)
     # An ordinary dropzone click is ungated preparation; it is not evidence
     # that the staged file was attached. Do not test an obsolete click grant.
     assert calls == [] and not controller.upload_attempted

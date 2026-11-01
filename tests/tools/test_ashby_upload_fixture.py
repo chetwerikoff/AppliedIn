@@ -836,7 +836,10 @@ async def test_repeated_model_upload_after_recovery_never_uploads_twice(
     assert result['status'] == 'gate'
     assert result['reason'] == 'agent_review_unavailable'
     assert 'observed form needs human inspection' in result['question']
-    assert authority.decisions == 6 and len(tasks) == 6
+    # Removing the per-action refusal lets all four harmless repeat
+    # decisions reach the model before its final review request. Neither
+    # decision replays the one protected upload or reaches Submit IPC.
+    assert authority.decisions == 7 and len(tasks) == 7
     assert 'The résumé is already attached by the server' in tasks[4]
     assert authority.fills == 2 and authority.upload_ipc == 1
     assert len(raw.uploads) == 1

@@ -284,7 +284,7 @@ def test_3300_options_and_long_page_text_preserve_complete_control_readback():
     forms.check_form(page, {}, True, 'Test User.pdf')
 
 
-def _read_local_react_select_gender(caption='Male', *, state='selected'):
+def _read_local_react_select_gender(caption='Male', *, state='selected', reader=None):
     """Run the production PAGE reader on the observed local React-select shape.
 
     Synthetic DOM only. The input stays blank and no hidden field, native
@@ -328,7 +328,7 @@ node('div',{role:'status','aria-live':'polite',text:'option '+CAPTION+', selecte
     script = fixture.replace(marker, injection + '\n' + marker)
     completed = subprocess.run(
         ['node', '-e', script, 'synthetic',
-         json.dumps({'url': 'https://employer.test/job/1'}), PAGE],
+         json.dumps({'url': 'https://employer.test/job/1'}), PAGE if reader is None else reader],
         text=True, capture_output=True, check=True, timeout=30)
     page = json.loads(completed.stdout)
     field = next(c for c in page['controls'] if c['selector'] == '#gender')
@@ -357,3 +357,23 @@ def test_actual_react_select_does_not_borrow_live_region_or_foreign_caption(stat
     assert combo['selected_text'] == ''
     assert combo['local_selected_proven'] is False
     assert combo['selected_caption_unreadable'] is True
+
+
+@pytest.mark.parametrize('caption,state', [
+    ('Male', 'selected'),
+    ('Decline To Self Identify', 'selected'),
+    ('Male', 'missing'),
+    ('Male', 'ambiguous'),
+])
+def test_protected_local_caption_matches_independent_fixed_reader(caption, state):
+    """A real final inventory uses two independent readers. The local
+    selected-value proof cannot be visible only in PAGE: that would reject
+    even a valid decline as a stale witness before the sole Submit check.
+    """
+    from tools.browser_skill_dom import PAGE
+
+    _, observed = _read_local_react_select_gender(
+        caption, state=state, reader=PAGE)
+    _, independent = _read_local_react_select_gender(
+        caption, state=state, reader=forms._FIXED_CONTROL_WITNESS)
+    assert observed['combobox'] == independent['combobox']

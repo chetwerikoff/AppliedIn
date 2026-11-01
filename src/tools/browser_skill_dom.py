@@ -50,6 +50,29 @@ _WIDGET_GRAPH = r"""
       e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||
       e.innerText || e.name);
   }
+  // The two independent readers use this same local-candidate shape for
+  // protected self-identification. A page-wide option announcement is never
+  // selection evidence, and country/location graphs remain unchanged.
+  function localProtectedChoice(e) {
+    if (e.tagName!=='INPUT' || e.type!=='text' ||
+        !/disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|sexual orientation|transgender|religion/i.test(controlCaption(e)))
+      return null;
+    const valueBox=e.closest('div.select__value-container');
+    const inputBox=e.closest('div.select__input-container');
+    const selectRoot=valueBox?.closest('div.select__container');
+    const selected=!!valueBox && (
+      valueBox.matches('div.select__value-container--has-value') ||
+      !!valueBox.querySelector('div.select__single-value'));
+    if (!selected) return null;
+    const singles=Array.from(valueBox.querySelectorAll('div.select__single-value'));
+    const sameField=!!inputBox && inputBox.parentElement===valueBox &&
+      !!selectRoot && selectRoot.querySelectorAll('[role="combobox"]').length===1 &&
+      selectRoot.querySelector('[role="combobox"]')===e;
+    const caption=sameField && singles.length===1 &&
+      singles[0].closest('div.select__value-container')===valueBox &&
+      visible(singles[0]) ? clean(singles[0].innerText) : '';
+    return {caption,unreadable:!caption};
+  }
   const graphNodes = new WeakMap(), newGraphs = new Map();
   const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
@@ -293,24 +316,7 @@ PAGE = r"""(() => {
         // The React-select input can be blank after selection. Read only the
         // single-value in this input's own selected value-container; never a
         // page-wide caption or an accessibility live-region announcement.
-        const valueBox=e.closest('div.select__value-container');
-        const inputBox=e.closest('div.select__input-container');
-        const selectRoot=valueBox?.closest('div.select__container');
-        // The final protection concerns self-identification. Ordinary
-        // closed country/location graphs retain their independent C2 and
-        // error-IDREF witnesses; a nearby display cannot upgrade them.
-        const localSelected=!!valueBox &&
-          /disabilit|veteran|\brace\b|ethnic|\bgender\b|\bsex\b|hispanic|latino|sexual orientation|transgender|religion/i.test(label(e)) &&
-          (valueBox.matches('div.select__value-container--has-value') ||
-           !!valueBox.querySelector('div.select__single-value'));
-        const localSingle=localSelected ? Array.from(
-          valueBox.querySelectorAll('div.select__single-value')) : [];
-        const localOwned=!!inputBox && inputBox.parentElement===valueBox &&
-          !!selectRoot && selectRoot.querySelectorAll('[role="combobox"]').length===1 &&
-          selectRoot.querySelector('[role="combobox"]')===e;
-        const localCaption=localSelected && localOwned && localSingle.length===1 &&
-          localSingle[0].closest('div.select__value-container')===valueBox &&
-          visible(localSingle[0]) ? clean(localSingle[0].innerText) : '';
+        const localChoice=localProtectedChoice(e);
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
@@ -329,10 +335,10 @@ PAGE = r"""(() => {
           // A current form-owned hidden receiver is the submitted machine
           // value even when the visible combobox has no data-selected-value.
           ...(receivers.length===1 ? {selected_value:receivers[0].value} : {}),
-          ...(localSelected ? {
-            selected_text:localCaption, displayed_text:localCaption,
-            local_selected_proven:!!localCaption,
-            selected_caption_unreadable:!localCaption,
+          ...(localChoice ? {
+            selected_text:localChoice.caption, displayed_text:localChoice.caption,
+            local_selected_proven:!!localChoice.caption,
+            selected_caption_unreadable:localChoice.unreadable,
           } : {})};
       })() : null,
       href:e.tagName === 'A' ? e.href : ''};

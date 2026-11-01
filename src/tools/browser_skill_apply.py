@@ -1425,6 +1425,7 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
         .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
           (typeof e.contains === 'function' && e.contains(h)) ||
           (hiddenName && h.name === hiddenName)));
+      const localChoice=type==='combobox' ? localProtectedChoice(e) : null;
       return {selector:ownSelector, diagnostic_locator:diagnosticLocator(e), unique:document.querySelectorAll(ownSelector).length === 1,
         commits_application:commitsApplication(e),
         tag:e.tagName.toLowerCase(), type, native_type:nativeType,
@@ -1473,7 +1474,12 @@ _FIXED_CONTROL_WITNESS = r"""(() => {
           displayed_text:clean(e.value || e.innerText || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:hidden.length === 1 ? selector(hidden[0]) : '',
-          hidden_value:hidden.length === 1 ? hidden[0].value : '', ...(graph || {})} : null};
+          hidden_value:hidden.length === 1 ? hidden[0].value : '', ...(graph || {}),
+          ...(localChoice ? {
+            selected_text:localChoice.caption, displayed_text:localChoice.caption,
+            local_selected_proven:!!localChoice.caption,
+            selected_caption_unreadable:localChoice.unreadable,
+          } : {})} : null};
     }), application_identity:applicationIdentity()};
 })()""".replace('  /* WIDGET_GRAPH */', _WIDGET_GRAPH)
 

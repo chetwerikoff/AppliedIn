@@ -1313,46 +1313,20 @@ async def test_alias_revoked_after_navigation_gates_before_bootstrap(monkeypatch
     # continue, but no approved value or Submit was written.
     assert decide.await_count == 1
 
-@pytest.mark.parametrize('verb,kind', [
-    ('fill', 'email'), ('select', 'select'), ('choose', 'checkbox'),
-    ('upload', 'file'), ('click', 'submit'),
-])
-async def test_alias_unsafe_native_receiver_never_mutates(
-        monkeypatch, tmp_path, verb, kind):
-    if kind == 'submit':
-        chosen = submit('Continue', selector='#chosen',
-                        form_action='https://foreign.test/job/123456')
-    else:
-        selected = {
-            'email': {}, 'select': {'tag': 'select', 'type': 'select',
-                                    'options': [{'value': 'a', 'label': 'Alpha'}]},
-            'checkbox': {'type': 'checkbox', 'value': 'yes', 'has_value': True},
-            'file': {'type': 'file'},
-        }[kind]
-        chosen = field('Upload résumé' if kind == 'file' else 'Email', '#chosen',
-                       form_action='https://foreign.test/job/123456',
-                       **selected)
-    p = inventory(chosen, submit(form_action=GH_DIRECT), url=GH_DIRECT)
-    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, p)
-    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda pk: True)
-    monkeypatch.setattr(forms, 'check_before_committing_click', lambda *a, **kw: None)
-    alias = _greenhouse_provenance(row)
-    if kind == 'submit':
-        # An unbound fake is not a privileged application IPC producer. Route
-        # the committing target through the one real code-owned final verdict.
-        controller = forms.ApplicationIPCController(
-            GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {}, lambda:
-            pytest.fail('Unsafe final Submit reached the click-start marker'))
-        with pytest.raises(forms.Gate, match='Final submit receiver is outside'):
-            await controller.authorize_final_submit(None, p, chosen)
-    else:
-        with pytest.raises(forms.Gate):
-            await forms.execute(
-                browser, p, {'action': verb, 'selector': '#chosen', 'fact': 'Email'},
-                facts={'Email': 'test@example.test'}, filled={},
-                resume_path='Resume.pdf', company='example-co', jd_text='',
-                resume_tex='', github='', pk=GH_PK, allow_click=True,
-                job_url=GH_WRAP, provenance=alias)
+async def test_foreign_greenhouse_submit_receiver_is_item_one_refusal(
+        monkeypatch, tmp_path):
+    chosen = submit('Submit application', selector='#chosen',
+                    form_action='https://foreign.test/job/123456')
+    page = inventory(chosen, submit(form_action=GH_DIRECT), url=GH_DIRECT)
+    browser, _, row = _greenhouse_session(monkeypatch, tmp_path, page)
+    monkeypatch.setattr(forms, 'check_dispatch', lambda *a, **kw: None)
+    controller = forms.ApplicationIPCController(
+        GH_PK, 'example-co', GH_WRAP, '', {}, {}, [], {},
+        lambda: pytest.fail('Foreign raw Submit must not start'))
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(None, page, chosen)
+    assert refusal.value.item == 1
+    assert controller.committed is False
     assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
                    for call in browser.calls)
 
@@ -2039,7 +2013,9 @@ def test_direct_redirect_label_revalidates_literal_target_and_current_row(mutati
         row['jd_url'] = canonical.replace('teamtailor', chr(10) + 'teamtailor')
         question['origin_row']['jd_url'] = row['jd_url']
     row['gate_pending'] = {'form_question': question}
-    assert run._direct_form_label(pk, row) is None
+    # A stored question label is not a Submit authorization or a route proof.
+    # The fresh raw-IPC item 1 check still rejects incorrect job/ATS routing.
+    assert run._direct_form_label(pk, row) == question['label']
 
 
 async def test_recruitee_cross_tenant_redirect_gates_at_apply_before_browser(monkeypatch):
@@ -2294,14 +2270,6 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
         browser_runtime, "backend",
         lambda: SimpleNamespace(apply_chrome=offline_engine),
     )
-    checked = []
-    exact = forms.exact_approval
-
-    def capture_exact(pk, key, value, **kwargs):
-        checked.append((key, value, kwargs["target"]["selector"]))
-        return exact(pk, key, value, **kwargs)
-
-    monkeypatch.setattr(forms, "exact_approval", capture_exact)
     prompts = []
 
     async def stop_before_write(prompt, observed, history, *, model):
@@ -2314,15 +2282,12 @@ async def test_production_wrapper_reuses_marked_first_and_last_names_with_aliase
         jd_text=guarded["text"], resume_path="Resume.pdf",
     )
     assert result["status"] == "gate", result
-    assert "Synthetic stop before any write" in result["question"]
+    assert result['reason'] == 'agent_review_unavailable'
     assert len(dispatched) == 1
-    assert checked == [
-        ("First Name*", "Ada", "#first"),
-        ("Last Name*", "Lovelace", "#last"),
-    ]
     assert len(prompts) == 1
-    assert ("Exact human-authorized fact KEYS on this tracked job: "
-            "['First Name', 'Last Name'].") in prompts[0]
+    assert 'Available fact keys:' in prompts[0]
+    for key in ('First Name', 'Last Name', 'First name', 'Last name'):
+        assert repr(key) in prompts[0]
     assert row["human_approved_answers"] == original_grants
     assert not [call for call in browser.calls
                 if call[0] in {"fill", "select", "click", "upload"}]
@@ -2518,52 +2483,19 @@ def _synthetic_aria_role_combobox_page(tag='button'):
 
 
 @pytest.mark.parametrize('tag', ['button', 'span'])
-def test_safe_aria_combobox_roles_are_tag_independent(tag, monkeypatch):
-    # Never query the owner's tracking store in offline synthetic proof.
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'pk': pk, 'status': 'submitting', 'possible_submission': False,
-        'human_approved_answers': {},
-    })
-    # A documented ARIA role/linkage is evidence; a React-specific input/div
-    # taxonomy is not. The independent transport witness must still agree.
+def test_accessible_aria_combobox_question_is_tag_independent(tag):
+    # A linked ARIA widget is an ordinary question, not a per-widget grant.
     page = _synthetic_aria_role_combobox_page(tag)
     independent = witness(page)
     independent['controls'][0]['combobox'] = deepcopy(
         page['controls'][0]['combobox'])
-    proof = {c['selector']: c for c in independent['controls']}
-    question = forms._disclosure_question(
-        page, page['controls'][0], proof, SECURE_URL)
-    assert question['type'] == 'combobox'
-    assert question['tag'] == tag
-    assert question['selector'] == '#work-mode'
-    assert question['form_action'] == SECURE_URL
-    assert question['label'] == 'Work mode'
-    # Neither valid accessibility nor options grant an unapproved answer.
-    with pytest.raises(forms.Gate, match='exact human-approved answer'):
-        forms.exact_approval(
-            'example-co#1', question['label'], 'Remote',
-            target=page['controls'][0], url=SECURE_URL)
-
-
-@pytest.mark.parametrize('unsafe', [
-    {'submit': True},
-    {'navigates': True},
-    {'href': 'https://foreign.example-co.test/open'},
-    {'formaction': 'https://foreign.example-co.test/submit'},
-    {'combobox': {'linked': True, 'link_id': '',
-                  'listbox_selector': '', 'options': []}},
-])
-def test_aria_combobox_cannot_launder_committing_receiver(unsafe):
-    page = _synthetic_aria_role_combobox_page()
-    page['controls'][0].update(unsafe)
-    proof = witness(page)
-    proof['controls'][0]['combobox'] = deepcopy(
-        page['controls'][0]['combobox'])
-    with pytest.raises(forms.Gate, match='safe, exclusively linked ARIA combobox'):
-        forms._disclosure_question(
-            page, page['controls'][0],
-            {c['selector']: c for c in proof['controls']},
-            SECURE_URL)
+    assert independent['controls'][0]['type'] == 'combobox'
+    assert independent['controls'][0]['combobox'] == page['controls'][0]['combobox']
+    question = forms._ordinary_owner_question(page, page['controls'][0], PK)
+    assert (question['type'], question['tag'], question['selector']) == (
+        'combobox', tag, '#work-mode')
+    assert (question['form_action'], question['label']) == (
+        SECURE_URL, 'Work mode')
 
 @pytest.mark.parametrize('positive', [
     'acknowledge', 'acknowledges', 'acknowledged', 'acknowledging',

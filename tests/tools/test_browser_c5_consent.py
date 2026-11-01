@@ -7,8 +7,7 @@ from __future__ import annotations
 import pytest
 
 from tools import browser_skill_apply as forms
-from tests.tools.test_browser_bootstrap import (
-    field, secure_attempt, secure_inventory, secure_world)
+
 
 
 def _text(label):
@@ -83,31 +82,46 @@ def test_promotional_clause_never_reclassifies_text_fields(label):
     assert forms._missing_answer_reason(target) == 'agent_review_unavailable'
 
 
-async def test_promotional_checkbox_routes_owner_end_to_end(monkeypatch):
-    consent = field('I agree to receive promotional emails', '#promo',
-                    tag='input', type='checkbox', value='on')
-    page = secure_inventory(consent)
-    browser, decide, _ = secure_world(monkeypatch, page)
-    report = await secure_attempt(page)
-    assert report['status'] == 'gate'
-    assert report['reason'] == 'owner_question'
-    assert report['review_route'] == 'owner'
-    assert decide.await_count == 0
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
+class _SyntheticSession:
+    def __init__(self):
+        self.calls = []
+
+    async def call(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return {}
 
 
-async def test_subscribe_checkbox_keeps_existing_account_guard(monkeypatch):
-    consent = field('I subscribe to recruitment marketing', '#promo',
-                    tag='input', type='checkbox', value='on')
-    page = secure_inventory(consent)
-    browser, decide, _ = secure_world(monkeypatch, page)
-    report = await secure_attempt(page)
-    assert report['status'] == 'gate'
-    assert report['reason'] != 'owner_question'
-    # Known D36 residual: the unchanged account guard keeps this label agent-first.
-    assert report['review_route'] == 'agent_unavailable'
-    assert 'Login or account form requires human inspection.' in report['question']
-    assert decide.await_count == 0
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
+def _choice_args():
+    return {
+        'facts': {}, 'filled': {}, 'resume_path': '',
+        'company': 'example-co', 'jd_text': 'Synthetic job',
+        'resume_tex': '', 'github': '', 'pk': 'example-co#1',
+        'job_url': 'https://example.test/application',
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_promotional_choice_asks_owner_without_a_grant():
+    target = _checkbox('I agree to receive promotional emails')
+    page = {'url': 'https://example.test/application', 'controls': [target]}
+    session = _SyntheticSession()
+    with pytest.raises(forms.Gate) as error:
+        await forms.execute(session, page, {
+            'action': 'choose', 'selector': '#agree',
+        }, **_choice_args())
+    assert error.value.reason == 'owner_question'
+    assert error.value.form_question['selector'] == '#agree'
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_account_purpose_choice_cannot_automate_subscription():
+    target = _checkbox('I subscribe to recruitment marketing')
+    page = {'url': 'https://example.test/application', 'controls': [target]}
+    session = _SyntheticSession()
+    with pytest.raises(forms.Gate, match='owner account action') as error:
+        await forms.execute(session, page, {
+            'action': 'choose', 'selector': '#agree', 'value': 'Yes',
+        }, **_choice_args())
+    assert error.value.reason != 'owner_question'
+    assert session.calls == []

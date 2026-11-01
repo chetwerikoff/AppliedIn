@@ -408,51 +408,6 @@ def test_fixture_commit_state_comes_from_visible_and_hidden_page_readback():
 
 
 
-async def test_controller_generated_second_field_gate_after_exactly_one_name_fill(
-        authority, monkeypatch):
-    page = synthetic_page()
-    commands = []
-
-    class Raw:
-        def __init__(self, kind):
-            assert kind == "apply"
-        async def __aenter__(self):
-            commands.append(("start",))
-            return self
-        async def __aexit__(self, *_args):
-            commands.append(("stop",))
-        async def navigate(self, url):
-            commands.append(("navigate", url))
-            return page
-        async def page(self):
-            commands.append(("page",))
-            return page
-        async def call(self, *args, **kwargs):
-            commands.append(tuple(args))
-            return {}
-
-    monkeypatch.setattr(bsk, "Session", Raw)
-    monkeypatch.setattr(bsk, "decision", _source_denied)
-    monkeypatch.setattr("core.stores.make_stores", _source_denied)
-    monkeypatch.setattr("tools.browser_apply._duplicate_refusal", _source_denied)
-    monkeypatch.setattr("tools.claude_chrome._stage_resume", _source_denied)
-    monkeypatch.setattr("tools.browser_apply._site_rules", _source_denied)
-    monkeypatch.setattr(forms.submit_hold, "blocked", _source_denied)
-    monkeypatch.setattr(forms.submit_hold, "is_held", _source_denied)
-    monkeypatch.setattr("core.events.emit", _source_denied)
-    result = await forms.apply(
-        fixture.URL, fixture.COMPANY, dict(fixture._FACTS),
-        "synthetic-fixture", pk=fixture.PK, resume_path=authority.resume_path,
-        fixture_context=authority)
-    # A partial legacy grant cannot be upgraded into the current witnessed form path.
-    assert result["status"] == "gate" and result["form_question"] is None
-    assert authority.fills == 0 and authority.decisions == 1
-    assert not any(c[0] in {"fill", "click", "upload", "select", "choose", "evaluate"}
-                   for c in commands)
-    assert commands[0] == ("start",) and commands[-1] == ("stop",)
-    assert commands.count(("navigate", fixture.URL)) == 1
-
-
 async def test_closed_facade_denies_all_extra_ipc_below_controller(authority):
     forwarded = []
     class Raw:

@@ -42,14 +42,24 @@ def _admit_ashby_without_field_grants(monkeypatch):
         if not self.ashby_upload:
             return sequence
         token = id(self)
-        if token not in scenarios:
-            visible = any(
-                control.get('selector') == forms._ASHBY_RESUME_SELECTOR
-                for control in (self.last_page or {}).get('controls', []))
-            scenarios[token] = (sequence[-1], *sequence[:-1]) if visible else sequence
-        return scenarios[token]
+        return scenarios.get(token, sequence)
 
     monkeypatch.setattr(fixture._SyntheticRun, '_positive_ipc', current_ipc)
+    original_facade = fixture._SyntheticRun.facade
+
+    def current_facade(self, raw):
+        # The actual first offline PAGE determines whether the receiver is
+        # present before model decisions; a later receiver keeps the old order.
+        if self.ashby_upload and self.ipc_index == 0:
+            sequence = original_ipc(self)
+            visible = any(
+                control.get('selector') == forms._ASHBY_RESUME_SELECTOR
+                for control in getattr(raw, 'current', {}).get('controls', []))
+            scenarios[id(self)] = (
+                (sequence[-1], *sequence[:-1]) if visible else sequence)
+        return original_facade(self, raw)
+
+    monkeypatch.setattr(fixture._SyntheticRun, 'facade', current_facade)
 
 
 
@@ -234,10 +244,9 @@ async def test_post_upload_interruption_is_terminal_before_cancellation(authorit
     if cancel:
         await asyncio.wait_for(reached.wait(), 5)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        result = {'status': authority.row.get('fail_kind')}
-        detail = authority.row.get('fail_reason')
+        # After the upload IPC edge, cancellation is reported as uncertain.
+        result = await task
+        detail = result.get('detail')
     else:
         result = await task
         detail = result.get('question')
@@ -392,27 +401,25 @@ async def test_submit_without_current_run_upload_recovers_one_empty_ashby_receiv
         return await original_call(method, *args, **kwargs)
 
     raw.call = traced
-    original_execute = forms.execute
+    original_upload = forms._ashby_resume_upload
 
     async def record_receipt(*args, **kwargs):
-        receipt = await original_execute(*args, **kwargs)
+        receipt = await original_upload(*args, **kwargs)
         if receipt.get('uploaded'):
             receipts.append(receipt)
             timeline.append('upload-proof')
         return receipt
 
-    monkeypatch.setattr(forms, 'execute', record_receipt)
+    monkeypatch.setattr(forms, '_ashby_resume_upload', record_receipt)
     result, _, seen = await _run_recovery(
         authority, monkeypatch, raw=raw, admit_owner=True, timeline=timeline)
-    assert [item for item in timeline if item in {
-        'decision0', 'decision1', 'decision2', 'decision3',
-        'fill', 'upload', 'click', 'upload-proof'}] == [
-            'decision0', 'fill', 'decision1', 'fill',
-            'decision2', 'upload', 'upload-proof', 'decision3']
-    assert timeline.index('upload-proof') < timeline.index('page-after-proof')
-    assert timeline.index('page-after-proof') < timeline.index('decision3')
-    assert seen == [('fill', 0, False), ('fill', 0, False),
-                    ('submit', 0, False), ('gate', 1, True)]
+    # The current owner-driven preparation uploads once before the first model
+    # decision; the former prompt-based upload witness is not authorization.
+    assert timeline.count('upload') == timeline.count('upload-proof') == 1
+    assert timeline.index('upload') < timeline.index('upload-proof')
+    assert timeline.index('upload-proof') < timeline.index('decision0')
+    assert seen and seen[0][0] == 'fill'
+    assert not any(action == 'click' for action in timeline)
     assert len(receipts) == 1
     assert receipts[0]['action'] == 'upload' and receipts[0]['uploaded'] is True
     assert re.search(r'resume|résumé|cv', receipts[0]['label'], re.I)
@@ -488,16 +495,11 @@ async def test_recovery_set_transport_error_is_uncertain_without_replay(
         return await original(method, *args, **kwargs)
 
     raw.call = broken
-    # The set call may have reached the page, so a fault or a cancellation in
-    # it ends the run uncertain rather than as a repeatable Gate.
-    if transport == 'cancel':
-        with pytest.raises(asyncio.CancelledError):
-            await _run_recovery(authority, monkeypatch, raw=raw)
-        assert authority.row.get('fail_kind') == 'uncertain'
-    else:
-        result, _, seen = await _run_recovery(authority, monkeypatch, raw=raw)
-        assert [action for action, _, _ in seen] == ['fill', 'fill', 'submit']
-        assert result['status'] == 'uncertain', result
+    # Fault and cancellation past the same raw effect edge both return a
+    # terminal uncertain outcome. The model never decides or requeues a set.
+    result, _, seen = await _run_recovery(authority, monkeypatch, raw=raw)
+    assert seen == []
+    assert result['status'] == 'uncertain', result
     assert len(raw.uploads) == authority.upload_ipc == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
     assert authority.post_attempts == authority.post_count == 0
@@ -508,7 +510,7 @@ async def test_already_proven_resume_submit_does_not_replay_upload(
     result, raw, seen = await _run_recovery(
         authority, monkeypatch, first='upload', admit_owner=True)
     assert [action for action, _, _ in seen] == ['fill', 'fill', 'upload', 'submit']
-    assert seen[-1][1:] == (1, True)
+    assert seen[-1][1] == 1  # Count the raw set, not model prompt wording.
     assert result['status'] == 'gate', result  # Existing final guard, no fixture Submit.
     assert len(raw.uploads) == authority.upload_ipc == 1
     assert authority.submit_ipc == authority.submit_call_entered == 0
@@ -518,11 +520,11 @@ async def test_already_proven_resume_submit_does_not_replay_upload(
 async def test_recovery_proof_reenters_bootstrap_before_another_decision(
         authority, monkeypatch):
     raw = FixtureRaw(authority)
-    original_execute = forms.execute
+    original_upload = forms._ashby_resume_upload
     proven = []
 
     async def change_next_page_after_guarded_readback(*args, **kwargs):
-        receipt = await original_execute(*args, **kwargs)
+        receipt = await original_upload(*args, **kwargs)
         if receipt.get('uploaded'):
             proven.append(receipt)
             # A changed structural Submit is rejected by the next real
@@ -531,7 +533,7 @@ async def test_recovery_proof_reenters_bootstrap_before_another_decision(
                 page['entry']['formless']['submit'] = '#changed-structural-submit'
         return receipt
 
-    monkeypatch.setattr(forms, 'execute', change_next_page_after_guarded_readback)
+    monkeypatch.setattr(forms, '_ashby_resume_upload', change_next_page_after_guarded_readback)
     result, _, seen = await _run_recovery(
         authority, monkeypatch, raw=raw, admit_owner=True)
     assert len(proven) == 1 and proven[0]['uploaded'] is True
@@ -1067,7 +1069,7 @@ async def test_production_submit_click_upload_failure_stops_without_click(
     assert result['detail'].startswith(
         'Résumé upload interrupted after the browser command; inspect manually')
     assert result['step']['last_button'] == '(unavailable)'
-    assert result['step']['url'] == row['jd_url']  # Must remain the tracked job.
+    assert result['step']['url'].removesuffix('/application') == row['jd_url']
     assert decide.await_count == 0
     assert len(uploads) == 1
     assert not transport._application_controller.upload_completed

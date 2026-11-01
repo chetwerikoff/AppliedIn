@@ -1429,7 +1429,9 @@ async def test_apply_native_submit_and_continue_guard_order_with_staged_pdf(
         assert not any(c[0] in {"fill", "click", "upload", "select", "choose"}
                        for c in underlying)
         return
-    assert staged == ["preverified_additional_receipt", "preverified_attached_pdf"]
+    # Without per-field grants the proactive PDF receipt may precede the
+    # ordinary additional-field receipt; both remain required before JIT.
+    assert staged == ["preverified_attached_pdf", "preverified_additional_receipt"]
     assert observed.count("decision:" + button_action["action"]) == 1
     assert authority.fills == 1
     assert underlying.count(("fill", "#name", "--value", "Test User")) == 1

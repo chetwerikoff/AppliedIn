@@ -1668,7 +1668,8 @@ def _formless_root(page: dict) -> dict | None:
     return None if entry.get('root') else entry.get('formless')
 
 
-def _formless_boundary(page: dict, provenance=None) -> list[dict]:
+def _formless_boundary(page: dict, provenance=None, *,
+                       submit_selector: str | None = None) -> list[dict]:
     """Prove the final same-job Ashby container, without widget approvals."""
     root = _formless_root(page)
     if (not root or not root.get('root') or root.get('error')
@@ -1691,7 +1692,9 @@ def _formless_boundary(page: dict, provenance=None) -> list[dict]:
     if len(members) != len(selectors):
         raise Gate('The final application container lost a receiver.')
     submit = root.get('submit')
-    if not isinstance(submit, str) or not submit or submit not in selectors:
+    if (not isinstance(submit, str) or not submit or submit not in selectors
+            or not (is_submission(controls[submit]) or native_submit(controls[submit]))
+            or (submit_selector is not None and submit != submit_selector)):
         raise Gate('A unique final application Submit is not proven.')
     # The submitter is a commit boundary, not a fill receiver. Description
     # links and account-purpose siblings never gain form-answer membership.
@@ -3351,7 +3354,10 @@ class ApplicationIPCController:
                     or self.upload_identity != self._row_pdf()):
                 raise Gate('Staged PDF upload is not current.')
             if _formless_root(page):
-                _formless_boundary(page, fresh_alias)
+                # Compare the exact raw committing target, not a different
+                # page-owned button with a similarly plausible caption.
+                _formless_boundary(
+                    page, fresh_alias, submit_selector=target.get('selector'))
             check_form(page, self.filled, True, Path(self.resume_path).name)
         except Gate:
             raise PreSubmitGate(2, 'The exact staged PDF or final form readback is incomplete.') from None

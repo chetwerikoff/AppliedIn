@@ -22,6 +22,7 @@ from tests.tools.test_browser_bootstrap_settlement import (
 )
 from tools import browser_skill as bsk
 from tools import browser_skill_apply as forms
+from tools import jd, posting_guard as pg
 
 
 class SyntheticBank:
@@ -77,14 +78,15 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
     bank = SyntheticBank({'Phone': PHONE} if bank_facts is None else bank_facts)
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
 
-    async def jd_meta(_row, *, yielding=True):
-        return {'text': 'Synthetic role text'}
+    # An owner-question fixture must first pass real matched-source admission.
+    def current_source(url, kind):
+        assert (url, kind) == (case.wrapper, 'jd')
+        text = 'Synthetic role text'
+        return {**pg.analyze(text, html_variants=[f'<p>{text}</p>'],
+                             source_required=True),
+                'source_kind': 'ats_html', 'source_url': url}
 
-    monkeypatch.setattr(run, '_jd_meta', jd_meta)
-    monkeypatch.setattr(
-        run, '_commit_posting_meta',
-        lambda pk, row, meta, current: current.tracking.get(pk))
-    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **k: True)
+    monkeypatch.setattr(jd, 'fetch_jd_meta', current_source)
     monkeypatch.setattr('core.rotation.ensure', lambda *a, **k: None)
     monkeypatch.setattr('core.profiles.resolve_for', lambda *a, **k: None)
     monkeypatch.setattr('core.profiles.expand_all', lambda facts: facts)

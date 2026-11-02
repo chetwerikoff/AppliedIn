@@ -2225,12 +2225,14 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
         session._readiness = True
     diagnostics = _WaitDiagnostics()
     phase = 'page'
+    completed = None  # (reason, predicate map) of the last poll that finished
     try:
         while loop.time() < deadline:
             diagnostics.sample(True)
             phase = 'page'
             try:
-                async with asyncio.timeout_at(deadline):
+                budget = asyncio.timeout_at(deadline)
+                async with budget:
                     fresh_session_read = page is None
                     page = await session.page() if fresh_session_read else page
                     diagnostics.page(page)
@@ -2290,6 +2292,7 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                     last_reason = ('unstable application form inventory' if seen else
                                    'no qualifying application form')
                     previous = identity
+                    completed = (last_reason, dict(diagnostics.state))
             except _EntryNotReady as exc:
                 observed = getattr(exc, 'observed_page', None)
                 if phase == 'safety' or (phase == 'page' and entry_session):
@@ -2301,9 +2304,16 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                     diagnostics.safety_passed()
                 last_reason, previous = str(exc), None
                 diagnostics.set('pair.stable', None)
+                completed = (last_reason, dict(diagnostics.state))
             except TimeoutError as exc:
-                last_reason, previous = _read_failure_reason(exc, entry_session), None
-                diagnostics.read_failed(phase)
+                if completed is not None and (budget.expired() or loop.time() >= deadline):
+                    # The wait budget cut an in-flight read: that read is not
+                    # evidence. Keep the last completed poll's reason and map.
+                    last_reason, diagnostics.state = completed[0], dict(completed[1])
+                    previous = None
+                else:
+                    last_reason, previous = _read_failure_reason(exc, entry_session), None
+                    diagnostics.read_failed(phase)
                 diagnostics.set('deadline.remaining', loop.time() < deadline)
                 break
             except (OSError, bsk.Unavailable) as exc:

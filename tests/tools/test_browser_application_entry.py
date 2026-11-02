@@ -675,7 +675,9 @@ async def test_one_monotonic_budget_includes_reads_and_sleeps_not_navigation(mon
     monkeypatch.setattr(forms.asyncio, 'sleep', elapsed_sleep)
     report = await attempt()
     assert report['status'] == 'gate'
-    assert 'read failed (exception=TimeoutError) after bounded wait' in report['question']
+    # The read cut by the deadline keeps the last completed poll's reason (C4b).
+    assert 'unstable application form inventory after bounded wait' in report['question']
+    assert 'read failed' not in report['question']
     # 40s navigation is excluded; four reads exhaust the single 15s wait,
     # whereas a restarted deadline would wrongly allow bootstrap.
     assert session.pages == 4
@@ -2937,3 +2939,31 @@ async def test_issue214_protected_response_survives_parent_fill_and_fresh_readba
         assert 'PROTECTED' not in repr(snapshot)
     assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == [
         ('fill', '#email', '--value', 'test@example-co.test')]
+
+
+async def test_deadline_cut_read_keeps_last_completed_not_ready_reason(monkeypatch, caplog):
+    # C4b: a read cut off by the wait deadline must not overwrite the not-ready
+    # evidence of the polls that completed before it.
+    caplog.set_level(logging.INFO, logger=forms._LOG.name)
+    _, _, session, decide = world(monkeypatch, pages=[application('ashby', controls=[])])
+    reads = []
+
+    async def slow_late_read(s):
+        reads.append(1)
+        if len(reads) > 1:
+            await asyncio.Event().wait()
+    session.on_page = slow_late_read
+    monkeypatch.setattr(forms, '_APPLICATION_WAIT_SECONDS', 0.4)
+    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.4)
+    report = await asyncio.wait_for(attempt(), timeout=3)
+    assert report['status'] == 'gate'
+    assert len(reads) > 1
+    assert 'no qualifying application form after bounded wait' in report['question']
+    assert 'read failed' not in report['question']
+    state = _wait_map(report['question'])
+    # The completed poll's predicate map survives; only the deadline is final.
+    assert state['read.page_available'] == 'true'
+    assert state['deadline.remaining'] == 'false'
+    assert _logged_map(caplog) == state
+    assert not decide.await_count
+    no_mutations(session)

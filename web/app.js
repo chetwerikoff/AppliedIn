@@ -363,10 +363,88 @@ function resumeBody(pk, act, value) {
   return { answer };
 }
 const STALE_OWNER_GATE = "This question is out of date. It is asked again on the next pass.";
+
+// Ephemeral evidence: do not persist exact gate tokens or add them to events.
+const _replyWitnesses = new Map();
+const _replyAttemptGates = new Map();
+const _replyAmbiguousGates = new Map();
+const _replyNotices = new Map();
+let _refusalStreamLost = false;
+const REFUSAL_DETAIL = "Owner reply not accepted.";
+const REFUSAL_CONTEXT = "An answer attempt for this pending question was not accepted; check before replying again.";
+
+function ownerGateKey(r) {
+  return r && routeOf(r) === "owner_question"
+    && r.gate_has_form_question === true && r.gate_has_call_id === true
+    && typeof r.gate_generation === "string" && !!r.gate_generation
+    && typeof r.gate_question_identity === "string" && !!r.gate_question_identity
+    ? JSON.stringify([r.gate_generation, r.gate_question_identity]) : "";
+}
+function markedReplyRefusal(e) {
+  return e?.kind === "response" && e.resume_answer_refused === true
+    && e.refusal_reason === "invalid_answer";
+}
+function replyNoticeHtml(r) {
+  return ownerGateKey(r) && _replyNotices.get(r.pk) === ownerGateKey(r)
+    ? `<div class="diag-note diag-triage" role="status">${REFUSAL_CONTEXT}</div>` : "";
+}
+function replyNoticeSlot(r) {
+  return routeOf(r) === "owner_question"
+    ? `<div data-reply-refusal="${esc(r.pk)}">${replyNoticeHtml(r)}</div>` : "";
+}
+function refreshReplyNoticeNodes(pk) {
+  const r = state.apps.find((item) => item.pk === pk);
+  $('[data-reply-refusal="' + CSS.escape(pk) + '"]').forEach((el) => {
+    el.innerHTML = r ? replyNoticeHtml(r) : "";
+  });
+}
+function pruneReplyEvidence() {
+  for (const [pk, key] of _replyAttemptGates) {
+    const r = state.apps.find((item) => item.pk === pk);
+    if (ownerGateKey(r) !== key) {
+      _replyAttemptGates.delete(pk);
+      _replyAmbiguousGates.delete(pk);
+    }
+  }
+  for (const [pk, witness] of _replyWitnesses) {
+    if (ownerGateKey(state.apps.find((r) => r.pk === pk)) !== witness.key)
+      _replyWitnesses.delete(pk);
+  }
+  for (const [pk, key] of _replyNotices) {
+    if (ownerGateKey(state.apps.find((r) => r.pk === pk)) !== key)
+      _replyNotices.delete(pk);
+  }
+}
+function beginReplyWitness(pk, body) {
+  const r = state.apps.find((item) => item.pk === pk);
+  const key = ownerGateKey(r);
+  const previous = _replyAttemptGates.get(pk);
+  // Two locally submitted attempts to the same gate are indistinguishable in
+  // an event with only a PK; neither can authorize current-question attribution.
+  if (key && previous === key) _replyAmbiguousGates.set(pk, key);
+  else if (previous !== key) _replyAmbiguousGates.delete(pk);
+  _replyAttemptGates.set(pk, key);
+  _replyWitnesses.delete(pk);
+  _replyNotices.delete(pk);
+  refreshReplyNoticeNodes(pk);
+  const exact = key && ["answer", "skip"].includes(body?.disposition)
+    && body.expected_gate_generation === r.gate_generation
+    && body.expected_question_identity === r.gate_question_identity;
+  if (!exact || _replyAmbiguousGates.get(pk) === key
+      || _refusalStreamLost || state.liveState !== "live") return null;
+  const witness = { key, acknowledged: false };
+  _replyWitnesses.set(pk, witness);
+  return witness;
+}
 // The resume endpoint only accepts work; the row itself shows the outcome.
 // "Sent" is shown only once the request was accepted, never before.
 function sendResume(pk, body, accepted) {
+  const witness = beginReplyWitness(pk, body);
   return post(`/actions/resume/${encodeURIComponent(pk)}`, body).then((d) => {
+    if (witness && _replyWitnesses.get(pk) === witness) {
+      if (d?.ok === true && d.status === "resuming") witness.acknowledged = true;
+      else _replyWitnesses.delete(pk);
+    }
     // post() already reported a network failure (null) in its own toast.
     if (d && (d.ok === false || d.error)) toast(d.error === "invalid_answer"
       ? "That reply was refused. Refresh and answer the current question." : (d.error || "Refused."));
@@ -1471,6 +1549,7 @@ function gateMini(r) {
       title="Open details">
     <div class="nc-co">${esc(r.company)}<span class="nc-role">${esc(r.title)}</span></div>
     <div class="nc-q">${esc(q)}</div>
+    ${replyNoticeSlot(r)}
     <div class="nc-foot"><span class="nc-gate">${esc(gateLabel(r.gate_reason))}</span>${act}</div>
   </div>`;
 }
@@ -2469,12 +2548,13 @@ function needsCard(r) {
     <div class="gc-actions">${canRequeueStructuralGate(r) ? requeueButton(r, "btn btn-primary") : ""}
       <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
   </article>`;
-  return `<article class="gatecard">
+  return `<article class="gatecard" data-reply-card="${esc(r.pk)}">
     <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
       <div class="gc-side"><span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
         <button class="btn btn-ghost" data-open="${esc(r.pk)}">Details</button></div></header>
     <div class="gc-q md">${md(r.gate_question || defaultGateText(r))}</div>
     ${manual && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
+    ${replyNoticeSlot(r)}
     <div class="gc-answer">
       ${owner ? `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
         placeholder="Answer the verified question…"></textarea>` : ""}
@@ -4769,6 +4849,7 @@ function openDrawer(pk) {
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
       ${captchaHandoff && r.gate_question ? `<div class="gate-q md">${esc(defaultGateText(r))}</div>` : ""}
+      ${replyNoticeSlot(r)}
       ${ownerQuestion ? `<textarea id="gate-answer" class="gate-input" rows="2"
         placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="drawer-actions">
@@ -4947,6 +5028,7 @@ function openDrawer(pk) {
   });
   state.openPk = r.pk;
   state.openRoute = routeOf(r);
+  state.openGateKey = ownerGateKey(r);
   rtStop();
   if (retailoring) rtBegin(r.pk);
   if (r.has_diff) loadDiff(r.pk);

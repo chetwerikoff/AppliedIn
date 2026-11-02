@@ -521,6 +521,56 @@ def test_current_jd_drift_never_rebinds_old_tailored_pdf_on_retry(
         assert current["status"] == "tailored"
     browser.assert_not_awaited()
 
+def test_normalized_equivalent_trailing_spaces_commit_before_browser(
+    stores, monkeypatch,
+):
+    old_text = TEXT + " "
+    old = pg.analyze(old_text, html_variants=[f"<p>{old_text}</p>"],
+                     source_required=True)
+    row = stores.tracking.get_current(PK)
+    assert stores.tracking.update_posting_guard(
+        PK, row, old, source_witness=True)
+    browser = _fake_direct_boundary(stores, monkeypatch)
+    calls = _fake_reads(monkeypatch, [_source()])
+    outcome = asyncio.run(run._apply_direct(PK, stores))
+    assert outcome["result"] == "gated"  # only the fake form gate
+    assert len(calls) == 1
+    browser.assert_awaited_once()
+    updated = stores.tracking.get_current(PK)
+    assert updated["jd_text"] == TEXT
+    assert updated["status"] == "needs_human"
+
+
+def test_retailor_reads_changed_long_jd_before_rebuilding_resume(
+    stores, monkeypatch,
+):
+    row = stores.tracking.get_current(PK)
+    assert stores.tracking.update_posting_guard(
+        PK, row, _source(), source_witness=True)
+    stores.tracking.set_status(
+        PK, Status.TAILORED, gate_reason="approval",
+        fail_kind="posting_guard_review_required")
+    changed = TEXT + "A new synthetic technical requirement."
+    calls = _fake_reads(monkeypatch, [_source(changed)])
+    tailored = []
+
+    async def fake_tailor(pk, state, title, company):
+        tailored.append((pk, state["jd_text"], title, company))
+
+    monkeypatch.setattr(run, "_session_state",
+                        lambda row, text: {"jd_text": text, "tailor_note": ""})
+    monkeypatch.setattr(run, "_tailor_only", fake_tailor)
+    monkeypatch.setattr(run, "_run", lambda awaitable: asyncio.run(awaitable))
+    outcome = run.retailor(PK, stores=stores)
+
+    assert outcome["result"] == "ok"
+    assert len(calls) == 1
+    assert tailored == [(PK, changed, "Test Engineer", "example-co")]
+    updated = stores.tracking.get_current(PK)
+    assert updated["jd_text"] == changed
+    assert pg.valid(updated["jd_text"], updated["posting_guard"])
+    assert updated["status"] == "tailored"
+
 
 @pytest.mark.parametrize("kind,html", [
     ("hidden_link", f'<p>{TEXT}</p><a hidden href="https://hidden.example.test/">secret</a>'),
@@ -578,31 +628,56 @@ def test_invalid_old_revision_html_only_positive_cannot_be_laundered(
      "generation": "unknown", "source_verified": True},
     {"revision": "posting-guard-v0", "status": "clean", "reasons": None,
      "generation": "corrupt", "source_verified": True},
+    {"revision": "posting-guard-v0", "status": "clean", "reasons": [],
+     "generation": "unverified-old-generation", "source_verified": True},
+    {"revision": "unknown-v999", "status": "clean", "reasons": [],
+     "generation": "bogus", "source_verified": True},
 ])
-def test_corrupt_or_unknown_legacy_guard_stays_closed(
+def test_untrusted_old_guard_is_replaced_only_after_fresh_clean_source(
     stores, monkeypatch, old_meta,
 ):
     _replace_row(stores, posting_guard=old_meta)
     browser = _fake_direct_boundary(stores, monkeypatch)
-    _fake_reads(monkeypatch, [_source()])
+    calls = _fake_reads(monkeypatch, [_source()])
     outcome = asyncio.run(run._apply_direct(PK, stores))
-    assert outcome["reason"] == "posting_guard_review_required"
+    assert outcome["result"] == "gated"  # only the synthetic form gate
+    assert len(calls) == 1
+    browser.assert_awaited_once()
+    current = stores.tracking.get_current(PK)
+    assert current["jd_text"] == TEXT
+    assert current["posting_guard"]["revision"] == pg.REVISION
+    assert current["posting_guard"]["status"] == "clean"
+    assert pg.valid(current["jd_text"], current["posting_guard"])
+
+
+def test_untrusted_old_guard_read_failure_names_failure_and_stays_closed(
+    stores, monkeypatch,
+):
+    old_meta = {"revision": "unknown-v999", "status": "clean",
+                "reasons": [], "generation": "bogus",
+                "source_verified": True}
+    _replace_row(stores, posting_guard=old_meta)
+    browser = _fake_direct_boundary(stores, monkeypatch)
+    calls = _fake_reads(monkeypatch, [
+        jd.PostingReadUnavailable("synthetic legacy source unavailable")])
+    outcome = asyncio.run(run._apply_direct(PK, stores))
+    assert len(calls) == 1
+    assert outcome["result"] == "gated"
+    assert "synthetic legacy source unavailable" in outcome["detail"]
     browser.assert_not_awaited()
-    assert stores.tracking.get_current(PK)["posting_guard"] == old_meta
+    current = stores.tracking.get_current(PK)
+    assert current["posting_guard"] == old_meta
+    assert current["fail_kind"] == "posting_guard_review_required"
 
 
-@pytest.mark.parametrize("legacy", [False, True])
 def test_current_clean_source_allows_old_clean_generation_only(
-    stores, monkeypatch, legacy,
+    stores, monkeypatch,
 ):
     old = stores.tracking.get_current(PK)
     assert stores.tracking.update_posting_guard(
         PK, old, _source(), source_witness=True)
     current = stores.tracking.get_current(PK)
-    old_meta = current["posting_guard"]
-    if legacy:
-        old_meta = {**old_meta, "revision": "posting-guard-v0"}
-    _replace_row(stores, posting_guard=old_meta,
+    _replace_row(stores, posting_guard=current["posting_guard"],
                  reviewed_guard_generation="previous-clean-generation")
     browser = _fake_direct_boundary(stores, monkeypatch)
     calls = _fake_reads(monkeypatch, [_source()])

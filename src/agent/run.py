@@ -681,7 +681,7 @@ def _commit_posting_meta(pk: str, observed: dict, meta: dict,
         expected_row = {**observed, "jd_text": expected["text"],
                         "posting_guard": expected["posting_guard"]}
         if (not guard_observation_matches(updated, expected_row)
-                or _reader_witness(updated) != _reader_witness(observed)
+                or _reader_witness(updated) != _reader_witness(expected_row)
                 or submit_hold.blocked(pk, updated, tracking=stores.tracking)):
             return None
     return updated
@@ -765,27 +765,17 @@ def _direct_approval_check(pk: str, expected: dict,
     return None, current
 
 
-def _approval_old_evidence_safe(row: dict) -> bool:
-    """A legacy projection may lose HTML-only positives: never promote those."""
+def _approval_old_positive_evidence(row: dict) -> bool:
+    """Keep known positives from invalid legacy metadata monotonic."""
     from tools import posting_guard as pg
 
     old = row.get("posting_guard")
-    if pg.valid(row.get("jd_text") or "", old):
-        return True
-    if not isinstance(old, dict):
-        return False
-    reasons = old.get("reasons")
-    # Only an identifiable older, internally coherent nonpositive revision can
-    # be reevaluated. Corrupt current revisions and unknown evidence stay gated.
-    return (isinstance(old.get("revision"), str)
-            and bool(old["revision"]) and old["revision"] != pg.REVISION
-            and isinstance(old.get("generation"), str)
-            and bool(old["generation"])
-            and type(old.get("source_verified")) is bool
-            and reasons in ([], ["source_html_unavailable"])
-            and old.get("status") == (
-                "unchecked" if reasons else "clean"))
-
+    reasons = old.get("reasons") if isinstance(old, dict) else None
+    # A fresh clean source may repair absent/corrupt metadata, but a recognized
+    # historic positive cannot be reconstructed from the sanitized JD alone.
+    return (isinstance(reasons, list)
+            and any(isinstance(reason, str) and reason in pg._POSITIVE
+                    for reason in reasons))
 
 async def _jd_text(row: dict, *, yielding: bool = True) -> str:
     """Compatibility string reader; model ingress uses _jd_meta plus commit."""
@@ -1242,7 +1232,10 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
         row = stores.tracking.get(pk) or row
 
     try:
-        inspected = _run(_jd_meta(row))
+        # A direct-approval refusal can mean cached long text hid posting drift;
+        # re-tailor from a fresh matched source before rebuilding that résumé.
+        refresh_source = row.get("fail_kind") == "posting_guard_review_required"
+        inspected = _run(_jd_meta(row, approval=refresh_source))
         updated = _commit_posting_meta(pk, row, inspected, stores)
         if updated is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
@@ -1708,7 +1701,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         baseline = pg.analyze(row.get("jd_text") or "",
                               strip_trailing=True)["text"]
         incoming = pg.analyze(jd_meta["text"], strip_trailing=True)["text"]
-        if incoming != baseline or not _approval_old_evidence_safe(row):
+        if incoming != baseline or _approval_old_positive_evidence(row):
             return _guard_refusal(pk, stores, observed=observed)
 
         guarded = _commit_posting_meta(pk, observed, jd_meta, stores)
@@ -1727,13 +1720,15 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         changed, _ = _direct_approval_check(pk, row, stores)
         if changed:
             return changed
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         # A reader failure is not permission to use cached verified metadata.
         # Refusal must compare the original claim, not settle a newer owner.
         log.exception("guarded JD fetch failed for pk=%s", pk)
-        emit("error", pk=pk, agent="applier", url=jd_url,
-             detail="Posting could not be safely inspected; current review required.")
-        return _guard_refusal(pk, stores, observed=observed)
+        failure = str(exc).strip() or type(exc).__name__
+        detail = f"Posting source read failed ({type(exc).__name__}): {failure}"
+        emit("error", pk=pk, agent="applier", url=jd_url, detail=detail)
+        refused = _guard_refusal(pk, stores, observed=observed)
+        return {**refused, "detail": detail}
     if _no_sponsorship(jd_text):  # don't submit an application that's a guaranteed no
         from core.events import emit
         stores.tracking.set_status(pk, Status.FAILED, fail_reason=_NO_SPONSOR_REASON,

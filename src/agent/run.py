@@ -231,6 +231,144 @@ def _reader_eligible(row: dict, *, now: datetime | None = None) -> bool:
         return False
 
 
+
+class JDURLUnresolvable(ValueError):
+    """The stored historic relative posting lacks safe current source authority."""
+
+
+def _historical_relative(row: dict) -> bool:
+    """Classify only the original persisted destination, never a reader projection."""
+    from urllib.parse import urlsplit
+
+    raw = row.get("jd_url")
+    # An absent legacy field is not a persisted historical relative address;
+    # preserve the pre-existing no-URL workflows and their separate guards.
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+        return parsed.scheme not in ("http", "https") or not parsed.netloc
+    except ValueError:
+        return True
+
+
+def _reader_url(row: dict) -> str:
+    """Source-bound operational read target; never write it back to a row."""
+    from urllib.parse import unquote, urljoin, urlsplit
+
+    from discovery.watchlist import load_watchlist
+    from tools.jd import _valid_reader_url
+
+    raw = row.get("jd_url")
+    if not _historical_relative(row):
+        return raw
+    if (not isinstance(raw, str) or not raw
+            or raw.startswith("//") or any(
+                c.isspace() or ord(c) < 32 or ord(c) == 127 or c == "\\"
+                for c in raw)):
+        raise JDURLUnresolvable("Original relative posting URL is unsafe")
+    try:
+        parts = urlsplit(raw)
+        if (parts.scheme or parts.netloc or parts.fragment or not parts.path
+                or any(unquote(seg) in (".", "..") or any(
+                    x in unquote(seg) for x in ("/", "\\", "%"))
+                    or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+                           for ch in unquote(seg))
+                    for seg in parts.path.split("/") if seg)):
+            raise JDURLUnresolvable("Original relative posting path is unsafe")
+        name = row.get("company")
+        ats = row.get("ats")
+        if not isinstance(name, str) or not name.strip() or ats not in ("custom", "workday"):
+            raise JDURLUnresolvable("Missing exact historical source classification")
+        cfg = Path(get_settings().config_dir) / "watchlist.yaml"
+        current_watchlist = load_watchlist(cfg)
+        matches = [c for c in current_watchlist
+                   if c.name.strip().casefold() == name.strip().casefold()
+                   and c.ats == ats]
+        # Another company entry with the same name but different source is
+        # ambiguous too; it must not be used as a source-specific fallback.
+        all_names = [c for c in current_watchlist
+                     if c.name.strip().casefold() == name.strip().casefold()]
+        if len(matches) != 1 or len(all_names) != 1:
+            raise JDURLUnresolvable("Current watchlist source is missing or ambiguous")
+        company = matches[0]
+        careers = company.careers_url
+        if not _valid_reader_url(careers):
+            raise JDURLUnresolvable("Current careers URL is unsafe")
+        base = urlsplit(careers)
+        if base.query or base.fragment:
+            raise JDURLUnresolvable("Current careers URL is not an origin base")
+        if ats == "workday":
+            from discovery.adapters.workday import _CXS_PATH, _HOST, _safe_segment
+
+            board_raw = company.board
+            if (not board_raw or not _valid_reader_url(board_raw)
+                    or any(c.isspace() for c in board_raw)):
+                raise JDURLUnresolvable("Explicit Workday board is missing")
+            board = urlsplit(board_raw)
+            match = _CXS_PATH.fullmatch(board.path)
+            if (board.scheme != "https" or base.scheme != "https"
+                    or _HOST.fullmatch(board.netloc) is None
+                    or board.query or board.fragment or match is None
+                    or not all(_safe_segment(seg) for seg in match.groups())
+                    or board.hostname != base.hostname or board.port != base.port):
+                raise JDURLUnresolvable("Workday careers and CXS board disagree")
+            site = match.group(2)
+            wrapper = [seg for seg in base.path.split("/") if seg]
+            # Workday's public wrapper may have a single locale component.
+            if (not wrapper or wrapper[-1] != site or len(wrapper) > 2
+                    or (len(wrapper) == 2 and not re.fullmatch(
+                        r"[A-Za-z]{2}(?:-[A-Za-z]{2})?", wrapper[0]))):
+                raise JDURLUnresolvable("Workday careers wrapper does not match site")
+            segments = parts.path.split("/")
+            if (len(segments) != 4 or segments[1] != "job"
+                    or not all(_safe_segment(seg) for seg in segments[2:])
+                    or segments[-1] != row.get("job_id") or parts.query):
+                raise JDURLUnresolvable("Workday posting identity does not match")
+            return f"https://{board.netloc}/{site}{parts.path}"
+        target = urljoin(careers, raw)
+        resolved = urlsplit(target)
+        if (not _valid_reader_url(target)
+                or resolved.hostname != base.hostname
+                or resolved.scheme != base.scheme
+                or resolved.port != base.port
+                or (raw.startswith("/") and resolved.path != parts.path)
+                or (not raw.startswith("/") and not resolved.path.endswith(
+                    "/" + parts.path))
+                or resolved.query != parts.query):
+            raise JDURLUnresolvable("Custom posting is not on the current careers origin")
+        return target
+    except (ValueError, OSError, TypeError) as exc:
+        if isinstance(exc, JDURLUnresolvable):
+            raise
+        raise JDURLUnresolvable("Current posting source cannot be verified") from exc
+
+
+def _relative_attention(pk: str, stores: Any, *,
+                        observed: dict | None = None) -> dict:
+    """Review-only settlement under the original reader witness, not a fresh one."""
+    reason = "posting_guard_review_required"
+    detail = "Historical posting source requires manual same-job verification; no application queued."
+    try:
+        current = stores.tracking.get(pk)
+        if not current:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        expected = observed if observed is not None else current
+        check = _reader_check(pk, expected, stores)
+        if check:
+            return check
+        if current.get("status") == "tailoring":
+            ok, _ = _reader_patch(pk, expected, stores, {
+                "status": Status.NEEDS_HUMAN, "gate_reason": reason,
+                "fail_kind": "source_html_unavailable", "error": detail,
+            })
+            if not ok:
+                return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+    except Exception as exc:
+        return _reader_storage_error(pk, stores, current if 'current' in locals() else None, exc)
+    return {"result": "gated", "pk": pk, "reason": reason, "detail": detail}
+
+
 def _reader_patch(pk: str, row: dict, stores: Any, changes: dict) -> tuple[bool, dict]:
     """One conditional partial commit against the same observed generation."""
     patch = dict(changes)
@@ -248,8 +386,10 @@ def _reader_check(pk: str, observed: dict, stores: Any) -> dict | None:
     Re-check immediately before preparation and recovery enqueue as well.
     """
     current = stores.tracking.get(pk)
-    if not current or current.get("status") != observed.get("status") or (
-            _reader_witness(current) != _reader_witness(observed)):
+    if (not current or current.get("status") != observed.get("status")
+            or any(current.get(field) != observed.get(field)
+                   for field in ("pk", "company", "job_id", "ats", "jd_url"))
+            or _reader_witness(current) != _reader_witness(observed)):
         return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
     if current.get("confirmation_id") or submit_hold.blocked(
             pk, current, tracking=stores.tracking):
@@ -382,7 +522,7 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         if (result or {}).get("result") == "prepared":
             try:
                 current = stores.tracking.get(pk) or {}
-                if current.get("apply_requested_at"):
+                if current.get("apply_requested_at") and not _historical_relative(current):
                     # Request authority is checked AGAIN inside the queue entry.
                     # The first GET can race a cancellation in any prepare-only
                     # mode, not just a JD-attention recovery.
@@ -399,9 +539,32 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     """Settle the actual admitted TAILORING generation, never an old FOUND row."""
     from tools.jd import PostingReadUnavailable
 
+    # Original relative URLs can only be processed by the review agent, even
+    # after a verified operational read and an earlier application request.
+    prepare_only = bool(prepare_only or _historical_relative(row))
     try:
         jd_meta = await _jd_meta(row)
         jd_text = jd_meta["text"]
+    except JDURLUnresolvable:
+        detail = ("Historical posting URL cannot be resolved against a unique safe "
+                  "current source. Verify the source manually; nothing was prepared.")
+        try:
+            check = _reader_check(pk, row, stores)
+            if check:
+                return check
+            committed, _ = _reader_patch(pk, row, stores, {
+                "status": Status.ERROR, "fail_kind": "jd_url_unresolvable",
+                "error": detail, "jd_read_error": "", "jd_read_retry_at": None,
+            })
+        except Exception as exc:
+            return _reader_storage_error(pk, stores, row, exc)
+        if not committed:
+            return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        from core.events import emit
+
+        emit("error", pk=pk, detail=detail, url=row.get("jd_url"))
+        return {"result": "error", "pk": pk, "reason": "jd_url_unresolvable",
+                "detail": detail}
     except PostingReadUnavailable as exc:
         try:
             check = _reader_check(pk, row, stores)
@@ -446,6 +609,15 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         log.warning("posting read deferred for pk=%s: %s", pk, detail)
         return {"result": "deferred", "pk": pk, "reason": "jd_reader_unavailable",
                 "detail": detail}
+
+    # A current board URL, HTTP 200, or guessed effective address cannot
+    # certify the historic original posting. Without an independent same-job
+    # HTML witness, leave the existing source guard and stop before preparation.
+    if _historical_relative(row):
+        from tools.jd import matched_source_witness
+
+        if not matched_source_witness(row, jd_meta):
+            return _relative_attention(pk, stores, observed=row)
 
     # This commit is required even on an initially metadata-free row. A later
     # FAILED exit must use its NEW witness, not the pre-read TAILORING witness.
@@ -574,17 +746,15 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
 
 async def _jd_meta(row: dict, *, yielding: bool = True,
                    approval: bool = False) -> dict:
-    """Select guarded JD; only direct approval requires raw current evidence.
-
-    yielding controls the reader's transport priority for ordinary JD consumers;
-    approval separately disables their cached/shorter-source fallback.
-    """
+    """Guarded JD read with separate operational URL and original source proof."""
     from tools import jd as _jd, posting_guard as pg
 
+    # Resolve before even considering cached text or opening Chrome/ATS/HTTP.
+    url = _reader_url(row)
+    historical = _historical_relative(row)
     if approval:
-        url = row.get("jd_url") or ""
-        if not url:
-            raise _jd.PostingReadUnavailable("Missing tracked posting URL")
+        if historical or not _jd._valid_reader_url(url):
+            raise JDURLUnresolvable("Historical relative posting is not an application URL")
         fresh = await asyncio.to_thread(_jd.fetch_jd_meta, url, "jd")
         if (not isinstance(fresh, dict)
                 or not isinstance(fresh.get("text"), str)
@@ -597,10 +767,14 @@ async def _jd_meta(row: dict, *, yielding: bool = True,
     old = row.get("posting_guard")
     if not pg.valid(captured, old):
         old = pg.projection(captured, old)["posting_guard"]
+    if historical:
+        # Previously cached content is not a source witness for an original
+        # relative posting, irrespective of its length or old guard projection.
+        old = pg.analyze(captured, previous=old,
+                         source_required=True)["posting_guard"]
     local = pg.analyze(captured, previous=old,
                        source_required="source_html_unavailable" in old.get("reasons", []))
     local["source_kind"] = ""
-    url = row.get("jd_url") or ""
     need_source = "source_html_unavailable" in old.get("reasons", [])
     if not url or (len(captured) >= 400 and not need_source):
         return local
@@ -608,7 +782,7 @@ async def _jd_meta(row: dict, *, yielding: bool = True,
         remote = await asyncio.to_thread(
             _jd.fetch_jd_meta, url, "jd_sweep" if yielding else "jd")
     except _jd.PostingReadUnavailable:
-        if _unreadable(local["text"]):
+        if historical or _unreadable(local["text"]):
             raise
         return local
     if not isinstance(remote, dict):
@@ -616,20 +790,20 @@ async def _jd_meta(row: dict, *, yielding: bool = True,
     rtext, guard = remote.get("text"), remote.get("posting_guard")
     if not isinstance(rtext, str) or not pg.valid(rtext, guard):
         return local
-    # Directory imports require ATS HTML; ordinary feed/crawler sources can
-    # clear the provisional marker after a verified same-URL HTTP read.
+    if historical:
+        # This tag is transient and is matched to independently parsed HTML
+        # canonical + JobPosting identifier, never projected into persisted jd_url.
+        remote = {**remote, "reader_effective_url": url}
     source_witness = _jd.matched_source_witness(row, remote)
     use_remote = bool(rtext) and (
         len(rtext) > len(local["text"]) or (need_source and source_witness))
-    # Canonical deferred reads of an already guarded feed summary retain the
-    # normalized metadata contract. A legacy/unwitnessed source keeps harmless
-    # terminal spaces and remains unchecked until source evidence is verified.
-    # Merge rebinds the generation to the selected text and all source findings.
     selected = (rtext.strip() if not need_source else rtext) if use_remote else local["text"]
     combined = pg.merge(selected, guard, old, source_witness=source_witness)
     return {**combined,
             "source_kind": remote.get("source_kind", "") if source_witness else "",
-            "source_url": url if source_witness else ""}
+            "source_url": remote.get("source_url", "") if source_witness else "",
+            "reader_effective_url": url if historical else "",
+            "source_identity": remote.get("source_identity") if historical else None}
 
 
 def _commit_posting_meta(pk: str, observed: dict, meta: dict,
@@ -838,22 +1012,33 @@ def prefetch_browser_jds(rows: list[dict], stores: Any) -> int:
             if row.get("confirmation_id") or submit_hold.blocked(
                     pk, row, tracking=stores.tracking):
                 continue
-            need.append(row)
+            try:
+                effective = _reader_url(row)
+            except JDURLUnresolvable:
+                # A browser echo cannot repair missing source authority.
+                continue
+            if not _jd._valid_reader_url(effective):
+                continue
+            need.append((row, effective))
         except Exception:
             log.exception("JD prefetch reader/tracking storage failed during selection for %s", pk)
     if not need:
         return 0
     log.info("reading %d browser-only posting(s) before the sweep", len(need))
     try:
-        got, gone = _jd.read_postings([r["jd_url"] for r in need], with_gone=True,
+        got, gone = _jd.read_postings([url for _, url in need], with_gone=True,
                                       with_meta=True)
     except _jd.PostingReadUnavailable as exc:
         log.warning("browser prefetch deferred: %s", exc)
         return 0
     filled = closed = 0
-    for observed in need:
-        pk, url = observed["pk"], observed["jd_url"]
+    for observed, url in need:
+        pk = observed["pk"]
         if url not in gone and not got.get(url):
+            continue
+        if _historical_relative(observed):
+            # Batch got/gone is keyed by the calculated URL, not independently
+            # verified original same-job HTML. Neither result may write this row.
             continue
         try:
             check = _reader_check(pk, observed, stores)
@@ -983,6 +1168,9 @@ def _enqueue_apply(pk: str, stores: Any, *, priority: bool = False,
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": submit_hold.REASON}
+    if _historical_relative(row):
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
+                "detail": "Historical relative posting requires manual source review."}
     if row.get("confirmation_id"):
         return {"result": "refused", "pk": pk, "reason": "already_confirmed"}
     if row.get("status") in ("applied", "applied_manual"):
@@ -1627,6 +1815,11 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
 
     row = stores.tracking.get(pk) or {}
     company, jd_url = row.get("company", ""), row.get("jd_url", "")
+    # Pre-browser JD handoff: neither the queued row nor a transient reader
+    # resolution may turn an original relative href into an Apply destination.
+    if _historical_relative(row):
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
+                "detail": "Historical relative posting requires manual source review."}
 
     # DUPLICATE GUARD — the one mistake this system must never make twice: a row
     # already applied (by the pipeline or by the owner's own hand) is refused
@@ -2050,6 +2243,8 @@ async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> 
     current = stores.tracking.get_current(pk)
     if not current:
         return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required"}
+    if _historical_relative(current):
+        return _relative_attention(pk, stores)
     session = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
     if session is None or _stale_posting(session, current, current.get("jd_text") or ""):
         return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
@@ -2130,7 +2325,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         int(row.get("jd_read_attempts") or 0) >= 3
         or row.get("fail_kind") in (
             "jd_reader_exhausted", "jd_tracking_storage_error",
-            "jd_retry_session_error"))
+            "jd_retry_session_error", "jd_url_unresolvable"))
     claim = _claim(pk, stores)
     if claim is None:
         return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
@@ -2213,7 +2408,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         if (result or {}).get("result") == "prepared":
             try:
                 current = stores.tracking.get(pk) or {}
-                if current.get("apply_requested_at"):
+                if current.get("apply_requested_at") and not _historical_relative(current):
                     return _enqueue_apply(pk, stores, priority=True,
                                           require_request=True)
             except Exception as exc:
@@ -2412,6 +2607,15 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
 
     from core.events import emit
 
+    # The review-only runner is the only safe agent for a persisted relative
+    # posting. Reject before invoking any root/applier tool (including resumes).
+    current = stores.tracking.get(pk) or {}
+    if _historical_relative(current):
+        from .graph import review_agent
+
+        if getattr(runner, "agent", None) is not review_agent:
+            return _relative_attention(pk, stores)
+        prepare_only = True
     last_author = None
     apply_result: Any = None  # the browser apply() return, if the applier ran it
     auto_go = False           # approval auto-granted → run _apply_direct after close
@@ -2445,6 +2649,9 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             for call in event.get_function_calls() or []:  # tool call = step INPUT
                 if call.name == "ask_human":
                     question = (call.args or {}).get("question", "")
+                    if (question.startswith("Ready to apply")
+                            and _historical_relative(stores.tracking.get(pk) or {})):
+                        return _relative_attention(pk, stores)
                     # NEVER offer "the tailored résumé is saved" unless one actually
                     # is. The tailor sometimes drifts into chat and finishes without
                     # calling save_tailored_resume; approving that gate would open a
@@ -2521,6 +2728,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                 emit("result", pk=pk, agent=author, detail=fr.name, output=_short(fr.response))
 
     if auto_go:
+        if _historical_relative(stores.tracking.get(pk) or {}):
+            return _relative_attention(pk, stores)
         # DECOUPLED: don't apply inline (a slow browser session would block the
         # evaluate worker from scoring/tailoring the rest of the backlog). Hand the
         # job to the apply queue; the separate apply worker submits it under the cap.
@@ -2537,6 +2746,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
 
     if prepare_only:
         row = stores.tracking.get(pk) or {}
+        if _historical_relative(row):
+            return _relative_attention(pk, stores)
         if not str(row.get("resume_s3_key") or "").endswith(".pdf"):
             stores.tracking.set_status(pk, Status.FAILED, fail_kind="no_resume",
                                        fail_reason="No PDF was saved. Retry preparation.")

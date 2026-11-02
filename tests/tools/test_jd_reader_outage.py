@@ -1107,3 +1107,361 @@ def test_retry_session_attention_storage_fault_is_bounded(monkeypatch):
     assert "could not be persisted" in result["detail"]
     assert tracking.get(pk)["status"] == "tailoring"
     assert not tracking.r.exists(f"lock:job:{pk}")
+
+
+
+# Issue #299: historical hrefs remain persisted relative; only their operational
+# read target is resolved from a unique, explicitly matching current source.
+_WORKDAY_BOARD = "https://wd.example.invalid/wday/cxs/fake-tenant/fake-site/jobs"
+_WORKDAY_CAREERS = "https://wd.example.invalid/en/fake-site"
+_WORKDAY_PATH = "/job/Example/Platform_ABC-17"
+_WORKDAY_URL = "https://wd.example.invalid/fake-site/job/Example/Platform_ABC-17"
+
+
+def _source_watchlist(monkeypatch, *, ats="workday", careers=None, board=None,
+                      extras=()):
+    from discovery.watchlist import CompanyConfig
+    entries = [CompanyConfig(
+        name="example-co", ats=ats,
+        careers_url=careers if careers is not None else (
+            _WORKDAY_CAREERS if ats == "workday" else "https://example.test/careers/"),
+        board=board if board is not None else (_WORKDAY_BOARD if ats == "workday" else ""),
+    ), *extras]
+    monkeypatch.setattr(run, "get_settings",
+                        lambda: SimpleNamespace(config_dir="/synthetic-only"))
+    monkeypatch.setattr("discovery.watchlist.load_watchlist", lambda _: entries)
+    return entries
+
+
+def _original_row(*, ats="workday", cached="Test role"):
+    return {
+        "pk": "example-co#Platform_ABC-17" if ats == "workday" else "example-co#42",
+        "company": "example-co", "ats": ats,
+        "job_id": "Platform_ABC-17" if ats == "workday" else "42",
+        "jd_url": _WORKDAY_PATH if ats == "workday" else "/jobs/42?lang=en",
+        "status": "found", "jd_text": cached,
+        "discovery_source": "crawler",
+    }
+
+
+@pytest.mark.parametrize("ats,original_href,expected", [
+    ("workday", _WORKDAY_PATH, _WORKDAY_URL),
+    ("custom", "/jobs/42?lang=en", "https://example.test/jobs/42?lang=en"),
+    ("custom", "jobs/42?lang=en", "https://example.test/careers/jobs/42?lang=en"),
+])
+def test_historic_reader_uses_exact_operational_target_before_cached_text(
+    monkeypatch, ats, original_href, expected,
+):
+    from tools import posting_guard as pg
+
+    _source_watchlist(monkeypatch, ats=ats)
+    row = _original_row(ats=ats, cached="Cached text " * 75)
+    row["jd_url"] = original_href
+    original = dict(row)
+    html = ('<html><head><link rel="canonical" href="' + expected +
+            '"><script type="application/ld+json">' +
+            json.dumps({"@type": "JobPosting", "identifier": {"value": row["job_id"]},
+                        "url": expected}) + '</script></head><body><h1>Test role</h1>' +
+            "<p>Build trustworthy offline systems. " * 35 + "</p></body></html>")
+    meta = pg.analyze(html, html_variants=[html], source_required=True)
+    meta.update(source_kind="http_html", source_url=expected,
+                source_identity=jd._html_source_identity(html))
+    requested = []
+
+    def read(target, kind):
+        requested.append(target)
+        return meta
+
+    monkeypatch.setattr(jd, "fetch_jd_meta", read)
+    selected = asyncio.run(run._jd_meta(row))
+    assert requested == [expected]
+    assert selected["reader_effective_url"] == expected
+    assert jd.matched_source_witness(row, selected)
+    assert selected["posting_guard"]["source_verified"] is True
+    assert row == original  # pk, URL, status and all reader witnesses unchanged
+
+
+@pytest.mark.parametrize("case", [
+    "missing", "duplicate", "board_absent", "board_foreign", "board_site",
+    "careers_foreign", "careers_site", "id_mismatch", "userinfo", "backslash",
+    "protocol_relative", "wrong_port", "traversal",
+])
+def test_workday_missing_or_unsafe_source_never_reaches_reader_or_cache(
+    monkeypatch, case,
+):
+    from discovery.watchlist import CompanyConfig
+
+    entries = _source_watchlist(monkeypatch)
+    row = _original_row(cached="Previously cached text " * 40)
+    if case == "missing":
+        entries.clear()
+    elif case == "duplicate":
+        entries.append(entries[0].model_copy(deep=True))
+    elif case == "board_absent":
+        entries[0].board = ""
+    elif case == "board_foreign":
+        entries[0].board = _WORKDAY_BOARD.replace("wd.example.invalid", "foreign.example")
+    elif case == "board_site":
+        entries[0].board = _WORKDAY_BOARD.replace("fake-site", "other-site")
+    elif case == "careers_foreign":
+        entries[0].careers_url = "https://foreign.example/en/fake-site"
+    elif case == "careers_site":
+        entries[0].careers_url = "https://wd.example.invalid/en/other-site"
+    elif case == "id_mismatch":
+        row["job_id"] = "Other_ID-99"
+    elif case == "userinfo":
+        entries[0].careers_url = "https://user@wd.example.invalid/en/fake-site"
+    elif case == "backslash":
+        row["jd_url"] = "/job/Example\\Platform_ABC-17"
+    elif case == "protocol_relative":
+        row["jd_url"] = "//foreign.example/job/Example/Platform_ABC-17"
+    elif case == "wrong_port":
+        entries[0].careers_url = "https://wd.example.invalid:8443/en/fake-site"
+    elif case == "traversal":
+        row["jd_url"] = "/job/%2e%2e/Platform_ABC-17"
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda *args: pytest.fail("unsafe source reached JD reader"))
+    with pytest.raises(run.JDURLUnresolvable):
+        asyncio.run(run._jd_meta(row))
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_unresolvable_settles_without_reader_outage_budget_or_cache(
+    monkeypatch, conflict,
+):
+    from core.models import JobRecord
+
+    pk = "example-co#job-1"
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    assert tracking.put_new(JobRecord(
+        company="example-co", job_id="job-1", ats="custom",
+        title="Test role", jd_url="/jobs/job-1",
+        jd_text="Cached text " * 60))
+    # JD/guard text is bound at creation; status writes may not overwrite it.
+    tracking.set_status(pk, Status.FOUND, jd_read_attempts=1,
+                        jd_read_revision=6, jd_read_retry_at=None)
+    stores = SimpleNamespace(tracking=tracking)
+    _source_watchlist(monkeypatch, ats="custom")[0].careers_url = ""
+    monkeypatch.setattr("core.events.emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run, "_session_service",
+                        lambda: pytest.fail("Unresolved URL cannot reach ADK/cache"))
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda *args: pytest.fail("Unresolved URL cannot reach HTTP/browser"))
+    if conflict:
+        original = tracking.update_if_status
+
+        def race(target, status, patch, *, expected_reader):
+            if patch.get("fail_kind") == "jd_url_unresolvable":
+                tracking.set_status(pk, Status.TAILORING, jd_read_revision=8)
+            return original(target, status, patch, expected_reader=expected_reader)
+
+        monkeypatch.setattr(tracking, "update_if_status", race)
+    outcome = run.run_job(pk, stores)
+    row = tracking.get(pk)
+    if conflict:
+        assert outcome["result"] == "conflict"
+        assert row["status"] == "tailoring"
+    else:
+        assert outcome["reason"] == "jd_url_unresolvable"
+        assert row["status"] == "error"
+        assert row["fail_kind"] == "jd_url_unresolvable"
+        assert row["jd_read_revision"] == 8
+        assert row["jd_read_retry_at"] is None
+        assert row["jd_read_error"] == ""
+    assert row["jd_url"] == "/jobs/job-1"
+    assert row["jd_read_attempts"] == 1
+    assert row["jd_text"] == "Cached text " * 60
+
+
+def test_synthetic_corrected_base_retry_is_review_only_with_zero_apply_calls(
+    monkeypatch,
+):
+    from core.apply_queue import ApplyQueue
+
+    tracking, pk = _synthetic_tracking()
+    tracking.set_status(pk, Status.ERROR, jd_url="/jobs/job-1",
+                        fail_kind="jd_url_unresolvable", jd_read_attempts=0,
+                        jd_read_revision=5,
+                        apply_requested_at="synthetic-prior-request")
+    stores = SimpleNamespace(tracking=tracking)
+    _source_watchlist(monkeypatch, ats="custom")
+    monkeypatch.setattr("core.events.emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run, "_reset_session", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(run, "_enqueue_apply",
+                        lambda *args, **kw: pytest.fail("Historical retry must not queue"))
+
+    async def review_only(target, admitted, current_stores, *, prepare_only):
+        assert prepare_only is True
+        assert admitted["jd_read_prepare_only"] is True
+        current_stores.tracking.set_status(target, Status.TAILORED)
+        return {"result": "prepared", "pk": target}
+
+    monkeypatch.setattr(run, "_run_job_async", review_only)
+    outcome = run.retry_job(pk, stores)
+    row = tracking.get(pk)
+    assert outcome["result"] == "prepared"
+    assert row["jd_read_prepare_only"] is True
+    assert row["apply_requested_at"] == "synthetic-prior-request"
+    assert row["jd_url"] == "/jobs/job-1"
+    assert ApplyQueue(tracking.r).pending() == []
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "review_retry"])
+def test_positive_workday_html_and_prior_request_never_authorize_application(
+    monkeypatch, entry,
+):
+    from agent import graph
+    from core.models import JobRecord
+    from tools import posting_guard as pg
+    from core.apply_queue import ApplyQueue
+
+    _source_watchlist(monkeypatch)
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    row = _original_row()
+    pk = row["pk"]
+    assert tracking.put_new(JobRecord(
+        company=row["company"], job_id=row["job_id"], ats=row["ats"],
+        title="Test role", jd_url=row["jd_url"], jd_text="Test role"))
+    tracking.set_status(pk, Status.FOUND if entry == "ordinary" else Status.ERROR,
+                        fail_kind="" if entry == "ordinary" else "jd_url_unresolvable",
+                        jd_read_attempts=0, apply_requested_at="synthetic-request")
+    stores = SimpleNamespace(tracking=tracking)
+    html = ('<html><head><link rel="canonical" href="' + _WORKDAY_URL +
+            '"><script type="application/ld+json">' +
+            json.dumps({"@type": "JobPosting", "url": _WORKDAY_URL,
+                        "identifier": {"value": row["job_id"]}}) +
+            '</script></head><body><h1>Test role</h1><p>' +
+            ("Build reliable products and resilient infrastructure. " * 16) +
+            '</p></body></html>')
+    meta = pg.analyze(html, html_variants=[html], source_required=True)
+    meta.update(source_kind="http_html", source_url=_WORKDAY_URL,
+                source_identity=jd._html_source_identity(html))
+    asks = []
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda url, kind: (asks.append(url) or meta))
+    monkeypatch.setattr("core.events.emit", lambda *args, **kw: None)
+    monkeypatch.setattr(run, "_session_state",
+                        lambda *args: {"base_latex": "Test User seed"})
+    monkeypatch.setattr(run, "_save_output", lambda *args: None)
+    monkeypatch.setattr(run, "_reset_session", lambda _: asyncio.sleep(0))
+    monkeypatch.setattr(run, "_enqueue_apply",
+                        lambda *args, **kwargs: pytest.fail("Apply queue forbidden"))
+    monkeypatch.setattr(run, "_apply_direct",
+                        lambda *args, **kwargs: pytest.fail("Direct apply forbidden"))
+
+    class EmptySessions:
+        async def get_session(self, **kwargs):
+            return None
+
+        async def create_session(self, **kwargs):
+            return None
+
+    class ReviewRunner:
+        def __init__(self, agent, **kwargs):
+            assert agent is graph.review_agent, "root_agent would be apply-capable"
+            self.agent = agent
+
+        async def run_async(self, **kwargs):
+            if False:
+                yield None
+
+    monkeypatch.setattr(run, "_session_service", lambda: EmptySessions())
+    monkeypatch.setattr(run, "Runner", ReviewRunner)
+    outcome = (run.run_job(pk, stores) if entry == "ordinary"
+               else run.retry_job(pk, stores))
+    final = tracking.get(pk)
+    assert outcome["result"] == "gated"
+    assert outcome["reason"] == "posting_guard_review_required"
+    assert asks == [_WORKDAY_URL]
+    assert final["jd_url"] == _WORKDAY_PATH
+    assert final["apply_requested_at"] == "synthetic-request"
+    assert final["status"] == "needs_human"
+    assert ApplyQueue(tracking.r).pending() == []
+
+
+@pytest.mark.parametrize("bad_href", [
+    "jobs/../42?lang=en",
+    "jobs/%2e%2e/42?lang=en",
+    "jobs/%2felse",
+    "//foreign.example/jobs/42",
+    "jobs/42#fragment",
+    "foreign:jobs/42",
+    "jobs\\42",
+])
+def test_custom_historical_path_relative_rejects_unsafe_source_before_cache(
+    monkeypatch, bad_href,
+):
+    _source_watchlist(monkeypatch, ats="custom")
+    row = _original_row(ats="custom", cached="Previously cached text " * 50)
+    row["jd_url"] = bad_href
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda *args: pytest.fail("Unsafe href reached JD reader"))
+    with pytest.raises(run.JDURLUnresolvable):
+        asyncio.run(run._jd_meta(row))
+
+
+@pytest.mark.parametrize("entry", ["direct", "queued", "resume", "root_agent"])
+def test_historical_relative_prior_request_cannot_enter_application_handoff(
+    monkeypatch, entry,
+):
+    """A persisted relative URL is not Apply authority even after preparation."""
+    from core.models import JobRecord
+    from tools import browser_apply
+
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    row = _original_row()
+    pk = row["pk"]
+    assert tracking.put_new(JobRecord(
+        company=row["company"], job_id=row["job_id"], ats=row["ats"],
+        title="Test role", jd_url=row["jd_url"], jd_text="Test role"))
+    tracking.set_status(pk, Status.TAILORED,
+                        apply_requested_at="synthetic-prior-request")
+    stores = SimpleNamespace(tracking=tracking)
+    before = tracking.get(pk)
+    monkeypatch.setattr(browser_apply, "apply",
+                        lambda *args, **kw: pytest.fail("Application browser reached"))
+    monkeypatch.setattr(run, "_enqueue_apply",
+                        lambda *args, **kw: pytest.fail("Application queue reached"))
+
+    class NoSession:
+        async def get_session(self, **kwargs):
+            pytest.fail("Historical relative resume reached an agent session")
+
+    monkeypatch.setattr(run, "_session_service", lambda: NoSession())
+    monkeypatch.setattr(run, "Runner",
+                        lambda *args, **kw: pytest.fail("Apply-capable agent created"))
+    if entry == "direct":
+        outcome = asyncio.run(run._apply_direct(pk, stores))
+    elif entry == "queued":
+        monkeypatch.setattr(run, "make_stores", lambda: stores)
+
+        class FakeLease:
+            def __init__(self):
+                self.finished = []
+
+            def done(self, item):
+                self.finished.append(item)
+
+            def retry(self, *args):
+                pytest.fail("Historical relative dispatch retried")
+
+        lease = FakeLease()
+        item = {"pk": pk}
+        outcome = run.run_queued(item, lease)
+        assert lease.finished == [item]
+    elif entry == "resume":
+        outcome = asyncio.run(run._resume_job_async(
+            pk, "synthetic-answer", "synthetic-call", stores))
+    else:
+        class ApplyCapableRunner:
+            agent = object()
+
+            def run_async(self, **kwargs):
+                pytest.fail("Apply-capable agent invoked")
+
+        outcome = asyncio.run(run._drive_async(
+            ApplyCapableRunner(), pk, object(), stores))
+
+    assert outcome["result"] == "gated"
+    assert outcome["reason"] == "posting_guard_review_required"
+    assert tracking.get(pk) == before

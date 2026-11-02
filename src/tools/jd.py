@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 import httpx
@@ -66,6 +68,89 @@ def _guarded(title: str, text: str, *, html_variants=(),
     return {"title": cleaned_title, **inspected}
 
 
+def _valid_reader_url(value: object) -> bool:
+    """Only complete, non-ambiguous HTTP(S) addresses may reach a reader."""
+    if (not isinstance(value, str) or not value
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+                   or ch == "\\" for ch in value)):
+        return False
+    try:
+        p = urlsplit(value)
+        return (p.scheme in {"http", "https"} and bool(p.netloc)
+                and bool(p.hostname) and p.username is None
+                and p.password is None and p.port != 0
+                and not p.hostname.endswith(".")
+                and not any(ch in p.hostname for ch in "%<>^`{|}"))
+    except ValueError:
+        return False
+
+
+class _JobHTMLIdentity(HTMLParser):
+    """Capture only HTML-authored canonical and JobPosting JSON-LD witnesses."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.canonicals: list[str] = []
+        self.structured: list[str] = []
+        self._ld: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        fields = dict(attrs)
+        if tag == "link" and "canonical" in (fields.get("rel") or "").lower().split():
+            self.canonicals.append(fields.get("href") or "")
+        if tag == "script" and (fields.get("type") or "").lower() == "application/ld+json":
+            self._ld = []
+
+    def handle_data(self, data: str) -> None:
+        if self._ld is not None:
+            self._ld.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self._ld is not None:
+            self.structured.append("".join(self._ld))
+            self._ld = None
+
+
+def _html_source_identity(html: str) -> dict:
+    """Independent job ID and posting URL from fetched HTML, never a model echo."""
+    try:
+        parser = _JobHTMLIdentity()
+        parser.feed(html)
+        parser.close()
+        canonical = set(parser.canonicals)
+        ids: set[str] = set()
+        posting_urls: set[str] = set()
+        for raw in parser.structured:
+            document = json.loads(raw)
+            queue = [document]
+            while queue:
+                item = queue.pop()
+                if isinstance(item, list):
+                    queue.extend(item)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                queue.extend(item.get("@graph", []) if isinstance(item.get("@graph"), list) else [])
+                kind = item.get("@type", "")
+                kinds = kind if isinstance(kind, list) else [kind]
+                if "JobPosting" not in kinds:
+                    continue
+                identifier = item.get("identifier")
+                if isinstance(identifier, dict):
+                    identifier = identifier.get("value")
+                if isinstance(identifier, (str, int)) and str(identifier):
+                    ids.add(str(identifier))
+                if isinstance(item.get("url"), str):
+                    posting_urls.add(item["url"])
+        if (len(canonical) != 1 or len(ids) != 1 or len(posting_urls) != 1
+                or canonical != posting_urls):
+            return {}
+        url = next(iter(canonical))
+        return {"canonical_url": url, "job_id": next(iter(ids))} if _valid_reader_url(url) else {}
+    except (ValueError, TypeError, RecursionError):
+        return {}
+
+
 def _same_posting_url(expected: str, effective: str) -> bool:
     """A redirect proves original HTML only for the same posting identity."""
     try:
@@ -92,9 +177,24 @@ def matched_source_witness(row: dict, meta: dict) -> bool:
     """
     guard = meta.get("posting_guard")
     kind = meta.get("source_kind")
-    return (_same_posting_url(row.get("jd_url") or "",
-                              meta.get("source_url") or "")
-            and isinstance(guard, dict) and guard.get("source_verified") is True
+    if not isinstance(guard, dict) or guard.get("source_verified") is not True:
+        return False
+    original = row.get("jd_url") or ""
+    if not _valid_reader_url(original):
+        # The operational URL is not a historical source witness. Require a
+        # *separate* canonical and job ID parsed from actual HTTP HTML, plus
+        # exact effective-response identity and the original persisted job ID.
+        target = meta.get("reader_effective_url") or ""
+        identity = meta.get("source_identity")
+        return (kind == "http_html"
+                and row.get("discovery_source") != "career_ops"
+                and isinstance(identity, dict)
+                and bool(row.get("job_id"))
+                and identity.get("job_id") == str(row["job_id"])
+                and _valid_reader_url(target)
+                and _same_posting_url(target, identity.get("canonical_url") or "")
+                and _same_posting_url(target, meta.get("source_url") or ""))
+    return (_same_posting_url(original, meta.get("source_url") or "")
             and (kind == "ats_html"
                  or (kind == "http_html"
                      and row.get("discovery_source") != "career_ops")))
@@ -194,7 +294,7 @@ def _from_ats(url: str) -> dict | None:
 
 def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
     """Guarded title, text, posting_guard and provenance for a posting."""
-    if not url:
+    if not _valid_reader_url(url):
         return _guarded("", "", source_required=True)
     ats = _from_ats(url)
     if ats and len(ats["text"]) > 200:
@@ -232,7 +332,8 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
                    source_complete=same_source)
     # A redirect to a different posting is not original-HTML evidence even
     # when that page returns HTTP 200 and its visible text looks clean.
-    hit.update(source_kind="http_html", source_url=effective_url)
+    hit.update(source_kind="http_html", source_url=effective_url,
+               source_identity=_html_source_identity(html) if same_source else {})
     if len(hit["text"]) < 400:
         try:
             seen = _from_chrome(url, kind)
@@ -242,7 +343,11 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
             combined = pg.merge(seen["text"], seen["posting_guard"],
                                 hit["posting_guard"])
             seen.update(combined)
-            hit = {**seen, "source_kind": "http_html", "source_url": effective_url}
+            # Chrome supplies longer text, not independent original-job identity.
+            # Retain only the canonical/JobPosting proof parsed from the HTTP HTML.
+            hit = {**seen, "source_kind": "http_html",
+                   "source_url": effective_url,
+                   "source_identity": hit["source_identity"] if same_source else {}}
     if ats:
         complete_ats = bool(ats["posting_guard"].get("source_verified"))
         # Never substitute another redirected page's JD for an ATS posting.
@@ -262,6 +367,8 @@ def _get(url: str, headers: dict) -> tuple[str, str] | None:
     job description, nothing downstream objected, and the tailor would have
     written a résumé against it. A refusal is not a page.
     """
+    if not _valid_reader_url(url):
+        return None
     try:
         with httpx.Client(headers=headers, follow_redirects=True, timeout=25) as client:
             r = client.get(url)
@@ -290,6 +397,7 @@ def read_postings(urls: list[str], *, batch: int = 6, kind: str = "jd_sweep",
     """
     from tools.browser_runtime import TAB_HYGIENE
 
+    urls = [url for url in urls if _valid_reader_url(url)]
     if not urls:
         return ({}, set()) if with_gone else {}
     _check_browser_reader()
@@ -378,6 +486,8 @@ def _from_chrome(url: str, kind: str = "jd") -> dict | None:
 
     from tools.browser_runtime import available, configuration, run_task
 
+    if not _valid_reader_url(url):
+        return None
     _check_browser_reader()
     ok, why = available()
     if not ok:

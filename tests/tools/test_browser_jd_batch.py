@@ -298,3 +298,130 @@ def test_prefetch_storage_error_does_not_close_or_fill(monkeypatch, caplog):
     assert prefetch_browser_jds([stores.tracking.get(pk)], stores) == 0
     assert stores.tracking.get(pk)["status"] == "found"
     assert "storage" in caplog.text.lower()
+
+
+
+def test_historical_relative_batch_echo_got_or_gone_never_writes_original_row(
+    monkeypatch,
+):
+    """An effective browser URL is not independent original-job HTML evidence."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from agent import run
+    from discovery.watchlist import CompanyConfig
+    from tools import posting_guard as pg
+
+    target = "https://example.test/jobs/42?lang=en"
+    original = {
+        "pk": "example-co#42", "company": "example-co", "job_id": "42",
+        "ats": "custom", "status": "found", "jd_url": "/jobs/42?lang=en",
+        "jd_text": "", "jd_read_attempts": 1,
+        "jd_read_retry_at": None, "jd_read_revision": 5,
+        "jd_read_prepare_only": False,
+        "posting_guard": pg.projection("", None)["posting_guard"],
+    }
+    monkeypatch.setattr(run, "get_settings",
+                        lambda: SimpleNamespace(config_dir="/synthetic-only"))
+    monkeypatch.setattr("discovery.watchlist.load_watchlist",
+                        lambda _: [CompanyConfig(
+                            name="example-co", ats="custom",
+                            careers_url="https://example.test/careers/")])
+    monkeypatch.setattr(run, "_browser_companies", lambda: {"example-co"})
+    for outcome in ("got", "gone", "wrong_job", "foreign"):
+        stores = _Stores([deepcopy(original)])
+        calls = []
+
+        def observed(urls, **kwargs):
+            calls.extend(urls)
+            assert urls == [target]
+            if outcome == "gone":
+                return {}, {target}
+            result = pg.analyze(GOOD, html_variants=["<p>" + GOOD + "</p>"],
+                                source_required=True)
+            # Even an echo with a plausible source flag lacks independently
+            # observed original canonical/ATS identity in read_postings.
+            result.update(source_kind="http_html", source_url=(
+                "https://foreign.example/jobs/42" if outcome == "foreign" else target),
+                source_identity={"job_id": "999" if outcome == "wrong_job" else "42",
+                                 "canonical_url": target})
+            return {target: result}, set()
+
+        monkeypatch.setattr(jd, "read_postings", observed)
+        assert prefetch_browser_jds([deepcopy(original)], stores) == 0
+        assert calls == [target]
+        assert stores.tracking.rows[original["pk"]] == original
+
+
+def test_historical_relative_browser_cas_race_never_closes_a_new_generation(
+    monkeypatch,
+):
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from agent import run
+    from discovery.watchlist import CompanyConfig
+
+    url = "https://example.test/jobs/42?lang=en"
+    original = {"pk": "example-co#42", "company": "example-co", "job_id": "42",
+                "ats": "custom", "status": "found", "jd_url": "/jobs/42?lang=en",
+                "jd_text": "", "jd_read_revision": 8,
+                "jd_read_attempts": 1, "jd_read_retry_at": None,
+                "jd_read_prepare_only": False}
+    stores = _Stores([original])
+    monkeypatch.setattr(run, "get_settings",
+                        lambda: SimpleNamespace(config_dir="/synthetic-only"))
+    monkeypatch.setattr("discovery.watchlist.load_watchlist",
+                        lambda _: [CompanyConfig(
+                            name="example-co", ats="custom",
+                            careers_url="https://example.test/careers/")])
+    monkeypatch.setattr(run, "_browser_companies", lambda: {"example-co"})
+
+    def delayed(urls, **kwargs):
+        assert urls == [url]
+        stores.tracking.rows[original["pk"]]["jd_read_revision"] = 9
+        return {}, {url}
+
+    monkeypatch.setattr(jd, "read_postings", delayed)
+    assert prefetch_browser_jds([deepcopy(original)], stores) == 0
+    assert stores.tracking.rows[original["pk"]] == {
+        **original, "jd_read_revision": 9,
+    }
+
+
+def test_missing_or_unsafe_historical_batch_has_no_browser_side_effect(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from agent import run
+    from discovery.watchlist import CompanyConfig
+
+    monkeypatch.setattr(run, "get_settings",
+                        lambda: SimpleNamespace(config_dir="/synthetic-only"))
+    monkeypatch.setattr("discovery.watchlist.load_watchlist",
+                        lambda _: [CompanyConfig(
+                            name="example-co", ats="custom", careers_url="")])
+    monkeypatch.setattr(run, "_browser_companies", lambda: {"example-co"})
+    monkeypatch.setattr(jd, "read_postings",
+                        lambda *args, **kw: (_ for _ in ()).throw(
+                            AssertionError("No browser read for unresolved relative URL")))
+    for relative in ("/jobs/42?lang=en", "//foreign.example/jobs/42",
+                     "/jobs\\42", "/jobs/%2e%2e/42"):
+        row = {"pk": "example-co#42", "company": "example-co", "job_id": "42",
+               "ats": "custom", "jd_url": relative,
+               "status": "found", "jd_text": ""}
+        stores = _Stores([row])
+        assert prefetch_browser_jds([row], stores) == 0
+        assert stores.tracking.rows[row["pk"]] == row
+
+
+def test_invalid_browser_batch_targets_are_dropped_before_runtime(monkeypatch):
+    monkeypatch.setattr(jd, "available",
+                        lambda: (_ for _ in ()).throw(AssertionError("No runtime")))
+    monkeypatch.setattr(jd, "run_task",
+                        lambda *args, **kw: (_ for _ in ()).throw(
+                            AssertionError("No browser navigation")))
+    bad = ["//foreign.example/jobs/42", "javascript:alert(1)",
+           "https://user@example.test/jobs/42", "https://example.test/jobs\\42"]
+    assert jd.read_postings(bad, with_gone=True) == ({}, set())

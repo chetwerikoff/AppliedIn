@@ -383,7 +383,7 @@ def _crawl_repair(stores, href="/jobs/123?job_id=123", *,
 
 
 @pytest.mark.parametrize("seen_hit", [False, True])
-def test_plain_recrawl_repairs_exhausted_once_without_new_discovery(
+def test_plain_recrawl_preserves_exhausted_relative_error_for_arch_only_retry(
     offline_pipeline, seen_hit,
 ):
     from agent.run import _reader_eligible
@@ -394,26 +394,18 @@ def test_plain_recrawl_repairs_exhausted_once_without_new_discovery(
     if seen_hit:
         offline_pipeline.urls.add(candidate)
     assert _crawl_repair(stores) == 0
-    repaired = stores.tracking.get(pk)
-    assert repaired == {
-        **{k: v for k, v in before.items() if k != "fail_kind"},
-        "jd_url": candidate, "status": "found",
-        "jd_read_attempts": 0, "jd_read_revision": 5,
-    }
-    assert _reader_eligible(repaired)
-    assert stores.queue.calls == []
-    assert offline_pipeline.marks == offline_pipeline.emitted == []
-    assert len(stores.tracking.repair_calls) == 1
+    assert stores.tracking.get(pk) == before
+    assert not _reader_eligible(before)
+    assert stores.tracking.repair_calls == []
     assert len(stores.tracking.put_calls) == (0 if seen_hit else 1)
-
-    snapshot = deepcopy(repaired)
-    assert _crawl_repair(stores) == 0
-    assert stores.tracking.get(pk) == snapshot
-    assert len(stores.tracking.repair_calls) == 1
     assert offline_pipeline.urls == ({candidate} if seen_hit else set())
-    assert offline_pipeline.marks == offline_pipeline.emitted == []
-    assert stores.queue.calls == []
+    assert offline_pipeline.marks == offline_pipeline.emitted == stores.queue.calls == []
 
+    # Repeated ordinary recrawls must not reopen this ERROR for a FOUND sweep.
+    assert _crawl_repair(stores) == 0
+    assert stores.tracking.get(pk) == before
+    assert stores.tracking.repair_calls == []
+    assert stores.queue.calls == []
 
 def test_found_dormant_reader_repairs_without_clearing_other_reader_fields(
     offline_pipeline,
@@ -447,18 +439,14 @@ def test_browser_actual_listing_recrawl_keeps_derived_identity(
     pk, before = _seed_legacy(stores, job_id=browser_id)
     assert crawler.crawl_company(_company(mode=DiscoveryMode.BROWSER),
                                  Preferences(), stores) == 0
-    assert stores.tracking.get(pk) == {
-        **{k: v for k, v in before.items() if k != "fail_kind"},
-        "jd_url": "https://example.test/jobs/123?job_id=123",
-        "status": "found", "jd_read_attempts": 0, "jd_read_revision": 5,
-    }
+    assert stores.tracking.get(pk) == before
     assert pk == "example-co#123?job_id=123"
     assert len(calls) == 1 and calls[0]["kind"] == "crawl"
     assert stores.queue.calls == offline_pipeline.marks == offline_pipeline.emitted == []
     assert crawler.crawl_company(_company(mode=DiscoveryMode.BROWSER),
                                  Preferences(), stores) == 0
     assert len(calls) == 2
-    assert len(stores.tracking.repair_calls) == 1
+    assert stores.tracking.repair_calls == []
 
 
 def test_plain_verified_http_https_upgrade_repairs_only_with_response_proof(
@@ -470,7 +458,10 @@ def test_plain_verified_http_https_upgrade_repairs_only_with_response_proof(
         return httpx.Response(200, text="<html>synthetic</html>")
 
     stores = _Stores()
-    pk, _ = _seed_legacy(stores)
+    # Verified transport upgrade remains eligible only for unrelated FOUND:
+    # historical relative exhausted ERROR never enters #22 repair.
+    pk, _ = _seed_legacy(stores, status="found", fail_kind="",
+                         jd_read_attempts=2)
     assert _crawl_repair(stores, "https://example.test/jobs/123?job_id=123",
                          source="http://example.test/careers") == 0
     assert stores.tracking.get(pk)["jd_url"].startswith("/")
@@ -604,7 +595,10 @@ def test_recrawl_repair_refuses_change_between_read_and_commit(
     offline_pipeline, field, value,
 ):
     stores = _Stores()
-    pk, _ = _seed_legacy(stores)
+    # #299 freezes exhausted relative ERROR before repair; test the legacy #22
+    # CAS interleaving on a separate, still-eligible dormant FOUND row instead.
+    pk, _ = _seed_legacy(stores, status="found", fail_kind="",
+                         jd_read_attempts=2)
     def competing_write(key):
         stores.tracking.persisted[key][field] = value
     stores.tracking.before_repair = competing_write
@@ -981,3 +975,20 @@ def test_failed_greenhouse_sitemap_feed_never_queues_unproved_numeric_claim(
     assert offline_pipeline.urls == set(expected)
     assert stores.tracking.repair_calls == []
     assert any("/sitemap.xml" in request for request in state.calls)
+
+
+def test_plain_relative_query_exact_careers_resolution_without_new_path_logic(
+    offline_pipeline,
+):
+    """#18 already resolves this; #299 must not regress or double-encode the query."""
+    stores = _Stores()
+    with _static_client() as client:
+        result = crawler.crawl_company(
+            _company("https://example.test/careers/"), Preferences(), stores,
+            client=client, extractor=lambda *_: [_job("/jobs/42?lang=en", "42")])
+    assert result == 1
+    expected = "https://example.test/jobs/42?lang=en"
+    assert stores.tracking.get("example-co#42")["jd_url"] == expected
+    assert offline_pipeline.screened == [expected]
+    assert offline_pipeline.marks == [[expected]]
+    assert len(stores.queue.calls) == 1

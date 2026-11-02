@@ -484,6 +484,11 @@ def _repair_duplicate(
     old_url = original.get("jd_url")
     if not legacy_relative_jd_url(old_url):
         return
+    # ARCH #299: normal recrawl must never reopen exhausted historical-relative
+    # ERROR rows, even when #22's other same-PK repair witnesses would pass.
+    if (original.get("status") == "error"
+            and original.get("fail_kind") == "jd_reader_exhausted"):
+        return
     stores.tracking.repair_legacy_jd_url(
         job.pk, job.company, job.job_id, old_url, job.jd_url,
         expected_status=original.get("status"),

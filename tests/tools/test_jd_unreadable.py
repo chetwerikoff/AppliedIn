@@ -410,3 +410,49 @@ def test_unsafe_single_posting_never_opens_http_or_chrome(monkeypatch, bad):
     monkeypatch.setattr(jd, "_from_chrome",
                         lambda *args: pytest.fail("No Chrome on an unsafe URL"))
     assert fetch_jd_meta(bad)["posting_guard"]["source_verified"] is False
+
+
+@pytest.mark.parametrize("html_job_id,verified", [
+    ("Platform_ABC-17", True),
+    ("Other_001", False),
+])
+def test_short_historical_http_preserves_independent_identity_after_chrome_text(
+    monkeypatch, html_job_id, verified,
+):
+    """Browser prose never replaces HTTP canonical + JobPosting ID evidence."""
+    import json
+
+    from tools import jd, posting_guard as pg
+
+    url = "https://wd.example.invalid/fake-site/job/Example/Platform_ABC-17"
+    html = ('<html><head><link rel="canonical" href="' + url + '">' +
+            '<script type="application/ld+json">' +
+            json.dumps({"@type": "JobPosting", "url": url,
+                        "identifier": {"value": html_job_id}}) +
+            '</script></head><body><h1>Test role</h1>' +
+            '<p>Short preview.</p></body></html>')
+    monkeypatch.setattr(httpx, "Client", _patched(lambda request: (
+        httpx.Response(200, text=html) if str(request.url) == url else
+        pytest.fail("Unexpected HTTP destination"))))
+    monkeypatch.setattr(jd, "_from_ats", lambda _: None)
+    browser_calls = []
+
+    def browser(target, kind):
+        browser_calls.append(target)
+        return jd._guarded("Test role",
+                           "Build reliable products and distributed systems. " * 25)
+
+    monkeypatch.setattr(jd, "_from_chrome", browser)
+    observed = fetch_jd_meta(url)
+    observed["reader_effective_url"] = url
+    original = {"company": "example-co", "ats": "workday",
+                "job_id": "Platform_ABC-17",
+                "jd_url": "/job/Example/Platform_ABC-17",
+                "discovery_source": "crawler"}
+    assert browser_calls == [url]
+    assert len(observed["text"]) >= 400
+    assert observed["source_identity"] == {"canonical_url": url,
+                                           "job_id": html_job_id}
+    assert observed["source_url"] == url
+    assert pg.valid(observed["text"], observed["posting_guard"])
+    assert jd.matched_source_witness(original, observed) is verified

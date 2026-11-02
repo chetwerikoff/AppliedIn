@@ -85,6 +85,8 @@ def test_review_is_not_an_automatic_success_or_real_submission():
         assert submit_review.guarded_row(row)
     for row in [{"gate_reason": "approval"},
                 {"gate_reason": "submit_uncertain",
-                 "possible_submission": True},
-                {"gate_reason": "submit_review", "review_state": None}]:
+                 "possible_submission": True}]:
         assert not submit_review.guarded_row(row)
+    for malformed in [None, "", "unexpected", {"not": "a state"}]:
+        assert submit_review.guarded_row(
+            {"gate_reason": "submit_review", "review_state": malformed})

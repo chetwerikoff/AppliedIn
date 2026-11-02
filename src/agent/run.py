@@ -633,42 +633,57 @@ async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
 
 def _commit_posting_meta(pk: str, observed: dict, meta: dict,
                          stores: Any) -> dict | None:
-    """Commit sanitized text and evidence against the pre-read observation."""
+    """Commit guarded JD and source provenance against the observed posting."""
     from core.storage.base import guard_observation_matches
     from tools import posting_guard as pg
 
     current = stores.tracking.get_current(pk)
     if (not current or current.get("pk") != pk
-            or not guard_observation_matches(current, observed)
+            or current.get("status") != observed.get("status")
+            or current.get("jd_url") != observed.get("jd_url")
             or _reader_witness(current) != _reader_witness(observed)
-            or submit_hold.blocked(pk, current, tracking=stores.tracking)
             or not pg.valid(meta.get("text"), meta.get("posting_guard"))):
+        return None
+    # Direct approval must carry the frozen pre-read observation through the
+    # guarded write. Other JD read paths retain their own reader generation CAS.
+    direct = observed.get("status") == Status.SUBMITTING.value
+    if direct and (not guard_observation_matches(current, observed)
+                   or submit_hold.blocked(pk, current, tracking=stores.tracking)):
         return None
     from tools import jd as _jd
 
-    source_witness = _jd.matched_source_witness(observed, meta)
-    # The job title is also untrusted and belongs to the bound JD generation.
+    source_witness = _jd.matched_source_witness(
+        observed if direct else current, meta)
     title_seen = pg.analyze(current.get("title") or "")
     if title_seen["posting_guard"]["reasons"]:
         meta = {**meta, **pg.merge(meta["text"],
                                    title_seen["posting_guard"],
                                    meta["posting_guard"],
                                    source_witness=source_witness)}
-    old_meta = current.get("posting_guard")
-    if not pg.valid(current.get("jd_text") or "", old_meta):
-        old_meta = pg.projection(current.get("jd_text") or "", old_meta)["posting_guard"]
-    expected = pg.merge(meta["text"], meta["posting_guard"], old_meta,
-                        source_witness=source_witness)
+    if direct:
+        old = current.get("posting_guard")
+        if not pg.valid(current.get("jd_text") or "", old):
+            old = pg.projection(current.get("jd_text") or "", old)["posting_guard"]
+        expected = pg.merge(meta["text"], meta["posting_guard"], old,
+                            source_witness=source_witness)
     if not stores.tracking.update_posting_guard(
-            pk, observed, meta, source_witness=source_witness):
+            pk, observed if direct else current, meta,
+            source_witness=source_witness):
         return None
     updated = stores.tracking.get_current(pk)
-    expected_row = {**observed, "jd_text": expected["text"],
-                    "posting_guard": expected["posting_guard"]}
-    return updated if (updated and guard_observation_matches(updated, expected_row)
-                       and _reader_witness(updated) == _reader_witness(observed)
-                       and pg.valid(updated.get("jd_text") or "",
-                                    updated.get("posting_guard"))) else None
+    if (not updated or updated.get("pk") != pk
+            or updated.get("status") != observed.get("status")
+            or not pg.valid(updated.get("jd_text") or "",
+                            updated.get("posting_guard"))):
+        return None
+    if direct:
+        expected_row = {**observed, "jd_text": expected["text"],
+                        "posting_guard": expected["posting_guard"]}
+        if (not guard_observation_matches(updated, expected_row)
+                or _reader_witness(updated) != _reader_witness(observed)
+                or submit_hold.blocked(pk, updated, tracking=stores.tracking)):
+            return None
+    return updated
 
 def _guard_refusal(pk: str, stores: Any, *, observed: dict | None = None) -> dict:
     """Conditionally undo a *pre-browser* SUBMITTING claim without lost flags."""

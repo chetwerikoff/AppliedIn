@@ -3420,7 +3420,9 @@ function appsSig() {
   for (const a of state.apps) {
     s += a.pk + "\u0001" + a.status + "\u0001" + (a.updated_at || "") + "\u0001"
        + (a.applied_at || "") + "\u0001"
-       + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
+       + (a.gate_reason || "") + (a.gate_question || "") + "\u0001"
+       + (a.gate_generation || "") + ":" + (a.gate_question_identity || "")
+       + ":" + (a.gate_skip_eligible ? "s" : "") + "\u0001"
        + (a.submit_hold_state || "missing") + ":" + (a.possible_submission ? "p" : "")
        + ":" + (a.fail_kind || "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
@@ -3588,6 +3590,7 @@ function paneSig() {
   return parts.join("\u0002");
 }
 
+const _drawnGateKeys = new Map(); // the gate owning each rendered answer field
 let _paneSig = null;      // signature of the data behind the last pane render
 let _paneDirty = false;   // a background repaint arrived while a press was down
 let _pressAt = 0;         // when the current pointer press began (0 = none)
@@ -3677,10 +3680,15 @@ function renderPane() {
   // so the courtesy stays for the rebuilds that remain.
   const selectedFocus = document.activeElement?.dataset?.reviewPick;
   const saved = {};
-  let focusPk = null;
-  $$("#pane textarea[data-answer-for]").forEach((t) => {
-    if (t.value) saved[t.dataset.answerFor] = t.value;
-    if (document.activeElement === t) focusPk = t.dataset.answerFor;
+  let focusInput = null;
+  $("#pane textarea[data-answer-for]").forEach((t) => {
+    const pk = t.dataset.answerFor;
+    const key = ownerGateKey(state.apps.find((r) => r.pk === pk));
+    if (key && key === _drawnGateKeys.get(pk)) {
+      if (t.value) saved[pk] = t.value;
+      if (document.activeElement === t)
+        focusInput = { pk, start: t.selectionStart, end: t.selectionEnd };
+    }
   });
   const paneInputs = ["fs-search", "fr-search"];
   const liveId = document.activeElement && paneInputs.includes(document.activeElement.id)
@@ -3701,9 +3709,18 @@ function renderPane() {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
     if (t) t.value = v;
   }
-  if (focusPk) {
-    const t = $(`#pane textarea[data-answer-for="${CSS.escape(focusPk)}"]`);
-    if (t) { t.focus(); t.selectionStart = t.selectionEnd = t.value.length; }
+  if (focusInput) {
+    const t = $(`#pane textarea[data-answer-for="${CSS.escape(focusInput.pk)}"]`);
+    if (t) {
+      t.focus();
+      try { t.setSelectionRange(focusInput.start, focusInput.end); }
+      catch { /* Restricted DOMs may not expose a selection. */ }
+    }
+  }
+  _drawnGateKeys.clear();
+  for (const r of state.apps) {
+    const key = ownerGateKey(r);
+    if (key) _drawnGateKeys.set(r.pk, key);
   }
   if (liveId) {
     const t = $("#" + liveId);

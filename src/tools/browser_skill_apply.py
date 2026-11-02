@@ -3217,7 +3217,8 @@ class ApplicationIPCController:
     def __init__(self, pk: str, company: str, url: str, resume_path: str,
                  facts: dict, filled: dict, history: list, step: dict,
                  mark_click_started, *, fixture_context=None, seal_stage=False,
-                 verified_redirect=None, entry_provenance=None):
+                 verified_redirect=None, entry_provenance=None,
+                 submit_review_at_start=False):
         import hashlib
         self.pk, self.company, self.url = pk, company, url
         self.protected_snapshot = bool(seal_stage)
@@ -3241,6 +3242,10 @@ class ApplicationIPCController:
         self.upload_pending = False
         self._resume_set_identity = None
         self.committed = False
+        # The start observation cannot be erased by a later flag OFF.
+        self.submit_review_at_start = bool(submit_review_at_start)
+        self.review_holder = None
+        self.review_effect_args = None
         self.expected_digest = None
         if self.resume_path and Path(self.resume_path).is_file():
             self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
@@ -3490,11 +3495,110 @@ class ApplicationIPCController:
             raise PreSubmitGate(1, 'Raw application click or implicit Submit receiver is ambiguous.')
         if target is None:
             return
-        # The fresh self._page read is the final decision's evidence.
-        # check_pre_submit already owns route, CAPTCHA and five-item checks.
-        await self.check_pre_submit(session, page, target)
-        self.committed = True
-        self.mark_click_started()
+        # One final boundary. An OFF->ON transition holds; an ON->OFF
+        # transition refuses. Neither can fall through to unreviewed raw IPC.
+        from core import flags
+        if self.submit_review_at_start or flags.submit_review_enabled():
+            await self._review_before_commit(session, page, target, args, kwargs)
+        else:
+            await self.check_pre_submit(session, page, target)
+            self.committed = True
+            self.mark_click_started()
+
+    async def _review_before_commit(self, session, page, target, args, kwargs):
+        """The original live application task owns all continuation and Submit."""
+        from core import flags
+        from tools import browser_runtime, browser_skill, submit_review
+        if (not flags.submit_review_enabled()
+                or browser_runtime.backend() is not browser_skill
+                or session is None
+                or getattr(session, '_application_controller', None) is not self
+                or getattr(session, 'owner', None) is not asyncio.current_task()):
+            raise Gate('Submit review was revoked or its BrowserSkill owner is unavailable.',
+                       reason='submit_review')
+        # Five existing checks only; NOT the actual possible-submission marker.
+        await self.check_pre_submit(session, page, target, validation_only=True)
+        holder = None
+        try:
+            private_form = submit_review.form_snapshot(self, page, target)
+            screenshot = await session.review_screenshot()  # exactly one
+            # A screenshot of a different form is not a contemporaneous packet.
+            fresh = await self._page(session)
+            fresh_target = [c for c in fresh.get('controls', [])
+                            if c.get('selector') == target.get('selector')]
+            if len(fresh_target) != 1:
+                raise submit_review.Refused('Submit receiver changed during capture.')
+            current_form = submit_review.form_snapshot(
+                self, fresh, fresh_target[0])
+            if submit_review.form_differences(private_form, current_form):
+                raise submit_review.Refused('Application changed during screenshot capture.')
+            if not flags.submit_review_enabled():
+                raise submit_review.Refused('Submit review was disabled before publication.')
+            holder = submit_review.publish(
+                pk=self.pk, company=self.company, controller=self, session=session,
+                packet=private_form, screenshot=screenshot)
+            self.review_holder = holder
+            decision = await submit_review.await_decision(holder)
+            if decision == 'reject':
+                submit_review.settle(
+                    holder, {'ok': True, 'decision': 'reject', 'review_state': 'rejected'})
+                raise Gate('Submit review rejected; a fresh run is required.',
+                           reason='submit_review')
+            if decision != 'approve':
+                raise Gate('Submit review no longer authorizes this generation.',
+                           reason='submit_review')
+            submit_review.require_claim(holder)
+            live = await self._page(session)
+            matching = [c for c in live.get('controls', [])
+                        if c.get('selector') == target.get('selector')]
+            if len(matching) != 1:
+                submit_review.settle(holder, {
+                    'ok': False, 'error': 'form_changed',
+                    'differences': [{'control': 'Submit receiver',
+                                     'before': target.get('selector'), 'after': 'unavailable'}]})
+                raise Gate('Application receiver changed after reviewer approval.',
+                           reason='submit_review')
+            latest_packet = submit_review.form_snapshot(self, live, matching[0])
+            differences = submit_review.form_differences(private_form, latest_packet)
+            if differences:
+                submit_review.settle(holder, {
+                    'ok': False, 'error': 'form_changed', 'differences': differences})
+                raise Gate('Application controls changed after review; a new packet is required.',
+                           reason='submit_review')
+            submit_review.require_claim(holder)
+            submit_review.activate(holder)
+            # check_pre_submit keeps its exact five checks AND the real marker,
+            # post-marker page/tenant/PDF/lease checks on the actual commit path.
+            await self.check_pre_submit(
+                session, live, matching[0],
+                review_before_hold=lambda: submit_review.require_claim(
+                    holder, committing=True))
+            # The BrowserSkill Session._run raw guard will check the stronger
+            # marked state once more, after its context-sync awaits.
+            self.committed = True
+            self.mark_click_started()
+            self.review_effect_args = tuple(args)
+        except BaseException as exc:
+            if holder is not None:
+                submit_review.invalidate(
+                    holder, 'rejected' if isinstance(exc, Gate)
+                    and str(exc).startswith('Submit review rejected')
+                    else 'expired' if time.monotonic() >= holder.deadline
+                    else 'invalidated')
+            if isinstance(exc, submit_review.Refused):
+                raise Gate('Submit review is stale or no longer safe; start a fresh run.',
+                           reason='submit_review') from None
+            raise
+
+    def final_review_effect_guard(self, session, args) -> None:
+        """No review grant survives a changed raw effect, owner or lease."""
+        from tools import submit_review
+        if (self.review_holder is None or self.review_effect_args != tuple(args)
+                or self.review_holder.session is not session
+                or getattr(session, '_application_controller', None) is not self):
+            raise Gate('The reviewed raw Submit effect is not current.',
+                       reason='submit_review')
+        submit_review.require_actual_marker(self.review_holder)
 
     async def after_ipc(self, session, args: tuple, kwargs: dict, *,
                         succeeded: bool) -> None:
@@ -3544,7 +3648,8 @@ class ApplicationIPCController:
                 self.upload_completed = True
 
 
-    async def check_pre_submit(self, session, page: dict, target: dict) -> None:
+    async def check_pre_submit(self, session, page: dict, target: dict, *,
+                               validation_only=False, review_before_hold=None) -> None:
         """The only substantive pre-Submit decision at raw application IPC.
 
         Five item failures stop before IPC; the sixth, uncertain outcome, is
@@ -3827,6 +3932,12 @@ class ApplicationIPCController:
                 raise PreSubmitGate(
                     5, 'The restricted-country question needs a checked safe decline.')
 
+        # Reviewer preparation is harmless: never install a possible-submit
+        # marker, committed latch or click until a generation is consumed.
+        if validation_only:
+            return
+        if review_before_hold is not None:
+            review_before_hold()
         # Own hold is acquired only after all five items pass. It is not prior
         # submission evidence. Preserve the existing post-hold drift checks.
         expected_page = (_page_identity(page), page.get('title'))
@@ -3893,6 +4004,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         from core.events import emit
         from tools.browser_apply import _site_rules
         from tools.claude_chrome import _stage_resume
+    from core import flags
+    review_start_enabled = flags.submit_review_enabled()
     submitted = False
     producer_guard = None
 
@@ -4000,7 +4113,8 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
                         step, mark_click_started, seal_stage=True,
                         verified_redirect=(provenance if isinstance(
                             provenance, VendorRedirectProvenance) else None),
-                        entry_provenance=provenance)
+                        entry_provenance=provenance,
+                        submit_review_at_start=review_start_enabled)
                     try:
                         raw_session.bind_application_controller(controller)
                         if getattr(raw_session, '_application_controller', None) is not controller:

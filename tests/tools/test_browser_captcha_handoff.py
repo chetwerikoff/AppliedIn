@@ -112,20 +112,23 @@ async def synthetic_controller(monkeypatch, case, *, url=URL, prior_button=None)
             assert address == url
             return deepcopy(page)
 
+        async def page(self):
+            # The removed _bootstrap was not an authority to gate each
+            # preparation action. Classify the synthetic observed page at
+            # the first real read, before any model decision or browser IPC.
+            if case == "ordinary":
+                raise forms.Gate("A synthetic form question requires manual review.",
+                                 form_question={"label": "Synthetic question"})
+            if case == "control":
+                raise forms.ControlGate({
+                    "action": "fill", "selector": "[redacted]",
+                    "reason": "absent: 0 matches", "caller": "decision-initial",
+                })
+            classify(page)
+            pytest.fail("The synthetic safety refusal must precede decisions")
+
         async def call(self, *args):
             pytest.fail("A terminal Gate cannot perform browser mutations")
-
-    async def bootstrap(_session, current, *args, **kwargs):
-        if case == "ordinary":
-            raise forms.Gate("A synthetic form question requires manual review.",
-                             form_question={"label": "Synthetic question"})
-        if case == "control":
-            raise forms.ControlGate({
-                "action": "fill", "selector": "[redacted]",
-                "reason": "absent: 0 matches", "caller": "decision-initial",
-            })
-        classify(current)
-        pytest.fail("Test case must hit a terminal safety Gate before model decisions")
 
     from core import events
     from tools import browser_apply, claude_chrome
@@ -137,7 +140,6 @@ async def synthetic_controller(monkeypatch, case, *, url=URL, prior_button=None)
                "jd_url": url, "status": "submitting",
                "possible_submission": False, "ats": "custom"}
     monkeypatch.setattr(forms, "_row", lambda pk: tracked if pk == PK else {})
-    monkeypatch.setattr(forms, "_bootstrap", bootstrap)
     monkeypatch.setattr(bsk, "Session", Session)
     monkeypatch.setattr(bsk, "decision", AsyncMock(side_effect=AssertionError("model called")))
     monkeypatch.setattr(browser_apply, "_site_rules", lambda *a, **k: "")

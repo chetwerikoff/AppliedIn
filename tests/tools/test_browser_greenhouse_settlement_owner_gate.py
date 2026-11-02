@@ -78,8 +78,7 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
     bank = SyntheticBank({'Phone': PHONE} if bank_facts is None else bank_facts)
     stores = SimpleNamespace(tracking=tracking, answer_bank=bank, secrets=None)
 
-    # This form test needs a *real* approval guard boundary, with only the
-    # source transport faked to a complete exact-URL ATS HTML witness.
+    # An owner-question fixture must first pass real matched-source admission.
     def current_source(url, kind):
         assert (url, kind) == (case.wrapper, 'jd')
         text = 'Synthetic role text'
@@ -113,47 +112,49 @@ def tracked_greenhouse(monkeypatch, *, kind='select', bank_facts=None):
     ('select', 'Remote'),
     ('text', 'Synthetic salary range'),
 ])
-async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
+async def test_required_greenhouse_owner_question_is_tokened_and_requeued(
         monkeypatch, kind, answer):
-    """Missing-bank native choice and free text have an answerable, bound gate."""
+    """The existing owner-answer path binds and requeues an ordinary question.
+
+    BrowserSkill does not mint a field grant; this offline test injects the
+    already code-classified owner question to exercise run.py and token guards.
+    """
     case, raw, stores = tracked_greenhouse(monkeypatch, kind=kind)
+    question = forms._ordinary_owner_question(
+        case.page, case.page['controls'][1], case.pk)
+    calls = []
 
-    async def model_must_not_run(*a, **kw):
-        pytest.fail('Required unbanked field must gate before model review')
+    async def needs_answer(*args, **kwargs):
+        calls.append(True)
+        return {'status': 'gate', 'reason': 'owner_question',
+                'review_route': 'owner',
+                'question': 'Synthetic missing ordinary application fact.',
+                'form_question': deepcopy(question)}
 
-    monkeypatch.setattr(bsk, 'decision', model_must_not_run)
+    monkeypatch.setattr('tools.browser_apply.apply', needs_answer)
     first = await run._apply_direct(case.pk, stores)
     assert first['result'] == 'gated', first
+    assert calls == [True]
     row = stores.tracking.get(case.pk)
     assert row['status'] == 'needs_human'
     assert row['gate_reason'] == 'owner_question'
     assert row['gate_source'] == 'applier'
     assert row['gate_call_id'] == 'direct'
     assert row['gate_pending']['review_route'] == 'owner'
-    question = row['gate_pending']['form_question']
-    assert question['pk'] == case.pk
-    assert question['selector'] == '#screening'
-    assert question['label'] == ('Desired salary' if kind == 'text'
+    observed = row['gate_pending']['form_question']
+    assert observed['pk'] == case.pk
+    assert observed['selector'] == '#screening'
+    assert observed['label'] == ('Desired salary' if kind == 'text'
                                  else 'Screening choice')
-    assert question['type'] == kind
-    assert question['url'] == case.url
-    # An owner answer is useful only if its same-job form identity can pass
-    # the independent resume-time alias/config check without a relaxed gate.
-    assert run._direct_form_label(case.pk, row) == question['label']
-
-    # An exact phone grant and bank value settle before the missing screening
-    # field gates; the ordinary fixture has no raw producer auto-grant binder.
-    assert raw.writes == [('fill', '#phone')]
-    assert raw.target('#screening')['has_value'] is False
-    assert row['human_approved_answers']['Phone']['value'] == PHONE
-    assert question['label'] not in row['human_approved_answers']
+    assert observed['type'] == kind
+    assert run._direct_form_label(case.pk, row) == observed['label']
     assert stores.answer_bank.writes == []
+    assert not any(c[0] == 'click' and c[1] == '#submit' for c in raw.calls)
 
     tokens = server._owner_gate_tokens(row)
     assert tokens['gate_generation']
     assert tokens['gate_question_identity'] == forms.owner_question_identity(
-        case.pk, question)
-    assert tokens['gate_skip_eligible'] is False
+        case.pk, observed)
     for generation, identity in (
         (tokens['gate_generation'] + '-stale', tokens['gate_question_identity']),
         (tokens['gate_generation'], tokens['gate_question_identity'] + '-stale'),
@@ -172,124 +173,8 @@ async def test_required_greenhouse_question_is_tokened_and_exactly_resumable(
         expected_gate_generation=tokens['gate_generation'],
         expected_question_identity=tokens['gate_question_identity'])
     assert accepted['result'] == 'queued', accepted
-    granted = stores.tracking.get(case.pk)['human_approved_answers'][question['label']]
-    assert granted['selector'] == question['selector']
-    assert granted['value'] == answer
-    assert stores.answer_bank.writes == [(question['label'], answer)]
-
-    decisions = []
-
-    async def stop_before_submit(_prompt, _page, _history, *, model):
-        decisions.append(True)
-        return {'action': 'gate', 'question': 'Synthetic stop before Submit'}
-
-    monkeypatch.setattr(bsk, 'decision', stop_before_submit)
-    second = await run._apply_direct(case.pk, stores)
-    assert second['result'] == 'gated', second
-    assert decisions == [True]
-    assert raw.writes == ([('fill', '#phone'), ('select', '#screening')]
-                          if kind == 'select' else [('fill', '#phone')])
-    assert not any(call[0] == 'click' and call[1] == '#submit'
-                   for call in raw.calls)
-
-
-async def test_bank_held_required_greenhouse_salary_is_direct_owner_gate(monkeypatch):
-    """Bank-auto refuses salary, but the required answer remains owner-answerable."""
-    salary = 'Synthetic range A'
-    case, raw, stores = tracked_greenhouse(
-        monkeypatch, kind='salary_select',
-        bank_facts={'Phone': PHONE, 'Desired salary': salary})
-    # This is the real bank-auto predicate, not a mocked refusal. An ordinary
-    # bank value cannot authorize a salary disclosure for this job/form.
-    assert not forms._bank_auto_eligible(case.page['controls'][1], salary)
-
-    async def model_must_not_run(*a, **kw):
-        pytest.fail('Required bank-held salary must gate before model review')
-
-    monkeypatch.setattr(bsk, 'decision', model_must_not_run)
-    result = await run._apply_direct(case.pk, stores)
-    assert result['result'] == 'gated', result
-
-    row = stores.tracking.get(case.pk)
-    assert row['status'] == 'needs_human'
-    assert row['gate_reason'] == 'owner_question'
-    assert row['gate_source'] == 'applier'
-    assert row['gate_call_id'] == 'direct'
-    assert row['gate_pending']['review_route'] == 'owner'
-    expected_question = {
-        'pk': case.pk,
-        'label': 'Desired salary',
-        'selector': '#screening',
-        'url': case.url,
-        'control_label': 'Desired salary',
-        'question': '',
-        'tag': 'select',
-        'type': 'select',
-        'form_selector': '#application',
-        'form_action': case.url,
-        'origin_row': {
-            'jd_url': case.wrapper, 'company': COMPANY, 'ats': 'greenhouse',
-        },
-        'options': [
-            {'value': 'range-a', 'label': 'Synthetic range A'},
-            {'value': 'range-b', 'label': 'Synthetic range B'},
-        ],
-    }
-    assert row['gate_pending']['form_question'] == expected_question
-    assert run._direct_form_label(case.pk, row) == 'Desired salary'
-    tokens = server._owner_gate_tokens(row)
-    assert tokens['gate_generation']
-    assert tokens['gate_question_identity'] == forms.owner_question_identity(
-        case.pk, expected_question)
-    assert tokens['gate_skip_eligible'] is False
-
-    # The separately approved phone can settle. The bank-held salary cannot
-    # fill, gain an automatic grant, or enqueue/submit an application.
-    assert raw.writes == [('fill', '#phone')]
-    assert raw.target('#screening')['has_value'] is False
-    assert raw.target('#screening')['value'] == ''
-    assert set(row['human_approved_answers']) == {'Phone'}
-    assert stores.answer_bank.facts['Desired salary'] == salary
-    assert stores.answer_bank.writes == []
-    assert ApplyQueue(stores.tracking.r).pending() == []
-    assert not any(call[0] == 'click' and call[1] == '#submit'
-                   for call in raw.calls)
-
-async def test_greenhouse_global_bank_answers_still_auto_fill(monkeypatch):
-    """Owner routing changes no guarded native bank-authorized write path."""
-    facts = {'Phone': PHONE, 'Screening choice': 'Remote'}
-    case, raw, stores = tracked_greenhouse(monkeypatch, bank_facts=facts)
-
-    # This fake Session does not bind a production raw IPC controller, so mint
-    # exact GLOBAL grants at the actual code-owned bank admission seam using
-    # an independent synthetic fixed witness. No model, DOM or browser grants.
-    stores.tracking.set_status(
-        case.pk, Status.SUBMITTING, human_approved_answers={})
-    provenance = forms._configured_alias(case.pk, COMPANY, case.wrapper)
-    assert isinstance(provenance, forms.GreenhouseJobAlias)
-    scoped = forms._GreenhouseSession(
-        raw, lambda href: href == case.url, provenance, submitted=lambda: False)
-    page, observed_witness = await forms._observe_controls(
-        scoped, deepcopy(raw.state), site='bootstrap-material')
-    forms._auto_grant_from_global(
-        page, observed_witness, case.pk, facts, facts, case.wrapper,
-        provenance=provenance)
-    stores.tracking.set_status(case.pk, Status.TAILORED)
-    decisions = []
-
-    async def stop_before_submit(_prompt, _page, _history, *, model):
-        decisions.append(True)
-        return {'action': 'gate', 'question': 'Synthetic stop before Submit'}
-
-    monkeypatch.setattr(bsk, 'decision', stop_before_submit)
-    result = await run._apply_direct(case.pk, stores)
-    assert result['result'] == 'gated', result
-    assert decisions == [True]
-    assert raw.writes == [('fill', '#phone'), ('select', '#screening')]
-    row = stores.tracking.get(case.pk)
-    assert {key: row['human_approved_answers'][key]['source']
-            for key in ('Phone', 'Screening choice')} == {
-                'Phone': 'bank-auto', 'Screening choice': 'bank-auto'}
-    assert stores.answer_bank.writes == []
-    assert not any(call[0] == 'click' and call[1] == '#submit'
-                   for call in raw.calls)
+    assert stores.answer_bank.writes == [(observed['label'], answer)]
+    # Owner answers are facts in the bank, not new per-field permission grants.
+    assert observed['label'] not in (
+        stores.tracking.get(case.pk).get('human_approved_answers') or {})
+    assert not any(c[0] == 'click' and c[1] == '#submit' for c in raw.calls)

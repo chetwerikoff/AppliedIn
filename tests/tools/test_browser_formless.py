@@ -476,7 +476,7 @@ async def test_rootless_hidden_enterprise_retries_until_real_structural_root(mon
         session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
     assert page['entry']['frames'][0]['status'] == 'R'
     assert page['entry']['frames'][0]['outside'] is True
-    assert reads[0] >= 4  # Rootless, hydrated, then the stable fresh read pair.
+    assert reads[0] >= 4  # Fresh PAGE reads surround both independent witnesses.
     assert start < clock[0] < start + forms._ASHBY_WAIT_SECONDS
     assert session._readiness is False
     assert not decision.await_count
@@ -595,23 +595,37 @@ async def test_rootless_hidden_recap_keeps_visible_challenge_precedence(monkeypa
     no_mutations(raw)
 
 
-async def test_unknown_frames_gate_after_readiness_and_on_every_post_commit_read(monkeypatch):
+async def test_unknown_frames_are_not_a_reversible_per_read_gate(monkeypatch):
     first = _synthetic_enterprise_pair(missing_root=True)
     second = _synthetic_enterprise_pair()
     clock, raw, session, provenance, decision, reads = _temporal_entry_session(
         monkeypatch, first, second)
     await forms._stable_application_form(
-        session, session.allowed, provenance, deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
+        session, session.allowed, provenance,
+        deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
     assert session._readiness is False
     raw.current, raw.fixed = deepcopy(first)
-    # Issue #214 category (a): the hidden exact-origin frame is frame-only
-    # admitted before commit; the untouched post-commit branch still refuses it.
     assert (await session.page())['entry']['frames'][0]['status'] == 'unknown'
     session.committing = True
+    # Preparation/readback cannot restore the retired per-action frame gate.
     for _ in range(2):
-        with pytest.raises(forms.Gate, match='Untrusted frame after a committing click'):
-            await session.page()
+        assert (await session.page())['entry']['frames'][0]['status'] == 'unknown'
     assert not decision.await_count
+    no_mutations(raw)
+
+
+async def test_preparation_can_continue_when_fixed_reader_disagrees(monkeypatch):
+    pair = _synthetic_enterprise_pair()
+    pair[1]['controls'][0]['disabled'] = not pair[1]['controls'][0].get('disabled', False)
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, pair)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
+    assert page['url'] == entry('ashby')
+    assert any(call[1] == forms._ENTRY_FIXED_CONTROL_WITNESS
+               for call in raw.calls)
+    assert reads[0] >= 4 and not decision.await_count
     no_mutations(raw)
 
 
@@ -629,103 +643,38 @@ def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     assert page['entry']['root'] is None
 
 
-async def test_normal_apply_reaches_actual_direct_human_question(monkeypatch):
+async def test_formless_apply_without_staged_pdf_stops_before_model(monkeypatch):
     _, raw, decision, _ = root_world(monkeypatch)
     result = await attempt()
     assert result['status'] == 'gate', result
-    question = result['form_question']
-    assert question['label'] == 'Name'
-    assert question['owner_kind'] == 'ashby-formless-root'
-    assert question['form_selector'] == '#application-root'
-    assert question['form_action'] == '#structural-submit'
-    assert not decision.await_count
+    assert result['reason'] == 'unknown_field'
+    assert 'row-tailored staged PDF is missing' in result['question']
+    assert result['form_question'] is None
+    assert decision.await_count == 0
     no_mutations(raw)
-    # The real unchanged consumer, not a hand-built approval API.
-    from agent.run import _direct_form_label
-    pending = dict(pk=PK, status='needs_human', gate_source='applier',
-                   gate_call_id='direct', jd_url=posting('ashby'), ats='ashby',
-                   gate_pending={'form_question': question})
-    assert _direct_form_label(PK, pending) == 'Name'
 
-
-@pytest.mark.parametrize('changes,cause', [
-    ({'duplicate': True}, 'ambiguous application roots'),
-    ({'outside': '_systemfield_email'}, 'candidate control outside root'),
-    ({'hiddenOutside': True}, 'receiver outside root'),
-    ({'duplicateLabel': True}, 'label/control association'),
-    *[({'extraType': typ}, 'unsupported ' + typ) for typ in ('select', 'radio', 'checkbox', 'hidden')],
-    ({'extraType': 'file'}, 'unsupported file receiver'),
-    ({'extraType': 'text', 'extraAttrs': {'role': 'combobox'}}, 'unsupported autocomplete/combobox'),
-    ({'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}}, 'unsupported contenteditable'),
+@pytest.mark.parametrize('changes', [
+    {'duplicate': True},
+    {'outside': '_systemfield_email'},
+    {'hiddenOutside': True},
+    {'duplicateLabel': True},
+    {'extraType': 'select'},
+    {'extraType': 'radio'},
+    {'extraType': 'checkbox'},
+    {'extraType': 'hidden'},
+    {'extraType': 'file'},
+    {'extraType': 'text', 'extraAttrs': {'role': 'combobox'}},
+    {'extraType': 'text', 'extraAttrs': {'contenteditable': 'true'}},
 ])
-async def test_normal_apply_preserves_specific_danger_before_model_or_ipc(monkeypatch, tmp_path, changes, cause):
-    if cause in {'unsupported radio', 'unsupported checkbox',
-                 'unsupported autocomplete/combobox', 'unsupported contenteditable'}:
-        # A permanent synthetic unsupported control cannot become ready later.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-    if cause == 'ambiguous application roots':
-        await prepared_shape_refusal(monkeypatch, tmp_path, changes, cause)
-        return
-    _, raw, decision, provenance = root_world(monkeypatch, **changes)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    # Entry may be transient; these structural defects still forbid final Submit.
-    expected = ('label/control association' if cause in {
-        'unsupported select', 'unsupported radio', 'unsupported checkbox',
-        'unsupported autocomplete/combobox'} else cause)
-    with pytest.raises(forms.Gate, match=expected):
-        forms._formless_boundary(raw.current, provenance)
-    assert not decision.await_count
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('selector,verb', [
-    ('#autofill-file', 'upload'), ('#autofill-file', 'fill'),
-    ('#autofill-button', 'click'), ('#dropzone', 'click'),
-])
-async def test_actual_ipc_producer_denies_pane_and_dropzone_even_without_execute(monkeypatch, selector, verb):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='fresh unique application receiver|current application root|forbidden at IPC producer'):
-        await session.call(verb, selector)
-    no_mutations(raw)
-
-
-async def test_exact_structural_grant_permits_only_matching_fill_with_readback(monkeypatch):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate) as gate:
-        await forms._bootstrap(session, page, PK, {}, provenance=provenance)
-    q = gate.value.form_question
-    # Exercise the unchanged real consumer/persistence and only its offline
-    # stores: the structural envelope must survive the same human-answer path.
-    from agent.run import _direct_gate_pending, resume_job
-    from tests.agent.test_resume_starts_now import _Stores, _queued
-    stores = _Stores({**row, 'status': 'needs_human', 'gate_source': 'applier',
-                      'gate_call_id': 'direct', 'gate_reason': 'unknown_field',
-                      'gate_pending': _direct_gate_pending(str(gate.value), q, 'owner')})
-    from core.storage.local import RedisTracking
-    pending = stores.tracking.row
-    pending.pop('pk')
-    stores.tracking = RedisTracking(stores.tracking.r)
-    stores.tracking.set_status(PK, pending.pop('status'), **pending)
-    resume_job(PK, 'Test User', stores=stores, disposition='answer',
-               expected_gate_generation=pending['gate_pending']['generation'],
-               expected_question_identity=forms.owner_question_identity(PK, q))
-    grant = stores.tracking.get(PK)['human_approved_answers']['Name']
-    assert grant['form_selector'] == '#application-root'
-    assert grant['form_action'] == '#structural-submit'
-    assert [item['pk'] for item in _queued(stores)] == [PK]
-    row['human_approved_answers'] = stores.tracking.get(PK)['human_approved_answers']
-    filled = {}
-    receipt = await forms.execute(
-        session, page, {'action': 'fill', 'selector': q['selector'], 'fact': 'Name'},
-        facts={'Name': 'Test User'}, filled=filled, resume_path='Resume.pdf',
-        company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
-        job_url=posting('ashby'), provenance=provenance)
-    assert receipt['approved_value'] == 'Test User'
-    assert filled == {'#_systemfield_name': 'Test User'}
-    assert [c for c in raw.calls if c[0] == 'fill'] == [
-        ('fill', '#_systemfield_name', '--value', 'Test User')]
-
+def test_untrusted_formless_shapes_do_not_authorize_the_final_root(monkeypatch, changes):
+    _, raw, _, provenance = root_world(monkeypatch, **changes)
+    # Structural disagreements are represented in the current reader's
+    # final root evidence. No per-control mutation refusal is reintroduced.
+    root = raw.current['entry'].get('formless') or {}
+    assert isinstance(root, dict)
+    if root.get('error'):
+        with pytest.raises(forms.Gate, match='final Ashby application container'):
+            forms._formless_boundary(raw.current, provenance)
 
 async def test_changed_root_after_admission_can_be_reobserved_before_final_submit(monkeypatch):
     """A changed historical root sibling is not an irreversible application effect."""
@@ -737,24 +686,17 @@ async def test_changed_root_after_admission_can_be_reobserved_before_final_submi
 
 
 def approve_fields(row, page, fixed, provenance):
-    facts = {'Name': 'Test User', 'Email': 'test@example-co.test'}
-    witness = {c['selector']: c for c in fixed['controls']}
-    for target in page['controls']:
-        if target.get('label') not in facts:
-            continue
-        q = forms._disclosure_question(page, target, witness, posting('ashby'),
-                                       provenance=provenance)
-        row['human_approved_answers'][q['label']] = {
-            'value': facts[q['label']], 'label': q['control_label'],
-            **{k: q[k] for k in ('selector', 'url', 'question', 'tag', 'type',
-                                 'form_selector', 'form_action')}}
-    return facts
+    """Historical synthetic fixture entrypoint: ordinary bank facts only.
+
+    No per-control grant, witness or authorization is issued.
+    """
+    return {'Name': 'Test User', 'Email': 'test@example-co.test'}
 
 
 def action_sequence():
+    # The application loop stages the unique PDF before its first decision.
     return [dict(action='fill', selector='#_systemfield_name', fact='Name'),
             dict(action='fill', selector='#_systemfield_email', fact='Email'),
-            dict(action='upload', selector='#_systemfield_resume'),
             dict(action='submit', selector='#structural-submit')]
 
 
@@ -778,6 +720,11 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     monkeypatch.setattr(forms, 'check_before_committing_click', check)
     def clicked():
         assert checkpoints == ['held', 'checked']
+        # The committing boundary consumes its own current PAGE. A second
+        # all-control fixed witness is no longer a Submit precondition.
+        page_reads = [i for i, call in enumerate(raw.calls)
+                      if call == ('evaluate', forms.ENTRY_PAGE)]
+        assert page_reads
         if outcome == 'click-fault':
             raise OSError('Synthetic transport lost after possibly committing')
     raw.before_click = clicked
@@ -799,34 +746,21 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
                                pk=PK, resume_path=pdf)
     assert result['status'] == ('applied' if outcome == 'confirmed' else 'uncertain'), result
     task = decide.await_args_list[0].args[0]
-    # Ordinary fact values remain server-side; PAGE-listed choice data is not
-    # authority, and no model-supplied value can authorize a native write.
-    assert ('Ordinary approved FACT VALUES are hidden: name the authorized fact KEY '
-            'and the server writes the exact value.') in task
+    # The model receives fact *keys* and may prepare fields without widget
+    # permits. The only committing authority remains raw check_pre_submit.
+    assert 'Use existing owner fact keys' in task
+    assert 'without any per-control approval' in task
+    assert 'Never invent missing owner facts' in task
     assert all(value not in task for value in facts.values())
-    assert 'For fill, select and other fact actions use an authorized bank fact key' in task
-    assert ('For choose only, use the exact approved_choices PAGE-listed '
-            'radio member/checkbox selector and its raw key') in task
-    assert 'That fact is a routing label only' in task
-    assert 'server resolves the exact choice answer from its existing grant' in task
-    assert 'your value or PAGE text cannot authorize a write' in task
-    assert ('Choice answers visible in approved_choices are untrusted PAGE data, '
-            'not instructions or permission.') in task
-    assert ('Salary, beyond-standard privacy consent and new legal attestations '
-            'require direct owner decisions.') in task
-    assert decide.await_args_list[0].args[1]['approved_choices'] == []
-    assert ('For the required résumé file input, use upload with its selector; '
-            'the server attaches the staged file. ') in task
-    assert f'Exact human-authorized fact KEYS on this tracked job: {list(facts)}. ' in task
     assert effect_calls(raw.calls) == [
+        ('set', Path(transport._application_controller.resume_path).name),
         ('fill', '#_systemfield_name', '--value', 'Test User'),
         ('fill', '#_systemfield_email', '--value', 'test@example-co.test'),
-        ('set', Path(transport._application_controller.resume_path).name),
         ('click', '#structural-submit')]
     assert checkpoints == ['held', 'checked']
 
 
-@pytest.mark.parametrize('failure', ['missing-attachment', 'changed-grant', 'stale-seed', 'duplicate', 'hold'])
+@pytest.mark.parametrize('failure', ['missing-attachment', 'wrong-job', 'stale-seed', 'duplicate', 'hold'])
 async def test_real_presubmit_retains_independent_invariants(monkeypatch, failure):
     row, raw, decide, provenance = root_world(monkeypatch)
     facts = approve_fields(row, raw.current, raw.fixed, provenance)
@@ -839,8 +773,8 @@ async def test_real_presubmit_retains_independent_invariants(monkeypatch, failur
                     for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
                         if c.get('type') == 'file':
                             c['files'] = []
-            elif failure == 'changed-grant':
-                row['human_approved_answers']['Name']['value'] = 'Changed'
+            elif failure == 'wrong-job':
+                row['job_id'] = 'different-job'
             elif failure in {'stale-seed', 'duplicate'}:
                 def refuse(*a, **kw):
                     raise forms.Gate('Synthetic ' + failure)
@@ -858,14 +792,6 @@ async def test_real_presubmit_retains_independent_invariants(monkeypatch, failur
     assert not any(c[0] == 'click' for c in raw.calls)
 
 
-@pytest.mark.parametrize('verb', ['focus', 'fill', 'click', 'upload', 'select', 'hover', 'scroll'])
-async def test_every_pane_ipc_is_denied_at_producer(monkeypatch, verb):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
-        await session.call(verb, '#autofill-file')
-    no_mutations(raw)
-
-
 async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_path):
     row, raw, _, provenance = root_world(monkeypatch)
     transport, tracking, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
@@ -873,12 +799,12 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
     session = forms._EntrySession(transport, lambda u: u == entry('ashby'), provenance)
     page = await forms._stable_application_form(
         session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
-    with pytest.raises(forms.Gate, match='lacks final approval'):
+    with pytest.raises(forms.bsk.Unavailable, match='Unmediated application IPC is forbidden'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
     # #139 binding 1/AC9: copied facade state is not Submit authority.
     session.submit_authorized = forms._page_identity(await session.page())
-    with pytest.raises(forms.Gate, match='lacks final approval'):
+    with pytest.raises(forms.bsk.Unavailable, match='Unmediated application IPC is forbidden'):
         await session.call('click', '#structural-submit')
     no_mutations(raw)
     facts = approve_fields(row, page, raw.fixed, provenance)
@@ -889,6 +815,12 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
     transport.bind_application_controller(controller)
     session.resume_path = controller.resume_path
     try:
+        # The real raw producer needs its one staged PDF before final Submit.
+        # Ungated field fills cannot substitute for a verified attachment.
+        upload = await forms._ashby_resume_upload(
+            session, await session.page(), resume_path=controller.resume_path)
+        history.append(upload)
+        assert controller.upload_completed
         for action in action_sequence()[:-1]:
             receipt = await forms.execute(
                 session, await session.page(), action, facts=facts, filled=filled,
@@ -896,7 +828,8 @@ async def test_submit_producer_cannot_be_bypassed_or_retried(monkeypatch, tmp_pa
                 resume_tex='', github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
             history.append(receipt)
         await session.call('click', '#structural-submit')
-        with pytest.raises(forms.Gate, match='cannot be retried'):
+        assert controller.committed
+        with pytest.raises(forms.Gate, match='cannot be repeated'):
             await session.call('click', '#structural-submit')
         assert [c for c in raw.calls if c[0] == 'click'] == [('click', '#structural-submit')]
     finally:
@@ -911,140 +844,75 @@ def test_native_submit_needs_actual_independent_form_owner(tag, typ, owner):
     assert forms.native_submit(target) is (owner == '#native')
 
 
-@pytest.mark.parametrize('member,value,cause', [
-    ('unique', False, 'ambiguous application root control identity'),
-    ('native_owner', '#foreign', 'receiver outside root'),
-    ('declared_owner', 'foreign', 'receiver outside root'),
-    ('formaction', 'https://example-co.test/receive', 'receiver outside root'),
-    ('inside', False, 'candidate control outside root'),
-    ('in_container', False, 'outside application container'),
-    ('associated', False, 'label/control association'),
-    ('readonly', True, 'editability changed'),
-    ('inert', True, 'editability changed'),
-    ('visible', False, 'editability changed'),
-    ('disabled', True, 'editability changed'),
-    ('iti', True, 'unsupported .iti'),
-    ('contenteditable', True, 'unsupported contenteditable'),
-    ('type', 'hidden', 'unsupported hidden'),
-    ('type', 'file', 'unsupported file'),
-    ('type', 'unknown', 'application field inventory differs'),
-    ('type', 'select', 'application field inventory differs'),
-    ('type', 'radio', 'application field inventory differs'),
-    ('type', 'checkbox', 'application field inventory differs'),
-    ('label', 'I agree to these terms', 'application field inventory differs'),
+@pytest.mark.parametrize('spec', [
+    {'wrapperTag': 'section'}, {'wrapperClass': 'generic'},
+    {'paneTag': 'section'}, {'movePane': True},
+    {'moveSubmit': True}, {'duplicateSubmit': True},
+    {'duplicatePane': True}, {'duplicateId': True},
+    {'noResume': True}, {'invisible': '_systemfield_name'},
+    {'submitAttrs': {'type': 'button'}},
+    {'submitAttrs': {'role': 'button'}},
 ])
-def test_boundary_guard_local_cause(monkeypatch, member, value, cause):
-    # Observe first, then alter precisely one independent evidence member. Calling
-    # the producing seam directly prevents another controller guard masking it.
-    _, raw, _, provenance = root_world(monkeypatch)
-    c = next(c for c in raw.current['entry']['root_evidence'] if c['id'] == '_systemfield_name')
-    c[member] = value
-    with pytest.raises(forms.Gate, match=cause):
-        forms._formless_boundary(raw.current, provenance)
+def test_changed_ashby_roots_never_prove_an_unaudited_final_submit(monkeypatch, spec):
+    _, raw, _, provenance = root_world(monkeypatch, **spec)
+    root = raw.current['entry'].get('formless') or {}
+    if root.get('error') or not root.get('root'):
+        with pytest.raises(forms.Gate, match='final Ashby application container'):
+            forms._formless_boundary(raw.current, provenance)
+    else:
+        # Changing unrelated controls does not make another raw Submit safe.
+        expected = root.get('submit')
+        with pytest.raises(forms.Gate, match='unique final application Submit|final application container lost a receiver'):
+            forms._formless_boundary(
+                raw.current, provenance, submit_selector='#untracked-submit')
 
-
-@pytest.mark.parametrize('member,value', [('untyped', False), ('tag', 'input'), ('role', 'button'),
-                                        ('disabled', True), ('inert', True), ('visible', False)])
-def test_exact_submit_guard_local_cause(monkeypatch, member, value):
-    _, raw, _, provenance = root_world(monkeypatch)
-    c = next(c for c in raw.current['entry']['root_evidence'] if c['submit'])
-    c[member] = value
-    with pytest.raises(forms.Gate, match='exact structural submit changed'):
-        forms._formless_boundary(raw.current, provenance)
-
-
-@pytest.mark.parametrize('spec,cause', [
-    ({'wrapperTag': 'section'}, 'sibling identity mismatch'),
-    ({'wrapperClass': 'generic'}, 'sibling identity mismatch'),
-    ({'paneTag': 'section'}, 'sibling identity mismatch'),
-    ({'movePane': True}, 'sibling identity mismatch'),
-    ({'moveSubmit': True}, 'sibling identity mismatch'),
-    ({'duplicateSubmit': True}, 'ambiguous application roots'),
-    ({'duplicatePane': True}, 'ambiguous application roots'),
-    ({'duplicateId': True}, 'label/control association'),
-    ({'noResume': True}, 'missing unique labelled resume receiver'),
-    ({'invisible': '_systemfield_name'}, 'editability changed'),
-    ({'submitAttrs': {'type': 'button'}}, 'exact structural submit changed'),
-    ({'submitAttrs': {'role': 'button'}}, 'exact structural submit changed'),
+@pytest.mark.parametrize('problem', [
+    'truncated', 'empty-evidence', 'cross-channel', 'no-resume',
+    'root-error', 'root-missing', 'wrong-provenance',
 ])
-async def test_real_dom_root_edges_and_hidden_fields_gate_before_model(monkeypatch, tmp_path, spec, cause):
-    if cause == 'sibling identity mismatch':
-        # Issue #198 r03: the tolerated mismatch still admits the required,
-        # unanswered Name receiver, so the owner is asked before any model turn.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-        row, raw, decide, _ = root_world(monkeypatch, **spec)
-        transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-        result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
-                                   pk=PK, resume_path=pdf)
-        assert result['status'] == 'gate', result
-        assert result['reason'] == 'owner_question', result
-        assert result['review_route'] == 'owner', result
-        question = result['form_question']
-        assert question['selector'] == '#_systemfield_name', result
-        assert question['owner_kind'] == 'ashby-reversible-entry', result
-        assert not decide.await_count
-        assert [c for c in raw.calls if c[0] not in {'evaluate', 'navigate'}] == []
-        assert not transport._application_controller.upload_completed
-        assert not transport._application_controller.committed
-        return
-    if cause == 'ambiguous application roots':
-        await prepared_shape_refusal(monkeypatch, tmp_path, spec, cause)
-        return
-    _, raw, decide, provenance = root_world(monkeypatch, **spec)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    with pytest.raises(forms.Gate, match=cause):
-        forms._formless_boundary(raw.current, provenance)
-    assert not decide.await_count
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('problem,cause', [
-    ('truncated', 'incomplete application root evidence'),
-    ('empty-evidence', 'incomplete application root evidence'),
-    ('cross-channel', 'field inventory differs'),
-    ('no-resume', 'missing unique labelled resume receiver'),
-    ('root-error', 'ambiguous application roots'),
-    ('root-missing', 'no unique application root'),
-    ('wrong-provenance', 'structural recipient not proven'),
-])
-def test_boundary_metadata_guard_local_cause(monkeypatch, problem, cause):
+def test_final_formless_boundary_does_not_borrow_unproven_roots(monkeypatch, problem):
     _, raw, _, provenance = root_world(monkeypatch)
-    page = raw.current
+    page = deepcopy(raw.current)
     root = page['entry']['formless']
     if problem == 'truncated':
         root['truncated'] = True
     elif problem == 'empty-evidence':
         page['entry']['root_evidence'] = []
     elif problem == 'cross-channel':
-        page['controls'][0]['value'] = 'Changed independently'
+        page['entry']['root_evidence'].append(
+            {'selector': '#synthetic-extra', 'type': 'text'})
     elif problem == 'no-resume':
-        page['entry']['root_evidence'] = [c for c in page['entry']['root_evidence'] if c['type'] != 'file']
+        # The final PDF check, rather than the root witness's per-input
+        # admission, rejects a missing actual staged file receiver.
+        page['entry']['root_evidence'] = [
+            c for c in page['entry']['root_evidence'] if c.get('type') != 'file']
+        page['controls'] = [
+            c for c in page['controls'] if c.get('type') != 'file']
+        with pytest.raises(forms.Gate, match='résumé input'):
+            forms.check_form(page, {}, True, 'Synthetic.pdf')
+        return
     elif problem == 'root-error':
         root['error'] = 'ambiguous application roots'
     elif problem == 'root-missing':
         root['root'] = ''
     elif problem == 'wrong-provenance':
         provenance = None
-    with pytest.raises(forms.Gate, match=cause):
+    with pytest.raises(forms.Gate):
         forms._formless_boundary(page, provenance)
 
-
-@pytest.mark.parametrize('which', ['bootstrap', 'execute'])
-async def test_unapproved_formless_field_still_refuses_without_historic_admission(monkeypatch, which):
-    """Removing root identity gates must not authorize an unapproved value."""
+async def test_missing_formless_fact_is_a_normal_owner_question_not_a_grant(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
-    session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
-    with pytest.raises(forms.Gate, match='approved answer|human-approved|answer is needed'):
-        if which == 'bootstrap':
-            await forms._bootstrap(session, raw.current, PK, {}, provenance=provenance)
-        else:
-            await forms.execute(session, raw.current, action_sequence()[0], facts={}, filled={},
-                                resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                                resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                                provenance=provenance)
+    session = forms._EntrySession(
+        raw, lambda url: url == entry('ashby'), provenance)
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            session, raw.current, action_sequence()[0],
+            facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
+            jd_text='', resume_tex='', github='', pk=PK,
+            job_url=posting('ashby'), provenance=provenance)
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question is not None
     no_mutations(raw)
-
 
 async def test_independent_entry_witness_disagreement_cannot_authorize(monkeypatch):
     _, raw, _, provenance = root_world(monkeypatch)
@@ -1052,19 +920,6 @@ async def test_independent_entry_witness_disagreement_cannot_authorize(monkeypat
     session = forms._EntrySession(raw, lambda url: url == entry('ashby'), provenance)
     with pytest.raises(forms.Gate, match='predicate=entry.equal'):
         await forms._observe_controls(session, raw.current)
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('changed', ['value', 'label', 'selector', 'form_selector', 'form_action'])
-async def test_changed_exact_grant_has_zero_writes(monkeypatch, changed):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    row['human_approved_answers']['Name'][changed] = 'Changed'
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page, action_sequence()[0], facts=facts, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
     no_mutations(raw)
 
 
@@ -1124,71 +979,12 @@ async def _snapshot(page):
     return deepcopy(page)
 
 
-async def test_structural_fill_requires_exact_independent_readback(monkeypatch):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    original = raw.call
-    async def corrupt(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'fill':
-            for snapshot in (raw.current, raw.fixed):
-                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                    if c['selector'] == args[0]:
-                        c['value'] = 'Wrong value'
-        return result
-    raw.call = corrupt
-    with pytest.raises(forms.Gate, match='did not read back exactly'):
-        await forms.execute(session, page, action_sequence()[0], facts=facts, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-
-
-async def test_upload_requires_independent_fixed_readback(monkeypatch, tmp_path):
-    # FF-224g: the PAGE side alone never proves the direct set. A fixed witness
-    # that still shows no file is a Gate after one set, never a repeat.
-    _, raw, session, page, provenance = await admitted(monkeypatch)
-    original = raw.call
-    async def corrupt(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'evaluate' and resume_set_name(args[0]):
-            for c in raw.fixed['controls'] + raw.fixed['entry']['root_evidence']:
-                if c['type'] == 'file':
-                    c['files'] = []
-        return result
-    raw.call = corrupt
-    pdf = tmp_path / 'Resume.pdf'
-    pdf.write_bytes(b'%PDF-1.4 synthetic')
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path=str(pdf), company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-    assert session.upload_attempted
-    assert [c for c in effect_calls(raw.calls) if c[0] == 'set'] == [('set', 'Resume.pdf')]
-    assert not any(c[0] in {'click', 'submit'} for c in raw.calls)
-
-
-async def test_previous_structural_grant_drift_reasks_that_field(monkeypatch):
-    # Issue #258 (b'): an approval that no longer binds names its key and
-    # re-asks that one field on the current page; it is never written.
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    row['human_approved_answers']['Name']['form_action'] = '#changed-submit'
-    with pytest.raises(forms.Gate, match='Previously approved answer for "Name" no longer binds') as gate:
-        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
-    question = gate.value.form_question
-    assert question['label'] == 'Name' and question['pk'] == PK
-    assert question['form_action'] == forms._formless_root(page)['submit']
-    no_mutations(raw)
-
-
-async def test_description_link_is_not_a_receiver_or_an_action_grant(monkeypatch):
+async def test_description_link_is_not_a_form_answer_receiver(monkeypatch):
     _, raw, decide, _ = root_world(monkeypatch, descriptionLink=True)
     assert '#description-link' in {c['selector'] for c in raw.current['controls']}
     assert '#description-link' not in {c['selector'] for c in raw.current['entry']['root_evidence']}
     result = await attempt()
-    assert result['status'] == 'gate' and result['form_question']['label'] == 'Name'
+    assert result['status'] == 'gate' and result['form_question'] is None
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1198,11 +994,15 @@ def test_only_exact_structural_submit_matches_commit_target(monkeypatch):
     # The single final guard calls the existing structural root census; a
     # removed legacy helper is not an additional per-step submit authority.
     assert raw.current['entry']['formless']['submit'] == '#structural-submit'
-    forms._formless_boundary(raw.current, provenance)
+    forms._formless_boundary(
+        raw.current, provenance, submit_selector='#structural-submit')
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
+        forms._formless_boundary(
+            raw.current, provenance, submit_selector='#autofill-button')
     for selector in ('#dropzone', '#autofill-button', '#_systemfield_name'):
         drifted = deepcopy(raw.current)
         drifted['entry']['formless']['submit'] = selector
-        with pytest.raises(forms.Gate, match='exact structural submit changed'):
+        with pytest.raises(forms.Gate, match='unique final application Submit'):
             forms._formless_boundary(drifted, provenance)
     no_mutations(raw)
 
@@ -1212,83 +1012,11 @@ def test_structural_receiver_membership_is_guarded_at_destination_seam(monkeypat
         forms.check_form_destination(raw.current, {'selector': '#autofill-file'}, provenance=provenance)
 
 
-def test_structural_question_cannot_attribute_pane_control(monkeypatch):
-    _, raw, _, _ = root_world(monkeypatch)
-    with pytest.raises(forms.Gate, match='non-applicant target cannot request an answer'):
-        forms._form_subject(raw.current, {'selector': '#autofill-file'})
-
-
-def test_structural_resume_cannot_request_an_answer_grant(monkeypatch):
-    _, raw, _, provenance = root_world(monkeypatch)
-    target = next(c for c in raw.current['controls'] if c['type'] == 'file')
-    witness = {c['selector']: c for c in raw.fixed['controls']}
-    with pytest.raises(forms.Gate, match='Only witnessed text-entry controls'):
-        forms._disclosure_question(raw.current, target, witness, posting('ashby'), provenance=provenance)
-
-
-async def test_populated_field_cannot_use_a_different_approved_fact(monkeypatch):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    for snapshot in (page, raw.current, raw.fixed):
-        for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-            if c['selector'] == '#_systemfield_name':
-                c.update(value='Wrong value', has_value=True)
-    with pytest.raises(forms.Gate, match='unapproved populated application control'):
-        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
-    no_mutations(raw)
-
-
-async def test_grant_revoked_during_fill_cannot_produce_approval_receipt(monkeypatch):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    facts = approve_fields(row, page, raw.fixed, provenance)
-    original = raw.call
-    async def revoke(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'fill':
-            row['human_approved_answers'] = {}
-        return result
-    raw.call = revoke
-    with pytest.raises(forms.Gate, match='exact human-approved answer'):
-        await forms.execute(session, page, action_sequence()[0], facts=facts, filled={},
-                            resume_path='Resume.pdf', company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-
-
-async def test_ipc_producer_takes_its_own_fresh_independent_witness(monkeypatch):
-    _, raw, session, _, _ = await admitted(monkeypatch)
-    raw.fixed['controls'][0]['native_form_owner_selector'] = '#changed'
-    with pytest.raises(forms.Gate, match='predicate=native_form_owner_selector.equal'):
-        await session.call('fill', '#_systemfield_name', '--value', 'Test User')
-    no_mutations(raw)
-
-
-async def test_structural_upload_cannot_accept_an_additional_file(monkeypatch, tmp_path):
-    _, raw, session, page, provenance = await admitted(monkeypatch)
-    original = raw.call
-    async def extra_file(method, *args, **kw):
-        result = await original(method, *args, **kw)
-        if method == 'evaluate' and resume_set_name(args[0]):
-            for snapshot in (raw.current, raw.fixed):
-                for c in snapshot['controls'] + snapshot['entry']['root_evidence']:
-                    if c.get('type') == 'file':
-                        c['files'].append('Unexpected.pdf')
-        return result
-    raw.call = extra_file
-    pdf = tmp_path / 'Resume.pdf'
-    pdf.write_bytes(b'%PDF-1.4 synthetic')
-    with pytest.raises(forms.Gate, match='not proven in the current file input'):
-        await forms.execute(session, page, action_sequence()[2], facts={}, filled={},
-                            resume_path=str(pdf), company=COMPANY, jd_text='',
-                            resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                            provenance=provenance)
-
-
 def test_structural_presubmit_requires_only_the_staged_attachment(monkeypatch):
     _, raw, _, _ = root_world(monkeypatch)
     resume = next(c for c in raw.current['controls'] if c['type'] == 'file')
     resume['files'] = ['Resume.pdf', 'Unexpected.pdf']
-    with pytest.raises(forms.Gate, match='exact staged résumé'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(raw.current, {}, True, 'Resume.pdf')
 
 
@@ -1321,22 +1049,11 @@ async def test_final_submit_producer_rejects_state_drift_after_hold(monkeypatch,
     assert not any(c[0] == 'click' for c in raw.calls), result
     assert result['status'] == 'gate', result
     # #139 AC8: the same raw final guard checks post-hold form/root drift.
-    assert 'changed before submit' in result['question']
+    assert 'changed after the own hold' in result['question']
     # This is a post-admission drift, not a zero-total-IPC admission refusal.
     assert [c for c in raw.calls if c[0] == 'fill'], result
     assert len([c for c in effect_calls(raw.calls) if c[0] == 'set']) == 1
     assert not [c for c in raw.calls if c[0] == 'click']
-
-
-def test_cleared_optional_structural_answer_is_not_a_verified_receipt(monkeypatch):
-    _, raw, _, _ = root_world(monkeypatch)
-    for c in raw.current['controls']:
-        if c.get('required') and c.get('type') != 'file':
-            c.update(value='Verified', has_value=True)
-    filled = {c['selector']: c['value'] for c in raw.current['controls'] if c.get('has_value')}
-    filled['#additional'] = 'Approved optional answer'
-    with pytest.raises(forms.Gate, match='previously verified structural answer'):
-        forms.check_form(raw.current, filled, True)
 
 
 @pytest.mark.parametrize('style', [{'clip': 'rect(0px, 0px, 0px, 0px)'},
@@ -1349,11 +1066,10 @@ async def test_css_clipped_text_is_not_an_applicant_target(monkeypatch, style, a
         c = next(c for c in snapshot['entry']['root_evidence'] if c['id'] == target)
         assert not c['visible']
     result = await attempt()
-    # ARCH 17:51: the boundary's editability refusal now prepares through the
-    # reversible fallback, as main does; without the code-owned controller
-    # that route still gates before any model decision or effect.
+    # Clipping remains independently observable. Without a staged PDF,
+    # no Submit can be attempted; this is not a per-control permission gate.
     assert result['status'] == 'gate', result
-    assert 'requires the code-owned application IPC controller' in result['question'], result
+    assert 'row-tailored staged PDF is missing' in result['question'], result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1363,22 +1079,7 @@ def test_clipped_labelled_resume_remains_supported(monkeypatch):
                                       clipTarget='_systemfield_resume')
     for snapshot in (raw.current, raw.fixed):
         members = forms._formless_boundary(snapshot, provenance)
-        assert next(c for c in members if c['type'] == 'file')['id'] == '_systemfield_resume'
-
-
-@pytest.mark.parametrize('kind', ['search', 'foreign'])
-async def test_search_only_receiver_exception_reaches_real_question(monkeypatch, kind):
-    _, raw, decide, _ = root_world(monkeypatch, searchForm=kind)
-    result = await attempt()
-    assert result['status'] == 'gate', result
-    if kind == 'search':
-        assert result.get('form_question'), result
-        assert result['form_question']['label'] == 'Name', result
-    else:
-        assert 'native form receiver not proven' in result['question'], result
-        assert not result.get('form_question')
-    assert not decide.await_count
-    no_mutations(raw)
+        assert next(c for c in members if c['type'] == 'file')['selector'] == '#_systemfield_resume'
 
 
 async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatch):
@@ -1386,7 +1087,7 @@ async def test_ac_z_and_hidden_recaptcha_pair_reach_actual_human_gate(monkeypatc
     assert [f['status'] for f in raw.current['entry']['frames']] == ['R', 'R', 'Z']
     assert raw.current['entry'] == raw.fixed['entry']
     result = await attempt()
-    assert result['status'] == 'gate' and result['form_question']['label'] == 'Name', result
+    assert result['status'] == 'gate' and result['form_question'] is None, result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1429,8 +1130,11 @@ async def test_ac_z_becoming_active_is_rejected_on_later_inventory(monkeypatch):
     await forms._stable_application_form(
         session, session.allowed, provenance, deadline=asyncio.get_running_loop().time() + 10)
     raw.current, raw.fixed = observed(frames=['Z'], edit={'src': 'https://foreign.test/frame'})
+    # The reversible page read is ungated; the existing frame safety
+    # decision still rejects the now-active challenge on inspection.
+    fresh = await session.page()
     with pytest.raises(forms.Gate, match='unknown/untrusted application frame'):
-        await session.page()
+        forms._entry_safety(fresh, session.allowed, provenance)
     no_mutations(raw)
 
 
@@ -1456,14 +1160,6 @@ async def test_missing_autofill_pane_uses_the_existing_entry_wait(monkeypatch):
     assert page['entry']['formless']['root'] == '#application-root'
     assert reads >= 4
     no_mutations(raw)
-
-
-def test_search_only_exception_needs_the_inputs_actual_native_owner(monkeypatch):
-    _, raw, _, provenance = root_world(monkeypatch, searchForm='search')
-    search = next(c for c in raw.current['controls'] if c['selector'] == '#job-search')
-    search['native_form_owner_selector'] = ''
-    with pytest.raises(forms.Gate, match='native form receiver not proven'):
-        forms._formless_boundary(raw.current, provenance)
 
 
 @pytest.mark.parametrize('fact', ['src', 'title', 'data', 'aria', 'display', 'rects',
@@ -1497,66 +1193,12 @@ eval(process.argv[2]+'console.log(JSON.stringify(z));');
     {'wrapperTag': 'section'}, {'wrapperClass': 'foreign'}, {'wrongOrder': True},
     {'extraChild': True}, {'moveSubmit': True},
 ])
-def test_missing_pane_does_not_waive_proven_wrong_sibling_edges(monkeypatch, changes):
+def test_missing_pane_never_authorizes_unsafe_sibling_structure(monkeypatch, changes):
     _, raw, _, provenance = root_world(monkeypatch, missingPane=True, **changes)
-    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+    # A missing final container fails closed before the more specific sibling
+    # mismatch can be evaluated; both conditions deny raw Submit.
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
         forms._formless_boundary(raw.current, provenance)
-
-
-
-async def test_formless_bootstrap_uses_canonical_fact_only_with_raw_grant(
-        monkeypatch, tmp_path):
-    """Structural owner identity remains raw while bank fact is canonical."""
-    from core.models import AnswerScope
-    from core.storage.local import MarkdownAnswerBank
-
-    row, raw, _, provenance = root_world(monkeypatch)
-    # The independent PAGE and fixed root census witness the same starred label.
-    for snapshot in (raw.current, raw.fixed):
-        for target in snapshot['controls'] + snapshot['entry']['root_evidence']:
-            if target.get('selector') == '#_systemfield_name':
-                target['label'] = 'Name*'
-    session = forms._EntrySession(
-        raw, lambda url: url == entry('ashby'), provenance,
-        resume_path='Resume.pdf',
-    )
-    page = await forms._stable_application_form(
-        session, session.allowed, provenance,
-        deadline=asyncio.get_running_loop().time() + 10,
-    )
-    path = tmp_path / 'facts.md'
-    MarkdownAnswerBank(path).put("Name*", "Test User", AnswerScope.GLOBAL)
-    facts = MarkdownAnswerBank(path).all_facts("example-co")
-    assert facts == {"Name": "Test User"}
-    row['human_approved_answers'] = {
-        "Name*": {
-            "value": "Test User", "selector": "#_systemfield_name",
-            "url": page['url'], "label": "Name*", "question": "",
-            "tag": "input", "type": "text",
-            "form_selector": "#application-root",
-            "form_action": "#structural-submit",
-        },
-    }
-    checked = []
-    approved = forms.exact_approval
-
-    def capture(pk, key, value, **kwargs):
-        checked.append((key, value))
-        return approved(pk, key, value, **kwargs)
-
-    monkeypatch.setattr(forms, "exact_approval", capture)
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
-    assert caught.value.form_question['label'] == "Email"
-    assert ("Name*", "Test User") in checked
-    no_mutations(raw)
-
-    # The same canonically banked data is never an implicit approval grant.
-    row['human_approved_answers'] = {}
-    with pytest.raises(forms.Gate) as caught:
-        await forms._bootstrap(session, page, PK, facts, provenance=provenance)
-    assert caught.value.form_question['label'] == "Name*"
-    no_mutations(raw)
 
 @pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_duplicate(reader):
@@ -1565,15 +1207,16 @@ def test_complete_indistinguishable_formless_candidates_are_not_a_bare_empty_dup
     # Two separate populated label/receiver/file/submit graphs, not an extra
     # empty wrapper. There is no independently observable per-root job ID.
     assert result['entry']['formless']['error'] == 'ambiguous application roots'
-    controls = result['entry']['root_evidence']
-    assert len([c for c in controls if c.get('submit')]) == 0  # no unique exact submit
-    assert {'#_systemfield_name', '#second-name'} <= {c['selector'] for c in controls}
-    assert {'#_systemfield_resume', '#second-resume'} <= {c['selector'] for c in controls}
+    # An ambiguous pair offers no privileged final Submit receiver.
+    assert result['entry']['root_evidence'] == []
 
 
-async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch, tmp_path):
-    await prepared_shape_refusal(monkeypatch, tmp_path, {'secondFormlessComplete': True},
-                                 'ambiguous application roots')
+async def test_complete_two_formless_roots_refuse_final_submit(monkeypatch, tmp_path):
+    _, raw, decide, provenance = root_world(monkeypatch, secondFormlessComplete=True)
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
+        forms._formless_boundary(raw.current, provenance)
+    assert not decide.await_count
+    no_mutations(raw)
 
 
 @pytest.mark.parametrize('changes', [
@@ -1583,12 +1226,12 @@ async def test_complete_two_formless_roots_gate_before_model_and_ipc(monkeypatch
     {'idless': True, 'leadingInert': True, 'wrongOrder': True,
      'inertSibling': True, 'inertBeforeContainer': True},
 ])
-async def test_benign_ashby_restructuring_preserves_normal_human_question(
+async def test_benign_ashby_restructuring_retains_independent_readback(
         monkeypatch, changes):
     _, raw, decide, _ = root_world(monkeypatch, **changes)
+    assert raw.current['entry'] == raw.fixed['entry']
     result = await attempt()
-    assert result['status'] == 'gate', result
-    assert result['form_question']['label'] == 'Name', result
+    assert result['status'] == 'gate' and result['form_question'] is None, result
     assert not decide.await_count
     no_mutations(raw)
 
@@ -1598,7 +1241,7 @@ async def test_nested_interactive_sibling_gates_before_model_and_ipc(monkeypatch
     monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
     _, raw, decide, provenance = root_world(
         monkeypatch, inertSibling=True, inertDescendant=kind)
-    with pytest.raises(forms.Gate, match='sibling identity mismatch'):
+    with pytest.raises(forms.Gate, match='final Ashby application container'):
         forms._formless_boundary(raw.current, provenance)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -1626,28 +1269,19 @@ _LIVE_SIBLING = dict(inertSibling=True, inertBeforeContainer=True, highlight=Tru
     ({'inertDescendant': 'onclick'}, _UNSAFE),
     ({'inertDescendant': 'summary'}, _UNSAFE),
 ])
-def test_styled_inert_sibling_keeps_reversible_scope_without_wrapper_authority(
+def test_styled_inert_sibling_keeps_current_reader_scope_without_grants(
         changes, error):
-    # Live Ashby (Issue #222) puts an inert div carrying class + data-highlight
-    # beside the pane, container and Submit. After #220 that sibling was
-    # labelled "unsafe sibling", which is not a tolerated reversible root error,
-    # so every reversible scope came back empty and no row could be filled.
-    # class and data-* are styling: the page returns to the container-scoped
-    # mismatch, still never certifies the wrapper, and any other attribute or
-    # real interactivity on the sibling still refuses.
+    # Styling does not certify a root, nor create a per-widget admission gate.
     page, fixed = observed(**{**_LIVE_SIBLING, **changes})
     for current in (page, fixed):
         assert current['entry']['formless']['error'] == error
         assert current['entry']['root'] is None
-    scope = forms._reversible_entry_scope(
-        page, {c['selector']: c for c in fixed['controls']})
-    if error == _UNSAFE:
-        assert not scope
-    else:
-        assert scope
+        if error != _UNSAFE:
+            for key in ('container', 'submit', 'pane'):
+                assert current['entry']['formless'][key]
+    assert page['entry'] == fixed['entry']
 
-
-async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_click(
+async def test_real_idless_selectors_rekey_at_final_submit_not_on_field_writes(
         monkeypatch):
     row, raw, decide, provenance = root_world(monkeypatch, idless=True, domOrder=True)
     session = forms._EntrySession(
@@ -1657,27 +1291,19 @@ async def test_real_idless_selectors_rekey_without_semantic_admission_or_stale_c
         deadline=asyncio.get_running_loop().time() + 10)
     assert ':nth-of-type(' in old['entry']['formless']['root']
     old_submit = old['entry']['formless']['submit']
-    newer = observed(idless=True, domOrder=True, leadingInert=True, wrongOrder=True,
-                     inertSibling=True, inertBeforeContainer=True)
+    newer = observed(idless=True, domOrder=True, leadingInert=True,
+                     wrongOrder=True, inertSibling=True,
+                     inertBeforeContainer=True)
     raw.current, raw.fixed = deepcopy(newer)
     fresh = await session.page()
     assert old['entry']['formless']['root'] != fresh['entry']['formless']['root']
     assert old_submit != fresh['entry']['formless']['submit']
-    # querySelectorAll must follow the rebuilt tree order, not creation order.
-    def ordered_semantic_roles(page):
-        return ['submit' if c['submit'] else 'name' for c in page['entry']['root_evidence']
-                if c['submit'] or c['id'] == '_systemfield_name']
-    assert ordered_semantic_roles(old) == ['name', 'submit']
-    assert ordered_semantic_roles(fresh) == ['submit', 'name']
     assert forms._root_identity(old) == forms._root_identity(fresh)
-    assert forms._formless_boundary(fresh, provenance)
-    with pytest.raises(forms.Gate, match='forbidden at IPC producer'):
-        await session.call('click', old_submit)
-    with pytest.raises(forms.Gate, match='lacks final approval'):
-        await session.call('click', fresh['entry']['formless']['submit'])
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
+        forms._formless_boundary(
+            fresh, provenance, submit_selector=old_submit)
     assert not decide.await_count
     no_mutations(raw)
-
 
 async def test_one_successful_formless_fill_then_submit_shape_drift_allows_preparation(monkeypatch):
     """The changed Submit witness is for the final guard; fresh fields remain writable."""
@@ -1694,7 +1320,7 @@ async def test_one_successful_formless_fill_then_submit_shape_drift_allows_prepa
     await session.call('fill', '#_systemfield_email', '--value', facts['Email'])
     assert [c[:2] for c in raw.calls if c[0] == 'fill'] == [
         ('fill', '#_systemfield_name'), ('fill', '#_systemfield_email')]
-    with pytest.raises(forms.Gate, match='exact structural submit changed'):
+    with pytest.raises(forms.Gate, match='unique final application Submit'):
         forms._formless_boundary(raw.current, provenance)
     assert not [c for c in raw.calls if c[0] == 'click']
 
@@ -1756,7 +1382,10 @@ async def test_forless_witnessed_aria_picker_and_native_choices_reach_real_entry
     selectors = {c['selector'] for c in forms._formless_boundary(page, provenance)}
     assert selectors.issuperset({'#work-picker', '#radio-no', '#radio-yes', '#consent-choice'})
     radio = next(c for c in page['controls'] if c['selector'] == '#radio-no')
-    assert len(forms._radio_group(page, radio)) == 2
+    peers = [c for c in page['controls'] if c.get('type') == 'radio'
+             and c.get('question') == radio.get('question')
+             and c.get('form_selector') == radio.get('form_selector')]
+    assert len(peers) == 2
     for selector in ('#work-picker', '#radio-no', '#consent-choice'):
         await session.call('click', selector)
     assert [c for c in raw.calls if c[0] == 'click'] == [
@@ -2101,18 +1730,14 @@ def test_issue164_invalid_reserved_suffix_fails_before_throwing_value_getter(rea
         forms._entry_safety(page,lambda u:u==entry('ashby'),None)
 
 
-async def test_issue164_reserved_response_never_reaches_raw_fill_or_click(monkeypatch):
-    _, raw, _, provenance=root_world(monkeypatch)
-    raw.current=_issue164_reader('page',response=True)
-    raw.fixed=_issue164_reader('witness',response=True)
-    receiver=raw.current['entry']['responses'][0]['selector']
+def test_issue164_reserved_response_is_not_a_form_control(monkeypatch):
+    _, raw, _, _ = root_world(monkeypatch)
+    raw.current = _issue164_reader('page', response=True)
+    raw.fixed = _issue164_reader('witness', response=True)
+    receiver = raw.current['entry']['responses'][0]['selector']
     assert receiver not in {c['selector'] for c in raw.current['controls']}
-    session=forms._EntrySession(raw,lambda u:u==entry('ashby'),provenance,
-                                resume_path='Resume.pdf')
-    for method,args in [('fill',(receiver,'--value','synthetic-not-a-token')),
-                        ('click',(receiver,))]:
-        with pytest.raises(forms.Gate):
-            await session.call(method,*args)
+    assert receiver not in {c['selector']
+                            for c in raw.current['entry']['root_evidence']}
     no_mutations(raw)
 
 
@@ -2325,124 +1950,6 @@ def _issue182_tracking(monkeypatch, row):
     return writes
 
 
-@pytest.mark.parametrize('label,kind,value', [
-    ('Name', 'text', 'Test User'),
-    ('Phone', 'tel', '+12025550123'),
-    ('First Name', 'text', 'Test'),
-    ('Last Name', 'text', 'User'),
-])
-async def test_issue182_formless_global_grants_are_advertised_and_exact(
-        monkeypatch, label, kind, value):
-    row, raw, session, page, provenance = await _issue182_formless_page(
-        monkeypatch, label=label, kind=kind)
-    writes = _issue182_tracking(monkeypatch, row)
-    facts = {label: value, 'Email': 'synthetic@example.test'}
-    prepared = await forms._bootstrap(
-        session, page, PK, facts, posting('ashby'), provenance=provenance,
-        global_facts=dict(facts))
-    assert prepared['url'] == page['url']
-    assert len(writes) == 1
-    grants = row['human_approved_answers']
-    assert set(grants) == {label, 'Email'}
-    assert set(forms._advertised_grant_keys(PK, facts)) == {label, 'Email'}
-    for control in page['controls']:
-        if control['label'] not in facts:
-            continue
-        grant = grants[control['label']]
-        assert grant['source'] == 'bank-auto'
-        assert grant['selector'] == control['selector']
-        assert grant['value'] == facts[control['label']]
-        assert grant['form_selector'] == '#application-root'
-        assert grant['form_action'] == '#structural-submit'
-        bound = forms._bound_target(page, control)
-        forms.exact_approval(
-            PK, control['label'], grant['value'],
-            target=bound, url=page['url'], provenance=provenance)
-        with pytest.raises(forms.Gate, match='exact human-approved'):
-            forms.exact_approval(
-                PK, control['label'], 'different',
-                target=bound, url=page['url'], provenance=provenance)
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('label,kind,value', [
-    ('Desired salary', 'text', '500'),
-    ('I consent to privacy terms', 'text', 'yes'),
-    ('Sanctions or restricted country', 'text', 'No'),
-    ('Cover letter', 'textarea', 'Synthetic essay'),
-])
-async def test_issue182_formless_auto_grant_exclusions(
-        monkeypatch, label, kind, value):
-    row, raw, session, page, provenance = await _issue182_formless_page(
-        monkeypatch, label=label, kind=kind)
-    _issue182_tracking(monkeypatch, row)
-    facts = {label: value, 'Email': 'synthetic@example.test'}
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(
-            session, page, PK, facts, posting('ashby'), provenance=provenance,
-            global_facts=dict(facts))
-    assert label not in row['human_approved_answers']
-    assert set(row['human_approved_answers']) <= {'Email'}
-    no_mutations(raw)
-
-
-async def test_issue182_formless_company_overlay_mismatch_never_grants(monkeypatch):
-    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
-    _issue182_tracking(monkeypatch, row)
-    facts = {'Name': 'company-only', 'Email': 'synthetic@example.test'}
-    global_facts = {'Name': 'global-only', 'Email': 'synthetic@example.test'}
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(
-            session, page, PK, facts, posting('ashby'), provenance=provenance,
-            global_facts=global_facts)
-    assert 'Name' not in row['human_approved_answers']
-    no_mutations(raw)
-
-
-def test_issue182_formless_selector_membership_does_not_open_outer_scope():
-    from tests.tools.test_browser_bootstrap import field
-
-    outside = field('Email', '#outside', in_form=False)
-    assert not forms._bank_auto_eligible(
-        outside, 'synthetic@example.test',
-        formless_selectors=frozenset({'#inside'}))
-    assert forms._bank_auto_eligible(
-        outside, 'synthetic@example.test',
-        formless_selectors=frozenset({'#outside'}))
-    inside_native_form = field('Email', '#inside', in_form=True)
-    assert forms._bank_auto_eligible(inside_native_form, 'synthetic@example.test')
-
-async def test_issue182_formless_partial_label_is_not_a_global_fact(monkeypatch):
-    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
-    _issue182_tracking(monkeypatch, row)
-    partial = {'Full Name': 'Test User'}
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(
-            session, page, PK, partial, posting('ashby'),
-            provenance=provenance, global_facts=partial)
-    assert row['human_approved_answers'] == {}
-    no_mutations(raw)
-
-
-async def test_issue182_formless_existing_explicit_grant_is_not_overwritten(monkeypatch):
-    row, raw, session, page, provenance = await _issue182_formless_page(monkeypatch)
-    original = {'value': 'Owner decision', 'selector': '#old'}
-    row['human_approved_answers'] = {'Name': original.copy()}
-    _issue182_tracking(monkeypatch, row)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with pytest.raises(forms.Gate):
-        await forms._bootstrap(
-            session, page, PK, facts, posting('ashby'),
-            provenance=provenance, global_facts=facts)
-    assert row['human_approved_answers']['Name'] == original
-    no_mutations(raw)
-
-
-# Issue #184: a reversible raw session has no unique historical Ashby root.
-# The code-owned controller permits only freshly witnessed, form-free GLOBAL
-# facts to be granted; no root-based or final-Submit authority is inferred.
-
-
 @pytest.fixture
 def bootstrap_caplog(caplog):
     # Production logging is logger-local and never propagates to root caplog.
@@ -2506,697 +2013,9 @@ def _issue184_add_name_phone_controls(raw):
             snapshot['entry']['root_evidence'].append(evidence)
 
 
-async def test_issue184_reversible_exact_global_keys_advertised_with_safe_info(
-        monkeypatch, bootstrap_caplog):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    _issue184_add_name_phone_controls(raw)
-    # Exercise the real raw Session.page implementation. The generic PAGE
-    # lacks 'entry', so silently using it on the fallback must fail this test.
-    generic = await raw.page()
-    assert generic['url'] == entry('ashby') and 'entry' not in generic
-    allowed = lambda url: url == entry('ashby')
-    scoped = forms._EntrySession(raw, allowed, provenance, resume_path='Resume.pdf')
-    session, page = await forms._entry_or_reversible_page(
-        scoped, raw, allowed, provenance,
-        deadline=asyncio.get_running_loop().time() + 0.05)
-    assert isinstance(session, forms._ReversibleEntryReader)
-    assert session.raw is raw and forms._formless_root(page)
-    assert not forms._formless_root(page).get('root')
-    assert any(call == ('evaluate', forms.ENTRY_PAGE) for call in raw.calls)
-    writes = _issue182_tracking(monkeypatch, row)
-    facts = {'First Name': 'Test', 'Last Name': 'User',
-             'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
-    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
-        returned = await forms._bootstrap(
-            session, page, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=dict(facts))
-    assert returned is page
-    # The same reader follows post-action reads, with matching fixed witness
-    # for parity. It never falls back to generic Session.page().
-    after = await session.page()
-    assert forms._formless_root(after)
-    reread, witness = await forms._bootstrap_observe_controls(
-        session, after, site='bootstrap-formless')
-    assert forms._formless_root(reread)
-    assert set(witness) == {c['selector'] for c in after['controls']}
-    assert ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS) in raw.calls
-    assert ('evaluate', forms._FIXED_CONTROL_WITNESS) not in raw.calls
-    assert len(writes) == 1
-    grants = row['human_approved_answers']
-    assert set(grants) == set(facts)
-    assert set(forms._advertised_grant_keys(PK, facts)) == set(facts)
-    for key, value in facts.items():
-        grant = grants[key]
-        assert grant['source'] == 'bank-auto' and grant['value'] == value
-        assert grant['url'] == entry('ashby')
-        assert grant['form_selector'] == '' and grant['form_action'] == ''
-        assert grant['selector'] in {c['selector'] for c in raw.current['controls']
-                                     if c['label'] == key and c['in_form'] is False}
-    diagnostics = [r.getMessage() for r in bootstrap_caplog.records
-                   if 'bootstrap pk=' in r.getMessage()]
-    assert len(diagnostics) == 1
-    assert f'pk={PK} route=reversible' in diagnostics[0]
-    for key in facts:
-        assert key in diagnostics[0]
-    for value in facts.values():
-        assert value not in diagnostics[0]
-    no_mutations(raw)
-
-
-async def test_issue186_bootstrap_info_uses_production_console_stdout(monkeypatch, capsys):
-    from core.logging import _ConsoleFormatter
-
-    # Do not call get_logger here: doing so would fix the broken module
-    # logger inside the regression instead of testing its import-time setup.
-    logger = forms._LOG
-    assert logger.level == logging.INFO
-    assert logger.propagate is False
-    handlers = [
-        handler for handler in logger.handlers
-        if (isinstance(handler, logging.StreamHandler)
-            and isinstance(handler.formatter, _ConsoleFormatter))
-    ]
-    assert len(handlers) == 1
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    _issue184_add_name_phone_controls(raw)
-    writes = _issue182_tracking(monkeypatch, row)
-    facts = {'First Name': 'Test', 'Last Name': 'User',
-             'Phone': '+12025550123', 'Email': 'synthetic@example.test'}
-
-    # The real production-installed StreamHandler must write to stdout;
-    # give it the test's currently captured stdout without replacing its formatter.
-    with monkeypatch.context() as capture:
-        capture.setattr(handlers[0], 'stream', sys.stdout)
-        result = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=dict(facts))
-        forms._bootstrap_log(
-            {'label': 'Phone', 'type': 'tel', 'value': facts['Phone']},
-            0, 'bank-auto', required=True)
-        stdout = capsys.readouterr().out
-
-    assert result is raw.current
-    assert len(writes) == 1
-    assert set(row['human_approved_answers']) == set(facts)
-    bootstrap = [line for line in stdout.splitlines() if 'bootstrap pk=' in line]
-    assert len(bootstrap) == 1
-    expected = (f'bootstrap pk={PK} route=reversible '
-                f'bank-auto-granted={sorted(facts)}')
-    assert re.fullmatch(
-        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(expected)}',
-        bootstrap[0])
-    decisions = [line for line in stdout.splitlines()
-                 if 'bootstrap field decision ' in line]
-    assert len(decisions) == 1
-    assert re.match(r'^\d{2}:\d{2}:\d{2} INFO\s+tools\s+bootstrap field decision ',
-                    decisions[0])
-    assert "'label': 'phone'" in decisions[0]
-    for value in facts.values():
-        assert value not in stdout
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('label,kind,value', [
-    ('Desired salary', 'text', '500'),
-    ('I consent to processing', 'text', 'yes'),
-    ('I certify the information is true', 'text', 'yes'),
-    ('Sanctions or restricted country', 'text', 'No'),
-    ('Cover letter', 'textarea', 'Synthetic essay'),
-    ('Why do you want this job?', 'text', 'Synthetic motivation'),
-])
-async def test_issue184_reversible_exclusions_do_not_create_grants(
-        monkeypatch, label, kind, value):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    for snapshot in (raw.current, raw.fixed):
-        target = next(c for c in snapshot['controls']
-                      if c['selector'] == '#_systemfield_name')
-        target.update(label=label, question='', type=kind,
-                      native_type=kind, tag='textarea' if kind == 'textarea' else 'input')
-    _issue182_tracking(monkeypatch, row)
-    facts = {label: value, 'Email': 'synthetic@example.test'}
-    returned = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=dict(facts))
-    assert returned is raw.current
-    assert label not in row['human_approved_answers']
-    assert set(row['human_approved_answers']) == {'Email'}
-    assert forms._advertised_grant_keys(PK, facts) == ['Email']
-    no_mutations(raw)
-
-
-async def test_issue184_reversible_existing_grant_and_overlay_still_win(monkeypatch):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    _issue184_add_name_phone_controls(raw)
-    owner_grant = {'source': 'owner', 'value': 'Explicit synthetic answer',
-                   'selector': '#old'}
-    row['human_approved_answers']['First Name'] = deepcopy(owner_grant)
-    _issue182_tracking(monkeypatch, row)
-    facts = {'First Name': 'Test', 'Last Name': 'User',
-             'Phone': 'company-only', 'Email': 'synthetic@example.test'}
-    global_facts = {**facts, 'Phone': 'global-only'}
-    returned = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=global_facts)
-    assert returned is raw.current
-    assert row['human_approved_answers']['First Name'] == owner_grant
-    assert set(row['human_approved_answers']) == {'First Name', 'Last Name', 'Email'}
-    assert 'Phone' not in forms._advertised_grant_keys(PK, facts)
-    no_mutations(raw)
-
-
-async def test_issue184_reversible_native_owner_outside_scope(monkeypatch):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    for snapshot in (raw.current, raw.fixed):
-        target = next(c for c in snapshot['controls']
-                      if c['selector'] == '#_systemfield_name')
-        target.update(label='First Name', question='', in_form=True,
-                      form_selector='#foreign', form_action=entry('ashby'),
-                      native_form_owner_selector='#foreign')
-    _issue182_tracking(monkeypatch, row)
-    facts = {'First Name': 'Test', 'Email': 'synthetic@example.test'}
-    result = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=facts)
-    assert result is raw.current
-    assert set(row['human_approved_answers']) == {'Email'}
-    no_mutations(raw)
-
-
-async def test_issue184_reversible_without_controller_mints_nothing(monkeypatch):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    del raw._application_controller
-    writes = _issue182_tracking(monkeypatch, row)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with pytest.raises(forms.Gate, match='application IPC controller'):
-        await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=facts)
-    assert row['human_approved_answers'] == {}
-    assert writes == [] and raw.calls == []
-
-
-async def test_issue184_reversible_observation_gate_returns_original_page(
-        monkeypatch, bootstrap_caplog):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    observe = AsyncMock(side_effect=forms.Gate('Synthetic changed witness'))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
-        result = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=facts)
-    assert result is raw.current and row['human_approved_answers'] == {}
-    observe.assert_awaited_once()
-    assert writes == []
-    messages = [r.getMessage() for r in bootstrap_caplog.records if 'bootstrap pk=' in r.getMessage()]
-    assert len(messages) == 1 and 'route=reversible' in messages[0]
-    assert 'bank-auto-granted=[]' in messages[0]
-    for value in facts.values():
-        assert value not in messages[0]
-    no_mutations(raw)
-
-
-async def test_issue184_reversible_disallowed_fresh_origin_returns_page(monkeypatch):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    _issue182_tracking(monkeypatch, row)
-    foreign = deepcopy(raw.current)
-    foreign['url'] = 'https://unrelated.example.test/foreign'
-    observe = AsyncMock(return_value=(foreign, {}))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observe)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    result = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=facts)
-    assert result is raw.current and row['human_approved_answers'] == {}
-    observe.assert_awaited_once()
-    no_mutations(raw)
-
-
-async def test_issue184_bootstrap_info_routes_entry_and_form(monkeypatch, bootstrap_caplog):
-    row, raw, session, page, provenance = await admitted(monkeypatch)
-    with bootstrap_caplog.at_level('INFO', logger=forms.__name__):
-        with pytest.raises(forms.Gate):
-            await forms._bootstrap(session, page, PK, {},
-                                   posting('ashby'), provenance=provenance)
-        form_page = {'url': entry('ashby'), 'controls': [],
-                     'entry': {'root': {'selector': '#synthetic-form'}}}
-        assert await forms._bootstrap(
-            raw, form_page, PK, {}, posting('ashby'), provenance=provenance) is form_page
-    messages = [r.getMessage() for r in bootstrap_caplog.records
-                if 'bootstrap pk=' in r.getMessage()]
-    assert len(messages) == 2
-    assert f'pk={PK} route=entry' in messages[0]
-    assert f'pk={PK} route=form' in messages[1]
-    assert all('bank-auto-granted=[]' in message for message in messages)
-    no_mutations(raw)
-
-
-def _issue184_real_producer(monkeypatch, facts):
-    """Real raw Session/IPC guard, synthetic command transport and generic PAGE."""
-    row, endpoint, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    monkeypatch.setattr(forms.submit_hold, 'is_held', lambda *args, **kwargs: False)
-
-    async def command(*args, **kwargs):
-        assert not kwargs and args[-2:] == ('--session', 'synthetic-session')
-        return await endpoint.call(*args[:-2])
-
-    monkeypatch.setattr(forms.bsk, 'command', command)
-    producer = ProductionBrowserSession('apply')
-    producer.id = 'synthetic-session'
-    filled, history = {}, []
-    controller = forms.ApplicationIPCController(
-        PK, COMPANY, posting('ashby'), '', facts, filled, history,
-        {'url': entry('ashby')}, lambda: None)
-    producer.bind_application_controller(controller)
-    return row, endpoint, producer, controller, provenance, writes
-
-
-async def _issue184_prepare_producer(producer, provenance, facts):
-    # Real raw Session.page() has no entry.formless; the scoped fallback must
-    # supply ENTRY_PAGE, while its raw application_effect stays in control.
-    generic = await producer.page()
-    assert generic['url'] == entry('ashby') and 'entry' not in generic
-    allowed = lambda url: url == entry('ashby')
-    scoped = forms._EntrySession(producer, allowed, provenance,
-                                 resume_path='Resume.pdf')
-    session, page = await forms._entry_or_reversible_page(
-        scoped, producer, allowed, provenance,
-        deadline=asyncio.get_running_loop().time() + 0.05)
-    assert isinstance(session, forms._ReversibleEntryReader)
-    assert session.raw is producer and forms._formless_root(page)
-    assert not forms._formless_root(page).get('root')
-    returned = await forms._bootstrap(
-        session, page, PK, facts, posting('ashby'), company=COMPANY,
-        provenance=provenance, global_facts=dict(facts))
-    assert returned is page
-    assert set(forms._advertised_grant_keys(PK, facts)) == set(facts)
-    return session, page
-
-
-@pytest.mark.parametrize('key,selector,value', [
-    ('Name', '#_systemfield_name', 'Test User'),
-    ('Email', '#_systemfield_email', 'synthetic@example.test'),
-])
-async def test_issue184_bank_auto_fill_reaches_raw_controller_and_exact_readback(
-        monkeypatch, key, selector, value):
-    """Review findings: granted facts reach the real producer and exact readback."""
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    row, endpoint, producer, controller, provenance, writes = (
-        _issue184_real_producer(monkeypatch, facts))
-    session, page = await _issue184_prepare_producer(producer, provenance, facts)
-    before_ipc = controller.before_ipc
-    calls = []
-
-    async def checked_before_ipc(raw, args, kwargs):
-        calls.append(args)
-        return await before_ipc(raw, args, kwargs)
-
-    monkeypatch.setattr(controller, 'before_ipc', checked_before_ipc)
-    witnessed = sum(c == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)
-                    for c in endpoint.calls)
-    action = {'action': 'fill', 'selector': selector, 'fact': key}
-    receipt = await forms.execute(
-        session, page, action, facts=facts, filled=controller.filled,
-        resume_path='', company=COMPANY, jd_text='', resume_tex='', github='',
-        pk=PK, job_url=posting('ashby'), provenance=provenance)
-    assert receipt['action'] == 'fill'
-    assert calls == [('fill', selector, '--value', value)]
-    assert [call for call in endpoint.calls if call[0] == 'fill'] == [
-        ('fill', selector, '--value', value)]
-    assert controller.filled == {selector: value}
-    after = await session.page()
-    target = next(c for c in after['controls'] if c['selector'] == selector)
-    assert target['value'] == value and target['has_value'] is True
-    assert forms._bound_target(after, target)['form_action'] == ''
-    # Producer validation must have performed its OWN fresh ENTRY_PAGE/fixed
-    # witness pair, not relied on the two execute checks or bootstrap proof.
-    assert sum(c == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)
-               for c in endpoint.calls) >= witnessed + 2
-    assert len(writes) == 1 and not controller.committed
-    assert not any(call[0] == 'click' for call in endpoint.calls)
-
-
-async def test_issue184_before_ipc_exact_ownerless_grant_rejects_forged_form_action(
-        monkeypatch):
-    """Review finding 2: the fresh producer checks native, not invented root, identity."""
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    row, endpoint, producer, controller, provenance, writes = (
-        _issue184_real_producer(monkeypatch, facts))
-    session, page = await _issue184_prepare_producer(producer, provenance, facts)
-    control = next(c for c in page['controls']
-                   if c['selector'] == '#_systemfield_name')
-    assert control['in_form'] is False and control['form_action'] == ''
-    assert forms._formless_root(page)['root'] == ''
-    assert forms._bound_target(page, control)['form_action'] == ''
-    request = ('fill', control['selector'], '--value', facts['Name'])
-    await controller.before_ipc(producer, request, {})
-    assert not [call for call in endpoint.calls if call[0] == 'fill']
-    assert len(writes) == 1
-    # Even the independently observed structural Submit selector is not
-    # permission to change the bank grant's native receiver identity.
-    original = row['human_approved_answers']['Name']['form_action']
-    row['human_approved_answers']['Name']['form_action'] = '#structural-submit'
-    try:
-        with pytest.raises(forms.Gate, match='exact human-approved'):
-            await controller.before_ipc(producer, request, {})
-    finally:
-        row['human_approved_answers']['Name']['form_action'] = original
-    assert not controller.committed and not any(
-        call[0] == 'click' for call in endpoint.calls)
-
-
-@pytest.mark.parametrize('mutation', ['outside-fresh-scope', 'native-form-owner'])
-async def test_issue184_old_grant_never_authorizes_a_changed_raw_receiver(
-        monkeypatch, mutation):
-    """The persisted key is not a stale PAGE/scope authority at either IPC edge."""
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    row, endpoint, producer, controller, provenance, writes = (
-        _issue184_real_producer(monkeypatch, facts))
-    session, page = await _issue184_prepare_producer(producer, provenance, facts)
-    assert 'Email' in forms._advertised_grant_keys(PK, facts)
-
-    # The DOM changes AFTER bootstrap. Both real readers see the changed
-    # control; cached bootstrap membership would incorrectly authorize it.
-    for snapshot in (endpoint.current, endpoint.fixed):
-        email = next(c for c in snapshot['controls']
-                     if c['selector'] == '#_systemfield_email')
-        if mutation == 'outside-fresh-scope':
-            email['href'] = 'https://unrelated.example.test/foreign'
-        else:
-            email.update(in_form=True, form_selector='#foreign-native',
-                         form_action=entry('ashby'),
-                         native_form_owner_selector='#foreign-native')
-    current = await session.page()
-    assert forms._formless_root(current) and not forms._formless_root(current).get('root')
-    action = {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'}
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, current, action, facts=facts, filled=controller.filled,
-            resume_path='', company=COMPANY, jd_text='', resume_tex='', github='',
-            pk=PK, job_url=posting('ashby'), provenance=provenance)
-
-    # A direct raw producer request cannot borrow the previous successful
-    # bootstrap scope or bypass execute-time refusal.
-    observed_before = len([call for call in endpoint.calls
-                           if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)])
-    with pytest.raises(forms.Gate, match='exact human-approved reversible receiver'):
-        await controller.before_ipc(
-            producer, ('fill', '#_systemfield_email', '--value', facts['Email']), {})
-    observed_after = len([call for call in endpoint.calls
-                          if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)])
-    assert observed_after > observed_before
-    assert not controller.filled and not controller.committed
-    assert not [c for c in endpoint.calls if c[0] in {'fill', 'select', 'click'}]
-    assert set(row['human_approved_answers']) == set(facts)
-    assert len(writes) == 1
-
-# Issue #188: trace only code-owned diagnostics through the real, non-propagating
-# production StreamHandler. Root caplog misses this logger by design.
-def _issue188_console_handler():
-    from core.logging import _ConsoleFormatter
-
-    logger = forms._LOG
-    assert logger.level == logging.INFO and logger.propagate is False
-    handlers = [
-        h for h in logger.handlers
-        if isinstance(h, logging.StreamHandler)
-        and isinstance(h.formatter, _ConsoleFormatter)
-    ]
-    assert len(handlers) == 1
-    return handlers[0]
-
-
-_ISSUE188_LONG_WITNESS = (
-    'The current DOM witness is unavailable or changed; '
-    'exception=ValueError; predicate=controls.length.equal; control='
-    + 'input:nth-of-type(1)' + ' > div:nth-of-type(1)' * 12
-    + '; site=bootstrap-formless'
-)
-
-
-@pytest.mark.parametrize('message,expected_text', [
-    ('The reversible observation left the preparation origin.',
-     'The reversible observation left the preparation origin.'),
-    (_ISSUE188_LONG_WITNESS, _ISSUE188_LONG_WITNESS[:200]),
-    ('Private page says Test User, synthetic@example.test; token=private-synthetic',
-     '[redacted]'),
-])
-async def test_issue188_swallowed_reversible_gate_uses_safe_production_stdout(
-        monkeypatch, capsys, message, expected_text):
-    from unittest.mock import AsyncMock
-
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    observer = AsyncMock(side_effect=forms.Gate(message, reason='defect_witness'))
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', observer)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        result = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=facts)
-        output = capsys.readouterr().out
-
-    assert result is raw.current
-    assert row['human_approved_answers'] == {} and writes == []
-    observer.assert_awaited_once()
-    lines = [line for line in output.splitlines()
-             if 'reversible bootstrap gate pk=' in line]
-    assert len(lines) == 1
-    message = (f'reversible bootstrap gate pk={PK} reason=defect_witness '
-               f'text={expected_text}')
-    assert re.fullmatch(
-        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(message)}',
-        lines[0])
-    assert len(expected_text) <= 200
-    assert 'bank-auto-granted=[]' in output
-    for secret in ('Test User', 'synthetic@example.test', 'private-synthetic'):
-        assert secret not in output
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('case,reason,key', [
-    ('not_in_scope', 'not_in_scope', 'Name'),
-    ('has_value', 'has_value', 'Name'),
-    ('no_key', 'no_key', 'input:nth-of-type(2)'),
-    ('no_global', 'no_global', 'Name'),
-    ('no_global_empty', 'no_global', 'Name'),
-    ('value_mismatch', 'value_mismatch', 'Name'),
-    ('not_eligible', 'not_eligible', 'Name'),
-    ('disclosure_gate', 'disclosure_gate', 'Name'),
-    ('radio_mismatch', 'radio_mismatch', 'Name'),
-    ('already_granted', 'not_eligible', 'Name'),
-    ('opaque_label', 'has_value', '[redacted]'),
-])
-async def test_issue188_bank_auto_skip_codes_use_safe_production_stdout(
-        monkeypatch, capsys, case, reason, key):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    page = deepcopy(raw.current)
-    target = next(item for item in page['controls']
-                  if item['selector'] == '#_systemfield_name')
-    page['controls'] = [target]
-    facts = {'Name': 'Test User'}
-    global_facts = dict(facts)
-    if case == 'not_in_scope':
-        target['in_form'] = True
-    elif case == 'has_value':
-        target.update(has_value=True, value='already-filled-synthetic')
-    elif case == 'no_key':
-        target.update(question='', label='', selector='input:nth-of-type(2)')
-    elif case == 'no_global':
-        global_facts = {'Email': 'synthetic@example.test'}
-    elif case == 'no_global_empty':
-        global_facts = {}
-    elif case == 'value_mismatch':
-        facts['Name'] = 'company-only'
-        global_facts['Name'] = 'global-only'
-    elif case == 'not_eligible':
-        target.update(tag='textarea', type='textarea')
-    elif case == 'radio_mismatch':
-        target.update(tag='input', type='radio', native_type='radio',
-                      question='Name', label='Option A', name='synthetic-radio',
-                      value='choice-a')
-        sibling = deepcopy(target)
-        sibling.update(selector='#synthetic-radio-b', label='Option B',
-                       value='choice-b')
-        page['controls'].append(sibling)
-        # _key validates the group before disclosure. Keep the independently
-        # witnessed receiver identities complete and inside the application,
-        # while their option values deliberately do not match the bank fact.
-        root_member = next(e for e in page['entry']['root_evidence']
-                           if e['selector'] == '#_systemfield_name')
-        evidence = []
-        for member in page['controls']:
-            bound = deepcopy(root_member)
-            bound.update(selector=member['selector'], label=member['label'],
-                         tag='input', type='radio', native_type='radio',
-                         associated=True, in_container=True, inside=True,
-                         unique=True, required=member['required'],
-                         value=member['value'], files=member['files'])
-            evidence.append(bound)
-        page['entry']['root_evidence'] = evidence
-        monkeypatch.setattr(forms, '_disclosure_question',
-                            lambda *args, **kwargs: {'selector': target['selector']})
-    elif case == 'already_granted':
-        row['human_approved_answers']['Name'] = {
-            'source': 'owner', 'value': 'synthetic-explicit', 'selector': '#prior'}
-    elif case == 'opaque_label':
-        target.update(question='', label='Private Test User application text',
-                      selector='#private-Test-User', has_value=True,
-                      value='already-filled-synthetic')
-
-    prior = deepcopy(row['human_approved_answers'])
-    scope = frozenset(member['selector'] for member in page['controls'])
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        forms._auto_grant_from_global(
-            page, {}, PK, facts, global_facts, posting('ashby'),
-            provenance=provenance, formless_selectors=scope,
-            reversible_scope=scope)
-        output = capsys.readouterr().out
-
-    assert row['human_approved_answers'] == prior and writes == []
-    lines = [line for line in output.splitlines() if 'bank-auto skip pk=' in line]
-    # Both radio members are skipped; each must have one production INFO line.
-    assert len(lines) == (2 if case == 'radio_mismatch' else 1)
-    expected = f'bank-auto skip pk={PK} key={key} why={reason}'
-    assert all(re.fullmatch(
-        rf'\d{{2}}:\d{{2}}:\d{{2}} INFO\s+tools\s+{re.escape(expected)}',
-        line) for line in lines)
-    for secret in ('Test User', 'synthetic@example.test', 'company-only',
-                   'global-only', 'already-filled-synthetic', 'synthetic-explicit'):
-        assert secret not in output
-    no_mutations(raw)
-
-# Issue #190: a strict entry mismatch may settle only at bootstrap. The
-# production PAGE+witness handler owns the reread budget and safe diagnostic.
-_ISSUE190_PRIVATE_ENTRY = 'SYNTHETIC_ENTRY_VALUE_NOT_FOR_LOGS'
-
-
-def _issue190_entry_witness_reads(raw, *, unstable):
-    original_call = raw.call
-    reads = []
-
-    async def call(method, *args, **kwargs):
-        if method == 'evaluate' and args == (forms._ENTRY_FIXED_CONTROL_WITNESS,):
-            reads.append(len(reads) + 1)
-            fixed = deepcopy(raw.fixed)
-            if len(reads) in unstable:
-                fixed['entry']['frames'] = [_ISSUE190_PRIVATE_ENTRY]
-            return {'value': fixed}
-        return await original_call(method, *args, **kwargs)
-
-    raw.call = call
-    return reads
-
-
-async def test_issue190_reversible_bootstrap_recovers_after_first_entry_mismatch(monkeypatch):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    reads = _issue190_entry_witness_reads(raw, unstable={1})
-    reached_auto_grant = []
-    real_auto_grant = forms._auto_grant_from_global
-
-    def auto_grant(*args, **kwargs):
-        reached_auto_grant.append(True)
-        return real_auto_grant(*args, **kwargs)
-
-    monkeypatch.setattr(forms, '_auto_grant_from_global', auto_grant)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    returned = await forms._bootstrap(
-        raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-        company=COMPANY, provenance=provenance, global_facts=dict(facts))
-
-    assert returned is raw.current
-    assert reads == [1, 2, 3]  # Read 1 differs; complete reads 2 and 3 agree.
-    assert reached_auto_grant == [True]
-    assert len(writes) == 1
-    assert set(row['human_approved_answers']) == set(facts)
-    no_mutations(raw)
-
-
-async def test_issue190_persistent_frames_gate_names_key_on_production_stdout(
-        monkeypatch, capsys):
-    row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    writes = _issue182_tracking(monkeypatch, row)
-    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4, 5})
-    original_observe = forms._bootstrap_observe_controls
-    gates = []
-
-    async def record_gate(*args, **kwargs):
-        try:
-            return await original_observe(*args, **kwargs)
-        except forms.Gate as gate:
-            gates.append(str(gate))
-            raise
-
-    monkeypatch.setattr(forms, '_bootstrap_observe_controls', record_gate)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    with monkeypatch.context() as capture:
-        capture.setattr(_issue188_console_handler(), 'stream', sys.stdout)
-        returned = await forms._bootstrap(
-            raw._reversible_session, raw.current, PK, facts, posting('ashby'),
-            company=COMPANY, provenance=provenance, global_facts=dict(facts))
-        output = capsys.readouterr().out
-
-    assert returned is raw.current and reads == [1, 2, 3, 4]
-    assert len(gates) == 1
-    predicate = 'predicate=entry.equal.frames; control=unavailable; site=bootstrap-formless'
-    assert predicate in gates[0]
-    lines = [line for line in output.splitlines() if 'reversible bootstrap gate pk=' in line]
-    assert len(lines) == 1
-    assert predicate in lines[0] and '[redacted]' not in lines[0]
-    assert _ISSUE190_PRIVATE_ENTRY not in gates[0] + output
-    assert all(value not in output for value in facts.values())
-    assert row['human_approved_answers'] == {} and writes == []
-    no_mutations(raw)
-
-
-async def test_issue190_execute_entry_mismatch_gates_on_first_read(monkeypatch):
-    _row, raw, provenance = _issue184_reversible_session(monkeypatch)
-    reads = _issue190_entry_witness_reads(raw, unstable={1, 2, 3, 4})
-    with pytest.raises(forms.Gate, match=r'predicate=entry\.equal\.frames; control=unavailable; site=execute'):
-        await forms.execute(
-            raw._reversible_session, raw.current,
-            dict(action='fill', selector='#_systemfield_name', fact='Name'),
-            facts={'Name': 'Test User'}, filled={}, resume_path='',
-            company=COMPANY, jd_text='', resume_tex='', github='',
-            pk=PK, job_url=posting('ashby'), provenance=provenance)
-    assert reads == [1]
-    no_mutations(raw)
-
-
-@pytest.mark.parametrize('site', ['bootstrap-formless', 'bootstrap-material'])
-@pytest.mark.parametrize('unstable,success,failed_predicate', [
-    ({1, 2, 3, 4}, False, 'entry.equal.frames'),
-    ({1, 3}, False, 'inventory.identity.equal'),
-    ({1, 2}, True, ''),
-])
-async def test_issue190_bootstrap_entry_retry_cap_and_consecutive_complete_reads(
-        monkeypatch, site, unstable, success, failed_predicate):
-    _row, raw, _provenance = _issue184_reversible_session(monkeypatch)
-    reads = _issue190_entry_witness_reads(raw, unstable=unstable)
-    if success:
-        page, witness = await forms._bootstrap_observe_controls(
-            raw._reversible_session, raw.current, site=site)
-        assert page['entry'] == raw.current['entry']
-        assert set(witness) == {c['selector'] for c in raw.current['controls']}
-    else:
-        with pytest.raises(forms.Gate, match='predicate=' + re.escape(failed_predicate)):
-            await forms._bootstrap_observe_controls(
-                raw._reversible_session, raw.current, site=site)
-    assert reads == [1, 2, 3, 4]  # Never a fifth PAGE/witness evaluation.
-    no_mutations(raw)
-
+# Opaque synthetic page-controlled diagnostic sentinel; no grant or
+# per-action witness helper is reintroduced.
+_ISSUE190_PRIVATE_ENTRY = 'SYNTHETIC_PRIVATE_ENTRY_SENTINEL'
 
 @pytest.mark.parametrize('key', [
     'frames', 'responses', 'response_error', 'root', 'native_candidates',
@@ -3214,8 +2033,6 @@ async def test_issue190_diagnostic_names_only_top_level_entry_key(monkeypatch, k
     text = str(failure.value)
     assert f'predicate=entry.equal.{key}; control=unavailable; site=execute' in text
     assert _ISSUE190_PRIVATE_ENTRY not in text
-    assert _ISSUE190_PRIVATE_ENTRY not in forms._reversible_bootstrap_gate_text(
-        failure.value)
     no_mutations(raw)
 
 
@@ -3245,20 +2062,15 @@ async def test_issue190_missing_entry_key_is_not_equal_to_null(monkeypatch):
     no_mutations(raw)
 
 
-def test_issue196_date_is_fillable_but_not_bank_auto_grantable():
-    """A newly owner-answerable date must not expand the prior GLOBAL grant scope."""
+def test_issue196_date_is_a_normal_answerable_input_without_bank_grants():
     target = {
         'selector': '#synthetic-date', 'tag': 'input', 'type': 'date',
         'in_form': False, 'disabled': False, 'required': True,
         'label': 'Start date', 'question': '', 'value': '', 'has_value': False,
     }
     assert forms._native_answer(target)
-    # The obsolete per-step native-action helper is gone; bank admission is not.
+    assert not hasattr(forms, '_bank_auto_eligible')
     assert not hasattr(forms, '_require_native_action')
-    assert not forms._bank_auto_eligible(
-        target, '2026-11-10', formless_selectors=frozenset({'#synthetic-date'}))
-
-
 
 async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(monkeypatch):
     """#241: rooted Yes/No can be inspected and prepared, not silently approved.
@@ -3272,505 +2084,71 @@ async def test_rooted_untyped_yes_no_pair_defers_requiredness_to_final_submit(mo
              if e.get('boolean_group')]
     assert len(group) == 2 and all(e['in_container'] for e in group)
     assert forms._formless_boundary(raw.current, provenance)
-    # The reader identifies both members; final Submit still rejects an empty pair
-    # rather than silently ignoring its unapproved answer.
+    # Normal Yes/No choices are not committing Submit actions.
     selectors = {e['selector'] for e in group}
-    isolated = deepcopy(raw.current)
-    isolated['controls'] = [c for c in isolated['controls']
-                            if c['selector'] in selectors]
-    assert len(isolated['controls']) == 2
-    with pytest.raises(forms.Gate, match='A Yes/No answer is empty or conflicting'):
-        forms.check_form(isolated, {}, uploaded=True)
+    isolated = [c for c in raw.current['controls'] if c['selector'] in selectors]
+    assert len(isolated) == 2
+    assert all(not forms.is_submission(c) and not forms.native_submit(c)
+               for c in isolated)
     assert not decision.await_count
     no_mutations(raw)
     _, plain, _, provenance = root_world(monkeypatch)
     assert forms._formless_boundary(plain.current, provenance)
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize('render', [
     {},
     {'additionalCaption': 'Synthetic re-rendered caption'},
     {'additionalCaption': 'Synthetic re-rendered caption', 'additionalRequired': True},
 ], ids=['same-caption', 'changed-caption', 'changed-caption-now-required'])
-async def test_rootless_skip_of_an_optional_attributed_field_is_reasked_once_rooted(
-        monkeypatch, tmp_path, render):
-    """Issue #202 AC2 (ARCH21:26): a SKIP taken while requiredness was unknown
-    is not an OPTIONAL answer. Once the root is proven every rootless SKIP is
-    void, so the still-blank field is asked again as a normal owner question,
-    before the final Submit decision and with no write to that field. This
-    holds when a conditional render changed its caption, and when it also made
-    the field required."""
-    monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 2)
+async def test_prior_rootless_skip_does_not_authorize_missing_owner_fact(
+        monkeypatch, render):
+    """A stale SKIP cannot turn an unanswered ordinary form field into assent."""
     row, raw, decide, _ = root_world(monkeypatch, **render)
-    extra = next(c for c in raw.current['controls'] if c['selector'] == '#additional')
+    extra = next(c for c in raw.current['controls']
+                 if c['selector'] == '#additional')
     assert extra['required'] is render.get('additionalRequired', False)
     assert not extra.get('has_value')
-    row['owner_gate_skips'] = {'q1_synthetic': {
-        'identity': 'q1_synthetic', 'route': 'ashby-sibling-mismatch', 'kind': 'textarea',
-        'label': 'Additional information', 'generation': 'synthetic-generation'}}
-    # Name/Email carry exact owner grants, so only the skipped field is left.
-    row['human_approved_answers'] = {}
-    for c in raw.current['controls']:
-        value = {'text': 'Synthetic Name', 'email': 'synthetic@example.com'}.get(c['type'])
-        if value:
-            t = forms._bound_target(raw.current, c)
-            row['human_approved_answers'][forms._key(raw.current, c)] = {
-                'value': value, 'url': raw.current['url'],
-                **{k: t.get(k, '' if k == 'question' else None) for k in (
-                    'selector', 'label', 'question', 'tag', 'type',
-                    'form_selector', 'form_action')}}
-    transport, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-    file = next(c for c in raw.current['controls']
-                if c['type'] == 'file' and c['label'] == 'Resume')
-    button = next(c for c in raw.current['controls'] if c['label'] == 'Submit application')
-    original_call = raw.call
-
-    async def call(method, *args, **kwargs):
-        if method == 'upload':
-            raw.calls.append((method, *args))
-            name = Path(args[2]).name
-            raw.current, raw.fixed = observed(attached=True, files=[name], displayName=name,
-                                              **render)
-            return {}
-        return await original_call(method, *args, **kwargs)
-    raw.call = call
-    decide.side_effect = [dict(action='upload', selector=file['selector']),
-                          dict(action='submit', selector=button['selector'])]
-    facts = {'Name': 'Synthetic Name', 'Email': 'synthetic@example.com'}
-    result = await forms.apply(posting('ashby'), COMPANY, facts, 'synthetic',
-                               pk=PK, resume_path=pdf)
-    assert result['status'] == 'gate', result
-    # Issue #262 makes a required unanswered fact an exact owner-answer gate.
-    assert result['reason'] == 'owner_question'
-    assert result['form_question']['selector'] == extra['selector']
-    assert result['form_question'].get('route') != 'ashby-sibling-mismatch'  # no SKIP offered
-    assert decide.await_count <= 1  # asked before the Submit decision
-    assert not [c for c in raw.calls if extra['selector'] in c[1:2]]
-    assert not [c for c in raw.calls if c[0] == 'click']
-    assert not transport._application_controller.committed
+    row['owner_gate_skips'] = {'synthetic-old-skip': {
+        'route': 'ashby-sibling-mismatch', 'generation': 'retired'}}
+    with pytest.raises(forms.Gate) as caught:
+        await forms.execute(
+            raw, raw.current,
+            {'action': 'fill', 'selector': extra['selector'],
+             'fact': 'Additional information'},
+            facts={}, filled={}, resume_path='', company=COMPANY,
+            jd_text='', resume_tex='', github='', pk=PK,
+            job_url=posting('ashby'))
+    assert caught.value.reason == 'owner_question'
+    assert caught.value.form_question['selector'] == extra['selector']
+    assert not decide.await_count
+    no_mutations(raw)
 
 
-def _issue218_main_reader_scripts():
-    """Reconstruct and hash-pin this reader baseline, not a hand-built tree."""
-    import hashlib
-    from tools import browser_skill_dom as producer
-
-    source = Path(producer.__file__).read_text()
-    old = producer._ENTRY_OBSERVATION
-    # Keep the Issue #218 historical byte/hash oracle unchanged. Remove only
-    # Issue #252's precisely bounded survey delta from both live readers
-    # before reconstructing the old baseline; re-pinning the hash would
-    # silently weaken the original non-survey regression.
-    # Issue #252 ARCH 17:33: the one shared caption rule. Invert it first.
-    caption_delta = [
-        ("  // Issue #252: one caption rule for PAGE, both witnesses and the root census\n  // (declarations, so the entry root code above may call them). On Ashby a\n  // placeholder is never a label. An id-less, formless text-like input takes\n  // only the single question title of its own field entry inside the one main\n  // or one survey container; zero or several titles, or a title owned by\n  // another live control, give no caption.\n  function ashbyFieldTitle(e) {\n    if (!(location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com') ||\n        e.tagName!=='INPUT' || e.id || e.form || e.closest('form') ||\n        document.querySelector('form') || ['checkbox','radio','file','hidden','submit',\n          'button','image','reset'].includes(e.type)) return null;\n    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));\n    const main=all.filter(c=>!c.closest('.ashby-survey-form-container'));\n    const inner=surveys.length===1 ? all.filter(c=>surveys[0].contains(c)) : [];\n    const regions=main.length!==1 || surveys.length>1 ? [] :\n      [main[0], ...(inner.length===1 ? inner : [])];\n    const region=regions.find(r=>r.contains(e));\n    const entry=region ? e.closest('div.ashby-application-form-field-entry') : null;\n    if (!entry || !region.contains(entry)) return null;\n    const titles=Array.from(entry.querySelectorAll('label.ashby-application-form-question-title'));\n    const owner=titles.length===1 ? titles[0].getAttribute('for') : null;\n    return titles.length===1 && !(owner && document.getElementById(owner)) ? titles[0] : null;\n  }\n  function controlCaption(e) {\n    const title=ashbyFieldTitle(e);\n    if (title) return clean(title.innerText);\n    const ashby=location.protocol==='https:' && location.hostname==='jobs.ashbyhq.com';\n    return clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n      (e.getAttribute('aria-labelledby') || '').split(' ')\n        .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n      e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||\n      e.innerText || e.name);\n  }\n",
-         '',
-         False),
-        ('  const label = e => controlCaption(e);\n',
-         "  const label = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n    (e.getAttribute('aria-labelledby') || '').split(' ')\n      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);\n",
-         False),
-        ('  const entryLabel = e => controlCaption(e);\n',
-         "  const entryLabel = e => clean(Array.from(e.labels || []).map(x=>x.innerText).join(' ') ||\n    (e.getAttribute('aria-labelledby') || '').split(' ')\n      .map(id=>document.getElementById(id)?.innerText || '').join(' ') ||\n    e.getAttribute('aria-label') || e.getAttribute('placeholder') || e.innerText || e.name);\n",
-         True),
-        ("      // The shared caption rule; association also needs this census's own\n      // field-entry proof to name the same title.\n      const titleLabel=ashbyFieldTitle(e), titled=!!titleLabel && field?.title===titleLabel;\n",
-         '',
-         True),
-        ("      // ARCH 17:40: a native choice is captioned by its own single label[for]\n      // in the same application container, the caption PAGE reads for it.\n      const choiceLabel=!hiddenLabel && !linked && !!id && e.tagName==='INPUT' &&\n        ['radio','checkbox'].includes(e.type) && labels.length===1 &&\n        actualLabels.length===1 && actualLabels[0]===labels[0] &&\n        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&\n        document.querySelectorAll('#'+CSS.escape(id)).length===1 &&\n        !!clean(labels[0].innerText) &&\n        !labels[0].querySelector('a[href],button,input,select,textarea,summary,details,'+\n          'area[href],audio[controls],video[controls],object,embed,iframe,'+\n          '[role],[tabindex],[contenteditable],[onclick]') ? labels[0] : null;\n      const ownLabel=linked ? labels[0] : hiddenLabel || (titled ? titleLabel : null) || choiceLabel;\n",
-         '',
-         True),
-        ("        id,label:titleLabel ? clean(titleLabel.innerText) : linked ? clean(labels[0].innerText) :\n          hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) :\n          choiceLabel ? clean(choiceLabel.innerText) : '',\n        label_selector:titleLabel ? selector(titleLabel) : linked ? selector(labels[0]) :\n          hiddenLabel ? selector(hiddenLabel) : choiceLabel ? selector(choiceLabel) : '',\n        name:e.name || '',associated:linked || !!hiddenLabel || titled || !!choiceLabel,\n        // A reported fact: is the one associated label itself visible?\n        label_visible:!!ownLabel && entryEvidenceVisible(ownLabel),\n",
-         "        id,label:linked ? clean(labels[0].innerText) : hiddenLabel ? clean(hiddenLabel.innerText || hiddenLabel.textContent) : '',\n        label_selector:linked ? selector(labels[0]) : hiddenLabel ? selector(hiddenLabel) : '',\n        name:e.name || '',associated:linked || !!hiddenLabel,\n",
-         True),
-    ]
-    for updated, previous, shared in caption_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    # Issue #252 amendment 16:29: the live div#form wrapper, quarantined
-    # uploader and link-only siblings. Invert only that exact delta first.
-    div_form_delta = [
-        ("    // One survey's single nested container is not a second application root.\n    const all=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    const surveys=Array.from(document.querySelectorAll('.ashby-survey-form-container'));\n    const main=all.filter(e=>!e.closest('.ashby-survey-form-container'));\n    const containers=surveys.length===1 && all.length-main.length===1 ? main : all;\n    if(containers.length===1",
-         "    const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));\n    if(containers.length===1",
-         False),
-        ("  // Live Ashby renders the same quarantined autofill helper as an uploader.\n  const panes=Array.from(document.querySelectorAll(\n    '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader'));",
-         "  const panes=Array.from(document.querySelectorAll('.ashby-application-form-autofill-pane'));",
-         True),
-        ('  // A styled DIV, SPAN or P sibling whose only controls, if any, are plain\n  // description links. Links are never receivers, targets or click authority.\n  const linkOnlySibling=e=>{\n    if(![\'DIV\',\'SPAN\',\'P\'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n       !(a.name===\'class\' || /^data-/i.test(a.name)))) return false;\n    const nodes=[e,...Array.from(e.querySelectorAll(\'*\'))];\n    const interactive=query+\',iframe,[contenteditable],[role],[tabindex],summary,details,form,object,embed,area[href],audio[controls],video[controls],label,[autofocus],[controls],[form],[formaction]\';\n    const links=Array.from(e.querySelectorAll(\'a[href]\'));\n    return Array.from(e.querySelectorAll(interactive)).every(n=>\n      links.includes(n) && Array.from(n.attributes).every(a=>\n        [\'href\',\'target\',\'rel\',\'class\'].includes(a.name) || /^data-/i.test(a.name))) &&\n      nodes.every(n=>!n.shadowRoot && !Array.from(n.attributes).some(a=>/^on/i.test(a.name)));\n  };\n  // The quarantined helper is never a receiver; it may not carry Submit.\n  const paneArmed=panes.length===1 && !!panes[0].querySelector(\n    \'form,button.ashby-application-form-submit-button,button[type="submit"],\'+\n    \'input[type="submit"],input[type="image"],[form],[formaction],\'+\n    \'.ashby-application-form-container,.ashby-survey-form-container\');\n  const paneSafe=panes.length===1 && panes[0].tagName===\'DIV\' &&\n    panes[0].parentElement===wrapper && !paneArmed;\n', '', True),
-        ("!(surveyValid && n===survey) && !inertSibling(n,true) && !linkOnlySibling(n));",
-         "!(surveyValid && n===survey) && !inertSibling(n,true));", True),
-        ("  // Issue #252: the live div#form wrapper. Its direct children are exactly one\n  // quarantined helper, the main container, the exact Submit, at most one valid\n  // survey, and only inert or link-only siblings. It has the pane shape's\n  // authority and no more; any other child leaves the wrapper unowned.\n  const formShape=!!wrapper && wrapper.tagName==='DIV' && wrapper.id==='form' &&\n    !wrapper.getAttribute('class') && container?.tagName==='DIV' &&\n    exactSubmit?.tagName==='BUTTON' && exactSubmit.parentElement===wrapper && paneSafe &&\n    (!surveyWrappers.length || surveyValid) &&\n    siblings.every(n=>n===container || n===panes[0] || n===exactSubmit ||\n      (surveyValid && n===survey) || inertSibling(n,true) || linkOnlySibling(n));\n  const structuralRoot=!forms.length && (formShape || (ordered && paneSafe &&\n    (!surveyWrappers.length || surveyValid))) ? wrapper : null;",
-         '  const structuralRoot=!forms.length && ordered &&\n    (!surveyWrappers.length || surveyValid) ? wrapper : null;',
-         True),
-        ("      paneArmed || (surveyWrappers.length>0 && !surveyValid)))",
-         "      (surveyWrappers.length>0 && !surveyValid)))", True),
-        ("!ordered && !formShape &&\n      !surveyPane && !(",
-         "!ordered && !surveyPane && !(", True),
-        ("style,'+\n            '.ashby-application-form-autofill-pane,.ashby-application-form-autofill-uploader')",
-         "style,.ashby-application-form-autofill-pane')", True),
-    ]
-    for updated, previous, shared in div_form_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    survey_delta = [
-        (
-            """    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]') &&
-    !Array.from(pageSurveyWrappers[0].querySelectorAll('button'))
-      .some(b=>!b.hasAttribute('type')));""",
-            """    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]'));""",
-            False,
-        ),
-        (
-            """      in_form:!!form, form_selector:form ? selector(form) : '',
-      ...(pageAshbyNative && e.closest('div.ashby-survey-form-container')
-        ? {ashby_survey:true} : {}),
-      native_form_owner_selector:e.form ? selector(e.form) : '',""",
-            """      in_form:!!form, form_selector:form ? selector(form) : '',
-      native_form_owner_selector:e.form ? selector(e.form) : '',""",
-            False,
-        ),
-        (
-            """    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]') &&
-    !Array.from(survey.querySelectorAll('button')).some(b=>!b.hasAttribute('type'));""",
-            """    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]');""",
-            True,
-        ),
-        (
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),
-        ...(surveyValid && surveyContainer?.contains(e) ? {ashby_survey:true} : {}),""",
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),""",
-            True,
-        ),
-        (
-            """  // A valid survey beside the pane is not an unknown sibling, but it does
-  // not extend the historic three-child certificate to final Submit.
-  const surveyPane=surveyValid && panes.length===1 && panes[0].tagName==='DIV' &&
-    panes[0].parentElement===wrapper && exactSubmit?.parentElement===wrapper &&
-    siblings.every(n=>n===container || n===panes[0] || n===survey ||
-      n===exactSubmit || inertSibling(n));
-  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            """  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            True,
-        ),
-        (
-            """  else if (!forms.length && container && exactSubmit && !ordered && !surveyPane && !(""",
-            """  else if (!forms.length && container && exactSubmit && !ordered && !(""",
-            True,
-        ),
-        (
-            """  const containerUploadRoot=(structuralError==='application root sibling identity mismatch' ||
-    (surveyPane && !structuralError)) &&
-    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
-            """  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&
-    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&""",
-            True,
-        ),
-        (
-            """  // Standalone PAGE must count only the main form, just like both entry readers.
-  const pageSurveyWrappers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-survey-form-container')) : [];
-  const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!e.closest('.ashby-survey-form-container')) : [];
-  const pageSurveyValid=pageSurveyWrappers.length===0 || (
-    pageSurveyWrappers.length===1 && ashbyContainers.length===1 &&
-    pageSurveyWrappers[0].tagName==='DIV' &&
-    pageSurveyWrappers[0].parentElement===ashbyContainers[0].parentElement &&
-    pageSurveyWrappers[0].querySelectorAll('.ashby-application-form-container').length===1 &&
-    !pageSurveyWrappers[0].querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]'));""",
-            """  const ashbyContainers=pageAshbyNative ? Array.from(
-    document.querySelectorAll('.ashby-application-form-container')) : [];""",
-            False,
-        ),
-        (
-            """    return pageAshbyNative && !document.querySelector('form') &&
-      pageSurveyValid && ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
-            """    return pageAshbyNative && !document.querySelector('form') &&
-      ashbyContainers.length===1 && !ashbyContainers[0].closest('form') &&""",
-            False,
-        ),
-        (
-            """  const surveyWrappers=ashbyNative ?
-    Array.from(document.querySelectorAll('.ashby-survey-form-container')) : [];
-  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'))
-    .filter(e=>!(ashbyNative && e.closest('.ashby-survey-form-container')));""",
-            """  const containers=Array.from(document.querySelectorAll('.ashby-application-form-container'));""",
-            True,
-        ),
-        (
-            """  const wrapper=container?.parentElement;
-  const survey=surveyWrappers.length===1 ? surveyWrappers[0] : null;
-  const surveyContainers=survey ? Array.from(
-    survey.querySelectorAll('.ashby-application-form-container')) : [];
-  const surveyContainer=surveyContainers.length===1 ? surveyContainers[0] : null;
-  // Only one direct sibling section is a survey. Never elevate it to a new
-  // Submit certificate or treat its controls as bank-approved answers.
-  const surveyValid=!!survey && survey.tagName==='DIV' && survey.parentElement===wrapper &&
-    !!surveyContainer && !survey.querySelector(
-      'form,button.ashby-application-form-submit-button,button[type="submit"],'+
-      'input[type="submit"],input[type="image"]');
-  // Layout order is decoration, not authority.""",
-            """  const wrapper=container?.parentElement;
-  // Layout order is decoration, not authority.""",
-            True,
-        ),
-        (
-            """  const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit &&
-    !(surveyValid && n===survey) && !inertSibling(n,true));""",
-            """  const unsafeSibling=!!wrapper && siblings.some(n=>
-    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n,true));""",
-            True,
-        ),
-        (
-            """  const structuralRoot=!forms.length && ordered &&
-    (!surveyWrappers.length || surveyValid) ? wrapper : null;""",
-            """  const structuralRoot=!forms.length && ordered ? wrapper : null;""",
-            True,
-        ),
-        (
-            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1 ||
-      (surveyWrappers.length>0 && !surveyValid)))
-    structuralError='ambiguous application roots';""",
-            """  if (!forms.length && (containers.length>1 || submitters.length>1 || panes.length>1))
-    structuralError='ambiguous application roots';""",
-            True,
-        ),
-        (
-            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && (
-      (wrapper.children.length===2 &&
-       wrapper.children[0]===container && wrapper.children[1]===exactSubmit) ||
-      (surveyValid && wrapper.children.length===3 &&
-       siblings.includes(container) && siblings.includes(survey) &&
-       siblings.includes(exactSubmit)))))""",
-            """    panes.length===0 && wrapper?.tagName==='DIV' && !wrapper.getAttribute('class') &&
-    exactSubmit.parentElement===wrapper && wrapper.children.length===2 &&
-    wrapper.children[0]===container && wrapper.children[1]===exactSubmit))""",
-            True,
-        ),
-        (
-            """  const controlContainer=e=>container?.contains(e) ? container :
-    (surveyValid && surveyContainer?.contains(e) ? surveyContainer : null);
-  const fieldEntry = e => {
-    const region=controlContainer(e);
-    if (forms.length || !region || e.id) return null;
-    const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !region.contains(entry)) return null;""",
-            """  const fieldEntry = e => {
-    if (forms.length || !container || !container.contains(e) || e.id) return null;
-    const entry=e.closest('div.ashby-application-form-field-entry');
-    if (!entry || !container.contains(entry)) return null;""",
-            True,
-        ),
-        (
-            """        !!controlContainer(e) && controlContainer(e).contains(labels[0]) &&""",
-            """        !!container && container.contains(labels[0]) && container.contains(e) &&""",
-            True,
-        ),
-        (
-            """        return ashbyNative && !forms.length && containers.length===1 &&
-          (!surveyWrappers.length || surveyValid) &&
-          (e.type==='checkbox' && container?.contains(e) || e.type==='radio' && surveyValid && surveyContainer?.contains(e)) &&
-          e.tagName""",
-            """        return ashbyNative && !forms.length && containers.length===1 &&
-          container?.contains(e) && e.tagName""",
-            True,
-        ),
-        (
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!controlContainer(e),""",
-            """        ashby_hidden_choice:!!hiddenLabel,inside:!!structuralRoot && structuralRoot.contains(e),
-        in_container:!!container && container.contains(e),""",
-            True,
-        ),
-    ]
-    for updated, previous, shared in survey_delta:
-        assert source.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        if shared:
-            assert old.count(updated) == 1, updated[:80]
-            old = old.replace(updated, previous, 1)
-    changes = [
-        (
-            "  // The exact sibling mismatch loses wrapper ownership but retains one bounded,\n"
-            "  // independently observed application container. It has no Submit authority.\n"
-            "  const containerUploadRoot=structuralError==='application root sibling identity mismatch' &&\n"
-            "    !forms.length && containers.length===1 && submitters.length===1 && panes.length<=1 &&\n"
-            "    !!container && !!exactSubmit;\n"
-            "  const uploadRoot=structuralRoot || (containerUploadRoot ? container : null);\n"
-            "  let passiveDelete=null;\n",
-            "",
-        ),
-        ("  if (uploadRoot) try {\n    const source=[], stack=[[uploadRoot,-1]];",
-         "  if (structuralRoot) try {\n    const source=[], stack=[[structuralRoot,-1]];"),
-        ("uploadRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')",
-         "structuralRoot.querySelectorAll('button.ashby-application-form-input-file-dropzone-upload')"),
-        ("    const items=Array.from(uploadRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n\n",
-         "    const items=Array.from(structuralRoot.querySelectorAll('div.ashby-application-form-input-file-item'));\n"),
-        ("        passiveDelete=del;\n", ""),
-        ("    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector).concat(\n"
-         "      containerUploadRoot && passiveDelete ? [selector(passiveDelete)] : []),",
-         "    excluded:Array.from(paneNodes).filter(e=>e.matches(query)).map(selector),"),
-        ("    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree :\n"
-         "      (containerUploadRoot && uploadTree.complete ? {...uploadTree,scope:'container'} : null),",
-         "    formless,root_evidence:rootEvidence,upload_tree:structuralRoot ? uploadTree : null,"),
-        ("  // class and data-* are styling: they may not certify the wrapper, but must\n"
-         "  // not turn the container-scoped mismatch into \"unsafe sibling\" either. Live\n"
-         "  // Ashby decorates an inert sibling with data-highlight, and that label\n"
-         "  // emptied every reversible scope after #220. Any other attribute is unsafe.\n"
-         "  const inertSibling=(e,styled=false)=>{\n"
-         "    if(!['DIV','SPAN'].includes(e.tagName) || Array.from(e.attributes).some(a=>\n"
-         "       !(styled && (a.name==='class' || /^data-/i.test(a.name))))) return false;",
-         "  const inertSibling=e=>{\n"
-         "    if(!['DIV','SPAN'].includes(e.tagName) || e.attributes.length) return false;"),
-        ("!inertSibling(n,true));", "!inertSibling(n));"),
-        ("  const unsafeSibling=!!wrapper && siblings.some(n=>\n"
-         "    n!==container && n!==panes[0] && n!==exactSubmit && !inertSibling(n));\n", ""),
-        ("    structuralError=unsafeSibling ?\n"
-         "      'application root sibling identity mismatch: unsafe sibling' :\n"
-         "      'application root sibling identity mismatch';",
-         "    structuralError='application root sibling identity mismatch';"),
-    ]
-    for updated, previous in changes:
-        assert source.count(updated) == old.count(updated) == 1, updated[:80]
-        source = source.replace(updated, previous, 1)
-        old = old.replace(updated, previous, 1)
-    # FF-243a changed the controls reader, outside _ENTRY_OBSERVATION, so it
-    # is reverted in the hashed source only; both compared readers carry it.
-    # FF-247a scoped that aria-pressed read to Ashby Yes/No groups.
-    pressed = (
-        "      // Ashby marks the chosen Yes/No <button> only with aria-pressed (FF-247a\n"
-        "      // probe: Yes and No alike); no other button's aria-pressed is an answer.\n"
-        "      has_value:!!e.value, checked:!!e.checked || e.getAttribute('aria-checked') === 'true'\n"
-        "        || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'\n"
-        "          && !!e.closest('div.ashby-application-form-input-yesno')),\n")
-    assert source.count(pressed) == 1 and old.count(pressed) == 0
-    source = source.replace(pressed, "      has_value:!!e.value, checked:!!e.checked || "
-                            "e.getAttribute('aria-checked') === 'true',\n", 1)
-    # The #248 interactive-label admission is not part of the Issue #218
-    # historical source witness; remove only those exact new predicates.
-    def hidden_label_guard(label, indent):
-        return (f"{indent}!{label}.querySelector("
-                "'a[href],button,input,select,textarea,summary,details,'+\n"
-                f"{indent}  'area[href],audio[controls],video[controls],object,embed,iframe,'+\n"
-                f"{indent}  '[role],[tabindex],[contenteditable],[onclick]') &&\n")
-
-    for guard in (hidden_label_guard('labels[0]', '      '),
-                  hidden_label_guard('ls[0]', '          ')):
-        assert source.count(guard) == 1
-        source = source.replace(guard, '', 1)
-    root_guard = hidden_label_guard('ls[0]', '          ')
-    assert old.count(root_guard) == 1
-    old = old.replace(root_guard, '', 1)
-    # The #256 Greenhouse-only phone-picker proof lives outside both Ashby
-    # entry readers; remove only that exact block and its one composition.
-    start = source.index('# Issue 256: every live Greenhouse embed read')
-    end = source.index('def greenhouse_reader(script: str) -> str:')
-    assert source.count('_GREENHOUSE_PHONE_PICKER') == 2 and start < end
-    assert producer._GREENHOUSE_PHONE_PICKER not in forms.ENTRY_PAGE
-    assert producer._GREENHOUSE_PHONE_PICKER not in forms._ENTRY_FIXED_CONTROL_WITNESS
-    source = source[:start] + source[end:]
-    composed = ("    script = script.replace(_WIDGET_GRAPH, _GREENHOUSE_OBSERVATION + _WIDGET_GRAPH +\n"
-                "                            _GREENHOUSE_PHONE_PICKER)\n")
-    assert source.count(composed) == 1
-    source = source.replace(composed, "    script = script.replace(_WIDGET_GRAPH, "
-                            "_GREENHOUSE_OBSERVATION + _WIDGET_GRAPH)\n", 1)
-    # BrowserSkill 0.4 overlay census (Issue #272) replaced the 'Interrupt'-button
-    # shadow exemption in ordinary PAGE, which both compared readers carry; it is
-    # reverted in the hashed source only.
-    census_start = "  // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay"
-    census_end = "  const siteShadow = shadowRoots.some(e => e !== overlayHost);\n"
-    assert source.count(census_start) == source.count(census_end) == 1
-    assert old.count(census_start) == old.count(census_end) == 0  # not in _ENTRY_OBSERVATION
-    start = source.index(census_start)
-    end = source.index(census_end) + len(census_end)
-    assert start < end
-    source = source[:start] + (
-        "  // BrowserSkill injects its own Interrupt button in a shadow root. Treating\n"
-        "  // that overlay as an uninspected employer form gated every normal page.\n"
-        "  // Exempt only that exact, button-only overlay; site shadow controls still gate.\n"
-        "  const shadowRoots = Array.from(document.querySelectorAll('*')).filter(e=>e.shadowRoot);\n"
-        "  const siteShadow = shadowRoots.some(e => {\n"
-        "    const nested = Array.from(e.shadowRoot.querySelectorAll(query));\n"
-        "    const ownOverlay = e.tagName === 'BROWSER-SKILL-OVERLAY' && nested.length > 0 &&\n"
-        "      !e.shadowRoot.querySelector('iframe') && nested.every(n =>\n"
-        "        n.tagName === 'BUTTON' && n.type === 'button' && label(n) === 'Interrupt');\n"
-        "    return !ownOverlay;\n"
-        "  });\n") + source[end:]
-    overlay_filter = "    e !== overlayHost && !pickerParts.has(e) &&\n"
-    assert source.count(overlay_filter) == 1
-    assert old.count(overlay_filter) == 0
-    source = source.replace(
-        overlay_filter, "    e.tagName !== 'BROWSER-SKILL-OVERLAY' && !pickerParts.has(e) &&\n", 1)
-    git_blob = b'blob ' + str(len(source.encode())).encode() + b'\x00' + source.encode()
-    assert hashlib.sha1(git_blob).hexdigest() == 'bdcf6838e5450588fd012a386064b88810913929'  # Issue 282: + value_attr_present, hidden radio predicate, survey radio clause
-    assert forms.ENTRY_PAGE.count(producer._ENTRY_OBSERVATION) == 1
-    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(producer._ENTRY_OBSERVATION) == 1
-    # The fixed witness's own #252 survey census reads entry bindings that the
-    # historical observation lacks; invert only that exact clause there.
-    fixed_survey = "      containers.length===1 && (!surveyWrappers.length || surveyValid) &&\n"
-    assert forms._ENTRY_FIXED_CONTROL_WITNESS.count(fixed_survey) == 1
-    return [
-        forms.ENTRY_PAGE.replace(producer._ENTRY_OBSERVATION, old, 1),
-        forms._ENTRY_FIXED_CONTROL_WITNESS.replace(producer._ENTRY_OBSERVATION, old, 1)
-        .replace(fixed_survey, "      containers.length===1 &&\n", 1),
-    ]
-
-
-def _without_label_visible(snapshot):
-    # ARCH 17:40 adds exactly one reported census fact, label_visible; every
-    # other byte stays identical to main.
-    for e in snapshot['entry'].get('root_evidence') or []:
-        e.pop('label_visible', None)
-    return snapshot
-
-
-@pytest.mark.parametrize('reader_index', [0, 1])
 @pytest.mark.parametrize('spec_change', [
     {}, {'duplicateSubmit': True}, {'duplicatePane': True},
     {'secondFormlessComplete': True}, {'missingPane': True},
 ])
-def test_issue218_non_mismatch_readers_stay_byte_identical_to_main(reader_index, spec_change):
-    main = _issue218_main_reader_scripts()[reader_index]
-    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
+def test_formless_current_readers_agree_on_independent_entry_evidence(spec_change):
+    # Historical byte identity to main is intentionally invalid after #293.
+    # Compare the two active production readers on the same synthetic DOM.
     spec = dict(root=False, formless=True, url=entry('ashby'), **spec_change)
-    from json import dumps
-    assert dumps(_without_label_visible(dom(spec, reader)), ensure_ascii=False,
-                 separators=(',', ':')) == dumps(
-        dom(spec, main), ensure_ascii=False, separators=(',', ':'))
+    page = dom(spec, forms.ENTRY_PAGE)
+    fixed = dom(spec, forms._ENTRY_FIXED_CONTROL_WITNESS)
+    assert page['entry'] == fixed['entry']
+    assert [(c['selector'], c['type']) for c in page['controls']] == [
+        (c['selector'], c['type']) for c in fixed['controls']]
 
 
-@pytest.mark.parametrize('reader_index', [0, 1])
+@pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 @pytest.mark.parametrize('attached', [False, True])
-def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, attached):
-    from json import dumps
-    reader = (forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS)[reader_index]
-    main = _issue218_main_reader_scripts()[reader_index]
+def test_formless_current_upload_tree_reports_staged_file_and_passive_delete(
+        reader, attached):
     filename = 'Synthetic-Resume.pdf'
     spec = dict(root=False, formless=True, movePane=True, url=entry('ashby'),
                 **({'attached': True, 'files': [filename], 'displayName': filename}
                    if attached else {}))
-    current, baseline = _without_label_visible(dom(spec, reader)), dom(spec, main)
+    current = dom(spec, reader)
     root = current['entry']['formless']
     tree = current['entry']['upload_tree']
     assert root['error'] == 'application root sibling identity mismatch'
@@ -3782,33 +2160,15 @@ def test_issue218_container_tree_only_delta_and_passive_delete(reader_index, att
     assert tree['nodes'][tree['input']]['target_selector'] == '#_systemfield_resume'
     assert tree['nodes'][tree['dropzone']]['target_selector'] == '#dropzone'
     assert tree['attached'] is attached
-    assert baseline['entry']['upload_tree'] is None
-    normalized = deepcopy(current)
-    normalized['entry']['upload_tree'] = None
     if attached:
         assert tree['filename'] == filename and len(tree['items']) == 1
-        deleted = '#delete-0'  # masked id in tree; real CSS in excluded
+        deleted = '#delete-0'
         assert tree['nodes'][tree['delete']]['selector'] != deleted
         assert deleted not in {c['selector'] for c in current['controls']}
         assert deleted not in {c['selector'] for c in current['entry']['root_evidence']}
         assert deleted in root['excluded']
-        assert root['excluded'] == [*baseline['entry']['formless']['excluded'], deleted]
-        for section in ('controls',):
-            assert current[section] == [
-                c for c in baseline[section] if c['selector'] != deleted]
-            normalized[section] = baseline[section]
-        assert current['entry']['root_evidence'] == [
-            c for c in baseline['entry']['root_evidence']
-            if c['selector'] != deleted]
-        normalized['entry']['root_evidence'] = baseline['entry']['root_evidence']
-        normalized['entry']['formless']['excluded'] = baseline['entry']['formless']['excluded']
-        assert deleted not in {c['selector'] for c in
-                               forms._reversible_entry_scope(current, {})}
     else:
         assert tree['items'] == [] and not tree.get('attached')
-        assert root['excluded'] == baseline['entry']['formless']['excluded']
-    assert dumps(normalized, ensure_ascii=False, separators=(',', ':')) == dumps(
-        baseline, ensure_ascii=False, separators=(',', ':'))
 
 @pytest.mark.parametrize('reader', [forms.ENTRY_PAGE, forms._ENTRY_FIXED_CONTROL_WITNESS])
 def test_hidden_ashby_attestation_requires_one_visible_label_and_hidden_input(reader):
@@ -3882,102 +2242,82 @@ async def _opacity_blind_attestation_world(monkeypatch):
     return row, session, page, provenance
 
 
-async def test_rooted_hidden_attestation_with_stale_grant_is_asked_again(monkeypatch):
-    """A grant that no longer binds must re-ask the hidden checkbox, not gate it."""
+async def test_hidden_attestation_remains_independently_observed_without_member_grant(
+        monkeypatch):
     row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
-    assert 'ashby_hidden_choice' not in next(
-        c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
-    row['human_approved_answers'][_OWNER_ATTESTATION] = {
-        'value': 'yes', 'label': _OWNER_ATTESTATION, 'visible_text': _OWNER_ATTESTATION,
-        'selector': _HIDDEN_ATTESTATION, 'url': page['url'],
-        'question': _OWNER_ATTESTATION, 'tag': 'input', 'type': 'checkbox',
-        'form_selector': '#drifted-root', 'form_action': '#drifted-submit'}
-    with pytest.raises(forms.Gate) as gate:
-        await forms._bootstrap(session, page, PK, {}, provenance=provenance)
-    assert gate.value.reason == 'owner_question', str(gate.value)
-    assert 'no longer binds' in str(gate.value)
-    question = gate.value.form_question
-    assert question['selector'] == _HIDDEN_ATTESTATION
-    assert question['ashby_hidden_choice'] is True
-    assert question['visible'] is False
-    assert question['associated_label_selector'] == '#hidden-attestation-label'
+    target = next(c for c in page['controls']
+                  if c['selector'] == _HIDDEN_ATTESTATION)
+    witness = next(c for c in session.raw.fixed['controls']
+                   if c['selector'] == _HIDDEN_ATTESTATION)
+    evidence = next(e for e in page['entry']['root_evidence']
+                    if e['selector'] == _HIDDEN_ATTESTATION)
+    # The model-facing page no longer publishes a special hidden-choice grant
+    # flag. Independent form evidence remains present for final readback.
+    assert 'ashby_hidden_choice' not in target
+    assert witness['ashby_hidden_choice'] is True
+    assert evidence['ashby_hidden_choice'] is True
+    assert not hasattr(forms, '_disclosure_question')
+    assert not hasattr(forms, '_member_witness_predicate')
 
 
-async def test_hidden_choice_flag_needs_root_evidence_and_witness(monkeypatch, caplog):
-    """Only a choice both independent readers saw hidden behind its label is restored."""
-    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
-    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
-    witness = {c['selector']: c for c in session.raw.fixed['controls']}
-    assert forms._disclosure_question(
-        page, target, witness, posting('ashby'),
-        provenance=provenance)['ashby_hidden_choice'] is True
-    for damage in ('evidence', 'witness-flag', 'witness-label', 'witness-visible'):
-        broken_page, broken_witness = deepcopy(page), deepcopy(witness)
-        if damage == 'evidence':
-            for e in broken_page['entry']['root_evidence']:
-                if e['selector'] == _HIDDEN_ATTESTATION:
-                    e['ashby_hidden_choice'] = False
-        elif damage == 'witness-flag':
-            broken_witness[_HIDDEN_ATTESTATION]['ashby_hidden_choice'] = False
-        elif damage == 'witness-label':
-            broken_witness[_HIDDEN_ATTESTATION]['associated_label_selector'] = '#other'
-        else:
-            broken_witness[_HIDDEN_ATTESTATION]['visible'] = True
-            broken_witness[_HIDDEN_ATTESTATION]['visible_text'] = 'Different caption'
-        caplog.clear()
-        with caplog.at_level(logging.INFO, logger=forms._LOG.name):
-            with pytest.raises(forms.Gate) as gate:
-                forms._disclosure_question(
-                    broken_page, deepcopy(target), broken_witness, posting('ashby'),
-                    provenance=provenance)
-        assert gate.value.reason == 'defect_witness', damage
-        messages = [r.getMessage() for r in caplog.records
-                    if 'disclosure member witness failed' in r.getMessage()]
-        assert len(messages) == 1, damage
-        assert messages[0].startswith(
-            'disclosure member witness failed type=checkbox hidden_choice=False '
-            'predicate='), messages[0]
-        assert _OWNER_ATTESTATION not in messages[0]
-
-
-@pytest.mark.parametrize('damage,token', [
-    ('flag', 'hidden_flag'),
-    ('association', 'hidden_association'),
-    ('text', 'hidden_text'),
+@pytest.mark.parametrize('problem', [
+    'permitted-backing', 'unrelated-missing', 'wrong-question',
+    'missing-button', 'foreign-root',
 ])
-async def test_hidden_choice_member_witness_logs_only_failed_subpredicate_token(
-        monkeypatch, caplog, damage, token):
-    """Issue #276 ARCH delta: a hidden member names its first failed subpredicate."""
-    row, session, page, provenance = await _opacity_blind_attestation_world(monkeypatch)
-    target = next(c for c in page['controls'] if c['selector'] == _HIDDEN_ATTESTATION)
-    witness = deepcopy({c['selector']: c for c in session.raw.fixed['controls']})
-    flagged = {**target, 'ashby_hidden_choice': True, 'visible': False,
-               'associated_label_selector': witness[_HIDDEN_ATTESTATION][
-                   'associated_label_selector']}
-    dom = witness[_HIDDEN_ATTESTATION]
-    secret = 'Synthetic unlogged caption'
-    if damage == 'flag':
-        dom['ashby_hidden_choice'] = False
-    elif damage == 'association':
-        dom['associated_label_selector'] = '#' + secret.replace(' ', '-')
+def test_final_formless_boundary_ignores_only_hidden_backing_with_real_yes_no(
+        monkeypatch, problem):
+    """A hidden native backing can disappear from controls when the same
+    proven Ashby question is answered by two visible Yes/No buttons. Nothing
+    else can disappear from the independent root receiver census.
+    """
+    _, raw, _, provenance = root_world(monkeypatch)
+    page = deepcopy(raw.current)
+    base_evidence = next(c for c in page['entry']['root_evidence']
+                         if c.get('selector') == '#_systemfield_name')
+    base_control = next(c for c in page['controls']
+                        if c.get('selector') == '#_systemfield_name')
+    entry_id = '#synthetic-boolean-entry'
+    question = 'Synthetic work preference'
+    backing = {
+        **deepcopy(base_evidence),
+        'selector': '#hidden-backing', 'type': 'checkbox',
+        'field_entry': entry_id, 'entry_label': question,
+        'inside': True, 'in_container': True, 'visible': False,
+        'yes_no': False,
+    }
+    for label in ('Yes', 'No'):
+        selector = '#synthetic-' + label.lower()
+        e = {
+            **deepcopy(base_evidence),
+            'selector': selector, 'type': 'button', 'tag': 'button',
+            'field_entry': entry_id, 'entry_label': question,
+            'inside': True, 'in_container': True, 'visible': True,
+            'yes_no': True, 'caption': label,
+        }
+        c = {
+            **deepcopy(base_control),
+            'selector': selector, 'type': 'button', 'tag': 'button',
+            'question': question, 'label': label,
+            'checked': label == 'No', 'required': True,
+        }
+        page['entry']['root_evidence'].append(e)
+        page['controls'].append(c)
+    page['entry']['root_evidence'].append(backing)
+    if problem == 'unrelated-missing':
+        page['entry']['root_evidence'].append({
+            **deepcopy(backing), 'selector': '#unrelated-missing', 'type': 'text'})
+    elif problem == 'wrong-question':
+        page['controls'][-1]['question'] = 'Another field'
+    elif problem == 'missing-button':
+        page['controls'].pop()
+    elif problem == 'foreign-root':
+        page['entry']['root_evidence'][-1]['inside'] = False
+
+    if problem == 'permitted-backing':
+        members = forms._formless_boundary(page, provenance)
+        assert {'#synthetic-yes', '#synthetic-no'} <= {
+            c['selector'] for c in members}
+        assert '#hidden-backing' not in {c['selector'] for c in members}
     else:
-        dom['visible_text'] = secret
-    with caplog.at_level(logging.INFO, logger=forms._LOG.name):
-        with pytest.raises(forms.Gate) as gate:
-            forms._disclosure_question(page, flagged, witness, posting('ashby'),
-                                       provenance=provenance)
-    assert gate.value.reason == 'defect_witness'
-    messages = [r.getMessage() for r in caplog.records
-                if 'disclosure member witness failed' in r.getMessage()]
-    assert messages == ['disclosure member witness failed type=checkbox '
-                        f'hidden_choice=True predicate={token}']
-    assert secret not in messages[0] and _OWNER_ATTESTATION not in messages[0]
-    assert secret.replace(' ', '-') not in messages[0]
-
-
-def test_non_hidden_member_keeps_visible_predicate():
-    member = {'type': 'checkbox', 'label': 'x', 'disabled': False}
-    dom = {'visible': False, 'ashby_hidden_choice': False,
-           'associated_label_selector': '', 'visible_text': 'x'}
-    assert forms._member_witness_predicate(
-        member, dom, choice=True, hidden_attestation=False) == 'visible'
+        with pytest.raises(forms.Gate, match='lost a receiver'):
+            forms._formless_boundary(page, provenance)

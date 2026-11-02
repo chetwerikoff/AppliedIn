@@ -1,7 +1,10 @@
-"""Offline ARIA combobox authorization and commit-readback regressions."""
-import asyncio
+"""Issue #293: ungated accessible combobox preparation and final readback.
+
+Only the single pre-Submit check may deny an incompletely selected required
+picker. Ordinary option expansion/selection carries no grant or witness.
+All fixtures are synthetic, and browser calls are stubbed offline.
+"""
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,9 +18,6 @@ OPTIONS = [
     {'selector': '#country-other', 'unique': True, 'label': 'Other Country',
      'value': 'OT', 'selected': False, 'safe': True},
 ]
-
-def approved_values(values=None, facts=None):
-    return forms._ApprovedFormValues(values or {}, PK, facts or {})
 
 def control(*, selected_text='', selected_value='', hidden_value='',
             hidden_selector='#country-code', required=True):
@@ -62,65 +62,6 @@ def page(combo=None):
             'shadow_roots': False, 'unsupported_frames': []}
 
 
-def evidence(current):
-    return {'url': current['url'], 'controls': [
-        {'selector': c['selector'], 'unique': True, 'unique_form': True,
-         'tag': c['tag'], 'type': c['type'], 'in_form': c['in_form'],
-         'form_selector': c['form_selector'], 'form_action': c['form_action'],
-         'native_form_owner_selector': c.get('native_form_owner_selector'),
-         'formaction': c['formaction'], 'disabled': c['disabled'],
-         'readonly': False, 'inert': False, 'visible': True, 'visible_text': '',
-         'options': deepcopy(c['options']), 'combobox': deepcopy(c.get('combobox'))}
-        for c in current['controls']]}
-
-
-class Session:
-    def __init__(self, initial, committed=None):
-        self.current = initial
-        self.committed = committed
-        self.calls = []
-        self.clicked = False
-
-    async def call(self, *args, **kwargs):
-        self.calls.append(args)
-        if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-            return {'value': evidence(self.committed if self.clicked else self.current)}
-        if args == ('click', '#country-example'):
-            assert self.committed is not None
-            self.clicked = True
-            return {}
-        pytest.fail(f'Unexpected browser IPC: {args}')
-
-    async def page(self):
-        return deepcopy(self.committed if self.clicked else self.current)
-
-
-class DynamicSession:
-    def __init__(self, initial, opened, committed):
-        self.initial, self.opened, self.committed = initial, opened, committed
-        self.stage = 0
-        self.calls = []
-
-    def current(self):
-        return (self.initial, self.initial, self.opened, self.committed)[self.stage]
-
-    async def call(self, *args, **kwargs):
-        self.calls.append(args)
-        if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-            return {'value': evidence(self.current())}
-        if args == ('click', '#country'):
-            self.stage = 1
-            return {}
-        if args == ('fill', '#country', '--value', 'Example Country'):
-            self.stage = 2
-            return {}
-        if args == ('click', '#country-example'):
-            self.stage = 3
-            return {}
-        pytest.fail(f'Unexpected browser IPC: {args}')
-
-    async def page(self):
-        return deepcopy(self.current())
 def grant(answer='Example Country'):
     target = control()
     return {'value': answer, 'selector': target['selector'], 'url': URL,
@@ -128,1052 +69,311 @@ def grant(answer='Example Country'):
             'tag': target['tag'], 'type': target['type'],
             'form_selector': target['form_selector'], 'form_action': URL}
 
+class FakeSession:
+    def __init__(self, current):
+        self.current = deepcopy(current)
+        self.calls = []
 
-def test_combobox_grant_binds_stable_control_not_transient_options():
-    current = page()
-    target = current['controls'][0]
-    question = forms._disclosure_question(
-        current, target, {'#country': {'visible': True, 'readonly': False,
-                                        'disabled': False, 'inert': False,
-                                        'combobox': target['combobox']}}, URL)
-    assert question['label'] == 'What country?'
-    assert 'options' not in question
+    async def call(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return {}
 
-def test_resume_job_mints_the_exact_combobox_grant_from_direct_gate(monkeypatch):
-    from agent import run
-    current = page()
-    target = current['controls'][0]
-    row = {'pk': PK, 'status': 'submitting', 'jd_url': URL,
-           'company': 'example-co', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    with pytest.raises(forms.Gate) as raised:
-        asyncio.run(forms.execute(
-            Session(current), current, {'action': 'combobox',
-                                        'selector': '#country',
-                                        'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
+    async def page(self):
+        return deepcopy(self.current)
+
+
+def _complete_form(combo):
+    form = page(combo)
+    form['controls'].append({
+        'selector': '#resume', 'label': 'Resume', 'question': 'Resume',
+        'type': 'file', 'tag': 'input', 'disabled': False,
+        'files': ['Test User.pdf'], 'in_form': True,
+        'form_selector': '#application', 'form_action': URL})
+    return form
+
+
+@pytest.mark.asyncio
+async def test_current_accessible_option_is_chosen_without_per_widget_grant():
+    form = page()
+    session = FakeSession(form)
+    filled = {}
+    result = await forms.execute(
+        session, form,
+        {'action': 'combobox', 'selector': '#country',
+         'value': 'Example Country'}, facts={}, filled=filled,
+        resume_path='unused-synthetic.pdf', company='example-co', jd_text='',
+        resume_tex='', github='', pk=PK, job_url=URL)
+    assert result['action'] == 'combobox'
+    assert session.calls == [(('click', '#country-example'), {})]
+    assert filled == {'#country': 'Example Country'}
+
+
+@pytest.mark.asyncio
+async def test_unknown_combobox_fact_requests_owner_without_click():
+    form = page()
+    session = FakeSession(form)
+    with pytest.raises(forms.Gate) as failure:
+        await forms.execute(
+            session, form, {'action': 'combobox', 'selector': '#country'},
+            facts={}, filled={}, resume_path='unused-synthetic.pdf',
             company='example-co', jd_text='', resume_tex='', github='',
-            pk=PK, job_url=URL))
-    question = raised.value.form_question
-    assert question['selector'] == '#country'
-    row.update(status='needs_human', gate_source='applier', gate_call_id='direct',
-               gate_pending={'question': 'Answer the observed field.',
-                             'form_question': question})
-
-    class Tracking:
-        def get(self, pk):
-            assert pk == PK
-            return deepcopy(row)
-
-        def set_status(self, pk, status, **changes):
-            row.update(status=status, **changes)
-
-    stores = SimpleNamespace(tracking=Tracking(), answer_bank=SimpleNamespace(
-        put=lambda *args, **kwargs: None))
-    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
-    assert run.resume_job(PK, 'Example Country', stores,
-                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
-    saved = row['human_approved_answers']['What country?']
-    assert saved['value'] == 'Example Country'
-    assert saved['selector'] == '#country' and saved['form_selector'] == '#application'
-    monkeypatch.setattr(forms, '_row', lambda _pk: {**row, 'status': 'submitting'})
-    forms.exact_approval(PK, 'What country?', 'Example Country',
-                         target=target, url=URL)
-    current = page()
-    committed = page(control(selected_text='Example Country', selected_value='EX',
-                             hidden_value='EX'))
-    session = Session(current, committed)
-    filled = approved_values()
-    receipt = asyncio.run(forms.execute(
-        session, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL))
-    forms.check_form(page(committed['controls'][0]), filled, True,
-                     receipts=[receipt])
-    forms.check_approvals(PK, [receipt], committed)
+            pk=PK, job_url=URL)
+    assert failure.value.reason == 'owner_question'
+    assert failure.value.form_question['label'] == 'What country?'
+    assert not session.calls
 
 
-def test_combobox_choice_requires_caption_not_machine_value_and_exact_grant(monkeypatch):
-    current = page()
-    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    session = Session(current)
-    with pytest.raises(forms.Gate):
-        asyncio.run(forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'EX'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-            job_url=URL))
-    assert not any(call[0] == 'click' for call in session.calls)
-
-
-async def test_committed_caption_and_hidden_machine_value_are_verified(monkeypatch):
-    current = page()
-    committed = page(control(selected_text='Example Country', selected_value='EX',
-                             hidden_value='EX'))
-    row = {'pk': PK, 'status': 'submitting',
-           'human_approved_answers': {'What country?': grant()}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    session = Session(current, committed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        session, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    assert receipt['approved_value'] == 'Example Country'
-    assert receipt['hidden_value_before'] == ''
-    assert receipt['hidden_value'] == receipt['committed_value'] == 'EX'
-    assert filled == {'#country': 'Example Country'}
-    assert ('click', '#country-example') in session.calls
-    forms.check_form(page(committed['controls'][0]), filled, True,
-                     receipts=[receipt])
-    forms.check_approvals(PK, [receipt], committed)
-
-    changed_hidden = page(control(selected_text='Example Country',
-                                selected_value='EX', hidden_value='OTHER'))
-    with pytest.raises(forms.Gate, match='A hidden form value is not independently authorized'):
-        forms.check_form(changed_hidden, filled, True, receipts=[receipt])
-
-    changed_machine_value = page(control(
-        selected_text='Example Country', selected_value='OT', hidden_value='OT'))
-    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
-        forms.check_approvals(PK, [receipt], changed_machine_value)
-
-
-async def test_popup_link_may_disappear_after_verified_form_commit(monkeypatch):
-    """A closed listbox need not retain aria-controls through final Submit."""
-    current = page()
-    committed = page(control(selected_text='Example Country',
-                             selected_value='EX', hidden_value='EX'))
-    chosen = committed['controls'][0]['combobox']
-    chosen.update(linked=False, link_id='', listbox_selector='', options=[])
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    session = Session(current, committed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        session, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
-    assert ('click', '#country-example') in session.calls
-    # The listbox may close after selecting a verified approved value.
-    # Current form-owned bytes, rather than past admission, determine Submit.
-    forms.check_form(committed, filled, True)
-    forms.check_form(committed, filled, True, receipts=[receipt])
-    forms.check_approvals(PK, [receipt], committed)
-    wrong_form_value = deepcopy(committed)
-    wrong_form_value['controls'][-1]['value'] = 'OTHER'
-    with pytest.raises(forms.Gate, match='hidden form value'):
-        forms.check_form(wrong_form_value, filled, True, receipts=[receipt])
-
-
-async def test_unbound_form_receiver_denies_display_only_combobox(monkeypatch):
-    """A visible choice with no named input or hidden receiver cannot Submit."""
-    current = page(control(hidden_selector=''))
-    committed = page(control(selected_text='Example Country',
-                             selected_value='EX', hidden_selector=''))
-    committed['controls'][0]['name'] = ''  # no submitted form input name
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    session = Session(current, committed)
-    filled = {}
-    receipt = await forms.execute(
-        session, current,
-        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    # Selection is reversible preparation. A display-only choice must be
-    # refused at the code-owned final Submit check, not at the option click.
-    assert ('click', '#country-example') in session.calls
-    assert filled == {'#country': 'Example Country'}
-    with pytest.raises(forms.Gate, match='no verified form-own value receiver'):
-        forms.check_form(committed, filled, True, receipts=[receipt])
-    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
-
-
-@pytest.mark.parametrize(('before', 'after'), [
-    ('EX', 'EX'),  # A pre-existing value unchanged by this selection is not authority.
-    ('', 'OTHER'),  # A changed value must equal the selected option's machine value.
-])
-async def test_hidden_value_must_change_to_the_selected_machine_value(
-        monkeypatch, before, after):
-    current = page(control(hidden_value=before))
-    committed = page(control(selected_text='Example Country',
-                             selected_value='EX', hidden_value=after))
-    row = {'pk': PK, 'status': 'submitting',
-           'human_approved_answers': {'What country?': grant()}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    session = Session(current, committed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        session, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='',
-        pk=PK, job_url=URL)
-    # The prior receiver state is no longer a per-step certificate. The
-    # current selected option and named hidden value own final authorization.
-    assert receipt['hidden_value_before'] == before
-    assert receipt['committed_value'] == 'EX'
-    assert filled == {'#country': 'Example Country'}
-    if after == 'EX':
-        forms.check_form(committed, filled, True)
-        forms.check_form(committed, filled, True, receipts=[receipt])
-    else:
-        with pytest.raises(forms.Gate, match='hidden form value'):
-            forms.check_form(committed, filled, True, receipts=[receipt])
-    assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#country-example')]
-
-
-async def test_picker_with_no_rendered_options_cannot_authorize_final_submit(
-        monkeypatch):
-    """An unresolved picker is reversible; no value or Submit is invented."""
-    initial = page()
-    initial['controls'][0]['combobox']['options'] = []
-    opened = deepcopy(initial)
-    committed = deepcopy(initial)
-    session = DynamicSession(initial, opened, committed)
-
-    async def no_sleep(_delay):
-        # The 20 re-observations are bounded without a real browser or timer.
-        return None
-
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_sleep)
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    filled = {}
-    receipt = await forms.execute(
-        session, initial,
-        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-
-    assert receipt['action'] == 'combobox'
-    assert receipt['unresolved'] and 'committed_value' not in receipt
-    assert filled == {}
-    assert [call for call in session.calls if call[0] != 'evaluate'] == [
-        ('click', '#country'),
-        ('fill', '#country', '--value', 'Example Country')]
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(await session.page(), filled, True, receipts=[receipt])
-    assert not any(args[:2] == ('click', '#submit') for args in session.calls)
-
-
-def test_unlinked_or_changed_without_selection_hidden_values_gate():
-    unlinked = page(control(hidden_value='EX', hidden_selector=''))
-    unlinked['controls'].append({
-        'selector': '#country-code', 'label': 'Unrelated country value',
-        'question': '', 'tag': 'input', 'type': 'hidden', 'required': False,
-        'disabled': False, 'value': 'EX', 'has_value': True, 'in_form': True,
-        'form_selector': '#application', 'form_action': URL, 'formaction': '',
-        'submit': False, 'checked': False, 'name': 'country_value', 'options': [],
-    })
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
-        forms.check_form(unlinked, {'#country': 'Example Country'}, True)
-
-    changed_without_selection = page(control(hidden_value='EX'))
-    with pytest.raises(forms.Gate,
-                       match='A hidden form value is not independently authorized'):
-        forms.check_form(changed_without_selection, {}, True)
-
-
-
-async def test_closed_picker_loads_options_after_exact_approved_filter(monkeypatch):
-    closed = control()
-    closed['combobox'].update(linked=False, listbox_selector='', options=[])
-    opened = control()
-    committed = control(selected_text='Example Country', selected_value='EX',
-                        hidden_value='EX')
-    row = {'pk': PK, 'status': 'submitting',
-           'human_approved_answers': {'What country?': grant()}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    session = DynamicSession(page(closed), page(opened), page(committed))
-    filled = {}
-    receipt = await forms.execute(
-        session, page(closed), {'action': 'combobox', 'selector': '#country',
-                                'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-        job_url=URL)
-    assert receipt['approved_value'] == 'Example Country'
-    assert ('fill', '#country', '--value', 'Example Country') in session.calls
-    assert filled == {'#country': 'Example Country'}
-
-@pytest.mark.parametrize(('caption', 'value', 'hidden'), [
-    ('Example Country', 'EX', 'WRONG'),
-    ('Example Country', '', 'EX'),
-    ('Typed only', 'EX', 'EX'),
-])
-def test_combobox_pre_submit_requires_persistent_matching_commit(caption, value, hidden):
-    current = page(control(selected_text=caption, selected_value=value,
-                           hidden_value=hidden))
-    with pytest.raises(forms.Gate, match='hidden form value|combobox'):
-        forms.check_form(current, {'#country': 'Example Country'}, True)
-
-
-def test_orphan_or_ambiguous_combobox_link_gates_before_option_ipc(monkeypatch):
-    target = control()
-    target['combobox']['linked'] = False
-    target['combobox']['link_id'] = ''
-    current = page(target)
-    session = Session(current)
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    with pytest.raises(forms.Gate):
-        asyncio.run(forms.execute(
-            session, current, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk=PK,
-            job_url=URL))
-    assert not any(call[0] == 'click' for call in session.calls)
-
-@pytest.mark.parametrize('options', [
-    [{'selector': '#only', 'unique': True, 'label': 'Other Country', 'value': 'OT'}],
-    [OPTIONS[0], {**OPTIONS[0], 'selector': '#duplicate'}],
-    [{**OPTIONS[0], 'submit': True}],
-    [{**OPTIONS[0], 'navigates': True}],
-])
-async def test_unmatched_ambiguous_or_dangerous_option_never_clicks(monkeypatch, options):
-    current = page()
-    current['controls'][0]['combobox']['options'] = deepcopy(options)
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    session = Session(current)
-    filled = {}
-    action = {'action': 'combobox', 'selector': '#country',
-              'fact': 'What country?'}
-    kwargs = dict(facts={'What country?': 'Example Country'}, filled=filled,
-                  resume_path='', company='example-co', jd_text='',
-                  resume_tex='', github='', pk=PK, job_url=URL)
-    if len(options) == 1 and options[0]['label'] == 'Other Country':
-        # No matching caption is incomplete preparation, not a human Gate.
-        receipt = await forms.execute(session, current, action, **kwargs)
-        assert receipt['unresolved'] and filled == {}
-        with pytest.raises(forms.Gate):
-            forms.check_form(current, filled, True, receipts=[receipt])
-    else:
-        # Ambiguous, navigating or submitting options remain hard pre-click
-        # refusals; they must never become ordinary reversible preparation.
-        with pytest.raises(forms.Gate):
-            await forms.execute(session, current, action, **kwargs)
-    assert not any(call == ('click', '#country-example') for call in session.calls)
-
-@pytest.mark.parametrize('field', ['label', 'value'])
-def test_combobox_material_assent_options_require_bound_owner_answer(field):
-    current = page()
-    target = current['controls'][0]
-    target['combobox']['options'] = [
-        {'selector': '#yes', 'unique': True,
-         'label': 'I consent to arbitration' if field == 'label' else 'Other',
-         'value': 'I consent to arbitration' if field == 'value' else 'YES'},
-    ]
-    witness = {'#country': {'visible': True, 'readonly': False,
-                            'disabled': False, 'inert': False,
-                            'combobox': target['combobox']}}
-    question = forms._disclosure_question(current, target, witness, URL)
-    assert question['label'] == 'What country?'
-    assert question['options'] == [{
-        'selector': '#yes',
-        'label': target['combobox']['options'][0]['label'],
-        'value': target['combobox']['options'][0]['value'],
-    }]
-    assert forms._missing_answer_reason(target) == 'owner_question'
-    assert forms._choice_prompt(target, question).startswith('Legal acknowledgement: ')
-
-
-def test_optional_empty_combobox_and_hidden_control_keep_native_availability():
-    combo = control(required=False, hidden_selector='')
-    combo['combobox'].update(linked=False, link_id='optional-list',
-                             listbox_selector='', options=[])
-    hidden = {'selector': '#optional-hidden', 'label': 'Optional code',
-              'question': '', 'tag': 'input', 'type': 'hidden',
-              'required': False, 'disabled': False, 'value': '',
-              'has_value': False, 'in_form': True,
-              'form_selector': '#application', 'form_action': URL,
-              'formaction': '', 'submit': False, 'checked': False,
-              'name': 'optional_code', 'options': []}
-    current = page(combo)
-    current['controls'].append(hidden)
-    forms.check_form(current, {}, uploaded=True)
-
-
-def test_typed_visible_combobox_drift_gates_pre_submit():
-    target = control(selected_text='Example Country', selected_value='EX',
-                     hidden_value='EX')
-    target['combobox']['displayed_text'] = 'Different Country'
-    current = page(target)
-    receipt = {'action': 'combobox', 'selector': '#country', 'label': 'Country',
-               'question': 'What country?', 'url': URL, 'fact': 'What country?',
-               'approved_value': 'Example Country', 'committed_caption': 'Example Country',
-               'committed_value': 'EX', 'hidden_selector': '#country-code',
-               'hidden_value_before': '', 'hidden_value': 'EX'}
-    with pytest.raises(forms.Gate, match='combobox'):
-        forms.check_form(current, {'#country': 'Example Country'},
-                         uploaded=True, receipts=[receipt])
-    with pytest.raises(forms.Gate, match='The committed accessible choice or form value changed\.'):
-        forms.check_approvals(PK, [receipt], current)
-
-
-def test_combobox_machine_value_rejected_even_with_valid_caption_grant(monkeypatch):
-    current = page()
-    current['controls'][0]['combobox']['options'] = [{
-        'selector': '#country-example', 'unique': True,
-        'label': 'Other Country', 'value': 'Example Country', 'selected': False}]
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant('Example Country')}})
-    session = Session(current)
-    filled = {}
-    receipt = asyncio.run(forms.execute(
-        session, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='',
-        pk=PK, job_url=URL))
-    # A machine value equal to the grant cannot substitute for the displayed
-    # approved caption. No selection receipt exists, and final Submit refuses.
-    assert receipt['unresolved'] and filled == {}
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, filled, True, receipts=[receipt])
-    assert not any(call == ('click', '#country-example') for call in session.calls)
-
-async def test_async_option_timeout_never_clicks_an_option(monkeypatch):
-    closed = control()
-    closed['combobox'].update(linked=False, listbox_selector='', options=[])
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    async def no_wait(_seconds):
-        return None
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
-    class TimeoutSession:
-        def __init__(self):
-            self.current = page(closed)
-            self.calls = []
-        async def call(self, *args, **kwargs):
-            self.calls.append(args)
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(self.current)}
-            if args in {('click', '#country'),
-                        ('fill', '#country', '--value', 'Example Country')}:
-                return {}
-            pytest.fail(f'Unexpected browser IPC: {args}')
-        async def page(self):
-            return deepcopy(self.current)
-    session = TimeoutSession()
-    filled = {}
-    receipt = await forms.execute(
-        session, page(closed), {'action': 'combobox', 'selector': '#country',
-                                'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='',
-        pk=PK, job_url=URL)
-    assert receipt['unresolved'] and filled == {}
-    with pytest.raises(forms.Gate):
-        forms.check_form(page(closed), filled, True, receipts=[receipt])
-    assert not any(call[0] == 'click' and call[1] != '#country'
-                   for call in session.calls)
-
-async def test_closed_aria_picker_binds_exclusive_listbox_after_open(monkeypatch):
-    """A closed ARIA combobox has no aria-controls until its options mount."""
-    closed = control()
-    closed['combobox'].update(linked=False, link_id='',
-                              listbox_selector='', options=[])
-    opened = page()
-    committed = page(control(selected_text='Example Country',
-                             selected_value='EX', hidden_value='EX'))
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-
-    class LazyLinkSession(DynamicSession):
-        def current(self):
-            # The actual linked listbox first appears after the picker click.
-            return (self.initial, self.opened, self.opened, self.committed)[self.stage]
-
-    session = LazyLinkSession(page(closed), opened, committed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        session, page(closed),
-        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    mutations = [call for call in session.calls if call[0] != 'evaluate']
-    assert mutations == [
-        ('click', '#country'),
-        ('fill', '#country', '--value', 'Example Country'),
-        ('click', '#country-example'),
-    ]
-    assert receipt['committed_value'] == receipt['hidden_value'] == 'EX'
-    assert filled == {'#country': 'Example Country'}
-    forms.check_form(committed, filled, True, receipts=[receipt])
-    forms.check_approvals(PK, [receipt], committed)
-
-
-async def test_closed_aria_picker_without_rendered_link_never_selects(monkeypatch):
-    """Opening alone cannot confer a listbox/option identity or approval."""
-    closed = control()
-    closed['combobox'].update(linked=False, link_id='',
-                              listbox_selector='', options=[])
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-
-    async def no_wait(_seconds):
-        return None
-
-    monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
-
-    class NeverLinked(DynamicSession):
-        def current(self):
-            return self.initial
-
-    session = NeverLinked(page(closed), page(), page())
-    filled = {}
-    receipt = await forms.execute(
-        session, page(closed),
-        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    assert receipt['unresolved'] and filled == {}
-    with pytest.raises(forms.Gate):
-        forms.check_form(page(closed), filled, True, receipts=[receipt])
-    assert not any(call == ('click', '#country-example') for call in session.calls)
-
-
-async def test_dynamic_combobox_rechecks_provenance_before_each_mutation(monkeypatch):
-    """Reversible ARIA writes must retain a tracked canonical ATS route."""
-    job_id = '12345678-1234-4234-8234-123456789abc'
-    pk = 'example-co#' + job_id
-    posting = 'https://jobs.lever.co/example-co/' + job_id
-    form_url = posting + '/apply'
-
-    def on_form(snapshot):
-        snapshot['url'] = form_url
-        for item in snapshot['controls']:
-            item['form_action'] = form_url
-        return snapshot
-
-    closed = control()
-    closed['combobox'].update(linked=False, listbox_selector='', options=[])
-    initial = on_form(page(closed))
-    opened = on_form(page())
-    committed = on_form(page(control(
-        selected_text='Example Country', selected_value='EX', hidden_value='EX')))
-    approved = grant()
-    approved.update(url=form_url, form_action=form_url)
-    row = {
-        'pk': pk, 'company': 'example-co', 'job_id': job_id,
-        'ats': 'lever', 'jd_url': posting, 'status': 'submitting',
-        'possible_submission': False,
-        'human_approved_answers': {'What country?': approved},
-    }
-    monkeypatch.setattr(forms, '_row', lambda row_pk: row if row_pk == pk else {})
-    token = forms.ApplicationEntryProvenance(
-        pk=pk, company='example-co', ats='lever', job_id=job_id,
-        wrapper=posting, board='example-co', url=form_url)
-    # Host-only preparation must not demand the final ATS/board certificate.
-    # It *must* still re-read the same tracked job before each mutation.
-    preparation_current = forms._preparation_current
-    checked = []
-
-    def check_live(provenance, **kwargs):
-        checked.append(provenance)
-        return preparation_current(provenance, **kwargs)
-
-    monkeypatch.setattr(forms, '_preparation_current', check_live)
-    session = DynamicSession(initial, opened, committed)
-    receipt = await forms.execute(
-        session, initial, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'What country?'},
-        facts={'What country?': 'Example Country'}, filled={}, resume_path='',
-        company='example-co', jd_text='', resume_tex='', github='', pk=pk,
-        job_url=posting, provenance=token)
-    assert receipt['action'] == 'combobox'
-    assert len(checked) >= 3 and all(item is token for item in checked)
-    assert ('click', '#country-example') in session.calls
-
-
-async def test_apply_rechecks_dispatch_before_combobox_mutation(monkeypatch):
-    from tools import browser_skill as bsk
-    from unittest.mock import AsyncMock
-
-    job_id = '12345678-1234-4234-8234-123456789abc'
-    pk = 'example-co#' + job_id
-    posting = 'https://jobs.lever.co/example-co/' + job_id
-    form_url = posting + '/apply'
-
-    def on_form(snapshot):
-        snapshot['url'] = form_url
-        for item in snapshot['controls']:
-            item['form_action'] = form_url
-        return snapshot
-
-    calls = []
-    monkeypatch.setattr(forms, 'check_dispatch',
-                        lambda *args, **kwargs: calls.append('dispatch'))
-    approved = grant()
-    approved.update(url=form_url, form_action=form_url)
-    row = {'pk': pk, 'company': 'example-co', 'job_id': job_id,
-           'jd_url': posting, 'ats': 'lever', 'status': 'submitting',
-           'possible_submission': False,
-           'human_approved_answers': {'What country?': approved}}
-    monkeypatch.setattr(forms, '_row',
-                        lambda selected_pk: row if selected_pk == pk else {})
-    # The missing optional tenant pin must not block safe host preparation.
-    # No actual watchlist or owner configuration is read by this offline test.
-    monkeypatch.setattr(forms, '_configured_alias', lambda *args, **kwargs: None)
-    monkeypatch.setattr('tools.claude_chrome._stage_resume', lambda path, owner: path)
-    monkeypatch.setattr('tools.browser_apply._site_rules', lambda *args: '')
-    monkeypatch.setattr('core.events.emit', lambda *args, **kwargs: None)
-
-    initial = on_form(page())
-    committed = on_form(page(control(
-        selected_text='Example Country', selected_value='EX', hidden_value='EX')))
-
-    class ApplySession(Session):
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *args):
-            return False
-        async def navigate(self, _url):
-            return deepcopy(self.current)
-
-    session = ApplySession(initial, committed)
-    monkeypatch.setattr(bsk, 'Session', lambda _kind: session)
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-        {'action': 'gate', 'question': 'Stop after the synthetic committed choice.'}]))
-    outcome = await forms.apply(
-        posting, 'example-co', {'What country?': 'Example Country'}, 'synthetic',
-        pk=pk, resume_path='Resume.pdf')
-    assert outcome['status'] == 'gate'
-    assert ('click', '#country-example') in session.calls
-    assert calls.count('dispatch') >= 4
-
-
-async def test_option_without_positive_safety_witness_never_clicks(monkeypatch):
-    """An omitted safety field is not a safe ARIA option, even in a fake DOM."""
-    current = page()
-    current['controls'][0]['combobox']['options'][0].pop('safe')
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    session = Session(current)
-    with pytest.raises(forms.Gate, match='unsafe navigating option'):
+@pytest.mark.asyncio
+async def test_unmatched_and_ambiguous_options_do_not_invent_a_selection():
+    for options in ([], [OPTIONS[0], dict(OPTIONS[0], selector='#duplicate')]):
+        combo = control()
+        combo['combobox']['options'] = deepcopy(options)
+        form = page(combo)
+        session = FakeSession(form)
+        filled = {}
         await forms.execute(
-            session, current,
-            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={},
-            resume_path='', company='example-co', jd_text='', resume_tex='',
-            github='', pk=PK, job_url=URL)
-    assert ('click', '#country-example') not in session.calls
+            session, form, {'action': 'combobox', 'selector': '#country',
+                            'value': 'Example Country'},
+            facts={}, filled=filled, resume_path='unused-synthetic.pdf',
+            company='example-co', jd_text='', resume_tex='', github='',
+            pk=PK, job_url=URL)
+        assert ('click', '#country-example') not in [x[0] for x in session.calls]
+        assert filled == {'#country': 'Example Country'}
+        with pytest.raises(forms.Gate, match='required accessible picker'):
+            forms.check_form(_complete_form(combo), filled, True, 'Test User.pdf')
 
 
-async def test_unsafe_nested_option_effect_never_clicks(monkeypatch):
-    """A nested action is unsafe even without a submit/link on the option node."""
-    current = page()
-    chosen = current['controls'][0]['combobox']['options'][0]
-    chosen.update(safe=False, submit=False, navigates=False)
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting',
-        'human_approved_answers': {'What country?': grant()}})
-    session = Session(current)
-    with pytest.raises(forms.Gate, match='unsafe navigating option'):
-        await forms.execute(
-            session, current,
-            {'action': 'combobox', 'selector': '#country', 'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled={},
-            resume_path='', company='example-co', jd_text='', resume_tex='',
-            github='', pk=PK, job_url=URL)
-    assert ('click', '#country-example') not in session.calls
+def test_required_picker_uses_fresh_selection_not_model_filled_ledger():
+    form = _complete_form(control())
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(form, {'#country': 'Example Country'}, True, 'Test User.pdf')
+    selected = _complete_form(control(selected_text='Example Country',
+                                      selected_value='EX', hidden_value='EX'))
+    forms.check_form(selected, {}, True, 'Test User.pdf')
 
 
-def material_page(*, selected=False):
-    target = control(selected_text='I agree' if selected else '',
-                     selected_value='YES' if selected else '',
-                     hidden_value='YES' if selected else '')
-    target.update(label='Processing choice', question='Data processing consent?')
-    target['combobox']['options'] = [
-        {'selector': '#country-example', 'unique': True,
-         'label': 'I agree', 'value': 'YES', 'safe': True},
-        {'selector': '#country-other', 'unique': True,
-         'label': 'I decline', 'value': 'NO', 'safe': True},
-    ]
-    if selected:
-        target.update(value='I agree', has_value=True)
-    return page(target)
+@pytest.mark.parametrize('mutation', [
+    lambda controls: controls[-1].update(files=[]),
+    lambda controls: controls.append({
+        'selector': '#foreign-file', 'type': 'file', 'files': ['extra.pdf']}),
+])
+def test_selected_picker_does_not_waive_current_pdf_receiver(mutation):
+    form = _complete_form(control(selected_text='Example Country',
+                                  selected_value='EX'))
+    mutation(form['controls'])
+    with pytest.raises(forms.Gate, match='resume input|résumé input'):
+        forms.check_form(form, {}, True, 'Test User.pdf')
 
 
-def test_material_combobox_reply_stores_original_option_identity(monkeypatch):
-    from agent import run
-    current = material_page()
-    target = current['controls'][0]
-    question = forms._disclosure_question(
-        current, target, {'#country': {
-            'visible': True, 'readonly': False, 'disabled': False, 'inert': False,
-            'combobox': target['combobox']}}, URL, bootstrap=True)
-    question['pk'] = PK
-    row = {
-        'pk': PK, 'company': 'example-co', 'jd_url': URL,
-        'status': 'needs_human', 'gate_source': 'applier',
-        'gate_call_id': 'direct', 'possible_submission': False,
-        'human_approved_answers': {},
-        'gate_pending': {'question': 'Exact synthetic option question',
-                         'form_question': question},
+@pytest.mark.asyncio
+async def test_native_select_uses_current_accessible_option_not_approval_ledger():
+    select = {
+        'selector': '#region', 'label': 'Region', 'question': 'Region',
+        'tag': 'select', 'type': 'select', 'disabled': False,
+        'options': [{'label': 'Synthetic region', 'value': 'SR'}],
     }
-    stored = {}
-    class Tracking:
-        def get(self, pk):
-            return deepcopy(row)
-        def set_status(self, pk, status, **changes):
-            row.update(status=status, **changes)
-    stores = SimpleNamespace(
-        tracking=Tracking(), answer_bank=SimpleNamespace(
-            put=lambda label, value, *args, **kw:
-            stored.update({label: value})))
-    monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_enqueue_apply', lambda *a, **kw: {'result': 'queued'})
-    assert run.resume_job(PK, 'I agree', stores,
-                          **_owner_reply(stores.tracking, row))['result'] == 'queued'
-    # No material owner assent may be written to the reusable fact bank.
-    assert stored == {}
-    approved = row['human_approved_answers']['Data processing consent?']
-    assert approved['options'] == question['options']
-    assert approved['selector'] == '#country'
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        **row, 'status': 'submitting'})
-    forms.exact_approval(
-        PK, 'Data processing consent?', 'I agree', target=target, url=URL)
-    changed = deepcopy(target)
-    changed['combobox']['options'][0]['value'] = 'DIFFERENT'
-    with pytest.raises(forms.Gate):
-        forms.exact_approval(
-            PK, 'Data processing consent?', 'I agree', target=changed, url=URL)
-    changed = deepcopy(target)
-    changed['form_action'] = URL + '/other'
-    with pytest.raises(forms.Gate):
-        forms.exact_approval(
-            PK, 'Data processing consent?', 'I agree', target=changed, url=URL)
-
-
-async def test_material_combobox_first_gates_then_exact_reply_allows_one_option_click(
-        monkeypatch):
-    current = material_page()
-    initial_target = current['controls'][0]
-    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    no_write = Session(current)
-    with pytest.raises(forms.MaterialAssentGate) as first:
-        await forms._bootstrap(no_write, current, PK, {}, URL)
-    assert first.value.reason == 'owner_question'
-    assert first.value.form_question['options'] == [
-        {key: option[key] for key in ('selector', 'label', 'value')}
-        for option in initial_target['combobox']['options']]
-    assert not any(call[0] != 'evaluate' for call in no_write.calls)
-
-    form_question = first.value.form_question
-    row['human_approved_answers'] = {
-        'Data processing consent?': {
-            'value': 'I agree', 'selector': '#country', 'url': URL,
-            'label': 'Processing choice', 'question': 'Data processing consent?',
-            'tag': 'input', 'type': 'combobox', 'form_selector': '#application',
-            'form_action': URL, 'options': form_question['options'],
-        }}
-    await forms._bootstrap(no_write, current, PK, {}, URL)
-    assert not any(call[0] != 'evaluate' for call in no_write.calls)
-
-    committed = material_page(selected=True)
-    browser = Session(current, committed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        browser, current, {'action': 'combobox', 'selector': '#country',
-                           'fact': 'Data processing consent?'},
-        facts={}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=URL)
-    assert ('click', '#country-example') in browser.calls
-    assert not any(call[0] == 'click' and call[1] == '#submit'
-                   for call in browser.calls)
-    assert receipt['committed_caption'] == 'I agree'
-    assert receipt['committed_value'] == 'YES'
-    assert filled == {'#country': 'I agree'}
-
-
-@pytest.mark.parametrize('problem', ['unlinked', 'ambiguous', 'invisible', 'unbound'])
-async def test_material_combobox_bad_witness_cannot_request_grant(monkeypatch, problem):
-    current = material_page()
-    combo = current['controls'][0]
-    if problem == 'unlinked':
-        combo['combobox'].update(linked=False, link_id='',
-                                 listbox_selector='', options=[])
-    elif problem == 'ambiguous':
-        combo['combobox']['options'][1]['label'] = 'I agree'
-    elif problem == 'unbound':
-        combo['in_form'] = False
-    independent = evidence(current)
-    if problem == 'invisible':
-        independent['controls'][0]['visible'] = False
-    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    witness = {'#country': next(x for x in independent['controls']
-                                if x['selector'] == '#country')}
-    with pytest.raises(forms.Gate):
-        forms._disclosure_question(current, combo, witness, URL, bootstrap=True)
-
-async def test_material_closed_popup_exact_receipt_survives_final_approval(
-        monkeypatch):
-    opened = material_page()
-    closed = material_page(selected=True)
-    closed['controls'][0]['combobox'].update(
-        linked=False, link_id='', listbox_selector='', options=[])
-    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    question = forms._disclosure_question(
-        opened, opened['controls'][0],
-        {'#country': {'visible': True, 'readonly': False,
-                      'disabled': False, 'inert': False,
-                      'combobox': opened['controls'][0]['combobox']}}, URL)
-    row['human_approved_answers'] = {
-        question['label']: {
-            'value': 'I agree', 'selector': '#country', 'url': URL,
-            'label': 'Processing choice', 'question': 'Data processing consent?',
-            'tag': 'input', 'type': 'combobox',
-            'form_selector': '#application', 'form_action': URL,
-            'options': question['options']}}
-    session = Session(opened, closed)
-    filled = approved_values()
-    receipt = await forms.execute(
-        session, opened, {'action': 'combobox', 'selector': '#country',
-                          'fact': 'Data processing consent?'},
+    form = {'controls': [select]}
+    session = FakeSession(form)
+    filled = {}
+    await forms.execute(
+        session, form, {'action': 'select', 'selector': '#region',
+                        'value': 'Synthetic region'},
         facts={}, filled=filled, resume_path='', company='example-co',
         jd_text='', resume_tex='', github='', pk=PK, job_url=URL)
-    assert receipt['selected_option'] in receipt['witnessed_options']
-    forms.check_form(closed, filled, True, receipts=[receipt])
-    forms.check_approvals(PK, [receipt], closed)
-    wrong = deepcopy(receipt)
-    wrong['selected_option']['value'] = 'DIFFERENT'
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [wrong], closed)
-    row['human_approved_answers'][question['label']]['options'][0]['value'] = 'DIFFERENT'
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [receipt], closed)
+    assert session.calls == [(('select', '#region', '--value', 'SR'), {})]
+    assert filled['#region'] == 'SR'
 
-@pytest.mark.parametrize('caption', [
-    'Please Acknowledge receipt of our Candidate Privacy Notice.',
-    'I confirm, that I have read the Example Co Privacy Notice …',
-    'By selecting "I agree," …',
+
+def _read_native_single_select(*, options_count, selected_caption, long_text):
+    """Run the production JS reader against an in-memory synthetic Node DOM.
+
+    The existing fixture file is not edited: this test injects one real-shaped
+    select before the fixture's ID census, with no network or browser.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    from tools.browser_skill_dom import PAGE
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    injection = """
+const chosenIndex = Number(process.env.TEST_SELECTION_INDEX || 0);
+const list = node('select', {
+  id:'gender-native', name:'gender', role:'combobox', required:true,
+  'aria-expanded':'false', 'data-value-input':'gender-code',
+},form);
+node('label',{'for':'gender-native',text:'Gender'},form);
+const hidden = node('input',{id:'gender-code',type:'hidden',name:'gender_machine'},form);
+const total = TOTAL;
+const currentCaption = CHOSEN;
+const values = [];
+for (let i=0;i<total;i++) {
+  const label = i===total-1 ? currentCaption : 'Synthetic choice '+i;
+  const option = node('option',{text:label},list);
+  option.value = i===total-1 ? (currentCaption==='Male' ? 'male' : 'skip') : 'choice-'+i;
+  option.selected = i===total-1;
+  values.push(option);
+}
+list.options=values;
+list.value=values[total-1].value;
+list.multiple=false;
+hidden.value=list.value;
+if (LONG_TEXT) node('p',{text:'Synthetic '.repeat(12000)},body);
+"""
+    injection = injection.replace('TOTAL', str(options_count))
+    injection = injection.replace('CHOSEN', json.dumps(selected_caption))
+    injection = injection.replace('LONG_TEXT', 'true' if long_text else 'false')
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    fixture = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', fixture, 'synthetic',
+         json.dumps({'url': 'https://employer.test/job/1'}), PAGE],
+        capture_output=True, text=True, check=True, timeout=30)
+    return json.loads(completed.stdout)
+
+
+@pytest.mark.parametrize('caption,machine', [
+    ('Male', 'male'),
+    ('Prefer not to answer', 'skip'),
 ])
-async def test_closed_material_assent_bootstrap_witnesses_without_selection(
-        monkeypatch, caption):
-    closed = material_page()
-    closed['controls'][0].update(label=caption, question=caption)
-    closed['controls'][0]['combobox'].update(
-        linked=False, link_id='', listbox_selector='', options=[])
-    opened = material_page()
-    opened['controls'][0].update(label=caption, question=caption)
-    row = {'pk': PK, 'status': 'submitting', 'human_approved_answers': {}}
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-
-    class Reversible:
-        def __init__(self):
-            self.current = deepcopy(closed)
-            self.calls = []
-        async def page(self):
-            return deepcopy(self.current)
-        async def call(self, *args):
-            self.calls.append(args)
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(self.current)}
-            if args == ('click', '#country'):
-                self.current = deepcopy(opened)
-                return {}
-            if args == ('press', 'Escape'):
-                self.current = deepcopy(closed)
-                return {}
-            pytest.fail(f'unapproved witness action: {args}')
-
-    session = Reversible()
-    if caption.startswith('Please Acknowledge'):
-        # Intercept the real bootstrap open/Escape through the raw controller,
-        # not only the synthetic transport's permissive call method.
-        controller = forms.ApplicationIPCController(
-            PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
-        async def raw_page(_session):
-            return await session.page()
-        controller._page = raw_page
-        controller._fresh_preparation = lambda _origin: None
-        session._application_controller = controller
-        async def raw_effect(*args):
-            await controller.before_ipc(session, args, {})
-            try:
-                result = await session.call(*args)
-            except Exception:
-                await controller.after_ipc(session, args, {}, succeeded=False)
-                raise
-            await controller.after_ipc(session, args, {}, succeeded=True)
-            return result
-        session.application_effect = raw_effect
-    with pytest.raises(forms.MaterialAssentGate) as exc:
-        await forms._bootstrap(session, closed, PK, {}, URL)
-    assert exc.value.reason == 'owner_question'
-    assert exc.value.form_question['options'] == [
-        {k: option[k] for k in ('selector', 'label', 'value')}
-        for option in opened['controls'][0]['combobox']['options']]
-    assert [c for c in session.calls if c[0] != 'evaluate'] == [
-        ('click', '#country'), ('press', 'Escape')]
+def test_native_single_select_reader_captures_caption_and_hidden_machine(caption, machine):
+    """A native select with role=combobox must not look like an empty picker."""
+    page = _read_native_single_select(
+        options_count=3, selected_caption=caption, long_text=False)
+    field = next(c for c in page['controls'] if c['selector'] == '#gender-native')
+    combo = field['combobox']
+    assert combo['selected_text'] == caption
+    assert combo['selected_value'] == machine
+    assert combo['hidden_value'] == machine
+    assert combo['hidden_selector'] == '#gender-code'
+    assert field['value'] == machine
+    assert field['option_count'] == 3 and not field['options_capped']
 
 
-@pytest.mark.parametrize('failure', ['open-timeout', 'escape-failure'])
-async def test_material_witness_failure_clears_raw_escape_authority(monkeypatch, failure):
-    closed = material_page()
-    closed['controls'][0]['combobox'].update(
-        linked=False, link_id='', listbox_selector='', options=[])
-    opened = material_page()
-    monkeypatch.setattr(forms, '_row', lambda _pk: {
-        'pk': PK, 'status': 'submitting', 'human_approved_answers': {}})
-
-    class Transport:
-        def __init__(self):
-            self.current = deepcopy(closed)
-            self.calls = []
-        async def page(self):
-            return deepcopy(self.current)
-        async def call(self, *args):
-            self.calls.append(args)
-            if args == ('evaluate', forms._FIXED_CONTROL_WITNESS):
-                return {'value': evidence(self.current)}
-            if args == ('click', '#country'):
-                self.current = deepcopy(opened)
-                if failure == 'open-timeout':
-                    raise TimeoutError('synthetic click acknowledgement lost')
-                return {}
-            if args == ('press', 'Escape'):
-                if failure == 'escape-failure':
-                    raise TimeoutError('synthetic Escape acknowledgement lost')
-                self.current = deepcopy(closed)
-                return {}
-            pytest.fail('Witness attempted an unapproved action')
-
-    session = Transport()
-    controller = forms.ApplicationIPCController(
-        PK, 'example-co', URL, '', {}, {}, [], {}, lambda: None)
-    controller._fresh_preparation = lambda _origin: None
-    async def raw_page(_session):
-        return await session.page()
-    controller._page = raw_page
-    session._application_controller = controller
-    async def raw_effect(*args):
-        await controller.before_ipc(session, args, {})
-        try:
-            result = await session.call(*args)
-        except Exception:
-            await controller.after_ipc(session, args, {}, succeeded=False)
-            raise
-        await controller.after_ipc(session, args, {}, succeeded=True)
-        return result
-    session.application_effect = raw_effect
-    with pytest.raises(TimeoutError):
-        await forms._bootstrap(session, closed, PK, {}, URL)
-    assert ('click', '#country') in session.calls
-    assert controller._material_witness_request is None
-    assert controller._material_witness_close_request is None
-    assert controller._material_witness_selector is None
-    assert ('press', 'Escape') in session.calls
-    with pytest.raises(forms.Gate):
-        await controller.before_ipc(session, ('press', 'Escape'), {})
+def test_3300_options_and_long_page_text_preserve_complete_control_readback():
+    """Text and option caps cannot turn an otherwise complete form inventory
+    into a truncated final-Submit item-2 failure.
+    """
+    page = _read_native_single_select(
+        options_count=3300, selected_caption='Prefer not to answer',
+        long_text=True)
+    assert page['inventory_verified'] is True
+    assert page['truncated'] is False
+    assert page['text_truncated'] is True
+    assert len(page['text']) == 100000
+    field = next(c for c in page['controls'] if c['selector'] == '#gender-native')
+    assert field['option_count'] == 3300
+    assert field['options_capped'] is True
+    assert len(field['options']) == 65
+    assert [o['value'] for o in field['options'][:64]] == [
+        'choice-'+str(i) for i in range(64)]
+    assert field['options'][-1] == {
+        'value': 'skip', 'label': 'Prefer not to answer'}
+    assert field['combobox']['selected_text'] == 'Prefer not to answer'
+    assert field['combobox']['selected_value'] == 'skip'
+    # check_form still needs the staged PDF and other real answers; its
+    # inventory-completeness predicate alone must not reject long page text.
+    pdf = {
+        'selector': '#resume', 'tag': 'input', 'type': 'file',
+        'label': 'Resume', 'question': 'Resume', 'required': True,
+        'files': ['Test User.pdf'], 'in_form': True,
+        'form_selector': '#application-form',
+    }
+    page['controls'].append(pdf)
+    forms.check_form(page, {}, True, 'Test User.pdf')
 
 
-@pytest.mark.parametrize('linked,expected', [
-    (True, 'true'), (False, 'false'), (None, 'absent'),
-    ('PRIVATE_LINKED_SENTINEL', 'other'),
+def _read_local_react_select_gender(caption='Male', *, state='selected', reader=None):
+    """Run the production PAGE reader on the observed local React-select shape.
+
+    Synthetic DOM only. The input stays blank and no hidden field, native
+    select, or global live-region message can provide the chosen caption.
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    from tools.browser_skill_dom import PAGE
+
+    fixture = Path(__file__).with_name('entry_dom_fixture.js').read_text()
+    marker = '// Keep the 4096-node synthetic census cheap without weakening duplicate-ID proof.'
+    assert fixture.count(marker) == 1
+    injection = r"""
+const genderField=node('div',{class:'form-group'},form);
+node('label',{id:'gender-label','for':'gender',text:'Gender'},genderField);
+const shell=node('div',{class:'select__container'},genderField);
+const valueBox=node('div',{
+  class:'select__value-container select__value-container--has-value',
+},shell);
+if (MODE==='selected' || MODE==='ambiguous')
+  node('div',{class:'select__single-value',text:CAPTION},valueBox);
+if (MODE==='ambiguous')
+  node('div',{class:'select__single-value',text:'Decline To Self Identify'},valueBox);
+if (MODE==='outside')
+  node('div',{class:'select__single-value',text:CAPTION},shell);
+const inputBox=node('div',{class:'select__input-container','data-value':''},valueBox);
+const gender=node('input',{
+  id:'gender',type:'text',name:'gender',role:'combobox',
+  'aria-labelledby':'gender-label',
+  'aria-describedby':'gender-error','aria-errormessage':'gender-error',
+  'aria-expanded':'false',
+},inputBox);
+gender.value='';
+node('span',{id:'gender-error'},genderField);
+// This independent announcement must never become selected_text.
+node('div',{role:'status','aria-live':'polite',text:'option '+CAPTION+', selected.'},body);
+"""
+    injection = injection.replace('CAPTION', json.dumps(caption)).replace(
+        'MODE', json.dumps(state))
+    script = fixture.replace(marker, injection + '\n' + marker)
+    completed = subprocess.run(
+        ['node', '-e', script, 'synthetic',
+         json.dumps({'url': 'https://employer.test/job/1'}), PAGE if reader is None else reader],
+        text=True, capture_output=True, check=True, timeout=30)
+    page = json.loads(completed.stdout)
+    field = next(c for c in page['controls'] if c['selector'] == '#gender')
+    return page, field
+
+
+@pytest.mark.parametrize('caption', ['Male', 'Decline To Self Identify'])
+def test_actual_react_select_local_caption_not_blank_search_input(caption):
+    """Read one local single-value after a select/blur, not the empty input."""
+    page, field = _read_local_react_select_gender(caption)
+    combo = field['combobox']
+    assert field['value'] == '' and field['has_value'] is False
+    assert combo['selected_text'] == caption
+    assert combo['displayed_text'] == caption
+    assert combo['selected_value'] == '' and combo['hidden_selector'] == ''
+    assert combo['local_selected_proven'] is True
+    assert combo['selected_caption_unreadable'] is False
+
+
+@pytest.mark.parametrize('state', ['missing', 'outside', 'ambiguous'])
+def test_actual_react_select_does_not_borrow_live_region_or_foreign_caption(state):
+    """A selected-looking but non-unique/foreign caption stays unreadable."""
+    _, field = _read_local_react_select_gender('Male', state=state)
+    combo = field['combobox']
+    assert field['value'] == ''
+    assert combo['selected_text'] == ''
+    assert combo['local_selected_proven'] is False
+    assert combo['selected_caption_unreadable'] is True
+
+
+@pytest.mark.parametrize('caption,state', [
+    ('Male', 'selected'),
+    ('Decline To Self Identify', 'selected'),
+    ('Male', 'missing'),
+    ('Male', 'ambiguous'),
 ])
-@pytest.mark.parametrize('options,expected_options', [
-    (None, 'none'), ([], 'empty'), ([{'label': 'PRIVATE_OPTION_SENTINEL'}], 'present'),
-])
-@pytest.mark.parametrize('link_id,listbox', [
-    ('', ''), ('opaque-link', ''), ('', '#opaque-listbox'),
-    ('opaque-link', '#opaque-listbox'),
-])
-def test_material_witness_diagnostic_normalizes_field_classes(
-        linked, expected, options, expected_options, link_id, listbox):
-    combo = {'linked': linked, 'options': options,
-             'link_id': link_id, 'listbox_selector': listbox}
-    detail = forms._material_witness_disclosure_detail(
-        {'combobox': combo}, attempted=False)
-    assert detail == (
-        f'witness=not-attempted,linked={expected},options={expected_options},'
-        f"link_id={'present' if link_id else 'absent'},"
-        f"listbox={'present' if listbox else 'absent'}")
-    for sentinel in ('PRIVATE_LINKED_SENTINEL', 'PRIVATE_OPTION_SENTINEL',
-                     'opaque-link', '#opaque-listbox'):
-        assert sentinel not in detail
-    assert 'witness_reason=' not in detail
+def test_protected_local_caption_matches_independent_fixed_reader(caption, state):
+    """A real final inventory uses two independent readers. The local
+    selected-value proof cannot be visible only in PAGE: that would reject
+    even a valid decline as a stale witness before the sole Submit check.
+    """
+    from tools.browser_skill_dom import PAGE
 
-
-@pytest.mark.parametrize('failure', sorted(forms._MATERIAL_WITNESS_GATE_REASONS))
-def test_material_witness_diagnostic_accepts_only_witness_gate_literals(failure):
-    target = {'combobox': {'linked': False, 'options': [],
-                           'link_id': None, 'listbox_selector': None}}
-    detail = forms._material_witness_disclosure_detail(
-        target, attempted=True, reason=failure)
-    assert detail.endswith('witness_reason=' + failure)
-    unsafe = forms._material_witness_disclosure_detail(
-        target, attempted=True, reason='PRIVATE_GATE_TOKEN_SENTINEL ' + failure)
-    assert unsafe.endswith('witness_reason=' + forms._MATERIAL_WITNESS_GATE_OPAQUE)
-    assert 'PRIVATE_GATE_TOKEN_SENTINEL' not in unsafe
-
-
-@pytest.mark.parametrize('linked,expected', [
-    (None, 'absent'), ('unknown', 'other'), (True, 'true'),
-])
-@pytest.mark.parametrize('failure,expected', [
-    ('The closed combobox linkage is incomplete or ambiguous.',
-     'The closed combobox linkage is incomplete or ambiguous.'),
-    ('The material picker changed during reversible inspection.',
-     'The material picker changed during reversible inspection.'),
-    ('PRIVATE_GATE_TOKEN_SENTINEL with #selector and URL',
-     forms._MATERIAL_WITNESS_GATE_OPAQUE),
-])
-def _owner_reply(tracking, row):
-    """Issue #202 r07: reissue the hand-built direct gate with a fresh
-    generation, give the row stub the storage contract's own consume, and
-    return the exact current-gate tokens the dashboard sends."""
-    from agent import run
-    from core.storage.base import direct_gate_patch
-    pending = row['gate_pending']
-    row['gate_pending'] = run._direct_gate_pending(
-        pending.get('question'), pending['form_question'], 'owner')
-
-    def consume(pk, *, expected_pending, disposition, grant=None, skip=None):
-        patch = direct_gate_patch(row, expected_pending, disposition, grant, skip)
-        if patch is None:
-            return False
-        row.update(deepcopy(patch))
-        return True
-
-    tracking.consume_direct_form_gate = consume
-    return {'disposition': 'answer',
-            'expected_gate_generation': row['gate_pending']['generation'],
-            'expected_question_identity': forms.owner_question_identity(
-                row['pk'], row['gate_pending']['form_question'])}
+    _, observed = _read_local_react_select_gender(
+        caption, state=state, reader=PAGE)
+    _, independent = _read_local_react_select_gender(
+        caption, state=state, reader=forms._FIXED_CONTROL_WITNESS)
+    assert observed['combobox'] == independent['combobox']

@@ -160,16 +160,45 @@ def _unproven_final_inventory(page, opaque=0):
     assert page['opaque_count'] == opaque == len(page['opaque_locators'])
     assert page['opaque_controls'] is (opaque > 0)
     assert page['inventory_verified'] is (opaque == 0)
-    with pytest.raises(forms.Gate, match='inventory is incomplete' if opaque else
-                       'Unverified or changed combobox value'):
-        forms.check_form(page, {}, uploaded=True)
+    # Item 2 uses the current staged file-input readback, not an old widget
+    # receipt. Supply that independent synthetic file so these scenarios
+    # exercise incomplete inventory and required choices rather than a
+    # missing attachment unrelated to the selected country.
+    from copy import deepcopy
+    final = deepcopy(page)
+    files = [c for c in final['controls']
+             if c.get('type') == 'file' and re.search(r'resume|résumé|cv',
+                                                     forms.label(c), re.I)]
+    assert len(files) == 1
+    files[0]['files'] = ['Test User Resume.pdf']
+    with pytest.raises(forms.Gate) as error:
+        forms.check_form(final, {}, True, 'Test User Resume.pdf')
     if opaque:
+        assert 'inventory is incomplete' in str(error.value)
         return
-    # Country is bound per field: a visually selected Country with its exact
-    # approved answer still has no proven form value, so Submit refuses it.
-    alone = dict(page, controls=[_control(page, '#country')])
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value: Country'):
-        forms.check_form(alone, {'#country': 'Synthetic Country'}, uploaded=True)
+    assert 'staged résumé was not attached' not in str(error.value)
+    # F7: exactly one local current React-select caption can establish a
+    # form-owned choice despite a blank search input. An old model ledger
+    # alone still cannot repair a missing or ambiguous selected caption.
+    country = deepcopy(_control(final, '#country'))
+    country['required'] = True
+    alone = dict(final, controls=[country, files[0]])
+    if country['combobox'].get('local_selected_proven') is True:
+        assert country['combobox']['selected_text']
+        forms.check_form(alone, {'#country': 'Untrusted model guess'}, True,
+                         'Test User Resume.pdf')
+        unreadable = deepcopy(country)
+        unreadable['combobox'].update(
+            selected_text='', displayed_text='',
+            local_selected_proven=False, selected_caption_unreadable=True)
+        with pytest.raises(forms.Gate, match='required accessible picker'):
+            forms.check_form(dict(final, controls=[unreadable, files[0]]),
+                             {'#country': 'Synthetic Country'}, True,
+                             'Test User Resume.pdf')
+    else:
+        with pytest.raises(forms.Gate, match='required accessible picker'):
+            forms.check_form(alone, {'#country': 'Synthetic Country'}, True,
+                             'Test User Resume.pdf')
 
 
 def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
@@ -183,11 +212,12 @@ def test_settled_country_and_location_use_exact_greenhouse_owner_graphs():
         assert a['type'] == b['type'] == 'combobox'
         assert a['combobox'] == b['combobox']
         assert a['combobox']['options'] == []
-    # The visual div is NOT a browser-owned selected caption. A missing
-    # selected-value property must not be reconstructed from React CSS/DOM.
+    # A single same-field React-select caption is now independently readable,
+    # but it does not fabricate an input or unrelated hidden machine value.
     country = _control(page, '#country')
     assert not country['has_value']
-    assert not country['combobox']['selected_text']
+    assert country['combobox']['selected_text'] == 'Synthetic Country'
+    assert country['combobox']['local_selected_proven'] is True
     assert not country['combobox']['selected_value']
     assert not country['combobox']['hidden_value']
 
@@ -199,12 +229,11 @@ def test_selected_country_without_placeholder_is_main_failing_regression():
     for source in (page, witness):
         country = _control(source, '#country')
         location = _control(source, '#location')
-        # A visually selected ID-less node and a retained named machine input
-        # are different kinds of evidence. Neither can authorize Country.
-        # ID-less visual branches need not expose a name property at all.
-        # Absence is NOT an authorization to attribute a sibling receiver.
+        # The local selected caption is readable despite an empty, nameless
+        # input; a sibling hidden machine receiver still cannot be borrowed.
         assert not country.get('name')
-        assert country['combobox']['selected_text'] == ''
+        assert country['combobox']['selected_text'] == 'Synthetic Country'
+        assert country['combobox']['local_selected_proven'] is True
         assert country['combobox']['hidden_selector'] == ''
         assert location['type'] == 'combobox'
         assert location['combobox']['hidden_selector'] == ''
@@ -250,7 +279,7 @@ def test_retained_country_placeholder_c2_remains_classifiable():
     country = _control(page, '#country')
     assert country['type'] == 'combobox'
     assert not country['combobox'].get('selected_value')
-    assert not country['combobox'].get('selected_text')
+    assert country['combobox']['selected_text'] == 'Synthetic Country'
 
 
 def test_intact_country_subtree_outside_phone_fieldset_never_downgrades_to_generic_c2():

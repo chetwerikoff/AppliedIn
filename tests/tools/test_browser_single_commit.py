@@ -125,9 +125,9 @@ async def _setup(monkeypatch, page, controller):
 
 
 @pytest.mark.asyncio
-async def test_preprivate_js_apply_on_code_owned_ats_host_is_preparation(monkeypatch):
-    """ARCH01:58: before disclosure, ordinary JS Apply is reversible preparation."""
-    target = _control()
+async def test_ordinary_continue_on_code_owned_ats_host_is_preparation(monkeypatch):
+    """A Next/Continue click is ungated regardless of prior disclosure."""
+    target = _control(label="Continue")
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": [target]}, controller)
@@ -137,10 +137,10 @@ async def test_preprivate_js_apply_on_code_owned_ats_host_is_preparation(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("private,explicit_submit", [(True, False), (False, True)])
-async def test_commit_candidate_calls_same_final_guard_before_cli(
+@pytest.mark.parametrize("private,explicit_submit", [(True, False), (False, True), (True, True)])
+async def test_only_classified_submit_calls_final_guard_before_cli(
         monkeypatch, private, explicit_submit):
-    """r06: a private JS continuation or known native Submit cannot bypass hold."""
+    """Private form data never turns ordinary Continue into a per-step gate."""
     target = _control(private=private, label="Submit application" if explicit_submit else "Continue",
                       kind="submit" if explicit_submit else "button",
                       submit=explicit_submit)
@@ -152,15 +152,23 @@ async def test_commit_candidate_calls_same_final_guard_before_cli(
     page = {"url": "https://jobs.ashbyhq.com/example-co/synthetic",
             "controls": controls}
     controller = _controller()
+    checked = []
 
     async def refuse(_session, _page, _target):
-        raise forms.Gate("synthetic final guard refused")
+        checked.append("final")
+        raise forms.PreSubmitGate(1, "synthetic final refusal")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", refuse)
     session, calls = await _setup(monkeypatch, page, controller)
-    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
+    if explicit_submit:
+        with pytest.raises(forms.PreSubmitGate, match="synthetic final refusal"):
+            await session.application_effect("click", "#next")
+        assert calls == [] and checked == ["final"]
+    else:
         await session.application_effect("click", "#next")
-    assert calls == []
+        assert len(calls) == 1 and calls[0][0][:2] == ("click", "#next")
+        assert checked == []
+    assert controller.committed is False
 
 
 @pytest.mark.asyncio
@@ -230,7 +238,7 @@ async def test_interrupted_upload_never_creates_completion_from_unchanged_bytes(
     assert len(calls) == 1
     assert controller.upload_pending is False
     assert controller.upload_completed is False
-    with pytest.raises(forms.Gate, match="already attempted"):
+    with pytest.raises(forms.Gate, match="Only the staged row PDF may be uploaded once"):
         await session.application_effect(
             "upload", "#resume", "--file", str(path), timeout=130)
     assert len(calls) == 1
@@ -267,21 +275,17 @@ async def test_postprivate_approved_selection_and_pdf_upload_are_preparation(
         {"selector": "#resume", "type": "file", "tag": "input",
          "label": "Resume", "disabled": False, "files": []},
     ]}
-    accepted_values = []
-    monkeypatch.setattr(controller, "_approved",
-                        lambda _page, _target, value: accepted_values.append(value))
     identity = ("row-bound", controller.expected_digest)
     monkeypatch.setattr(controller, "_row_pdf", lambda: identity)
 
     async def no_early_submit(*_args):
-        pytest.fail("The full final guard must not run for an approved change/upload")
+        pytest.fail("The final Submit check must not run for ordinary select/upload")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", no_early_submit)
+    monkeypatch.setattr(controller, "check_pre_submit", no_early_submit)
     session, calls = await _setup(monkeypatch, page, controller)
     await session.application_effect("select", "#location", "--value", "remote")
     await session.application_effect("upload", "#resume", "--file",
                                      str(pdf), timeout=130)
-    assert accepted_values == ["Remote"]
     assert [c[0][0] for c in calls] == ["select", "upload"]
     assert controller.upload_completed is True
 
@@ -313,36 +317,6 @@ def test_generic_assent_scope_has_no_ats_or_widget_exception(question, expected)
     """ARCH21:26: only narrow standard privacy acknowledgement is delegated."""
     assert forms._assent_scope(_assent_target(question)) == expected
 
-
-def test_standard_privacy_acknowledgement_uses_standing_delegation(monkeypatch):
-    """No per-control yes grant; still require the real form receiver."""
-    pk = "example-co#synthetic"
-    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: {
-        "pk": pk, "status": "submitting", "human_approved_answers": {},
-    })
-    question = "I acknowledge processing of personal data for this application"
-    target = _assent_target(question)
-    page = {"url": "https://example.test/application", "controls": [target]}
-    assert forms._approved_native_choice(page, target, pk) == ("yes", target)
-    forms.exact_approval(pk, question, "yes", target=target, url=page["url"])
-    for bad in (_assent_target(question, value=""),
-                _assent_target(question, in_form=False)):
-        with pytest.raises(forms.Gate, match="verified form receiver"):
-            forms.exact_approval(pk, question, "yes", target=bad, url=page["url"])
-
-
-def test_beyond_standard_privacy_has_no_implicit_grant(monkeypatch):
-    pk = "example-co#synthetic"
-    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: {
-        "pk": pk, "status": "submitting", "human_approved_answers": {},
-    })
-    question = "I consent to processing personal data for recruitment and marketing"
-    target = _assent_target(question)
-    page = {"url": "https://example.test/application", "controls": [target]}
-    with pytest.raises(forms.Gate, match="owner decision"):
-        forms._approved_native_choice(page, target, pk)
-    with pytest.raises(forms.Gate, match="human-approved answer"):
-        forms.exact_approval(pk, question, "yes", target=target, url=page["url"])
 
 
 @pytest.mark.parametrize("question,expected", [
@@ -404,8 +378,9 @@ async def test_one_final_guard_rejects_independent_contradictory_job_id(
     monkeypatch.setattr(forms, "hold_possible_submission", forbid_hold)
     final_page = {"url": "https://jobs.ashbyhq.com/example-co/" + bad
                   + "/application", "title": "Synthetic Role"}
-    with pytest.raises(forms.Gate, match="contradictory job ID"):
-        await controller.authorize_final_submit(None, final_page, {})
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, final_page, {})
+    assert error.value.item == 1
 
 
 @pytest.mark.asyncio
@@ -421,7 +396,7 @@ async def test_raw_application_get_commit_bypass_refuses_before_cli(monkeypatch,
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": []}, controller)
-    with pytest.raises(forms.Gate, match="committing GET navigation"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect("navigate", href)
     assert calls == []
 
@@ -446,68 +421,55 @@ async def test_code_issued_form_get_mismatched_tracked_job_refuses(monkeypatch):
     controller = _controller()
     session, calls = await _setup(
         monkeypatch, {"url": controller.url, "controls": []}, controller)
-    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET navigation"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect(
             "navigate", "https://jobs.ashbyhq.com/example-co/job/application")
     assert calls == []
 
 
-@pytest.mark.parametrize("checked,form_value,approved,valid", [
-    (True, "on", "yes", True),
-    (False, "on", "yes", False),
-    (True, "", "yes", False),
-    (True, "on", "no", False),
-    (True, "other", "yes", False),
-])
-def test_final_standard_acknowledgement_checks_display_and_form_receiver(
-        checked, form_value, approved, valid):
-    """r06 accepted privacy delegation: no separate owner yes, no unchecked send."""
+@pytest.mark.parametrize("checked", [True, False])
+def test_current_required_acknowledgement_is_checked_before_submit(checked):
+    """Final form readback checks current state, not former approval receipts."""
     target = _assent_target(
         "I acknowledge processing of personal data for this application")
     target["checked"] = checked
-    target["value"] = form_value
-    target["in_form"] = True
     pdf = {"selector": "#pdf", "tag": "input", "type": "file",
            "label": "Resume", "files": ["Test User Resume.pdf"],
            "has_value": True}
-    page = {"url": "https://example.test/application", "inventory_verified": True,
-            "controls": [target, pdf]}
-    filled = {"#agree": "on"}
-    receipts = [{"action": "choose", "selector": "#agree",
-                 "approved_value": approved}]
-    if valid:
-        forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+    page = {"url": "https://example.test/application",
+            "inventory_verified": True, "controls": [target, pdf]}
+    if checked:
+        forms.check_form(page, {}, True, "Test User Resume.pdf")
     else:
-        with pytest.raises(forms.Gate):
-            forms.check_form(page, filled, True, "Test User Resume.pdf", receipts)
+        with pytest.raises(forms.Gate, match="required native choice"):
+            forms.check_form(page, {}, True, "Test User Resume.pdf")
 
 
-@pytest.mark.parametrize("approved,actual,valid", [
-    ("Remote", "remote", True),
-    ("On-site", "remote", False),
-    ("Remote", "unexpected", False),
+@pytest.mark.parametrize("stated,valid", [
+    ("remote", True),
+    ("office", True),
+    ("", False),
 ])
-def test_native_select_receives_exact_option_value_and_approved_caption(
-        approved, actual, valid):
-    """ARCH01:58: native select's opaque submitted value maps to approved text."""
+def test_native_select_required_final_readback_is_not_a_writer_grant(stated, valid):
+    """The final page value matters; an old approval receipt is not authority."""
     target = {"selector": "#location", "tag": "select", "type": "select",
               "label": "Work location", "required": True, "disabled": False,
-              "value": actual, "has_value": True,
+              "value": stated, "has_value": bool(stated),
               "options": [{"label": "Remote", "value": "remote"},
                           {"label": "On-site", "value": "office"}]}
     pdf = {"selector": "#pdf", "tag": "input", "type": "file",
            "label": "Resume", "files": ["Test User Resume.pdf"]}
     page = {"url": "https://example.test/application",
             "inventory_verified": True, "controls": [target, pdf]}
-    receipts = [{"selector": "#location", "action": "select",
-                 "approved_value": approved}]
+    stale_receipt = [{"selector": "#location", "action": "select",
+                      "approved_value": "Other"}]
     if valid:
-        forms.check_form(page, {"#location": "remote"}, True,
-                         "Test User Resume.pdf", receipts)
+        forms.check_form(page, {"#location": "incorrect"}, True,
+                         "Test User Resume.pdf", stale_receipt)
     else:
-        with pytest.raises(forms.Gate):
+        with pytest.raises(forms.Gate, match="required application field"):
             forms.check_form(page, {"#location": "remote"}, True,
-                             "Test User Resume.pdf", receipts)
+                             "Test User Resume.pdf", stale_receipt)
 
 
 @pytest.mark.asyncio
@@ -556,7 +518,7 @@ async def test_submission_marked_choice_uses_one_final_guard_before_ipc(
         checked.append(kind)
         raise forms.Gate("synthetic final guard refused")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", refuse)
     with pytest.raises(forms.Gate, match="synthetic final guard refused"):
         await session.application_effect("click", "#next")
     assert checked == [kind]
@@ -565,9 +527,9 @@ async def test_submission_marked_choice_uses_one_final_guard_before_ipc(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["upload", "select", "fill"])
-async def test_submit_marked_preparation_receivers_refuse_before_cli(
+async def test_preparation_uses_raw_ipc_without_widget_submit_gate(
         monkeypatch, tmp_path, operation):
-    """A known committing receiver is not ordinary form data transmission."""
+    """Only a committing click triggers the final check; ordinary writes run."""
     pdf = tmp_path / "synthetic-row.pdf"
     pdf.write_bytes(b"%PDF-1.4\\nsynthetic payload\\n")
     controller = _controller(resume_path=str(pdf))
@@ -577,15 +539,24 @@ async def test_submit_marked_preparation_receivers_refuse_before_cli(
     target["submit"] = True
     if operation == "select":
         target.update(tag="select", options=[{"value": "remote", "label": "Remote"}])
+    if operation == "upload":
+        monkeypatch.setattr(controller, "_row_pdf", lambda: ("synthetic-pdf",))
     page = {"url": controller.url, "controls": [target]}
     session, calls = await _setup(monkeypatch, page, controller)
     args = (("upload", "#next", "--file", str(pdf)) if operation == "upload"
             else ("select", "#next", "--value", "remote") if operation == "select"
             else ("fill", "#next", "--value", "Remote"))
-    with pytest.raises(forms.Gate, match="submission-capable"):
-        await session.application_effect(
-            *args, **({"timeout": 130} if operation == "upload" else {}))
-    assert calls == []
+
+    async def no_final(*_args):
+        pytest.fail("Preparation must not perform a final Submit check")
+
+    monkeypatch.setattr(controller, "check_pre_submit", no_final)
+    await session.application_effect(
+        *args, **({"timeout": 130} if operation == "upload" else {}))
+    assert [c[0][0] for c in calls] == [operation]
+    assert controller.committed is False
+    if operation == "upload":
+        assert controller.upload_completed is True
 
 
 def test_canonical_ats_posting_authority_is_not_board_pin_authority(monkeypatch):
@@ -666,32 +637,33 @@ async def test_formless_resume_set_producer_admits_only_its_own_exact_set(
 
     monkeypatch.setattr(bsk, "command", fake_command)
     other = forms._resume_file_set_script(pdf.name, b"%PDF-1.4 other bytes")
-    with pytest.raises(forms.Gate, match="executable or effectful IPC is forbidden"):
+    with pytest.raises(forms.Gate, match="Executable or unsupported raw application IPC"):
         await session.application_effect("evaluate", other)
-    with pytest.raises(forms.Gate, match="exact protected PDF file input"):
+    with pytest.raises(forms.Gate, match="Only the staged row PDF"):
         await session.application_effect(
-            "upload", "#dropzone", "--file", str(pdf), timeout=130)
-    with pytest.raises(forms.Gate):
-        await session.application_effect("click", "#dropzone")
+            "upload", "#dropzone", "--file", str(pdf) + ".other", timeout=130)
+    # An ordinary dropzone click is ungated preparation; it is not evidence
+    # that the staged file was attached. Do not test an obsolete click grant.
     assert calls == [] and not controller.upload_attempted
     script = forms._resume_file_set_script(pdf.name, pdf.read_bytes())
     await session.application_effect("evaluate", script)
     assert [entry[0][:2] for entry in calls] == [("evaluate", script)]
     assert controller.upload_completed is True
     assert controller.upload_identity == identity
-    with pytest.raises(forms.Gate, match="already attempted"):
+    with pytest.raises(forms.Gate, match="already uploaded"):
         await session.application_effect("evaluate", script)
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize(("required", "value", "has_value", "receipt", "reason"), [
-    (True, "", True, {"#answer": "Approved answer"}, "Required field is empty"),
-    (False, "Unapproved injected value", False, {}, "readback disagree"),
-    (False, "", True, {}, "readback disagree"),
+@pytest.mark.parametrize("required,value,has_value,valid", [
+    (True, "", True, False),
+    (True, "Selected", False, True),
+    (False, "", True, True),
+    (False, "Optional response", False, True),
 ])
-def test_final_native_form_readback_disagreement_denies_submit(
-        required, value, has_value, receipt, reason):
-    """The actual form-own native value, not a has_value flag, is authoritative."""
+def test_final_native_form_uses_required_current_value_not_writer_receipt(
+        required, value, has_value, valid):
+    """Fresh current value and matching staged PDF are authoritative."""
     page = {
         "url": "https://example-co.test/job/1",
         "inventory_verified": True, "truncated": False,
@@ -703,13 +675,22 @@ def test_final_native_form_readback_disagreement_denies_submit(
             "form_action": "https://example-co.test/job/1",
             "label": "Synthetic answer", "required": required,
             "value": value, "has_value": has_value,
+        }, {
+            "selector": "#resume", "tag": "input", "type": "file",
+            "label": "Resume", "files": ["Test User Resume.pdf"],
+            "in_form": True, "form_selector": "#application",
         }],
     }
-    with pytest.raises(forms.Gate, match=reason):
-        forms.check_form(page, receipt, uploaded=True)
+    if valid:
+        forms.check_form(page, {"#answer": "stale writer receipt"}, True,
+                         "Test User Resume.pdf")
+    else:
+        with pytest.raises(forms.Gate, match="required application field"):
+            forms.check_form(page, {"#answer": "stale writer receipt"}, True,
+                             "Test User Resume.pdf")
 
 
-def test_final_optional_native_value_requires_current_exact_readback():
+def test_optional_native_value_needs_no_historical_writer_grant():
     page = {
         "url": "https://example-co.test/job/1",
         "inventory_verified": True, "truncated": False,
@@ -719,14 +700,17 @@ def test_final_optional_native_value_requires_current_exact_readback():
             "selector": "#answer", "tag": "input", "type": "text",
             "in_form": True, "form_selector": "#application",
             "form_action": "https://example-co.test/job/1",
-            "label": "Synthetic answer", "required": False,
-            "value": "Approved answer", "has_value": True,
+            "label": "Synthetic optional answer", "required": False,
+            "value": "Current response", "has_value": True,
+        }, {
+            "selector": "#resume", "tag": "input", "type": "file",
+            "label": "Resume", "files": ["Test User Resume.pdf"],
+            "in_form": True, "form_selector": "#application",
         }],
     }
-    forms.check_form(page, {"#answer": "Approved answer"}, uploaded=True)
-    with pytest.raises(forms.Gate, match="Unverified or changed form value"):
-        forms.check_form(page, {}, uploaded=True)
-
+    forms.check_form(page, {}, True, "Test User Resume.pdf")
+    forms.check_form(page, {"#answer": "different old answer"}, True,
+                     "Test User Resume.pdf")
 
 @pytest.mark.parametrize("status,gate_reason", [
     ("applied_manual", ""),
@@ -810,51 +794,9 @@ def test_manual_confirmation_during_hold_does_not_reach_click(monkeypatch):
     assert client.get(f"submit_hold:{pk}") is None
 
 
-def test_distinct_native_forms_never_share_approval_ownership(monkeypatch):
-    """Other form purposes cannot block a safe write or steal its exact grant."""
-    url = "https://example-co.test/job/1"
-
-    def control(selector, owner):
-        return {
-            "selector": selector, "label": "Email",
-            "question": "Contact details", "tag": "input",
-            "type": "email", "in_form": True, "form_selector": owner,
-            "form_action": url, "formaction": "", "disabled": False,
-            "value": "", "has_value": False, "required": True,
-        }
-
-    main = control("#main-email", "#application")
-    unrelated = control("#other-email", "#other-form")
-    page = {"url": url, "controls": [unrelated, main]}
-    assert forms._form_subject(page, main) == [main]
-    assert forms._approval_question_collisions(page, main) == []
-    assert forms._key(page, main) == "Contact details"
-
-    pk, answer = "example-co#synthetic", "test@example-co.test"
-    grant = {key: main[key] for key in (
-        "selector", "label", "question", "tag", "type",
-        "form_selector", "form_action")}
-    grant.update(url=url, value=answer)
-    row = {"pk": pk, "status": "submitting",
-           "possible_submission": False,
-           "human_approved_answers": {"Contact details": grant}}
-    monkeypatch.setattr(forms, "_row", lambda _pk: row)
-
-    forms.exact_approval(pk, "Contact details", answer, target=main, url=url)
-    with pytest.raises(forms.Gate, match="exact human-approved answer"):
-        forms.exact_approval(
-            pk, "Contact details", answer, target=unrelated, url=url)
-
-    # Two real competing answers in the SAME form are still ambiguous.
-    same_form = control("#second-email", "#application")
-    both = {"url": url, "controls": [main, same_form]}
-    with pytest.raises(forms.Gate, match="same approval question"):
-        forms._key(both, main)
-
-
 @pytest.mark.asyncio
 async def test_native_choice_with_inline_requestsubmit_never_bypasses_final_guard(monkeypatch):
-    """A granted native checkbox's onclick requestSubmit is a commit, not autosave."""
+    """Inline page-owned JS is residual risk, not a pre-action approval gate."""
     target = _control(label="I agree", kind="checkbox", submit=False)
     target.update(tag="input", required=True, checked=False, value="on",
                   question="I acknowledge application data processing",
@@ -864,16 +806,15 @@ async def test_native_choice_with_inline_requestsubmit_never_bypasses_final_guar
         monkeypatch, {"url": controller.url, "controls": [target]}, controller)
     final_calls, marked = [], []
 
-    async def refuse(_session, _page, _target):
-        final_calls.append("same final guard")
-        raise forms.Gate("synthetic final guard refused")
+    async def final(*_args):
+        final_calls.append("unexpected early final check")
+        raise forms.PreSubmitGate(1, "must not run for ordinary choice")
 
-    monkeypatch.setattr(controller, "authorize_final_submit", refuse)
+    monkeypatch.setattr(controller, "check_pre_submit", final)
     controller.mark_click_started = lambda: marked.append("possible submission")
-    with pytest.raises(forms.Gate, match="synthetic final guard refused"):
-        await session.application_effect("click", "#next")
-    assert final_calls == ["same final guard"]
-    assert marked == [] and calls == []
+    await session.application_effect("click", "#next")
+    assert final_calls == []
+    assert marked == [] and [c[0][:2] for c in calls] == [("click", "#next")]
     assert controller.committed is False
 
 
@@ -901,7 +842,7 @@ def test_native_final_form_refuses_extra_file_attachments(files, second_file, va
     if valid:
         forms.check_form(page, {}, uploaded=True, attachment="Tailored.pdf")
     else:
-        with pytest.raises(forms.Gate, match="résumé attachment|exact staged résumé"):
+        with pytest.raises(forms.Gate, match="Exactly one current résumé input"):
             forms.check_form(page, {}, uploaded=True, attachment="Tailored.pdf")
 
 
@@ -996,7 +937,7 @@ async def test_verified_vendor_redirect_preserves_exact_raw_session_route(monkey
     session.bind_application_controller(controller)
     await session.application_effect("navigate", target)
     assert len(effects) == 1 and effects[0][:2] == ("navigate", target)
-    with pytest.raises(forms.Gate, match="Unknown, executable or committing GET"):
+    with pytest.raises(forms.Gate, match="Navigation outside the tracked application route"):
         await session.application_effect("navigate", foreign)
     assert len(effects) == 1
     row["job_id"] = "different-job"
@@ -1032,7 +973,7 @@ def test_native_submit_role_does_not_mask_trusted_reader_html_type(role, reader)
 async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeypatch, role):
     """A native committing input cannot become an approved reversible choice."""
     target = _control(label='Continue', kind=role, submit=False)
-    target.update(tag='input', native_type='submit',
+    target.update(tag='input', native_type='submit', submit=True,
                   native_form_owner_selector='#app')
     controller = _controller()
     session, calls = await _setup(
@@ -1043,7 +984,7 @@ async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeyp
         visited.append('single final guard')
         raise forms.Gate('synthetic final guard refused')
 
-    monkeypatch.setattr(controller, 'authorize_final_submit', refuse)
+    monkeypatch.setattr(controller, 'check_pre_submit', refuse)
     with pytest.raises(forms.Gate, match='synthetic final guard refused'):
         await session.application_effect('click', '#next')
     assert visited == ['single final guard']
@@ -1051,13 +992,13 @@ async def test_native_submit_input_masked_as_aria_role_never_reaches_cli(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('identity','expected'), [
-    ({'job_ids': ['other-job'], 'employers': []}, 'contradictory visible job ID'),
-    ({'job_ids': [], 'employers': ['foreign-co']}, 'contradictory visible employer'),
-    ({'job_ids': [], 'employers': []}, 'protected tailored PDF'),
+@pytest.mark.parametrize(('identity','expected_item'), [
+    ({'job_ids': ['other-job'], 'employers': []}, 1),
+    ({'job_ids': [], 'employers': ['foreign-co']}, 1),
+    ({'job_ids': [], 'employers': []}, 2),
 ])
 async def test_visible_application_identity_is_scoped_at_only_final_ipc(
-        monkeypatch, identity, expected):
+        monkeypatch, identity, expected_item):
     """Identical title is insufficient for a labelled foreign root identity.
 
     A foreign ID in unrelated page prose or a different form is not authority.
@@ -1090,8 +1031,9 @@ async def test_visible_application_identity_is_scoped_at_only_final_ipc(
         ],
     }
     session, calls = await _setup(monkeypatch, page, controller)
-    with pytest.raises(forms.Gate, match=expected):
+    with pytest.raises(forms.PreSubmitGate) as error:
         await session.application_effect('click', '#submit')
+    assert error.value.item == expected_item
     assert calls == []
     assert controller.committed is False
 
@@ -1125,436 +1067,3 @@ def test_both_raw_readers_scope_labelled_identity_to_application_root(reader, vi
     assert scoped_identity_conflict(page, '#application-form',
                                     'synthetic-job-42', 'example-co') == expected
 
-
-# Issue #223: a standard application-processing privacy acknowledgement rendered
-# as a closed input/combobox. The owner had already approved the exact option,
-# yet the run asked again. Bootstrap accepted the grant against the opened and
-# Escape-closed listbox, while the required-owner gate re-read the reclosed
-# picker, found no options to compare and treated the grant as missing.
-PRIVACY_URL = "http://127.0.0.1/fixture/example-co/jobs/1"
-PRIVACY_PK = "example-co#1"
-PRIVACY_QUESTION = ("I acknowledge the processing of my personal data "
-                    "for this application")
-PRIVACY_OPTIONS = [
-    {"selector": "#privacy-agree", "unique": True, "label": "I agree",
-     "value": "ACK", "selected": False, "safe": True},
-    {"selector": "#privacy-decline", "unique": True, "label": "I do not agree",
-     "value": "NOACK", "selected": False, "safe": True},
-]
-
-
-def _privacy_combobox(*, options=None, linked=True, caption="", value=""):
-    return {
-        "selector": "#privacy", "label": "Privacy notice",
-        "question": PRIVACY_QUESTION, "tag": "input", "type": "combobox",
-        "required": True, "disabled": False, "value": caption,
-        "has_value": bool(caption), "in_form": True,
-        "form_selector": "#application", "form_action": PRIVACY_URL,
-        "formaction": "", "submit": False, "checked": False, "name": "privacy",
-        "options": [], "combobox": {
-            "linked": linked, "link_id": "privacy-list" if linked else "",
-            "listbox_selector": "#privacy-list" if linked else "",
-            "options": __import__("copy").deepcopy(
-                PRIVACY_OPTIONS if options is None else options) if linked else [],
-            "selected_text": caption, "displayed_text": caption,
-            "selected_value": value, "hidden_selector": "#privacy-code",
-            "hidden_value": value,
-        },
-    }
-
-
-def _privacy_page(target):
-    hidden = (target["combobox"] or {}).get("hidden_value", "")
-    submit = {"selector": "#submit", "label": "Submit application",
-              "question": "", "tag": "button", "type": "submit",
-              "required": False, "disabled": False, "in_form": True,
-              "form_selector": "#application", "form_action": PRIVACY_URL,
-              "native_form_owner_selector": "#application", "formaction": "",
-              "submit": True, "checked": False, "name": "", "value": "",
-              "has_value": False, "options": [], "combobox": None}
-    receiver = {"selector": "#privacy-code", "label": "Response code",
-                "question": "", "tag": "input", "type": "hidden",
-                "required": False, "disabled": False, "value": hidden,
-                "has_value": bool(hidden), "in_form": True,
-                "form_selector": "#application", "form_action": PRIVACY_URL,
-                "formaction": "", "submit": False, "checked": False,
-                "name": "response_code", "options": []}
-    return {"url": PRIVACY_URL, "text": "Synthetic form",
-            "controls": [target, submit] + ([receiver] if target["combobox"] else []),
-            "inventory_verified": True, "truncated": False,
-            "opaque_controls": False, "shadow_roots": False,
-            "unsupported_frames": []}
-
-
-def _privacy_witness(current):
-    return {"url": current["url"], "controls": [
-        {"selector": c["selector"], "unique": True, "unique_form": True,
-         "tag": c["tag"], "type": c["type"], "in_form": c["in_form"],
-         "form_selector": c["form_selector"], "form_action": c["form_action"],
-         "native_form_owner_selector": c.get("native_form_owner_selector"),
-         "formaction": c["formaction"], "disabled": c["disabled"],
-         "readonly": False, "inert": False, "visible": True, "visible_text": "",
-         "options": __import__("copy").deepcopy(c["options"]),
-         "combobox": __import__("copy").deepcopy(c.get("combobox"))}
-        for c in current["controls"]]}
-
-
-def _privacy_grant(value="I agree", options=None):
-    options = PRIVACY_OPTIONS if options is None else options
-    return {"value": value, "selector": "#privacy", "url": PRIVACY_URL,
-            "label": "Privacy notice", "question": PRIVACY_QUESTION,
-            "tag": "input", "type": "combobox",
-            "form_selector": "#application", "form_action": PRIVACY_URL,
-            "options": [{k: o[k] for k in ("selector", "label", "value")}
-                        for o in options]}
-
-
-class _PrivacyPicker:
-    """Closed picker: click opens the exclusive listbox, Escape closes it,
-    and the affirmative option commits caption plus hidden machine value."""
-
-    def __init__(self, options=None, *, initial=None):
-        from copy import deepcopy
-        self.options = PRIVACY_OPTIONS if options is None else options
-        self.closed = _privacy_page(_privacy_combobox(linked=False))
-        self.opened = _privacy_page(_privacy_combobox(options=self.options))
-        self.current = deepcopy(initial or self.closed)
-        self.calls = []
-        self.controller = forms.ApplicationIPCController(
-            PRIVACY_PK, "example-co", PRIVACY_URL, "", {}, {}, [], {},
-            lambda: None)
-
-        async def raw_page(_session):
-            return await self.page()
-        self.controller._page = raw_page
-        self.controller._fresh_preparation = lambda _origin: None
-        self._application_controller = self.controller
-
-    async def page(self):
-        from copy import deepcopy
-        return deepcopy(self.current)
-
-    async def application_effect(self, *args):
-        await self.controller.before_ipc(self, args, {})
-        try:
-            result = await self.call(*args)
-        except Exception:
-            await self.controller.after_ipc(self, args, {}, succeeded=False)
-            raise
-        await self.controller.after_ipc(self, args, {}, succeeded=True)
-        return result
-
-    async def call(self, *args):
-        from copy import deepcopy
-        self.calls.append(args)
-        if args == ("evaluate", forms._FIXED_CONTROL_WITNESS):
-            return {"value": _privacy_witness(self.current)}
-        if args == ("click", "#privacy"):
-            self.current = deepcopy(self.opened)
-            return {}
-        if args == ("press", "Escape"):
-            self.current = deepcopy(self.closed)
-            return {}
-        if args[:2] == ("fill", "#privacy"):
-            return {}
-        if args[:3] == ("select", "#privacy", "--value"):
-            self.current = _privacy_page(_privacy_select(args[3]))
-            return {}
-        chosen = [o for o in self.options
-                  if args == ("click", o["selector"])]
-        if chosen:
-            self.current = _privacy_page(_privacy_combobox(
-                linked=False, caption=chosen[0]["label"],
-                value=chosen[0]["value"]))
-            return {}
-        pytest.fail(f"Unexpected browser IPC: {args}")
-
-
-def _privacy_row(monkeypatch, grants):
-    row = {"pk": PRIVACY_PK, "status": "submitting",
-           "human_approved_answers": grants}
-    monkeypatch.setattr(forms, "_row", lambda _pk, **_kw: row)
-    return row
-
-
-@pytest.mark.asyncio
-async def test_granted_closed_privacy_combobox_is_not_asked_again(monkeypatch):
-    """AC1: closed -> witnessed open -> Escape -> exact grant -> guarded choice."""
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
-    session = _PrivacyPicker()
-    closed = await session.page()
-    assert forms._assent_scope(closed["controls"][0]) == "standard_privacy"
-    assert forms._closed_material_combobox(closed["controls"][0])
-    await forms._bootstrap(session, closed, PRIVACY_PK, {}, PRIVACY_URL)
-    assert [c for c in session.calls if c[0] != "evaluate"] == [
-        ("click", "#privacy"), ("press", "Escape")]
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is None
-    filled = {}
-    receipt = await forms.execute(
-        session, await session.page(),
-        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
-        facts={}, filled=filled, resume_path="", company="example-co",
-        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
-    assert ("click", "#privacy-agree") in session.calls
-    assert ("click", "#privacy-decline") not in session.calls
-    assert not any(c[:2] == ("click", "#submit") for c in session.calls)
-    assert receipt["committed_caption"] == "I agree"
-    assert receipt["committed_value"] == "ACK"
-    assert receipt["hidden_selector"] == "#privacy-code"
-    assert filled == {"#privacy": "I agree"}
-
-
-def _privacy_select(value=""):
-    options = [{"label": "Choose", "value": ""},
-               {"label": "I agree", "value": "ACK"},
-               {"label": "I do not agree", "value": "NOACK"}]
-    return {**_privacy_combobox(), "tag": "select", "type": "select",
-            "value": value, "has_value": bool(value), "options": options,
-            "combobox": None}
-
-
-def _post_action_page(caption="I agree", selected="ACK", hidden="ACK"):
-    """A separately simulated fresh PAGE after the option click. Its fields are
-    test data for the unchanged readback guards, not evidence of live reader
-    output."""
-    page = _privacy_page(_privacy_combobox(
-        linked=False, caption=caption, value=selected))
-    page["controls"][2].update(value=hidden, has_value=bool(hidden))
-    return page
-
-
-@pytest.mark.asyncio
-async def test_granted_privacy_combobox_receipt_is_not_value_proof(monkeypatch):
-    """AC5: receipt and intent first, then fresh PAGE through final readback."""
-    row = _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
-    session = _PrivacyPicker()
-    filled = {}
-    receipt = await forms.execute(
-        session, await session.page(),
-        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
-        facts={}, filled=filled, resume_path="", company="example-co",
-        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
-    assert receipt["selected_option"] == {
-        "selector": "#privacy-agree", "label": "I agree", "value": "ACK"}
-    assert receipt["hidden_value"] == "ACK"
-    assert receipt["hidden_name"] == "response_code"
-
-    fresh = _post_action_page()
-    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
-    forms.check_form(fresh, filled, True, receipts=[receipt])
-
-    for bad in (_post_action_page(caption="I do not agree"),
-                _post_action_page(selected="NOACK"),
-                _post_action_page(hidden="NOACK"),
-                _post_action_page(hidden="")):
-        with pytest.raises(forms.Gate):
-            forms.check_approvals(PRIVACY_PK, [receipt], bad)
-            forms.check_form(bad, filled, True, receipts=[receipt])
-    absent = _post_action_page()
-    del absent["controls"][2]
-    foreign = _post_action_page()
-    foreign["controls"][2].update(form_selector="#other-form",
-                                  form_action=PRIVACY_URL + "/other")
-    renamed = _post_action_page()
-    renamed["controls"][2]["name"] = "marketing_opt_in"
-    with pytest.raises(forms.Gate, match="receiver name changed"):
-        forms.check_approvals(PRIVACY_PK, [receipt], renamed)
-    for bad in (absent, foreign):
-        with pytest.raises(forms.Gate):
-            forms.check_approvals(PRIVACY_PK, [receipt], bad)
-            forms.check_form(bad, filled, True, receipts=[receipt])
-    row["human_approved_answers"][PRIVACY_QUESTION]["value"] = "I do not agree"
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PRIVACY_PK, [receipt], fresh)
-
-
-@pytest.mark.asyncio
-async def test_granted_prelinked_privacy_combobox_needs_no_open(monkeypatch):
-    """AC1: a picker already exposing its exclusive listbox is not asked again."""
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
-    session = _PrivacyPicker()
-    session.current = session.opened
-    assert await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
-    filled = {}
-    receipt = await forms.execute(
-        session, await session.page(),
-        {"action": "combobox", "selector": "#privacy", "fact": PRIVACY_QUESTION},
-        facts={}, filled=filled, resume_path="", company="example-co",
-        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
-    assert [c for c in session.calls if c[0] != "evaluate"] == [
-        ("click", "#privacy-agree")]
-    assert (receipt["committed_caption"], receipt["committed_value"]) == (
-        "I agree", "ACK")
-    fresh = _post_action_page()
-    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
-    forms.check_form(fresh, filled, True, receipts=[receipt])
-
-
-@pytest.mark.asyncio
-async def test_granted_native_privacy_select_maps_caption_to_value(monkeypatch):
-    """AC1: the native select writes the option's own machine value."""
-    target = _privacy_select()
-    grant = {**_privacy_grant(), "tag": "select", "type": "select",
-             "options": target["options"]}
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: grant})
-    session = _PrivacyPicker(initial=_privacy_page(target))
-    assert await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL) is None
-    filled = {}
-    receipt = await forms.execute(
-        session, await session.page(),
-        {"action": "select", "selector": "#privacy", "fact": PRIVACY_QUESTION,
-         "value": "ACK"},
-        facts={}, filled=filled, resume_path="", company="example-co",
-        jd_text="", resume_tex="", github="", pk=PRIVACY_PK, job_url=PRIVACY_URL)
-    assert ("select", "#privacy", "--value", "ACK") in session.calls
-    assert receipt["action"] == "select"
-    fresh = _privacy_page(_privacy_select("ACK"))
-    forms.check_approvals(PRIVACY_PK, [receipt], fresh)
-    forms.check_form(fresh, filled, True, receipts=[receipt])
-    with pytest.raises(forms.Gate):
-        forms.check_form(_privacy_page(_privacy_select("NOACK")), filled, True,
-                         receipts=[receipt])
-
-
-AFFIRMATIVE_AND_NEGATIVE = [
-    {"selector": "#privacy-agree", "unique": True, "label": "I agree",
-     "value": "ACK", "selected": False, "safe": True},
-    {"selector": "#privacy-decline", "unique": True, "label": "Disagree",
-     "value": "NOACK", "selected": False, "safe": True},
-]
-
-
-def _two(first, second):
-    return [{**AFFIRMATIVE_AND_NEGATIVE[0], "label": first},
-            {**AFFIRMATIVE_AND_NEGATIVE[1], "label": second}]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("options,value", [
-    (_two("I agree", "Confirm"), "I agree"),
-    (_two("I agree", "I do not agree"), "I do not agree"),
-    (AFFIRMATIVE_AND_NEGATIVE, "Disagree"),
-    (_two("I agree to marketing", "No"), "I agree to marketing"),
-    (_two("I agree to third-party sharing", "No"),
-     "I agree to third-party sharing"),
-    (_two("I agree to arbitration", "No"), "I agree to arbitration"),
-    (_two("Yes", "No"), "Yes"),
-    (_two("Understood", "No"), "Understood"),
-])
-async def test_closed_privacy_combobox_outside_closed_caption_set_is_asked(
-        monkeypatch, options, value):
-    """AC2/AC4: only one whole affirmative caption, the granted one, continues.
-    A contained 'agree' token or a positive-looking word is not that caption."""
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant(value, options)})
-    session = _PrivacyPicker(options)
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is not None and pending.reason == "owner_question"
-    assert not any(c[0] == "click" and c[1] != "#privacy" for c in session.calls)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("question", [
-    "I consent to processing of my personal data for this application "
-    "and for marketing",
-    "I acknowledge processing of my personal data for this application "
-    "and sharing with partners",
-    "I agree to arbitration of any claim about this application",
-    "I certify the information in this application is accurate",
-    "I acknowledge the privacy notice",
-])
-async def test_closed_combobox_beyond_standard_privacy_keeps_owner_routing(
-        monkeypatch, question):
-    """AC4: marketing, sharing, arbitration, attestation and ambiguous scope
-    never borrow the deferred comparison, even with an affirmative grant."""
-    session = _PrivacyPicker()
-    for page in (session.closed, session.opened, session.current):
-        page["controls"][0]["question"] = question
-    assert forms._assent_scope(session.closed["controls"][0]) != "standard_privacy"
-    _privacy_row(monkeypatch, {question: {**_privacy_grant(), "question": question}})
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is not None and pending.reason == "owner_question"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", [
-    "none", "url", "selector", "type", "form", "question", "options", "value",
-])
-async def test_closed_privacy_combobox_without_exact_grant_is_asked(
-        monkeypatch, change):
-    """AC4: the deferred comparison never replaces the exact per-control grant."""
-    grant = _privacy_grant()
-    if change == "url":
-        grant["url"] = PRIVACY_URL + "/other"
-    elif change == "selector":
-        grant["selector"] = "#other"
-    elif change == "type":
-        grant["type"] = "select"
-    elif change == "form":
-        grant["form_action"] = PRIVACY_URL + "/other"
-    elif change == "question":
-        grant["question"] = "Another question"
-    elif change == "options":
-        grant["options"] = grant["options"][:1]
-        grant["options"][0]["label"] = "I confirm"
-    elif change == "value":
-        grant["value"] = "I confirm"
-    _privacy_row(monkeypatch, {} if change == "none" else {PRIVACY_QUESTION: grant})
-    session = _PrivacyPicker()
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is not None and pending.reason == "owner_question"
-
-
-@pytest.mark.asyncio
-async def test_stale_stored_privacy_option_list_goes_to_the_owner(monkeypatch):
-    """ARCH22:30: the grant's stored option list is not a witness. The owner
-    gate opens the picker itself; a listbox that changed since the owner
-    answered is asked again, and the guarded write still refuses it."""
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
-    changed = [{**PRIVACY_OPTIONS[0], "value": "OTHER"}, PRIVACY_OPTIONS[1]]
-    session = _PrivacyPicker(changed)
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is not None and pending.reason == "owner_question"
-    assert [c for c in session.calls if c[0] != "evaluate"] == [
-        ("click", "#privacy"), ("press", "Escape")]
-    with pytest.raises(forms.Gate):
-        await forms.execute(
-            session, await session.page(),
-            {"action": "combobox", "selector": "#privacy",
-             "fact": PRIVACY_QUESTION},
-            facts={}, filled={}, resume_path="", company="example-co",
-            jd_text="", resume_tex="", github="", pk=PRIVACY_PK,
-            job_url=PRIVACY_URL)
-    assert not any(c[0] == "click" and c[1] != "#privacy" for c in session.calls)
-
-
-@pytest.mark.asyncio
-async def test_unwitnessable_privacy_listbox_goes_to_the_owner(monkeypatch):
-    """ARCH22:30: without a fresh listbox witness the grant is not sufficient."""
-    _privacy_row(monkeypatch, {PRIVACY_QUESTION: _privacy_grant()})
-    session = _PrivacyPicker()
-    session.opened = session.closed  # the click never mounts a listbox
-    real_sleep = asyncio.sleep
-    monkeypatch.setattr(forms.asyncio, "sleep", lambda *_a: real_sleep(0))
-    pending = await forms._required_owner_gate(
-        session, await session.page(), PRIVACY_PK, PRIVACY_URL)
-    assert pending is not None and pending.reason == "owner_question"
-
-
-def test_standard_privacy_checkbox_keeps_its_no_grant_path(monkeypatch):
-    """AC2: select/combobox never inherit the checkbox no-grant shortcut."""
-    _privacy_row(monkeypatch, {})
-    target = _privacy_combobox()
-    with pytest.raises(forms.Gate, match="human-approved answer"):
-        forms.exact_approval(PRIVACY_PK, PRIVACY_QUESTION, "I agree",
-                             target=target, url=PRIVACY_URL)
-    checkbox = _assent_target(PRIVACY_QUESTION)
-    forms.exact_approval(PRIVACY_PK, PRIVACY_QUESTION, "yes",
-                         target=checkbox, url="https://example.test/application")

@@ -124,7 +124,9 @@ def test_exact_phone_inventory_uses_both_production_readers(phase):
     independent = next(c for c in witness['controls'] if c['selector'] == '#country')
     assert owner['combobox'] == independent['combobox']
     for graph in (owner['combobox'], independent['combobox']):
-        assert graph['selected_text'] == graph['selected_value'] == ''
+        # The C2 branch has one local caption, but no submitted machine value.
+        assert graph['selected_text'] == ('Approved country' if phase == 'C2' else '')
+        assert graph['selected_value'] == ''
         assert graph['hidden_selector'] == graph['hidden_value'] == ''
     assert owner['type'] == 'combobox' and not owner['name']
     assert not owner['has_value']
@@ -174,144 +176,31 @@ async def test_unproven_phone_shape_remains_opaque(scenario, monkeypatch, tmp_pa
         assert country['combobox'].get('selected_value', '') == ''
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
 
-async def test_receiverless_commit_has_no_fabricated_transport(phone_grants):
-    facts, _ = phone_grants
-    session, filled = PhoneSession(presentation=True, pickerDecoration=True), {}
-    receipt = await choose_country(session, facts, filled)
-    assert receipt['committed_caption'] == receipt['committed_value'] == facts['Country']
-    assert receipt['hidden_selector'] == receipt['hidden_value'] == ''
-    assert session.calls == [
-        ('click', '#country'), ('fill', '#country', '--value', facts['Country']),
-        ('click', '#country-option')]
-    # A reversible option click is not independent submitted-value evidence.
-    current = focused_country(await session.page(), receipt)
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(current, filled, True, receipts=[receipt])
-    with pytest.raises(forms.Gate, match='committed accessible choice'):
-        forms.check_approvals('example-co#1', [receipt], current)
-
-@pytest.mark.parametrize('scenario', [
-    {'countryCaption': 'approved country'}, {'countryCaption': 'Approved  country'},
-    {'countryCodes': {'value': 'CODE'}}, {'countryCodes': {'data-value': ''}},
-    {'countryCodes': {'value': 'Approved country', 'data-value': 'CODE'}},
-    {'countryDanger': True},
-])
-async def test_country_option_literal_or_safety_failure_precedes_click(phone_grants, scenario):
-    facts, _ = phone_grants
-    session, filled = PhoneSession(**scenario), {}
-    if scenario.get('countryDanger'):
-        with pytest.raises(forms.Gate, match='submission-capable'):
-            await choose_country(session, facts, filled)
-        assert not any(c == ('click', '#country-option') for c in session.calls)
-        return
-    receipt = await choose_country(session, facts, filled)
-    assert forms._same(receipt['committed_caption'], facts['Country'])
-    assert receipt['committed_value'] == (
-        scenario.get('countryCodes', {}).get('data-value')
-        or scenario.get('countryCodes', {}).get('value')
-        or receipt['committed_caption'])
-    assert session.calls == [
-        ('click', '#country'), ('fill', '#country', '--value', facts['Country']),
-        ('click', '#country-option')]
-    # Benign captions and encoded codes are selectable preparation; absent
-    # named form-owned value still refuses the single final Submit.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(focused_country(await session.page(), receipt),
-                         filled, True, receipts=[receipt])
-
-@pytest.mark.parametrize('phase', ['C1', 'C2'])
-async def test_country_candidate_cannot_supply_initial_admission(phone_grants, phase):
-    session, filled = PhoneSession(phases={'country': phase}), {}
-    receipt = await choose_country(session, phone_grants[0], filled)
-    assert forms._same(receipt['committed_caption'], phone_grants[0]['Country'])
-    assert not any(c == ('click', '#submit') for c in session.calls)
-    # An initial ARIA phase confers neither per-step authority nor Submit.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(focused_country(await session.page(), receipt),
-                         filled, True, receipts=[receipt])
-
-@pytest.mark.parametrize('key', ['selected_text', 'displayed_text'])
-async def test_each_country_token_projection_is_literal(phone_grants, key):
-    session, filled = PhoneSession(), approved_values(facts=phone_grants[0])
-    receipt = await choose_country(session, phone_grants[0], filled)
-    final = focused_country(await session.page(), receipt, form_owned=True)
-    forms.check_form(final, filled, True, receipts=[receipt])
-    forms.check_approvals('example-co#1', [receipt], final)
-    combo({'page': final}, 'country')['combobox'][key] = 'Different country'
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(final, filled, True, receipts=[receipt])
-
-@pytest.mark.parametrize('tamper', [
-    'receipt_copy', 'receipt_caption', 'receipt_code', 'current_caption',
-    'current_code', 'form_action', 'grant',
-])
-async def test_country_history_cannot_replace_original_proof(phone_grants, tamper):
-    facts, row = phone_grants
-    session, filled = PhoneSession(), approved_values(facts=facts)
-    receipt = await choose_country(session, facts, filled)
-    current = focused_country(await session.page(), receipt, form_owned=True)
-    if tamper == 'receipt_copy':
-        forms.check_form(current, filled, True, receipts=[dict(receipt)])
-        forms.check_approvals('example-co#1', [dict(receipt)], current)
-        return
-    if tamper == 'receipt_caption':
-        receipt['committed_caption'] = 'Different country'
-    elif tamper == 'receipt_code':
-        receipt['committed_value'] = 'DIFFERENT'
-    elif tamper == 'current_caption':
-        combo({'page': current}, 'country')['combobox']['selected_text'] = 'Different country'
-    elif tamper == 'current_code':
-        combo({'page': current}, 'country')['combobox']['selected_value'] = 'DIFFERENT'
-    elif tamper == 'form_action':
-        combo({'page': current}, 'country')['form_action'] = 'https://other.example.test/'
+@pytest.mark.parametrize('bad', ['empty_country', 'empty_phone', 'extra_file'])
+def test_complete_phone_form_uses_current_answers_and_single_pdf(bad):
+    """No group grant or historical receipt substitutes for live form values."""
+    file_field = {'selector': '#resume', 'type': 'file', 'tag': 'input',
+                  'label': 'Resume', 'files': ['Test User Resume.pdf']}
+    phone = {'selector': '#phone', 'type': 'tel', 'tag': 'input',
+             'label': 'Phone', 'required': True, 'value': '+15550101010'}
+    country = {'selector': '#country', 'type': 'combobox', 'tag': 'input',
+               'label': 'Country', 'required': True, 'value': 'EX',
+               'combobox': {'selected_text': 'Synthetic Country'}}
+    page = {'url': URL, 'inventory_verified': True, 'truncated': False,
+            'opaque_controls': False, 'unsupported_frames': [],
+            'shadow_roots': False, 'controls': [phone, country, file_field]}
+    forms.check_form(page, {}, True, 'Test User Resume.pdf')
+    if bad == 'empty_country':
+        country['value'] = ''
+        country['combobox']['selected_text'] = ''
+    elif bad == 'empty_phone':
+        phone['value'] = ''
     else:
-        row['human_approved_answers']['Country']['value'] = 'Different country'
+        page['controls'].append({'selector': '#other', 'type': 'file',
+                                 'label': 'Additional attachment',
+                                 'files': ['Unrelated.pdf']})
     with pytest.raises(forms.Gate):
-        forms.check_approvals('example-co#1', [receipt], current)
-
-@pytest.mark.parametrize('selector', ['#country-button', '#country-search', '#country-clear', '#picker-option-0'])
-@pytest.mark.parametrize('verb', ['click', 'fill', 'select', 'combobox', 'choose'])
-async def test_picker_decoration_is_never_a_controller_target(phone_grants, selector, verb):
-    session = PhoneSession()
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, await session.page(), {'action': verb, 'selector': selector, 'fact': 'Country'},
-                            facts=phone_grants[0], filled={}, resume_path='', company='example-co',
-                            jd_text='', resume_tex='', github='', pk='example-co#1', job_url=URL)
-    assert session.calls == []
-
-
-@pytest.mark.parametrize('tamper', [
-    None, 'selected_text', 'displayed_text', 'identity', 'grant', 'receipt',
-    'location', 'school', 'degree', 'discipline',
-])
-async def test_complete_phone_form_rechecks_each_current_answer_and_approval(
-        phone_grants, tamper):
-    facts, row = phone_grants
-    session = PhoneSession()
-    receipt = await choose_country(session, facts)
-    # This explicit synthetic positive creates *named* form-owned values for
-    # all five questions, not an exemption for the receiverless HTML.
-    page, filled, history = completed_approved_form(
-        await session.page(), facts, receipt)
-    forms.check_form(page, filled, True, receipts=history)
-    forms.check_approvals('example-co#1', history, page)
-    if tamper is None:
-        return
-    country = combo({'page': page}, 'country')
-    if tamper in {'selected_text', 'displayed_text'}:
-        country['combobox'][tamper] = 'Different country'
-    elif tamper == 'identity':
-        country['form_action'] = 'https://other.example.test/'
-    elif tamper == 'grant':
-        row['human_approved_answers']['Country']['value'] = 'Different approval'
-    elif tamper == 'receipt':
-        receipt['committed_value'] = 'DIFFERENT'
-    else:
-        peer = combo({'page': page}, tamper)
-        peer['value'] = peer['combobox']['selected_value'] = 'DIFFERENT'
-    with pytest.raises(forms.Gate):
-        forms.check_form(page, filled, True, receipts=history)
-        forms.check_approvals('example-co#1', history, page)
+        forms.check_form(page, {}, True, 'Test User Resume.pdf')
 
 
 async def test_actual_raw_submit_refuses_receiverless_country_without_ipc(
@@ -323,33 +212,11 @@ async def test_actual_raw_submit_refuses_receiverless_country_without_ipc(
         dom(fullPhone=True, phases={'country': 'C2'}),
         monkeypatch, tmp_path, require_incomplete=False)
 
-async def test_country_grant_is_not_a_phone_grant(phone_grants):
-    facts, row = phone_grants
-    del row['human_approved_answers']['Country']
-    row['human_approved_answers']['Phone'] = {'value': facts['Country']}
-    session = PhoneSession()
-    with pytest.raises(forms.Gate):
-        await choose_country(session, facts)
-    assert session.calls == []
-
-
 def test_country_open_popup_stays_in_the_native_form():
     snapshot = dom(fullPhone=True, phases={'country': 'C1'}, countryPortal=True)
     assert snapshot['page']['opaque_controls'] is True
     assert snapshot['page']['inventory_verified'] is False
 
-
-async def test_receiverless_history_never_compares_nonexistent_transport(phone_grants):
-    session, filled = PhoneSession(), {}
-    receipt = await choose_country(session, phone_grants[0], filled)
-    current = focused_country(await session.page(), receipt)
-    with pytest.raises(forms.Gate, match='committed accessible choice'):
-        forms.check_approvals('example-co#1', [receipt], current)
-    valid = focused_country(await session.page(), receipt, form_owned=True)
-    forms.check_approvals('example-co#1', [receipt], valid)
-    combo({'page': valid}, 'country')['combobox']['selected_value'] = ''
-    with pytest.raises(forms.Gate, match='committed accessible choice'):
-        forms.check_approvals('example-co#1', [receipt], valid)
 
 def served_fixture_dom(markup=None):
     # Parsed bytes prove structure only; primary smoke owns browser hydration.
@@ -401,40 +268,6 @@ async def test_served_fixture_html_itself_passes_production_readers_offline(
     await assert_unapproved_submit_is_refused(
         snapshot, monkeypatch, tmp_path, require_incomplete=False)
 
-@pytest.mark.parametrize('member', [
-    'current_caption', 'form_selector', 'missing_name', 'receipt_fact',
-    'receipt_selector', 'receipt_code_type', 'receipt_code_literal',
-    'receipt_caption', 'receipt_answer', 'fabricated_transport',
-])
-async def test_each_receiverless_commit_evidence_member_is_validated(phone_grants, member):
-    session, filled = PhoneSession(), {}
-    receipt = await choose_country(session, phone_grants[0], filled)
-    current = focused_country(await session.page(), receipt, form_owned=True)
-    field = combo({'page': current}, 'country')
-    if member == 'current_caption':
-        field['combobox']['selected_text'] = ''
-    elif member == 'form_selector':
-        field['form_selector'] = '#other-form'
-    elif member == 'missing_name':
-        field['name'] = ''
-    elif member == 'receipt_fact':
-        receipt['fact'] = 'unapproved'
-    elif member == 'receipt_selector':
-        receipt['selector'] = '#forged'
-    elif member == 'receipt_code_type':
-        receipt['committed_value'] = None
-    elif member == 'receipt_code_literal':
-        receipt['committed_value'] = 'DIFFERENT'
-    elif member == 'receipt_caption':
-        receipt['committed_caption'] = 'Different country'
-    elif member == 'receipt_answer':
-        receipt['approved_value'] = 'Different country'
-    elif member == 'fabricated_transport':
-        field['combobox']['hidden_value'] = 'invented'
-    with pytest.raises(forms.Gate):
-        forms.check_form(current, filled, True, receipts=[receipt])
-        forms.check_approvals('example-co#1', [receipt], current)
-
 @pytest.mark.parametrize('scenario', ['secondIti', 'movedIti', 'renamedPhone',
                                       'secondTelOutside', 'brokenPhoneChain'])
 async def test_picker_exemption_requires_one_exact_phone_branch(
@@ -453,57 +286,6 @@ async def test_picker_exemption_requires_one_exact_phone_branch(
     # the raw final Submit guard decide, never an ITI ancestor signature.
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
 
-async def test_unnamed_required_proxy_allows_approved_country_preparation(
-        phone_grants):
-    # A required empty native validation proxy is inventoried for Submit but
-    # has no name, accessible label or form-owned answer of its own. A common
-    # Phone fieldset legend cannot block the Country field's approved selection.
-    session, filled = PhoneSession(requiredProxy=True), {}
-    original = await session.page()
-    country = combo({'page': original}, 'country')
-    phone, = [c for c in original['controls'] if c['selector'] == '#phone']
-    assert forms._key(original, country) == 'Country'
-    assert forms._key(original, phone) == 'Phone'
-    proxies = [c for c in original['controls']
-               if c.get('required') and c.get('type') == 'text'
-               and not c.get('name') and not c.get('label')]
-    assert len(proxies) == 5
-    assert all(not forms._could_receive_an_answer(c) for c in proxies)
-    receipt = await choose_country(session, phone_grants[0], filled)
-    assert receipt['fact'] == 'Country'
-    assert receipt['committed_caption'] == phone_grants[0]['Country']
-    assert session.calls == [
-        ('click', '#country'),
-        ('fill', '#country', '--value', phone_grants[0]['Country']),
-        ('click', '#country-option')]
-    # A successful reversible choice does not mint a named form receiver.
-    # The complete final check still denies an absent live submitted value.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(focused_country(await session.page(), receipt),
-                         filled, True, receipts=[receipt])
-
-
-@pytest.mark.parametrize('scenario', [
-    {'countryCaption': 'approved country'}, {'countryCodes': {'data-value': 'CODE'}},
-])
-async def test_genuine_country_option_failure_keeps_country_commit_cause(phone_grants, scenario):
-    session, filled = PhoneSession(requiredProxy=True, **scenario), {}
-    receipt = await choose_country(session, phone_grants[0], filled)
-    assert forms._same(receipt['committed_caption'], phone_grants[0]['Country'])
-    assert session.calls == [
-        ('click', '#country'),
-        ('fill', '#country', '--value', phone_grants[0]['Country']),
-        ('click', '#country-option')]
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox'):
-        forms.check_form(focused_country(await session.page(), receipt),
-                         filled, True, receipts=[receipt])
-
-def test_genuine_country_option_linkage_failure():
-    target = combo(dom(fullPhone=True, phases={'country': 'C1'}), 'country')
-    target['combobox']['options'] = []
-    with pytest.raises(forms.Gate, match='combobox option linkage'):
-        forms._combobox_options(target)
-
 @pytest.mark.parametrize('phase', ['C0', 'C1', 'C2'])
 async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
         phase, monkeypatch, tmp_path):
@@ -517,17 +299,22 @@ async def test_hidden_optional_aria_parts_cannot_mask_form_receivers(
         c['selector'] for c in fixed['controls']]
     assert {'#phone', '#country', '#resume', '#submit'} <= {
         c['selector'] for c in page['controls']}
-    # An optional accessory is not automatically a submitted form answer;
-    # a nonempty optional telephone value IS and cannot escape approval.
+    # A non-required telephone value needs no historical per-control grant.
+    # The actual form cannot submit with an opaque inventory; the isolated
+    # final check below provides the staged résumé so it can examine just this
+    # optional field without failing on an unrelated missing PDF.
     phone = next(c for c in page['controls'] if c['selector'] == '#phone')
-    phone.update(value='Synthetic unapproved autofill', has_value=True)
+    phone.update(value='Synthetic optional autofill', has_value=True, required=False)
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
-    complete = {'url': page['url'], 'controls': [copy.deepcopy(phone)],
+    filename = 'Synthetic Resume.pdf'
+    complete = {'url': page['url'], 'controls': [copy.deepcopy(phone), {
+                    'selector': '#resume', 'label': 'Resume', 'type': 'file',
+                    'disabled': False, 'files': [filename],
+                }],
                 'inventory_verified': True, 'truncated': False,
                 'opaque_controls': False, 'shadow_roots': False,
                 'unsupported_frames': []}
-    with pytest.raises(forms.Gate, match='Unverified or changed form value'):
-        forms.check_form(complete, {}, True)
+    forms.check_form(complete, {}, True, attachment=filename)
 
 @pytest.mark.parametrize('attribute,value', [
     ('aria-required', 'true'),
@@ -552,58 +339,3 @@ async def test_hidden_submittable_aria_controls_remain_visible_to_final_guard(
     assert page['inventory_verified'] is False
     await assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path)
 
-
-def test_generic_legend_question_only_disambiguates_an_exact_named_receiver():
-    # The real reader associates the same Phone fieldset legend with a
-    # separate country combobox and telephone input. A single native input
-    # bearing that legend anchors the two *distinct* visible answer labels.
-    # This never grants either answer; exact_approval still binds each raw
-    # selector, question, label, form and current per-row approved value.
-    page = dom(fullPhone=True)['page']
-    country = combo({'page': page}, 'country')
-    phone, = [c for c in page['controls'] if c['selector'] == '#phone']
-    assert country['question'] == phone['question'] == 'Phone'
-    assert country['label'] == 'Country' and phone['label'] == 'Phone'
-    assert country['form_selector'] == phone['form_selector']
-    assert forms._key(page, country) == 'Country'
-    assert forms._key(page, phone) == 'Phone'
-
-
-@pytest.mark.parametrize('receiver_change', [
-    {'required': True},
-    {'name': 'country_search'},
-    {'value': 'Unapproved country', 'has_value': True},
-    {'combobox': {'selected_text': 'Unapproved country'}},
-])
-def test_optional_accessory_becoming_an_answer_blocks_shared_group_grant(
-        receiver_change):
-    # A decorative search is not an applicant answer. Becoming required,
-    # named, selected or valued restores the duplicate-question denial.
-    page = dom(fullPhone=True)['page']
-    country = combo({'page': page}, 'country')
-    accessory = next(c for c in page['controls']
-                     if c['selector'] == '#country-search')
-    for key, value in receiver_change.items():
-        if key == 'combobox':
-            accessory['combobox'].update(value)
-        else:
-            accessory[key] = value
-    with pytest.raises(forms.Gate, match='More than one control uses'):
-        forms._key(page, country)
-
-
-@pytest.mark.parametrize('mutation', ['no-legend-anchor', 'duplicate-label',
-                                      'competing-sibling'])
-def test_shared_group_legend_without_unique_native_anchor_remains_ambiguous(mutation):
-    page = dom(fullPhone=True)['page']
-    country = combo({'page': page}, 'country')
-    phone, = [c for c in page['controls'] if c['selector'] == '#phone']
-    if mutation == 'no-legend-anchor':
-        phone['label'] = 'Telephone number'
-    elif mutation == 'duplicate-label':
-        country['label'] = 'Phone'
-    else:
-        page['controls'].append({**phone, 'selector': '#second-phone',
-                                  'label': 'Phone'})
-    with pytest.raises(forms.Gate, match='More than one control uses'):
-        forms._key(page, country)

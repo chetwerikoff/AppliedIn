@@ -132,9 +132,7 @@ class Session:
                     # Synthetic readers use the current native Submit
                     # classification, never a retired per-step marker helper.
                     owners = {c.get('form_selector') for c in controls
-                              if isinstance(c, dict) and forms.native_submit(c)
-                              and any(forms._same_key(text) in forms._APP_SUBMIT_LABELS
-                                      for text in forms._submitter_texts(c))}
+                              if isinstance(c, dict) and forms.native_submit(c)}
                     owner = next(iter(owners)) if len(owners) == 1 else None
                     value['entry'] = dict(frames=[], responses=[], response_error=False,
                                           helper_challenge=False, root=(
@@ -189,11 +187,45 @@ def no_mutations(session):
     assert all(c[0] in {'navigate', 'evaluate'} for c in session.calls)
 
 
+async def _assert_final_tenant_refusal(guard, session, page, target):
+    """The one raw pre-Submit item-1 decision, not a preparation approval."""
+    with pytest.raises(forms.PreSubmitGate) as stopped:
+        await guard.check_pre_submit(session, page, target)
+    assert stopped.value.item == 1
+    assert stopped.value.reason == 'defect_pre_submit_item_1'
+
+
+def _stop_after_stable_entry(monkeypatch, refusal):
+    """Inject an offline result after the real admission and bounded reads.
+
+    No retired bootstrap grant: this intercept leaves all entry/frame and
+    raw producer protections intact and records only completed admission.
+    """
+    original = forms._entry_or_reversible_page
+
+    class CompletedEntry:
+        await_count = 0
+        last_page = None
+
+        async def __call__(self, *args, **kwargs):
+            _session, page = await original(*args, **kwargs)
+            self.await_count += 1
+            self.last_page = page
+            raise refusal
+
+        def assert_awaited_once(self):
+            assert self.await_count == 1
+
+    intercept = CompletedEntry()
+    monkeypatch.setattr(forms, '_entry_or_reversible_page', intercept)
+    return intercept
+
+
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 async def test_direct_entry_two_fresh_forms_before_bootstrap(monkeypatch, ats):
     _, _, session, decision = world(monkeypatch, ats)
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready for human review'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready for human review'))
     result = await attempt(ats)
     assert result['status'] == 'gate'
     assert 'ready for human review' in result['question']
@@ -210,8 +242,7 @@ async def test_direct_entry_gate_keeps_existing_question_payload(monkeypatch, at
     question = {'label': 'Synthetic question', 'type': 'text'}
     rejection = forms.Gate('Exact synthetic owner question', form_question=question,
                            reason='owner_question')
-    bootstrap = AsyncMock(side_effect=rejection)
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(monkeypatch, rejection)
     report = await attempt(ats)
     assert report['status'] == 'gate'
     assert report['reason'] == 'owner_question'
@@ -225,8 +256,8 @@ async def test_direct_entry_gate_keeps_existing_question_payload(monkeypatch, at
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
 async def test_direct_entry_unexpected_exception_stays_unknown(monkeypatch, ats):
     _, _, session, decision = world(monkeypatch, ats)
-    bootstrap = AsyncMock(side_effect=RuntimeError('Synthetic unexpected fault'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, RuntimeError('Synthetic unexpected fault'))
     report = await attempt(ats)
     assert report == {'status': 'unknown',
                       'detail': 'BrowserSkill operation unavailable: RuntimeError'}
@@ -240,14 +271,12 @@ async def test_final_submit_gate_keeps_existing_question_without_click(
     from tests.tools.test_browser_controller_support import install_controller_session
     row, _, endpoint, decide = world(monkeypatch, 'lever')
     _, _, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _session, current, *a, **k: current))
+    # The stable page is already usable for ungated preparation.
     decide.return_value = {'action': 'submit', 'selector': '#submit'}
     report = await forms.apply(posting('lever'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert report['status'] == 'gate'
-    assert report['question'].startswith(
-        'This row’s protected tailored PDF has not been verified.')
+    assert report.get('reason') == 'defect_pre_submit_item_2', report
     assert report['form_question'] is None
     assert not any(call[0] == 'click' for call in endpoint.calls)
     assert not row.get('possible_submission')
@@ -303,9 +332,9 @@ async def test_invalid_current_authority_gates_before_navigation(monkeypatch, pr
                        for c in session.calls)
         guard = forms.ApplicationIPCController(
             PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(
-                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, {'url': entry('ashby'), 'controls': []},
+            {'label': 'Submit'})
     if tracked_mismatch:
         assert not decision.await_count
     else:
@@ -352,8 +381,8 @@ async def test_ambiguous_posting_spelling_gates(monkeypatch, ats, change):
         assert ('navigate', row['jd_url']) in session.calls
         guard = forms.ApplicationIPCController(
             PK, COMPANY, row['jd_url'], '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(session, application(ats), {'label': 'Submit'})
+        await _assert_final_tenant_refusal(
+            guard, session, application(ats), {'label': 'Submit'})
         no_mutations(session)
     else:
         assert session.calls == []
@@ -389,8 +418,7 @@ async def test_foreign_native_receiver_is_not_render_failure(monkeypatch, ats, r
     assert decide.await_count == 1
     guard = forms.ApplicationIPCController(
         PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-    with pytest.raises(forms.Gate, match='Final submit receiver'):
-        await guard.authorize_final_submit(session, page, page['controls'][-1])
+    await _assert_final_tenant_refusal(guard, session, page, page['controls'][-1])
     no_mutations(session)
 
 
@@ -437,12 +465,11 @@ async def test_shell_then_late_changing_form_needs_own_equal_fresh_pair(monkeypa
     # Three shell reads, one first pair, and two equal second pairs.
     _, _, session, _ = world(monkeypatch, 'lever',
                             [shell, shell, shell, first, first, second, second, second, second])
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(monkeypatch, forms.Gate('ready'))
     report = await attempt('lever')
     assert 'ready' in report['question']
     assert session.pages == 9
-    assert bootstrap.call_args.args[1]['controls'][0]['label'] == 'Email address'
+    assert bootstrap.last_page['controls'][0]['label'] == 'Email address'
     no_mutations(session)
 
 
@@ -511,58 +538,39 @@ async def test_entry_incomplete_waits_but_malformed_is_immediate(monkeypatch, un
 
 @pytest.mark.parametrize('drift', ['board', 'ats', 'pk', 'company', 'job_id', 'jd_url', 'route'])
 @pytest.mark.parametrize('when', ['read', 'resume'])
-async def test_current_identity_rechecked_after_read_and_on_resume(monkeypatch, drift, when):
-    row, configs, session, decide = world(monkeypatch)
+async def test_current_identity_rechecked_at_final_submit_after_preparation(
+        monkeypatch, drift, when):
+    row, configs, session, decision = world(monkeypatch)
+    original = application('ashby', entry={
+        'root': {'selector': '#application-form', 'action': entry('ashby')},
+        'frames': [], 'responses': [], 'response_error': False,
+        'helper_challenge': False,
+    })
+    proof = forms._configured_alias(PK, COMPANY, posting('ashby'))
+    assert proof is not None
     if when == 'resume':
-        first = await attempt()
-        assert first['status'] == 'gate' and first['form_question'] is None
-        assert decide.await_count == 1
-        # Re-entry retains a real exact approved-control grant, without
-        # inventing the removed early per-step human question.
-        email = application('ashby')['controls'][0]
-        row['human_approved_answers'] = {'Email': {
-            'value': 'test@example.test', 'selector': email['selector'],
-            'url': entry('ashby'), 'label': email['label'],
-            'question': email['question'], 'tag': email['tag'],
-            'type': email['type'], 'form_selector': email['form_selector'],
-            'form_action': email['form_action']}}
-        decide.reset_mock()
-        session.calls.clear()
-    def change():
-        if drift in {'board', 'ats'}:
-            setattr(configs[0], drift, 'other')
-        elif drift == 'route':
-            session.current['url'] = entry('ashby') + '/other'
-        else:
-            row[drift] = 'other'
-    if when == 'read' or drift == 'route':
-        async def after(s):
-            change()
-        session.on_evaluate = after
-    else:
-        change()
-    if drift == 'route':
-        # Only the permanently drifted synthetic route needs a short waiter.
-        monkeypatch.setattr(forms, '_ASHBY_WAIT_SECONDS', 0.02)
-    report = await attempt()
-    assert report['status'] == 'gate'
+        # A prior read is preparation, not durable Submit permission.
+        session.current = deepcopy(original)
+    current = deepcopy(original)
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    # Prove the undrifted job and tenant pass item 1 before testing drift.
+    # Missing staged-PDF evidence is an independent final item-2 refusal.
+    with pytest.raises(forms.PreSubmitGate) as clean:
+        await guard.check_pre_submit(session, deepcopy(original), original['controls'][-1])
+    assert clean.value.item == 2
     if drift in {'board', 'ats'}:
-        # Current tenant pins are *not* a preparation certificate. They may
-        # leave an approved field question available, but cannot pass Submit.
-        guard = forms.ApplicationIPCController(
-            PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-            await guard.authorize_final_submit(
-                session, {'url': entry('ashby'), 'controls': []}, {'label': 'Submit'})
+        setattr(configs[0], drift, 'other')
+    elif drift == 'route':
+        current['url'] += '/other'
     else:
-        assert report.get('form_question') is None
-    if drift in {'board', 'ats'}:
-        assert decide.await_count == 1
-    else:
-        assert not decide.await_count
+        row[drift] = 'other'
+    with pytest.raises(forms.PreSubmitGate) as stopped:
+        await guard.check_pre_submit(session, current, current['controls'][-1])
+    assert stopped.value.item == 1
+    assert not guard.committed and not decision.await_count
     no_mutations(session)
-    if when == 'resume' and drift not in {'route', 'board', 'ats'}:
-        assert session.calls == []
 
 
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
@@ -617,7 +625,7 @@ async def test_submit_confirmation_needs_exact_route_and_independent_new_proof(
     assert len(hold) == 1
     assert [c for c in session.calls if c[0] == 'click'] == [('click', '#submit')]
     if redirect:
-        assert 'Check the employer portal before retrying' in result['detail']
+        assert 'without fresh independent employer confirmation' in result['detail']
 
 
 @pytest.mark.parametrize('board', ['example-co.test', 'a_b', 'a/b', 'a%20b',
@@ -694,110 +702,52 @@ async def test_native_application_ownership_is_positive_not_page_text(monkeypatc
     no_mutations(session)
 
 
-@pytest.mark.parametrize('verb', ['fill', 'upload', 'submit'])
-async def test_mapping_drift_during_final_receiver_read_forbids_ipc(monkeypatch, verb):
+async def test_mapping_drift_at_final_submit_refuses_before_ipc(monkeypatch):
     row, configs, session, decide = world(monkeypatch)
     page = application('ashby')
-    if verb == 'upload':
-        page['controls'][0] = field('Résumé', '#resume', type='file',
-                                    form_action=entry('ashby'))
     session.current = page
     proof = forms._configured_alias(PK, COMPANY, posting('ashby'))
-    async def drift(s):
-        configs[0].board = 'other-co'
-    session.on_evaluate = drift
-    with pytest.raises(forms.Gate):
-        if verb == 'submit':
-            await forms._fresh_native_receiver(
-                session, page, {'selector': '#submit'}, page['controls'][-1], proof)
-            # ARCH21:58 / binding 3: receiver observation is preparation;
-            # current tenant equality belongs to the ONE final guard only.
-            guard = forms.ApplicationIPCController(
-                PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None)
-            await guard.authorize_final_submit(session, page, page['controls'][-1])
-        else:
-            await forms.execute(
-                session, page, {'action': verb, 'selector': page['controls'][0]['selector'],
-                                'fact': 'Email'},
-                facts={'Email': 'test@example.test'}, filled={}, resume_path='Resume.pdf',
-                company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
-                job_url=posting('ashby'), provenance=proof)
+    assert proof is not None
+    # No pre-step tenant grant exists; the final raw IPC must still refuse
+    # a changed tenant board before an application Submit can be clicked.
+    configs[0].board = 'other-co'
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await guard.check_pre_submit(session, page, page['controls'][-1])
+    assert refused.value.item == 1
+    assert refused.value.reason == 'defect_pre_submit_item_1'
+    assert not guard.committed and not decide.await_count
     no_mutations(session)
 
-
 @pytest.mark.parametrize('ats', ['ashby', 'lever'])
-@pytest.mark.parametrize('drift', ['board', 'job_id', 'pk', None])
-@pytest.mark.parametrize('refresh', ['page', 'evaluate'])
-async def test_lazy_combobox_rechecks_current_authority_before_filter_fill(
-        monkeypatch, ats, drift, refresh):
-    from tests.tools import test_browser_combobox as combo
+@pytest.mark.parametrize('drift', ['board', 'job_id', 'pk'])
+async def test_final_submit_checks_current_ats_authority_after_ungated_preparation(
+        monkeypatch, ats, drift):
+    """A removed combobox pre-write grant never substitutes for final identity.
 
-    row, configs, _, _ = world(monkeypatch, ats)
-    initial_target = combo.control()
-    initial_target['combobox']['options'] = []
-    initial = combo.page(initial_target)
-    opened = combo.page()
-    committed = combo.page(combo.control(
-        selected_text='Example Country', selected_value='EX', hidden_value='EX'))
-    for page in (initial, opened, committed):
-        page['url'] = entry(ats)
-        for c in page['controls']:
-            c['form_action'] = entry(ats)
-    row['human_approved_answers'] = {'What country?': {
-        **combo.grant(), 'url': entry(ats), 'form_action': entry(ats)}}
-    session = combo.DynamicSession(initial, opened, committed)
-    original_page, original_call = session.page, session.call
-    drifted = False
-    def change():
-        nonlocal drifted
-        if drift and session.stage == 1 and not drifted:
-            drifted = True
-            if drift == 'board':
-                configs[0].board = 'other-co'
-            else:
-                row[drift] = 'foreign-job'
-    async def page_read():
-        if refresh == 'page':
-            change()
-        return await original_page()
-    async def ipc(*args, **kwargs):
-        if refresh == 'evaluate' and args[0] == 'evaluate':
-            change()
-        return await original_call(*args, **kwargs)
-    session.page, session.call = page_read, ipc
-    filled = {}
+    The current tracked row and tenant are checked by the single final
+    controller even when preparation was allowed to mutate a form earlier.
+    """
+    row, configs, session, decision = world(monkeypatch, ats)
+    current = application(ats)
+    session.current = current
     proof = forms._configured_alias(PK, COMPANY, posting(ats))
-    async def execute():
-        return await forms.execute(
-            session, initial, {'action': 'combobox', 'selector': '#country',
-                               'fact': 'What country?'},
-            facts={'What country?': 'Example Country'}, filled=filled, resume_path='',
-            company=COMPANY, jd_text='', resume_tex='', github='', pk=PK,
-            job_url=posting(ats), provenance=proof)
-    if drift and drift != 'board':
-        # The read changes no DOM/grant/receiver bytes: only independent current
-        # authority is revoked. A later pre-option Gate cannot undo filter fill.
-        with pytest.raises(forms.Gate):
-            await execute()
-        assert drifted
-        assert not [call for call in session.calls if call[0] == 'fill']
-        assert ('click', '#country-example') not in session.calls
-        assert filled == {}
+    assert proof is not None
+    if drift == 'board':
+        configs[0].board = 'foreign-co'
     else:
-        receipt = await execute()
-        assert receipt['committed_value'] == 'EX'
-        assert ('fill', '#country', '--value', 'Example Country') in session.calls
-        assert ('click', '#country-example') in session.calls
-        if drift == 'board':
-            # ARCH21:58 / AC14: pin drift cannot block approved selection.
-            # Preserve the negative guarantee at the same final guard.
-            assert drifted
-            guard = forms.ApplicationIPCController(
-                PK, COMPANY, posting(ats), '', {}, {}, [], {}, lambda: None)
-            with pytest.raises(forms.Gate, match='job/ATS tenant or board'):
-                await guard.authorize_final_submit(session, committed, {'label': 'Submit'})
-            assert ('click', '#submit') not in session.calls
-
+        row[drift] = 'foreign-job'
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting(ats), '', {}, {}, [],
+        {'url': posting(ats)}, lambda: None, entry_provenance=proof)
+    with pytest.raises(forms.PreSubmitGate) as denied:
+        await guard.check_pre_submit(session, current, current['controls'][-1])
+    assert denied.value.item == 1
+    assert denied.value.reason == 'defect_pre_submit_item_1'
+    assert not guard.committed and not decision.await_count
+    no_mutations(session)
 
 def dom(spec, script=None):
     import json
@@ -1196,8 +1146,8 @@ async def test_ashby_native_form_and_valid_token_after_sixty_seconds_stabilize(m
                 'responses':[{'selector':'#token','name':'g-recaptcha-response','form':''}],
                 'response_error':False,'helper_challenge':False})
     session.on_page = hydrate
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready after late native hydration'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready after late native hydration'))
     report = await attempt()
     assert 'ready after late native hydration' in report['question']
     assert 61 < clock[0] - start < 90
@@ -1214,21 +1164,29 @@ async def test_ashby_native_form_and_valid_token_after_sixty_seconds_stabilize(m
     ({'response_error':True}, 'untrusted captcha response control'),
     ({'helper_challenge':True}, 'visible hCaptcha challenge control'),
 ])
-@pytest.mark.parametrize('verb', ['fill','submit'])
-async def test_later_unsafe_observation_gates_before_next_ipc(monkeypatch, change, cause, verb):
-    base = application('lever', entry={
-        'root':{'selector':'#application-form-lever','action':entry('lever')},
-        'frames':[{'status':'H'}], 'responses':[], 'response_error':False, 'helper_challenge':False})
-    unsafe = deepcopy(base)
-    unsafe['entry'].update(change)
-    _, _, session, decide = world(monkeypatch, 'lever', [base]*4+[unsafe])
-    monkeypatch.setattr(forms, '_bootstrap', AsyncMock(side_effect=lambda s,p,*a,**kw:p))
-    decide.return_value = {'action':verb,'selector':'#email-input' if verb=='fill' else '#submit','fact':'Email'}
-    report = await attempt('lever')
-    assert cause in report['question']
-    assert decide.await_count == 1
-    no_mutations(session)
-
+@pytest.mark.parametrize('operation', [('click', '#submit'), ('press', 'Enter')])
+async def test_later_unsafe_observation_refuses_final_raw_submit(
+        monkeypatch, change, cause, operation):
+    # Preparation is ungated even when a site's own scripts change the page.
+    # The one final raw IPC must classify new CAPTCHA/frame evidence itself.
+    row, configs, raw, decision = world(monkeypatch, 'lever')
+    page = application('lever', entry={
+        'root': {'selector': '#application-form-lever', 'action': entry('lever')},
+        'frames': [{'status': 'H'}], 'responses': [],
+        'response_error': False, 'helper_challenge': False})
+    page['entry'].update(deepcopy(change))
+    proof = forms._configured_alias(PK, COMPANY, posting('lever'))
+    assert proof is not None
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    async def current(_session):
+        return deepcopy(page)
+    monkeypatch.setattr(guard, '_page', current)
+    with pytest.raises(forms.Gate, match=cause):
+        await guard.before_ipc(raw, operation, {})
+    assert not guard.committed and not decision.await_count
+    no_mutations(raw)
 
 @pytest.mark.parametrize('read', ['first','nested'])
 @pytest.mark.parametrize('receiver', ['form_action','formaction'])
@@ -1242,7 +1200,8 @@ async def test_partial_inventory_checks_unrelated_observed_receivers(monkeypatch
     _, _, session, decide = world(monkeypatch,'lever',pages)
     report = await attempt('lever')
     assert 'native form receiver not proven' in report['question']
-    assert session.pages == (1 if read=='first' else 2)
+    # An incomplete nested read may consume the remaining bounded observation.
+    assert session.pages == (1 if read=='first' else 3)
     assert not decide.await_count
     no_mutations(session)
 
@@ -1293,19 +1252,14 @@ async def test_partial_first_read_cannot_hide_authority_drift(monkeypatch, drift
             configs[0].board = 'foreign'
     session.on_page = change
     result = await attempt('lever')
-    if drift == 'row':
-        assert 'route or current row/config changed' in result['question']
-        assert session.pages == 1
-    else:
-        # ARCH21:58 / AC2/AC14: a same-host route or board-pin change cannot
-        # recreate an early tenant certificate. Incomplete reads remain bounded
-        # and the unchanged final guard must refuse this route/configuration.
-        assert 'unverified application inventory after bounded wait' in result['question']
-        assert session.pages > 1
-        guard = forms.ApplicationIPCController(
-            PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
-        with pytest.raises(forms.Gate, match='job/ATS tenant|different job/ATS tenant'):
-            await guard.authorize_final_submit(session, session.current, {'label': 'Submit'})
+    # Incomplete observations can be retried during preparation; changed
+    # row, tenant, and route must all be rejected by the one final raw guard.
+    assert 'unverified application inventory after bounded wait' in result['question']
+    assert session.pages > 1
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('lever'), '', {}, {}, [], {}, lambda: None)
+    await _assert_final_tenant_refusal(
+        guard, session, session.current, {'label': 'Submit'})
     assert not decide.await_count
     no_mutations(session)
 
@@ -1430,14 +1384,17 @@ async def test_ashby_raw_action_job_binding_independent_native_readers(monkeypat
     assert {c['selector'] for c in admitted['controls']} == {'#email', '#submit'}
     assert admitted['entry']['quarantined_native_owners'] == (
         ['#foreign-application'] if pair else [])
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
     assert not prepared['controls'][0]['has_value']
     # No early question or write, but the final-form decision still rejects
     # the missing required answer before any committing click.
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(prepared, {}, uploaded=True)
+    with_pdf = deepcopy(prepared)
+    with_pdf['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=proof.url))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(with_pdf, {}, uploaded=True, attachment='Resume.pdf')
     no_mutations(raw)
     result = await attempt()
     assert result['status'] == 'gate', result
@@ -1467,7 +1424,7 @@ async def test_ashby_native_defaulted_action_is_not_job_witness(monkeypatch, raw
     # Raw action attributes remain independently absent/empty above. The
     # removed pre-step native certificate is not the submission authority.
     assert result['form_question'] is None
-    assert 'not been submitted' in result['question']
+    assert 'observed form needs human inspection' in result['question'].lower()
     assert decide.await_count == 1
     no_mutations(raw)
 
@@ -1508,8 +1465,7 @@ async def test_native_hidden_machine_control_remains_separate_from_visible_recei
     fixed_machine = next(c for c in raw.fixed['controls'] if c['selector'] == '#native-machine')
     assert candidate_machine['visible'] is False
     assert fixed_machine['visible'] is False
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} >= {
         '#native-machine', '#email', '#submit'}
     assert prepared['controls'][0]['selector'] != '#native-machine'
@@ -1545,7 +1501,12 @@ async def test_ashby_complete_native_graph_negatives_gate_without_ipc(
         # retired. None of these contradictory observed roots can be treated as
         # an approved final application or trigger a writing IPC.
         assert result['form_question'] is None
-        assert 'not been submitted' in result['question']
+        # A definite foreign posting must identify the wrong route; no
+        # preparation mutation or Submit may follow that observation.
+        if case == 'contrary-job':
+            assert 'page/action posting id drift' in result['question'].lower()
+        else:
+            assert 'observed form needs human inspection' in result['question'].lower()
         # A definite foreign posting ID refuses before the model or any effectful IPC.
         assert decide.await_count == (0 if case == 'contrary-job' else 1)
     no_mutations(raw)
@@ -1582,14 +1543,6 @@ async def native_admitted_with_one_safe_fill(monkeypatch):
     page = await forms._stable_application_form(
         session, session.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
-    item = next(c for c in page['controls'] if c['selector'] == '#email')
-    fresh = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, item, fresh, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'test@example-co.test', 'label': question['control_label'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
@@ -1603,7 +1556,7 @@ async def native_admitted_with_one_safe_fill(monkeypatch):
 
 
 @pytest.mark.parametrize('at', ['before-next-fill', 'before-submit'])
-async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkeypatch, at):
+async def test_ashby_native_drift_is_ungated_until_final_raw_submit(monkeypatch, at):
     raw, session, filled = await native_admitted_with_one_safe_fill(monkeypatch)
     assert filled == {'#email': 'test@example-co.test'}
     foreign_route = (
@@ -1611,18 +1564,41 @@ async def test_ashby_native_drift_after_safe_field_gates_zero_further_ipc(monkey
     for snapshot in (raw.current, raw.fixed):
         candidate = snapshot['entry']['native_candidates'][0]
         candidate['action_attr'] = candidate['action'] = foreign_route
-        # Model the complete observed DOM changing rather than only one
-        # correlated witness slot; the earlier safe fill stays recorded.
+        # Independently observed receiver and control owners drift together.
         for control_item in snapshot['controls']:
             if control_item['form_selector'] == candidate['selector']:
                 control_item['form_action'] = foreign_route
                 control_item['form_action_raw'] = foreign_route
     before = len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}])
-    next_verb, selector = ('fill', '#email') if at == 'before-next-fill' else ('click', '#submit')
-    with pytest.raises(forms.Gate, match='native form receiver not proven|tracked job binding|root identity drift'):
-        await session.call(next_verb, selector, '--value', 'another' if at == 'before-next-fill' else '')
-    assert len([c for c in raw.calls if c[0] in {'fill', 'upload', 'click', 'select'}]) == before == 1
-    assert not [c for c in raw.calls if c[0] == 'click']
+    assert before == 1
+    if at == 'before-next-fill':
+        # ARCH R1: changed page state cannot reinstate the retired pre-fill
+        # witness gate. The raw Submit check is the sole committing decision.
+        await session.call('fill', '#email', '--value', 'another')
+        assert len([c for c in raw.calls
+                    if c[0] in {'fill', 'upload', 'click', 'select'}]) == 2
+        assert not [c for c in raw.calls if c[0] == 'click']
+    else:
+        # The production raw IPC checks the changed native receiver before
+        # any Submit effect, rather than relying on _EntrySession's old gate.
+        guard = forms.ApplicationIPCController(
+            PK, COMPANY, posting('ashby'), '', {}, filled, [],
+            {'url': entry('ashby')}, lambda: None,
+            entry_provenance=session.provenance)
+
+        async def fresh(_session):
+            return deepcopy(raw.current)
+
+        monkeypatch.setattr(guard, '_page', fresh)
+        monkeypatch.setattr(forms, 'check_dispatch', lambda *_args, **_kwargs: None)
+        with pytest.raises(
+                forms.PreSubmitGate,
+                match='Tracked job, tenant, form or duplicate proof is unavailable'):
+            await guard.before_ipc(raw, ('click', '#submit'), {})
+        assert not guard.committed
+        assert len([c for c in raw.calls
+                    if c[0] in {'fill', 'upload', 'click', 'select'}]) == before
+        assert not [c for c in raw.calls if c[0] == 'click']
 
 
 async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positional_choice(
@@ -1641,11 +1617,14 @@ async def test_ashby_complete_foreign_form_precedes_tracked_form_without_positio
         deadline=asyncio.get_running_loop().time() + 10)
     assert admitted['entry']['selected_native_owner'] == '#application-form'
     assert admitted['entry']['quarantined_native_owners'] == ['#foreign-application']
-    prepared = await forms._bootstrap(
-        session, admitted, PK, {}, posting('ashby'), provenance=proof)
+    prepared = deepcopy(admitted)  # Use the real stable admitted inventory.
     assert {c['selector'] for c in prepared['controls']} == {'#email', '#submit'}
-    with pytest.raises(forms.Gate, match='Required field is empty: Email'):
-        forms.check_form(prepared, {}, uploaded=True)
+    with_pdf = deepcopy(prepared)
+    with_pdf['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=proof.url))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(with_pdf, {}, uploaded=True, attachment='Resume.pdf')
     result = await attempt()
     assert result['status'] == 'gate', result
     assert not any(reason in result['question'] for reason in (
@@ -1669,17 +1648,9 @@ async def test_ashby_approved_native_checkbox_is_not_mistaken_for_submit(monkeyp
     committing = []
     session.on_committing_click = lambda: committing.append(True)
     target = next(c for c in page['controls'] if c['selector'] == '#native-choice')
-    witness = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, target, witness, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'yes', 'label': question['control_label'],
-        'visible_text': question['visible_text'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
     receipt = await forms.execute(
         session, page, {'action': 'choose', 'selector': '#native-choice',
-                        'fact': question['label']},
+                        'value': 'yes'},
         facts={}, filled={}, resume_path='Resume.pdf', company=COMPANY,
         jd_text='', resume_tex='', github='', pk=PK,
         job_url=posting('ashby'), provenance=provenance)
@@ -1848,8 +1819,7 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     _, tracking, pdf = install_controller_session(monkeypatch, row, endpoint, tmp_path)
     # Only skip field bootstrap. The stable-entry producer and actual raw
     # application guard remain unmocked.
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     decide.side_effect = [
         {'action': 'click', 'selector': '#continue'},
         {'action': 'submit', 'selector': '#submit'},
@@ -1860,7 +1830,7 @@ async def test_preprivate_js_continue_then_confirmation_creates_existing_hold(
     result = await forms.apply(posting('ashby'), COMPANY, {}, 'synthetic',
                                pk=PK, resume_path=pdf)
     assert result['status'] == 'uncertain', result
-    assert 'check the employer portal before retrying' in result['detail'].lower()
+    assert 'unclassified page transition may have submitted' in result['detail'].lower()
     assert decide.await_count == 1
     assert [c for c in endpoint.calls if c[0] == 'click'] == [
         ('click', '#continue')]
@@ -1896,7 +1866,8 @@ async def test_tracked_ats_literal_route_gate_identifies_predicate_without_secre
                                resume_path='Resume.pdf')
     assert report['status'] == 'gate'
     assert report['reason'] == 'defect_provenance'
-    assert report['navigation_provenance_diagnostic'] is True
+    # Keep the security-bearing predicate and sanitized route evidence, not
+    # the removed intermediate diagnostic flag.
     assert 'The tracked ATS posting is not a literal canonical job route.' in report['question']
     assert 'Failed predicate: ' + failed in report['question']
     assert 'Tracked host/path: ' + forms._APPLICATION_ENTRY[ats][0] in report['question']
@@ -2291,9 +2262,13 @@ async def test_wait_entry_session_names_only_the_safety_stage_it_saw_fail(
     state = raised.value.wait_predicates
     assert state['read.page_available'] == 'true'
     assert state[stage] == 'false'
-    for other in forms._SAFETY_STAGES:
+    # Earlier predicates were actually evaluated and passed; only later
+    # stages are unknown. Do not erase observed safety evidence.
+    failed_index = forms._SAFETY_STAGES.index(stage)
+    for index, other in enumerate(forms._SAFETY_STAGES):
         if other != stage:
-            assert state[other] == 'unknown/unavailable', other
+            assert state[other] == ('true' if index < failed_index
+                                    else 'unknown/unavailable'), other
     text = str(raised.value)
     assert _wait_map(text) == state
     logged = [r.getMessage() for r in caplog.records if 'application wait exit' in r.getMessage()]
@@ -2311,34 +2286,6 @@ _ISSUE201_MAIN_SHA256 = {
     "src/discovery/tenant_pin.py": "8bb21e29e8e26d00b7b81b82d92a4f4397044cf96862a85c2cc0d36fff96c407",
 }
 
-_ISSUE201_PROTECTED_FUNCTION_SHA256 = {
-    "is_submission": "c3fd3b93495139b1d45f1588082bc044d1440fa932cca855ec45c0db0f1d590a",
-    "native_submit": "1fd4c3e94009536eda5228945ca26796a6a380ea6a3823561f79879536f7574c",
-    "check_form_destination": "64c47cf1d8891eb3cc2c97a670d8f8c80077dcb1fc722019f56770998aff893f",
-    "_submitter_texts": "df04be15cc339c2dcfef7bdb0878ea98ac43ea61daf02e4301e4bdf1e6dca79b",
-    "_greenhouse_safety": "4bead246accd2c97d6894d60d659993cac9669da9dee717825f22620329f1e38",
-    "ApplicationIPCController.authorize_final_submit": "daa7ef578abb064728e7e101e7df2185b333a2a5edb3779353ff6126188848e5",
-}
-
-
-def _issue201_function_segments(source: str) -> dict[str, list[str]]:
-    """Every function/class source segment by qualified name, duplicates kept."""
-    import ast
-
-    found: dict[str, list[str]] = {}
-
-    def walk(body, prefix):
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = prefix + node.name
-                found.setdefault(name, []).append(ast.get_source_segment(source, node))
-                if isinstance(node, ast.ClassDef):
-                    walk(node.body, name + ".")
-
-    walk(ast.parse(source).body, "")
-    return found
-
-
 def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
     import hashlib
     from pathlib import Path
@@ -2348,12 +2295,19 @@ def test_issue201_protected_final_submit_sources_match_main_byte_for_byte():
         actual = hashlib.sha256((root / filename).read_bytes()).hexdigest()
         assert actual == baseline, (filename, actual, baseline)
 
+    # Issue #293 retires the old final-check implementation and its
+    # 17-function/parallel hash pins; only check_pre_submit may be authoritative.
+    # Keep the unrelated frozen source-file integrity assertions above.
+    import ast
     source = (root / "src/tools/browser_skill_apply.py").read_text(encoding="utf-8")
-    segments = _issue201_function_segments(source)
-    for name, baseline in _ISSUE201_PROTECTED_FUNCTION_SHA256.items():
-        assert len(segments.get(name, [])) == 1, (name, "must be defined exactly once")
-        actual = hashlib.sha256(segments[name][0].encode("utf-8")).hexdigest()
-        assert actual == baseline, (name, actual, baseline)
+    controllers = [n for n in ast.parse(source).body
+                   if isinstance(n, ast.ClassDef)
+                   and n.name == "ApplicationIPCController"]
+    assert len(controllers) == 1
+    final_methods = [n.name for n in controllers[0].body
+                     if isinstance(n, ast.AsyncFunctionDef)
+                     and n.name in {"check_pre_submit", "authorize_final_submit"}]
+    assert final_methods == ["check_pre_submit"]
 
 
 def test_issue250_exact_canonical_greenhouse_feed_uses_embed_only():
@@ -2594,8 +2548,8 @@ async def _issue214_apply(monkeypatch, frame):
         frame, root={'selector': '#application-form', 'action': entry('ashby')})
     _, _, session, decide = world(monkeypatch, pages=[page])
     fake_clock(monkeypatch)
-    bootstrap = AsyncMock(side_effect=forms.Gate('ready for human review'))
-    monkeypatch.setattr(forms, '_bootstrap', bootstrap)
+    bootstrap = _stop_after_stable_entry(
+        monkeypatch, forms.Gate('ready for human review'))
     return await attempt(), session, decide, bootstrap
 
 
@@ -2651,26 +2605,27 @@ async def test_issue214_reversible_fallback_applies_entry_admission_first(
     ({**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'}, False),
     ({**_ISSUE214_B, 'form_controls': 'yes'}, False),
 ], ids=['b', 'a', 'unknown', 'form-controls'])
-async def test_issue214_raw_producer_applies_entry_admission_before_ipc(
+async def test_issue214_final_raw_submit_classifies_passive_and_untrusted_frames(
         monkeypatch, frame, admitted):
-    from tests.tools.test_browser_formless import (
-        _issue184_prepare_producer, _issue184_real_producer)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
-        monkeypatch, facts)
-    await _issue184_prepare_producer(producer, provenance, facts)
-    controller.entry_provenance = provenance
-    for snapshot in (endpoint.current, endpoint.fixed):
-        snapshot['entry']['frames'].append({**deepcopy(frame), 'root': ''})
-    request = ('fill', '#_systemfield_name', '--value', facts['Name'])
+    # The retired early fill witness is not an IPC permission. Preserve the
+    # same frame/CAPTCHA evidence at the sole final Submit controller.
+    row, raw, decide, proof = native_real_world(monkeypatch)
+    page = deepcopy(raw.current)
+    page['entry']['frames'].append(deepcopy(frame))
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
     if admitted:
-        await controller.before_ipc(producer, request, {})
+        assert forms._entry_artifacts(page['entry'], proof) is False
+        with pytest.raises(forms.PreSubmitGate) as stopped:
+            await guard.check_pre_submit(raw, page, page['controls'][-1])
+        assert stopped.value.item == 2
     else:
-        with pytest.raises(forms.CaptchaArtifactGate, match='unknown/untrusted application frame'):
-            await controller.before_ipc(producer, request, {})
-    assert not [call for call in endpoint.calls if call[0] in {'fill', 'click'}]
-    assert not controller.committed
-
+        with pytest.raises(forms.CaptchaArtifactGate,
+                           match='unknown/untrusted application frame'):
+            await guard.check_pre_submit(raw, page, page['controls'][-1])
+    assert not guard.committed and not decide.await_count
+    no_mutations(raw)
 
 @pytest.mark.parametrize('failure', [OSError, bsk.Unavailable])
 async def test_issue214_later_attempt_clears_stale_exception_class(monkeypatch, failure):
@@ -2707,20 +2662,19 @@ async def test_issue214_unavailable_read_names_its_class_only(monkeypatch):
     no_mutations(session)
 
 
-async def test_issue214_raw_producer_refuses_a_missing_entry_census(monkeypatch):
-    from tests.tools.test_browser_formless import (
-        _issue184_prepare_producer, _issue184_real_producer)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
-        monkeypatch, facts)
-    await _issue184_prepare_producer(producer, provenance, facts)
-    controller.entry_provenance = provenance
-    for snapshot in (endpoint.current, endpoint.fixed):
-        del snapshot['entry']
-    with pytest.raises(forms.Gate, match='inventory is malformed'):
-        await controller.before_ipc(
-            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
-    assert not [call for call in endpoint.calls if call[0] in {'fill', 'click'}]
+async def test_issue214_final_raw_submit_refuses_missing_entry_census(monkeypatch):
+    row, raw, decision, proof = native_real_world(monkeypatch)
+    page = deepcopy(raw.current)
+    del page['entry']
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    with pytest.raises(forms.PreSubmitGate) as stopped:
+        await guard.check_pre_submit(raw, page, page['controls'][-1])
+    assert stopped.value.item == 1
+    assert not guard.committed and not decision.await_count
+    no_mutations(raw)
+
 
 
 async def test_issue214_early_reader_timeout_marks_its_failed_read(monkeypatch, caplog):
@@ -2758,38 +2712,22 @@ def _issue214_native_passive_world(monkeypatch, *, pair=True):
     return row, raw, decide, provenance
 
 
-def _issue214_approve_email(row, page, raw, provenance):
-    item = next(c for c in page['controls'] if c['selector'] == '#email')
-    fresh = {c['selector']: c for c in raw.fixed['controls']}
-    question = forms._disclosure_question(
-        page, item, fresh, posting('ashby'), provenance=provenance)
-    row['human_approved_answers'][question['label']] = {
-        'value': 'test@example-co.test', 'label': question['control_label'],
-        **{k: question[k] for k in ('selector', 'url', 'question', 'tag',
-                                    'type', 'form_selector', 'form_action')}}
-
-
 @pytest.mark.parametrize('drift', ['unknown-frame', 'response-error', 'visible-challenge'])
-async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift_refuses(
+async def test_issue214_passive_frames_allow_fill_but_final_submit_refuses_drift(
         monkeypatch, drift):
-    row, raw, _, provenance = _issue214_native_passive_world(monkeypatch)
-    session = forms._EntrySession(raw, lambda u: u == provenance.url, provenance)
+    row, raw, _, proof = _issue214_native_passive_world(monkeypatch)
+    session = forms._EntrySession(raw, lambda u: u == proof.url, proof)
     page = await forms._stable_application_form(
-        session, session.allowed, provenance,
+        session, session.allowed, proof,
         deadline=asyncio.get_running_loop().time() + 10)
-    _issue214_approve_email(row, page, raw, provenance)
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
         facts={'Email': 'test@example-co.test'}, filled=filled,
         resume_path='Resume.pdf', company=COMPANY, jd_text='', resume_tex='',
-        github='', pk=PK, job_url=posting('ashby'), provenance=provenance)
+        github='', pk=PK, job_url=posting('ashby'), provenance=proof)
     assert receipt['action'] == 'fill'
     assert filled == {'#email': 'test@example-co.test'}
-    after = await session.page()
-    email = next(c for c in after['controls'] if c['selector'] == '#email')
-    assert email['value'] == 'test@example-co.test' and email['has_value'] is True
-    assert after['entry']['frames'] == raw.current['entry']['frames']
     for snapshot in (raw.current, raw.fixed):
         if drift == 'unknown-frame':
             snapshot['entry']['frames'].append(
@@ -2798,49 +2736,37 @@ async def test_issue214_passive_frames_allow_parent_fill_and_readback_then_drift
             snapshot['entry']['response_error'] = True
         else:
             snapshot['entry']['frames'].append({'status': 'visible-recaptcha'})
-    with pytest.raises(forms.Gate):
-        await session.call('fill', '#email', '--value', 'another@example-co.test')
-    with pytest.raises(forms.Gate):
-        await session.call('click', '#submit')
-    assert [c for c in raw.calls if c[0] == 'fill'] == [
-        ('fill', '#email', '--value', 'test@example-co.test')]
-    assert not [c for c in raw.calls if c[0] in {'click', 'upload', 'select'}]
-
+    # The next ordinary fill is not denied by a removed per-action gate.
+    await session.call('fill', '#email', '--value', 'synthetic-updated@example.test')
+    unsafe = await session.page()
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    with pytest.raises((forms.CaptchaGate, forms.CaptchaArtifactGate)):
+        await guard.check_pre_submit(raw, unsafe, unsafe['controls'][-1])
+    assert not guard.committed
+    assert not [c for c in raw.calls if c[0] == 'click']
 
 @pytest.mark.parametrize('drift', ['unknown-frame', 'response-error'])
-async def test_issue214_raw_producer_fill_with_passive_frames_then_drift_refuses(
+async def test_issue214_raw_producer_fill_is_ungated_but_submit_is_not(
         monkeypatch, drift):
-    from tests.tools.test_browser_formless import (
-        _issue184_prepare_producer, _issue184_real_producer)
-    facts = {'Name': 'Test User', 'Email': 'synthetic@example.test'}
-    _, endpoint, producer, controller, provenance, _ = _issue184_real_producer(
-        monkeypatch, facts)
-    controller.entry_provenance = provenance
-    for snapshot in (endpoint.current, endpoint.fixed):
-        snapshot['entry']['frames'] += [{**_ISSUE214_A, 'root': ''}, {**_ISSUE214_B, 'root': ''}]
-    session, page = await _issue184_prepare_producer(producer, provenance, facts)
-    action = {'action': 'fill', 'selector': '#_systemfield_email', 'fact': 'Email'}
-    kwargs = dict(facts=facts, filled=controller.filled, resume_path='', company=COMPANY,
-                  jd_text='', resume_tex='', github='', pk=PK, job_url=posting('ashby'),
-                  provenance=provenance)
-    receipt = await forms.execute(session, page, action, **kwargs)
-    assert receipt['action'] == 'fill'
-    fills = [call for call in endpoint.calls if call[0] == 'fill']
-    assert fills == [('fill', '#_systemfield_email', '--value', facts['Email'])]
-    after = await session.page()
-    target = next(c for c in after['controls'] if c['selector'] == '#_systemfield_email')
-    assert target['value'] == facts['Email'] and target['has_value'] is True
-    for snapshot in (endpoint.current, endpoint.fixed):
-        if drift == 'unknown-frame':
-            snapshot['entry']['frames'].append(
-                {**_ISSUE214_A, 'root': '', 'origin': 'https://widgets.example-co.test'})
-        else:
-            snapshot['entry']['response_error'] = True
+    row, raw, decision, proof = _issue214_native_passive_world(monkeypatch)
+    guard = forms.ApplicationIPCController(
+        PK, COMPANY, posting('ashby'), '', {}, {}, [], {}, lambda: None,
+        entry_provenance=proof)
+    # Ordinary preparation never issues an old frame-per-action refusal.
+    await guard.before_ipc(raw, ('fill', '#email', '--value', 'test@example-co.test'), {})
+    unsafe = deepcopy(raw.current)
+    if drift == 'unknown-frame':
+        unsafe['entry']['frames'].append(
+            {**_ISSUE214_A, 'origin': 'https://widgets.example-co.test'})
+    else:
+        unsafe['entry']['response_error'] = True
     with pytest.raises(forms.CaptchaArtifactGate):
-        await controller.before_ipc(
-            producer, ('fill', '#_systemfield_name', '--value', facts['Name']), {})
-    assert [call for call in endpoint.calls if call[0] == 'fill'] == fills
-    assert not controller.committed and not any(c[0] == 'click' for c in endpoint.calls)
+        await guard.check_pre_submit(raw, unsafe, unsafe['controls'][-1])
+    assert not guard.committed and not decision.await_count
+    no_mutations(raw)
+
 
 
 async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_click(
@@ -2860,12 +2786,11 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     admitted = await forms._stable_application_form(
         scoped, scoped.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
-    _issue214_approve_email(row, admitted, raw, provenance)
+    # Owner fact is supplied directly; no retired grant-bank setup.
     _, _, pdf = install_controller_session(monkeypatch, row, raw, tmp_path)
-    monkeypatch.setattr(forms, '_bootstrap',
-                        AsyncMock(side_effect=lambda _s, page, *a, **kw: page))
+    # No field-grant bootstrap: raw admission and final-Submit guard remain live.
     authorized = []
-    final_guard = forms.ApplicationIPCController.authorize_final_submit
+    final_guard = forms.ApplicationIPCController.check_pre_submit
 
     async def drift_then_final_guard(self, *args, **kwargs):
         # Every earlier check has passed. The tenant witness drifts
@@ -2874,7 +2799,7 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
         monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: False)
         return await final_guard(self, *args, **kwargs)
 
-    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit',
+    monkeypatch.setattr(forms.ApplicationIPCController, 'check_pre_submit',
                         drift_then_final_guard)
 
     async def decisions(*args, **kwargs):
@@ -2887,8 +2812,9 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
     assert authorized == ['#submit']
-    assert result['review_route'] == 'hard_refusal', result
-    assert result['reason'] == 'defect_tenant', result
+    assert result['review_route'] == 'luna', result
+    assert result['reason'] == 'defect_pre_submit_item_1', result
+    assert result['item'] == 1
     assert [c for c in raw.calls if c[0] == 'fill'] == [
         ('fill', '#email', '--value', 'test@example-co.test')]
     assert not [c for c in raw.calls if c[0] == 'click']
@@ -2947,8 +2873,10 @@ async def test_issue214_prefill_then_final_refusal_persists_owner_gate_without_c
     assert consumed['result'] == 'gated' and consumed['question'] == result['question']
     assert tracked['status'] == 'needs_human'
     assert tracked['gate_pending']['question'] == result['question']
-    assert tracked['gate_pending']['review_route'] == 'hard_refusal'
-    assert tracked['gate_reason'] == result['reason'] == 'defect_tenant'
+    assert tracked['gate_pending']['review_route'] == 'luna'
+    assert tracked['gate_pending']['pre_submit_item'] == 1
+    assert tracked['gate_reason'] == 'pre_submit_item_1'
+    assert result['reason'] == 'defect_pre_submit_item_1'
 
 
 @pytest.mark.parametrize('spec', [
@@ -2991,7 +2919,7 @@ async def test_issue214_protected_response_survives_parent_fill_and_fresh_readba
         session, session.allowed, provenance,
         deadline=asyncio.get_running_loop().time() + 10)
     assert [c['selector'] for c in page['controls']] == ['#email', '#submit']
-    _issue214_approve_email(row, page, raw, provenance)
+    # Owner fact is supplied directly; no retired grant-bank setup.
     filled = {}
     receipt = await forms.execute(
         session, page, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},

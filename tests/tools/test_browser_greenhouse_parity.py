@@ -84,7 +84,7 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *
     with pytest.raises(forms.Gate) as form_denial:
         forms.check_form(page, {}, True, pdf.name)
     if require_incomplete:
-        assert 'form inventory is incomplete' in str(form_denial.value)
+        assert 'final application inventory is incomplete' in str(form_denial.value).lower()
     elif reason:
         assert str(form_denial.value).startswith(reason)
     # Both synthetic DOM families have a fixed independent heading. Keep
@@ -134,7 +134,9 @@ async def assert_unapproved_submit_is_refused(snapshot, monkeypatch, tmp_path, *
 
     with pytest.raises(forms.Gate) as final_denial:
         await session.application_effect('click', '#submit')
-    assert str(final_denial.value) == str(form_denial.value)
+    # The raw producer collapses the form detail into the reviewed item-2 outcome.
+    assert isinstance(final_denial.value, forms.PreSubmitGate)
+    assert final_denial.value.item == 2
     assert raw_ipc == [] and started == []
     assert controller.committed is False
     assert row['status'] == 'submitting' and row['possible_submission'] is False

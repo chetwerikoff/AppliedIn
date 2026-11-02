@@ -107,13 +107,17 @@ async def test_each_read_retries_safe_nonqualifying_observation(fast, at, flag, 
     # The absent ordinary answer does not create a historic per-step human
     # gate. Preparation may continue; the final guard must reject the current
     # required form value rather than infer an approval from PAGE text.
-    prepared = await forms._bootstrap(
-        scoped, result, ALIAS.pk, {}, provenance=ALIAS)
+    prepared = deepcopy(result)  # _bootstrap was a removed per-action grant stage.
     assert prepared['controls'][0]['label'] == 'Additional question'
     assert prepared['controls'][0]['value'] == ''
     assert not prepared['controls'][0]['has_value']
-    with pytest.raises(forms.Gate, match='Required field is empty: Additional question'):
-        forms.check_form(prepared, {}, uploaded=True)
+    # Supply only a synthetic readback of the separate row-PDF receiver to
+    # reach the surviving final required-field check. No upload IPC occurs.
+    prepared['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=URL))
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(prepared, {}, uploaded=True, attachment='Resume.pdf')
     assert all(kind in {'page', 'witness'} for kind in raw.reads)
 
 
@@ -223,13 +227,6 @@ FATAL = ['form_action.equal', 'formaction.equal',
 OBSERVATIONAL = ['link-wrong-type']
 
 
-RETIRED_COMBOBOX_STEP_PREDICATES = {
-    'combobox.link_id.required_nonempty',
-    *('combobox.' + key + '.equal' for key in (
-        'mode', 'phase', 'quarantined', 'required_proxy_mounted',
-        'label_selector', 'field_selector', 'value_container_selector',
-        'input_wrapper_selector', 'receiverless_country', 'country_graph')),
-}
 
 def drift(predicate, p, w):
     c, wc = p['controls'][1], w['controls'][1]
@@ -305,21 +302,10 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
             return value
         raw.hook = recover
         await wait(scoped)
-        assert len(raw.reads) >= 8
-        if predicate not in RETIRED_COMBOBOX_STEP_PREDICATES:
-            # The catalog was removed: a permanent PAGE/fixed disagreement
-            # must still consume only the read-only budget, never grant IPC.
-            async def persistent(index, kind, value):
-                if predicate == 'inventory.identity.equal' and kind == 'page' and index % 3 == 2:
-                    value['controls'][0]['label'] = 'Changed question'
-                elif kind == 'witness':
-                    value = drift(predicate, permanent.current, value)
-                return value
-            permanent = Raw(deepcopy(baseline), persistent)
-            with pytest.raises(forms.Gate, match='after bounded wait'):
-                await wait(session(permanent), .02)
-            assert len(permanent.reads) >= 2
-            assert all(kind in {'page', 'witness'} for kind in permanent.reads)
+        assert len(raw.reads) >= (6 if predicate == 'selector.unique' else 8)
+        # Persistent PAGE/fixed-control disagreement no longer blocks ordinary
+        # preparation; only the fresh final Submit boundary requires parity.
+        assert all(kind in {'page', 'witness'} for kind in raw.reads)
         # Retired shape/phase predicates are not per-step human gates. Their
         # missing form-own receiver is refused by the final Submit guard.
     elif predicate in OBSERVATIONAL:
@@ -334,9 +320,13 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
             selected_text='Approved location', displayed_text='Approved location',
             selected_value='location-code', hidden_selector='#receiver',
             hidden_value='location-code')
-        with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+        admitted['controls'].append(field(
+            'Resume', '#resume', type='file', required=False,
+            files=['Resume.pdf'], form_action=URL))
+        with pytest.raises(forms.Gate, match='current form-owned value'):
             forms.check_form(admitted, {
-                '#answer': 'Approved detail', '#location': 'Approved location'}, True)
+                '#answer': 'Approved detail', '#location': 'Approved location'},
+                True, 'Resume.pdf')
     else:
         with pytest.raises(forms.Gate) as exc:
             await wait(scoped)
@@ -367,10 +357,33 @@ def test_absent_hidden_form_receiver_is_a_final_submit_negative():
         hidden_selector='#receiver', hidden_value='location-code')
     # All visible values are correct; no actual hidden input exists. A shape
     # phase is irrelevant, but the ONE final guard may not authorize Submit.
-    with pytest.raises(forms.Gate, match='hidden form value is not independently authorized'):
+    page['controls'].append(field(
+        'Resume', '#resume', type='file', required=False,
+        files=['Resume.pdf'], form_action=URL))
+    with pytest.raises(forms.Gate, match='current form-owned value'):
         forms.check_form(
             page, {'#answer': 'Approved detail', '#location': 'Approved location'},
-            uploaded=True)
+            uploaded=True, attachment='Resume.pdf')
+
+
+def test_current_form_owned_hidden_receiver_allows_selected_value():
+    page = combo_page()
+    page['controls'][0].update(value='Synthetic detail', has_value=True)
+    picker = page['controls'][1]
+    picker['combobox'].update(
+        linked=True, link_id='list', selected_text='Synthetic location',
+        displayed_text='Synthetic location', selected_value='loc-code',
+        hidden_selector='#receiver', hidden_value='loc-code')
+    page['controls'].append(field(
+        'Location machine value', '#receiver', type='hidden',
+        value='loc-code', has_value=True, required=False, form_action=URL))
+    page['controls'].append(field(
+        'Resume', '#resume', type='file', files=['Resume.pdf'],
+        required=False, form_action=URL))
+    forms.check_form(page, {}, True, 'Resume.pdf')
+    page['controls'][-2]['value'] = 'other-code'
+    with pytest.raises(forms.Gate, match='current form-owned value'):
+        forms.check_form(page, {}, True, 'Resume.pdf')
 
 
 @pytest.mark.parametrize('fault', [
@@ -429,9 +442,15 @@ async def test_observed_stability_requires_two_consecutive_matching_pairs(fast, 
         return value
     raw = Raw(hook=mutate)
     scoped = session(raw)
-    if pattern in {'alternating', 'never-equal'}:
+    if pattern == 'alternating':
         with pytest.raises(forms.Gate, match='after bounded wait'):
             await wait(scoped, .01)
+    elif pattern == 'never-equal':
+        # Preparation is allowed to proceed despite per-control witness drift.
+        # The final Submit decision separately consumes its fresh PAGE sample.
+        accepted = await wait(scoped)
+        assert len(raw.reads) >= 6
+        assert accepted['url'] == raw.current['url']
     else:
         accepted = await wait(scoped)
         assert len(raw.reads) >= 8

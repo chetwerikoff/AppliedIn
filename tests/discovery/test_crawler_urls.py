@@ -458,7 +458,10 @@ def test_plain_verified_http_https_upgrade_repairs_only_with_response_proof(
         return httpx.Response(200, text="<html>synthetic</html>")
 
     stores = _Stores()
-    pk, _ = _seed_legacy(stores)
+    # Verified transport upgrade remains eligible only for unrelated FOUND:
+    # historical relative exhausted ERROR never enters #22 repair.
+    pk, _ = _seed_legacy(stores, status="found", fail_kind="",
+                         jd_read_attempts=2)
     assert _crawl_repair(stores, "https://example.test/jobs/123?job_id=123",
                          source="http://example.test/careers") == 0
     assert stores.tracking.get(pk)["jd_url"].startswith("/")

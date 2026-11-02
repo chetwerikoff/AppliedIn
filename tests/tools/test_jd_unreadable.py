@@ -318,3 +318,95 @@ def test_http_source_witness_checks_effective_redirect_identity(
     assert jd.matched_source_witness(
         {"jd_url": url, "discovery_source": "crawler"}, observed) is witness
     assert pg.valid(observed["text"], observed["posting_guard"])
+
+
+
+@pytest.mark.parametrize("witness_kind", ["exact", "wrong_job", "foreign_redirect"])
+def test_historical_source_requires_independent_jobposting_canonical_and_id(
+    monkeypatch, witness_kind,
+):
+    """Same operational URL and HTTP 200 do not alone prove original posting."""
+    import json
+
+    from tools import jd, posting_guard as pg
+
+    url = "https://wd.example.invalid/fake-site/job/Example/Platform_ABC-17"
+    redirected = ("https://foreign.example/jobs/Other_001" if witness_kind == "foreign_redirect"
+                  else url)
+    id_seen = "Other_001" if witness_kind == "wrong_job" else "Platform_ABC-17"
+    html = ('<html><head><link rel="canonical" href="' + redirected + '">' +
+            '<script type="application/ld+json">' +
+            json.dumps({"@type": "JobPosting", "url": redirected,
+                        "identifier": {"@type": "PropertyValue", "value": id_seen}}) +
+            '</script></head><body><h1>Test role</h1><p>' +
+            ("Build reliable products and distributed systems. " * 18) +
+            '</p></body></html>')
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if witness_kind == "foreign_redirect" and str(request.url) == url:
+            return httpx.Response(302, headers={"Location": redirected})
+        assert str(request.url) == redirected
+        return httpx.Response(200, text=html)
+
+    monkeypatch.setattr(httpx, "Client", _patched(handler))
+    monkeypatch.setattr(jd, "_from_ats", lambda _: None)
+    monkeypatch.setattr(jd, "_from_chrome",
+                        lambda *args: pytest.fail("Long source fixture should not open Chrome"))
+    result = fetch_jd_meta(url)
+    result["reader_effective_url"] = url
+    original = {
+        "company": "example-co", "job_id": "Platform_ABC-17",
+        "ats": "workday", "jd_url": "/job/Example/Platform_ABC-17",
+    }
+    verified = jd.matched_source_witness(original, result)
+    assert verified is (witness_kind == "exact")
+    assert pg.valid(result["text"], result["posting_guard"])
+    if witness_kind == "exact":
+        assert result["source_identity"]["job_id"] == original["job_id"]
+        assert result["source_identity"]["canonical_url"] == url
+    if witness_kind == "wrong_job":
+        assert result["source_identity"]["job_id"] != original["job_id"]
+    if witness_kind == "foreign_redirect":
+        assert result["source_identity"] == {}
+        assert result["posting_guard"]["source_verified"] is False
+    assert calls[0] == url
+
+
+def test_model_echo_cannot_supply_historical_original_html_witness():
+    from tools import jd, posting_guard as pg
+
+    url = "https://example.test/jobs/42?lang=en"
+    row = {"jd_url": "/jobs/42?lang=en", "job_id": "42",
+           "discovery_source": "crawler"}
+    # Fake browser result has only URL-keyed text and no independent source HTML.
+    echo = pg.analyze("Build trustworthy software systems. " * 20)
+    echo.update(source_url=url, source_kind="http_html",
+                reader_effective_url=url)
+    assert not jd.matched_source_witness(row, echo)
+    # Even a source flag copied from a different job must not license a read.
+    false_source = pg.analyze("Build trustworthy software systems. " * 20,
+                              html_variants=["<p>other posting</p>"],
+                              source_required=True)
+    false_source.update(source_url=url, source_kind="http_html",
+                        reader_effective_url=url,
+                        source_identity={"canonical_url": url, "job_id": "other"})
+    assert not jd.matched_source_witness(row, false_source)
+
+
+@pytest.mark.parametrize("bad", [
+    "javascript:alert(1)", "//foreign.example/jobs/42",
+    "https://user@example.test/jobs/42", "https://example.test:invalid/jobs/42",
+    "https://example.test/jobs\\42", "https://example.test/jobs/\n42",
+])
+def test_unsafe_single_posting_never_opens_http_or_chrome(monkeypatch, bad):
+    from tools import jd
+
+    monkeypatch.setattr(jd, "_from_ats",
+                        lambda _: pytest.fail("No ATS API on an unsafe URL"))
+    monkeypatch.setattr(jd, "_get",
+                        lambda *args: pytest.fail("No HTTP on an unsafe URL"))
+    monkeypatch.setattr(jd, "_from_chrome",
+                        lambda *args: pytest.fail("No Chrome on an unsafe URL"))
+    assert fetch_jd_meta(bad)["posting_guard"]["source_verified"] is False

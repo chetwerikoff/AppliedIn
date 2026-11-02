@@ -362,7 +362,7 @@ class Session:
                 raise Unavailable("The private application screenshot is unavailable.")
             path.chmod(0o600)
             data = path.read_bytes()
-            if not data.startswith(b"\\x89PNG\\r\\n\\x1a\\n") or not data:
+            if not data.startswith(b"\x89PNG\r\n\x1a\n") or not data:
                 raise Unavailable("The private application screenshot is not PNG.")
             return data
         finally:

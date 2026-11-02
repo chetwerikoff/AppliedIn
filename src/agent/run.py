@@ -270,6 +270,8 @@ def _reader_url(row: dict) -> str:
         if (parts.scheme or parts.netloc or parts.fragment or not parts.path
                 or any(unquote(seg) in (".", "..") or any(
                     x in unquote(seg) for x in ("/", "\\", "%"))
+                    or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+                           for ch in unquote(seg))
                     for seg in parts.path.split("/") if seg)):
             raise JDURLUnresolvable("Original relative posting path is unsafe")
         name = row.get("company")
@@ -337,19 +339,21 @@ def _reader_url(row: dict) -> str:
         raise JDURLUnresolvable("Current posting source cannot be verified") from exc
 
 
-def _relative_attention(pk: str, stores: Any) -> dict:
-    """Review-only settlement of a historical posting; never synthesize approval."""
+def _relative_attention(pk: str, stores: Any, *,
+                        observed: dict | None = None) -> dict:
+    """Review-only settlement under the original reader witness, not a fresh one."""
     reason = "posting_guard_review_required"
     detail = "Historical posting source requires manual same-job verification; no application queued."
     try:
         current = stores.tracking.get(pk)
         if not current:
             return {"result": "conflict", "pk": pk, "reason": "jd_reader_state_changed"}
+        expected = observed if observed is not None else current
+        check = _reader_check(pk, expected, stores)
+        if check:
+            return check
         if current.get("status") == "tailoring":
-            check = _reader_check(pk, current, stores)
-            if check:
-                return check
-            ok, _ = _reader_patch(pk, current, stores, {
+            ok, _ = _reader_patch(pk, expected, stores, {
                 "status": Status.NEEDS_HUMAN, "gate_reason": reason,
                 "fail_kind": "source_html_unavailable", "error": detail,
             })
@@ -608,7 +612,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
         from tools.jd import matched_source_witness
 
         if not matched_source_witness(row, jd_meta):
-            return _relative_attention(pk, stores)
+            return _relative_attention(pk, stores, observed=row)
 
     # This commit is required even on an initially metadata-free row. A later
     # FAILED exit must use its NEW witness, not the pre-read TAILORING witness.

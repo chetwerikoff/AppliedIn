@@ -262,7 +262,7 @@ def _reader_url(row: dict) -> str:
     raw = row.get("jd_url")
     if not _historical_relative(row):
         return raw
-    if (not isinstance(raw, str) or not raw.startswith("/")
+    if (not isinstance(raw, str) or not raw
             or raw.startswith("//") or any(
                 c.isspace() or ord(c) < 32 or ord(c) == 127 or c == "\\"
                 for c in raw)):
@@ -332,7 +332,10 @@ def _reader_url(row: dict) -> str:
                 or resolved.hostname != base.hostname
                 or resolved.scheme != base.scheme
                 or resolved.port != base.port
-                or resolved.path != parts.path or resolved.query != parts.query):
+                or (raw.startswith("/") and resolved.path != parts.path)
+                or (not raw.startswith("/") and not resolved.path.endswith(
+                    "/" + parts.path))
+                or resolved.query != parts.query):
             raise JDURLUnresolvable("Custom posting is not on the current careers origin")
         return target
     except (ValueError, OSError, TypeError) as exc:

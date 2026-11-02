@@ -1,0 +1,206 @@
+"""Issue #301: fully offline final-Submit review boundary fixtures.
+
+Every value and employer is synthetic. No real session, Redis service,
+browser, network, applicant data, application or live Submit is used.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import time
+from concurrent.futures import Future
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from core import flags
+from tools import browser_runtime, submit_review
+from tools.browser_skill_apply import ApplicationIPCController
+
+
+PK = "example-co#1"
+URL = "https://example.test/jobs/1"
+
+
+def control(selector, label, *, value="", checked=False, options=None,
+            combo=None, kind="text"):
+    return {
+        "selector": selector, "label": label, "question": label,
+        "visible": True, "tag": "input", "type": kind, "name": selector[1:],
+        "required": False, "disabled": False, "checked": checked,
+        "value": value, "files": [], "options": options or [],
+        "option_count": len(options or []), "options_capped": False,
+        "combobox": combo, "in_form": True, "form_selector": "#form",
+        "form_action": URL, "formaction": "",
+    }
+
+
+def world():
+    submit = control("#submit", "Submit application", kind="submit")
+    email = control("#email", "Email", value="test@example.test")
+    other = control("#extra", "Additional field")  # unselected but visible
+    choice = control("#choice", "Location", value="", kind="combobox",
+                     combo={"selected_text": "Remote",
+                            "selected_value": "remote",
+                            "displayed_text": "Remote",
+                            "hidden_selector": "#location_id",
+                            "hidden_value": "location_remote"})
+    page = {
+        "url": URL, "title": "Test User application", "inventory_verified": True,
+        "opaque_controls": False, "shadow_roots": False,
+        "unsupported_frames": False, "truncated": False,
+        "attached_file_displays": [],
+        "controls": [email, other, choice, submit],
+    }
+    controller = SimpleNamespace(
+        pk=PK, company="example-co", url=URL, resume_path="/synthetic/Test User.pdf",
+        expected_digest="a" * 64, entry_provenance=None, greenhouse_provenance=None,
+        _row=lambda: {"pk": PK, "company": "example-co",
+                      "job_id": "1", "ats": "test"},
+        _row_pdf=lambda: (1, 2, "synthetic"),
+    )
+    return controller, page, submit
+
+
+def test_complete_private_snapshot_contains_unselected_control_and_machine_choice():
+    controller, page, target = world()
+    packet = submit_review.form_snapshot(controller, page, target)
+    assert len(packet["controls"]) == 4
+    assert packet["controls"][1]["label"] == "Additional field"
+    assert packet["controls"][1]["value"] == ""
+    assert packet["controls"][2]["combobox"]["selected_text"] == "Remote"
+    assert packet["controls"][2]["combobox"]["hidden_value"] == "location_remote"
+    assert packet["attachment"]["filename"] == "Test User.pdf"
+    assert packet["job"]["company"] == "example-co"
+
+
+def test_same_caption_with_different_hidden_value_is_not_approved():
+    controller, page, target = world()
+    before = submit_review.form_snapshot(controller, page, target)
+    page["controls"][2]["combobox"]["hidden_value"] = "location_other"
+    after = submit_review.form_snapshot(controller, page, target)
+    differences = submit_review.form_differences(before, after)
+    assert any(d["control"] == "Location" for d in differences)
+    assert differences[0]["before"] != differences[0]["after"]
+
+
+def test_added_unselected_control_and_duplicate_labels_still_differ():
+    controller, page, target = world()
+    before = submit_review.form_snapshot(controller, page, target)
+    page["controls"].insert(1, control("#other", "Email"))
+    after = submit_review.form_snapshot(controller, page, target)
+    differences = submit_review.form_differences(before, after)
+    assert differences
+    assert any(d["control"] == "visible control count" for d in differences)
+    page["controls"].insert(1, control("#other", "Email"))
+    with pytest.raises(submit_review.Refused, match="ambiguous"):
+        submit_review.form_snapshot(controller, page, target)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda page: page.update(inventory_verified=False),
+    lambda page: page.update(shadow_roots=True),
+    lambda page: page["controls"].append(control("#duplicate", "Password", kind="password")),
+    lambda page: page["controls"].append(control("#otp", "One-time code", kind="otp")),
+    lambda page: page["controls"][0].update(selector=""),
+    lambda page: page["controls"][0].update(value=None),
+])
+def test_incomplete_and_account_only_packets_refuse_before_publication(mutation):
+    controller, page, target = world()
+    mutation(page)
+    with pytest.raises(submit_review.Refused):
+        submit_review.form_snapshot(controller, page, target)
+
+
+def test_single_winner_atomic_decision_and_no_second_claim(monkeypatch, tmp_path):
+    row = {"status": "needs_human", "review_state": "pending"}
+    generation = "synthetic-generation-" + "g" * 32
+    holder = submit_review.Holder(
+        PK, "example-co", generation, time.monotonic() + 300,
+        "2099-01-01T00:00:00+00:00", None, SimpleNamespace(id="tab"),
+        object(), {}, tmp_path, Future(), Future())
+    monkeypatch.setattr(submit_review, "_HOLDERS", {PK: holder})
+    monkeypatch.setattr(submit_review, "_private_bytes", lambda h: ({}, b"png"))
+    monkeypatch.setattr(submit_review, "_authority", lambda h, **kw:
+                        row["review_state"] == ("claimed" if kw.get("claimed") else "pending"))
+
+    def cas(pk, *, states, status, generation, changes):
+        if row["status"] != status or row["review_state"] not in states:
+            return False
+        row.update(changes)
+        return True
+
+    monkeypatch.setattr(submit_review, "_patch", cas)
+    response = submit_review.claim(PK, generation, "approve")
+    assert row["review_state"] == "claimed"
+    assert holder.decision.result() == "approve"
+    assert response is holder.response
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, generation, "approve")
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, generation, "reject")
+
+
+@pytest.mark.asyncio
+async def test_reject_consumes_generation_without_commit(monkeypatch, tmp_path):
+    row = {"status": "needs_human", "review_state": "pending"}
+    generation = "synthetic-generation-" + "g" * 32
+    holder = submit_review.Holder(
+        PK, "example-co", generation, time.monotonic() + 300,
+        "2099-01-01T00:00:00+00:00", asyncio.get_running_loop(),
+        SimpleNamespace(id="tab"), object(), {}, tmp_path, Future(), Future())
+    monkeypatch.setattr(submit_review, "_HOLDERS", {PK: holder})
+    monkeypatch.setattr(submit_review, "_private_bytes", lambda h: ({}, b"png"))
+    monkeypatch.setattr(submit_review, "_authority", lambda h, **kw:
+                        row["review_state"] == ("claimed" if kw.get("claimed") else "pending"))
+
+    def cas(pk, *, states, status, generation, changes):
+        if row["status"] != status or row["review_state"] not in states:
+            return False
+        row.update(changes)
+        return True
+
+    monkeypatch.setattr(submit_review, "_patch", cas)
+    submit_review.claim(PK, generation, "reject")
+    assert row["review_state"] == "rejected"
+    assert row["review_reject_reason"] == "reviewer_rejected"
+    assert await submit_review.await_decision(holder) == "reject"
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, generation, "approve")
+
+
+@pytest.mark.asyncio
+async def test_unsupported_engine_refuses_before_start(monkeypatch):
+    class Unsupported:
+        started = False
+        async def apply_chrome(self, *args, **kwargs):
+            self.started = True
+            raise AssertionError("unsupported browser must never start")
+
+    other = Unsupported()
+    monkeypatch.setattr(browser_runtime, "backend", lambda: other)
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: True)
+    result = await browser_runtime.apply("synthetic job")
+    assert result["status"] == "gate"
+    assert result["reason"] == "submit_review requires the browser_skill engine"
+    assert not other.started
+
+
+@pytest.mark.parametrize("value", ["", "true", "yes", "1", "ON", "off", "on "])
+def test_default_off_and_malformed_flag_are_not_on(monkeypatch, value):
+    monkeypatch.setattr(flags, "get_flag", lambda key, default="": value)
+    assert flags.submit_review_enabled() is False
+
+
+def test_expired_holder_does_not_authorize_any_new_decision(monkeypatch, tmp_path):
+    holder = submit_review.Holder(
+        PK, "example-co", "synthetic-generation-12345678",
+        time.monotonic() - 1, "2026-01-01T00:00:00+00:00",
+        None, SimpleNamespace(id="tab"), object(), {}, tmp_path,
+        Future(), Future())
+    monkeypatch.setattr(submit_review, "_HOLDERS", {PK: holder})
+    monkeypatch.setattr(submit_review, "_authority", lambda h, **kwargs:
+                        time.monotonic() < h.deadline)
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, holder.generation, "approve")

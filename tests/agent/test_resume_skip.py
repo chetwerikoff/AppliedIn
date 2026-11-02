@@ -430,3 +430,260 @@ def test_a_skip_does_not_survive_its_question_being_reasked_at_another_selector(
         PK, stores, _question(label="Other synthetic", question="Other synthetic")) == {}
     assert run._owner_skip_retention(PK, stores, _question(
         selector="body > textarea", tag="textarea", type="textarea")) == {}
+
+
+# Issue #300: a background refusal is observational, never a second answer gate.
+def _record_refusals(world, monkeypatch):
+    from core import events, memory
+
+    stores, _ = world
+    redis = stores.tracking.r
+    monkeypatch.setattr(events, "_redis", lambda: redis)
+    monkeypatch.setattr(events, "get_settings", lambda: SimpleNamespace(mode="local"))
+    monkeypatch.setattr(memory, "remember", lambda *args, **kwargs: None)
+    original = events.emit
+    attempts = []
+
+    def emit(kind, **kwargs):
+        attempts.append((kind, kwargs))
+        return original(kind, **kwargs)
+
+    monkeypatch.setattr(events, "emit", emit)
+    return attempts, redis
+
+
+def _refusal_event(attempts):
+    assert len(attempts) == 1, "one report attempt, not guaranteed delivery"
+    kind, payload = attempts[0]
+    assert kind == "response"
+    assert set(payload) == {
+        "pk", "detail", "resume_answer_refused", "refusal_reason",
+        "same_pending_gate_at_emit",
+    }
+    assert payload["pk"] == PK
+    assert payload["detail"] == "Owner reply not accepted."
+    assert payload["resume_answer_refused"] is True
+    assert payload["refusal_reason"] == "invalid_answer"
+    assert type(payload["same_pending_gate_at_emit"]) is bool
+    # No page/answer/question/bearer or internal gate correlation token.
+    assert not any(x in str(payload) for x in (
+        "Synthetic display", "Synthetic Name", "nth-of-type", FORM_URL,
+        "expected_gate_generation", "expected_question_identity",
+        "q1_", "generation", "secret",
+    ))
+    return payload
+
+
+@pytest.mark.parametrize("case", [
+    "stale_generation", "foreign_identity", "generationless",
+    "invalid_checkbox", "invalid_radio", "invalid_group",
+    "ineligible_skip", "missing_gate",
+])
+def test_background_refusal_emits_once_without_any_application_effect(world, monkeypatch, case):
+    from core import events
+
+    stores, queue = world
+    attempts, redis = _record_refusals(world, monkeypatch)
+    question = _question()
+    if case == "invalid_checkbox":
+        question = _question(type="checkbox", control_label="Synthetic required assent",
+                             requiredness="required")
+    if case == "invalid_radio":
+        question = _question(type="radio", radio_members=[
+            {"caption": "Yes", "value": "yes"},
+            {"caption": "No", "value": "no"}])
+    if case == "invalid_group":
+        question = _question(type="checkbox_group", options=["Synthetic A", "Synthetic B"])
+    if case == "ineligible_skip":
+        question = _question(requiredness="required")
+    row = _gate(stores, question, generation=case != "generationless")
+    tokens = _tokens(row)
+    body = {"disposition": "answer", "answer": "Synthetic Name", **tokens}
+    if case == "stale_generation":
+        body["expected_gate_generation"] = "stale-synthetic-generation"
+    if case == "foreign_identity":
+        body["expected_question_identity"] = forms.owner_question_identity(
+            PK, _question(selector="body > synthetic-other"))
+    if case == "generationless":
+        body["expected_gate_generation"] = "synthetic-pre-upgrade"
+        body["expected_question_identity"] = forms.owner_question_identity(PK, question)
+    if case == "invalid_checkbox":
+        body["answer"] = "maybe"
+    if case == "invalid_radio":
+        body["answer"] = "Neither"
+    if case == "invalid_group":
+        body["answer"] = '["Synthetic A", "Synthetic A"]'
+    if case == "ineligible_skip":
+        body = {"disposition": "skip", **tokens}
+    if case == "missing_gate":
+        stores.tracking.set_status(PK, Status.NEEDS_HUMAN,
+                                   gate_reason="owner_question", gate_pending={},
+                                   gate_call_id=None, gate_source=None)
+    before = deepcopy(stores.tracking.get(PK))
+    ack, results = _post(body)
+    assert ack == {"ok": True, "status": "resuming"}
+    assert len(results) == 1 and results[0]["result"] == "gated"
+    assert results[0]["reason"] == "invalid_answer"
+    payload = _refusal_event(attempts)
+    assert payload["same_pending_gate_at_emit"] is (case in (
+        "invalid_checkbox", "invalid_radio", "invalid_group", "ineligible_skip"))
+    assert stores.tracking.get(PK) == before
+    assert stores.answer_bank.puts == [] and _queued(queue) == []
+    delivered = events.recent(400)
+    assert len(delivered) == 1
+    assert delivered[0]["kind"] == "response"
+    assert delivered[0]["resume_answer_refused"] is True
+    assert delivered[0]["same_pending_gate_at_emit"] is payload["same_pending_gate_at_emit"]
+    assert "Synthetic Name" not in str(delivered[0])
+
+
+def test_background_wrapper_keeps_original_return_and_one_resume_invocation(world, monkeypatch):
+    stores, queue = world
+    attempts, _ = _record_refusals(world, monkeypatch)
+    row = _gate(stores)
+    original = run.resume_job
+    calls = []
+
+    def exactly_once(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run, "resume_job", exactly_once)
+    body = {"disposition": "answer", "answer": "Synthetic Name",
+            **_tokens(row)}
+    body["expected_gate_generation"] = "stale-synthetic-generation"
+    background = BackgroundTasks()
+    assert _endpoint()(PK, body, background) == {"ok": True, "status": "resuming"}
+    assert len(background.tasks) == 1
+    result = background.tasks[0].func(*background.tasks[0].args,
+                                      **background.tasks[0].kwargs)
+    assert len(calls) == 1
+    assert result == {"result": "gated", "pk": PK, "reason": "invalid_answer",
+                      "detail": result["detail"]}
+    assert len(attempts) == 1 and not _queued(queue)
+    assert stores.answer_bank.puts == []
+
+    # The immediate syntax gate never schedules or reports anything.
+    background = BackgroundTasks()
+    assert _endpoint()(PK, {"disposition": "answer", "answer": ""}, background) == {
+        "ok": False, "error": "invalid_answer"}
+    assert len(background.tasks) == 0 and len(calls) == 1 and len(attempts) == 1
+
+
+def test_late_generation_a_cas_loser_reports_history_not_new_question(world, monkeypatch):
+    stores, queue = world
+    attempts, _ = _record_refusals(world, monkeypatch)
+    a = _gate(stores)
+    tokens = _tokens(a)
+    original = run.resume_job
+    won = []
+    b_rows = []
+
+    def race(pk, answer, **kwargs):
+        # Another actor wins the one-winner CAS, then a different owner gate B
+        # is issued before the losing background task can report its result.
+        won.append(original(pk, "", stores, disposition="skip", **tokens))
+        b_rows.append(_gate(stores, _question(
+            label="Synthetic next question", question="Synthetic next question")))
+        return original(pk, answer, stores, **kwargs)
+
+    monkeypatch.setattr(run, "resume_job", race)
+    ack, results = _post({"disposition": "answer", "answer": "Synthetic Name", **tokens})
+    assert ack["status"] == "resuming"
+    assert len(won) == 1 and won[0]["result"] == "queued"
+    assert len(results) == 1 and results[0]["reason"] == "invalid_answer"
+    assert _refusal_event(attempts)["same_pending_gate_at_emit"] is False
+    assert stores.tracking.get(PK) == b_rows[0]
+    assert b_rows[0]["gate_pending"]["generation"] != a["gate_pending"]["generation"]
+    assert stores.answer_bank.puts == [] and _queued(queue) == [PK]
+
+
+def test_telemetry_failure_cannot_replace_result_or_retry(world, monkeypatch):
+    from core import events
+
+    stores, queue = world
+    row = _gate(stores)
+    body = {"disposition": "answer", "answer": "Synthetic Name",
+            **_tokens(row)}
+    body["expected_gate_generation"] = "stale-synthetic-generation"
+    before = deepcopy(stores.tracking.get(PK))
+    attempted = []
+    original = run.resume_job
+    resumed = []
+
+    def one_resume(*args, **kwargs):
+        resumed.append(True)
+        return original(*args, **kwargs)
+
+    def failed_emit(*args, **kwargs):
+        attempted.append((args, kwargs))
+        raise RuntimeError("synthetic telemetry failure")
+
+    monkeypatch.setattr(run, "resume_job", one_resume)
+    monkeypatch.setattr(events, "emit", failed_emit)
+    _, results = _post(body)
+    assert len(results) == 1 and results[0]["reason"] == "invalid_answer"
+    assert len(resumed) == len(attempted) == 1
+    assert stores.tracking.get(PK) == before
+    assert stores.answer_bank.puts == [] and _queued(queue) == []
+
+
+@pytest.mark.parametrize("case", ["answer", "skip", "safe_decline", "legacy",
+                                   "not_gated", "post_consume_queue_error"])
+def test_non_pre_effect_refusals_never_acquire_diagnostic_marker(world, monkeypatch, case):
+    stores, queue = world
+    attempts, _ = _record_refusals(world, monkeypatch)
+    if case == "not_gated":
+        ack, results = _post({"answer": "approved"})
+        assert ack["ok"] and results[0]["result"] == "not_gated"
+    elif case == "legacy":
+        stores.tracking.set_status(PK, Status.NEEDS_HUMAN, gate_reason="approval",
+                                   gate_call_id="synthetic-call", gate_source="applier",
+                                   gate_pending={"question": "Ready to apply? Synthetic."})
+        _, results = _post({"answer": "approved"})
+        assert results[0]["result"] == "queued"
+    else:
+        question = _question(
+            type="checkbox", control_label="Synthetic required assent",
+            requiredness="required") if case == "safe_decline" else _question()
+        old = _gate(stores, question)
+        body = {"disposition": "skip" if case == "skip" else "answer", **_tokens(old)}
+        if case != "skip":
+            body["answer"] = "no" if case == "safe_decline" else "Synthetic Name"
+        if case == "post_consume_queue_error":
+            def broken(self, *args, **kwargs):
+                raise ConnectionError("synthetic queue failure")
+            monkeypatch.setattr(ApplyQueue, "put", broken)
+        _, results = _post(body)
+        assert len(results) == 1
+        assert results[0]["result"] == ("gated" if case == "safe_decline"
+                                         else "error" if case == "post_consume_queue_error"
+                                         else "queued")
+        if case == "safe_decline":
+            assert results[0]["reason"] == "cannot_proceed"
+    assert attempts == [], "success, consumed safe decline and queue errors are not refusals"
+
+
+def test_global_400_sse_replay_does_not_expand_to_2000_job_log(world, monkeypatch):
+    from core import events
+
+    stores, _ = world
+    _, redis = _record_refusals(world, monkeypatch)
+    refusal = {"kind": "response", "pk": PK, "detail": "Owner reply not accepted.",
+               "at": "2026-01-01T00:00:00+00:00", "resume_answer_refused": True,
+               "refusal_reason": "invalid_answer", "same_pending_gate_at_emit": False}
+    redis.lpush(events.HISTORY, json.dumps(refusal))
+    for n in range(399):
+        redis.lpush(events.HISTORY, json.dumps({
+            "kind": "step", "pk": "example-co#other", "detail": str(n)}))
+    assert any(e.get("resume_answer_refused") for e in events.recent(400))
+    redis.lpush(events.HISTORY, json.dumps({
+        "kind": "step", "pk": "example-co#other", "detail": "400"}))
+    assert not any(e.get("resume_answer_refused") for e in events.recent(400))
+    job_log = next(r.endpoint for r in server.create_app().routes
+                   if getattr(r, "path", "") == "/job-log/{pk:path}")
+    assert job_log(PK)["events"] == [refusal]
+    for n in range(1601):
+        redis.lpush(events.HISTORY, json.dumps({
+            "kind": "step", "pk": "example-co#other", "detail": str(n)}))
+    assert not any(e.get("resume_answer_refused") for e in job_log(PK)["events"])

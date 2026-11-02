@@ -572,14 +572,26 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     return result
 
 
-async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
-    """Select guarded JD while retaining original-source provenance.
+async def _jd_meta(row: dict, *, yielding: bool = True,
+                   approval: bool = False) -> dict:
+    """Select guarded JD; direct approval requires the raw current source.
 
-    Directory-scan plaintext (even >400 chars) cannot become clean without
-    rereading matching ATS HTML. Legacy strings are kept as unchecked evidence
-    if the reader fails; no unfiltered fallback enters a model.
+    Other readers retain the existing cached/fallback selection contract.
+    Approval never substitutes that cache for a witnessed read.
     """
     from tools import jd as _jd, posting_guard as pg
+
+    if approval:
+        url = row.get("jd_url") or ""
+        if not url:
+            raise _jd.PostingReadUnavailable("Missing tracked posting URL")
+        fresh = await asyncio.to_thread(_jd.fetch_jd_meta, url, "jd")
+        if (not isinstance(fresh, dict)
+                or not isinstance(fresh.get("text"), str)
+                or not pg.valid(fresh["text"], fresh.get("posting_guard"))
+                or not _jd.matched_source_witness(row, fresh)):
+            raise _jd.PostingReadUnavailable("No complete matching posting source")
+        return fresh
 
     captured = row.get("jd_text") or ""
     old = row.get("posting_guard")
@@ -624,38 +636,44 @@ async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
 
 def _commit_posting_meta(pk: str, observed: dict, meta: dict,
                          stores: Any) -> dict | None:
-    """Commit sanitized text and evidence together, never after a stale read."""
+    """Commit sanitized text and evidence against the pre-read observation."""
+    from core.storage.base import guard_observation_matches
     from tools import posting_guard as pg
 
     current = stores.tracking.get_current(pk)
     if (not current or current.get("pk") != pk
-            or current.get("status") != observed.get("status")
-            or current.get("jd_url") != observed.get("jd_url")
+            or not guard_observation_matches(current, observed)
             or _reader_witness(current) != _reader_witness(observed)
+            or submit_hold.blocked(pk, current, tracking=stores.tracking)
             or not pg.valid(meta.get("text"), meta.get("posting_guard"))):
         return None
     from tools import jd as _jd
 
-    source_witness = _jd.matched_source_witness(current, meta)
-    # The job title is also untrusted source text and appears in the initial
-    # evaluator prompt. Fold any title finding into the exact JD generation.
+    source_witness = _jd.matched_source_witness(observed, meta)
+    # The job title is also untrusted and belongs to the bound JD generation.
     title_seen = pg.analyze(current.get("title") or "")
     if title_seen["posting_guard"]["reasons"]:
         meta = {**meta, **pg.merge(meta["text"],
                                    title_seen["posting_guard"],
                                    meta["posting_guard"],
                                    source_witness=source_witness)}
+    old_meta = current.get("posting_guard")
+    if not pg.valid(current.get("jd_text") or "", old_meta):
+        old_meta = pg.projection(current.get("jd_text") or "", old_meta)["posting_guard"]
+    expected = pg.merge(meta["text"], meta["posting_guard"], old_meta,
+                        source_witness=source_witness)
     if not stores.tracking.update_posting_guard(
-            pk, current, meta, source_witness=source_witness):
+            pk, observed, meta, source_witness=source_witness):
         return None
     updated = stores.tracking.get_current(pk)
-    return updated if (updated and updated.get("pk") == pk
-                       and updated.get("status") == observed.get("status")
+    expected_row = {**observed, "jd_text": expected["text"],
+                    "posting_guard": expected["posting_guard"]}
+    return updated if (updated and guard_observation_matches(updated, expected_row)
+                       and _reader_witness(updated) == _reader_witness(observed)
                        and pg.valid(updated.get("jd_text") or "",
                                     updated.get("posting_guard"))) else None
 
-
-def _guard_refusal(pk: str, stores: Any) -> dict:
+def _guard_refusal(pk: str, stores: Any, *, observed: dict | None = None) -> dict:
     """Conditionally undo a *pre-browser* SUBMITTING claim without lost flags."""
     from tools import posting_guard as pg
 
@@ -671,6 +689,13 @@ def _guard_refusal(pk: str, stores: Any) -> dict:
                 or current.get("gate_reason") == "submit_uncertain"):
             return {"result": "failed", "pk": pk, "reason": "uncertain",
                     "detail": submit_hold.REASON}
+        if observed is not None:
+            from core.storage.base import guard_observation_matches
+
+            if (not guard_observation_matches(current, observed)
+                    or _reader_witness(current) != _reader_witness(observed)):
+                return {"result": "conflict", "pk": pk,
+                        "reason": "posting_guard_state_changed"}
         if current.get("status") == "submitting":
             ok = stores.tracking.update_posting_guard(
                 pk, current, settle_refusal=True)
@@ -702,6 +727,51 @@ def _guard_refusal(pk: str, stores: Any) -> dict:
                 "reason": "posting_guard_state_changed"}
     return {"result": "gated", "pk": pk, "reason": reason,
             "detail": "Current posting generation requires job-specific review."}
+
+
+def _direct_approval_check(pk: str, expected: dict,
+                           stores: Any) -> tuple[dict | None, dict | None]:
+    """A row/hold check tied to this approval's immutable observation."""
+    from core.storage.base import guard_observation_matches
+
+    current = stores.tracking.get_current(pk)
+    if not current:
+        return {"result": "conflict", "pk": pk,
+                "reason": "posting_guard_state_changed"}, None
+    if (submit_hold.blocked(pk, current, tracking=stores.tracking)
+            or current.get("confirmation_id")):
+        return {"result": "failed", "pk": pk, "reason": "uncertain",
+                "detail": submit_hold.REASON}, current
+    if current.get("status") in ("applied", "applied_manual"):
+        return {"result": "duplicate", "pk": pk,
+                "reason": "already_applied"}, current
+    if (not guard_observation_matches(current, expected)
+            or _reader_witness(current) != _reader_witness(expected)):
+        return {"result": "conflict", "pk": pk,
+                "reason": "posting_guard_state_changed"}, current
+    return None, current
+
+
+def _approval_old_evidence_safe(row: dict) -> bool:
+    """A legacy projection may lose HTML-only positives: never promote those."""
+    from tools import posting_guard as pg
+
+    old = row.get("posting_guard")
+    if pg.valid(row.get("jd_text") or "", old):
+        return True
+    if not isinstance(old, dict):
+        return False
+    reasons = old.get("reasons")
+    # Only an identifiable older, internally coherent nonpositive revision can
+    # be reevaluated. Corrupt current revisions and unknown evidence stay gated.
+    return (isinstance(old.get("revision"), str)
+            and bool(old["revision"]) and old["revision"] != pg.REVISION
+            and isinstance(old.get("generation"), str)
+            and bool(old["generation"])
+            and type(old.get("source_verified")) is bool
+            and reasons in ([], ["source_html_unavailable"])
+            and old.get("status") == (
+                "unchecked" if reasons else "clean"))
 
 
 async def _jd_text(row: dict, *, yielding: bool = True) -> str:
@@ -1757,28 +1827,51 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
     stores.tracking.set_status(pk, Status.SUBMITTING, gate_reason="")
     emit("running", pk=pk, agent="applier", detail="reading the posting…", url=jd_url)
 
+    # set_status does not claim guard/JD ownership. Freeze the post-claim row,
+    # comparing it to the pre-claim approval before the slow source read.
+    expected_claim = {**row, "status": Status.SUBMITTING.value, "gate_reason": ""}
+    changed, observed = _direct_approval_check(pk, expected_claim, stores)
+    if changed:
+        return changed
+
     try:
-        jd_meta = await _jd_meta(row, yielding=False)
-        jd_text = jd_meta["text"]
-        current = stores.tracking.get_current(pk)
-        if (not current or current.get("status") != Status.SUBMITTING.value):
-            return {"result": "gated", "pk": pk, "reason": "posting_guard_state_changed"}
-        guarded = _commit_posting_meta(pk, current, jd_meta, stores)
+        jd_meta = await _jd_meta(row, yielding=False, approval=True)
+        changed, _ = _direct_approval_check(pk, observed, stores)
+        if changed:
+            return changed
+        from tools import posting_guard as pg
+
+        # This PDF was tailored to the captured JD. A different posting must
+        # be prepared afresh; updating JD here would falsely certify that PDF.
+        baseline = pg.analyze(row.get("jd_text") or "",
+                              strip_trailing=True)["text"]
+        incoming = pg.analyze(jd_meta["text"], strip_trailing=True)["text"]
+        if incoming != baseline or not _approval_old_evidence_safe(row):
+            return _guard_refusal(pk, stores, observed=observed)
+
+        guarded = _commit_posting_meta(pk, observed, jd_meta, stores)
         if guarded is None:
-            return _guard_refusal(pk, stores)
+            changed, _ = _direct_approval_check(pk, observed, stores)
+            return changed or {"result": "conflict", "pk": pk,
+                               "reason": "posting_guard_state_changed"}
         row = guarded
         jd_text = row.get("jd_text") or ""
-        from tools import posting_guard as pg
-        if not pg.authorised(row, text=jd_text):
-            return _guard_refusal(pk, stores)
-    except Exception as exc:  # noqa: BLE001
-        # A failed guard/read is pre-browser, but a concurrent submission hold
-        # or human/terminal update still outranks any restoration attempt.
+        # Approval deliberately does not inherit the hidden-only / previously
+        # reviewed generation exemptions of other posting_guard callers.
+        if (jd_meta["posting_guard"]["status"] != "clean"
+                or row["posting_guard"]["status"] != "clean"
+                or not pg.authorised(row, text=jd_text)):
+            return _guard_refusal(pk, stores, observed=row)
+        changed, _ = _direct_approval_check(pk, row, stores)
+        if changed:
+            return changed
+    except Exception:  # noqa: BLE001
+        # A reader failure is not permission to use cached verified metadata.
+        # Refusal must compare the original claim, not settle a newer owner.
         log.exception("guarded JD fetch failed for pk=%s", pk)
         emit("error", pk=pk, agent="applier", url=jd_url,
              detail="Posting could not be safely inspected; current review required.")
-        return _guard_refusal(pk, stores)
-
+        return _guard_refusal(pk, stores, observed=observed)
     if _no_sponsorship(jd_text):  # don't submit an application that's a guaranteed no
         from core.events import emit
         stores.tracking.set_status(pk, Status.FAILED, fail_reason=_NO_SPONSOR_REASON,
@@ -1831,6 +1924,11 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         except Exception:
             pass
 
+    # Rotation/profile preparation may take time. No source proof can waive a
+    # later row change or independent durable submission hold at admission.
+    changed, _ = _direct_approval_check(pk, row, stores)
+    if changed:
+        return changed
     emit("running", pk=pk, agent="applier", detail="filling the form…", url=jd_url)
 
     result = await browser_apply(

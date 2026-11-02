@@ -120,25 +120,21 @@ async def test_read_only_recognition_does_not_cache_missing_error_admission(
     assert session.calls == []
 
 
-async def test_missing_error_preserves_approved_receipt_and_literal_readbacks(phone_grants):
-    session, filled = PhoneSession(countryErrorAbsent=True), {}
-    receipt = await choose_country(session, phone_grants[0], filled)
+async def test_missing_error_does_not_waive_final_inventory_or_file_proof():
+    """A model ledger and a guessed picker caption are not current evidence.
+
+    An absent ARIA error reference leaves the independent readers opaque.
+    Only the one final Submit check can refuse it; no old option receipt or
+    per-widget grant is required in the preparation flow.
+    """
+    session = PhoneSession(countryErrorAbsent=True)
     page, _ = await forms._observe_controls(session, await session.page())
-    # The reversible picker option was clicked with an exact grant. A missing
-    # referenced native receiver still refuses at final Submit, with no second
-    # option click and no fabricated submitted-value evidence.
-    assert receipt['action'] == 'combobox'
-    assert receipt['committed_caption'] == receipt['committed_value'] == 'Approved country'
-    graph = combo({'page': page}, 'country')['combobox']
-    assert graph.get('selected_value', '') == ''
-    with pytest.raises(forms.Gate, match='form inventory is incomplete'):
-        forms.check_form(page, filled, True, receipts=[receipt])
-    with pytest.raises(forms.Gate):
-        forms.check_approvals('example-co#1', [receipt], page)
-    assert session.calls == [
-        ('click', '#country'),
-        ('fill', '#country', '--value', 'Approved country'),
-        ('click', '#country-option')]
+    assert page['opaque_controls'] is True
+    assert page['inventory_verified'] is False
+    filled = {'#country': 'Approved country'}  # deliberately untrusted ledger
+    with pytest.raises(forms.Gate, match='final application inventory'):
+        forms.check_form(page, filled, True, 'Test User.pdf')
+    assert session.calls == []
 
 
 @pytest.mark.parametrize('source', ['_closed_form', '_greenhouse_form'])

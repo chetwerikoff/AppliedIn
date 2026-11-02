@@ -135,7 +135,10 @@ def _world(monkeypatch, tmp_path, *, drift=None, ats=''):
 @pytest.mark.parametrize('drift', [None, 'approval', 'job', 'url', 'ats', 'lease', 'posting',
                                  'answer', 'attachment', 'receiver'])
 async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, tmp_path, drift):
-    """A valid own hold permits one IPC; hold-time authority changes permit none."""
+    """After the own hold, real job/tenant/lease/page changes prevent IPC.
+
+    A stale per-control human approval is inert in the final-only design.
+    """
     def change(row, page, redis, configs):
         if drift == 'approval':
             row['human_approved_answers']['Email']['value'] = 'other@example.test'
@@ -159,9 +162,10 @@ async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, 
 
     row, page, tracking, raw, effects, pdf = _world(
         monkeypatch, tmp_path, drift=change if drift else None)
+    # apply() itself stages and uploads the unique current PDF before asking
+    # the model; it must never request a second upload for the same attempt.
     actions = iter([
         {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'upload', 'selector': '#resume'},
         {'action': 'submit', 'selector': '#submit'},
     ])
 
@@ -175,9 +179,10 @@ async def test_actual_apply_raw_producer_checks_own_hold_and_drift(monkeypatch, 
     monkeypatch.setattr(forms.asyncio, 'sleep', no_wait)
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
-    assert result['status'] == ('gate' if drift else 'applied'), result
-    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')] + (
-        [] if drift else [('click', '#submit')])
+    real_drift = drift not in {None, 'approval'}
+    assert result['status'] == ('gate' if real_drift else 'applied'), result
+    assert effects == [('navigate', URL), ('upload', '#resume'), ('fill', '#email')] + (
+        [] if real_drift else [('click', '#submit')])
     assert submit_hold.is_held(PK, tracking=tracking)
     assert row['status'] == 'needs_human'
     # Session teardown owns only the per-attempt snapshot, never the row PDF.
@@ -267,7 +272,7 @@ async def test_raw_final_guard_rechecks_tenant_after_own_hold(monkeypatch, tmp_p
         await raw.application_effect('upload', '#resume', '--file',
                                      controller.resume_path, timeout=130)
         if drift:
-            with pytest.raises(forms.Gate, match='tenant or board changed after the hold'):
+            with pytest.raises(forms.Gate, match='ATS tenant changed after the own submission hold'):
                 await raw.application_effect('click', '#submit')
         else:
             await raw.application_effect('click', '#submit')
@@ -289,8 +294,9 @@ async def test_final_receiver_change_never_creates_hold_or_click(monkeypatch, tm
         PK, COMPANY, URL, pdf, {}, {}, [], {}, lambda: None)
     raw.id = 'synthetic-session'
     raw.bind_application_controller(controller)
-    with pytest.raises(forms.Gate, match='Final submit receiver'):
+    with pytest.raises(forms.PreSubmitGate) as error:
         await raw.application_effect('click', '#submit')
+    assert error.value.item == 1
     assert effects == []
     assert not submit_hold.is_held(PK, tracking=tracking)
 
@@ -301,14 +307,16 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
         monkeypatch, tmp_path, confirmed):
     """The real formless facade must reach the same production raw-IPC verdict."""
     from tests.tools.test_browser_formless import (
-        RootSession, observed, approve_fields, action_sequence, effect_calls,
+        RootSession, observed, action_sequence, effect_calls,
     )
 
     row, _, tracking, raw, _, pdf = _world(monkeypatch, tmp_path, ats='ashby')
     current, fixed = observed()
     spy = RootSession(current, fixed)
     provenance = forms._configured_alias(row['pk'], COMPANY, row['jd_url'])
-    facts = approve_fields(row, current, fixed, provenance)
+    # Owner facts are ordinary preparation inputs; the removed per-receiver
+    # approval/witness synthesizer is neither needed nor valid here.
+    facts = {'Name': 'Test User', 'Email': 'test@example-co.test'}
     if confirmed:
         after, after_fixed = deepcopy(current), deepcopy(fixed)
         for snapshot in (after, after_fixed):
@@ -338,40 +346,56 @@ async def test_formless_apply_uses_bound_raw_controller_not_legacy_permit(
     result = await forms.apply(row['jd_url'], COMPANY, facts, 'synthetic',
                                pk=row['pk'], resume_path=pdf)
     effects = [c[:2] for c in effect_calls(spy.calls)]
-    assert effects == [('fill', '#_systemfield_name'), ('fill', '#_systemfield_email'),
-                       ('set', Path(pdf).name), ('click', '#structural-submit')], result
+    # The production facade may fill ordinary fields before the sole raw-IPC
+    # Submit check. Keep their real effects and the independent outcome test.
+    assert effects == [('set', Path(pdf).name),
+                       ('fill', '#_systemfield_name'),
+                       ('fill', '#_systemfield_email'),
+                       ('click', '#structural-submit')], result
     assert result['status'] == ('applied' if confirmed else 'uncertain'), result
+    if confirmed:
+        assert result['confirmation'] == 'Thank you for applying'
+    else:
+        assert 'confirmation' not in result
     assert submit_hold.is_held(row['pk'], tracking=tracking)
     assert raw._application_controller.committed
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('action', ['fill', 'upload'])
-@pytest.mark.parametrize('wall', ['password', 'challenge'])
-async def test_raw_preparation_never_bypasses_authentication_wall(
-        monkeypatch, tmp_path, action, wall):
-    """Generic fallback skips old shape certificates, never login/CAPTCHA safety."""
+async def test_normal_preparation_never_automates_an_account_form(
+        monkeypatch, tmp_path, action):
+    """The existing execute() account boundary blocks model-selected login work."""
     row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
-
-    controller = forms.ApplicationIPCController(
-        PK, COMPANY, URL, pdf, {'Email': 'test@example.test'}, {}, [], {}, lambda: None)
-    raw.bind_application_controller(controller)
-    raw.id = 'synthetic-session'
-    if wall == 'password':
-        page['controls'].append(field(selector='#password', label='Password', type='password'))
-    else:
-        page['entry'] = {'helper_challenge': True}
-    # Direct producer calls cannot borrow execute()/bootstrap's earlier checks.
-    with pytest.raises(forms.Gate, match='Sign in yourself' if wall == 'password' else 'challenge'):
-        await raw.application_effect(
-            action, '#email' if action == 'fill' else '#resume',
-            '--value' if action == 'fill' else '--file',
-            'test@example.test' if action == 'fill' else controller.resume_path,
-            **({} if action == 'fill' else {'timeout': 130}))
+    page['controls'].append(field(
+        selector='#password', label='Password', type='password'))
+    selected = '#email' if action == 'fill' else '#resume'
+    with pytest.raises(forms.Gate, match='An owner account action is required'):
+        await forms.execute(
+            raw, page, {'action': action, 'selector': selected,
+                        **({'fact': 'Email'} if action == 'fill' else {})},
+            facts={'Email': 'test@example.test'}, filled={},
+            resume_path=pdf, company=COMPANY, jd_text='',
+            resume_tex='', github='', pk=PK, job_url=URL)
     assert effects == []
-    assert not controller.upload_completed
-    assert not controller.committed
     assert not submit_hold.is_held(PK, tracking=tracking)
+
+
+def test_entry_safety_precedes_any_captcha_form_preparation(monkeypatch, tmp_path):
+    """A reader-positive CAPTCHA has priority even without a stable form root."""
+    row, page, tracking, raw, effects, pdf = _world(
+        monkeypatch, tmp_path, ats='ashby')
+    page['entry'] = {
+        'root': None, 'frames': [{'status': 'visible-hcaptcha'}],
+        'responses': [], 'response_error': False, 'helper_challenge': False,
+    }
+    provenance = forms.ApplicationEntryProvenance(
+        row['pk'], COMPANY, 'ashby', row['job_id'],
+        row['jd_url'], COMPANY, page['url'])
+    with pytest.raises(forms.CaptchaGate, match='visible hCaptcha'):
+        forms._entry_safety(page, lambda href: href == page['url'],
+                            provenance, readiness=True)
+    assert effects == []
 
 
 @pytest.mark.asyncio
@@ -384,8 +408,9 @@ async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
     for control in page['controls']:
         control['form_action'] = url
     row['human_approved_answers']['Email'].update(url=url, form_action=url)
+    # apply() already attaches the unique PDF; a second model upload is not
+    # an authorization step and would intentionally be refused by raw IPC.
     actions = iter([dict(action='fill', selector='#email', fact='Email'),
-                    dict(action='upload', selector='#resume'),
                     dict(action='submit', selector='#submit')])
     async def decide(*args, **kwargs):
         return next(actions)
@@ -393,24 +418,9 @@ async def test_missing_greenhouse_metadata_prepares_but_cannot_omit_final_alias(
     result = await forms.apply(url, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert result['reason'] == 'defect_tenant'
-    assert effects == [('navigate', url), ('fill', '#email'), ('upload', '#resume')]
+    assert result.get('item') == 1
+    assert result['reason'] == 'defect_pre_submit_item_1'
+    assert effects == [('navigate', url), ('upload', '#resume'), ('fill', '#email')]
     assert not raw._application_controller.committed
     assert not submit_hold.is_held(PK, tracking=tracking)
 
-
-@pytest.mark.asyncio
-async def test_upload_preserves_raw_challenge_refusal(monkeypatch, tmp_path):
-    """A raw no-IPC CAPTCHA refusal must retain its named manual next step."""
-    row, page, tracking, raw, effects, pdf = _world(monkeypatch, tmp_path)
-    async def decide(*args, **kwargs):
-        page['entry'] = {'helper_challenge': True}
-        return dict(action='upload', selector='#resume')
-    monkeypatch.setattr(bsk, 'decision', decide)
-    result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
-                               'synthetic', pk=PK, resume_path=pdf)
-    assert result['status'] == 'gate', result
-    assert 'Visible application challenge requires manual authentication' in result['question']
-    assert effects == [('navigate', URL)]
-    assert not raw._application_controller.upload_completed
-    assert not submit_hold.is_held(PK, tracking=tracking)

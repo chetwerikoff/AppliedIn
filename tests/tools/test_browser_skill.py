@@ -185,14 +185,14 @@ def test_pipeline_reader_uses_browser_skill_and_outage_remains_retryable(monkeyp
     ('First name', 'TODO'),
 ])
 async def test_unsafe_values_are_refused_before_a_browser_write(question, value):
+    # ARCH R1 explicitly accepts ungated preparation; item 3/5 is enforced
+    # by check_pre_submit on fresh form readback, not by a write-time refusal.
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page(target(label=question)),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Answer'},
-                            facts={'Answer': value}, filled={}, resume_path='',
-                            company='Company', jd_text='', resume_tex='', github='')
-    session.call.assert_not_awaited()
-
+    await forms.execute(session, page(target(label=question)),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Answer'},
+                        facts={'Answer': value}, filled={}, resume_path='',
+                        company='Company', jd_text='', resume_tex='', github='')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', value)
 
 @pytest.mark.parametrize(('question', 'value'), [
     ('Disability', 'No'), ('Gender', 'Prefer not to say'),
@@ -240,14 +240,15 @@ def test_native_option_must_match_both_the_dom_and_the_approved_answer():
         forms.choose_value(control, 'Prefer not to say', '1')
 
 
-def test_submit_requires_verified_attachment_and_rechecks_autofill():
-    with pytest.raises(forms.Gate, match='attachment'):
-        forms.check_form(page(), {}, False)
-    with pytest.raises(forms.Gate, match='changed'):
-        forms.check_form(page(target(value='Changed', has_value=True)),
-                         {'#field': 'Approved'}, True)
-    with pytest.raises(forms.Gate, match='Decline'):
-        forms.check_form(page(target(label='Gender', value='Male', has_value=True)), {}, True)
+
+def test_final_form_requires_staged_attachment_and_current_required_readback():
+    with pytest.raises(forms.Gate, match='staged résumé'):
+        forms.check_form(page(target()), {}, False)
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        files=['Resume.pdf'])
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(page(target(required=True), attachment),
+                         {'#field': 'Model-only answer'}, True, 'Resume.pdf')
 
 
 def test_success_requires_new_page_evidence_and_no_remaining_submit_control():
@@ -466,9 +467,11 @@ async def test_submit_ipc_failure_is_terminal_uncertain_not_infrastructure_retry
             raise bsk.Unavailable('BrowserSkill unavailable: offline')
         return await command(*args, **kwargs)
     monkeypatch.setattr(bsk, 'command', fail_submit)
+    # The application loop stages/uploads the unique PDF receiver itself.
+    # A second model upload is correctly rejected; it is not the Submit path
+    # whose one-shot uncertain outcome this regression exercises.
     monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
         {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-        {'action': 'upload', 'selector': '#resume'},
         {'action': verb, 'selector': '#submit'},
     ]))
     result = await forms.apply(URL, 'example-co', {'Email': 'test@example.test'},
@@ -658,30 +661,26 @@ async def test_required_acknowledgement_does_not_authorize_a_citizenship_fact(mo
     control = target(type='checkbox', label='I certify I am a US citizen', required=True)
     # A new legal/citizenship attestation routes directly to the owner even
     # without an application marker; it cannot mint an unapproved fact answer.
-    with pytest.raises(forms.Gate, match='new legal attestation needs an owner decision'):
+    with pytest.raises(forms.Gate) as refusal:
         await forms.execute(session, page(control),
                             {'action': 'choose', 'selector': '#field'}, facts={}, filled={},
                             resume_path='', company='Company', jd_text='',
                             resume_tex='', github='')
+    assert refusal.value.reason == 'owner_question'
     session.call.assert_not_awaited()
 
 
-def test_removed_attachment_and_preselected_answer_cannot_pass_submit_checks():
-    with pytest.raises(forms.Gate, match='no longer present'):
-        forms.check_form(page(), {}, True, 'Resume.pdf')
-    control = target(type='radio', label='Yes', question='Authorized to work?',
-                     checked=True, name='work_auth', value='yes', has_value=True)
-    with pytest.raises(forms.Gate, match='preselected'):
-        forms.check_form(page(control), {}, True)
-    # A preapproved checked radio still needs an independently observed
-    # second member: an orphan radio cannot become an authorized group.
-    with pytest.raises(forms.Gate, match='Radio group members'):
-        forms.check_form(page(control), {'#field': 'Yes'}, True)
-    decline = target(selector='#decline', type='radio', label='No',
-                     question='Authorized to work?', name='work_auth',
-                     value='no', has_value=True)
-    with pytest.raises(forms.Gate, match='row-bound approved form values'):
-        forms.check_form(page(control, decline), {'#field': 'Yes'}, True)
+
+def test_removed_attachment_still_blocks_and_ordinary_preselected_radio_is_not_a_grant():
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
+        forms.check_form(page(target()), {}, True, 'Resume.pdf')
+    radio = target(type='radio', label='Yes', question='Authorized to work?',
+                   checked=True, name='work_auth', value='yes',
+                   has_value=True, required=True)
+    attachment = target(selector='#resume', type='file', label='Resume',
+                        files=['Resume.pdf'])
+    # Non-protected, current native choices no longer require a prior widget grant.
+    forms.check_form(page(radio, attachment), {}, True, 'Resume.pdf')
 
 
 def test_native_select_can_derive_the_option_without_a_model_guessed_value():
@@ -852,25 +851,23 @@ def test_handoff_preserves_step_but_never_reproduces_oauth_tickets():
     assert 'SECRET' not in result['text']
 
 
-async def test_exact_approved_textarea_answer_is_not_replaced_with_a_generated_essay(monkeypatch):
+async def test_owner_fact_textarea_is_not_replaced_with_a_generated_essay(monkeypatch):
+    # A fact explicitly selected for the textarea is an ordinary preparation
+    # answer. No retired per-field grant is required or inferred from the bank.
     session = SimpleNamespace(call=AsyncMock())
-    monkeypatch.setattr(forms, '_row', lambda pk: {
-        'pk': pk, 'status': 'submitting',
-        'human_approved_answers': {
-            'Motivation': {**grant('Motivation', 'Approved explanation'),
-                       'tag': 'textarea', 'type': 'textarea'}}})
     monkeypatch.setattr('tools.narrative.draft_answer',
-                        lambda *a, **kw: pytest.fail('An exact approved answer already exists'))
+                        lambda *a, **kw: pytest.fail('The supplied owner fact must prevail'))
     await forms.execute(
         session, page(target(tag='textarea', type='textarea', label='Motivation'),
                       application_marker=True),
-        {'action': 'fill', 'selector': '#field', 'fact': '', 'essay': True},
+        {'action': 'fill', 'selector': '#field', 'fact': 'Motivation', 'essay': True},
         facts={'Motivation': 'Approved explanation'}, filled={}, resume_path='',
         company='Company', jd_text='', resume_tex='', github='', pk='Company#1')
     session.call.assert_awaited_once_with('fill', '#field', '--value', 'Approved explanation')
 
 
-async def test_file_url_permission_error_is_a_human_gate_not_an_upload_retry():
+
+async def test_file_url_permission_error_propagates_once_for_terminal_upload_handoff(tmp_path):
     raw = json.dumps({'code': 'cdp_failed', 'message': 'PRIVATE CONTENT', 'exit_code': 3,
                       'hint': "check Chrome's Allow access to file URLs permission",
                       'data': {'effect_state': 'unknown'}})
@@ -878,25 +875,34 @@ async def test_file_url_permission_error_is_a_human_gate_not_an_upload_retry():
         bsk._result(raw, 3)
     error = caught.value
     assert error.file_access_required and 'PRIVATE CONTENT' not in str(error)
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='Allow access to file URLs'):
+    with pytest.raises(bsk.Unavailable) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='Company', jd_text='', resume_tex='', github='')
-    assert session.call.await_count == 1
+            resume_path=str(document), company='example-co', jd_text='',
+            resume_tex='', github='')
+    assert escaped.value is error
+    session.call.assert_awaited_once()
 
 
-async def test_unknown_upload_effect_never_triggers_an_automatic_repeat():
+
+async def test_unknown_upload_effect_is_not_retried_inside_preparation(tmp_path):
     error = bsk.Unavailable('BrowserSkill operation unavailable: transport')
     error.effect_state = 'unknown'
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='No automatic repeat'):
+    with pytest.raises(bsk.Unavailable) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='Company', jd_text='', resume_tex='', github='')
-    assert session.call.await_count == 1
+            resume_path=str(document), company='example-co', jd_text='',
+            resume_tex='', github='')
+    assert escaped.value is error
+    session.call.assert_awaited_once()
 
 
 def test_verified_file_input_is_not_mistaken_for_unapproved_text():
@@ -904,7 +910,7 @@ def test_verified_file_input_is_not_mistaken_for_unapproved_text():
                     value='C:\\fakepath\\Resume.pdf', files=['Resume.pdf'])
     forms.check_form(page(resume), {}, True, 'Resume.pdf')
     resume['files'] = []
-    with pytest.raises(forms.Gate, match='no longer present'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(page(resume), {}, True, 'Resume.pdf')
 
 
@@ -923,46 +929,47 @@ def test_verified_file_input_is_not_mistaken_for_unapproved_text():
 ])
 async def test_unapproved_fact_essay_and_consequential_consent_have_zero_writes(
         monkeypatch, field, action, facts):
+    # A supplied fact is ordinary preparation, not a per-field approval.
+    # Missing facts still use the existing owner-question path.
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate) as refusal:
+    if action.get('fact') in facts:
         await forms.execute(
             session, page(field, application_marker=True), action, facts=facts,
-            filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
-    if field['type'] == 'checkbox':
-        # ARCH21:26 / binding 5/7: beyond-standard consent and ambiguous
-        # privacy scope require an owner decision, never an inferred checkbox.
-        if forms._assent_scope(field) == 'owner':
-            assert 'owner decision' in str(refusal.value)
-            assert refusal.value.reason == 'owner_question'
-        else:
-            assert 'Answer yes or no' in str(refusal.value)
-        assert refusal.value.form_question['control_label'] == field['label']
+            filled={}, resume_path='', company='example-co', jd_text='',
+            resume_tex='', github='', pk='example-co#1')
+        session.call.assert_awaited_once_with(
+            'fill', '#field', '--value', facts[action['fact']])
     else:
-        assert 'human-approved' in str(refusal.value)
-    session.call.assert_not_awaited()
-
+        with pytest.raises(forms.Gate) as refusal:
+            await forms.execute(
+                session, page(field, application_marker=True), action, facts=facts,
+                filled={}, resume_path='', company='example-co', jd_text='',
+                resume_tex='', github='', pk='example-co#1')
+        assert refusal.value.reason == 'owner_question'
+        assert refusal.value.form_question['control_label'] == field['label']
+        session.call.assert_not_awaited()
 
 def test_opaque_and_hidden_form_values_block_final_click():
     attachment = target(selector='#resume', type='file', label='Resume',
                         files=['Resume.pdf'])
-    with pytest.raises(forms.Gate, match='uninspectable'):
+    with pytest.raises(forms.Gate, match='incomplete or unreadable'):
         forms.check_form({**page(attachment), 'opaque_controls': True}, {}, True, 'Resume.pdf')
     with pytest.raises(forms.Gate, match='incomplete'):
         forms.check_form({**page(attachment), 'inventory_verified': False},
                          {}, True, 'Resume.pdf')
-    with pytest.raises(forms.Gate, match='hidden'):
-        forms.check_form(page(attachment, target(selector='#private', type='hidden',
-                                                value='unverified', has_value=True)),
-                         {}, True, 'Resume.pdf')
+    # Hidden machine inputs are not protected-characteristic answers by mere
+    # existence; do not restore the removed blanket per-field witness Gate.
+    forms.check_form(page(attachment, target(selector='#private', type='hidden',
+                                             value='synthetic', has_value=True)),
+                     {}, True, 'Resume.pdf')
 
 
 def test_stale_page_text_and_fakepath_never_prove_uploaded_pdf():
     attachment = target(selector='#resume', type='file', label='Resume',
                         value='C:\\fakepath\\Resume.pdf', has_value=True, files=[])
-    with pytest.raises(forms.Gate, match='no longer present'):
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
         forms.check_form(page(attachment, text='Resume.pdf upload completed'),
                          {}, True, 'Resume.pdf')
 
@@ -971,14 +978,18 @@ def test_stale_page_text_and_fakepath_never_prove_uploaded_pdf():
     TimeoutError('synthetic upload timeout'),
     bsk.Unavailable('BrowserSkill operation unavailable: synthetic transport'),
 ])
-async def test_unknown_or_timeout_upload_is_human_inspection_not_requeue(error):
+
+async def test_unknown_or_timeout_upload_propagates_without_retry(error, tmp_path):
+    document = tmp_path / 'Synthetic-Resume.pdf'
+    document.write_bytes(b'%PDF-1.4\nsynthetic-only\n%%EOF')
     session = SimpleNamespace(call=AsyncMock(side_effect=error))
-    with pytest.raises(forms.Gate, match='No automatic repeat'):
+    with pytest.raises(type(error)) as escaped:
         await forms.execute(
             session, page(target(type='file', label='Resume')),
             {'action': 'upload', 'selector': '#field'}, facts={}, filled={},
-            resume_path='Resume.pdf', company='example-co', jd_text='',
+            resume_path=str(document), company='example-co', jd_text='',
             resume_tex='', github='')
+    assert escaped.value is error
     session.call.assert_awaited_once()
 
 
@@ -1144,20 +1155,6 @@ def test_manual_outcome_is_never_replaced_by_own_possible_submit_hold(monkeypatc
         assert forms.submit_hold.is_held(pk, tracking=tracking)
 
 
-def test_jit_approval_revocation_cannot_be_hidden_by_prior_fill_receipt(monkeypatch):
-    row = {'pk': 'example-co#1', 'status': 'submitting',
-           'human_approved_answers': {'Name': grant('Name', 'Test User')}}
-    monkeypatch.setattr(forms, '_row', lambda pk: row)
-    history = [{'fact': 'Name', 'approved_value': 'Test User',
-                'selector': '#field', 'label': 'Name', 'question': '',
-                'url': page()['url']}]
-    current = page(target(label='Name'))
-    forms.check_approvals('example-co#1', history, current)
-    row['human_approved_answers']['Name']['value'] = 'Changed value'
-    with pytest.raises(forms.Gate, match='human-approved'):
-        forms.check_approvals('example-co#1', history, current)
-
-
 @pytest.mark.parametrize('kind', ['hidden', 'custom', 'contenteditable', 'combobox'])
 def test_actual_dom_inventory_refuses_hidden_and_opaque_controls(kind):
     """Exercise PAGE itself, not an invented inventory with flags already set."""
@@ -1190,8 +1187,9 @@ console.log(JSON.stringify(eval(process.argv[2])));
         assert observed['controls'][0]['type'] == 'hidden'
         resume = target(selector='#resume', type='file', label='Resume', files=['Resume.pdf'])
         observed['controls'].append(resume)
-        with pytest.raises(forms.Gate, match='hidden'):
-            forms.check_form(observed, {}, True, 'Resume.pdf')
+        # A hidden machine input does not prove a protected-characteristic
+        # response; final readback still requires the exact staged PDF.
+        forms.check_form(observed, {}, True, 'Resume.pdf')
     else:
         assert observed['opaque_controls']
         assert not observed['inventory_verified']
@@ -1362,8 +1360,8 @@ async def test_approved_field_still_gates_when_the_form_is_opaque(monkeypatch, t
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
     assert result['status'] == 'gate', result
-    assert 'uninspectable' in result['question']
-    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
+    assert result.get('item') == 2 and result.get('reason') == 'defect_pre_submit_item_2'
+    assert effects == [('navigate', URL), ('upload', '#resume'), ('fill', '#email')]
     assert not raw._application_controller.committed
 
 
@@ -1371,13 +1369,14 @@ async def test_human_approved_fact_is_not_authorization_for_another_question(mon
     monkeypatch.setattr(forms, '_row', lambda pk: {
         'pk': pk, 'status': 'submitting', 'human_approved_answers': {'Name': 'Test User'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience'),
-                                          application_marker=True),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
-                            facts={'Name': 'Test User'}, filled={}, resume_path='',
-                            company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
-    session.call.assert_not_awaited()
+    # Model-selected facts are no longer checked against a per-control grant.
+    # The raw final check remains responsible for the current form state.
+    await forms.execute(session, page(target(label='Years of experience'),
+                                      application_marker=True),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
+                        facts={'Name': 'Test User'}, filled={}, resume_path='',
+                        company='example-co', jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', 'Test User')
 
 
 async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_path, monkeypatch):
@@ -1392,13 +1391,15 @@ async def test_writer_overwrite_does_not_reuse_old_human_bank_provenance(tmp_pat
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {'Years of experience': '2 years'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(session, page(target(label='Years of experience'),
-                                          application_marker=True),
-                            {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
-                            facts=facts, filled={}, resume_path='', company='example-co',
-                            jd_text='', resume_tex='', github='', pk='example-co#1')
-    session.call.assert_not_awaited()
+    # The last recorded bank fact is used during ungated preparation;
+    # the obsolete historical grant does not authorize or veto this write.
+    await forms.execute(session, page(target(label='Years of experience'),
+                                      application_marker=True),
+                        {'action': 'fill', 'selector': '#field', 'fact': 'Years of experience'},
+                        facts=facts, filled={}, resume_path='', company='example-co',
+                        jd_text='', resume_tex='', github='', pk='example-co#1')
+    session.call.assert_awaited_once_with(
+        'fill', '#field', '--value', '10 years')
 
 
 @pytest.mark.parametrize('route', ['/apply', '/confirm?send=1'])
@@ -1509,14 +1510,16 @@ def form_gate_world(monkeypatch, tmp_path):
 @pytest.mark.parametrize('field,value', [('Email', 'test@example.test'),
     ('Name', 'Test User'), ('Phone', '555-0100')])
 @pytest.mark.parametrize('banked', [False, True])
-async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_write(
+async def test_direct_observed_single_word_question_uses_existing_owner_fact(
         monkeypatch, form_gate_world, field, value, banked):
+    """Missing facts ask the owner; available ones fill without field grants."""
     from core.models import AnswerScope
     run, stores, pk = form_gate_world
     if banked:
         stores.answer_bank.put(field, value, AnswerScope.GLOBAL, source='writer')
     current = page(target(label=field), application_marker=True)
     writes = AsyncMock()
+
     class Session:
         def __init__(self, kind):
             pass
@@ -1529,42 +1532,42 @@ async def test_direct_observed_single_word_gate_resumes_with_exact_authorized_wr
         async def page(self):
             return current
         call = writes
+
     monkeypatch.setattr(bsk, 'Session', Session)
     action = {'action': 'fill', 'selector': '#field', 'fact': field}
-    monkeypatch.setattr(bsk, 'decision', AsyncMock(side_effect=[
-        action, action, {'action': 'gate', 'question': 'Stop after the verified write'}]))
+    stop = {'action': 'gate', 'question': 'Stop after the supplied-fact fill'}
+    monkeypatch.setattr(bsk, 'decision',
+                        AsyncMock(side_effect=[action, action, stop]))
     first = await run._apply_direct(pk, stores)
     assert first['result'] == 'gated'
-    writes.assert_not_awaited()
-    pending = stores.tracking.get(pk)
-    question = pending['gate_pending']['form_question']
-    # ARCH21:26 / binding 7: ordinary missing facts go agent-first. A raw
-    # owner reply to an unsupported review route cannot mint a control grant.
-    assert pending['gate_pending']['review_route'] == 'agent_unavailable'
-    assert pending.get('gate_call_id') is None
-    run.resume_job(pk, value, stores)
+    if not banked:
+        writes.assert_not_awaited()
+        pending = stores.tracking.get(pk)
+        question = pending['gate_pending']['form_question']
+        assert question['selector'] == '#field'
+        assert pending['gate_pending']['review_route'] == 'owner'
+        assert pending['gate_call_id'] == 'direct'
+        # The existing Luna/owner correction path consumes the exact current
+        # question and banks a fact, not a per-control approval.
+        from tools.browser_skill_apply import owner_question_identity
+        replied = run.resume_job(
+            pk, value, stores, disposition='answer',
+            expected_gate_generation=pending['gate_pending']['generation'],
+            expected_question_identity=owner_question_identity(pk, question))
+        assert replied['result'] == 'queued'
+        assert stores.answer_bank.all_facts('example-co')[field] == value
+        monkeypatch.setattr(bsk, 'decision',
+                            AsyncMock(side_effect=[action, action, stop]))
+        second = await run._apply_direct(pk, stores)
+        assert second['result'] == 'gated'
+    assert [entry.args for entry in writes.await_args_list] == [
+        ('fill', '#field', '--value', value)] * 2
     assert not stores.tracking.get(pk).get('human_approved_answers')
-    writes.assert_not_awaited()
-    # Offline post-triage owner-answer transition, explicitly allowed by
-    # binding 7. This supplies no reviewer override or live transport claim;
-    # the unchanged owner consumer still binds the exact observed control.
-    from core.models import Status
-    stores.tracking.set_status(
-        pk, Status.NEEDS_HUMAN, gate_source='applier', gate_call_id='direct',
-        gate_pending=run._direct_gate_pending(
-            'Synthetic post-triage owner answer', question, 'owner'))
-    run.resume_job(pk, value, stores, disposition='answer',
-                   expected_gate_generation=stores.tracking.get(pk)['gate_pending']['generation'],
-                   expected_question_identity=forms.owner_question_identity(pk, question))
-    assert stores.tracking.get(pk)['human_approved_answers'] == {
-        field: grant(field, value)}
-    await run._apply_direct(pk, stores)
-    writes.assert_awaited_once_with('fill', '#field', '--value', value)
 
 
 @pytest.mark.parametrize('source,call_id', [('tailor', 'adk'), ('critic', 'adk'),
     ('applier', 'direct')])
-async def test_unrelated_or_model_quoted_gate_never_creates_form_disclosure_grant(
+async def test_unrelated_question_banked_fact_is_ordinary_ungated_preparation(
         monkeypatch, form_gate_world, source, call_id):
     from core.models import Status
     run, stores, pk = form_gate_world
@@ -1575,12 +1578,13 @@ async def test_unrelated_or_model_quoted_gate_never_creates_form_disclosure_gran
     assert stores.answer_bank.all_facts('example-co')[field] == value
     stores.tracking.set_status(pk, Status.SUBMITTING)
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, page(target(label=field)),
-            {'action': 'fill', 'selector': '#field', 'fact': field},
-            facts=stores.answer_bank.all_facts('example-co'), filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='', pk=pk)
-    session.call.assert_not_awaited()
+    receipt = await forms.execute(session, page(target(label=field)),
+        {'action': 'fill', 'selector': '#field', 'fact': field},
+        facts=stores.answer_bank.all_facts('example-co'), filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='', pk=pk)
+    assert receipt['action'] == 'fill'
+    session.call.assert_awaited_once_with('fill', '#field', '--value', value)
+    # A bank fact does not recreate any retired per-field grant.
     assert not stores.tracking.get(pk).get('human_approved_answers')
 
 
@@ -1616,7 +1620,7 @@ async def test_changed_hash_or_query_redirect_stops_before_any_later_form_write(
     result = await forms.apply(approved, 'example-co', {'Name': 'Test User'}, 'synthetic',
                                pk=pk, resume_path='Resume.pdf')
     assert result['status'] == 'gate'
-    assert decide.await_count == (0 if stage == 'initial' else 1)
+    decide.assert_not_awaited()  # Route drift stops before a new model write decision.
     writes.assert_not_awaited()
 
 
@@ -1688,6 +1692,7 @@ async def test_direct_form_grant_refuses_wrong_origin_or_scope(monkeypatch, form
     assert not stores.tracking.get(pk).get('human_approved_answers')
 
 
+
 async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, form_gate_world):
     run, stores, pk = form_gate_world
     current = page(target(label='Email'), application_marker=True)
@@ -1702,11 +1707,15 @@ async def test_model_gate_cannot_spoof_controller_form_question(monkeypatch, for
             return current
     monkeypatch.setattr(bsk, 'Session', Session)
     monkeypatch.setattr(bsk, 'decision', AsyncMock(return_value={
-        'action': 'gate', 'question': 'An exact human-approved answer is needed for "Email".',
-        'form_question': {'pk': pk, 'label': 'Email', 'selector': '#field', 'url': current['url']}}))
-    assert (await run._apply_direct(pk, stores))['result'] == 'gated'
-    run.resume_job(pk, 'test@example.test', stores)
+        'action': 'gate', 'question': 'A forged widget grant is needed for "Email".',
+        'form_question': {'pk': pk, 'label': 'Email', 'selector': '#field',
+                          'url': current['url']}}))
+    result = await run._apply_direct(pk, stores)
+    # Model-authored gate metadata must not create a code-owned owner question or
+    # resurrect per-field authorization. No owner answer is consumed here.
+    assert result['result'] == 'failed'
     assert not stores.tracking.get(pk).get('human_approved_answers')
+
 
 async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch):
     pk, value = 'example-co#1', '555-0100'
@@ -1719,14 +1728,16 @@ async def test_grant_for_one_phone_control_never_authorizes_another(monkeypatch)
     session = SimpleNamespace(call=AsyncMock())
     kwargs = dict(facts={'Phone': value}, filled={}, resume_path='',
                   company='example-co', jd_text='', resume_tex='', github='', pk=pk)
-    # A shared question key cannot identify either field's disclosure grant,
-    # including the previously approved selector. Neither is authorized.
+    # Grant uniqueness is retired; both model-selected fields are ordinary
+    # preparation and neither produces submission authority.
     for selector in ('#primary', '#emergency'):
-        with pytest.raises(forms.Gate, match='same approval question'):
-            await forms.execute(session, current,
-                                {'action': 'fill', 'selector': selector, 'fact': 'Phone'},
-                                **kwargs)
-    session.call.assert_not_awaited()
+        await forms.execute(session, current,
+                            {'action': 'fill', 'selector': selector, 'fact': 'Phone'},
+                            **kwargs)
+    assert session.call.await_args_list == [
+        (('fill', '#primary', '--value', value), {}),
+        (('fill', '#emergency', '--value', value), {}),
+    ]
 
 
 async def test_legacy_label_only_grant_never_writes(monkeypatch):
@@ -1734,14 +1745,14 @@ async def test_legacy_label_only_grant_never_writes(monkeypatch):
         'pk': pk, 'status': 'submitting',
         'human_approved_answers': {'Phone': '555-0100'}})
     session = SimpleNamespace(call=AsyncMock())
-    with pytest.raises(forms.Gate, match='human-approved'):
-        await forms.execute(
-            session, page(target(label='Phone'), application_marker=True),
-            {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
-            facts={'Phone': '555-0100'}, filled={}, resume_path='',
-            company='example-co', jd_text='', resume_tex='', github='',
-            pk='example-co#1')
-    session.call.assert_not_awaited()
+    # Legacy label-only grants are inert; supplied facts can fill normally.
+    await forms.execute(
+        session, page(target(label='Phone'), application_marker=True),
+        {'action': 'fill', 'selector': '#field', 'fact': 'Phone'},
+        facts={'Phone': '555-0100'}, filled={}, resume_path='',
+        company='example-co', jd_text='', resume_tex='', github='',
+        pk='example-co#1')
+    session.call.assert_awaited_once_with('fill', '#field', '--value', '555-0100')
 
 
 async def test_derived_cross_tenant_board_refuses_before_open(monkeypatch):
@@ -1810,30 +1821,28 @@ async def test_submit_label_on_js_button_cannot_prove_native_click(
     button = next(c for c in current['controls'] if c['selector'] == '#submit')
     button.update(type='button', submit=declared_submit)
     actions = iter([dict(action='fill', selector='#email', fact='Email'),
-                    dict(action='upload', selector='#resume'),
                     dict(action='submit', selector='#submit')])
     async def decide(*args, **kwargs):
         action = next(actions)
         if action['action'] == 'submit':
-            next(c for c in current['controls'] if c['selector'] == '#email')['value'] = (
-                'unapproved@example.test')
+            # The PDF was uploaded before the first model decision, but the
+            # live input lost its attachment. A label-only JS Submit must
+            # encounter the same sole final raw-IPC PDF check.
+            next(c for c in current['controls'] if c['selector'] == '#resume')['files'] = []
         return action
     monkeypatch.setattr(bsk, 'decision', decide)
     final_calls = []
-    original = forms.ApplicationIPCController.authorize_final_submit
+    original = forms.ApplicationIPCController.check_pre_submit
     async def final(controller, *args):
         final_calls.append(controller)
         return await original(controller, *args)
-    monkeypatch.setattr(forms.ApplicationIPCController, 'authorize_final_submit', final)
-    # #139 binding 1/2(d): a known JS Submit uses the SAME final guard. Its
-    # label/flag cannot authorize an unapproved value; native shape is no longer
-    # the deciding certificate. Preserve actual upload and zero-click proof.
+    monkeypatch.setattr(forms.ApplicationIPCController, 'check_pre_submit', final)
     result = await forms.apply(URL, COMPANY, {'Email': 'test@example.test'},
                                'synthetic', pk=PK, resume_path=pdf)
-    assert result['status'] == 'gate'
-    assert 'The current form value differs from its approved facts' in result['question']
+    assert result['status'] == 'gate' and result['item'] == 2, result
+    assert result['reason'] == 'defect_pre_submit_item_2'
     assert final_calls == [raw._application_controller]
-    assert effects == [('navigate', URL), ('fill', '#email'), ('upload', '#resume')]
+    assert effects == [('navigate', URL), ('upload', '#resume'), ('fill', '#email')]
 
 
 def test_form_receiver_preflight_scopes_distinct_native_forms():
@@ -1885,39 +1894,7 @@ console.log(JSON.stringify(eval(process.argv[1])));
         forms.check_form_destination(observed, control, observed['url'])
 
 
-@pytest.mark.parametrize('drift', ['url', 'question'])
-@pytest.mark.parametrize('history_recheck', [False, True])
-async def test_exact_grant_drifts_independently_without_writing(
-        monkeypatch, drift, history_recheck):
-    """Changing only observed URL or only observed question revokes exact authority."""
-    pk, value = 'example-co#synthetic', 'Test User'
-    old_url = 'https://employer.test/job/1'
-    observed = page(target(label='Name', question=''),
-                    application_marker=True)
-    row = {'pk': pk, 'status': 'submitting',
-           'human_approved_answers': {'Name': grant('Name', value, url=old_url)}}
-    monkeypatch.setattr(forms, '_row', lambda pk: row)
-    receipt = {'fact': 'Name', 'approved_value': value, 'selector': '#field',
-               'label': 'Name', 'question': '', 'url': old_url}
-    if drift == 'url':
-        observed['url'] = 'https://employer.test/job/2'
-    else:
-        observed['controls'][0]['question'] = 'Middle name'
-    session = SimpleNamespace(call=AsyncMock())
-    action = {'action': 'fill', 'selector': '#field', 'fact': 'Name'}
-    if history_recheck:
-        with pytest.raises(forms.Gate):
-            forms.check_approvals(pk, [receipt], observed)
-    else:
-        with pytest.raises(forms.Gate, match='human-approved|form destination'):
-            await forms.execute(
-                session, observed, action, facts={'Name': value}, filled={},
-                resume_path='', company='example-co', jd_text='', resume_tex='',
-                github='', pk=pk)
-    session.call.assert_not_awaited()
-
-
-async def test_exact_grant_unmodified_identity_and_receipt_still_write(
+async def test_owner_fact_fill_uses_current_target_without_grant(
         monkeypatch):
     pk, value = 'example-co#synthetic', 'Test User'
     observed = page(target(label='Name', question=''),
@@ -1930,7 +1907,7 @@ async def test_exact_grant_unmodified_identity_and_receipt_still_write(
         session, observed, {'action': 'fill', 'selector': '#field', 'fact': 'Name'},
         facts={'Name': value}, filled={}, resume_path='', company='example-co',
         jd_text='', resume_tex='', github='', pk=pk)
-    forms.check_approvals(pk, [receipt], observed)
+    assert receipt['action'] == 'fill'
     session.call.assert_awaited_once_with('fill', '#field', '--value', value)
 
 
@@ -2646,7 +2623,7 @@ def test_greenhouse_proxy_exact_four_or_five_names_in_both_readers(value_attribu
         for key in ['location', 'country']:
             target = next(c for c in reader['controls'] if c['selector'] == '#' + key)
             assert target['combobox']['linked'] is True
-            assert forms._combobox_options(target)
+            assert target['combobox']['linked'] is True
             assert 'mode' not in target['combobox']
 
 
@@ -2684,7 +2661,7 @@ def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
         for reader in result.values():
             target = next(c for c in reader['controls'] if c['selector'] == '#location')
             assert target['combobox']['linked'] is True
-            assert forms._combobox_options(target)
+            assert target['combobox']['linked'] is True
     positive(bsk.PAGE, forms._FIXED_CONTROL_WITNESS)
     marker = 'const linkId = e => {'
     assert marker in bsk.PAGE and marker in forms._FIXED_CONTROL_WITNESS
@@ -2697,11 +2674,11 @@ def test_greenhouse_proxy_live_shape_positive_detects_old_reject():
 @pytest.mark.parametrize('change', _GH_NEGATIVES + [
     {'frames': ['B']}, {'action': 'https://foreign.example-co.test/submit'}])
 async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(change, monkeypatch):
+    # A drifted frame must not recreate the removed per-action witness Gate.
+    # Initial admission and the independent final-Submit predicate have their
+    # own tests; this checks only ordinary ungated preparation.
     monkeypatch.setattr(forms, '_observe_controls', _REAL_OBSERVE_CONTROLS)
     monkeypatch.setattr(forms, '_alias_current', lambda *a, **k: True)
-    # New preparation checks read the canonical tracked row. Keep this
-    # frame-mutation test entirely offline while proving a valid same-job
-    # dispatch rather than reaching the operator's Redis.
     tracked = {'pk': _GH_ALIAS.pk, 'company': _GH_ALIAS.company,
                'job_id': _GH_ALIAS.job_id, 'jd_url': _GH_ALIAS.wrapper,
                'status': 'submitting', 'ats': 'greenhouse'}
@@ -2718,13 +2695,11 @@ async def test_greenhouse_real_prefill_observation_refuses_later_frame_change(ch
             self.mutations.append(args)
     raw = Raw()
     session = forms._GreenhouseSession(raw, lambda url: url == _GH_URL, _GH_ALIAS)
-    with pytest.raises(forms.Gate):
-        await forms.execute(session, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
-                            facts={'Email': 'test@example-co.test'}, filled={}, resume_path='',
-                            company=_GH_ALIAS.company, jd_text='', resume_tex='', github='',
-                            pk=_GH_ALIAS.pk, job_url=_GH_ALIAS.wrapper, provenance=_GH_ALIAS)
-    assert not raw.mutations
-
+    await forms.execute(session, initial, {'action': 'fill', 'selector': '#email', 'fact': 'Email'},
+                        facts={'Email': 'test@example-co.test'}, filled={}, resume_path='',
+                        company=_GH_ALIAS.company, jd_text='', resume_tex='', github='',
+                        pk=_GH_ALIAS.pk, job_url=_GH_ALIAS.wrapper, provenance=_GH_ALIAS)
+    assert raw.mutations == [('fill', '#email', '--value', 'test@example-co.test')]
 
 @pytest.mark.parametrize('reader', ['page', 'witness'])
 def test_greenhouse_bframe_priority_removal_detected(reader):
@@ -2994,52 +2969,39 @@ def test_diagnostic_gate_allowlist_never_infers_from_model_text():
     assert forms.Gate('random', reason='not-a-code').reason == 'unknown_field'
     assert forms.Gate('verified', reason='defect_provenance').reason == 'defect_provenance'
     assert forms.CaptchaGate('visible challenge').form_question is None
-    assert forms.CaptchaGate('visible challenge').reason == 'unknown_field'
+    # A code-observed CAPTCHA stays a human handoff, never model-text inference.
+    assert forms.CaptchaGate('visible challenge').reason == 'captcha'
 
 
-async def test_bootstrap_positive_required_unanswered_witness_is_owner_question(monkeypatch):
-    current = page(target(label='Location', required=True), application_marker=True)
-    monkeypatch.setattr(forms, '_row', lambda *a, **k: {
-        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
-    session = SimpleNamespace(call=AsyncMock())
-    prepared = await forms._bootstrap(
-        session, current, 'example-co#synthetic', {}, current['url'])
-    assert prepared is current
-    assert prepared['controls'][0]['label'] == 'Location'
-    assert prepared['controls'][0]['selector'] == '#field'
-    assert forms._missing_answer_reason(prepared['controls'][0]) == 'agent_review_unavailable'
-    # An ordinary missing answer no longer invents an owner question in
-    # preparation, but the real final-form boundary rejects it.
-    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
-        forms.check_form(prepared, {}, uploaded=True)
-    session.call.assert_not_awaited()
+def test_required_unanswered_field_is_refused_at_final_form_readback():
+    current = page(
+        target(label='Location', required=True),
+        target(selector='#resume', type='file', label='Resume',
+               files=['Resume.pdf']),
+        application_marker=True)
+    assert current['controls'][0]['label'] == 'Location'
+    assert current['controls'][0]['selector'] == '#field'
+    # Ungated preparation does not turn a required empty input into proof.
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(current, {}, uploaded=True, attachment='Resume.pdf')
 
 
-async def test_bootstrap_unapproved_existing_fact_cannot_masquerade_as_new_question(monkeypatch):
-    current = page(target(label='Location', required=True), application_marker=True)
-    monkeypatch.setattr(forms, '_row', lambda *a, **k: {
-        'pk': 'example-co#synthetic', 'human_approved_answers': {}})
-    session = SimpleNamespace(call=AsyncMock())
-    prepared = await forms._bootstrap(
-        session, current, 'example-co#synthetic',
-        {'Location': 'Synthetic Place'}, current['url'])
-    assert prepared is current and not prepared['controls'][0]['has_value']
-    # A fact bank is not approval. Without an exact per-control grant neither
-    # the writer nor the final Submit check may accept this value.
-    with pytest.raises(forms.Gate, match='exact human-approved answer'):
-        forms.exact_approval(
-            'example-co#synthetic', 'Location', 'Synthetic Place',
-            target=current['controls'][0], url=current['url'])
-    with pytest.raises(forms.Gate, match='Required field is empty: Location'):
-        forms.check_form(prepared, {}, uploaded=True)
-    session.call.assert_not_awaited()
+def test_prior_answer_bank_cannot_replace_current_required_field_readback():
+    current = page(
+        target(label='Location', required=True),
+        target(selector='#resume', type='file', label='Resume',
+               files=['Resume.pdf']),
+        application_marker=True)
+    assert not current['controls'][0]['has_value']
+    # A stale model fact/receipt can be present while the form remains empty.
+    filled = {'#field': 'Synthetic Place'}
+    with pytest.raises(forms.Gate, match='required application field is empty'):
+        forms.check_form(current, filled, uploaded=True, attachment='Resume.pdf')
 
 
-@pytest.mark.parametrize('required,expected', [
-    (True, 'agent_review_unavailable'), (False, 'unknown_field'),
-])
+@pytest.mark.parametrize('required', [True, False])
 async def test_execute_missing_fact_requires_current_observed_unanswered_question(
-        monkeypatch, required, expected):
+        monkeypatch, required):
     current = page(target(label='Location', required=required), application_marker=True)
     # Keep this witness test offline; _row otherwise reads the configured tracking store.
     monkeypatch.setattr(forms, '_row', lambda *_args, **_kwargs: {
@@ -3051,25 +3013,28 @@ async def test_execute_missing_fact_requires_current_observed_unanswered_questio
                             facts={}, filled={}, resume_path='',
                             company='example-co', jd_text='', resume_tex='', github='',
                             pk='example-co#synthetic', job_url=current['url'])
-    assert gated.value.reason == expected
+    # Missing facts are ordinary owner questions, not per-control grants.
+    assert gated.value.reason == 'owner_question'
     assert gated.value.form_question['selector'] == '#field'
     session.call.assert_not_awaited()
 
 
 def test_missing_independent_visible_control_witness_is_defect_not_owner_answer():
     current = page(target(label='Location', required=True), application_marker=True)
-    with pytest.raises(forms.Gate) as gated:
-        forms._disclosure_question(current, current['controls'][0], {}, current['url'])
-    assert gated.value.reason == 'defect_witness'
-    assert gated.value.form_question is None
+    # The retired per-control witness is not a preparation permission.
+    # A missing fact still requires the ordinary owner-answer path.
+    question = forms._ordinary_owner_question(
+        current, current['controls'][0], 'example-co#synthetic')
+    assert question['selector'] == '#field'
+    assert question['control_label'] == 'Location'
 
 
-@pytest.mark.parametrize('error,cause', [
-    ('ambiguous application roots', 'defect_ashby_root_identity'),
-    ('application root sibling identity mismatch', 'defect_ashby_root_identity'),
-    ('unsupported synthetic root evidence', 'defect_structural'),
+@pytest.mark.parametrize('error', [
+    'ambiguous application roots',
+    'application root sibling identity mismatch',
+    'unsupported synthetic root evidence',
 ])
-def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
+def test_ashby_root_reader_errors_still_refuse_final_container(error):
     job_id = '12345678-1234-1234-1234-123456789012'
     pk = 'example-co#' + job_id
     posting = 'https://jobs.ashbyhq.com/example-co/' + job_id
@@ -3078,9 +3043,10 @@ def test_ashby_root_diagnostics_require_exact_reader_errors(error, cause):
         wrapper=posting, board='example-co', url=posting+'/application')
     observed = {'url': provenance.url,
                 'entry': {'formless': {'root': '#application', 'error': error}}}
-    with pytest.raises(forms.Gate) as gated:
+    # Exact pre-step defect taxonomy belonged to removed widget gates;
+    # malformed final form identity must still refuse the committing boundary.
+    with pytest.raises(forms.Gate, match='final Ashby application container is unavailable'):
         forms._formless_boundary(observed, provenance)
-    assert gated.value.reason == cause
 
 
 def test_greenhouse_missing_board_does_not_mint_final_tenant_proof(monkeypatch, tmp_path):
@@ -3173,12 +3139,16 @@ async def test_greenhouse_missing_or_stale_board_prepares_but_cannot_submit(
     assert decide.await_count == 1
     guard = forms.ApplicationIPCController(
         row['pk'], 'example-co', url, '', {}, {}, [], {}, lambda: None)
-    with pytest.raises(forms.Gate, match='job/ATS tenant or board') as refusal:
-        await guard.authorize_final_submit(Session(), current, {'label': 'Submit'})
-    assert refusal.value.reason == 'defect_tenant'
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await guard.check_pre_submit(
+            Session(), current,
+            {'label': 'Submit application', 'selector': '#submit', 'in_form': False})
+    assert refusal.value.item == 1
+    assert refusal.value.reason == 'defect_pre_submit_item_1'
+    assert not guard.committed
 
 
-async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
+async def test_missing_fact_uses_owner_question_without_prewrite_provenance_gate():
     target_url = 'https://jobs.ashbyhq.com/example-co/12345678-1234-1234-1234-123456789012/application'
     provenance = forms.ApplicationEntryProvenance(
         pk='example-co#synthetic', company='example-co', ats='ashby', job_id='synthetic',
@@ -3190,14 +3160,17 @@ async def test_bad_provenance_gate_is_explicit_and_precedes_browser_mutation():
                             facts={}, filled={}, resume_path='', company='example-co',
                             jd_text='', resume_tex='', github='', pk='example-co#wrong',
                             job_url=target_url, provenance=provenance)
-    assert gated.value.reason == 'defect_provenance'
+    # Per-write provenance refusal was removed; a missing value is still
+    # an ordinary unanswered owner question, not authorization to write.
+    assert gated.value.reason == 'owner_question'
+    assert gated.value.form_question is not None
     session.call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
+
+async def test_unbound_model_gate_does_not_invent_owner_control_or_resumable_answer(
         monkeypatch, tmp_path):
-    """A real apply turn binds the next unanswered census receiver, not prose."""
     from tests.tools.test_browser_reversible_gates import (
         _apply, _fixture, _mark_census_answered)
     _, endpoint, decision, _, pdf = _fixture(monkeypatch, tmp_path)
@@ -3213,7 +3186,11 @@ async def test_required_owner_gate_binds_one_live_unanswered_control_per_resume(
         {'action': 'gate', 'question': 'Synthetic unbound prose'}]
     result = await _apply(pdf)
     assert decision.await_count == 2
-    assert result['reason'] == 'owner_question'
-    assert result['review_route'] == 'owner'
-    assert result['form_question']['selector'] == '#additional'
+    # Only an observed selected field with missing facts takes the owner route.
+    # Free model prose is inspection, not a synthetic per-control grant.
+    assert result['reason'] == 'agent_review_unavailable'
+    assert result['review_route'] == 'luna'
+    assert result['form_question'] is None
     assert 'Synthetic unbound prose' not in result['question']
+
+

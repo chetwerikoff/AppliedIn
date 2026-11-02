@@ -124,21 +124,30 @@ def test_live_embed_phone_picker_is_one_phone_receiver():
     assert not country['combobox']['selected_value']
 
 
-def test_admitted_picker_still_binds_country_and_phone_per_field():
+def test_admitted_picker_requires_fresh_country_and_phone_readback():
     page = _admitted(snapshot())
-    # Nothing is chosen for the owner: an approved Country answer without a
-    # proven form value, and an unapproved phone, both still stop Submit.
-    alone = dict(page, controls=[c for c in page['controls'] if c['selector'] == '#country'])
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value: Country'):
-        forms.check_form(alone, {'#country': 'Synthetic Country'}, uploaded=True)
+    # Only final current values matter, not old per-field bank/write receipts.
+    country = dict(next(c for c in page['controls'] if c['selector'] == '#country'))
     phone = dict(next(c for c in page['controls'] if c['selector'] == '#phone'))
-    assert phone['required'] is True and phone['value'] == ''
-    with pytest.raises(forms.Gate, match='Required field is empty: Phone'):
-        forms.check_form(dict(page, controls=[phone]), {}, uploaded=True)
-    changed = dict(phone, value='+1 555 0100', has_value=True)
-    with pytest.raises(forms.Gate, match='phone value is empty or changed'):
-        forms.check_form(dict(page, controls=[changed]), {'#phone': '+1 555 0199'},
-                         uploaded=True)
+    attachment = 'Test User Resume.pdf'
+    staged = dict(selector='#synthetic-resume', type='file', label='Resume',
+                  disabled=False, required=False, files=[attachment])
+    current = dict(page, controls=[country, phone, staged])
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(current, {}, True, attachment)
+
+    country['value'] = 'Synthetic Country'
+    country['has_value'] = True
+    country['combobox'] = {**country['combobox'],
+                           'selected_text': 'Synthetic Country'}
+    with pytest.raises(forms.Gate, match='required application field'):
+        forms.check_form(current, {}, True, attachment)
+
+    phone['value'] = '+1 555 0100'
+    phone['has_value'] = True
+    forms.check_form(current, {'#country': 'stale', '#phone': 'stale'},
+                     True, attachment)
+
 
 
 def test_generic_reader_keeps_the_same_picker_opaque():

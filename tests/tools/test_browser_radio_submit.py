@@ -1,100 +1,105 @@
-"""Final native-radio approval must bind a live, unique form/name/question.
+"""Issue #293: native-radio selection is evaluated once at final Submit.
 
-Only synthetic in-memory controls and the production raw Submit guard are used.
-An earlier approved writer cannot make conflicting current radio receivers safe.
+No previous per-radio grants, selection receipts or pre-write witnesses.
+Tests use the synthetic raw-IPC decision fixture and never submit a form.
 """
 import pytest
 
+from tests.tools.test_browser_pre_submit_check import _world
 from tools import browser_skill_apply as forms
-from tests.tools.test_browser_bootstrap import (
-    field, secure_inventory, prepared_without_unapproved_write,
-    final_submit_denied,
-)
 
 
-def _selected_group():
-    return secure_inventory(
-        field('Yes', '#yes', tag='input', type='radio',
-              name='work_authorization', question='Work authorization',
-              value='yes', has_value=True, checked=True),
-        field('No', '#no', tag='input', type='radio',
-              name='work_authorization', question='Work authorization',
-              value='no', has_value=True, checked=False),
-    )
+def _radio(label, selector, *, checked=False, required=True,
+           question='Work authorization', form='#app'):
+    return {
+        'selector': selector, 'label': label, 'question': question,
+        'tag': 'input', 'type': 'radio', 'name': 'work_authorization',
+        'checked': checked, 'value': label.lower(),
+        'required': required, 'disabled': False,
+        'in_form': True, 'form_selector': form,
+    }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('drift,reason', [
-    ('missing-name', 'A native radio group needs a form, name and visible question'),
-    ('missing-question', 'A native radio group needs a form, name and visible question'),
-    ('foreign-form', 'Radio group members or captions are incomplete or ambiguous'),
-    ('duplicate-value', 'Radio group members or captions are incomplete or ambiguous'),
-    ('duplicate-caption', 'Radio group members or captions are incomplete or ambiguous'),
-    ('two-selected', 'Native radio group has conflicting checked members'),
-    ('unassociated', 'Radio group members or captions are incomplete or ambiguous'),
-])
-async def test_radio_group_drift_refuses_real_final_submit(
-        monkeypatch, tmp_path, drift, reason):
-    page = _selected_group()
-    browser, row, filled, history = await prepared_without_unapproved_write(
-        monkeypatch, page)
-    # Baseline: the current native selection has one form, name, visible
-    # question, unique machine values and exactly one checked radio.
-    filled['#yes'] = 'Yes'
-    yes, no = page['controls'][:2]
-    row['human_approved_answers'] = {forms._key(page, yes): {
-        'value': 'Yes', 'selector': yes['selector'], 'url': page['url'],
-        'label': yes['label'], 'question': yes['question'],
-        'tag': yes['tag'], 'type': yes['type'],
-        'form_selector': yes['form_selector'], 'form_action': yes['form_action'],
-        'radio_name': yes['name'],
-        'radio_members': [{'selector': member['selector'],
-                           'caption': member['label'], 'value': member['value']}
-                          for member in (yes, no)],
-    }}
-    forms.check_form(page, filled, uploaded=True)
+async def test_one_current_native_radio_choice_is_sufficient_without_a_grant(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'][:0] = [
+        _radio('Yes', '#yes', checked=True),
+        _radio('No', '#no'),
+    ]
+    await controller.check_pre_submit(None, page, target)
+    assert fixture.held
+    assert controller.step['last_button'] == 'Submit application'
 
-    yes, no = page['controls'][:2]
-    if drift == 'missing-name':
-        yes.pop('name')
-    elif drift == 'missing-question':
-        yes['question'] = ''
-    elif drift == 'foreign-form':
-        no['form_selector'] = '#other-form'
-    elif drift == 'duplicate-value':
-        no['value'] = yes['value']
-    elif drift == 'duplicate-caption':
-        no['label'] = yes['label']
-    elif drift == 'two-selected':
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('choice', [
+    'none', 'unselected_required', 'foreign_checked',
+])
+async def test_current_required_radio_without_a_checked_form_peer_refuses_item_2(
+        monkeypatch, tmp_path, choice):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    yes = _radio('Yes', '#yes', checked=False)
+    no = _radio('No', '#no', checked=False, required=False)
+    if choice == 'foreign_checked':
         no['checked'] = True
-    elif drift == 'unassociated':
-        yes['in_form'] = False
-
-    await final_submit_denied(
-        monkeypatch, tmp_path, page, row, filled, history,
-        reason=reason)
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
+        no['form_selector'] = '#other-form'
+    if choice == 'unselected_required':
+        no['checked'] = False
+    page['controls'][:0] = [yes, no]
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, page, target)
+    assert error.value.item == 2
+    assert not fixture.held
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('selected,reason', [
-    (False, 'Required choice is empty: Yes'),
-    (True, 'Unverified preselected answer: Yes'),
-])
-async def test_missing_or_unapproved_radio_answer_refuses_before_shape(
-        monkeypatch, tmp_path, selected, reason):
-    # A missing visible group question is never submission authority. If the
-    # answer is absent or unapproved, report that independent failure before
-    # asking for further group proof. Both cases reach the production raw-click
-    # guard and neither creates a hold or dispatches a Submit IPC.
-    page = _selected_group()
-    page['controls'][0]['question'] = ''
-    page['controls'][0]['checked'] = selected
-    browser, row, filled, history = await prepared_without_unapproved_write(
-        monkeypatch, page)
-    await final_submit_denied(
-        monkeypatch, tmp_path, page, row, filled, history, reason=reason)
-    assert filled == {} and history == []
-    assert not any(call[0] in {'fill', 'select', 'click', 'upload'}
-                   for call in browser.calls)
+async def test_required_group_uses_current_form_not_model_action_history(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'][:0] = [
+        _radio('Yes', '#yes', checked=False),
+        _radio('No', '#no', checked=True, required=False),
+    ]
+    controller.filled['#yes'] = 'Yes'  # stale model ledger does not authorize
+    await controller.check_pre_submit(None, page, target)
+    assert fixture.held
+
+
+@pytest.mark.asyncio
+async def test_preselected_protected_characteristic_affirmative_is_item_3(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, _radio(
+        'Female', '#gender', question='Gender', checked=True, required=False))
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, page, target)
+    assert error.value.item == 3
+    assert not fixture.held
+
+
+@pytest.mark.asyncio
+async def test_native_choice_click_is_preparation_and_not_a_final_grant(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].insert(0, _radio('No', '#no', checked=False))
+    class Session:
+        def __init__(self):
+            self.calls = []
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {}
+    session = Session()
+    result = await forms.execute(
+        session, page, {'action': 'choose', 'selector': '#no', 'value': 'No'},
+        facts={}, filled={}, resume_path=controller.resume_path,
+        company='example-co', jd_text='Synthetic role', resume_tex='',
+        github='', pk='example-co#1', job_url='https://employer.test/job/1')
+    assert result['action'] == 'choose'
+    assert session.calls == [(('click', '#no'), {})]
+    assert not fixture.held
+    # The model's click is never proof that the native input is now checked.
+    with pytest.raises(forms.PreSubmitGate) as error:
+        await controller.check_pre_submit(None, page, target)
+    assert error.value.item == 2

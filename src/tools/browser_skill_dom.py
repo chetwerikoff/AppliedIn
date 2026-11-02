@@ -50,6 +50,31 @@ _WIDGET_GRAPH = r"""
       e.getAttribute('aria-label') || (ashby ? '' : e.getAttribute('placeholder')) ||
       e.innerText || e.name);
   }
+  // A React-select search input may stay blank after the page renders its
+  // chosen caption. Both independent readers inspect only the input's own
+  // value-container; no global option/live-region text is submission evidence.
+  function localReactSelectChoice(e) {
+    if (e.tagName!=='INPUT' || e.type!=='text' ||
+        e.getAttribute('role')!=='combobox') return null;
+    const valueBox=e.closest('div.select__value-container');
+    const inputBox=e.closest('div.select__input-container');
+    const selectRoot=valueBox?.closest('div.select__container');
+    const selected=!!valueBox && (
+      valueBox.matches('div.select__value-container--has-value') ||
+      !!valueBox.querySelector('div.select__single-value'));
+    if (!selected) return null;
+    const singles=Array.from(valueBox.querySelectorAll('div.select__single-value'));
+    const sameField=!!inputBox && inputBox.parentElement===valueBox &&
+      !!selectRoot && selectRoot.querySelectorAll('[role="combobox"]').length===1 &&
+      selectRoot.querySelector('[role="combobox"]')===e;
+    const caption=sameField && singles.length===1 &&
+      singles[0].closest('div.select__value-container')===valueBox &&
+      visible(singles[0]) ? clean(singles[0].innerText) : '';
+    return {caption,unreadable:!caption};
+  }
+  // The existing independent fixed-witness script still calls this name;
+  // preserve compatibility without editing its authoritative readback source.
+  const localProtectedChoice=localReactSelectChoice;
   const graphNodes = new WeakMap(), newGraphs = new Map();
   const requiredProxies = new Set(), pickerParts = new Set(), quarantined = new Set();
   const nativeForm = e => e.form || e.closest('form');
@@ -235,6 +260,13 @@ PAGE = r"""(() => {
     const formAction = form?.action || '';
     const override = e.getAttribute('formaction') !== null ? (e.formAction || '') : '';
     const hiddenLabel=hiddenAshbyChoice(e) ? hiddenAshbyLabel(e) : null;
+    // A long select list is a presentation bound, not an incomplete control.
+    // Keep the current selected option even when it lies beyond the first 64.
+    const nativeOptions=e.options ? Array.from(e.options) : [];
+    const chosenNative=nativeOptions.filter(o=>o.selected === true);
+    const shownNative=nativeOptions.slice(0,64);
+    for(const chosen of chosenNative)
+      if(!shownNative.includes(chosen)) shownNative.push(chosen);
     return {selector:selector(e), diagnostic_locator:diagnosticLocator(e), label:label(e).slice(0,600),
       ...(hiddenLabel ? {visible:false,associated_label_selector:selector(hiddenLabel),ashby_hidden_choice:true} : {}),
       question:question.slice(0,1200), tag:e.tagName.toLowerCase(), type, native_type:nativeType, submit,
@@ -258,8 +290,9 @@ PAGE = r"""(() => {
         || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
           && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
-      options:e.options ? Array.from(e.options)
-        .map(o=>({value:o.value,label:clean(o.textContent)})) : [],
+      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent)})),
+      option_count:nativeOptions.length,
+      options_capped:shownNative.length<nativeOptions.length,
       combobox: type === 'combobox' ? (() => {
         const list = currentListbox(e);
         const options = list ? Array.from(list.querySelectorAll('[role="option"]'))
@@ -282,6 +315,10 @@ PAGE = r"""(() => {
           .filter(h=>h.form === form && ((hiddenId && h.id === hiddenId) ||
             (typeof e.contains === 'function' && e.contains(h)) ||
             (hiddenName && h.name === hiddenName)));
+        // The React-select input can be blank after selection. Read only the
+        // single-value in this input's own selected value-container; never a
+        // page-wide caption or an accessibility live-region announcement.
+        const localChoice=localReactSelectChoice(e);
         return {...(graph || {}),...(quarantined.has(e) ? {quarantined:true} : {}),
           linked:!!list, link_id:quarantined.has(e) ? '' : graph ? (list?.id || '') : linkId(e),
           listbox_selector:list ? selector(list) : '', options,
@@ -290,7 +327,21 @@ PAGE = r"""(() => {
           displayed_text:clean(e.value || e.innerText || ''),
           selected_value:e.getAttribute('data-selected-value') || '',
           hidden_selector:receivers.length === 1 ? selector(receivers[0]) : '',
-          hidden_value:receivers.length === 1 ? receivers[0].value : '', ...(graph || {})};
+          hidden_value:receivers.length === 1 ? receivers[0].value : '',
+          ...(graph || {}),
+          // The native single-select caption is the current rendered choice,
+          // not an ARIA placeholder or a stale model-selected answer.
+          ...(e.tagName==='SELECT' && !e.multiple ? {
+            selected_text:chosenNative.length===1 ? clean(chosenNative[0].textContent) : '',
+          } : {}),
+          // A current form-owned hidden receiver is the submitted machine
+          // value even when the visible combobox has no data-selected-value.
+          ...(receivers.length===1 ? {selected_value:receivers[0].value} : {}),
+          ...(localChoice ? {
+            selected_text:localChoice.caption, displayed_text:localChoice.caption,
+            local_selected_proven:!!localChoice.caption,
+            selected_caption_unreadable:localChoice.unreadable,
+          } : {})};
       })() : null,
       href:e.tagName === 'A' ? e.href : ''};
   });
@@ -298,6 +349,68 @@ PAGE = r"""(() => {
   const title = document.querySelector('[data-automation-id="jobPostingHeader"]')?.innerText
     || document.querySelector('h1')?.innerText || document.title;
   const text = document.body?.innerText || '';
+  // An ATS may replace an input[type=file] after upload with a passive,
+  // form-owned filename display. Inventory the existing Ashby file-item
+  // structure; the final check also binds it to the committing receiver.
+  const attachedFileDisplays = Array.from(document.querySelectorAll(
+    'div.ashby-application-form-input-file-item'))
+    // A deliberately minimal synthetic read may return nonmatching nodes
+    // for any query. Do not treat them as employer file displays.
+    .filter(item => item.matches?.('div.ashby-application-form-input-file-item') === true)
+    .map(item => {
+    const fileBox=item.closest('div.ashby-application-form-input-file');
+    const field=item.closest('div.ashby-application-form-field-entry');
+    const names=item.querySelectorAll('p.ashby-application-form-input-file-item-name');
+    const titles=field ? field.querySelectorAll(
+      'label.ashby-application-form-question-title') : [];
+    const owner=fileBox?.closest('form');
+    const container=field?.closest('.ashby-application-form-container');
+    const deletes=item.querySelectorAll(
+      'button.ashby-application-form-input-file-item-delete');
+    return {
+      filename:names.length===1 ? clean(names[0].innerText) : '',
+      field_label:titles.length===1 ? clean(titles[0].innerText) : '',
+      in_form:!!owner, form_selector:owner ? selector(owner) : '',
+      root_selector:container ? selector(container) : '',
+      valid:!!fileBox && item.parentElement===fileBox && !!field &&
+        field.contains(fileBox) && names.length===1 &&
+        titles.length===1 && deletes.length===1 &&
+        item.children.length===2 && names[0].parentElement===item &&
+        deletes[0].parentElement===item &&
+        !!(owner || container),
+    };
+  }).concat(Array.from(document.querySelectorAll(
+    'div.file-upload[role="group"][aria-labelledby]'))
+    .filter(group=>group.matches?.('div.file-upload[role="group"]')===true)
+    .map(group=>{
+      const owner=group.closest('form');
+      const container=group.closest('.ashby-application-form-container');
+      const labelId=(group.getAttribute('aria-labelledby') || '').trim();
+      const labels=labelId && !/\s/.test(labelId) ? Array.from(
+        document.querySelectorAll('#'+CSS.escape(labelId))) : [];
+      const names=Array.from(group.querySelectorAll('div.file-upload__filename'))
+        .filter(n=>n.closest('div.file-upload')===group);
+      const captions=names.length===1 ? Array.from(
+        names[0].querySelectorAll('p.body.body__secondary')) : [];
+      const remove=Array.from(group.querySelectorAll(
+        'button[aria-label="Remove file"]')).filter(b=>
+          b.closest('div.file-upload')===group);
+      const labelOwned=labels.length===1 && (
+        group.contains(labels[0]) ||
+        (!!owner && labels[0].closest('form')===owner) ||
+        (!owner && !!container && container.contains(labels[0])));
+      return {
+        filename:captions.length===1 ? clean(captions[0].innerText) : '',
+        field_label:labels.length===1 ? clean(labels[0].innerText) : '',
+        in_form:!!owner, form_selector:owner ? selector(owner) : '',
+        root_selector:container ? selector(container) : '',
+        valid:labelOwned && names.length===1 && captions.length===1 &&
+          captions[0].closest('div.file-upload__filename')===names[0] &&
+          remove.length===1 && !remove[0].disabled &&
+          remove[0].getAttribute('aria-disabled')!=='true' &&
+          !!(owner || container),
+      };
+    }));
   // BrowserSkill 0.4 injects exactly one open <browser-skill-overlay data-bsk-overlay>
   // host (Pause Agent / Stop task buttons) as the child of <html> that directly
   // follows <body>. Treating it as an uninspected employer form gated every
@@ -371,7 +484,8 @@ PAGE = r"""(() => {
     controls.length <= 500 && !opaqueControls && !siteShadow;
   return {url:location.href, title, text:text.slice(0,100000),
     description:description?.innerText || '', controls:controls.slice(0,500),
-    truncated:controls.length > 500 || text.length > 100000,
+    attached_file_displays:attachedFileDisplays,
+    truncated:controls.length > 500, text_truncated:text.length > 100000,
     unsupported_frames:Array.from(document.querySelectorAll('iframe'))
       .filter(visible).map(e=>e.src),
     shadow_roots:siteShadow, opaque_controls:opaqueControls,
@@ -712,9 +826,13 @@ _ASHBY_ROOT = r"""
     });
     return owners.length===1;
   };
+  // A form answer census is confined to the owned application/survey
+  // container. A separate sign-in, subscribe, autofill, description link or
+  // unrelated page control does not become an application answer receiver.
   const evidenceNodes=Array.from(document.querySelectorAll(query.replace('a[href],','')+
     ',input[type="hidden"],[contenteditable],[role="listbox"],canvas,object,embed'))
-    .filter(e=>!excluded.has(e));
+    .filter(e=>!excluded.has(e) && e.tagName!=='A' &&
+      (!!controlContainer(e) || e===exactSubmit));
   const entryVisible=e => {
     if (!entryEvidenceVisible(e)) return false;
     // Clipping can hide a text recipient despite a positive layout rectangle.

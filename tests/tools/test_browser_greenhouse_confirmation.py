@@ -42,8 +42,9 @@ async def test_greenhouse_post_submit_rootless_confirmation(monkeypatch, tmp_pat
     browser, decide, row = _greenhouse_session(monkeypatch, tmp_path, current)
     row.update(title=current['title'], resume_seed='synthetic-seed')
     browser.allow_mutations = True
+    # The form loop automatically attaches the row PDF once. Keep the model
+    # focused on Submit so this test exercises the real confirmation boundary.
     decide.side_effect = [
-        {'action': 'upload', 'selector': '#resume'},
         {'action': 'submit', 'selector': '#submit'},
     ]
 
@@ -152,7 +153,7 @@ async def test_greenhouse_post_submit_rootless_confirmation(monkeypatch, tmp_pat
     assert raw_effects[0] == ('navigate', GH_DIRECT)
     assert raw_effects[-1] == ('click', '#submit')
     assert marker['held'] and clicked and row['status'] == 'needs_human'
-    assert decide.await_count == 2
+    assert decide.await_count == 1
     assert not row.get('possible_submission')
     if after_kind == 'revoked-provenance':
         assert row['job_id'] == '654321'

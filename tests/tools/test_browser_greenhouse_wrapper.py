@@ -83,10 +83,13 @@ async def _must_final_tenant_deny(state, *, url=URL):
         PK, COMPANY, url, "synthetic.pdf", {}, {}, [], {},
         lambda: clicks.append("submitted"))
     prior_starts = len(state.browser_starts)
-    with pytest.raises(forms.Gate):
-        await controller.authorize_final_submit(
-            None, {"url": HOSTED, "title": "Synthetic role"},
+    # Tenant/posting safety is item 1 of the single code-owned final check.
+    # Do not restore the deleted authorize_final_submit compatibility layer.
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(
+            None, {"url": HOSTED, "title": "Synthetic role", "controls": []},
             {"label": "Submit application"})
+    assert refusal.value.item == 1
     assert clicks == []
     assert len(state.browser_starts) == prior_starts
 
@@ -288,7 +291,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     page = {
         "url": URL, "title": "Synthetic Role", "text": "Synthetic neutral posting. " * 30,
         "description": "", "controls": [
-            {"selector": "#apply", "label": "Apply", "question": "",
+            {"selector": "#continue", "label": "Continue", "question": "",
              "tag": "button", "type": "button", "submit": False,
              "disabled": False, "in_form": False, "href": "", "formaction": "",
              "form_selector": "", "form_action": "", "files": [],
@@ -322,7 +325,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     monkeypatch.setattr(REAL_APPLICATION_SESSION, "__aexit__", exit)
     monkeypatch.setattr(bsk, "command", command)
     decisions = AsyncMock(side_effect=[
-        {"action": "click", "selector": "#apply"},
+        {"action": "click", "selector": "#continue"},
         {"action": "gate", "question": "Synthetic inspection stop"},
     ])
     monkeypatch.setattr(bsk, "decision", decisions)
@@ -331,7 +334,7 @@ async def test_missing_pin_full_apply_execute_keeps_reversible_click_and_denies_
     assert result["status"] == "gate", result
     assert decisions.await_count == 2
     assert [cmd[:2] for cmd in ipc if cmd[0] in {"click", "navigate"}] == [
-        ("navigate", URL), ("click", "#apply")]
+        ("navigate", URL), ("click", "#continue")]
     # Reversible Apply click is not an authorized final Submit/possible hold.
     assert authority.tracking.rows[PK].get("possible_submission") is not True
     await _must_final_tenant_deny(authority)

@@ -69,8 +69,10 @@ def observed(state, kind):
     page = snapshot['page']
     forms._inventory_ok(page)
     target = next(c for c in page['controls'] if c['type'] == kind)
-    witness = {c['selector']: c for c in snapshot['witness']['controls']}
-    question = forms._disclosure_question(page, target, witness, fixture.URL, bootstrap=True)
+    # A missing fact now requests an ordinary owner answer. The removed
+    # per-control witness/disclosure grant must not be resurrected to drive
+    # this synthetic observation-only fixture.
+    question = forms._ordinary_owner_question(page, target, fixture.PK)
     return {'status': 'gate', 'form_question': question}
 
 

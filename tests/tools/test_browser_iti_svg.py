@@ -98,13 +98,13 @@ async def test_svg_geometry_never_authorizes_a_missing_final_form_answer(
 @pytest.mark.parametrize('kind', ['entry', 'greenhouse'])
 @pytest.mark.parametrize('selector', ['#search-svg', '#clear-svg',
                                      '#country-clear', '#picker-option-0'])
-async def test_unapproved_svg_or_picker_click_cannot_escape_raw_ipc(
+async def test_non_submit_svg_or_picker_click_is_ordinary_preparation(
         kind, selector, monkeypatch):
     from tools import browser_skill as bsk
 
-    # Even a direct Session call must pass the one existing application
-    # controller. Neither an SVG descendant, hidden search option nor
-    # unapproved native clear button can issue an arbitrary browser click.
+    # Ordinary non-Submit clicks are not per-widget gated. A page-owned
+    # onchange/click script may have effects; that is Issue #293's explicitly
+    # accepted residual risk. It never counts as a classified Submit here.
     page = svg_observe(kind, svgParts='positive')['page']
     emitted = []
     controller = forms.ApplicationIPCController(
@@ -124,6 +124,10 @@ async def test_unapproved_svg_or_picker_click_cannot_escape_raw_ipc(
     session = bsk.Session('apply')
     session.id = 'synthetic-offline'
     session.bind_application_controller(controller)
-    with pytest.raises(forms.Gate):
-        await session.application_effect('click', selector)
-    assert emitted == [] and controller.committed is False
+    await session.application_effect('click', selector)
+    assert len(emitted) == 1
+    args, kwargs = emitted[0]
+    assert args[:2] == ('click', selector)
+    assert args[-2:] == ('--session', 'synthetic-offline')
+    assert kwargs == {}
+    assert controller.committed is False

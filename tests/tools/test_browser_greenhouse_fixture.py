@@ -1,6 +1,7 @@
 """Static synthetic hydration construction; live all-leg smoke remains separate."""
 from tests.tools.reader_node_harness import reader_output
 import json
+from copy import deepcopy
 import re
 import subprocess
 from html.parser import HTMLParser
@@ -70,8 +71,23 @@ def test_greenhouse_fixture_nonqualifying_before_hydration_and_parity_after():
     assert not any(c['selector'].startswith(('#iti-', '#country-button', '#country-clear'))
                    for c in later['page']['controls'])
     assert sum(c['type'] == 'tel' for c in later['page']['controls']) == 1
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
-        forms.check_form(later['page'], {}, uploaded=True)
+    # Satisfy the separate staged-PDF and ordinary required-field proofs
+    # synthetically; missing picker commitment must independently deny Submit.
+    current = deepcopy(later['page'])
+    # Hydration now exposes the real résumé receiver. Reuse its current
+    # form-owned file input instead of manufacturing a second attachment.
+    resumes = [c for c in current['controls'] if c.get('type') == 'file']
+    assert len(resumes) == 1
+    assert re.search(r'resume|résumé|cv', forms.label(resumes[0]), re.I)
+    assert resumes[0]['in_form'] is True
+    resumes[0]['files'] = ['Synthetic-Resume.pdf']
+    for control in current['controls']:
+        if control.get('required') and control.get('type') in {
+                'text', 'email', 'tel', 'textarea'}:
+            control['value'] = 'Synthetic value'
+            control['has_value'] = True
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(current, {}, uploaded=True, attachment='Synthetic-Resume.pdf')
     assert [c['selector'] for c in later['page']['controls']] == [
         c['selector'] for c in later['witness']['controls']]
     assert any(c['selector'] == '#additional' for c in later['page']['controls'])

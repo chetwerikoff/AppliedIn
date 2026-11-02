@@ -259,38 +259,6 @@ class FakeLever:
         pytest.fail(f'Unexpected browser IPC method/arguments: {args}')
 
 
-@pytest.fixture
-def grant_row(monkeypatch):
-    row = {
-        'pk': PK, 'company': 'example-co', 'job_id': JOB_ID, 'ats': 'lever',
-        'jd_url': POSTING, 'status': 'submitting', 'possible_submission': False,
-        'human_approved_answers': {
-            'Current location': {
-                'value': ANSWER, 'selector': '#current-location', 'url': URL,
-                'label': 'Current location', 'question': '', 'tag': 'input',
-                'type': 'combobox', 'form_selector': '#application-form',
-                'form_action': URL,
-            },
-        },
-    }
-    monkeypatch.setattr(forms, '_row', lambda _pk: row)
-    # Synthetic row/config are not the owner's real tracking or watchlist.
-    monkeypatch.setattr(forms, '_alias_current', lambda *_args, **_kw: True)
-    return row
-
-
-async def run_choice(session, *, approved=ANSWER, verb='combobox'):
-    initial = await session.page()
-    filled = forms._ApprovedFormValues({}, PK, {'Current location': approved})
-    receipt = await forms.execute(
-        session, initial, {'action': verb, 'selector': '#current-location',
-                           'fact': 'Current location'},
-        facts={'Current location': approved}, filled=filled,
-        resume_path='', company='example-co', jd_text='', resume_tex='',
-        github='', pk=PK, job_url=POSTING, provenance=PROVENANCE)
-    return receipt, filled
-
-
 def test_strict_iso_names_whole_city_and_supported_press_keys():
     assert parse_location(ANSWER) == ('testville', 'USA')
     assert equivalent_location(ANSWER, 'Testville, USA')
@@ -325,244 +293,107 @@ def test_offline_location_fixture_only_commits_on_option_click(caption):
     assert caption in html
 
 
+
+async def prepare_location(session, answer=ANSWER):
+    """Current accessible preparation; no value grant, widget receipt or approval."""
+    initial = await session.page()
+    filled = {}
+    action = {'action': 'combobox', 'selector': '#current-location',
+              'fact': 'Current location'}
+    result = await forms.execute(
+        session, initial, action,
+        facts={'Current location': answer} if answer else {}, filled=filled,
+        resume_path='', company='example-co', jd_text='', resume_tex='',
+        github='', pk=PK, job_url=POSTING, provenance=PROVENANCE)
+    return result, filled
+
+
+def with_synthetic_pdf(page):
+    """An offline form receiver with the one staged filename for final readback."""
+    current = deepcopy(page)
+    current['controls'].append({
+        'selector': '#resume', 'label': 'Resume', 'question': 'Resume',
+        'tag': 'input', 'type': 'file', 'required': True, 'disabled': False,
+        'in_form': True, 'form_selector': '#application-form',
+        'files': ['Resume.pdf'],
+    })
+    return current
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize('caption', ['Testville, USA', 'Testville, United States'])
-async def test_typed_choice_preserves_grant_and_final_report(grant_row, caption):
-    session = FakeLever(caption=caption)
-    grant_row['human_approved_answers']['Current location']['value'] = caption
-    grant_before = deepcopy(grant_row['human_approved_answers'])
-    receipt, filled = await run_choice(session, approved=caption)
-    assert receipt['approved_value'] == caption
-    assert receipt['committed_caption'] == caption
-    assert receipt['committed_value'] == 'testville-verified'
-    assert filled == {'#current-location': caption}
-    assert grant_row['human_approved_answers'] == grant_before
-    actions = [call for call in session.calls if call[0] != 'evaluate']
-    assert actions == [
+async def test_ungated_location_preparation_selects_visible_matching_option():
+    session = FakeLever(caption=ANSWER)
+    receipt, filled = await prepare_location(session)
+    assert receipt == {'action': 'combobox', 'selector': '#current-location',
+                       'label': 'Current location'}
+    assert filled == {'#current-location': ANSWER}
+    assert [call for call in session.calls if call[0] != 'evaluate'] == [
         ('click', '#current-location'),
-        ('fill', '#current-location', '--value', caption),
+        ('fill', '#current-location', '--value', ANSWER),
         ('click', '#location-option'),
     ]
-    assert sum(call[0] == 'click' for call in session.calls) == 2
-    assert all(call[0] not in {'press', 'focus', 'select', 'navigate'} for call in session.calls)
-    assert sum(call[0] == 'evaluate' for call in session.calls) >= 4
-    final = await session.page()
-    forms.check_form(final, filled, uploaded=True, receipts=[receipt])
-    forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
-    assert forms._fields_report([receipt], filled) == [
-        {'label': 'Current location', 'value': caption}]
-    # A merely equivalent spelling is not an exact approved form answer.
-    assert receipt['committed_caption'] == receipt['approved_value']
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('options', [
-    [],
-    [option('York, USA')],
-    [option('Testville, CAN')],
-    [option('Testville, ZZZ')],
-    [option('Testville, USA, Extra')],
-    [option('Testville, USA'), option('Testville, United States',
-                                    selector='#location-option-2',
-                                    value='another-verified')],
-    [option(ANSWER), option(ANSWER,
-                           selector='#location-option-2',
-                           value='another-verified')],
-    [option(ANSWER, safe=False)],
-    [option(ANSWER, navigates=True)],
-    [option(ANSWER, submit=True)],
-    [option(ANSWER, unique=False)],
-])
-async def test_rejected_candidates_gate_same_field_before_click(grant_row, options):
-    session = FakeLever(options=options)
-    if any(o['label'] == ANSWER and (not o['safe'] or o['navigates'] or o['submit'])
-           for o in options):
-        # Opening and typing are reversible; an exact-caption option with a
-        # submitting/navigating handler is NOT an approved choice click.
-        with pytest.raises(forms.Gate, match='submission-capable or unsafe navigating option'):
-            await run_choice(session)
-        assert ('click', '#current-location') in session.calls
-        assert ('fill', '#current-location', '--value', ANSWER) in session.calls
-        assert not any(c[0] == 'click' and c[1].startswith('#location-option')
-                       for c in session.calls)
-        assert ('click', '#submit') not in session.calls
-        with pytest.raises(forms.Gate):
-            forms.check_form(await session.page(), {}, uploaded=True)
-        return
-    receipt, filled = await run_choice(session)
-    # r06 admits reversible picker opening/search; it never equates a
-    # differently captioned city, ambiguous options or an unsafe handler with
-    # an exact approved choice or final Submit.
-    assert ('click', '#current-location') in session.calls
-    assert ('fill', '#current-location', '--value', ANSWER) in session.calls
-    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
-    selected = [o for o in options if o['label'] == ANSWER
-                and o['safe'] is True and o['unique'] is True
-                and not o['submit'] and not o['navigates']]
-    if len(selected) == 1 and selected[0]['selector'] == '#location-option-2':
-        # Two city spellings are not interchangeable. Only the exact
-        # authorized caption can be clicked; the synthetic change handler
-        # intentionally commits different bytes, which final Submit refuses.
-        assert ('click', '#location-option-2') in session.calls
-        assert receipt['committed_caption'] == ANSWER
-        assert receipt['committed_value'] == 'another-verified'
-        # Form-owned data can look internally consistent while disagreeing
-        # with the exact option clicked. Keep both production checks: current
-        # receiver and independent action receipt/grant must agree at Submit.
-        final = await session.page()
-        forms.check_form(final, filled, uploaded=True, receipts=[receipt])
-        with pytest.raises(forms.Gate, match='committed accessible choice'):
-            forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
-    else:
-        assert receipt.get('unresolved') and filled == {}
-        assert not any(call[0] == 'click' and call[1].startswith('#location-option')
-                       for call in session.calls)
-        with pytest.raises(forms.Gate):
-            forms.check_form(await session.page(), filled, uploaded=True)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('drift', ['option', 'field'])
-async def test_control_or_option_drift_gates_before_click(grant_row, drift):
-    session = FakeLever(drift=drift)
-    if drift == 'option':
-        receipt, filled = await run_choice(session)
-        assert receipt.get('unresolved') and filled == {}
-    else:
-        # An observed change of the question identity must not borrow the old
-        # grant even when the unchanged selector still exists.
-        with pytest.raises(forms.Gate):
-            await run_choice(session)
-    assert not any(call[0] == 'click' and call[1].startswith('#location-option')
-                   for call in session.calls)
-    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('failed_commit', ['typed-only', 'value', 'cleared',
-                                            'receiver', 'hidden'])
-async def test_post_click_uncertain_commit_never_retries_or_submits(grant_row, failed_commit):
-    session = FakeLever(failed_commit=failed_commit)
-    receipt, filled = await run_choice(session)
-    final = await session.page()
-    # Reversible option click is allowed; its actual submitted values must
-    # still fail the one final form check when the commit is incomplete.
-    with pytest.raises(forms.Gate):
-        forms.check_form(final, filled, uploaded=True, receipts=[receipt])
-    assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
-    assert all(call[0] != 'submit' for call in session.calls)
-
-
-
-@pytest.mark.asyncio
-async def test_uncertain_option_ipc_gates_without_a_second_click(grant_row):
-    session = FakeLever(click_uncertain=True)
-    # Direct execute() cannot claim a no-effect transport fault or retry an
-    # option whose first IPC might have issued. The outer apply loop owns the
-    # eventual uncertain/human outcome, not an early widget-shape certificate.
-    with pytest.raises(RuntimeError, match='simulated uncertain BrowserSkill option click'):
-        await run_choice(session)
-    assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
-    assert not any(call[0] in {'submit', 'navigate'} for call in session.calls)
-
-
-@pytest.mark.asyncio
-async def test_unapproved_input_never_dispatches_keyboard(grant_row):
-    grant_row['human_approved_answers'].clear()
-    session = FakeLever()
-    with pytest.raises(forms.Gate) as err:
-        await run_choice(session)
-    assert err.value.form_question['selector'] == '#current-location'
-    assert not any(call[0] in {'press', 'focus', 'click'} for call in session.calls)
-
-
-@pytest.mark.asyncio
-async def test_unsupported_city_key_gates_before_input(grant_row):
-    value = 'Téstville, United States'
-    grant_row['human_approved_answers']['Current location']['value'] = value
-    session = FakeLever()
-    receipt, filled = await run_choice(session, approved=value)
-    # Generic fill writes exact approved UTF-8 text without the removed
-    # Lever-only keystroke whitelist; absent exact options cannot be selected.
-    assert receipt.get('unresolved') and filled == {}
-    assert ('fill', '#current-location', '--value', value) in session.calls
-    assert not any(call[0] == 'press' or
-                   (call[0] == 'click' and call[1].startswith('#location-option'))
-                   for call in session.calls)
-    with pytest.raises(forms.Gate):
-        forms.check_form(await session.page(), filled, uploaded=True)
-
-
-@pytest.mark.asyncio
-async def test_submit_checks_reject_missing_receipt_or_changed_grant(grant_row):
-    # Use the exact owner-approved caption in this scenario: the test checks
-    # current grant drift, not the separate display-name equivalence question.
-    session = FakeLever(caption=ANSWER)
-    receipt, filled = await run_choice(session)
-    committed = await session.page()
-    forms.check_form(committed, filled, uploaded=True)
-    forms.check_approvals(PK, [receipt], committed, provenance=PROVENANCE)
-    # No historical selection certificate is needed once the current
-    # approved caption and actual named form-owned value are independently read.
-    changed_receiver = location_page(
-        typed=ANSWER, selected=True, caption=ANSWER,
-        changed={'receiver.value': 'OTHER'})
-    with pytest.raises(forms.Gate, match='hidden form value'):
-        forms.check_form(changed_receiver, filled, uploaded=True)
-    grant_row['human_approved_answers']['Current location']['value'] = 'Changed'
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [receipt], committed, provenance=PROVENANCE)
+    observed = await session.page()
+    assert observed['controls'][0]['combobox']['selected_text'] == ANSWER
+    assert observed['controls'][0]['combobox']['selected_value']
+    forms.check_form(with_synthetic_pdf(observed), filled, True, 'Resume.pdf')
     assert not any(c[:2] == ('click', '#submit') for c in session.calls)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('change', [
-    pytest.param({'combo.selected_text': ''}, id='lost-selection'),
-    pytest.param({'combo.displayed_text': ''}, id='cleared-display'),
-    pytest.param({'value': ''}, id='cleared-native-input'),
-    pytest.param({'has_value': False}, id='native-value-flag-lost'),
-    pytest.param({'disabled': True}, id='disabled-location'),
-    pytest.param({'combo.selected_value': ''}, id='machine-value-lost'),
-    pytest.param({'combo.hidden_value': 'OTHER'}, id='changed-hidden-commit'),
-    pytest.param({'combo.link_id': 'orphan'}, id='lost-listbox-owner'),
-    pytest.param({'receiver.value': 'OTHER'}, id='changed-hidden-receiver'),
-    pytest.param({'label': 'Another location'}, id='relabelled-location'),
-    pytest.param({'type': 'text'}, id='combobox-type-lost'),
-    pytest.param({'selector': '#replaced-location'}, id='replaced-control'),
-    pytest.param({'form_action': 'https://example.invalid/apply'}, id='changed-destination'),
+@pytest.mark.parametrize('available', [
+    [], [option('Elseville, USA')], [option('Testville, CAN')],
+    [option('Testville, USA, Extra')],
 ])
-async def test_submit_checks_reject_each_location_drift(grant_row, change):
+async def test_unknown_location_option_does_not_invent_a_selection(available):
+    session = FakeLever(options=available)
+    receipt, filled = await prepare_location(session)
+    assert receipt['action'] == 'combobox'
+    assert filled == {'#current-location': ANSWER}
+    assert not session.selected
+    assert [c for c in session.calls if c[0] == 'click'] == [
+        ('click', '#current-location')]
+    assert not any(c[:2] == ('click', '#submit') for c in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_missing_location_fact_is_an_owner_answer_request():
     session = FakeLever()
-    receipt, filled = await run_choice(session)
-    altered = location_page(typed=ANSWER, selected=True, changed=change)
-    # Neither pre-submit check may let a changed/disabled control escape the
-    # original witnessed selection just because its native loop would skip it.
-    with pytest.raises(forms.Gate):
-        forms.check_form(altered, filled, uploaded=True, receipts=[receipt])
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
+    with pytest.raises(forms.Gate) as refusal:
+        await prepare_location(session, answer='')
+    assert refusal.value.reason == 'owner_question'
+    assert refusal.value.form_question['selector'] == '#current-location'
+    assert not session.calls
 
 
-def test_other_combobox_cannot_borrow_location_equivalence():
-    other = location_page(typed=ANSWER, selected=True)
-    other['controls'][0]['label'] = 'Country'
-    # An unrelated question cannot borrow legacy city equivalence or a
-    # site-specific admission helper; the generic final reader is literal.
-    with pytest.raises(forms.Gate, match='Unverified or changed combobox value'):
-        forms.check_form(other, {'#current-location': ANSWER}, uploaded=True)
-    fake = {
-        'action': 'combobox', 'selector': '#current-location',
-        'label': 'Country', 'question': '', 'url': URL,
-        'fact': 'Country', 'approved_value': ANSWER,
-        'committed_caption': 'Testville, USA',
-        'committed_value': 'testville-verified',
-        'hidden_selector': '#location-token', 'hidden_value': 'testville-verified',
-    }
-    # This cannot pass the ordinary exact approved-to-committed check.
-    with pytest.raises(forms.Gate, match='committed accessible choice'):
-        forms.check_approvals(PK, [fake], other)
+@pytest.mark.asyncio
+async def test_interrupted_option_click_is_not_retried_automatically():
+    session = FakeLever(click_uncertain=True)
+    with pytest.raises(RuntimeError, match='simulated uncertain BrowserSkill option click'):
+        await prepare_location(session)
+    assert [c for c in session.calls if c[0] == 'click'] == [
+        ('click', '#current-location'), ('click', '#location-option')]
+    assert not session.selected
+
+
+@pytest.mark.asyncio
+async def test_generic_final_readback_requires_nonempty_current_location_and_pdf():
+    session = FakeLever(caption=ANSWER)
+    _, filled = await prepare_location(session)
+    current = with_synthetic_pdf(await session.page())
+    forms.check_form(current, filled, True, 'Resume.pdf')
+    cleared = deepcopy(current)
+    cleared['controls'][0]['value'] = ''
+    cleared['controls'][0]['combobox']['selected_text'] = ''
+    with pytest.raises(forms.Gate, match='required accessible picker'):
+        forms.check_form(cleared, filled, True, 'Resume.pdf')
+    without_pdf = deepcopy(current)
+    without_pdf['controls'][-1]['files'] = []
+    with pytest.raises(forms.Gate, match='Exactly one current résumé input'):
+        forms.check_form(without_pdf, filled, True, 'Resume.pdf')
+    duplicate = deepcopy(current)
+    duplicate['controls'].append(deepcopy(duplicate['controls'][0]))
+    with pytest.raises(forms.Gate, match='unique selectors'):
+        forms.check_form(duplicate, filled, True, 'Resume.pdf')
 
 
 def test_lever_dom_witnesses_are_shared_by_both_production_readers():
@@ -578,125 +409,6 @@ def test_lever_dom_witnesses_are_shared_by_both_production_readers():
         assert "e.form || e.closest('form')" in script
         assert 'hidden_selector:' in script and 'hidden_value:' in script
         assert 'const leverLocationField = e =>' not in script
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('shape', ['dangling', 'dangling_name', 'duplicate'])
-async def test_declared_receiver_without_form_owned_value_refuses_final_submit(grant_row, shape):
-    html = _lever_location_form().decode('utf-8')
-    hidden = '<input id="location-token" type="hidden" name="location_token">'
-    assert hidden in html
-    if shape == 'duplicate':
-        html = html.replace(hidden, hidden + hidden)
-        assert html.count('id="location-token"') == 2
-    elif shape == 'dangling_name':
-        html = html.replace('data-value-input="location-token"',
-                            'data-value-name="location_token"').replace(hidden, '')
-        assert 'data-value-name="location_token"' in html
-    else:
-        html = html.replace(hidden, '')
-    session = FakeLever(receiver_shape=shape)
-    receipt, filled = await run_choice(session)
-    final = await session.page()
-    # Without the declared receiver, a missing native form-owned value is
-    # an actual final-submit defect, not an authorization to block the option.
-    final['controls'][0].update(value='', has_value=False)
-    with pytest.raises(forms.Gate, match='verified form-own value receiver'):
-        forms.check_form(final, filled, uploaded=True, receipts=[receipt])
-    # A closed picker opens first, then clicks the one approved option. Neither
-    # reversible IPC authorizes the application Submit with no form receiver.
-    assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
-    assert not any(call[0] == 'submit' for call in session.calls)
-
-
-@pytest.mark.asyncio
-async def test_receiver_witness_disagreement_has_no_option_click(grant_row):
-    # PAGE still reports a hidden token, but the independent witness conflicts.
-    # Opening/typing is reversible; the disagreement may not authorize option
-    # commitment, a form-value receiver or the final Submit.
-    session = FakeLever(witness_receiver_drift=True)
-    receipt, filled = await run_choice(session)
-    assert receipt.get('unresolved') and filled == {}
-    assert not any(call[0] == 'click' and call[1].startswith('#location-option')
-                   for call in session.calls)
-    with pytest.raises(forms.Gate):
-        forms.check_form(await session.page(), filled, uploaded=True)
-
-
-@pytest.mark.asyncio
-async def test_only_undeclared_location_receiver_can_be_absent(grant_row):
-    # The browser's named input must submit the same value as the selected
-    # option. A removed hidden token cannot leave an executable token.value
-    # dereference or a machine code that the form will never submit.
-    html = _lever_location_form(caption=ANSWER).decode('utf-8')
-    html = html.replace(' data-value-input="location-token"', '')
-    html = html.replace('<input id="location-token" type="hidden" name="location_token">', '')
-    html = html.replace('data-value="testville-verified"', f'data-value="{ANSWER}"')
-    html = html.replace(
-        "input.setAttribute('data-selected-value', 'testville-verified');",
-        f"input.setAttribute('data-selected-value', '{ANSWER}');")
-    html = html.replace('token.value =', 'if (token) token.value =')
-    assert 'data-value-input=' not in html and 'id="location-token"' not in html
-    assert f'data-value="{ANSWER}"' in html
-    assert f"data-selected-value', '{ANSWER}'" in html
-    assert html.count('if (token) token.value =') == 2
-
-    session = FakeLever(receiver_shape='none')
-    receipt, filled = await run_choice(session)
-    assert receipt['hidden_selector'] == '' and receipt['hidden_value'] == ''
-    assert receipt['committed_caption'] == receipt['committed_value'] == ANSWER
-    final = await session.page()
-    owner = next(c for c in final['controls'] if c['selector'] == '#current-location')
-    assert owner['in_form'] and owner['form_selector'] == '#application-form'
-    assert owner['name'] == 'location' and owner['has_value']
-    assert owner['value'] == owner['combobox']['selected_value'] == ANSWER
-    forms.check_form(final, filled, uploaded=True)
-    forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
-
-    for field, value in (('value', ''), ('value', 'OTHER'),
-                         ('name', ''), ('has_value', False)):
-        changed = deepcopy(final)
-        target = next(c for c in changed['controls']
-                      if c['selector'] == '#current-location')
-        target[field] = value
-        with pytest.raises(forms.Gate, match='form-own value receiver'):
-            forms.check_form(changed, filled, uploaded=True)
-    changed = deepcopy(final)
-    changed['controls'][0]['combobox']['selected_value'] = 'OTHER'
-    with pytest.raises(forms.Gate, match='form-own value receiver'):
-        forms.check_form(changed, filled, uploaded=True)
-    assert [call for call in session.calls if call[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
-    assert not any(call[:2] == ('click', '#submit') for call in session.calls)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('shape', ['post_dangling', 'post_duplicate'])
-async def test_receiver_disappearing_after_option_click_cannot_submit(grant_row, shape):
-    session = FakeLever(receiver_shape=shape)
-    receipt, filled = await run_choice(session)
-    final = await session.page()
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [receipt], final, provenance=PROVENANCE)
-    assert [c for c in session.calls if c[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
-    assert not any(c[0] == 'submit' for c in session.calls)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('shape', ['post_dangling', 'post_duplicate'])
-async def test_receiver_loss_at_final_submit_gates_both_checks(grant_row, shape):
-    session = FakeLever()
-    receipt, filled = await run_choice(session)
-    session.receiver_shape = shape
-    altered = await session.page()
-    # Missing or altered receiver metadata cannot preserve the originally
-    # approved hidden-selector history at final Submit.
-    with pytest.raises(forms.Gate):
-        forms.check_approvals(PK, [receipt], altered, provenance=PROVENANCE)
-    assert [c for c in session.calls if c[0] == 'click'] == [
-        ('click', '#current-location'), ('click', '#location-option')]
 
 
 @pytest.mark.asyncio

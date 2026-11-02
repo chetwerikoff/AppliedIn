@@ -230,78 +230,64 @@ Tests and smoke use only synthetic offline data, never a real feed, record,
 browser, application, Redis instance or submission.
 
 
-### Issue #139: application preparation and final Submit boundary
+### Issue #293: ungated form preparation and final Submit boundary
 
-At application preparation, the code-owned approved HTTPS employer/ATS host
-restriction allows `jobs.ashbyhq.com`, `jobs.lever.co` and host-only
-`job-boards.greenhouse.io` without requiring an already-current board pin,
-legacy wrapper certificate or tenant equality before reversible work.
-This permits approved field writes, accessible-choice changes and upload of
-the exact seed-valid row PDF under their per-action protections; it does not
-authorize application submission. A uniquely observed native form owner may be
-projected to focus preparation, but an absent or hydrating native census is not
-an independent per-step approval or final Submit certificate. Independently
-witnessed form receivers, approved values and safe destinations still govern
-each write, and ambiguity cannot authorize the irreversible click.
+Application preparation on the approved HTTPS employer/ATS route fills and reads
+back accessible text, select, radio, checkbox, combobox, survey and native
+controls, including the exact staged row PDF, without per-action grant, witness,
+widget-specific, or pre-dispatch approval gates. A missing owner fact is requested
+through the existing owner-question channel; it is not an additional Submit
+criterion. Normal Next/Continue, focus, blur and other non-Submit operations do
+not acquire a final submission hold.
 
-The one final code-owned raw-click guard re-reads the current tracked row,
-configured/pinned tenant, final job and origin, approvals, duplicate/hold
-state, posting generation and seed-bound PDF. A missing, stale or foreign
-board/pin refuses that irreversible click, even when approved fields,
-accessible options and the correct PDF were prepared. Re-verify the board
-and row through the existing operator mechanism; do not rewrite legacy
-tracking rows or infer tenant membership from page hints.
+The raw application IPC controller performs **one fresh `check_pre_submit`**
+before a classified Submit click or in-form Enter/Space/implicit submission. It checks
+the tracked job/ATS/tenant and duplicate state, the seed-valid staged PDF and its
+single matching current file input on the committing form (or the proven
+formless application root), protected-characteristic non-affirmation,
+stated salary versus a comparable owner floor (otherwise an owner question),
+and the checked safe negative/decline sanctions caption. Failure persists the
+item ID and a sanitized reason in the existing `NEEDS_HUMAN` flow for Luna;
+correction/requeue reruns the same check. The existing submission hold,
+duplicate protection and independent employer confirmation remain unchanged.
+An unconfirmed possibly committing attempt is `submit_uncertain`, never
+`applied`, and cannot be blindly retried.
+
+Page JavaScript triggered by change, blur or upload can autosave or commit
+**before** Submit. This is an explicitly owner-accepted residual risk: the
+single final check does not intercept or prevent page-owned JavaScript effects.
 
 ## Operation and guarantees
 
-Every job runs in its own Agent Window. Only its own session is cleaned up;
-user tabs are never borrowed, and shared daemons are never stopped by reset.
-Independent readers can coexist with an application without stealing its tab.
+Each job uses its own dedicated application Agent Window; only that session is
+cleaned up. Shared daemons and user tabs are never borrowed or stopped.
+The model chooses typed accessibility actions, not arbitrary shell or JavaScript,
+and uses available owner facts and the operator brief to answer the form. It may
+fill and read back controls without obtaining a per-control permission token.
+Unanswered facts and account/login challenges use the existing human question
+path; the agent does not sign in, solve CAPTCHAs or invent missing facts.
 
-The adapter's form controller executes only a finite set of typed actions:
-models cannot run shell, arbitrary JavaScript, borrow tabs, or choose another
-profile. The model selects approved fact **keys**, and the server substitutes and
-checks their values before writing. Native select and radio/checkbox options
-must match both the page and an approved answer. Required decision-only
-acknowledgements may be accepted, but facts and self-identification cannot be
-inferred from an acknowledgement.
-An exact approved textarea answer takes precedence over an unnecessary essay
-request; matching is literal, not inferred. The model is told that the server
-already owns the staged PDF and supplies it to the upload action.
+Navigation stays on the approved tracked application route; explicitly committing
+GET destinations are refused even when they are on that route. A missing or stale
+configured ATS tenant is rejected by the final Submit decision, not by a
+per-field gate. The final check uses a fresh complete application inventory,
+observed current field values and exact current file input; a prior model receipt
+alone is not evidence of what the form will submit. The staged file's local
+identity and digest are checked, not a browser `File.arrayBuffer()` digest or
+an unobserved remote ATS attachment.
 
-Application navigation is limited to the job/direct-board hosts and known ATS
-domains. The check also covers clicked links, so clicking cannot bypass the
-navigation restriction. Unrelated and lookalike hosts produce a human gate.
+After a committing attempt the system requires a **new** employer confirmation,
+with no active Submit control, before marking a row `applied`. A timed-out,
+disconnected or otherwise unconfirmed potentially submitted attempt persists
+`submit_uncertain` for inspection. No new Luna transport, retry mechanism,
+approval subsystem, or browser engine is introduced.
 
-Before final Submit, the controller rechecks the tracked dispatch, duplicate
-status, résumé seed, attachment and current form values. Protected-characteristic
-affirmations, unsafe restricted-country answers, placeholders, unverified
-resume-parser autofill and incomplete form inventories become human gates.
-Missing facts, login/CAPTCHA and unsupported embedded/shadow controls also gate;
-there is no attempt to bypass them or silently change browser backends.
-The DOM guard distinguishes the extension's own `BROWSER-SKILL-OVERLAY` containing
-only Interrupt buttons from site shadow controls. A site shadow form or iframe
-still gates. File inputs are checked through their verified attachment receipt,
-not through Chrome's synthetic `C:\fakepath` text value.
+Scoring, tailoring, critic and PDF rendering still use the upstream graph.
+The scorer's structured response and score thresholds remain. Career Ops
+`Score & tailor` is prepare-only; engine selection and retry grant no
+permission to submit.
 
-A submit-command timeout or disconnect is **uncertain**, never retryable. A
-submission is recorded as applied only after observing a new employer
-confirmation, with no remaining active Submit control. A phrase already present
-before the click is not confirmation. Site-specific structures that cannot be
-verified require review rather than a guessed submission.
-Gate and uncertain reports include the last attempted button and reached URL
-for manual completion. OAuth query tickets and URL fragments are stripped from
-that handoff context. Next/Continue remain submission-capable steps: an
-interruption after them never authorizes an automatic retry.
-
-Scoring, tailoring, critic and PDF rendering still use the upstream graph. The
-scorer explicitly requests its existing JSON schema to avoid Markdown responses
-from subscription models; strict schema validation and score thresholds remain.
-Career Ops `Score & tailor` remains prepare-only; neither engine selection nor
-retry grants permission to apply. Preparation errors leave an actionable error
-card rather than an unclaimed card permanently marked WORKING.
-
-To explicitly return all browser operations to the original engine:
+To explicitly return browser operations to the original engine:
 
 ```yaml
 # config/browser.local.yaml

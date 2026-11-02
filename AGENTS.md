@@ -188,11 +188,14 @@ probably never saw them: check whether the company should be `discovery: browser
 
 These are enforced in code, not requested in prompts, because a rule that lives
 only in a prompt is a rule nobody is enforcing. Do not move them into a prompt.
-For BrowserSkill applications, the one fresh, code-owned final pre-Submit decision
-at the raw application IPC producer enforces the six outcomes below. Approved
-field entry, accessible choices and the exact seed-valid row PDF upload remain
-reversible preparation with per-action protections; no model or reviewer can
-replace or override the final decision.
+For BrowserSkill applications, ordinary accessible form filling, choices,
+focus, navigation within the form and the row PDF upload are ungated preparation.
+Exactly one fresh code-owned check at raw application IPC precedes Submit or
+in-form implicit submission: it verifies five substantive conditions; an
+unconfirmed potentially committed attempt remains uncertain, never applied.
+Page-owned change/blur/upload handlers can commit early; this is an explicitly
+accepted residual risk, not protection provided by the final check. No model
+or reviewer can replace the code-owned Submit decision.
 
 - **Never declare a protected characteristic.** `guard_value()` in
   `claude_chrome.py` intercepts every value the model writes. Disability, veteran

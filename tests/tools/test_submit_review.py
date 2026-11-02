@@ -360,3 +360,20 @@ def test_restart_disposes_orphaned_private_packet_and_revokes_stored_token(
     # A restart cannot magically reconstruct the former BrowserSkill owner.
     with pytest.raises(submit_review.Refused):
         submit_review.claim(PK, "synthetic-generation", "approve")
+
+
+def test_orphan_recovery_is_asgi_startup_only(monkeypatch):
+    """App construction stays offline; actual ASGI startup revokes orphan holders."""
+    from fastapi.testclient import TestClient
+    from server import create_app
+
+    calls = []
+    monkeypatch.setattr(submit_review, "recover_orphans",
+                        lambda: calls.append("startup"))
+    app = create_app()
+    assert calls == []
+    with TestClient(app) as client:
+        assert calls == ["startup"]
+        assert client.get("/config.js").status_code == 200
+        assert calls == ["startup"]
+    assert calls == ["startup"]

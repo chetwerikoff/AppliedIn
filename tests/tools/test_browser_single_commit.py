@@ -1067,3 +1067,80 @@ def test_both_raw_readers_scope_labelled_identity_to_application_root(reader, vi
     assert scoped_identity_conflict(page, '#application-form',
                                     'synthetic-job-42', 'example-co') == expected
 
+
+
+@pytest.mark.asyncio
+async def test_final_review_rechecks_before_real_raw_cli_after_context_wait(monkeypatch):
+    """Synthetic revoked generation is refused before *any* CLI effect."""
+    from types import SimpleNamespace
+    calls = []
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+
+    def revoked(_session, args):
+        calls.append(("guard", args))
+        raise forms.Gate("revoked synthetic review", reason="submit_review")
+
+    session._application_controller = SimpleNamespace(
+        review_effect_args=("click", "#synthetic-submit"),
+        final_review_effect_guard=revoked,
+    )
+
+    async def forbidden(*args, **kwargs):
+        calls.append(("raw", args))
+        raise AssertionError("raw CLI must not execute after revocation")
+
+    monkeypatch.setattr(bsk, "command", forbidden)
+    with pytest.raises(forms.Gate, match="revoked synthetic review"):
+        await session._run(("click", "#synthetic-submit"), {})
+    assert calls == [("guard", ("click", "#synthetic-submit"))]
+
+
+@pytest.mark.asyncio
+async def test_private_screenshot_is_one_png_and_cleaned_from_temp(monkeypatch, tmp_path):
+    """In-memory synthetic PNG, not an employer screenshot or live CLI."""
+    from tools import submit_review
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+    session.owner = asyncio.current_task()
+    session._application_controller = object()
+    png = b"\\x89PNG\\r\\n\\x1a\\n" + b"synthetic-only"
+    calls = []
+
+    async def fake_screenshot(args, kwargs):
+        assert args[:2] == ("screenshot", "--out")
+        from pathlib import Path
+        output = Path(args[2])
+        output.write_bytes(png)
+        calls.append(output)
+        return {"path": str(output)}
+
+    monkeypatch.setattr(session, "_run", fake_screenshot)
+    monkeypatch.setattr(submit_review, "_private_root", lambda: tmp_path)
+    assert await session.review_screenshot() == png
+    assert len(calls) == 1
+    assert not calls[0].exists()
+    assert not calls[0].parent.exists()
+
+
+@pytest.mark.asyncio
+async def test_bad_private_screenshot_refuses_without_leaving_files(monkeypatch, tmp_path):
+    from tools import submit_review
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+    session.owner = asyncio.current_task()
+    session._application_controller = object()
+    calls = []
+
+    async def fake_screenshot(args, kwargs):
+        from pathlib import Path
+        output = Path(args[2])
+        output.write_bytes(b"not-a-png")
+        calls.append(output)
+        return {"path": str(output)}
+
+    monkeypatch.setattr(session, "_run", fake_screenshot)
+    monkeypatch.setattr(submit_review, "_private_root", lambda: tmp_path)
+    with pytest.raises(bsk.Unavailable, match="not PNG"):
+        await session.review_screenshot()
+    assert len(calls) == 1 and not calls[0].exists()

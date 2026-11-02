@@ -204,3 +204,53 @@ def test_expired_holder_does_not_authorize_any_new_decision(monkeypatch, tmp_pat
                         time.monotonic() < h.deadline)
     with pytest.raises(submit_review.Refused):
         submit_review.claim(PK, holder.generation, "approve")
+
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(("origin", "host", "peer"), [
+    (None, "localhost:8000", "127.0.0.1"),
+    ("chrome-extension://synthetic", "localhost:8000", "127.0.0.1"),
+    ("moz-extension://synthetic", "localhost:8000", "127.0.0.1"),
+    ("http://elsewhere.test:8000", "localhost:8000", "127.0.0.1"),
+    ("http://localhost:8001", "localhost:8000", "127.0.0.1"),
+    ("http://localhost:8000", "elsewhere.test:8000", "127.0.0.1"),
+    ("http://localhost:8000", "localhost:8000", "192.0.2.1"),
+])
+def test_review_first_party_route_policy_rejects_external_origin_host_or_peer(
+        monkeypatch, method, origin, host, peer):
+    from fastapi import HTTPException
+    from starlette.requests import Request
+    from server import _require_submit_review_first_party
+    import server
+
+    monkeypatch.setattr(server, "get_settings",
+                        lambda: SimpleNamespace(mode="local"))
+    headers = [(b"host", host.encode())]
+    if origin is not None:
+        headers.append((b"origin", origin.encode()))
+    request = Request({"type": "http", "method": method, "scheme": "http",
+                       "path": "/applications/example-co%231/submit-review",
+                       "root_path": "", "query_string": b"", "headers": headers,
+                       "client": (peer, 40000), "server": ("127.0.0.1", 8000)})
+    with pytest.raises(HTTPException) as error:
+        _require_submit_review_first_party(request)
+    assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_review_first_party_allows_exact_loopback_origin_only(monkeypatch, method):
+    from starlette.requests import Request
+    from server import _require_submit_review_first_party
+    import server
+
+    monkeypatch.setattr(server, "get_settings",
+                        lambda: SimpleNamespace(mode="local"))
+    request = Request({"type": "http", "method": method, "scheme": "http",
+                       "path": "/actions/submit-review/example-co%231",
+                       "root_path": "", "query_string": b"",
+                       "headers": [(b"host", b"127.0.0.1:8000"),
+                                   (b"origin", b"http://127.0.0.1:8000")],
+                       "client": ("127.0.0.1", 45000),
+                       "server": ("127.0.0.1", 8000)})
+    _require_submit_review_first_party(request)

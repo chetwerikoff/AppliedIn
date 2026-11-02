@@ -522,6 +522,26 @@
       <div id="rmodal-body" class="rmodal-body"></div>
     </div>
 
+    <!-- Private per-generation reviewer view; not a persisted document cache. -->
+    <dialog id="submit-review-dialog" class="submit-review-dialog"
+      aria-label="Review final application form">
+      <div class="submit-review-top">
+        <h2>Final Submit review</h2>
+        <button id="submit-review-close" type="button" class="drawer-close"
+          aria-label="Close review without deciding">✕</button>
+      </div>
+      <div id="submit-review-body" class="submit-review-body" aria-live="polite"></div>
+      <div class="submit-review-actions" id="submit-review-actions" hidden>
+        <label for="submit-review-reason">Reason for Reject (private, optional)</label>
+        <textarea id="submit-review-reason" maxlength="500" rows="2"
+          placeholder="Reason for rejecting this form (up to 500 characters)"></textarea>
+        <div class="submit-review-buttons">
+          <button id="submit-review-reject" type="button" class="btn btn-danger">Reject · no Submit</button>
+          <button id="submit-review-approve" type="button" class="btn btn-primary">Approve exact form</button>
+        </div>
+      </div>
+    </dialog>
+
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
     <script src="config.js"></script>

@@ -4923,7 +4923,7 @@ function closeSubmitReview() {
   $("#submit-review-body").replaceChildren();
   $("#submit-review-reason").value = "";
   if (dialog?.open && typeof dialog.close === "function") dialog.close();
-  else dialog?.removeAttribute("open");
+  else dialog?.removeAttribute?.("open");
 }
 function submitReviewValue(value) {
   return esc(typeof value === "string" ? value : JSON.stringify(value ?? null));
@@ -5695,6 +5695,19 @@ window.addEventListener("resize", () => {
 });
 
 function wire() {
+  // Install the review interceptor before ordinary delegated handlers. Only an
+  // actual review button can consume the event; other pane/drawer actions keep
+  // their existing delegation and focus semantics.
+  for (const parent of ["#pane", "#drawer"]) {
+    $(parent).addEventListener("click", (e) => {
+      const el = e.target.closest("[data-submit-review-open]");
+      const pk = el?.dataset?.submitReviewOpen;
+      if (!pk) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      openSubmitReview(pk);
+    }, { capture: true });
+  }
   document.addEventListener("career-show-all", () => {
     state.coFilter = ""; state.query = "";
     $("#co-filter").value = ""; $("#search").value = "";
@@ -7275,15 +7288,6 @@ function wire() {
   $("#submit-review-dialog").addEventListener("close", closeSubmitReview);
   $("#submit-review-approve").addEventListener("click", () => decideSubmitReview("approve"));
   $("#submit-review-reject").addEventListener("click", () => decideSubmitReview("reject"));
-  for (const parent of ["#pane", "#drawer"]) {
-    $(parent).addEventListener("click", (e) => {
-      const el = e.target.closest("[data-submit-review-open]");
-      if (!el) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      openSubmitReview(el.dataset.submitReviewOpen);
-    }, { capture: true });
-  }
   $("#m-headless").addEventListener("click", () => { toggleHeadless(); closeMenu(); });
   $("#m-theme").addEventListener("click", () => {
     const root = document.documentElement;

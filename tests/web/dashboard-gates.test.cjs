@@ -878,6 +878,35 @@ test('generation B replaces A question and actions without retaining the A answe
   assert.equal(h.context.sendCount, 1);
 });
 
+test('a delayed A refusal with a true emit hint cannot be attributed to submitted B', async () => {
+  const a = exactOwner('example-co#synthetic');
+  const {h, emit, slots} = liveRefusalHarness(a);
+  await h.fn('sendResume')(a.pk, ownerBody(a), 'Sent — checking the result.');
+  await settle();
+  // A emits while it is current; SSE delivery is delayed until after another
+  // actor consumes A, B is projected, and a new local answer to B is submitted.
+  const b = exactOwner(a.pk, {gate_generation:'gen-B',
+    gate_question_identity:'q1_synthetic_B', gate_question:'Synthetic question B?'});
+  h.context.sourceRows = [b];
+  await h.fn('loadApps')(); // ordinary refresh pruned A's attempt in the old code
+  await h.fn('sendResume')(b.pk, ownerBody(b), 'Sent — checking the result.');
+  await settle();
+  emit(markedRefusal(a.pk, {same_pending_gate_at_emit:true,
+    at:'2026-01-01T00:00:02+00:00'}));
+  await settle(); await settle();
+
+  assert.ok(slots.every((s) => !s.innerHTML), 'no inline notice may blame B for A');
+  assert.doesNotMatch(h.fn('needsCard')(h.state.apps[0]),
+    /An answer attempt for this pending question/);
+  assert.doesNotMatch(h.fn('gateMini')(h.state.apps[0]),
+    /An answer attempt for this pending question/);
+  assert.match(h.node('#drawer-body').innerHTML, /Synthetic question B/);
+  assert.match(h.fn('feedItem')(h.state.events[0]), /owner reply refused/,
+    'A still appears in historical Logs');
+  assert.equal(h.state.events[0].detail, 'Owner reply not accepted.');
+  assert.equal(h.context.sendCount, 2, 'delayed refusal cannot retry either answer');
+});
+
 test('overlap, held/advanced/generationless row, different PK and replay remain historical', async () => {
   for (const change of ['overlap','held','advanced','generationless','other_pk','full_reload']) {
     const a = exactOwner('example-co#synthetic');

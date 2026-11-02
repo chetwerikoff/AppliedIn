@@ -399,13 +399,8 @@ function refreshReplyNoticeNodes(pk) {
   });
 }
 function pruneReplyEvidence() {
-  for (const [pk, key] of _replyAttemptGates) {
-    const r = state.apps.find((item) => item.pk === pk);
-    if (ownerGateKey(r) !== key) {
-      _replyAttemptGates.delete(pk);
-      _replyAmbiguousGates.delete(pk);
-    }
-  }
+  // Keep past same-PK attempts ambiguous across gate generations. A PK-only
+  // refusal from A can arrive after the locally submitted gate has become B.
   for (const [pk, witness] of _replyWitnesses) {
     if (ownerGateKey(state.apps.find((r) => r.pk === pk)) !== witness.key)
       _replyWitnesses.delete(pk);
@@ -419,10 +414,9 @@ function beginReplyWitness(pk, body) {
   const r = state.apps.find((item) => item.pk === pk);
   const key = ownerGateKey(r);
   const previous = _replyAttemptGates.get(pk);
-  // Two locally submitted attempts to the same gate are indistinguishable in
-  // an event with only a PK; neither can authorize current-question attribution.
-  if (key && previous === key) _replyAmbiguousGates.set(pk, key);
-  else if (previous !== key) _replyAmbiguousGates.delete(pk);
+  // A refusal carries no attempt or generation identity. Once this PK has had
+  // another local attempt, even on gate A, a late event cannot be bound to B.
+  if (key && previous !== undefined) _replyAmbiguousGates.set(pk, key);
   _replyAttemptGates.set(pk, key);
   _replyWitnesses.delete(pk);
   _replyNotices.delete(pk);

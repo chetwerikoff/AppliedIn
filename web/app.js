@@ -394,7 +394,7 @@ function replyNoticeSlot(r) {
 }
 function refreshReplyNoticeNodes(pk) {
   const r = state.apps.find((item) => item.pk === pk);
-  $('[data-reply-refusal="' + CSS.escape(pk) + '"]').forEach((el) => {
+  document.querySelectorAll('[data-reply-refusal="' + CSS.escape(pk) + '"]').forEach((el) => {
     el.innerHTML = r ? replyNoticeHtml(r) : "";
   });
 }
@@ -3681,7 +3681,7 @@ function renderPane() {
   const selectedFocus = document.activeElement?.dataset?.reviewPick;
   const saved = {};
   let focusInput = null;
-  $("#pane textarea[data-answer-for]").forEach((t) => {
+  document.querySelectorAll("#pane textarea[data-answer-for]").forEach((t) => {
     const pk = t.dataset.answerFor;
     const key = ownerGateKey(state.apps.find((r) => r.pk === pk));
     if (key && key === _drawnGateKeys.get(pk)) {

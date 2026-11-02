@@ -290,7 +290,7 @@ PAGE = r"""(() => {
         || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
           && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
-      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent)})),
+      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent),selected:!!o.selected})),
       option_count:nativeOptions.length,
       options_capped:shownNative.length<nativeOptions.length,
       combobox: type === 'combobox' ? (() => {

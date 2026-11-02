@@ -772,6 +772,13 @@ async def test_real_owner_answer_then_exact_checks_and_clearing(monkeypatch):
     first = await owner.run._apply_direct(case.pk, stores)
     assert first['result'] == 'gated', first
     row = stores.tracking.get(case.pk)
+    # The owner-question path is only entered after the real matched-source
+    # admission; a text-only fixture cannot bypass the posting guard.
+    from tools import posting_guard as pg
+
+    assert pg.valid(row['jd_text'], row['posting_guard'])
+    assert row['posting_guard']['status'] == 'clean'
+    assert row['posting_guard']['source_verified'] is True
     question = row['gate_pending']['form_question']
     assert row['gate_reason'] == 'owner_question'
     assert question['type'] == 'checkbox_group' and question['options'] == OPTIONS

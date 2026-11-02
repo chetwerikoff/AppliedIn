@@ -37,5 +37,27 @@ def test_the_apply_passes_the_non_yielding_kind(monkeypatch):
     from tools import posting_guard as pg
     monkeypatch.setattr(jd, "fetch_jd_meta", lambda url, kind="jd":
                         (seen.setdefault("kind", kind), pg.analyze("Synthetic job role."))[1])
-    asyncio.run(_jd_text({"jd_url": "https://x/1", "jd_text": ""}, yielding=False))
+    # Non-yielding is only transport priority, not direct approval: this
+    # historical text adapter may still consume an unverified reader result.
+    text = asyncio.run(_jd_text({"jd_url": "https://x/1", "jd_text": ""},
+                                yielding=False))
+    assert text == "Synthetic job role."
     assert seen["kind"] == "jd"
+
+
+def test_strict_approval_source_is_separate_from_non_yielding_text(monkeypatch):
+    import pytest
+    from agent.run import _jd_meta
+    from tools import posting_guard as pg
+
+    calls = []
+
+    def unverified(url, kind):
+        calls.append((url, kind))
+        return pg.analyze("Synthetic job role.")
+
+    monkeypatch.setattr(jd, "fetch_jd_meta", unverified)
+    with pytest.raises(jd.PostingReadUnavailable):
+        asyncio.run(_jd_meta({"jd_url": "https://x/1", "jd_text": ""},
+                             yielding=False, approval=True))
+    assert calls == [("https://x/1", "jd")]

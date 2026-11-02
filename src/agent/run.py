@@ -572,15 +572,16 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     return result
 
 
-async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
-    """Select guarded JD; direct approval requires the raw current source.
+async def _jd_meta(row: dict, *, yielding: bool = True,
+                   approval: bool = False) -> dict:
+    """Select guarded JD; only direct approval requires raw current evidence.
 
-    Other readers retain the existing cached/fallback selection contract.
-    Approval never substitutes that cache for a witnessed read.
+    yielding controls the reader's transport priority for ordinary JD consumers;
+    approval separately disables their cached/shorter-source fallback.
     """
     from tools import jd as _jd, posting_guard as pg
 
-    if not yielding:
+    if approval:
         url = row.get("jd_url") or ""
         if not url:
             raise _jd.PostingReadUnavailable("Missing tracked posting URL")
@@ -1847,7 +1848,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return changed
 
     try:
-        jd_meta = await _jd_meta(row, yielding=False)
+        jd_meta = await _jd_meta(row, yielding=False, approval=True)
         changed, _ = _direct_approval_check(pk, observed, stores)
         if changed:
             return changed

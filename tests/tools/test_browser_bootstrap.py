@@ -934,6 +934,54 @@ async def test_actual_reader_hidden_role_is_not_owner_material_type():
         assert prepared == page
 
 
+
+
+class _OfflineApprovalTracking:
+    """Small observable guard-CAS row for the INFO/event consumer tests."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def get(self, pk):
+        assert pk == PK
+        return dict(self.row)
+
+    def get_current(self, pk):
+        return self.get(pk)
+
+    def set_status(self, pk, status, **updates):
+        assert pk == PK
+        self.row.update(status=getattr(status, 'value', status), **updates)
+
+    def update_posting_guard(self, pk, observed, inspected=None, *,
+                             source_witness=False, settle_refusal=False, **kwargs):
+        from core.storage.base import guard_observation_matches, guard_patch
+
+        assert pk == PK
+        if not guard_observation_matches(self.row, observed):
+            return False
+        patch = guard_patch(self.row, inspected, source_witness=source_witness,
+                            settle_refusal=settle_refusal)
+        if patch is None:
+            return False
+        self.row.update(patch)
+        return True
+
+
+def _offline_approval_source(monkeypatch, row):
+    """A matched complete source is needed before the synthetic browser gate."""
+    from tools import jd, posting_guard as pg
+
+    def read(url, kind):
+        assert (url, kind) == (row['jd_url'], 'jd')
+        text = row['jd_text']
+        return {**pg.analyze(text, html_variants=[f'<p>{text}</p>'],
+                             source_required=True),
+                'source_kind': 'ats_html', 'source_url': url}
+
+    monkeypatch.setattr(jd, 'fetch_jd_meta', read)
+
+
 @pytest.mark.parametrize('queued_worker', [False, True], ids=['direct', 'queued-worker'])
 @pytest.mark.parametrize('material', [False])
 async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
@@ -958,33 +1006,20 @@ async def test_material_gate_owner_detail_is_not_ordinary_event_or_info_log(
     assert ('OWNER_VISIBLE_LOG_SENTINEL' in gate['question']) is material
     assert (gate.get('material_assent_diagnostic') is True) is material
 
+    from tools import posting_guard as pg
+
+    text = 'Synthetic offline job description'
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
-           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
-    class Tracking:
-        def get(self, pk):
-            assert pk == PK
-            return dict(row)
-
-        def get_current(self, pk):
-            assert pk == PK
-            return dict(row)
-
-        def set_status(self, pk, status, **updates):
-            assert pk == PK
-            row.update(status=getattr(status, 'value', status), **updates)
-
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role',
+           'jd_text': text, 'posting_guard': pg.analyze(text)['posting_guard']}
     stores = SimpleNamespace(
-        tracking=Tracking(), secrets=None,
+        tracking=_OfflineApprovalTracking(row), secrets=None,
         answer_bank=SimpleNamespace(all_facts=lambda company: {}))
     events = []
     monkeypatch.setattr('core.events.emit',
                         lambda kind, **kwargs: events.append((kind, kwargs)))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
-        return_value={'text': 'Synthetic offline job description'}))
-    monkeypatch.setattr(run, '_commit_posting_meta',
-                        lambda pk, current, meta, stores: dict(current))
-    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
+    _offline_approval_source(monkeypatch, row)
     monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
     monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
     monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)
@@ -4404,31 +4439,17 @@ async def test_navigation_diagnostic_stays_out_of_telemetry(monkeypatch):
     assert navigation['navigation_provenance_diagnostic'] is True
     assert navigation['reason'] == 'defect_provenance'
 
+    from tools import posting_guard as pg
+
+    text = 'Synthetic offline description'
     row = {'pk': PK, 'status': 'tailored', 'company': 'example-co',
-           'jd_url': SECURE_URL, 'title': 'Synthetic Role'}
-
-    class Tracking:
-        def get(self, key):
-            assert key == PK
-            return dict(row)
-
-        def get_current(self, key):
-            assert key == PK
-            return dict(row)
-
-        def set_status(self, key, status, **updates):
-            assert key == PK
-            row.update(status=getattr(status, 'value', status), **updates)
-
+           'jd_url': SECURE_URL, 'title': 'Synthetic Role',
+           'jd_text': text, 'posting_guard': pg.analyze(text)['posting_guard']}
     stores = SimpleNamespace(
-        tracking=Tracking(), secrets=None,
+        tracking=_OfflineApprovalTracking(row), secrets=None,
         answer_bank=SimpleNamespace(all_facts=lambda company: {}))
     monkeypatch.setattr(run.submit_hold, 'blocked', lambda *a, **kw: False)
-    monkeypatch.setattr(run, '_jd_meta', AsyncMock(
-        return_value={'text': 'Synthetic offline description'}))
-    monkeypatch.setattr(run, '_commit_posting_meta',
-                        lambda pk, current, meta, stores: dict(current))
-    monkeypatch.setattr('tools.posting_guard.authorised', lambda *a, **kw: True)
+    _offline_approval_source(monkeypatch, row)
     monkeypatch.setattr(run, '_no_sponsorship', lambda text: False)
     monkeypatch.setattr('core.rotation.ensure', lambda *a, **kw: None)
     monkeypatch.setattr('core.profiles.resolve_for', lambda row: None)

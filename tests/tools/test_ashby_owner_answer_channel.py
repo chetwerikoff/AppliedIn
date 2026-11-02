@@ -19,6 +19,7 @@ from tests.tools.test_browser_application_entry import COMPANY, JOB, PK, posting
 from tests.tools.test_browser_ashby_survey import _ATTESTATIONS, _FACTS, _LIVE
 from tests.tools.test_browser_formless import no_mutations, root_world
 from tools import browser_skill_apply as forms
+from tools import jd, posting_guard as pg
 
 
 class _Bank:
@@ -70,16 +71,16 @@ def _world(monkeypatch, shape, facts, *, name_field=None, stale=False,
             PK, Status.TAILORED, human_approved_answers={
                 "Name": {"value": "Old synthetic value", "selector": "#prior"}})
 
-    # Exercise the actual `_apply_direct` -> BrowserSkill -> gate row path.
-    # The unrelated JD/rotation/PDF transport is synthetic and offline.
-    async def jd_meta(_row, *, yielding=True):
-        return {"text": "Synthetic role text"}
+    # Exercise the real direct approval reader and conditional guard commit.
+    # Only ATS/HTML transport is fake; a bare text result cannot admit a form.
+    def current_source(url, kind):
+        assert (url, kind) == (posting("ashby"), "jd")
+        text = "Synthetic role text"
+        return {**pg.analyze(text, html_variants=[f"<p>{text}</p>"],
+                             source_required=True),
+                "source_kind": "ats_html", "source_url": url}
 
-    monkeypatch.setattr(run, "_jd_meta", jd_meta)
-    monkeypatch.setattr(
-        run, "_commit_posting_meta",
-        lambda pk, row, meta, current: current.tracking.get(pk))
-    monkeypatch.setattr("tools.posting_guard.authorised", lambda *a, **k: True)
+    monkeypatch.setattr(jd, "fetch_jd_meta", current_source)
     monkeypatch.setattr("core.rotation.ensure", lambda *a, **k: None)
     monkeypatch.setattr("core.profiles.resolve_for", lambda *a, **k: None)
     monkeypatch.setattr("core.profiles.expand_all", lambda values: values)

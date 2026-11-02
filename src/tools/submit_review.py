@@ -140,9 +140,10 @@ def _private_root() -> Path:
     if root.is_symlink():
         raise Refused("Private submit review storage is unavailable.")
     root.mkdir(mode=0o700, exist_ok=True)
-    for p in (local, root):
-        if (not p.is_dir() or stat.S_IMODE(p.stat().st_mode) & 0o077):
-            raise Refused("Private submit review directory is not private.")
+    # A pre-existing .local parent may be readable; the per-review root must
+    # itself exclude every group/other permission, without chmodding user data.
+    if not root.is_dir() or stat.S_IMODE(root.stat().st_mode) & 0o077:
+        raise Refused("Private submit review directory is not private.")
     return root
 
 
@@ -313,8 +314,11 @@ def claim(pk: str, expected: str, decision: str, reason: str = "") -> Future:
                         (pk + expected).encode()).hexdigest() + ".txt"), reason.encode())
                 except OSError:
                     reason = ""
-            _patch(pk, states=("claimed",), status="needs_human",
-                   generation=expected, changes={"review_state": "rejected"})
+            if not _patch(pk, states=("claimed",), status="needs_human",
+                          generation=expected,
+                          changes={"review_state": "rejected",
+                                   "review_reject_reason": "reviewer_rejected"}):
+                raise Refused("Review state changed during Reject.")
         _signal(holder, decision)
         return holder.response
 

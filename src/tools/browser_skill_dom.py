@@ -290,7 +290,10 @@ PAGE = r"""(() => {
         || (e.tagName === 'BUTTON' && e.getAttribute('aria-pressed') === 'true'
           && !!e.closest('div.ashby-application-form-input-yesno')),
       files:e.files ? Array.from(e.files).map(f=>f.name) : [],
-      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent),selected:!!o.selected})),
+      // Preserve the existing options shape while retaining independent
+      // selection evidence for the private exact-form packet, including multi-select.
+      options:shownNative.map(o=>({value:o.value,label:clean(o.textContent)})),
+      selected_options:chosenNative.map(o=>({value:o.value,label:clean(o.textContent)})),
       option_count:nativeOptions.length,
       options_capped:shownNative.length<nativeOptions.length,
       combobox: type === 'combobox' ? (() => {

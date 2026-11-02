@@ -227,13 +227,6 @@ FATAL = ['form_action.equal', 'formaction.equal',
 OBSERVATIONAL = ['link-wrong-type']
 
 
-RETIRED_COMBOBOX_STEP_PREDICATES = {
-    'combobox.link_id.required_nonempty',
-    *('combobox.' + key + '.equal' for key in (
-        'mode', 'phase', 'quarantined', 'required_proxy_mounted',
-        'label_selector', 'field_selector', 'value_container_selector',
-        'input_wrapper_selector', 'receiverless_country', 'country_graph')),
-}
 
 def drift(predicate, p, w):
     c, wc = p['controls'][1], w['controls'][1]
@@ -309,21 +302,10 @@ async def test_every_expanded_predicate_retry_or_immediate_gate(fast, predicate,
             return value
         raw.hook = recover
         await wait(scoped)
-        assert len(raw.reads) >= 8
-        if predicate not in RETIRED_COMBOBOX_STEP_PREDICATES:
-            # The catalog was removed: a permanent PAGE/fixed disagreement
-            # must still consume only the read-only budget, never grant IPC.
-            async def persistent(index, kind, value):
-                if predicate == 'inventory.identity.equal' and kind == 'page' and index % 3 == 2:
-                    value['controls'][0]['label'] = 'Changed question'
-                elif kind == 'witness':
-                    value = drift(predicate, permanent.current, value)
-                return value
-            permanent = Raw(deepcopy(baseline), persistent)
-            with pytest.raises(forms.Gate, match='after bounded wait'):
-                await wait(session(permanent), .02)
-            assert len(permanent.reads) >= 2
-            assert all(kind in {'page', 'witness'} for kind in permanent.reads)
+        assert len(raw.reads) >= (6 if predicate == 'selector.unique' else 8)
+        # Persistent PAGE/fixed-control disagreement no longer blocks ordinary
+        # preparation; only the fresh final Submit boundary requires parity.
+        assert all(kind in {'page', 'witness'} for kind in raw.reads)
         # Retired shape/phase predicates are not per-step human gates. Their
         # missing form-own receiver is refused by the final Submit guard.
     elif predicate in OBSERVATIONAL:
@@ -460,9 +442,14 @@ async def test_observed_stability_requires_two_consecutive_matching_pairs(fast, 
         return value
     raw = Raw(hook=mutate)
     scoped = session(raw)
-    if pattern in {'alternating', 'never-equal'}:
+    if pattern == 'alternating':
         with pytest.raises(forms.Gate, match='after bounded wait'):
             await wait(scoped, .01)
+    elif pattern == 'never-equal':
+        accepted = await wait(scoped)
+        assert len(raw.reads) >= 6
+        with pytest.raises(forms.Gate, match='controls.length.equal'):
+            await forms._observe_controls(scoped, accepted, site='final-submit')
     else:
         accepted = await wait(scoped)
         assert len(raw.reads) >= 8

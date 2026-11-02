@@ -2253,7 +2253,8 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                     if reason:
                         raise _EntryNotReady(reason)
                     phase = 'witness'
-                    page, witness = await _observe_controls(session, page, readiness=True, site='readiness-witness')
+                    page, witness = await _observe_controls(
+                        session, page, readiness=True, site='readiness-witness')
                     diagnostics.witness(True)
                     diagnostics.page(page)
                     phase = 'structure'
@@ -2269,9 +2270,9 @@ async def _stable_application_form(session, allowed, provenance, *, deadline: fl
                         and bool(c.get('question') or c.get('label'))
                         and (_native_answer(c) or (c.get('tag') == 'input'
                              and c.get('type') in {'radio', 'checkbox'}))
-                        and witness[c['selector']].get('visible') is True
-                        and witness[c['selector']].get('readonly') is False
-                        and witness[c['selector']].get('inert') is False
+                        and witness.get(c['selector'], {}).get('visible') is True
+                        and witness.get(c['selector'], {}).get('readonly') is False
+                        and witness.get(c['selector'], {}).get('inert') is False
                         and not c.get('disabled') for c in page['controls'])
                     if _formless_root(page) and provenance.ats == 'ashby':
                         qualifying = _wait_boundary(diagnostics, page, provenance)
@@ -2373,54 +2374,65 @@ async def _observe_controls(session, page: dict, *, readiness: bool = False,
             require(value.get('greenhouse') == page.get('greenhouse'), 'greenhouse.equal')
         require(value.get('url') == page.get('url'), 'url.equal')
         require(isinstance(value.get('controls'), list), 'controls.list')
-        require(len(value['controls']) == len(page['controls']) or (
-            page.get('truncated') is True
-            and len(value['controls']) > len(page['controls'])),
-            'controls.length.equal')
+        allow_readiness_drift = readiness and site == 'readiness-witness'
+        if not allow_readiness_drift:
+            require(len(value['controls']) == len(page['controls']) or (
+                page.get('truncated') is True
+                and len(value['controls']) > len(page['controls'])),
+                'controls.length.equal')
         lookup = {}
         for original, observed in zip(page['controls'], value['controls']):
             locator = _safe_diagnostic(original.get('diagnostic_locator'))
             require(isinstance(observed, dict), 'control.object')
             sel = original['selector']
-            require(sel not in lookup, 'selector.unique')
-            require(observed.get('selector') == sel, 'selector.equal')
+            observed_sel = observed.get('selector')
+            require(isinstance(observed_sel, str) and bool(observed_sel),
+                    'selector.string')
+            require(observed_sel not in lookup, 'selector.unique')
+            if not allow_readiness_drift:
+                require(observed_sel == sel, 'selector.equal')
             for key in ('unique', 'unique_form'):
                 require(observed.get(key) is True, key + '.true')
-            for key in ('tag', 'type', 'native_type', 'in_form', 'form_selector',
-                        'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
-                        'form_action_attr_present', 'form_action_raw',
-                        'formaction_attr_present', 'formaction_raw',
-                        'commits_application'):
-                require((original.get(key, False) == observed.get(key, False)
-                         if key == 'commits_application' else
-                         original.get(key) == observed.get(key)), key + '.equal')
+            if not allow_readiness_drift:
+                for key in ('tag', 'type', 'native_type', 'in_form', 'form_selector',
+                            'form_action', 'formaction', 'disabled', 'native_form_owner_selector',
+                            'form_action_attr_present', 'form_action_raw',
+                            'formaction_attr_present', 'formaction_raw',
+                            'commits_application'):
+                    require((original.get(key, False) == observed.get(key, False)
+                             if key == 'commits_application' else
+                             original.get(key) == observed.get(key)), key + '.equal')
             if original.get('type') in {'radio', 'checkbox'}:
                 if isinstance(session, _GreenhouseSession) and readiness:
                     require(isinstance(observed.get('visible_text'), str), 'visible_text.string')
                 require(isinstance(observed.get('visible_text'), str) and
                         bool(observed['visible_text'].strip()), 'visible_text.required_nonempty')
-                require(observed['visible_text'] == original.get('label'), 'visible_text.equal')
-            if original.get('tag') == 'select':
+                if not allow_readiness_drift:
+                    require(observed['visible_text'] == original.get('label'),
+                            'visible_text.equal')
+            if original.get('tag') == 'select' and not allow_readiness_drift:
                 require(original.get('options') == observed.get('options'), 'options.equal')
             if original.get('type') == 'combobox':
                 combo = observed.get('combobox')
                 require(isinstance(combo, dict), 'combobox.object')
-                source = original.get('combobox')
-                require(isinstance(source, dict), 'combobox.PAGE.object')
-                keys = ('link_id', 'linked', 'listbox_selector', 'options',
-                        'selected_text', 'displayed_text', 'selected_value',
-                        'hidden_selector', 'hidden_value')
-                for key in keys:
-                    require(source.get(key) == combo.get(key), 'combobox.' + key + '.equal')
-                require(source == combo, 'combobox.equal')
-                require((combo.get('linked') is True
-                         and isinstance(combo.get('listbox_selector'), str)
-                         and isinstance(combo.get('options'), list)) or
-                        (combo.get('linked') is False and combo.get('options') in (None, [])),
-                        'combobox.linked.shape')
+                if not allow_readiness_drift:
+                    source = original.get('combobox')
+                    require(isinstance(source, dict), 'combobox.PAGE.object')
+                    keys = ('link_id', 'linked', 'listbox_selector', 'options',
+                            'selected_text', 'displayed_text', 'selected_value',
+                            'hidden_selector', 'hidden_value')
+                    for key in keys:
+                        require(source.get(key) == combo.get(key),
+                                'combobox.' + key + '.equal')
+                    require(source == combo, 'combobox.equal')
+                    require((combo.get('linked') is True
+                             and isinstance(combo.get('listbox_selector'), str)
+                             and isinstance(combo.get('options'), list)) or
+                            (combo.get('linked') is False and combo.get('options') in (None, [])),
+                            'combobox.linked.shape')
             for key in ('visible', 'readonly', 'inert'):
                 require(isinstance(observed.get(key), bool), key + '.bool')
-            lookup[sel] = observed
+            lookup[observed_sel] = observed
         locator = 'unavailable'
         current = await session.page()
         if isinstance(session, _EntrySession) and readiness and _entry_not_ready(current):
@@ -3346,6 +3358,39 @@ class ApplicationIPCController:
         return False
 
 
+    async def _final_control_read(self, session, page):
+        """Use the entry site's independent reader at the irreversible boundary."""
+        if self.entry_provenance is None and self.greenhouse_provenance is None:
+            return page, {}
+        if self.entry_provenance is not None:
+            allowed = lambda href: _job_preparation_route(
+                href, self.url, provenance=self.entry_provenance,
+                pk=self.pk, company=self.company,
+                fixture_context=self.fixture_context)
+            try:
+                _entry_safety(page, allowed, self.entry_provenance)
+            except (CaptchaGate, CaptchaArtifactGate):
+                raise
+            except Gate:
+                # Let the substantive final check preserve its item-1 mapping.
+                return page, {}
+            observation_session = _EntrySession(
+                session, allowed, self.entry_provenance,
+                fixture_context=self.fixture_context)
+        else:
+            allowed = lambda href: navigation_allowed(
+                href, self.url, provenance=self.greenhouse_provenance)
+            try:
+                _greenhouse_safety(page, allowed, self.greenhouse_provenance)
+            except (CaptchaGate, CaptchaArtifactGate):
+                raise
+            except Gate:
+                return page, {}
+            observation_session = _GreenhouseSession(
+                session, allowed, self.greenhouse_provenance)
+        return await _observe_controls(
+            observation_session, page, site='final-submit')
+
     async def before_ipc(self, session, args: tuple, kwargs: dict) -> None:
         """Classify only committing IPC; all other form actions are preparation."""
         if not args or not isinstance(args[0], str) or self.committed:
@@ -3353,11 +3398,18 @@ class ApplicationIPCController:
         op = args[0]
         if self.upload_pending:
             raise Gate('A prior upload has not settled.')
+        target = None
+        page = None
         if op == 'navigate':
             if len(args) != 2 or kwargs or not isinstance(args[1], str):
                 raise Gate('Unknown application navigation operation.')
-            # Same-job /submit GET routes are committing, never preparation.
-            if (_committing_get_route(args[1])
+            if _committing_get_route(args[1]):
+                page = await self._page(session)
+                matches = [c for c in page.get('controls', [])
+                           if c.get('tag') == 'a' and c.get('href') == args[1]]
+                if len(matches) == 1:
+                    target = matches[0]
+            if target is None and (_committing_get_route(args[1])
                     or (not _job_preparation_route(
                         args[1], self.url,
                         provenance=(self.greenhouse_provenance or self.entry_provenance),
@@ -3365,11 +3417,12 @@ class ApplicationIPCController:
                         fixture_context=self.fixture_context)
                         and not self._verified_redirect_url(args[1]))):
                 raise Gate('Navigation outside the tracked application route is forbidden.')
-            return
+            if target is None:
+                return
         resume_set = (op == 'evaluate' and len(args) == 2 and not kwargs
                       and args[1] == self._resume_set_script())
         if ((op not in {'fill', 'select', 'upload', 'click', 'press', 'focus'}
-             and not resume_set)
+             and not resume_set and target is None)
                 or (op == 'press' and (
                     len(args) < 2 or not isinstance(args[1], str)
                     or args[1] not in _UNGATED_APPLICATION_KEYS | _IMPLICIT_SUBMIT_KEYS))):
@@ -3395,13 +3448,13 @@ class ApplicationIPCController:
             return
         # No value, widget, grant, fact source, model action or side-effect gate
         # is placed on fill/select/choose/focus/blur/ordinary clicks here.
-        if op not in {'click', 'press'}:
+        if target is None and op not in {'click', 'press'}:
             return
         # Only these navigation/editing keys cannot activate a Submit.
         if op == 'press' and args[1] in _UNGATED_APPLICATION_KEYS:
             return
-        page = await self._page(session)
-        target = None
+        if page is None:
+            page = await self._page(session)
         ambiguous = False
         if op == 'click' and len(args) >= 2 and isinstance(args[1], str):
             matching = [c for c in page.get('controls', [])
@@ -3456,6 +3509,7 @@ class ApplicationIPCController:
             raise PreSubmitGate(1, 'Raw application click or implicit Submit receiver is ambiguous.')
         if target is None:
             return
+        page, _ = await self._final_control_read(session, page)
         await self.check_pre_submit(session, page, target)
         self.committed = True
         self.mark_click_started()
@@ -3738,7 +3792,16 @@ class ApplicationIPCController:
                 number *= 1000 if amount.group(2).lower() == 'k' else 1000000
             return next(iter(currencies)), next(iter(periods)), number
         for field in salary_fields:
-            stated = parse_salary(str(field['value']), context=label(field))
+            salary_value = str(field.get('value') or '').strip()
+            if field.get('tag') == 'select':
+                selected_options = [option for option in field.get('options') or []
+                                     if option.get('value') == field.get('value')]
+                salary_value = (str(selected_options[0].get('label') or '').strip()
+                                if len(selected_options) == 1 else '')
+            elif field.get('type') == 'combobox':
+                combo = field.get('combobox') or {}
+                salary_value = str(combo.get('selected_text') or '').strip()
+            stated = parse_salary(salary_value, context=label(field))
             minimum = parse_salary(floor) if floor else None
             if not stated or not minimum or stated[:2] != minimum[:2]:
                 raise PreSubmitGate(
@@ -3750,7 +3813,6 @@ class ApplicationIPCController:
                 raise PreSubmitGate(
                     4, 'The stated salary is below the owner floor.',
                     form_question=_ordinary_owner_question(page, field, self.pk))
-
         # Every observed restricted-country question must have a checked
         # negative/decline option, not merely lack a checked affirmative.
         sanctions_groups: dict[tuple, list[dict]] = {}
@@ -3775,9 +3837,9 @@ class ApplicationIPCController:
                     if len(chosen) == 1:
                         selected.append(str(chosen[0] or ''))
                 else:
-                    # A free-text claim is not an observed checked caption.
-                    if str(field.get('value') or '').strip():
-                        selected.append(str(field['value']))
+                    # A free-text claim is not a checked choice or native
+                    # selected option, so it cannot satisfy item 5.
+                    continue
             if not selected or any(
                     not _SAFE_OPTION_RX.match(caption) for caption in selected):
                 raise PreSubmitGate(

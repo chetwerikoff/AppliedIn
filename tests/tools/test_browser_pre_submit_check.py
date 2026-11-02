@@ -142,6 +142,11 @@ def _world(monkeypatch, tmp_path, *, case='ready', resume_name='Test User.pdf'):
         return deepcopy(page)
 
     monkeypatch.setattr(controller, '_page', current)
+
+    async def fixed_reader(_session, current_page, **kwargs):
+        return current_page, {}
+
+    monkeypatch.setattr(forms, '_observe_controls', fixed_reader)
     return controller, page, target, fixture
 
 
@@ -635,16 +640,41 @@ async def test_salary_label_numeric_example_never_overrides_entered_amount(
 
 
 @pytest.mark.asyncio
-async def test_same_job_committing_get_navigation_is_refused_without_submit(
+@pytest.mark.parametrize(('caption', 'blocked'), [
+    ('USD 90000 yearly', True), ('USD 110000 yearly', False),
+])
+async def test_salary_native_picker_compares_selected_caption_to_floor(
+        monkeypatch, tmp_path, caption, blocked):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path, case='salary')
+    pay = next(c for c in page['controls'] if c.get('selector') == '#pay')
+    pay.update(tag='select', type='select', value='choice', options=[
+        {'value': 'choice', 'label': caption},
+    ])
+    if blocked:
+        with pytest.raises(forms.PreSubmitGate) as refused:
+            await controller.check_pre_submit(None, page, target)
+        assert refused.value.item == 4
+        assert not fixture.held
+    else:
+        await controller.check_pre_submit(None, page, target)
+        assert fixture.held
+
+
+@pytest.mark.asyncio
+async def test_sanctions_free_text_cannot_satisfy_checked_decline_item(
         monkeypatch, tmp_path):
     controller, page, target, fixture = _world(monkeypatch, tmp_path)
-    with pytest.raises(forms.Gate, match='Navigation outside'):
-        await controller.before_ipc(
-            None, ('navigate', URL + '/submit'), {})
-    await controller.before_ipc(
-        None, ('navigate', URL + '/application'), {})
-    assert not fixture.held and not controller.committed
-
+    page['controls'].insert(1, {
+        'selector': '#restricted-text',
+        'label': 'Are you from a restricted country?',
+        'question': 'Are you from a restricted country?',
+        'tag': 'input', 'type': 'text', 'value': 'No',
+        'required': False, 'in_form': True, 'form_selector': '#app',
+    })
+    with pytest.raises(forms.PreSubmitGate) as refusal:
+        await controller.check_pre_submit(None, page, target)
+    assert refusal.value.item == 5
+    assert not fixture.held
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('key', [
@@ -665,6 +695,37 @@ async def test_implicit_submit_key_without_proven_receiver_fails_closed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('route', ['/submit', '/submitApplication'])
+async def test_committing_get_link_runs_final_check_and_hold_before_navigation(
+        monkeypatch, tmp_path, route):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    href = URL + route
+    page['controls'].append({
+        'selector': '#route-submit', 'href': href,
+        'label': 'Submit application', 'tag': 'a',
+        'in_form': True, 'form_selector': '#app', 'form_action': URL,
+    })
+    await controller.before_ipc(None, ('navigate', href), {})
+    assert fixture.held and controller.committed
+
+
+@pytest.mark.asyncio
+async def test_ordinary_same_job_application_navigation_stays_ungated(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    await controller.before_ipc(
+        None, ('navigate', URL + '/application'), {})
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_model_submit_click_reaches_the_same_final_check_and_hold(
+        monkeypatch, tmp_path):
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    await controller.before_ipc(None, ('click', '#submit'), {})
+    assert fixture.held and controller.committed
+
+
 @pytest.mark.parametrize(('value', 'blocked'), [
     ('1,500,000', True), ('2,500,000', False),
 ])

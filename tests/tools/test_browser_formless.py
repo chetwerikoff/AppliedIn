@@ -476,7 +476,7 @@ async def test_rootless_hidden_enterprise_retries_until_real_structural_root(mon
         session, session.allowed, provenance, deadline=start + forms._ASHBY_WAIT_SECONDS)
     assert page['entry']['frames'][0]['status'] == 'R'
     assert page['entry']['frames'][0]['outside'] is True
-    assert reads[0] >= 4  # Rootless, hydrated, then the stable fresh read pair.
+    assert reads[0] >= 4  # Fresh PAGE reads surround both independent witnesses.
     assert start < clock[0] < start + forms._ASHBY_WAIT_SECONDS
     assert session._readiness is False
     assert not decision.await_count
@@ -613,6 +613,22 @@ async def test_unknown_frames_are_not_a_reversible_per_read_gate(monkeypatch):
     assert not decision.await_count
     no_mutations(raw)
 
+
+async def test_preparation_can_continue_when_fixed_reader_disagrees(monkeypatch):
+    pair = _synthetic_enterprise_pair()
+    pair[1]['controls'][0]['disabled'] = not pair[1]['controls'][0].get('disabled', False)
+    clock, raw, session, provenance, decision, reads = _temporal_entry_session(
+        monkeypatch, pair)
+    page = await forms._stable_application_form(
+        session, session.allowed, provenance,
+        deadline=clock[0] + forms._ASHBY_WAIT_SECONDS)
+    assert page['url'] == entry('ashby')
+    assert any(call[1] == forms._ENTRY_FIXED_CONTROL_WITNESS
+               for call in raw.calls)
+    assert reads[0] >= 4 and not decision.await_count
+    no_mutations(raw)
+
+
 def test_readers_independently_agree_on_real_shape_and_never_read_autofill():
     page, fixed = observed()
     assert page['entry'] == fixed['entry']
@@ -704,6 +720,11 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     monkeypatch.setattr(forms, 'check_before_committing_click', check)
     def clicked():
         assert checkpoints == ['held', 'checked']
+        fixed_reads = [i for i, call in enumerate(raw.calls)
+                       if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)]
+        page_reads = [i for i, call in enumerate(raw.calls)
+                      if call == ('evaluate', forms.ENTRY_PAGE)]
+        assert fixed_reads and page_reads and fixed_reads[-1] < page_reads[-1]
         if outcome == 'click-fault':
             raise OSError('Synthetic transport lost after possibly committing')
     raw.before_click = clicked

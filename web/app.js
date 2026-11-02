@@ -363,10 +363,82 @@ function resumeBody(pk, act, value) {
   return { answer };
 }
 const STALE_OWNER_GATE = "This question is out of date. It is asked again on the next pass.";
+
+// Ephemeral evidence: do not persist exact gate tokens or add them to events.
+const _replyWitnesses = new Map();
+const _replyAttemptGates = new Map();
+const _replyAmbiguousGates = new Map();
+const _replyNotices = new Map();
+let _refusalStreamLost = false;
+const REFUSAL_DETAIL = "Owner reply not accepted.";
+const REFUSAL_CONTEXT = "An answer attempt for this pending question was not accepted; check before replying again.";
+
+function ownerGateKey(r) {
+  return r && routeOf(r) === "owner_question"
+    && r.gate_has_form_question === true && r.gate_has_call_id === true
+    && typeof r.gate_generation === "string" && !!r.gate_generation
+    && typeof r.gate_question_identity === "string" && !!r.gate_question_identity
+    ? JSON.stringify([r.gate_generation, r.gate_question_identity]) : "";
+}
+function markedReplyRefusal(e) {
+  return e?.kind === "response" && e.resume_answer_refused === true
+    && e.refusal_reason === "invalid_answer";
+}
+function replyNoticeHtml(r) {
+  return ownerGateKey(r) && _replyNotices.get(r.pk) === ownerGateKey(r)
+    ? `<div class="diag-note diag-triage" role="status">${REFUSAL_CONTEXT}</div>` : "";
+}
+function replyNoticeSlot(r) {
+  return routeOf(r) === "owner_question"
+    ? `<div data-reply-refusal="${esc(r.pk)}">${replyNoticeHtml(r)}</div>` : "";
+}
+function refreshReplyNoticeNodes(pk) {
+  const r = state.apps.find((item) => item.pk === pk);
+  document.querySelectorAll('[data-reply-refusal="' + CSS.escape(pk) + '"]').forEach((el) => {
+    el.innerHTML = r ? replyNoticeHtml(r) : "";
+  });
+}
+function pruneReplyEvidence() {
+  // Keep past same-PK attempts ambiguous across gate generations. A PK-only
+  // refusal from A can arrive after the locally submitted gate has become B.
+  for (const [pk, witness] of _replyWitnesses) {
+    if (ownerGateKey(state.apps.find((r) => r.pk === pk)) !== witness.key)
+      _replyWitnesses.delete(pk);
+  }
+  for (const [pk, key] of _replyNotices) {
+    if (ownerGateKey(state.apps.find((r) => r.pk === pk)) !== key)
+      _replyNotices.delete(pk);
+  }
+}
+function beginReplyWitness(pk, body) {
+  const r = state.apps.find((item) => item.pk === pk);
+  const key = ownerGateKey(r);
+  const previous = _replyAttemptGates.get(pk);
+  // A refusal carries no attempt or generation identity. Once this PK has had
+  // another local attempt, even on gate A, a late event cannot be bound to B.
+  if (key && previous !== undefined) _replyAmbiguousGates.set(pk, key);
+  _replyAttemptGates.set(pk, key);
+  _replyWitnesses.delete(pk);
+  _replyNotices.delete(pk);
+  refreshReplyNoticeNodes(pk);
+  const exact = key && ["answer", "skip"].includes(body?.disposition)
+    && body.expected_gate_generation === r.gate_generation
+    && body.expected_question_identity === r.gate_question_identity;
+  if (!exact || _replyAmbiguousGates.get(pk) === key
+      || _refusalStreamLost || state.liveState !== "live") return null;
+  const witness = { key, acknowledged: false };
+  _replyWitnesses.set(pk, witness);
+  return witness;
+}
 // The resume endpoint only accepts work; the row itself shows the outcome.
 // "Sent" is shown only once the request was accepted, never before.
 function sendResume(pk, body, accepted) {
+  const witness = beginReplyWitness(pk, body);
   return post(`/actions/resume/${encodeURIComponent(pk)}`, body).then((d) => {
+    if (witness && _replyWitnesses.get(pk) === witness) {
+      if (d?.ok === true && d.status === "resuming") witness.acknowledged = true;
+      else _replyWitnesses.delete(pk);
+    }
     // post() already reported a network failure (null) in its own toast.
     if (d && (d.ok === false || d.error)) toast(d.error === "invalid_answer"
       ? "That reply was refused. Refresh and answer the current question." : (d.error || "Refused."));
@@ -1471,6 +1543,7 @@ function gateMini(r) {
       title="Open details">
     <div class="nc-co">${esc(r.company)}<span class="nc-role">${esc(r.title)}</span></div>
     <div class="nc-q">${esc(q)}</div>
+    ${replyNoticeSlot(r)}
     <div class="nc-foot"><span class="nc-gate">${esc(gateLabel(r.gate_reason))}</span>${act}</div>
   </div>`;
 }
@@ -2469,12 +2542,13 @@ function needsCard(r) {
     <div class="gc-actions">${canRequeueStructuralGate(r) ? requeueButton(r, "btn btn-primary") : ""}
       <button class="btn btn-ghost" data-open="${esc(r.pk)}">View details</button></div>
   </article>`;
-  return `<article class="gatecard">
+  return `<article class="gatecard" data-reply-card="${esc(r.pk)}">
     <header><div><span class="gc-co">${esc(r.company)}</span><span class="gc-role">${esc(r.title)}</span></div>
       <div class="gc-side"><span class="gatepill">${esc(gateLabel(r.gate_reason))}</span>
         <button class="btn btn-ghost" data-open="${esc(r.pk)}">Details</button></div></header>
     <div class="gc-q md">${md(r.gate_question || defaultGateText(r))}</div>
     ${manual && r.gate_question ? `<div class="gc-q md">${esc(defaultGateText(r))}</div>` : ""}
+    ${replyNoticeSlot(r)}
     <div class="gc-answer">
       ${owner ? `<textarea class="gate-input" rows="2" data-answer-for="${esc(r.pk)}"
         placeholder="Answer the verified question…"></textarea>` : ""}
@@ -3340,7 +3414,9 @@ function appsSig() {
   for (const a of state.apps) {
     s += a.pk + "\u0001" + a.status + "\u0001" + (a.updated_at || "") + "\u0001"
        + (a.applied_at || "") + "\u0001"
-       + (a.gate_reason || "") + (a.gate_question ? "?" : "") + "\u0001"
+       + (a.gate_reason || "") + (a.gate_question || "") + "\u0001"
+       + (a.gate_generation || "") + ":" + (a.gate_question_identity || "")
+       + ":" + (a.gate_skip_eligible ? "s" : "") + "\u0001"
        + (a.submit_hold_state || "missing") + ":" + (a.possible_submission ? "p" : "")
        + ":" + (a.fail_kind || "") + "\u0001"
        + (a.match_score ?? "") + "\u0001" + (a.tailored_at || "") + "\u0001" + (a.retailored_at || "") + "\u0001"
@@ -3508,6 +3584,7 @@ function paneSig() {
   return parts.join("\u0002");
 }
 
+const _drawnGateKeys = new Map(); // the gate owning each rendered answer field
 let _paneSig = null;      // signature of the data behind the last pane render
 let _paneDirty = false;   // a background repaint arrived while a press was down
 let _pressAt = 0;         // when the current pointer press began (0 = none)
@@ -3597,10 +3674,15 @@ function renderPane() {
   // so the courtesy stays for the rebuilds that remain.
   const selectedFocus = document.activeElement?.dataset?.reviewPick;
   const saved = {};
-  let focusPk = null;
-  $$("#pane textarea[data-answer-for]").forEach((t) => {
-    if (t.value) saved[t.dataset.answerFor] = t.value;
-    if (document.activeElement === t) focusPk = t.dataset.answerFor;
+  let focusInput = null;
+  document.querySelectorAll("#pane textarea[data-answer-for]").forEach((t) => {
+    const pk = t.dataset.answerFor;
+    const key = ownerGateKey(state.apps.find((r) => r.pk === pk));
+    if (key && key === _drawnGateKeys.get(pk)) {
+      if (t.value) saved[pk] = t.value;
+      if (document.activeElement === t)
+        focusInput = { pk, start: t.selectionStart, end: t.selectionEnd };
+    }
   });
   const paneInputs = ["fs-search", "fr-search"];
   const liveId = document.activeElement && paneInputs.includes(document.activeElement.id)
@@ -3621,9 +3703,18 @@ function renderPane() {
     const t = $(`#pane textarea[data-answer-for="${CSS.escape(pk)}"]`);
     if (t) t.value = v;
   }
-  if (focusPk) {
-    const t = $(`#pane textarea[data-answer-for="${CSS.escape(focusPk)}"]`);
-    if (t) { t.focus(); t.selectionStart = t.selectionEnd = t.value.length; }
+  if (focusInput) {
+    const t = $(`#pane textarea[data-answer-for="${CSS.escape(focusInput.pk)}"]`);
+    if (t) {
+      t.focus();
+      try { t.setSelectionRange(focusInput.start, focusInput.end); }
+      catch { /* Restricted DOMs may not expose a selection. */ }
+    }
+  }
+  _drawnGateKeys.clear();
+  for (const r of state.apps) {
+    const key = ownerGateKey(r);
+    if (key) _drawnGateKeys.set(r.pk, key);
   }
   if (liveId) {
     const t = $("#" + liveId);
@@ -3690,8 +3781,9 @@ function smartRaw(e, raw) {
 function feedItem(e) {
   const t = e.at ? new Date(e.at).toLocaleTimeString("en-GB") : "";
   const app = e.pk ? state.apps.find((a) => a.pk === e.pk) : null;
-  const co = app ? app.company : (e.company || "");
-  const stage = STAGE_LABEL[e.agent] || e.agent || "";
+  const refused = markedReplyRefusal(e);
+  const co = app ? app.company : (refused ? "" : (e.company || ""));
+  const stage = refused ? "" : (STAGE_LABEL[e.agent] || e.agent || "");
   const coChip = !co ? ""
     : app ? `<span class="fe-co" data-open="${esc(e.pk)}" title="open ${esc(co)}">${esc(co)}</span>`
           : `<span class="fe-co">${esc(co)}</span>`;
@@ -3699,14 +3791,15 @@ function feedItem(e) {
     return `<div class="fe fe-step mono">
       <span>${esc(STAGE_LABEL[e.detail] || e.detail || stage)}</span>${coChip}</div>`;
   }
-  const k = KIND[e.kind] || { mark: e.kind || "·", cls: "" };
-  let raw = e.detail || "";
-  if (e.kind === "action") raw = `${e.detail}(${e.input ?? ""})`;
-  else if (e.kind === "result") raw = `${e.detail}  ${e.output ?? ""}`;
+  const k = refused ? { mark: "owner reply refused", cls: "k-bad" }
+    : (KIND[e.kind] || { mark: e.kind || "·", cls: "" });
+  let raw = refused ? REFUSAL_DETAIL : (e.detail || "");
+  if (!refused && e.kind === "action") raw = `${e.detail}(${e.input ?? ""})`;
+  else if (!refused && e.kind === "result") raw = `${e.detail}  ${e.output ?? ""}`;
   const text = unraw(smartRaw(e, raw));
   const isMd = e.kind === "response" || e.kind === "gate";
   const long = text.length > CLIP_AT;
-  const shot = e.screenshot
+  const shot = !refused && e.screenshot
     ? `<a class="fe-shot" href="${esc(e.screenshot)}" target="_blank" rel="noopener">
          <img src="${esc(e.screenshot)}" alt="screenshot" loading="lazy"></a>` : "";
   return `<div class="fe ${k.cls}">
@@ -3804,14 +3897,21 @@ function connectLive() {
     es.onmessage = (m) => {
       try {
         const e = JSON.parse(m.data);
-        const sig = `${e.at}|${e.kind}|${e.pk || ""}|${String(e.detail || "").slice(0, 80)}`;
+        const refused = markedReplyRefusal(e);
+        const sig = `${e.at}|${e.kind}|${e.pk || ""}|${refused ? REFUSAL_DETAIL : String(e.detail || "").slice(0, 80)}|${refused ? String(e.same_pending_gate_at_emit === true) : ""}`;
         if (seen.has(sig)) return;
         seen.add(sig);
         if (seen.size > 5000) seen.clear();
-        state.events.unshift(e);
+        // A marked response is a fixed diagnostic, never model output. Do not
+        // copy unexpected event extras into an owner-visible history or card.
+        const shown = refused ? { kind: "response", pk: e.pk, at: e.at,
+          detail: REFUSAL_DETAIL, resume_answer_refused: true,
+          refusal_reason: "invalid_answer" } : e;
+        state.events.unshift(shown);
         if (state.events.length > 1500) state.events.length = 1500;
-        if (e.pk && e.detail && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
-          state.activity[e.pk] = { detail: String(e.detail), at: e.at, kind: e.kind };
+        if (!refused && e.pk && shown.detail
+            && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
+          state.activity[e.pk] = { detail: String(shown.detail), at: e.at, kind: e.kind };
           scheduleLive(e.pk);   // update the card's live line without a full reload
         }
         scheduleFeed();
@@ -3825,10 +3925,27 @@ function connectLive() {
         // so the page spent more time rebuilding than idle and nothing could be
         // clicked. These four are real transitions: a job appears, finishes, needs
         // you, or breaks.
-        if (["discovered", "applied", "gate", "error"].includes(e.kind)) scheduleReload();
+        if (refused && typeof e.pk === "string" && e.pk && !isInternalPk(e.pk)) {
+          // The event itself is historical evidence only. A fresh row read may
+          // separately permit a same-gate notice if local submission proves it.
+          void loadApps(e);
+        } else if (["discovered", "applied", "gate", "error"].includes(e.kind)) {
+          scheduleReload();
+        }
       } catch { /* ignore malformed lines */ }
     };
-    es.onerror = () => { es.close(); setFeedStatus("connecting"); setTimeout(open, 3000); };
+    es.onerror = () => {
+      es.close();
+      _refusalStreamLost = true; // reconnect replay has no live/replay discriminator
+      _replyWitnesses.clear();
+      _replyAttemptGates.clear();
+      _replyAmbiguousGates.clear();
+      const noticed = [..._replyNotices.keys()];
+      _replyNotices.clear();
+      noticed.forEach(refreshReplyNoticeNodes);
+      setFeedStatus("connecting");
+      setTimeout(open, 3000);
+    };
   };
   open();
 }
@@ -4002,23 +4119,86 @@ async function assignReply(recordId) {
   await Promise.all([loadApps(), loadUnassigned()]);
   toast("Reply assigned.");
 }
-async function loadApps() {
+// Refusal refreshes are observational: update only the affected visible gate
+// instead of tearing down hundreds of unrelated cards on unchanged status.
+function repaintRefusalRow(pk, before, current) {
+  if (!before || !current || before.status !== current.status
+      || routeOf(before) !== routeOf(current)) return false;
+  const newGate = ownerGateKey(before) !== ownerGateKey(current)
+    || before.gate_question !== current.gate_question
+    || before.gate_skip_eligible !== current.gate_skip_eligible;
+  if (newGate && routeOf(current) === "owner_question") {
+    if (state.tab === "pipeline") {
+      const card = $(`#pane .ps-needs .ncard[data-open="${CSS.escape(pk)}"]`);
+      if (card) card.outerHTML = gateMini(current);
+    } else if (state.tab === "needs") {
+      const card = $(`#pane .gatecard[data-reply-card="${CSS.escape(pk)}"]`);
+      if (card) card.outerHTML = needsCard(current);
+    }
+    // A new generation never inherits the old rendered textarea.
+    _drawnGateKeys.set(pk, ownerGateKey(current));
+  }
+  refreshReplyNoticeNodes(pk);
+  return true;
+}
+
+let _appsReadVersion = 0;
+async function loadApps(refusalEvent = null) {
   if (DEMO) return;
+  const request = ++_appsReadVersion;
+  const previous = state.apps;
   try {
     const a = await fetch(api("/applications"), { headers: auth.header() }).then((r) => r.json());
+    if (request !== _appsReadVersion) return;
     state.apps = (a.items || []).filter((r) => !isInternalPk(r.pk));
+    pruneReplyEvidence();
+    const pk = refusalEvent?.pk;
+    if (typeof pk === "string") {
+      const current = state.apps.find((r) => r.pk === pk);
+      const witness = _replyWitnesses.get(pk);
+      if (witness) {
+        _replyWitnesses.delete(pk); // a delivered refusal is not a retry grant
+        if (refusalEvent.same_pending_gate_at_emit === true && witness.acknowledged
+            && !_refusalStreamLost && witness.key === ownerGateKey(current)
+            && _replyAttemptGates.get(pk) === witness.key
+            && _replyAmbiguousGates.get(pk) !== witness.key) {
+          _replyNotices.set(pk, witness.key);
+        }
+      }
+    }
     await loadUnassigned();
     await migrateReviewSkips();
+    if (request !== _appsReadVersion) return;
+    pruneReplyEvidence();
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
-    renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
+    renderTabs();
+    if (typeof pk === "string") {
+      const before = previous.find((r) => r.pk === pk);
+      const current = state.apps.find((r) => r.pk === pk);
+      // A coincident unrelated data change takes the existing ordinary path;
+      // the refusal-only case updates one card without a full-pane repaint.
+      const otherRowsSame = JSON.stringify(previous.filter((r) => r.pk !== pk))
+        === JSON.stringify(state.apps.filter((r) => r.pk !== pk));
+      if (otherRowsSame && repaintRefusalRow(pk, before, current))
+        _paneSig = paneSig();
+      else refreshPane();
+    } else refreshPane();
+    renderFooter();
+    scheduleFeed();
     if (state.openPk && !$("#drawer").hidden) {
       const current = state.apps.find((item) => item.pk === state.openPk);
-      if (current && routeOf(current) !== state.openRoute) openDrawer(current.pk);
+      if (current && (routeOf(current) !== state.openRoute
+          || ownerGateKey(current) !== state.openGateKey)) {
+        openDrawer(current.pk);
+      } else if (typeof pk === "string" && pk === state.openPk) {
+        refreshReplyNoticeNodes(pk);
+      }
     }
   } catch {
     // A failed authoritative projection may not leave stale "clear" controls.
     state.apps = state.apps.map((r) => ({ ...r, submit_hold_state: "unknown" }));
+    pruneReplyEvidence();
     renderTabs(); refreshPane();
     if (state.openPk && !$("#drawer").hidden) openDrawer(state.openPk);
   }
@@ -4769,6 +4949,7 @@ function openDrawer(pk) {
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
       ${captchaHandoff && r.gate_question ? `<div class="gate-q md">${esc(defaultGateText(r))}</div>` : ""}
+      ${replyNoticeSlot(r)}
       ${ownerQuestion ? `<textarea id="gate-answer" class="gate-input" rows="2"
         placeholder="Answer the verified question…"></textarea>` : ""}
       <div class="drawer-actions">
@@ -4947,6 +5128,7 @@ function openDrawer(pk) {
   });
   state.openPk = r.pk;
   state.openRoute = routeOf(r);
+  state.openGateKey = ownerGateKey(r);
   rtStop();
   if (retailoring) rtBegin(r.pk);
   if (r.has_diff) loadDiff(r.pk);
@@ -4979,11 +5161,12 @@ function loadAgentLog(pk) {
         return;
       }
       el.innerHTML = evs.map((e) => {
-        const body = [e.detail, e.input, e.output].filter(Boolean)
+        const refused = markedReplyRefusal(e);
+        const body = refused ? REFUSAL_DETAIL : [e.detail, e.input, e.output].filter(Boolean)
           .map((x) => unraw(typeof x === "string" ? x : JSON.stringify(x))).join("\n");
         return `<div class="al-e">
-          <div class="al-h"><span class="al-k" data-kind="${esc(e.kind || "")}">${esc(e.kind || "·")}</span>
-            ${e.agent ? `<span class="al-a">${esc(e.agent)}</span>` : ""}
+          <div class="al-h"><span class="al-k" data-kind="${esc(e.kind || "")}">${refused ? "owner reply refused" : esc(e.kind || "·")}</span>
+            ${!refused && e.agent ? `<span class="al-a">${esc(e.agent)}</span>` : ""}
             <span class="al-t">${when(e.at)}</span></div>
           ${body ? `<pre class="al-b">${esc(body)}</pre>` : ""}</div>`;
       }).join("");

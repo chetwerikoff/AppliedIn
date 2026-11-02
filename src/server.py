@@ -1901,9 +1901,39 @@ def create_app() -> FastAPI:
                     or not isinstance(identity, str) or not 0 < len(identity) <= 128))
                 or (disposition == "answer" and not answer.strip())):
             return {"ok": False, "error": "invalid_answer"}
-        background.add_task(resume_job, pk, answer, disposition=disposition,
-                            expected_gate_generation=generation,
-                            expected_question_identity=identity)
+        def _run_and_report():
+            # A transport acknowledgement is not an answer decision. Report only
+            # the original pre-effect refusal; never invoke resume_job again.
+            result = resume_job(pk, answer, disposition=disposition,
+                                expected_gate_generation=generation,
+                                expected_question_identity=identity)
+            if (disposition in ("answer", "skip") and isinstance(result, dict)
+                    and result.get("result") == "gated"
+                    and result.get("reason") == "invalid_answer"):
+                same_gate = False
+                try:
+                    # Report-time relevance is observational, never an authority
+                    # to accept a reply or change the stored gate.
+                    current = stores.tracking.get(pk) or {}
+                    tokens = _owner_gate_tokens(current)
+                    same_gate = (
+                        current.get("status") == Status.NEEDS_HUMAN.value
+                        and current.get("gate_reason") == "owner_question"
+                        and tokens["gate_generation"] == generation
+                        and tokens["gate_question_identity"] == identity
+                        and _project_submit_hold(pk, current, stores.tracking) == "clear")
+                except Exception:
+                    pass  # An unreadable gate is historical-only in the UI.
+                try:
+                    from core.events import emit
+                    emit("response", pk=pk, detail="Owner reply not accepted.",
+                         resume_answer_refused=True, refusal_reason="invalid_answer",
+                         same_pending_gate_at_emit=bool(same_gate))
+                except Exception:
+                    pass  # Telemetry must not change the background result.
+            return result
+
+        background.add_task(_run_and_report)
         # Accepted for processing only; the dashboard reads the eventual row.
         return {"ok": True, "status": "resuming"}
 

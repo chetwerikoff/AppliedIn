@@ -315,11 +315,20 @@ function routeNotice(r) {
     ${r.gate_question ? `<p class="diag-raw">${esc(r.gate_question)}</p>` : ""}</div>`;
   return "";
 }
+// A closed, never-submitted generation needs a new preparation and packet.
+// Only the existing human Retry button can initiate that separate run.
+const FRESH_REVIEW_STATES = new Set(["rejected", "expired", "restart", "session_lost"]);
+function canFreshSubmitReview(r) {
+  return !!r && r.status === "needs_human" && r.gate_reason === "submit_review"
+    && FRESH_REVIEW_STATES.has(r.review_state) && r.submit_hold_state === "clear"
+    && r.possible_submission !== true && !r.confirmation_id;
+}
 // Every delegated action re-checks current rows. DOM visibility cannot authorize.
 function rowActionAllowed(pk, act) {
   const r = state.apps.find((item) => item.pk === pk);
   // A stale control cannot override a blocked or unverified independent hold.
-  if (!r || r.submit_hold_state !== "clear" || r.gate_reason === "submit_review") return false;
+  if (!r || r.submit_hold_state !== "clear") return false;
+  if (r.gate_reason === "submit_review") return act === "retry" && canFreshSubmitReview(r);
   const kind = routeOf(r);
   if (act === "queue-apply" && canRequeueStructuralGate(r)) return true;
   if (READ_ONLY_ROUTES.has(kind)) return false;
@@ -2553,7 +2562,9 @@ function needsCard(r) {
     <p class="mono">State: ${esc(r.review_state || "unavailable")} · Expires ${esc(r.review_expires_at || "unknown")}</p>
     <div class="gc-actions">${r.review_state === "pending" && r.gate_generation
       ? `<button type="button" class="btn btn-primary" data-submit-review-open="${esc(r.pk)}">Inspect form &amp; decide</button>`
-      : `<span class="muted">Review closed. A fresh manually initiated run is required.</span>`}</div>
+      : canFreshSubmitReview(r)
+        ? `<button type="button" class="btn btn-primary" data-act="retry" data-pk="${esc(r.pk)}">Start fresh preparation</button>`
+        : `<span class="muted">Review closed. A fresh manually initiated run is required.</span>`}</div>
   </article>`;
   const manual = kind === "captcha" || kind === "no_account";
   const owner = kind === "owner_question";
@@ -4790,8 +4801,11 @@ function paneAction(act, pk, el) {
       loadApps();
     });
   } else if (act === "retry") {
-    post(`/actions/retry/${encodeURIComponent(pk)}`);
-    toast("Retrying — re-running the pipeline for this job.");
+    post(`/actions/retry/${encodeURIComponent(pk)}`).then((r) => {
+      toast(r?.ok ? "Fresh pipeline preparation requested." :
+        r?.error || "Retry was refused; inspect the current review state.");
+      loadApps();
+    }).catch(() => toast("Retry request failed; no new run was confirmed."));
   } else if (act === "mark-applied") {
     post(`/actions/mark-applied/${encodeURIComponent(pk)}`).then((r) => {
       toast(r && r.ok ? "Marked applied — won't resubmit."
@@ -4965,13 +4979,27 @@ async function openSubmitReview(pk) {
       throw new Error("The current private form is incomplete or stale.");
     }
     const items = p.controls.map((c) => {
+      const options = Array.isArray(c.options) ? c.options : [];
+      // A multi-select's "value" can hold only one selected machine value.
+      // Keep every selected caption/value separate from unselected options.
+      const selected = Array.isArray(c.selected_options) ? c.selected_options
+        : c.tag === "select" ? options.filter((o) => o.value === c.value) : [];
+      const unselected = options.filter((o) => !selected.some((s) =>
+        s.value === o.value && s.label === o.label));
+      const choiceLabels = (list) => list.map((o) =>
+        esc(o.label) + " (" + esc(o.value) + ")").join(" · ") || "None";
+      const choices = c.tag === "select"
+        ? `<div><b>Selected options (caption / value):</b> ${choiceLabels(selected)}</div>
+           <div><b>Available but unselected:</b> ${choiceLabels(unselected)}</div>`
+        : "";
       const value = {
         value: c.value, checked: c.checked, files: c.files,
-        options: c.options, selected: c.combobox,
+        options: c.tag === "select" ? undefined : c.options,
+        selected: c.combobox,
       };
       return `<tr><th>${esc(c.label || c.question || "Unnamed")}<small>
         ${esc(c.selector)}</small></th><td class="submit-review-value">
-        ${submitReviewValue(value)}</td></tr>`;
+        ${submitReviewValue(value)}${choices}</td></tr>`;
     }).join("");
     $("#submit-review-body").innerHTML = `
       <p><b>${esc(p.job?.company)} · ${esc(p.job?.job_id)}</b></p>
@@ -5113,7 +5141,9 @@ function openDrawer(pk) {
       <p>State: ${esc(r.review_state || "unavailable")} · ${esc(r.review_expires_at || "no expiry")}</p>
       ${r.review_state === "pending" && r.gate_generation
         ? `<button class="btn btn-primary" type="button" data-submit-review-open="${esc(r.pk)}">Inspect exact form &amp; decide</button>`
-        : `<p>Review closed. Manual fresh run required; ordinary approval cannot resume this one.</p>`}
+        : canFreshSubmitReview(r)
+          ? `<button class="btn btn-primary" data-act="retry" data-pk="${esc(r.pk)}">Start fresh preparation</button>`
+          : `<p>Review closed. Manual fresh run required; ordinary approval cannot resume this one.</p>`}
     </div>` : gated ? `
     <div class="section gate-box">
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>

@@ -77,6 +77,7 @@ const state = {
   activity: {},       // pk -> {detail, at} — the live step, shown on active cards
   coQuery: "",        // search inside the company picker
   mode: "gated",
+  submitReview: false,
   headless: false,
   paused: false,
   autoMin: 8,
@@ -223,6 +224,7 @@ const GATE_LABEL = {
   captcha: "CAPTCHA, finish it manually",
   no_account: "account/login needed",
   low_confidence: "needs review",
+  submit_review: "final form review",
 };
 const gateLabel = (r) => GATE_LABEL[r] || String(r || "review").replace(/_/g, " ");
 function defaultGateText(r) {
@@ -242,7 +244,7 @@ const DEFECT_ISSUE_URLS = Object.freeze({
   defect_greenhouse_tenant_alias: "https://github.com/chetwerikoff/AppliedIn/issues/118",
 });
 const READ_ONLY_ROUTES = new Set(["portal_check", "waiting_for_fix", "manual_triage"]);
-const INTERVENTION_ROUTES = new Set(["owner_question", "approval", "low_confidence", "captcha", "no_account"]);
+const INTERVENTION_ROUTES = new Set(["owner_question", "approval", "low_confidence", "captcha", "no_account", "submit_review"]);
 // No text-based diagnosis: raw prose and stale non-active gate codes are never
 // authority to answer, approve, or claim a source-specific defect.
 function routeOf(r) {
@@ -252,6 +254,7 @@ function routeOf(r) {
       || r.status === "uncertain") return "portal_check";
   if (!Object.hasOwn(STATUS_META, r.status)) return "manual_triage";
   if (r.status !== "needs_human") return r.status;
+  if (r.gate_reason === "submit_review") return "submit_review";
   if (r.fail_kind && r.fail_kind !== "") return "manual_triage";
   if (DEFECT_CODES.has(r.gate_reason))
     return r.gate_has_form_question === true ? "manual_triage" : "waiting_for_fix";
@@ -316,7 +319,7 @@ function routeNotice(r) {
 function rowActionAllowed(pk, act) {
   const r = state.apps.find((item) => item.pk === pk);
   // A stale control cannot override a blocked or unverified independent hold.
-  if (!r || r.submit_hold_state !== "clear") return false;
+  if (!r || r.submit_hold_state !== "clear" || r.gate_reason === "submit_review") return false;
   const kind = routeOf(r);
   if (act === "queue-apply" && canRequeueStructuralGate(r)) return true;
   if (READ_ONLY_ROUTES.has(kind)) return false;
@@ -915,6 +918,11 @@ function renderMenuState() {
   const pause = $("#m-pause-state");
   pause.textContent = state.paused ? "paused" : "running";
   pause.className = "menu-state mono " + (state.paused ? "warn" : "on");
+  const submitMode = $("#m-submit-review-state");
+  if (submitMode) {
+    submitMode.textContent = state.submitReview ? "on · final pause" : "off";
+    submitMode.className = "menu-state mono " + (state.submitReview ? "warn" : "");
+  }
   const mode = $("#m-mode-state");
   mode.textContent = { auto: "auto ☾", assisted: "assisted ⎋", gated: "gated" }[state.mode] || "gated";
   mode.className = "menu-state mono " + (state.mode === "gated" ? "" : "on");
@@ -1523,7 +1531,11 @@ const moreBtn = (key, shown, total, step = REVEAL) =>
 function gateMini(r) {
   const kind = routeOf(r);
   const captcha = kind === "captcha" || kind === "no_account";
-  const act = isReadOnly(r)
+  const act = kind === "submit_review"
+    ? (r.review_state === "pending" && r.gate_generation
+      ? `<button class="kc-retry kc-apply" data-submit-review-open="${esc(r.pk)}">Review exact form</button>`
+      : `<span class="nc-gate">Review ${esc(r.review_state || "unavailable")} · fresh run required</span>`)
+    : isReadOnly(r)
     ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}">View details</button>`
     : captcha
     ? `<button class="kc-retry kc-apply" data-open="${esc(r.pk)}"
@@ -2532,6 +2544,17 @@ function viewApps() {
 // --- Needs-you cards -------------------------------------------------------
 function needsCard(r) {
   const kind = routeOf(r);
+  if (kind === "submit_review") return `<article class="gatecard" data-submit-review-row="${esc(r.pk)}">
+    <header><div><span class="gc-co">${esc(r.company)}</span>
+      <span class="gc-role">${esc(r.title)}</span></div>
+      <span class="gatepill">Final Submit review</span></header>
+    <p>One live form is paused before Submit. Neither approval nor ordinary queue
+      decisions can replace inspection of this exact private snapshot.</p>
+    <p class="mono">State: ${esc(r.review_state || "unavailable")} · Expires ${esc(r.review_expires_at || "unknown")}</p>
+    <div class="gc-actions">${r.review_state === "pending" && r.gate_generation
+      ? `<button type="button" class="btn btn-primary" data-submit-review-open="${esc(r.pk)}">Inspect form &amp; decide</button>`
+      : `<span class="muted">Review closed. A fresh manually initiated run is required.</span>`}</div>
+  </article>`;
   const manual = kind === "captcha" || kind === "no_account";
   const owner = kind === "owner_question";
   const decision = kind === "approval" || kind === "low_confidence";
@@ -3971,6 +3994,7 @@ function demoEvents(apps) {
 function applyStats(s) {
   state.stats = s || {};
   if (s && s.apply_mode) state.mode = s.apply_mode;
+  state.submitReview = s?.submit_review === true;
   if (s && typeof s.headless === "boolean") state.headless = s.headless;
   if (s) state.paused = !!s.paused;
   if (s && s.auto_min_score != null) state.autoMin = s.auto_min_score;
@@ -4889,6 +4913,143 @@ async function resetPipeline() {
   load().catch(() => {});
 }
 
+// --- Private generation-bound final form review ---------------------------
+let submitReviewActive = null; // {pk,generation}, never packet/form bytes
+
+function closeSubmitReview() {
+  submitReviewActive = null;
+  const dialog = $("#submit-review-dialog");
+  $("#submit-review-actions").hidden = true;
+  $("#submit-review-body").replaceChildren();
+  $("#submit-review-reason").value = "";
+  if (dialog?.open && typeof dialog.close === "function") dialog.close();
+  else dialog?.removeAttribute("open");
+}
+function submitReviewValue(value) {
+  return esc(typeof value === "string" ? value : JSON.stringify(value ?? null));
+}
+function submitReviewDiffHtml(differences) {
+  return (Array.isArray(differences) ? differences.slice(0, 12) : []).map((c) =>
+    `<tr><th>${esc(c.control || c.identity || "Form item")}</th>
+      <td class="submit-review-value">${submitReviewValue(c.before)}</td>
+      <td class="submit-review-value">${submitReviewValue(c.after)}</td></tr>`).join("");
+}
+async function openSubmitReview(pk) {
+  if (demoGuard()) return;
+  const row = state.apps.find((r) => r.pk === pk);
+  const generation = row?.gate_generation;
+  if (row?.gate_reason !== "submit_review" || row.review_state !== "pending"
+      || typeof generation !== "string" || !generation
+      || !Number.isFinite(Date.parse(row.review_expires_at))
+      || Date.parse(row.review_expires_at) <= Date.now()) {
+    toast("That review is no longer live. Refresh and start a fresh run.");
+    return;
+  }
+  closeSubmitReview();
+  submitReviewActive = { pk, generation };
+  const dialog = $("#submit-review-dialog");
+  $("#submit-review-body").textContent = "Reading the private form snapshot…";
+  dialog.showModal();
+  try {
+    const response = await fetch(api(`/applications/${encodeURIComponent(pk)}/submit-review`),
+      { method: "GET", cache: "no-store", credentials: "same-origin", headers: auth.header() });
+    if (!response.ok) throw new Error("Current private review packet unavailable.");
+    const answer = await response.json();
+    if (!submitReviewActive || submitReviewActive.pk !== pk
+        || submitReviewActive.generation !== generation) return;
+    const p = answer.packet;
+    if (!p || p.gate_generation !== generation || !Array.isArray(p.controls)
+        || !p.controls.length || typeof answer.screenshot !== "string"
+        || !/^data:image\\/png;base64,[A-Za-z0-9+/=]+$/.test(answer.screenshot)) {
+      throw new Error("The current private form is incomplete or stale.");
+    }
+    const items = p.controls.map((c) => {
+      const value = {
+        value: c.value, checked: c.checked, files: c.files,
+        options: c.options, selected: c.combobox,
+      };
+      return `<tr><th>${esc(c.label || c.question || "Unnamed")}<small>
+        ${esc(c.selector)}</small></th><td class="submit-review-value">
+        ${submitReviewValue(value)}</td></tr>`;
+    }).join("");
+    $("#submit-review-body").innerHTML = `
+      <p><b>${esc(p.job?.company)} · ${esc(p.job?.job_id)}</b></p>
+      <p class="mono">Form: ${esc(p.page?.form_selector)}
+        · Submit: ${esc(p.page?.submit_selector)}
+        · Deadline: ${esc(p.expires_at)}</p>
+      <p>Attached PDF: ${esc(p.attachment?.filename)} · digest:
+        ${esc(p.attachment?.pdf_sha256 || "unavailable")}</p>
+      <table aria-label="All visible form controls"><thead><tr>
+        <th>Control / label</th><th>Current value, options and selection</th>
+      </tr></thead><tbody>${items}</tbody></table>
+      <h3>Current held tab screenshot</h3>
+      <img src="${esc(answer.screenshot)}" alt="One current application form screenshot" />
+      <p>Approval authorizes only the exact live Submit decision after another
+        complete safety check. It is not an employer confirmation.</p>`;
+    $("#submit-review-actions").hidden = false;
+  } catch (err) {
+    if (!submitReviewActive || submitReviewActive.pk !== pk) return;
+    $("#submit-review-body").innerHTML = `<p class="submit-review-err">
+      ${esc(err?.message || "Private review unavailable.")}</p>`;
+    $("#submit-review-actions").hidden = true; // No packet => no approval
+  }
+}
+async function decideSubmitReview(decision) {
+  const selection = submitReviewActive;
+  if (!selection || !["approve", "reject"].includes(decision) || demoGuard()) return;
+  const row = state.apps.find((r) => r.pk === selection.pk);
+  if (row?.gate_reason !== "submit_review" || row.review_state !== "pending"
+      || row.gate_generation !== selection.generation) {
+    $("#submit-review-body").textContent = "Review generation has changed. No decision sent.";
+    $("#submit-review-actions").hidden = true;
+    return;
+  }
+  if (decision === "approve" && !confirm(
+      "Approve this exact live form for one guarded Submit attempt? " +
+      "The employer may receive the application; this does NOT mark it applied.")) return;
+  const buttons = [$("#submit-review-approve"), $("#submit-review-reject")];
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    const result = await post(
+      `/actions/submit-review/${encodeURIComponent(selection.pk)}`, {
+        decision, expected_gate_generation: selection.generation,
+        reason: decision === "reject" ? $("#submit-review-reason").value.slice(0, 500) : "",
+      });
+    if (!submitReviewActive || submitReviewActive.generation !== selection.generation) return;
+    if (result?.error === "form_changed" || Array.isArray(result?.differences)) {
+      $("#submit-review-body").innerHTML = `<h3>Form changed · no Submit</h3>
+        <table><thead><tr><th>Control</th><th>Reviewed</th><th>Current</th></tr></thead>
+        <tbody>${submitReviewDiffHtml(result.differences)}</tbody></table>
+        <p>A fresh run and new packet are required.</p>`;
+      $("#submit-review-actions").hidden = true;
+    } else if (result?.ok) {
+      $("#submit-review-body").textContent = decision === "reject"
+        ? "Rejected. No Submit was requested. This generation is consumed."
+        : "Review claim consumed. The original BrowserSkill session alone will attempt one guarded Submit.";
+      $("#submit-review-actions").hidden = true;
+    } else {
+      $("#submit-review-body").textContent = result?.error || "Decision refused.";
+      $("#submit-review-actions").hidden = true;
+    }
+    loadApps();
+  } finally {
+    buttons.forEach((b) => { b.disabled = false; });
+  }
+}
+async function toggleSubmitReview() {
+  if (demoGuard()) return;
+  const enabled = !state.submitReview;
+  if (enabled && !confirm("Enable final Submit review only for BrowserSkill? " +
+      "This pauses before Submit and never submits a form by itself.")) return;
+  const result = await post("/actions/submit-review-mode", { enabled });
+  if (result?.ok && typeof result.submit_review === "boolean") {
+    state.submitReview = result.submit_review;
+    renderMenuState();
+    toast(state.submitReview ? "Final Submit review ON (BrowserSkill only)." :
+      "Final Submit review OFF. Live review generations revoked; no auto Submit.");
+  } else toast(result?.detail || result?.error || "Submit review mode unchanged.");
+}
+
 // --- detail drawer ---------------------------------------------------------
 function openDrawer(pk) {
   if (!state.trackerLoaded) loadTracker();
@@ -4915,7 +5076,8 @@ function openDrawer(pk) {
     `<div class="tl"><div class="tl-dot ${t.done ? "done" : ""}"></div>
       <div><div class="tl-label">${esc(t.label)}</div><div class="tl-time">${when(t.at)}</div></div></div>`).join("");
 
-  const canRetailor = !guarded && !["applied", "applied_manual", "submitting"].includes(r.status);
+  const canRetailor = !guarded && kind !== "submit_review"
+    && !["applied", "applied_manual", "submitting"].includes(r.status);
   const retailoring = r.status === "tailoring";
   const kept = (r.tailor_note || "").trim();
   const retailor = canRetailor ? `
@@ -4944,7 +5106,14 @@ function openDrawer(pk) {
   const ownerQuestion = kind === "owner_question";
   const reviewDecision = kind === "approval" || kind === "low_confidence";
   const gated = !guarded && (INTERVENTION_ROUTES.has(kind) || canApply(r));
-  const gate = gated ? `
+  const gate = kind === "submit_review" ? `
+    <div class="section gate-box">
+      <div class="section-t">Private final Submit review</div>
+      <p>State: ${esc(r.review_state || "unavailable")} · ${esc(r.review_expires_at || "no expiry")}</p>
+      ${r.review_state === "pending" && r.gate_generation
+        ? `<button class="btn btn-primary" type="button" data-submit-review-open="${esc(r.pk)}">Inspect exact form &amp; decide</button>`
+        : `<p>Review closed. Manual fresh run required; ordinary approval cannot resume this one.</p>`}
+    </div>` : gated ? `
     <div class="section gate-box">
       <div class="section-t">⏸ ${esc(gateLabel(r.gate_reason))}</div>
       <div class="gate-q md">${md(r.gate_question || defaultGateText(r))}</div>
@@ -7098,6 +7267,22 @@ function wire() {
   });
   $("#m-pause").addEventListener("click", () => { togglePause(); closeMenu(); });
   $("#m-mode").addEventListener("click", () => { toggleMode(); closeMenu(); });
+  $("#m-submit-review").addEventListener("click", () => {
+    toggleSubmitReview(); closeMenu();
+  });
+  $("#submit-review-close").addEventListener("click", closeSubmitReview);
+  $("#submit-review-dialog").addEventListener("close", closeSubmitReview);
+  $("#submit-review-approve").addEventListener("click", () => decideSubmitReview("approve"));
+  $("#submit-review-reject").addEventListener("click", () => decideSubmitReview("reject"));
+  for (const parent of ["#pane", "#drawer"]) {
+    $(parent).addEventListener("click", (e) => {
+      const el = e.target.closest("[data-submit-review-open]");
+      if (!el) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      openSubmitReview(el.dataset.submitReviewOpen);
+    }, { capture: true });
+  }
   $("#m-headless").addEventListener("click", () => { toggleHeadless(); closeMenu(); });
   $("#m-theme").addEventListener("click", () => {
     const root = document.documentElement;

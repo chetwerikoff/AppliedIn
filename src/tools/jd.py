@@ -72,7 +72,7 @@ def _valid_reader_url(value: object) -> bool:
     """Only complete, non-ambiguous HTTP(S) addresses may reach a reader."""
     if (not isinstance(value, str) or not value
             or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
-                   or ch == "\\\\" for ch in value)):
+                   or ch == "\\" for ch in value)):
         return False
     try:
         p = urlsplit(value)

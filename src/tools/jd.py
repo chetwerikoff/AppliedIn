@@ -343,7 +343,11 @@ def fetch_jd_meta(url: str, kind: str = "jd") -> dict:
             combined = pg.merge(seen["text"], seen["posting_guard"],
                                 hit["posting_guard"])
             seen.update(combined)
-            hit = {**seen, "source_kind": "http_html", "source_url": effective_url}
+            # Chrome supplies longer text, not independent original-job identity.
+            # Retain only the canonical/JobPosting proof parsed from the HTTP HTML.
+            hit = {**seen, "source_kind": "http_html",
+                   "source_url": effective_url,
+                   "source_identity": hit["source_identity"] if same_source else {}}
     if ats:
         complete_ats = bool(ats["posting_guard"].get("source_verified"))
         # Never substitute another redirected page's JD for an ATS posting.

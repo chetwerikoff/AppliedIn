@@ -4124,23 +4124,86 @@ async function assignReply(recordId) {
   await Promise.all([loadApps(), loadUnassigned()]);
   toast("Reply assigned.");
 }
-async function loadApps() {
+// Refusal refreshes are observational: update only the affected visible gate
+// instead of tearing down hundreds of unrelated cards on unchanged status.
+function repaintRefusalRow(pk, before, current) {
+  if (!before || !current || before.status !== current.status
+      || routeOf(before) !== routeOf(current)) return false;
+  const newGate = ownerGateKey(before) !== ownerGateKey(current)
+    || before.gate_question !== current.gate_question
+    || before.gate_skip_eligible !== current.gate_skip_eligible;
+  if (newGate && routeOf(current) === "owner_question") {
+    if (state.tab === "pipeline") {
+      const card = $(`#pane .ps-needs .ncard[data-open="${CSS.escape(pk)}"]`);
+      if (card) card.outerHTML = gateMini(current);
+    } else if (state.tab === "needs") {
+      const card = $(`#pane .gatecard[data-reply-card="${CSS.escape(pk)}"]`);
+      if (card) card.outerHTML = needsCard(current);
+    }
+    // A new generation never inherits the old rendered textarea.
+    _drawnGateKeys.set(pk, ownerGateKey(current));
+  }
+  refreshReplyNoticeNodes(pk);
+  return true;
+}
+
+let _appsReadVersion = 0;
+async function loadApps(refusalEvent = null) {
   if (DEMO) return;
+  const request = ++_appsReadVersion;
+  const previous = state.apps;
   try {
     const a = await fetch(api("/applications"), { headers: auth.header() }).then((r) => r.json());
+    if (request !== _appsReadVersion) return;
     state.apps = (a.items || []).filter((r) => !isInternalPk(r.pk));
+    pruneReplyEvidence();
+    const pk = refusalEvent?.pk;
+    if (typeof pk === "string") {
+      const current = state.apps.find((r) => r.pk === pk);
+      const witness = _replyWitnesses.get(pk);
+      if (witness) {
+        _replyWitnesses.delete(pk); // a delivered refusal is not a retry grant
+        if (refusalEvent.same_pending_gate_at_emit === true && witness.acknowledged
+            && !_refusalStreamLost && witness.key === ownerGateKey(current)
+            && _replyAttemptGates.get(pk) === witness.key
+            && _replyAmbiguousGates.get(pk) !== witness.key) {
+          _replyNotices.set(pk, witness.key);
+        }
+      }
+    }
     await loadUnassigned();
     await migrateReviewSkips();
+    if (request !== _appsReadVersion) return;
+    pruneReplyEvidence();
     if (state.tab === "activity") loadActivity();
     if (state.tab === "fresh") loadFresh();
-    renderTabs(); refreshPane(); renderFooter(); scheduleFeed();
+    renderTabs();
+    if (typeof pk === "string") {
+      const before = previous.find((r) => r.pk === pk);
+      const current = state.apps.find((r) => r.pk === pk);
+      // A coincident unrelated data change takes the existing ordinary path;
+      // the refusal-only case updates one card without a full-pane repaint.
+      const otherRowsSame = JSON.stringify(previous.filter((r) => r.pk !== pk))
+        === JSON.stringify(state.apps.filter((r) => r.pk !== pk));
+      if (otherRowsSame && repaintRefusalRow(pk, before, current))
+        _paneSig = paneSig();
+      else refreshPane();
+    } else refreshPane();
+    renderFooter();
+    scheduleFeed();
     if (state.openPk && !$("#drawer").hidden) {
       const current = state.apps.find((item) => item.pk === state.openPk);
-      if (current && routeOf(current) !== state.openRoute) openDrawer(current.pk);
+      if (current && (routeOf(current) !== state.openRoute
+          || ownerGateKey(current) !== state.openGateKey)) {
+        openDrawer(current.pk);
+      } else if (typeof pk === "string" && pk === state.openPk) {
+        refreshReplyNoticeNodes(pk);
+      }
     }
   } catch {
     // A failed authoritative projection may not leave stale "clear" controls.
     state.apps = state.apps.map((r) => ({ ...r, submit_hold_state: "unknown" }));
+    pruneReplyEvidence();
     renderTabs(); refreshPane();
     if (state.openPk && !$("#drawer").hidden) openDrawer(state.openPk);
   }

@@ -523,7 +523,9 @@ def create_app() -> FastAPI:
     app.include_router(cosign_router)
     settings = get_settings()
     from tools import submit_review
-    submit_review.recover_orphans()
+    # A route-registration/import must not touch the private store or Redis.
+    # Revoke orphaned generations on real ASGI startup, before serving requests.
+    app.add_event_handler("startup", submit_review.recover_orphans)
 
     @app.get("/steering")
     def get_steering():

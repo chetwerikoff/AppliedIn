@@ -4612,3 +4612,30 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .pg-warning strong { display: block; margin-bottom: 2px; }
 .pg-warning span { display: block; overflow-wrap: anywhere; }
+
+
+/* Private submit review: same-origin local modal, never written to localStorage. */
+.submit-review-dialog {
+  width: min(94vw, 980px); max-height: 92vh; overflow: auto;
+  background: var(--panel); color: var(--fg); border: 1px solid var(--border-2);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-2); padding: 0;
+}
+.submit-review-dialog::backdrop { background: rgba(0,0,0,.73); }
+.submit-review-top { display: flex; align-items: center; justify-content: space-between;
+  padding: 15px 20px; border-bottom: 1px solid var(--border); }
+.submit-review-top h2 { margin: 0; font-size: 1.1rem; }
+.submit-review-body { padding: 18px 20px; max-height: 60vh; overflow: auto; }
+.submit-review-body table { border-collapse: collapse; width: 100%; font-size: .87rem; }
+.submit-review-body th, .submit-review-body td { padding: 8px; text-align: left;
+  border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.submit-review-body img { display: block; max-width: 100%; height: auto;
+  margin: 12px auto; border: 1px solid var(--border); }
+.submit-review-actions { padding: 16px 20px; border-top: 1px solid var(--border); }
+.submit-review-actions label { display: block; margin-bottom: 8px; color: var(--muted); }
+.submit-review-actions textarea { width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--card); border: 1px solid var(--border-2); color: var(--fg);
+  border-radius: var(--r-sm); padding: 10px; }
+.submit-review-buttons { display: flex; gap: 12px; flex-wrap: wrap;
+  justify-content: flex-end; margin-top: 12px; }
+.submit-review-err { color: var(--bad); white-space: pre-wrap; }
+.submit-review-value { max-width: 480px; overflow-wrap: anywhere; white-space: pre-wrap; }

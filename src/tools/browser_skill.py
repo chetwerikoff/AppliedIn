@@ -306,6 +306,25 @@ class Session:
         # first navigation, which itself needs no context.
         self._tab_ready = False
         self._lock = asyncio.Lock()
+        # Keep the last transport check even when a session runner is substituted
+        # (e.g. a cooperating backend shim); the native runner repeats it after
+        # its context-sync awaits, immediately before raw IPC.
+        self._run = self._guarded_raw_run
+
+    def _check_review_raw_effect(self, args) -> None:
+        controller = self._application_controller
+        if (self.kind == "apply" and controller is not None
+                and getattr(controller, "review_effect_args", None) is not None):
+            controller.final_review_effect_guard(self, args)
+
+    async def _guarded_raw_run(self, args, kwargs):
+        self._check_review_raw_effect(args)
+        result = await type(self)._run(self, args, kwargs)
+        controller = self._application_controller
+        if (self.kind == "apply" and controller is not None
+                and getattr(controller, "review_effect_args", None) is not None):
+            controller.review_raw_effect_started = True
+        return result
 
     def bind_application_controller(self, controller):
         """Bind once to the actual application controller; raw calls gain no authority."""
@@ -332,10 +351,16 @@ class Session:
                 await self._application_controller.after_ipc(
                     self, args, kwargs, succeeded=succeeded)
             finally:
-                holder = self._application_controller.review_holder
-                if holder is not None and self._application_controller.committed:
+                controller = self._application_controller
+                holder = getattr(controller, "review_holder", None)
+                if holder is not None and controller.committed:
                     from tools import submit_review
-                    submit_review.finish(holder)
+                    # Revocation before raw IPC is never a successful reviewer
+                    # continuation, even when the original marker was staged.
+                    if getattr(controller, "review_raw_effect_started", False):
+                        submit_review.finish(holder)
+                    else:
+                        submit_review.invalidate(holder, "invalidated")
 
     async def review_screenshot(self) -> bytes:
         """One read-only screenshot of this owned application tab, never shared.
@@ -437,9 +462,10 @@ class Session:
                 # Every await above could have changed the effective mode,
                 # company lease, reviewer generation or tab ownership. Inspect
                 # immediately before invoking the raw committing CLI.
+                self._check_review_raw_effect(args)
                 if (self.kind == "apply" and self._application_controller is not None
-                        and self._application_controller.review_effect_args == args):
-                    self._application_controller.final_review_effect_guard(self, args)
+                        and getattr(self._application_controller, "review_effect_args", None) is not None):
+                    self._application_controller.review_raw_effect_started = True
                 try:
                     result = await command(*args, *extra, "--session", self.id, **kwargs)
                 except Unavailable as exc:

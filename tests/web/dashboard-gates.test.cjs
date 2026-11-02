@@ -759,3 +759,174 @@ test('an owner reply says Sent only after the request was accepted', async () =>
   await send('pk-1', {}, 'Sent — checking the result.');
   assert.deepEqual(toasts(), []);
 });
+
+
+// Issue #300: real SSE handler and rendered gates, entirely offline.
+function liveRefusalHarness(gate = exactOwner('example-co#synthetic')) {
+  const h = harness();
+  h.state.apps = [gate];
+  h.state.tab = 'needs';
+  h.context.sourceRows = [gate];
+  h.context.sent = [];
+  h.context.toasts = [];
+  h.context.EventSource = class FakeEventSource {
+    constructor(url) { assert.equal(url, '/events'); h.eventSource = this; }
+    close() { this.closed = true; }
+  };
+  h.context.fetch = (url, options) => {
+    h.requests.push([url, options]);
+    assert.equal(url, '/applications', 'refusal can only fetch existing projection');
+    return Promise.resolve({json: async () => ({items: h.context.sourceRows})});
+  };
+  vm.runInContext([
+    'loadUnassigned = async () => {};',
+    'migrateReviewSkips = async () => {};',
+    'renderTabs = () => {}; renderFooter = () => {};',
+    'scheduleFeed = () => {}; loadAgentLog = () => {};',
+    'globalThis.sendCount = 0;',
+    'post = async (path, body) => { globalThis.sendCount++;',
+    '  globalThis.sent.push({path, body}); return {ok:true, status:"resuming"}; };',
+    'toast = (msg) => { globalThis.toasts.push(msg); };',
+  ].join('\n'), h.context);
+  // The mock does not parse innerHTML; supply DOM notice slots separately.
+  const slots = Array.from({length:3}, () => ({innerHTML: ''}));
+  h.document.querySelectorAll = (selector) => selector ===
+    '[data-reply-refusal="' + gate.pk + '"]' ? slots : [];
+  h.fn('renderPane')();
+  h.fn('openDrawer')(gate.pk);
+  h.fn('connectLive')();
+  h.eventSource.onopen();
+  return {h, gate, slots, emit(e) {
+    h.eventSource.onmessage({data: JSON.stringify(e)});
+  }};
+}
+function markedRefusal(pk, overrides = {}) {
+  return {kind: 'response', pk, at: '2026-01-01T00:00:00+00:00',
+    detail: '<synthetic private answer and selector>',
+    resume_answer_refused: true, refusal_reason: 'invalid_answer',
+    same_pending_gate_at_emit: true, ...overrides};
+}
+function ownerBody(gate) {
+  return {disposition: 'answer', answer: 'Test User',
+    expected_gate_generation: gate.gate_generation,
+    expected_question_identity: gate.gate_question_identity};
+}
+
+test('strict live refusal reaches Logs and all three current-gate surfaces without retry', async () => {
+  const {h, gate, slots, emit} = liveRefusalHarness();
+  const drawerHtml = h.node('#drawer-body').innerHTML;
+  const paneHtml = h.node('#pane').innerHTML;
+  const input = h.node('#gate-answer');
+  input.value = 'Partially typed synthetic text';
+  input.selectionStart = 4; input.selectionEnd = 9;
+  h.document.activeElement = input;
+  await h.fn('sendResume')(gate.pk, ownerBody(gate), 'Sent — checking the result.');
+  await settle();
+  assert.equal(h.context.sendCount, 1);
+  emit(markedRefusal(gate.pk));
+  await settle(); await settle();
+  assert.ok(h.requests.filter(([p]) => p === '/applications').length >= 2);
+  assert.ok(slots.every((s) => /An answer attempt for this pending question/.test(s.innerHTML)));
+  assert.match(h.fn('viewPipeline')(), /An answer attempt for this pending question/);
+  assert.match(h.fn('viewNeeds')(), /An answer attempt for this pending question/);
+  assert.equal(h.node('#drawer-body').innerHTML, drawerHtml);
+  assert.equal(h.node('#pane').innerHTML, paneHtml, 'no full-board repaint');
+  assert.equal(input.value, 'Partially typed synthetic text');
+  assert.equal(input.selectionStart, 4);
+  assert.equal(input.selectionEnd, 9);
+  assert.equal(h.document.activeElement, input);
+  const displayed = h.fn('feedItem')(h.state.events[0]);
+  assert.match(displayed, /owner reply refused/);
+  assert.match(displayed, /Owner reply not accepted/);
+  assert.doesNotMatch(displayed, /synthetic private answer|selector/i);
+  assert.deepEqual(Array.from(Object.keys(h.state.events[0])).sort(), [
+    'at', 'detail', 'kind', 'pk', 'refusal_reason', 'resume_answer_refused',
+  ]);
+  emit(markedRefusal(gate.pk)); // duplicate SSE/replay cannot submit
+  await settle();
+  assert.equal(h.context.sendCount, 1);
+  assert.deepEqual(Array.from(h.context.toasts), ['Sent — checking the result.']);
+  assert.match(h.fn('needsCard')(gate), /data-act="skip-field"/);
+  assert.match(h.fn('needsCard')(gate), /data-act="answer"/);
+});
+
+test('generation B replaces A question and actions without retaining the A answer', async () => {
+  const a = exactOwner('example-co#synthetic');
+  const {h, emit, slots} = liveRefusalHarness(a);
+  const input = h.node('#gate-answer'), body = h.node('#drawer-body');
+  let drawerRefreshes = 0, rendered = body.innerHTML;
+  Object.defineProperty(body, 'innerHTML', {configurable: true,
+    get() { return rendered; },
+    set(next) { drawerRefreshes++; rendered = next; input.value = ''; },
+  });
+  input.value = 'Old A synthetic draft';
+  await h.fn('sendResume')(a.pk, ownerBody(a), 'Sent — checking the result.');
+  await settle();
+  const b = exactOwner(a.pk, {gate_generation: 'gen-B',
+    gate_question_identity: 'q1_synthetic_B', gate_question: 'Synthetic question B?'});
+  h.context.sourceRows = [b];
+  emit(markedRefusal(a.pk, {same_pending_gate_at_emit: false}));
+  await settle(); await settle();
+  assert.ok(drawerRefreshes >= 1, 'same-route drawer refreshes for new generation');
+  assert.match(body.innerHTML, /Synthetic question B/);
+  assert.doesNotMatch(body.innerHTML, /Old A synthetic draft/);
+  assert.equal(input.value, '');
+  assert.equal(h.state.openGateKey, h.fn('ownerGateKey')(b));
+  assert.ok(slots.every((s) => !s.innerHTML), 'B never receives A refusal');
+  assert.match(h.node('#pane .gatecard[data-reply-card="example-co#synthetic"]').outerHTML,
+    /Synthetic question B/);
+  assert.equal(h.context.sendCount, 1);
+});
+
+test('overlap, held/advanced/generationless row, different PK and replay remain historical', async () => {
+  for (const change of ['overlap','held','advanced','generationless','other_pk','full_reload']) {
+    const a = exactOwner('example-co#synthetic');
+    const {h, emit, slots} = liveRefusalHarness(a);
+    if (change !== 'full_reload') {
+      await h.fn('sendResume')(a.pk, ownerBody(a), 'Sent — checking the result.');
+      await settle();
+    }
+    if (change === 'overlap') {
+      await h.fn('sendResume')(a.pk, ownerBody(a), 'Sent — checking the result.');
+      await settle();
+    }
+    if (change === 'held') h.context.sourceRows = [exactOwner(a.pk, {submit_hold_state:'blocked'})];
+    if (change === 'advanced') h.context.sourceRows = [exactOwner(a.pk, {status:'tailored'})];
+    if (change === 'generationless') h.context.sourceRows = [exactOwner(a.pk, {gate_generation:''})];
+    emit(markedRefusal(change === 'other_pk' ? 'example-co#other' : a.pk));
+    await settle(); await settle();
+    assert.ok(slots.every((s) => !s.innerHTML), change);
+    assert.match(h.fn('feedItem')(h.state.events[0]), /owner reply refused/, change);
+    assert.equal(h.context.sendCount,
+      change === 'full_reload' ? 0 : change === 'overlap' ? 2 : 1);
+  }
+});
+
+test('ordinary model responses, malformed markers and a reconnect cannot invent a refusal', async () => {
+  const {h, gate, emit, slots} = liveRefusalHarness();
+  await h.fn('sendResume')(gate.pk, ownerBody(gate), 'Sent — checking the result.');
+  await settle();
+  const reads = h.requests.length;
+  emit(markedRefusal(gate.pk, {resume_answer_refused: 'true'}));
+  emit({kind:'response',pk:gate.pk,detail:'Synthetic ordinary model response',
+    at:'2026-01-01T00:00:01+00:00'});
+  assert.equal(h.requests.length, reads, 'normal model response never reloads board');
+  assert.match(h.fn('feedItem')(h.state.events[0]), /model/);
+  assert.ok(slots.every((s) => !s.innerHTML));
+  h.eventSource.onerror();
+  assert.equal(h.fn('_refusalStreamLost'), true);
+  assert.equal(h.context.sendCount, 1);
+});
+
+test('only supplied SSE replay records restore Logs; full refresh has no gate witness', async () => {
+  const {h, gate, emit, slots} = liveRefusalHarness();
+  emit(markedRefusal(gate.pk, {at:'2026-01-01T00:00:01+00:00'}));
+  await settle(); await settle();
+  assert.ok(slots.every((s) => !s.innerHTML));
+  assert.match(h.fn('feedItem')(h.state.events[0]), /owner reply refused/);
+  for (let i = 0; i < 399; i++)
+    emit({kind:'step', pk:'example-co#other', detail:'synthetic step',
+      at:'2026-01-01T00:01:' + String(i).padStart(3,'0')});
+  assert.equal(h.state.events.length, 400);
+  assert.equal(h.context.sendCount, 0);
+});

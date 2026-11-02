@@ -3909,7 +3909,8 @@ function connectLive() {
           refusal_reason: "invalid_answer" } : e;
         state.events.unshift(shown);
         if (state.events.length > 1500) state.events.length = 1500;
-        if (e.pk && shown.detail && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
+        if (!refused && e.pk && shown.detail
+            && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
           state.activity[e.pk] = { detail: String(shown.detail), at: e.at, kind: e.kind };
           scheduleLive(e.pk);   // update the card's live line without a full reload
         }

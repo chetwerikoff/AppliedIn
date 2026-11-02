@@ -931,6 +931,34 @@ test('overlap, held/advanced/generationless row, different PK and replay remain 
   }
 });
 
+test('a historical refusal never overwrites active tailoring or submitting progress', async () => {
+  for (const status of ['tailoring', 'submitting']) {
+    const {h, gate, emit} = liveRefusalHarness();
+    const active = row(gate.pk, {status, gate_reason:'', gate_question:'',
+      gate_has_form_question:false, gate_has_call_id:false});
+    h.state.apps = [active];
+    h.context.sourceRows = [active];
+    h.state.tab = 'pipeline';
+    const progress = {detail:'Synthetic ' + status + ' work in progress',
+      at:'2026-01-01T00:00:01+00:00', kind:'running'};
+    h.state.activity[active.pk] = progress;
+    vm.runInContext('globalThis.liveRefreshes = 0; scheduleLive = () => { globalThis.liveRefreshes++; };',
+      h.context);
+    emit(markedRefusal(active.pk, {same_pending_gate_at_emit:false,
+      at:'2026-01-01T00:00:03+00:00'}));
+    await settle(); await settle();
+
+    assert.equal(h.state.activity[active.pk], progress,
+      'historical rejection must preserve the current ' + status + ' activity');
+    assert.match(h.fn('laneCard')(h.state.apps[0]), /Synthetic (tailoring|submitting) work in progress/);
+    assert.equal(h.context.liveRefreshes, 0, 'refusal must not schedule a live-line repaint');
+    assert.match(h.fn('feedItem')(h.state.events[0]), /owner reply refused/,
+      'the refusal remains visible in historical Logs');
+    assert.equal(h.state.events[0].detail, 'Owner reply not accepted.');
+    assert.equal(h.context.sendCount, 0, 'history never retries a submission');
+  }
+});
+
 test('ordinary model responses, malformed markers and a reconnect cannot invent a refusal', async () => {
   const {h, gate, emit, slots} = liveRefusalHarness();
   await h.fn('sendResume')(gate.pk, ownerBody(gate), 'Sent — checking the result.');

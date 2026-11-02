@@ -592,7 +592,10 @@ def test_recrawl_repair_refuses_change_between_read_and_commit(
     offline_pipeline, field, value,
 ):
     stores = _Stores()
-    pk, _ = _seed_legacy(stores)
+    # #299 freezes exhausted relative ERROR before repair; test the legacy #22
+    # CAS interleaving on a separate, still-eligible dormant FOUND row instead.
+    pk, _ = _seed_legacy(stores, status="found", fail_kind="",
+                         jd_read_attempts=2)
     def competing_write(key):
         stores.tracking.persisted[key][field] = value
     stores.tracking.before_repair = competing_write

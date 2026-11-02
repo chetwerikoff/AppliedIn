@@ -558,7 +558,7 @@ async def test_new_packet_after_explicit_restart_has_new_generation(monkeypatch,
     holder = submit_review.publish(
         pk=PK, company="example-co", controller=controller,
         session=SimpleNamespace(id="synthetic-tab"), packet=packet,
-        screenshot=b"\\x89PNG\\r\\n\\x1a\\nsynthetic")
+        screenshot=b"\x89PNG\r\n\x1a\nsynthetic")
     assert holder.generation != old_generation
     assert row["gate_generation"] == holder.generation
     assert row["review_state"] == "pending"

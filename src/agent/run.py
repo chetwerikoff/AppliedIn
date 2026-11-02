@@ -241,8 +241,10 @@ def _historical_relative(row: dict) -> bool:
     from urllib.parse import urlsplit
 
     raw = row.get("jd_url")
+    # An absent legacy field is not a persisted historical relative address;
+    # preserve the pre-existing no-URL workflows and their separate guards.
     if not isinstance(raw, str) or not raw:
-        return True
+        return False
     try:
         parsed = urlsplit(raw)
         return parsed.scheme not in ("http", "https") or not parsed.netloc

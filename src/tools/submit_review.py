@@ -516,6 +516,7 @@ def _selected_control(control: dict) -> dict:
         "value": control.get("value"), "checked": control.get("checked"),
         "files": control.get("files"),
         "options": control.get("options"),
+        "selected_options": control.get("selected_options"),
         "option_count": control.get("option_count"),
         "options_capped": control.get("options_capped"),
         "combobox": {

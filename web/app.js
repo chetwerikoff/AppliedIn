@@ -3787,8 +3787,9 @@ function smartRaw(e, raw) {
 function feedItem(e) {
   const t = e.at ? new Date(e.at).toLocaleTimeString("en-GB") : "";
   const app = e.pk ? state.apps.find((a) => a.pk === e.pk) : null;
-  const co = app ? app.company : (e.company || "");
-  const stage = STAGE_LABEL[e.agent] || e.agent || "";
+  const refused = markedReplyRefusal(e);
+  const co = app ? app.company : (refused ? "" : (e.company || ""));
+  const stage = refused ? "" : (STAGE_LABEL[e.agent] || e.agent || "");
   const coChip = !co ? ""
     : app ? `<span class="fe-co" data-open="${esc(e.pk)}" title="open ${esc(co)}">${esc(co)}</span>`
           : `<span class="fe-co">${esc(co)}</span>`;
@@ -3796,14 +3797,15 @@ function feedItem(e) {
     return `<div class="fe fe-step mono">
       <span>${esc(STAGE_LABEL[e.detail] || e.detail || stage)}</span>${coChip}</div>`;
   }
-  const k = KIND[e.kind] || { mark: e.kind || "·", cls: "" };
-  let raw = e.detail || "";
-  if (e.kind === "action") raw = `${e.detail}(${e.input ?? ""})`;
-  else if (e.kind === "result") raw = `${e.detail}  ${e.output ?? ""}`;
+  const k = refused ? { mark: "owner reply refused", cls: "k-bad" }
+    : (KIND[e.kind] || { mark: e.kind || "·", cls: "" });
+  let raw = refused ? REFUSAL_DETAIL : (e.detail || "");
+  if (!refused && e.kind === "action") raw = `${e.detail}(${e.input ?? ""})`;
+  else if (!refused && e.kind === "result") raw = `${e.detail}  ${e.output ?? ""}`;
   const text = unraw(smartRaw(e, raw));
   const isMd = e.kind === "response" || e.kind === "gate";
   const long = text.length > CLIP_AT;
-  const shot = e.screenshot
+  const shot = !refused && e.screenshot
     ? `<a class="fe-shot" href="${esc(e.screenshot)}" target="_blank" rel="noopener">
          <img src="${esc(e.screenshot)}" alt="screenshot" loading="lazy"></a>` : "";
   return `<div class="fe ${k.cls}">
@@ -3901,14 +3903,20 @@ function connectLive() {
     es.onmessage = (m) => {
       try {
         const e = JSON.parse(m.data);
-        const sig = `${e.at}|${e.kind}|${e.pk || ""}|${String(e.detail || "").slice(0, 80)}`;
+        const refused = markedReplyRefusal(e);
+        const sig = `${e.at}|${e.kind}|${e.pk || ""}|${refused ? REFUSAL_DETAIL : String(e.detail || "").slice(0, 80)}|${refused ? String(e.same_pending_gate_at_emit === true) : ""}`;
         if (seen.has(sig)) return;
         seen.add(sig);
         if (seen.size > 5000) seen.clear();
-        state.events.unshift(e);
+        // A marked response is a fixed diagnostic, never model output. Do not
+        // copy unexpected event extras into an owner-visible history or card.
+        const shown = refused ? { kind: "response", pk: e.pk, at: e.at,
+          detail: REFUSAL_DETAIL, resume_answer_refused: true,
+          refusal_reason: "invalid_answer" } : e;
+        state.events.unshift(shown);
         if (state.events.length > 1500) state.events.length = 1500;
-        if (e.pk && e.detail && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
-          state.activity[e.pk] = { detail: String(e.detail), at: e.at, kind: e.kind };
+        if (e.pk && shown.detail && ["response", "running", "action", "gate", "applied", "error"].includes(e.kind)) {
+          state.activity[e.pk] = { detail: String(shown.detail), at: e.at, kind: e.kind };
           scheduleLive(e.pk);   // update the card's live line without a full reload
         }
         scheduleFeed();
@@ -3922,10 +3930,27 @@ function connectLive() {
         // so the page spent more time rebuilding than idle and nothing could be
         // clicked. These four are real transitions: a job appears, finishes, needs
         // you, or breaks.
-        if (["discovered", "applied", "gate", "error"].includes(e.kind)) scheduleReload();
+        if (refused && typeof e.pk === "string" && e.pk && !isInternalPk(e.pk)) {
+          // The event itself is historical evidence only. A fresh row read may
+          // separately permit a same-gate notice if local submission proves it.
+          void loadApps(e);
+        } else if (["discovered", "applied", "gate", "error"].includes(e.kind)) {
+          scheduleReload();
+        }
       } catch { /* ignore malformed lines */ }
     };
-    es.onerror = () => { es.close(); setFeedStatus("connecting"); setTimeout(open, 3000); };
+    es.onerror = () => {
+      es.close();
+      _refusalStreamLost = true; // reconnect replay has no live/replay discriminator
+      _replyWitnesses.clear();
+      _replyAttemptGates.clear();
+      _replyAmbiguousGates.clear();
+      const noticed = [..._replyNotices.keys()];
+      _replyNotices.clear();
+      noticed.forEach(refreshReplyNoticeNodes);
+      setFeedStatus("connecting");
+      setTimeout(open, 3000);
+    };
   };
   open();
 }
@@ -5078,11 +5103,12 @@ function loadAgentLog(pk) {
         return;
       }
       el.innerHTML = evs.map((e) => {
-        const body = [e.detail, e.input, e.output].filter(Boolean)
+        const refused = markedReplyRefusal(e);
+        const body = refused ? REFUSAL_DETAIL : [e.detail, e.input, e.output].filter(Boolean)
           .map((x) => unraw(typeof x === "string" ? x : JSON.stringify(x))).join("\n");
         return `<div class="al-e">
-          <div class="al-h"><span class="al-k" data-kind="${esc(e.kind || "")}">${esc(e.kind || "·")}</span>
-            ${e.agent ? `<span class="al-a">${esc(e.agent)}</span>` : ""}
+          <div class="al-h"><span class="al-k" data-kind="${esc(e.kind || "")}">${refused ? "owner reply refused" : esc(e.kind || "·")}</span>
+            ${!refused && e.agent ? `<span class="al-a">${esc(e.agent)}</span>` : ""}
             <span class="al-t">${when(e.at)}</span></div>
           ${body ? `<pre class="al-b">${esc(body)}</pre>` : ""}</div>`;
       }).join("");

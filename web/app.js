@@ -4960,7 +4960,8 @@ async function openSubmitReview(pk) {
     const p = answer.packet;
     if (!p || p.gate_generation !== generation || !Array.isArray(p.controls)
         || !p.controls.length || typeof answer.screenshot !== "string"
-        || !/^data:image\\/png;base64,[A-Za-z0-9+/=]+$/.test(answer.screenshot)) {
+        || !answer.screenshot.startsWith("data:image/png;base64,")
+        || !/^[A-Za-z0-9+/=]+$/.test(answer.screenshot.slice(22))) {
       throw new Error("The current private form is incomplete or stale.");
     }
     const items = p.controls.map((c) => {

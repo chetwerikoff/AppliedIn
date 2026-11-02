@@ -1227,10 +1227,17 @@ def test_workday_missing_or_unsafe_source_never_reaches_reader_or_cache(
 def test_unresolvable_settles_without_reader_outage_budget_or_cache(
     monkeypatch, conflict,
 ):
-    tracking, pk = _synthetic_tracking()
-    tracking.set_status(pk, Status.FOUND, jd_url="/jobs/job-1",
-                        jd_read_attempts=1, jd_read_revision=6,
-                        jd_text="Cached text " * 60, jd_read_retry_at=None)
+    from core.models import JobRecord
+
+    pk = "example-co#job-1"
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    assert tracking.put_new(JobRecord(
+        company="example-co", job_id="job-1", ats="custom",
+        title="Test role", jd_url="/jobs/job-1",
+        jd_text="Cached text " * 60))
+    # JD/guard text is bound at creation; status writes may not overwrite it.
+    tracking.set_status(pk, Status.FOUND, jd_read_attempts=1,
+                        jd_read_revision=6, jd_read_retry_at=None)
     stores = SimpleNamespace(tracking=tracking)
     _source_watchlist(monkeypatch, ats="custom")[0].careers_url = ""
     monkeypatch.setattr("core.events.emit", lambda *args, **kwargs: None)

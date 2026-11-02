@@ -440,6 +440,12 @@ async def test_approved_submit_keeps_independent_confirmation_readback(monkeypat
     assert calls == ["click", "evaluate", "evaluate"]
     with pytest.raises(AssertionError):
         await session.application_effect("click", "#submit")
+    # A raw runner that bypasses application_effect must not revive a spent
+    # authority. Read-only PAGE works, but no second committing IPC can run.
+    with pytest.raises(bsk.Unavailable, match="after committing attempt"):
+        await session._run(("click", "#submit"), {})
+    with pytest.raises(bsk.Unavailable, match="after committing attempt"):
+        await session._run(("evaluate", "(() => fetch('/submit'))()"), {})
     assert calls.count("click") == 1
 
 

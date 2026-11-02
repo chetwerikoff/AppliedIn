@@ -10,6 +10,7 @@ DynamoDB — same contract, different host.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -516,16 +517,20 @@ def _review_row_conflict(row: dict | None) -> bool:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="AppliedIn")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # Route registration/import must not touch the private store or Redis.
+        # Revoke orphaned generations only on ASGI startup, before requests.
+        submit_review.recover_orphans()
+        yield
+
+    app = FastAPI(title="AppliedIn", lifespan=lifespan)
     from discovery.career_ops_api import router as career_ops_router
     app.include_router(career_ops_router)
     from discovery.cosign_api import router as cosign_router
     app.include_router(cosign_router)
     settings = get_settings()
     from tools import submit_review
-    # A route-registration/import must not touch the private store or Redis.
-    # Revoke orphaned generations on real ASGI startup, before serving requests.
-    app.add_event_handler("startup", submit_review.recover_orphans)
 
     @app.get("/steering")
     def get_steering():

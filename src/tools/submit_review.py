@@ -553,7 +553,14 @@ def form_snapshot(controller, page: dict, target: dict) -> dict:
                  "form_action": target.get("form_action"),
                  "formaction": target.get("formaction"),
                  "application_identity": page.get("application_identity"),
-                 "attached_file_displays": page.get("attached_file_displays")},
+                 "attached_file_displays": [
+                     d for d in (page.get("attached_file_displays") or [])
+                     if isinstance(d, dict)
+                     and ((root and d.get("in_form")
+                           and d.get("form_selector") == root)
+                          or (not root and not d.get("in_form")
+                              and d.get("root_selector")
+                              == (page.get("formless_root") or {}).get("selector")))]},
         "attachment": {
             "filename": _Path(controller.resume_path).name,
             "pdf_sha256": controller.expected_digest,

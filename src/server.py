@@ -13,8 +13,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI
-from fastapi.responses import Response, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, Request, HTTPException
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from core.config import get_settings
@@ -302,6 +302,10 @@ def _to_ui(row: dict, artifacts) -> dict:
             (row.get("gate_pending") or {}).get("form_question"), dict),
         "gate_has_call_id": bool(row.get("gate_call_id")),
         **_owner_gate_tokens(row),
+        **({"gate_generation": row.get("gate_generation"),
+            "review_state": row.get("review_state"),
+            "review_expires_at": row.get("review_expires_at")}
+           if row.get("gate_reason") == "submit_review" else {}),
         "possible_submission": row.get("possible_submission") is True,
         "fail_kind": row.get("fail_kind") or "",
         "fail_reason": row.get("fail_reason") or "",
@@ -465,6 +469,52 @@ def _commit_manual_posting(pk: str, stores, inspected: dict) -> bool:
         source_witness=jd.matched_source_witness(current, inspected)))
 
 
+
+
+def _require_submit_review_first_party(request: Request) -> None:
+    """Strict *route-local* first-party containment, not local client auth.
+
+    Host/Origin are spoofable by an already-trusted loopback process. The three
+    review endpoints refuse extension, absent-origin and nonloopback browsers
+    before reading a packet or consuming a generation.
+    """
+    from ipaddress import ip_address
+
+    def deny():
+        raise HTTPException(403, "Submit review requires a local first-party request.",
+                            headers={"Cache-Control": "no-store"})
+
+    if get_settings().mode != "local":
+        deny()
+    peer = getattr(request.client, "host", "") if request.client else ""
+    try:
+        if not ip_address(peer).is_loopback:
+            deny()
+    except ValueError:
+        deny()
+    server = request.scope.get("server")
+    if (not isinstance(server, (tuple, list)) or len(server) < 2
+            or type(server[1]) is not int or not 0 < server[1] <= 65535):
+        deny()
+    port = server[1]
+    allowed = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
+    hosts = request.headers.getlist("host")
+    origins = request.headers.getlist("origin")
+    if len(hosts) != 1 or hosts[0] not in allowed or len(origins) != 1:
+        deny()
+    # Do not accept null, foreign schemes, extension Origins, credentials,
+    # alternate ports, repeated headers, path/query/fragment, or absent Origin.
+    if origins[0] != "http://" + hosts[0]:
+        deny()
+    if request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        deny()
+
+
+def _review_row_conflict(row: dict | None) -> bool:
+    from tools.submit_review import guarded_row
+    return guarded_row(row)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="AppliedIn")
     from discovery.career_ops_api import router as career_ops_router
@@ -472,6 +522,8 @@ def create_app() -> FastAPI:
     from discovery.cosign_api import router as cosign_router
     app.include_router(cosign_router)
     settings = get_settings()
+    from tools import submit_review
+    submit_review.recover_orphans()
 
     @app.get("/steering")
     def get_steering():
@@ -516,6 +568,16 @@ def create_app() -> FastAPI:
         # Live config: same-origin API, real data (not demo). Overrides web/config.js.
         return Response('window.APPLIEDIN_CONFIG = {demo:false, env:"local", apiUrl:""};\n',
                         media_type="application/javascript")
+
+    @app.get("/applications/{pk:path}/submit-review")
+    def submit_review_packet(pk: str, request: Request):
+        _require_submit_review_first_party(request)
+        try:
+            return JSONResponse(submit_review.packet_for(pk),
+                                headers={"Cache-Control": "no-store"})
+        except submit_review.Refused:
+            raise HTTPException(409, "No current approvable review packet.",
+                                headers={"Cache-Control": "no-store"}) from None
 
     @app.get("/applications")
     def applications():
@@ -686,6 +748,7 @@ def create_app() -> FastAPI:
                 "browser_status": browser_status(settings),
                 "queue_age_seconds": None, "paused": flags.paused(),
                 "apply_mode": flags.apply_mode(),
+                "submit_review": flags.submit_review_enabled(),
                 "headless": flags.browser_headless(),
                 "auto_min_score": settings.auto_min_score,
                 "counts_by_status": counts,
@@ -2914,6 +2977,55 @@ def create_app() -> FastAPI:
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
+
+    @app.post("/actions/submit-review-mode")
+    def set_submit_review_mode(body: dict, request: Request):
+        _require_submit_review_first_party(request)
+        from core import flags
+        from tools import browser_runtime, browser_skill
+        on = (body or {}).get("enabled")
+        if type(on) is not bool:
+            raise HTTPException(422, "enabled must be boolean",
+                                headers={"Cache-Control": "no-store"})
+        if on:
+            try:
+                supported = browser_runtime.backend() is browser_skill
+            except Exception:
+                supported = False
+            if not supported:
+                raise HTTPException(409, "submit_review requires the browser_skill engine",
+                                    headers={"Cache-Control": "no-store"})
+        if not flags.set_submit_review_enabled(on):
+            raise HTTPException(503, "Submit review flag storage is unavailable.",
+                                headers={"Cache-Control": "no-store"})
+        if not on:
+            submit_review.invalidate_all()
+        return JSONResponse({"ok": True, "submit_review": flags.submit_review_enabled()},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/actions/submit-review/{pk:path}")
+    async def decide_submit_review(pk: str, body: dict, request: Request):
+        _require_submit_review_first_party(request)
+        import asyncio
+        try:
+            decision = body.get("decision")
+            generation = body.get("expected_gate_generation")
+            reason = body.get("reason", "")
+            future = submit_review.claim(pk, generation, decision, reason)
+        except (submit_review.Refused, TypeError, AttributeError):
+            raise HTTPException(409, "Review generation is invalid, stale or consumed.",
+                                headers={"Cache-Control": "no-store"}) from None
+        # The live application worker, not this HTTP handler, performs the
+        # private readback, fresh safety checks and any raw Submit effect.
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)), timeout=90)
+        except asyncio.TimeoutError:
+            outcome = {"ok": True, "review_state": "claimed",
+                       "note": "Decision consumed; inspect the updated job state."}
+        status = 200 if outcome.get("ok") else 409
+        return JSONResponse(outcome, status_code=status,
+                            headers={"Cache-Control": "no-store"})
 
     @app.post("/actions/mode")
     def set_mode(body: dict):

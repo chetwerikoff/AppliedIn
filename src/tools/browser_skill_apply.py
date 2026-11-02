@@ -3247,6 +3247,7 @@ class ApplicationIPCController:
         self.submit_review_at_start = bool(submit_review_at_start)
         self.review_holder = None
         self.review_effect_args = None
+        self.review_raw_effect_started = False
         self.expected_digest = None
         if self.resume_path and Path(self.resume_path).is_file():
             self.expected_digest = hashlib.sha256(Path(self.resume_path).read_bytes()).hexdigest()
@@ -3515,8 +3516,7 @@ class ApplicationIPCController:
                 or session is None
                 or getattr(session, '_application_controller', None) is not self
                 or getattr(session, 'owner', None) is not asyncio.current_task()):
-            raise Gate('Submit review was revoked or its BrowserSkill owner is unavailable.',
-                       reason='submit_review')
+            submit_review.raise_review_gate('Submit review was revoked or its BrowserSkill owner is unavailable.')
         # Five existing checks only; NOT the actual possible-submission marker.
         await self.check_pre_submit(session, page, target, validation_only=True)
         holder = None
@@ -3543,11 +3543,9 @@ class ApplicationIPCController:
             if decision == 'reject':
                 submit_review.settle(
                     holder, {'ok': True, 'decision': 'reject', 'review_state': 'rejected'})
-                raise Gate('Submit review rejected; a fresh run is required.',
-                           reason='submit_review')
+                submit_review.raise_review_gate('Submit review rejected; a fresh run is required.')
             if decision != 'approve':
-                raise Gate('Submit review no longer authorizes this generation.',
-                           reason='submit_review')
+                submit_review.raise_review_gate('Submit review no longer authorizes this generation.')
             submit_review.require_claim(holder)
             live = await self._page(session)
             matching = [c for c in live.get('controls', [])
@@ -3557,15 +3555,13 @@ class ApplicationIPCController:
                     'ok': False, 'error': 'form_changed',
                     'differences': [{'control': 'Submit receiver',
                                      'before': target.get('selector'), 'after': 'unavailable'}]})
-                raise Gate('Application receiver changed after reviewer approval.',
-                           reason='submit_review')
+                submit_review.raise_review_gate('Application receiver changed after reviewer approval.')
             latest_packet = submit_review.form_snapshot(self, live, matching[0])
             differences = submit_review.form_differences(private_form, latest_packet)
             if differences:
                 submit_review.settle(holder, {
                     'ok': False, 'error': 'form_changed', 'differences': differences})
-                raise Gate('Application controls changed after review; a new packet is required.',
-                           reason='submit_review')
+                submit_review.raise_review_gate('Application controls changed after review; a new packet is required.')
             submit_review.require_claim(holder)
             submit_review.activate(holder)
             # check_pre_submit keeps its exact five checks AND the real marker,
@@ -3587,8 +3583,7 @@ class ApplicationIPCController:
                     else 'expired' if time.monotonic() >= holder.deadline
                     else 'invalidated')
             if isinstance(exc, submit_review.Refused):
-                raise Gate('Submit review is stale or no longer safe; start a fresh run.',
-                           reason='submit_review') from None
+                submit_review.raise_review_gate('Submit review is stale or no longer safe; start a fresh run.')
             raise
 
     def final_review_effect_guard(self, session, args) -> None:
@@ -3597,8 +3592,7 @@ class ApplicationIPCController:
         if (self.review_holder is None or self.review_effect_args != tuple(args)
                 or self.review_holder.session is not session
                 or getattr(session, '_application_controller', None) is not self):
-            raise Gate('The reviewed raw Submit effect is not current.',
-                       reason='submit_review')
+            submit_review.raise_review_gate('The reviewed raw Submit effect is not current.')
         submit_review.require_actual_marker(self.review_holder)
 
     async def after_ipc(self, session, args: tuple, kwargs: dict, *,

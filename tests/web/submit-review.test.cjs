@@ -122,3 +122,61 @@ test('stale reviewer generation cannot perform a POST', async () => {
   h.state.apps[0].review_state = 'expired';
   assert.doesNotMatch(h.fn('needsCard')(h.state.apps[0]), /data-submit-review-open/);
 });
+
+
+test('native multi-select review separates every selected caption and value', async () => {
+  const selected = [
+    { label: 'Hybrid', value: 'hybrid' },
+    { label: 'Remote', value: 'remote' },
+  ];
+  const options = [...selected,
+    { label: 'Office', value: 'office' },
+    { label: '<Unselected>', value: 'decline' }];
+  const packet = {
+    gate_generation: 'synthetic-generation',
+    job: { company: 'example-co', job_id: 'synthetic' },
+    page: { form_selector: '#form', submit_selector: '#submit' },
+    attachment: { filename: 'Test User.pdf', pdf_sha256: 'synthetic' },
+    expires_at: '2099-01-01T00:00:00+00:00',
+    controls: [{
+      label: 'Work preferences', selector: '#work', tag: 'select',
+      value: 'hybrid', checked: false, files: [], combobox: null,
+      selected_options: selected, options,
+    }],
+  };
+  const h = harness({ ok: true, status: 200, json: async () => ({
+    packet, screenshot: 'data:image/png;base64,iVBORw0KGgo=',
+  }) });
+  h.state.apps = [job()];
+  await h.fn('openSubmitReview')(PK);
+  const html = h.node('#submit-review-body').innerHTML;
+  const selection = html.split('Selected options (caption / value):</b>')[1]
+    .split('Available but unselected:')[0];
+  const available = html.split('Available but unselected:</b>')[1].split('</div>')[0];
+  assert.match(selection, /Hybrid \(hybrid\).*Remote \(remote\)/);
+  assert.doesNotMatch(selection, /Office|Unselected/);
+  assert.match(available, /Office \(office\).*&lt;Unselected&gt; \(decline\)/);
+  assert.doesNotMatch(available, /Hybrid|Remote/);
+  assert.equal(h.node('#submit-review-actions').hidden, false);
+  assert.deepEqual(h.persisted, []);
+});
+
+test('only closed harmless review states display the explicit fresh Retry action', () => {
+  for (const review_state of ['rejected', 'expired', 'restart', 'session_lost']) {
+    const h = harness();
+    const closed = { ...job(), review_state };
+    h.state.apps = [closed];
+    assert.equal(h.fn('rowActionAllowed')(PK, 'retry'), true);
+    assert.match(h.fn('needsCard')(closed), /data-act="retry"/);
+    for (const action of ['answer', 'queue-apply', 'mark-applied', 'apply-now']) {
+      assert.equal(h.fn('rowActionAllowed')(PK, action), false);
+    }
+  }
+  for (const review_state of ['pending', 'claimed', 'invalidated']) {
+    const h = harness();
+    const active = { ...job(), review_state };
+    h.state.apps = [active];
+    assert.equal(h.fn('rowActionAllowed')(PK, 'retry'), false);
+    assert.doesNotMatch(h.fn('needsCard')(active), /data-act="retry"/);
+  }
+});

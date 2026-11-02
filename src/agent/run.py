@@ -572,8 +572,7 @@ async def _run_job_async(pk: str, row: dict, stores: Any, *,
     return result
 
 
-async def _jd_meta(row: dict, *, yielding: bool = True,
-                   approval: bool = False) -> dict:
+async def _jd_meta(row: dict, *, yielding: bool = True) -> dict:
     """Select guarded JD; direct approval requires the raw current source.
 
     Other readers retain the existing cached/fallback selection contract.
@@ -581,7 +580,7 @@ async def _jd_meta(row: dict, *, yielding: bool = True,
     """
     from tools import jd as _jd, posting_guard as pg
 
-    if approval:
+    if not yielding:
         url = row.get("jd_url") or ""
         if not url:
             raise _jd.PostingReadUnavailable("Missing tracked posting URL")
@@ -604,8 +603,6 @@ async def _jd_meta(row: dict, *, yielding: bool = True,
     need_source = "source_html_unavailable" in old.get("reasons", [])
     if not url or (len(captured) >= 400 and not need_source):
         return local
-    import asyncio
-
     try:
         remote = await asyncio.to_thread(
             _jd.fetch_jd_meta, url, "jd_sweep" if yielding else "jd")
@@ -1835,7 +1832,7 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         return changed
 
     try:
-        jd_meta = await _jd_meta(row, yielding=False, approval=True)
+        jd_meta = await _jd_meta(row, yielding=False)
         changed, _ = _direct_approval_check(pk, observed, stores)
         if changed:
             return changed

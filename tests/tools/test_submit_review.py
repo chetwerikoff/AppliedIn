@@ -16,7 +16,11 @@ import pytest
 
 from core import flags
 from tools import browser_runtime, submit_review
-from tools.browser_skill_apply import ApplicationIPCController
+from tools.browser_skill_apply import ApplicationIPCController, Gate
+
+# Exercise the real BrowserSkill cooperation-context transport guard. Other
+# modules retain the pre-cooperation synthetic command shim.
+REAL_COOPERATION = True
 
 
 PK = "example-co#1"
@@ -83,6 +87,48 @@ def test_same_caption_with_different_hidden_value_is_not_approved():
     differences = submit_review.form_differences(before, after)
     assert any(d["control"] == "Location" for d in differences)
     assert differences[0]["before"] != differences[0]["after"]
+
+
+@pytest.mark.asyncio
+async def test_native_raw_submit_rechecks_current_generation_after_context_await(monkeypatch):
+    """Revoking a generation while sync_context awaits cannot reach raw IPC."""
+    from tools import browser_skill as bsk
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+    session._tab_ready = True
+    state = {"current": True}
+    calls = []
+
+    def guard(_session, args):
+        calls.append(("guard", tuple(args)))
+        if not state["current"]:
+            raise Gate("revoked during synthetic context sync", reason="submit_review")
+
+    session._application_controller = SimpleNamespace(
+        review_effect_args=("click", "#submit"),
+        final_review_effect_guard=guard,
+        review_raw_effect_started=False,
+    )
+
+    async def sync_context(*, settle=True):
+        await asyncio.sleep(0)
+        session._context = "synthetic-fresh-context"
+        state["current"] = False
+        return session._context
+
+    async def forbidden(*args, **kwargs):
+        calls.append(("raw", args))
+        raise AssertionError("revoked reviewer generation reached raw CLI")
+
+    monkeypatch.setattr(session, "sync_context", sync_context)
+    monkeypatch.setattr(bsk, "command", forbidden)
+    with pytest.raises(Gate, match="revoked during synthetic context sync"):
+        await session._run(("click", "#submit"), {})
+    assert calls == [
+        ("guard", ("click", "#submit")),
+        ("guard", ("click", "#submit")),
+    ]
+    assert session._application_controller.review_raw_effect_started is False
 
 
 def test_native_selected_option_identity_and_multi_select_drift_are_private_and_exact():

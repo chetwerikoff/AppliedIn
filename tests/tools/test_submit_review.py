@@ -377,3 +377,109 @@ def test_orphan_recovery_is_asgi_startup_only(monkeypatch):
         assert client.get("/config.js").status_code == 200
         assert calls == ["startup"]
     assert calls == ["startup"]
+
+
+@pytest.mark.asyncio
+async def test_approved_submit_keeps_independent_confirmation_readback(monkeypatch):
+    """A consumed one-shot Submit grant must not block fixed passive reads."""
+    from tools import browser_skill as bsk
+    from tools import browser_skill_apply as apply_mod
+
+    session = bsk.Session("apply")
+    session.id = "synthetic-application-tab"
+    calls = []
+    before = {"url": URL, "text": "Complete application",
+              "controls": [{"type": "submit", "disabled": False}]}
+    after = {"url": URL, "text": "Thank you for applying", "controls": []}
+
+    class ApprovedController:
+        review_holder = object()
+        review_effect_args = None
+        pending_commit_args = None
+        review_raw_effect_started = False
+        committed = False
+
+        async def before_ipc(self, owner, args, kwargs):
+            assert owner is session and kwargs == {}
+            assert not self.committed
+            self.review_effect_args = tuple(args)
+            self.committed = True
+
+        def final_review_effect_guard(self, owner, args):
+            assert owner is session and tuple(args) == ("click", "#submit")
+
+        async def after_ipc(self, *args, **kwargs):
+            assert kwargs["succeeded"]
+
+    controller = ApprovedController()
+    session._application_controller = controller
+
+    async def cli(*args, **kwargs):
+        calls.append(args[0])
+        if args[0] == "click":
+            return {"ok": True}
+        if args[0] == "evaluate":
+            return {"value": after}
+        raise AssertionError("Unexpected synthetic raw IPC")
+
+    async def fixed_observe(owner, observed, **kwargs):
+        return await owner.page(), {}
+
+    finished = []
+    monkeypatch.setattr(bsk, "command", cli)
+    monkeypatch.setattr(submit_review, "finish", lambda holder: finished.append(holder))
+    monkeypatch.setattr(apply_mod, "_observe_controls", fixed_observe)
+
+    await session.application_effect("click", "#submit")
+    assert finished == [controller.review_holder]
+    assert controller.review_effect_args is None
+    assert await session.page() == after
+    confirmed = await apply_mod._fresh_confirmed_outcome(
+        session, before, after, None, URL)
+    assert "thank you for applying" in confirmed.lower()
+    assert calls == ["click", "evaluate", "evaluate"]
+    with pytest.raises(AssertionError):
+        await session.application_effect("click", "#submit")
+    assert calls.count("click") == 1
+
+
+@pytest.mark.asyncio
+async def test_submit_review_on_during_awaited_precheck_never_reaches_raw_ipc(monkeypatch):
+    """An OFF snapshot cannot authorize a Submit after an awaited flag toggle."""
+    from tools import browser_skill as bsk
+
+    _ctrl, page, target = world()
+    controller = ApplicationIPCController(
+        PK, "example-co", URL, "", {}, {}, [], {"last_button": ""},
+        lambda: None, submit_review_at_start=False)
+    session = bsk.Session("apply")
+    session.id = "synthetic-tab"
+    session._application_controller = controller
+    mode = {"enabled": False}
+    called = []
+
+    async def page_read(owner):
+        return page
+
+    async def precheck(owner, fresh, receiver, **kwargs):
+        assert receiver["selector"] == target["selector"]
+        assert not mode["enabled"]
+        await asyncio.sleep(0)
+        mode["enabled"] = True
+
+    async def forbidden(*args, **kwargs):
+        called.append(args)
+        raise AssertionError("Toggled-on Submit must not reach raw CLI")
+
+    monkeypatch.setattr(controller, "_page", page_read)
+    monkeypatch.setattr(controller, "check_pre_submit", precheck)
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: mode["enabled"])
+    monkeypatch.setattr(browser_runtime, "backend", lambda: bsk)
+    monkeypatch.setattr(bsk, "command", forbidden)
+
+    with pytest.raises(Gate, match="became enabled before raw IPC"):
+        await session.application_effect("click", "#submit")
+    assert mode["enabled"]
+    assert not called
+    assert controller.review_effect_args is None
+    assert controller.pending_commit_args is None

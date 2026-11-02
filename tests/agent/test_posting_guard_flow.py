@@ -84,6 +84,20 @@ def _fake_reads(monkeypatch, results):
     return calls
 
 
+def test_strict_approval_source_is_separate_from_non_yielding_text(monkeypatch):
+    calls = []
+
+    def unverified(url, kind):
+        calls.append((url, kind))
+        return pg.analyze("Synthetic job role.")
+
+    monkeypatch.setattr(jd, "fetch_jd_meta", unverified)
+    with pytest.raises(jd.PostingReadUnavailable):
+        asyncio.run(run._jd_meta({"jd_url": "https://x/1", "jd_text": ""},
+                                 yielding=False, approval=True))
+    assert calls == [("https://x/1", "jd")]
+
+
 def test_old_same_seed_session_rejected_on_missing_or_old_guard_generation(stores):
     row = stores.tracking.get_current(PK)
     state = {"jd_text": row["jd_text"],
@@ -514,6 +528,8 @@ def test_current_jd_drift_never_rebinds_old_tailored_pdf_on_retry(
     for attempt in range(2):
         outcome = asyncio.run(run._apply_direct(PK, stores))
         assert outcome["reason"] == "posting_guard_review_required"
+        assert outcome["detail"] == (
+            "posting changed since tailoring; retry the row to re-tailor")
         assert len(calls) == attempt + 1
         current = stores.tracking.get_current(PK)
         assert current["jd_text"] == before["jd_text"]
@@ -539,37 +555,6 @@ def test_normalized_equivalent_trailing_spaces_commit_before_browser(
     updated = stores.tracking.get_current(PK)
     assert updated["jd_text"] == TEXT
     assert updated["status"] == "needs_human"
-
-
-def test_retailor_reads_changed_long_jd_before_rebuilding_resume(
-    stores, monkeypatch,
-):
-    row = stores.tracking.get_current(PK)
-    assert stores.tracking.update_posting_guard(
-        PK, row, _source(), source_witness=True)
-    stores.tracking.set_status(
-        PK, Status.TAILORED, gate_reason="approval",
-        fail_kind="posting_guard_review_required")
-    changed = TEXT + "A new synthetic technical requirement."
-    calls = _fake_reads(monkeypatch, [_source(changed)])
-    tailored = []
-
-    async def fake_tailor(pk, state, title, company):
-        tailored.append((pk, state["jd_text"], title, company))
-
-    monkeypatch.setattr(run, "_session_state",
-                        lambda row, text: {"jd_text": text, "tailor_note": ""})
-    monkeypatch.setattr(run, "_tailor_only", fake_tailor)
-    monkeypatch.setattr(run, "_run", lambda awaitable: asyncio.run(awaitable))
-    outcome = run.retailor(PK, stores=stores)
-
-    assert outcome["result"] == "ok"
-    assert len(calls) == 1
-    assert tailored == [(PK, changed, "Test Engineer", "example-co")]
-    updated = stores.tracking.get_current(PK)
-    assert updated["jd_text"] == changed
-    assert pg.valid(updated["jd_text"], updated["posting_guard"])
-    assert updated["status"] == "tailored"
 
 
 @pytest.mark.parametrize("kind,html", [
@@ -621,12 +606,44 @@ def test_invalid_old_revision_html_only_positive_cannot_be_laundered(
     assert current["posting_guard"] == legacy
 
 
+@pytest.mark.parametrize("legacy_guard", [
+    pytest.param(
+        {"revision": "posting-guard-v0", "status": "clean",
+         "reasons": ["unknown"], "generation": "old",
+         "source_verified": True}, id="unknown"),
+    pytest.param(
+        {"revision": "posting-guard-v1", "status": "clean",
+         "reasons": ["source_html_unavailable", 7], "generation": "corrupt",
+         "source_verified": True}, id="malformed"),
+    pytest.param(
+        {"revision": "posting-guard-v0", "status": "clean",
+         "reasons": None, "generation": "old",
+         "source_verified": True}, id="none-reasons"),
+    pytest.param(None, id="missing-guard"),
+])
+def test_unrecognized_legacy_guard_re_reads_but_refuses_without_rebinding(
+    stores, monkeypatch, legacy_guard,
+):
+    _replace_row(stores, posting_guard=legacy_guard)
+    browser = _fake_direct_boundary(stores, monkeypatch)
+    before = stores.tracking.get_current(PK)
+    calls = _fake_reads(monkeypatch, [_source()])
+    outcome = asyncio.run(run._apply_direct(PK, stores))
+
+    assert calls == [(URL, "jd")]
+    assert outcome["result"] == "gated"
+    assert outcome["reason"] == "posting_guard_review_required"
+    assert outcome["detail"] == "legacy posting_guard reasons unrecognized; owner review"
+    browser.assert_not_awaited()
+    after = stores.tracking.get_current(PK)
+    assert after["jd_text"] == before["jd_text"]
+    assert after["posting_guard"] == before["posting_guard"]
+    assert after["status"] == "tailored"
+    assert after["fail_kind"] == "posting_guard_review_required"
+
+
 @pytest.mark.parametrize("old_meta", [
     {"revision": "posting-guard-v1", "status": "clean", "reasons": [],
-     "generation": "corrupt", "source_verified": True},
-    {"revision": "posting-guard-v0", "status": "clean", "reasons": ["unknown"],
-     "generation": "unknown", "source_verified": True},
-    {"revision": "posting-guard-v0", "status": "clean", "reasons": None,
      "generation": "corrupt", "source_verified": True},
     {"revision": "posting-guard-v0", "status": "clean", "reasons": [],
      "generation": "unverified-old-generation", "source_verified": True},

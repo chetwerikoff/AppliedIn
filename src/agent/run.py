@@ -686,7 +686,8 @@ def _commit_posting_meta(pk: str, observed: dict, meta: dict,
             return None
     return updated
 
-def _guard_refusal(pk: str, stores: Any, *, observed: dict | None = None) -> dict:
+def _guard_refusal(pk: str, stores: Any, *, observed: dict | None = None,
+                   detail: str | None = None) -> dict:
     """Conditionally undo a *pre-browser* SUBMITTING claim without lost flags."""
     from tools import posting_guard as pg
 
@@ -739,7 +740,7 @@ def _guard_refusal(pk: str, stores: Any, *, observed: dict | None = None) -> dic
         return {"result": "conflict", "pk": pk,
                 "reason": "posting_guard_state_changed"}
     return {"result": "gated", "pk": pk, "reason": reason,
-            "detail": "Current posting generation requires job-specific review."}
+            "detail": detail or "Current posting generation requires job-specific review."}
 
 
 def _direct_approval_check(pk: str, expected: dict,
@@ -765,17 +766,25 @@ def _direct_approval_check(pk: str, expected: dict,
     return None, current
 
 
-def _approval_old_positive_evidence(row: dict) -> bool:
-    """Keep known positives from invalid legacy metadata monotonic."""
+def _approval_legacy_evidence(row: dict) -> str | None:
+    """Invalid legacy reasons must not disappear through guard projection."""
     from tools import posting_guard as pg
 
     old = row.get("posting_guard")
     reasons = old.get("reasons") if isinstance(old, dict) else None
-    # A fresh clean source may repair absent/corrupt metadata, but a recognized
-    # historic positive cannot be reconstructed from the sanitized JD alone.
-    return (isinstance(reasons, list)
-            and any(isinstance(reason, str) and reason in pg._POSITIVE
-                    for reason in reasons))
+    if not pg.valid(row.get("jd_text") or "", old):
+        # Only a well-formed, recognized reason list is safe to reconsider
+        # against a complete matched reread. Sanitized JD can lose HTML evidence.
+        known = pg._POSITIVE | {"source_html_unavailable"}
+        if (not isinstance(reasons, list)
+                or any(type(reason) is not str or reason not in known
+                       for reason in reasons)
+                or reasons != sorted(set(reasons))):
+            return "unrecognized"
+    if isinstance(reasons, list) and any(reason in pg._POSITIVE
+                                         for reason in reasons):
+        return "positive"
+    return None
 
 async def _jd_text(row: dict, *, yielding: bool = True) -> str:
     """Compatibility string reader; model ingress uses _jd_meta plus commit."""
@@ -1232,10 +1241,7 @@ def retailor(pk: str, note: str | None = None, stores: Any = None) -> dict:
         row = stores.tracking.get(pk) or row
 
     try:
-        # A direct-approval refusal can mean cached long text hid posting drift;
-        # re-tailor from a fresh matched source before rebuilding that résumé.
-        refresh_source = row.get("fail_kind") == "posting_guard_review_required"
-        inspected = _run(_jd_meta(row, approval=refresh_source))
+        inspected = _run(_jd_meta(row))
         updated = _commit_posting_meta(pk, row, inspected, stores)
         if updated is None:
             return {"result": "conflict", "pk": pk, "reason": "posting_guard_state_changed"}
@@ -1701,7 +1707,16 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
         baseline = pg.analyze(row.get("jd_text") or "",
                               strip_trailing=True)["text"]
         incoming = pg.analyze(jd_meta["text"], strip_trailing=True)["text"]
-        if incoming != baseline or _approval_old_positive_evidence(row):
+        if incoming != baseline:
+            return _guard_refusal(
+                pk, stores, observed=observed,
+                detail="posting changed since tailoring; retry the row to re-tailor")
+        legacy = _approval_legacy_evidence(row)
+        if legacy == "unrecognized":
+            return _guard_refusal(
+                pk, stores, observed=observed,
+                detail="legacy posting_guard reasons unrecognized; owner review")
+        if legacy:
             return _guard_refusal(pk, stores, observed=observed)
 
         guarded = _commit_posting_meta(pk, observed, jd_meta, stores)

@@ -139,3 +139,43 @@ def test_existing_consumer_veto_precedes_all_new_row_seen_and_queue_effects(
     assert queue.messages == []
     assert not _seen.load()
     assert tracking.get(h._watermark_pk(co.name))["last_poll"] == "done"
+
+
+
+def test_workday_relative_cxs_path_is_absolute_before_new_row_seen_and_queue(
+    applications_table, monkeypatch,
+):
+    """The already-correct producer must survive the real feed consumer handoff."""
+    from discovery.adapters.workday import WorkdayAdapter
+
+    board = "https://wd.example.invalid/wday/cxs/fake-tenant/fake-site/jobs"
+    expected = "https://wd.example.invalid/fake-site/job/Example/Platform_ABC-17"
+    pk = "example-co#Platform_ABC-17"
+    co = CompanyConfig(name="example-co", ats="workday", board=board,
+                       careers_url="https://wd.example.invalid/en/fake-site")
+    calls = []
+
+    def transport(request):
+        calls.append(str(request.url))
+        assert request.method == "POST"
+        assert str(request.url) == board
+        return httpx.Response(200, json={
+            "total": 1, "jobPostings": [{
+                "externalPath": "/job/Example/Platform_ABC-17",
+                "title": "Synthetic role",
+                "url": "https://foreign.example/jobs/other",
+            }],
+        })
+
+    monkeypatch.setattr(h, "ADAPTERS", {"workday": WorkdayAdapter()})
+    tracking = TrackingStore(applications_table)
+    queue = FakeQueue()
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        assert h.discover_company(
+            co, Preferences(max_new_per_run=0), tracking, queue, client,
+            "synthetic-tailor") == 1
+    assert calls == [board]
+    assert tracking.get(pk)["jd_url"] == expected
+    assert queue.messages == [("synthetic-tailor", {"pk": pk})]
+    assert expected in _seen.load()
+    assert "/job/Example/Platform_ABC-17" not in _seen.load()

@@ -292,14 +292,21 @@ def connection_status(settings=None) -> dict:
         cfg = _config(settings)
         key = (cfg['browser'], cfg['user_data_dir'], cfg['chrome_path'], os.getenv('BSK_HOME'))
         with _STATUS_LOCK:
+            rows = _browsers() if cfg['browser'] else []
             if not cfg['browser']:
                 state, detail = 'setup_required', 'Run ./appliedin browser-setup for the clean profile.'
-            elif _connected(_browsers(), cfg['browser']):
+            elif _connected(rows, cfg['browser']):
                 _owned_profile_pid(cfg)
                 state, detail = 'connected', 'Pinned extension and dedicated Chrome argv observed.'
             elif profile_pids(cfg['user_data_dir']):
-                state, detail = 'extension_missing', (
-                    'Dedicated Chrome is running but pinned BrowserSkill is not connected.')
+                matching = [row for row in rows if row.get('instance_id') == cfg['browser']]
+                if len(matching) == 1 and matching[0].get('version_skew'):
+                    _owned_profile_pid(cfg)
+                    state, detail = 'version_skew', (
+                        'bsk update, then bsk daemon stop; the next bsk call starts the new daemon')
+                else:
+                    state, detail = 'extension_missing', (
+                        'Dedicated Chrome is running but pinned BrowserSkill is not connected.')
             else:
                 _chrome(cfg)
                 state, detail = 'not_running', (

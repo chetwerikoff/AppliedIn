@@ -46,6 +46,24 @@ def set_flag(name: str, value: str) -> None:
         log.debug("set_flag failed", exc_info=True)
 
 
+def submit_review_enabled() -> bool:
+    """Independent BrowserSkill final-Submit pause; unreadable/malformed is OFF."""
+    return get_flag("submit_review", "") == "on"
+
+
+def set_submit_review_enabled(enabled: bool) -> bool:
+    """Fail closed when the durable live flag cannot be written and read back."""
+    if type(enabled) is not bool:
+        raise ValueError("submit_review expects a boolean")
+    desired = "on" if enabled else "off"
+    try:
+        client = _redis()
+        client.hset(_KEY, "submit_review", desired)
+        return client.hget(_KEY, "submit_review") == desired
+    except Exception:
+        return False
+
+
 def apply_mode() -> str:
     """How an approved job gets submitted.
 

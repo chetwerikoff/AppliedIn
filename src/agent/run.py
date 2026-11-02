@@ -1805,6 +1805,11 @@ async def _apply_direct(pk: str, stores: Any) -> dict:
 
     row = stores.tracking.get(pk) or {}
     company, jd_url = row.get("company", ""), row.get("jd_url", "")
+    # Pre-browser JD handoff: neither the queued row nor a transient reader
+    # resolution may turn an original relative href into an Apply destination.
+    if _historical_relative(row):
+        return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
+                "detail": "Historical relative posting requires manual source review."}
 
     # DUPLICATE GUARD — the one mistake this system must never make twice: a row
     # already applied (by the pipeline or by the owner's own hand) is refused
@@ -2228,6 +2233,8 @@ async def _resume_job_async(pk: str, answer: str, call_id: str, stores: Any) -> 
     current = stores.tracking.get_current(pk)
     if not current:
         return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required"}
+    if _historical_relative(current):
+        return _relative_attention(pk, stores)
     session = await sessions.get_session(app_name=_APP, user_id=_USER, session_id=pk)
     if session is None or _stale_posting(session, current, current.get("jd_text") or ""):
         return {"result": "gated", "pk": pk, "reason": "posting_guard_review_required",
@@ -2308,7 +2315,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         int(row.get("jd_read_attempts") or 0) >= 3
         or row.get("fail_kind") in (
             "jd_reader_exhausted", "jd_tracking_storage_error",
-            "jd_retry_session_error"))
+            "jd_retry_session_error", "jd_url_unresolvable"))
     claim = _claim(pk, stores)
     if claim is None:
         return {"result": "error", "pk": pk, "reason": "jd_tracking_storage_error",
@@ -2391,7 +2398,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         if (result or {}).get("result") == "prepared":
             try:
                 current = stores.tracking.get(pk) or {}
-                if current.get("apply_requested_at"):
+                if current.get("apply_requested_at") and not _historical_relative(current):
                     return _enqueue_apply(pk, stores, priority=True,
                                           require_request=True)
             except Exception as exc:
@@ -2590,6 +2597,15 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
 
     from core.events import emit
 
+    # The review-only runner is the only safe agent for a persisted relative
+    # posting. Reject before invoking any root/applier tool (including resumes).
+    current = stores.tracking.get(pk) or {}
+    if _historical_relative(current):
+        from .graph import review_agent
+
+        if getattr(runner, "agent", None) is not review_agent:
+            return _relative_attention(pk, stores)
+        prepare_only = True
     last_author = None
     apply_result: Any = None  # the browser apply() return, if the applier ran it
     auto_go = False           # approval auto-granted → run _apply_direct after close
@@ -2623,6 +2639,9 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
             for call in event.get_function_calls() or []:  # tool call = step INPUT
                 if call.name == "ask_human":
                     question = (call.args or {}).get("question", "")
+                    if (question.startswith("Ready to apply")
+                            and _historical_relative(stores.tracking.get(pk) or {})):
+                        return _relative_attention(pk, stores)
                     # NEVER offer "the tailored résumé is saved" unless one actually
                     # is. The tailor sometimes drifts into chat and finishes without
                     # calling save_tailored_resume; approving that gate would open a
@@ -2699,6 +2718,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
                 emit("result", pk=pk, agent=author, detail=fr.name, output=_short(fr.response))
 
     if auto_go:
+        if _historical_relative(stores.tracking.get(pk) or {}):
+            return _relative_attention(pk, stores)
         # DECOUPLED: don't apply inline (a slow browser session would block the
         # evaluate worker from scoring/tailoring the rest of the backlog). Hand the
         # job to the apply queue; the separate apply worker submits it under the cap.
@@ -2715,6 +2736,8 @@ async def _drive_async(runner: Runner, pk: str, message: Any, stores: Any, *,
 
     if prepare_only:
         row = stores.tracking.get(pk) or {}
+        if _historical_relative(row):
+            return _relative_attention(pk, stores)
         if not str(row.get("resume_s3_key") or "").endswith(".pdf"):
             stores.tracking.set_status(pk, Status.FAILED, fail_kind="no_resume",
                                        fail_reason="No PDF was saved. Retry preparation.")

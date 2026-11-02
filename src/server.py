@@ -3009,13 +3009,20 @@ def create_app() -> FastAPI:
 
     @app.post("/actions/retry/{pk}")
     def retry(pk: str, background: BackgroundTasks):
-        """Re-run a failed/errored job from scratch (clean session, current KB)."""
+        """Explicit fresh preparation for closed reviews; other Retry stays unchanged."""
         from agent.run import retry_job
         stores = make_stores(settings)
-        if _review_row_conflict(stores.tracking.get(pk) or {}):
-            return {"ok": False, "error": "Submit review is held or closed; start a separate fresh application run."}
-        if submit_hold.blocked(pk, stores.tracking.get(pk) or {}, tracking=stores.tracking):
+        row = stores.tracking.get(pk) or {}
+        if submit_hold.blocked(pk, row, tracking=stores.tracking):
             return {"ok": False, "error": "possible submission; check the employer portal before retrying"}
+        if _review_row_conflict(row):
+            # Never borrow generic queue/resume/revive authority. The worker
+            # repeats this check before atomically consuming the closed token.
+            if not submit_review.manual_restart_allowed(
+                    pk, row, tracking=stores.tracking):
+                return {"ok": False, "error": "Only an unsent, closed review with no live holder can start a fresh run."}
+            background.add_task(retry_job, pk, explicit_review_restart=True)
+            return {"ok": True, "status": "retrying", "fresh_preparation": True}
         background.add_task(retry_job, pk)
         return {"ok": True, "status": "retrying"}
 

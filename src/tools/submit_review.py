@@ -32,6 +32,16 @@ class Refused(ValueError):
     """Non-approving review refusal, without private values in its message."""
 
 
+def raise_review_gate(message: str) -> None:
+    """All reviewer-only hold/continuation refusals share one Gate conversion.
+
+    This keeps the original application Gate routing and prevents introducing
+    additional per-control Gate sites at the sole final-Submit boundary.
+    """
+    from tools.browser_skill_apply import Gate
+    raise Gate(message, reason="submit_review")
+
+
 @dataclass
 class Holder:
     pk: str

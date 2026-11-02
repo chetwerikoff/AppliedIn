@@ -1144,17 +1144,19 @@ def _original_row(*, ats="workday", cached="Test role"):
     }
 
 
-@pytest.mark.parametrize("ats,expected", [
-    ("workday", _WORKDAY_URL),
-    ("custom", "https://example.test/jobs/42?lang=en"),
+@pytest.mark.parametrize("ats,original_href,expected", [
+    ("workday", _WORKDAY_PATH, _WORKDAY_URL),
+    ("custom", "/jobs/42?lang=en", "https://example.test/jobs/42?lang=en"),
+    ("custom", "jobs/42?lang=en", "https://example.test/careers/jobs/42?lang=en"),
 ])
 def test_historic_reader_uses_exact_operational_target_before_cached_text(
-    monkeypatch, ats, expected,
+    monkeypatch, ats, original_href, expected,
 ):
     from tools import posting_guard as pg
 
     _source_watchlist(monkeypatch, ats=ats)
     row = _original_row(ats=ats, cached="Cached text " * 75)
+    row["jd_url"] = original_href
     original = dict(row)
     html = ('<html><head><link rel="canonical" href="' + expected +
             '"><script type="application/ld+json">' +
@@ -1375,3 +1377,91 @@ def test_positive_workday_html_and_prior_request_never_authorize_application(
     assert final["apply_requested_at"] == "synthetic-request"
     assert final["status"] == "needs_human"
     assert ApplyQueue(tracking.r).pending() == []
+
+
+@pytest.mark.parametrize("bad_href", [
+    "jobs/../42?lang=en",
+    "jobs/%2e%2e/42?lang=en",
+    "jobs/%2felse",
+    "//foreign.example/jobs/42",
+    "jobs/42#fragment",
+    "foreign:jobs/42",
+    "jobs\\42",
+])
+def test_custom_historical_path_relative_rejects_unsafe_source_before_cache(
+    monkeypatch, bad_href,
+):
+    _source_watchlist(monkeypatch, ats="custom")
+    row = _original_row(ats="custom", cached="Previously cached text " * 50)
+    row["jd_url"] = bad_href
+    monkeypatch.setattr(jd, "fetch_jd_meta",
+                        lambda *args: pytest.fail("Unsafe href reached JD reader"))
+    with pytest.raises(run.JDURLUnresolvable):
+        asyncio.run(run._jd_meta(row))
+
+
+@pytest.mark.parametrize("entry", ["direct", "queued", "resume", "root_agent"])
+def test_historical_relative_prior_request_cannot_enter_application_handoff(
+    monkeypatch, entry,
+):
+    """A persisted relative URL is not Apply authority even after preparation."""
+    from core.models import JobRecord
+    from tools import browser_apply
+
+    tracking = RedisTracking(fakeredis.FakeRedis(decode_responses=True))
+    row = _original_row()
+    pk = row["pk"]
+    assert tracking.put_new(JobRecord(
+        company=row["company"], job_id=row["job_id"], ats=row["ats"],
+        title="Test role", jd_url=row["jd_url"], jd_text="Test role"))
+    tracking.set_status(pk, Status.TAILORED,
+                        apply_requested_at="synthetic-prior-request")
+    stores = SimpleNamespace(tracking=tracking)
+    before = tracking.get(pk)
+    monkeypatch.setattr(browser_apply, "apply",
+                        lambda *args, **kw: pytest.fail("Application browser reached"))
+    monkeypatch.setattr(run, "_enqueue_apply",
+                        lambda *args, **kw: pytest.fail("Application queue reached"))
+
+    class NoSession:
+        async def get_session(self, **kwargs):
+            pytest.fail("Historical relative resume reached an agent session")
+
+    monkeypatch.setattr(run, "_session_service", lambda: NoSession())
+    monkeypatch.setattr(run, "Runner",
+                        lambda *args, **kw: pytest.fail("Apply-capable agent created"))
+    if entry == "direct":
+        outcome = asyncio.run(run._apply_direct(pk, stores))
+    elif entry == "queued":
+        monkeypatch.setattr(run, "make_stores", lambda: stores)
+
+        class FakeLease:
+            def __init__(self):
+                self.finished = []
+
+            def done(self, item):
+                self.finished.append(item)
+
+            def retry(self, *args):
+                pytest.fail("Historical relative dispatch retried")
+
+        lease = FakeLease()
+        item = {"pk": pk}
+        outcome = run.run_queued(item, lease)
+        assert lease.finished == [item]
+    elif entry == "resume":
+        outcome = asyncio.run(run._resume_job_async(
+            pk, "synthetic-answer", "synthetic-call", stores))
+    else:
+        class ApplyCapableRunner:
+            agent = object()
+
+            def run_async(self, **kwargs):
+                pytest.fail("Apply-capable agent invoked")
+
+        outcome = asyncio.run(run._drive_async(
+            ApplyCapableRunner(), pk, object(), stores))
+
+    assert outcome["result"] == "gated"
+    assert outcome["reason"] == "posting_guard_review_required"
+    assert tracking.get(pk) == before

@@ -51,10 +51,13 @@ class Holder:
 
 
 def guarded_row(row: dict | None) -> bool:
-    """Legacy mutations must never treat a review generation as approval."""
+    """Even a corrupted/unknown review state may not enter legacy apply paths.
+
+    The actual possible-submission state is separate and stronger; once its
+    hold is acquired the gate_reason changes to submit_uncertain.
+    """
     return bool(isinstance(row, dict)
-                and row.get("gate_reason") == "submit_review"
-                and row.get("review_state") in _STATES)
+                and row.get("gate_reason") == "submit_review")
 
 
 def _tracking():

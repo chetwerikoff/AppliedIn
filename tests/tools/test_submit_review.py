@@ -280,54 +280,245 @@ def test_expired_holder_does_not_authorize_any_new_decision(monkeypatch, tmp_pat
 
 
 
-@pytest.mark.parametrize("method", ["GET", "POST"])
-@pytest.mark.parametrize(("origin", "host", "peer"), [
-    (None, "localhost:8000", "127.0.0.1"),
-    ("chrome-extension://synthetic", "localhost:8000", "127.0.0.1"),
-    ("moz-extension://synthetic", "localhost:8000", "127.0.0.1"),
-    ("http://elsewhere.test:8000", "localhost:8000", "127.0.0.1"),
-    ("http://localhost:8001", "localhost:8000", "127.0.0.1"),
-    ("http://localhost:8000", "elsewhere.test:8000", "127.0.0.1"),
-    ("http://localhost:8000", "localhost:8000", "192.0.2.1"),
-])
-def test_review_first_party_route_policy_rejects_external_origin_host_or_peer(
-        monkeypatch, method, origin, host, peer):
-    from fastapi import HTTPException
-    from starlette.requests import Request
-    from server import _require_submit_review_first_party
+@pytest.fixture
+def local_review_guard(monkeypatch):
     import server
 
     monkeypatch.setattr(server, "get_settings",
                         lambda: SimpleNamespace(mode="local"))
+    return server._require_submit_review_first_party
+
+
+def _review_request(method="GET", *, host="localhost:8000",
+                    peer="127.0.0.1", origins=(), fetch_sites=(),
+                    extra_headers=()):
+    from starlette.requests import Request
+
     headers = [(b"host", host.encode())]
-    if origin is not None:
-        headers.append((b"origin", origin.encode()))
-    request = Request({"type": "http", "method": method, "scheme": "http",
-                       "path": "/applications/example-co%231/submit-review",
-                       "root_path": "", "query_string": b"", "headers": headers,
-                       "client": (peer, 40000), "server": ("127.0.0.1", 8000)})
+    headers.extend((b"origin", value.encode()) for value in origins)
+    headers.extend((b"sec-fetch-site", value.encode()) for value in fetch_sites)
+    headers.extend((name.encode(), value.encode())
+                   for name, value in extra_headers)
+    return Request({"type": "http", "method": method, "scheme": "http",
+                    "path": "/applications/example-co%231/submit-review",
+                    "root_path": "", "query_string": b"", "headers": headers,
+                    "client": (peer, 40000), "server": ("127.0.0.1", 8000)})
+
+
+@pytest.mark.parametrize(("fetch_sites", "allowed"), [
+    ((), True),
+    (("same-origin",), True),
+    (("none",), True),
+    (("same-site",), False),
+    (("cross-site",), False),
+    (("invalid",), False),
+    (("",), False),
+])
+def test_review_packet_get_without_origin_uses_fetch_metadata(
+        local_review_guard, fetch_sites, allowed):
+    from fastapi import HTTPException
+
+    request = _review_request("GET", fetch_sites=fetch_sites)
+    if allowed:
+        local_review_guard(request)
+    else:
+        with pytest.raises(HTTPException) as error:
+            local_review_guard(request)
+        assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("host", ["localhost:8000", "127.0.0.1:8000",
+                                  "[::1]:8000"])
+def test_review_first_party_exact_origin_allows_loopback(
+        local_review_guard, method, host):
+    local_review_guard(_review_request(method, host=host,
+                                       origins=("http://" + host,)))
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("origins", [
+    ("chrome-extension://synthetic",),
+    ("moz-extension://synthetic",),
+    ("https://localhost:8000",),
+    ("http://elsewhere.test:8000",),
+    ("http://localhost:8001",),
+    ("http://localhost",),
+    ("http://localhost:8000/path",),
+    ("http://localhost:8000?query=1",),
+    ("http://localhost:8000#fragment",),
+    ("http://test@localhost:8000",),
+    ("http://LOCALHOST:8000",),
+    ("null",),
+    ("",),
+    ("http://localhost:8000", "http://localhost:8000"),
+    ("http://localhost:8000", "http://elsewhere.test:8000"),
+])
+def test_review_rejects_nonexact_duplicate_or_foreign_origin(
+        local_review_guard, method, origins):
+    from fastapi import HTTPException
+
     with pytest.raises(HTTPException) as error:
-        _require_submit_review_first_party(request)
+        local_review_guard(_review_request(method, origins=origins))
     assert error.value.status_code == 403
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
-def test_review_first_party_allows_exact_loopback_origin_only(monkeypatch, method):
-    from starlette.requests import Request
-    from server import _require_submit_review_first_party
+@pytest.mark.parametrize("changes", [
+    {"host": "elsewhere.test:8000"},
+    {"host": "localhost:8001"},
+    {"host": "127.0.0.1:8000"},
+    {"peer": "192.0.2.1"},
+    {"peer": "nonlocal"},
+    {"extra_headers": (("host", "localhost:8000"),)},
+    {"fetch_sites": ("same-origin", "same-origin")},
+    {"fetch_sites": ("same-origin", "cross-site")},
+])
+def test_review_rejects_foreign_host_peer_or_duplicate_headers(
+        local_review_guard, method, changes):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as error:
+        local_review_guard(_review_request(
+            method, origins=("http://localhost:8000",), **changes))
+    assert error.value.status_code == 403
+
+
+@pytest.mark.parametrize("fetch_sites", [(), ("same-origin",), ("none",)])
+def test_review_post_requires_origin_even_with_fetch_metadata(
+        local_review_guard, fetch_sites):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as error:
+        local_review_guard(_review_request("POST", fetch_sites=fetch_sites))
+    assert error.value.status_code == 403
+
+
+def test_review_rejects_nonlocal_mode_before_any_read(monkeypatch):
+    from fastapi import HTTPException
+    import server
+
+    monkeypatch.setattr(server, "get_settings",
+                        lambda: SimpleNamespace(mode="cloud"))
+    with pytest.raises(HTTPException) as error:
+        server._require_submit_review_first_party(_review_request(
+            origins=("http://localhost:8000",)))
+    assert error.value.status_code == 403
+
+
+@pytest.fixture
+def local_review_client(monkeypatch):
+    from fastapi.testclient import TestClient
     import server
 
     monkeypatch.setattr(server, "get_settings",
                         lambda: SimpleNamespace(mode="local"))
-    request = Request({"type": "http", "method": method, "scheme": "http",
-                       "path": "/actions/submit-review/example-co%231",
-                       "root_path": "", "query_string": b"",
-                       "headers": [(b"host", b"127.0.0.1:8000"),
-                                   (b"origin", b"http://127.0.0.1:8000")],
-                       "client": ("127.0.0.1", 45000),
-                       "server": ("127.0.0.1", 8000)})
-    _require_submit_review_first_party(request)
+    monkeypatch.setattr(submit_review, "recover_orphans", lambda: None)
+    with TestClient(server.create_app(), base_url="http://127.0.0.1:8000",
+                    client=("127.0.0.1", 45000)) as client:
+        yield client
 
+
+def test_review_packet_get_without_javascript_origin_reaches_private_route(
+        monkeypatch, local_review_client):
+    reads = []
+    def packet_for(pk):
+        reads.append(pk)
+        return {"packet": {"job": {"company": "example-co"},
+                           "controls": []},
+                "screenshot": "data:image/png;base64,iVBORw0KGgo="}
+
+    monkeypatch.setattr(submit_review, "packet_for", packet_for)
+    path = "/applications/example-co%231/submit-review"
+    for fetch_site in (None, "same-origin", "none"):
+        headers = {} if fetch_site is None else {"sec-fetch-site": fetch_site}
+        response = local_review_client.get(path, headers=headers)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.json()["packet"]["job"]["company"] == "example-co"
+    assert reads == [PK] * 3
+
+    for fetch_site in ("same-site", "cross-site"):
+        response = local_review_client.get(
+            path, headers={"sec-fetch-site": fetch_site})
+        assert response.status_code == 403
+        assert response.headers["cache-control"] == "no-store"
+    assert reads == [PK] * 3
+
+
+@pytest.mark.parametrize(("path", "body"), [
+    ("/actions/submit-review-mode", {"enabled": False}),
+    ("/actions/submit-review/example-co%231",
+     {"decision": "reject", "expected_gate_generation": "synthetic-generation"}),
+])
+@pytest.mark.parametrize("headers", [
+    (),
+    (("sec-fetch-site", "same-origin"),),
+    (("sec-fetch-site", "none"),),
+    (("origin", "chrome-extension://synthetic"),),
+    (("origin", "moz-extension://synthetic"),),
+    (("origin", "https://127.0.0.1:8000"),),
+    (("origin", "http://localhost:8000"),),
+    (("origin", "http://127.0.0.1:8001"),),
+    (("origin", "http://127.0.0.1:8000"),
+     ("origin", "http://127.0.0.1:8000")),
+    (("origin", "http://127.0.0.1:8000"),
+     ("origin", "http://elsewhere.test:8000")),
+])
+def test_review_post_routes_refuse_before_flag_or_decision_effect(
+        monkeypatch, local_review_client, path, body, headers):
+    effects = []
+    monkeypatch.setattr(flags, "set_submit_review_enabled",
+                        lambda on: effects.append(("flag", on)) or True)
+    monkeypatch.setattr(submit_review, "invalidate_all",
+                        lambda: effects.append(("invalidate",)))
+    monkeypatch.setattr(submit_review, "claim",
+                        lambda *args: effects.append(("claim", args)))
+
+    response = local_review_client.post(path, json=body, headers=list(headers))
+    assert response.status_code == 403
+    assert response.headers["cache-control"] == "no-store"
+    assert effects == []  # No flag change, review generation consumption or cleanup.
+
+
+def test_review_post_routes_accept_exact_origin_with_synthetic_state(
+        monkeypatch, local_review_client):
+    from tools import browser_skill
+
+    state = {"enabled": False, "review_state": "pending", "effects": []}
+    monkeypatch.setattr(browser_runtime, "backend", lambda: browser_skill)
+    def set_mode(on):
+        state["enabled"] = on
+        state["effects"].append("mode")
+        return True
+    monkeypatch.setattr(flags, "set_submit_review_enabled", set_mode)
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: state["enabled"])
+    def claim(pk, generation, decision, reason):
+        assert (pk, generation, decision, reason) == (
+            PK, "synthetic-generation", "reject", "")
+        state["review_state"] = "rejected"
+        state["effects"].append("decision")
+        result = Future()
+        result.set_result({"ok": True, "review_state": "rejected"})
+        return result
+    monkeypatch.setattr(submit_review, "claim", claim)
+
+    headers = {"origin": "http://127.0.0.1:8000"}
+    mode = local_review_client.post("/actions/submit-review-mode",
+                                    json={"enabled": True}, headers=headers)
+    assert mode.status_code == 200
+    assert mode.headers["cache-control"] == "no-store"
+    assert mode.json()["submit_review"] is True
+    decision = local_review_client.post(
+        "/actions/submit-review/example-co%231",
+        json={"decision": "reject",
+              "expected_gate_generation": "synthetic-generation"},
+        headers=headers)
+    assert decision.status_code == 200
+    assert decision.headers["cache-control"] == "no-store"
+    assert decision.json()["review_state"] == "rejected"
+    assert state == {"enabled": True, "review_state": "rejected",
+                     "effects": ["mode", "decision"]}
 
 
 def test_restart_disposes_orphaned_private_packet_and_revokes_stored_token(

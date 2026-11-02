@@ -475,9 +475,9 @@ def _commit_manual_posting(pk: str, stores, inspected: dict) -> bool:
 def _require_submit_review_first_party(request: Request) -> None:
     """Strict *route-local* first-party containment, not local client auth.
 
-    Host/Origin are spoofable by an already-trusted loopback process. The three
-    review endpoints refuse extension, absent-origin and nonloopback browsers
-    before reading a packet or consuming a generation.
+    Host/Origin are spoofable by an already-trusted loopback process. A packet
+    GET may omit Origin for a direct/same-origin browser request; both POSTs
+    require an exact Origin before reading or changing any review state.
     """
     from ipaddress import ip_address
 
@@ -501,11 +501,17 @@ def _require_submit_review_first_party(request: Request) -> None:
     allowed = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
     hosts = request.headers.getlist("host")
     origins = request.headers.getlist("origin")
-    if len(hosts) != 1 or hosts[0] not in allowed or len(origins) != 1:
+    fetch_sites = request.headers.getlist("sec-fetch-site")
+    if (len(hosts) != 1 or hosts[0] not in allowed
+            or len(origins) > 1 or len(fetch_sites) > 1):
         deny()
-    # Do not accept null, foreign schemes, extension Origins, credentials,
-    # alternate ports, repeated headers, path/query/fragment, or absent Origin.
-    if origins[0] != "http://" + hosts[0]:
+    # Exact equality also rules out extension schemes, credentials, alternate
+    # ports, paths and queries; duplicate/conflicting headers are never trusted.
+    if origins:
+        if origins[0] != "http://" + hosts[0]:
+            deny()
+    elif request.method != "GET" or (fetch_sites and
+                                     fetch_sites[0] not in {"same-origin", "none"}):
         deny()
     if request.url.hostname not in {"localhost", "127.0.0.1", "::1"}:
         deny()

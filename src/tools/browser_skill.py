@@ -301,6 +301,7 @@ class Session:
         self.owner = None
         self._application_controller = None
         self._context = ""
+        self._observation = ""
         # A fresh session has no shared tab: `cooperate sync` is refused until the
         # first navigation, which itself needs no context.
         self._tab_ready = False
@@ -342,7 +343,7 @@ class Session:
                 result = await command("cooperate", "sync", "--session", self.id)
                 break
             except Unavailable as exc:
-                self._context = ""
+                self._context = self._observation = ""
                 if (not settle or not self._tab_ready or not _sync_transient(exc)
                         or time.monotonic() + _SYNC_POLL >= deadline):
                     raise
@@ -351,12 +352,20 @@ class Session:
         value = result.get("context_id")
         if value is None and isinstance(data, dict):
             value = data.get("context_id")
-        if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', value):
-            self._context = ""
+        # BrowserSkill 0.4.1 also needs the sync's observation id on shared-tab
+        # actions. Absent keeps the old context-only argv; malformed fails closed.
+        seen = result.get("observation_id")
+        if seen is None and isinstance(data, dict):
+            seen = data.get("observation_id")
+        if (type(value) is not str or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', value)
+                or (seen is not None and (type(seen) is not str
+                    or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', seen)))):
+            self._context = self._observation = ""
             raise _failed(("cooperate", "sync"),
                           "BrowserSkill operation unavailable: cooperation_sync_failed",
                           "cooperation_sync_failed")
         self._context = value
+        self._observation = seen or ""
         self._tab_ready = True
         return value
 
@@ -379,8 +388,10 @@ class Session:
                         await self.sync_context()
                     if self._context:
                         extra = ("--context", self._context)
+                        if self._observation:
+                            extra += ("--observation", self._observation)
                     # Spent whether or not the action succeeds: never reuse it.
-                    self._context = ""
+                    self._context = self._observation = ""
                 try:
                     result = await command(*args, *extra, "--session", self.id, **kwargs)
                 except Unavailable as exc:
@@ -396,7 +407,7 @@ class Session:
                     except Unavailable as exc:
                         if not _sync_transient(exc):
                             raise
-                        self._context = ""  # the next action performs the bounded sync
+                        self._context = self._observation = ""  # next action syncs
                 return result
 
     async def __aenter__(self):

@@ -254,3 +254,36 @@ def test_review_first_party_allows_exact_loopback_origin_only(monkeypatch, metho
                        "client": ("127.0.0.1", 45000),
                        "server": ("127.0.0.1", 8000)})
     _require_submit_review_first_party(request)
+
+
+
+def test_restart_disposes_orphaned_private_packet_and_revokes_stored_token(
+        monkeypatch, tmp_path):
+    orphan = tmp_path / "synthetic-orphan"
+    orphan.mkdir(mode=0o700)
+    (orphan / "packet.json").write_text('{"synthetic":true}')
+    (orphan / "screenshot.png").write_bytes(b"synthetic-no-real-png")
+    row = {
+        "pk": PK, "company": "example-co", "status": "needs_human",
+        "gate_reason": "submit_review", "gate_generation": "synthetic-generation",
+        "review_state": "claimed", "possible_submission": False,
+    }
+    monkeypatch.setattr(submit_review, "_HOLDERS", {})
+    monkeypatch.setattr(submit_review, "_private_root", lambda: tmp_path)
+    monkeypatch.setattr(submit_review, "_tracking", lambda: SimpleNamespace(
+        query_status=lambda status: [row] if status == "needs_human" else []))
+    transitions = []
+
+    def change(pk, *, states, status, generation, changes):
+        transitions.append((pk, status, generation))
+        row.update(changes)
+        return True
+
+    monkeypatch.setattr(submit_review, "_patch", change)
+    submit_review.recover_orphans()
+    assert row["review_state"] == "restart"
+    assert transitions == [(PK, "needs_human", "synthetic-generation")]
+    assert not orphan.exists()
+    # A restart cannot magically reconstruct the former BrowserSkill owner.
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, "synthetic-generation", "approve")

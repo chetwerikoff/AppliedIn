@@ -85,6 +85,33 @@ def test_same_caption_with_different_hidden_value_is_not_approved():
     assert differences[0]["before"] != differences[0]["after"]
 
 
+def test_native_selected_option_identity_and_multi_select_drift_are_private_and_exact():
+    """Keep the legacy option shape but compare the full selected value set.
+
+    The first 64 options alone cannot prove a selected choice beyond the cap,
+    and a multiselect may change another value without changing its first one.
+    """
+    controller, page, target = world()
+    native = control("#native", "Availability", value="keep",
+                     options=[{"value": "keep", "label": "Keep"},
+                              {"value": "skip", "label": "Prefer not to answer"}],
+                     kind="select")
+    native["tag"] = "select"
+    native["selected_options"] = [
+        {"value": "keep", "label": "Keep"},
+        {"value": "skip", "label": "Prefer not to answer"},
+    ]
+    page["controls"].insert(2, native)
+    before = submit_review.form_snapshot(controller, page, target)
+    selected = next(c for c in before["controls"] if c["selector"] == "#native")
+    assert selected["selected_options"] == native["selected_options"]
+    assert all(set(option) == {"value", "label"} for option in selected["options"])
+    native["selected_options"] = [{"value": "keep", "label": "Keep"}]
+    after = submit_review.form_snapshot(controller, page, target)
+    assert any(d["control"] == "Availability" for d in
+               submit_review.form_differences(before, after))
+
+
 def test_added_unselected_control_and_duplicate_labels_still_differ():
     controller, page, target = world()
     before = submit_review.form_snapshot(controller, page, target)

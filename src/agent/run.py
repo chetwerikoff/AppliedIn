@@ -2302,7 +2302,8 @@ def _active_apply_lease(pk: str, stores: Any) -> bool | None:
         return None
 
 
-def retry_job(pk: str, stores: Any = None) -> dict:
+def retry_job(pk: str, stores: Any = None, *,
+              explicit_review_restart: bool = False) -> dict:
     """Recover a closed unsent job under ONE claim and admitted TAILORING row.
 
     JD attention goes directly ERROR -> TAILORING with durable review-only
@@ -2316,14 +2317,17 @@ def retry_job(pk: str, stores: Any = None) -> dict:
     if row is None:
         return {"result": "missing", "pk": pk}
     from tools import submit_review
-    if submit_review.guarded_row(row):
-        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     # An independent submit hold is authoritative even if an old writer
     # restored the row's status to FOUND. The public Retry response must not
     # downgrade uncertainty into an innocuous "already_done".
     if submit_hold.blocked(pk, row, tracking=stores.tracking):
         return {"result": "failed", "pk": pk, "reason": "uncertain",
                 "detail": submit_hold.REASON}
+    review_restart = submit_review.guarded_row(row)
+    if review_restart and (
+            not explicit_review_restart or not submit_review.manual_restart_allowed(
+                pk, row, tracking=stores.tracking)):
+        return {"result": "gated", "pk": pk, "reason": "submit_review"}
     status = row.get("status")
     if status in ("applied", "applied_manual"):
         return {"result": "duplicate", "pk": pk, "reason": "already_applied"}
@@ -2331,7 +2335,8 @@ def retry_job(pk: str, stores: Any = None) -> dict:
         from core.events import emit
         emit("response", pk=pk, url=row.get("jd_url"), detail=_ALREADY_RUNNING)
         return {"result": "already_running", "pk": pk}
-    if status not in ("skipped", "failed", "error", "job_gone", "capped"):
+    if (status not in ("skipped", "failed", "error", "job_gone", "capped")
+            and not (review_restart and status == "needs_human")):
         return {"result": "already_done", "pk": pk, "status": status}
     try:
         check = _reader_check(pk, row, stores)
@@ -2351,7 +2356,7 @@ def retry_job(pk: str, stores: Any = None) -> dict:
     # Skip keeps the original failure evidence. Treat it as reader attention
     # even when the current closed status is SKIPPED, so Retry cannot fall
     # back to the full apply graph after an exhausted JD read.
-    jd_attention = (
+    jd_attention = not review_restart and (
         int(row.get("jd_read_attempts") or 0) >= 3
         or row.get("fail_kind") in (
             "jd_reader_exhausted", "jd_tracking_storage_error",
@@ -2367,6 +2372,9 @@ def retry_job(pk: str, stores: Any = None) -> dict:
             check = _reader_check(pk, row, stores)
             if check:
                 return check
+            if review_restart and not submit_review.manual_restart_allowed(
+                    pk, row, tracking=stores.tracking):
+                return {"result": "gated", "pk": pk, "reason": "submit_review"}
             lease = _active_apply_lease(pk, stores)
             if lease is None or lease:
                 return {"result": "refused", "pk": pk, "reason": "apply_lease_unknown"
@@ -2387,7 +2395,24 @@ def retry_job(pk: str, stores: Any = None) -> dict:
                 })
             else:
                 changes["error"] = ""
-            committed, admitted = _reader_patch(pk, row, stores, changes)
+            if review_restart:
+                # Retry is the *only* explicit recovery entrypoint. The spent
+                # packet and PDF must never become a shortcut to a new Submit.
+                changes.update({
+                    "gate_reason": "", "gate_generation": None,
+                    "review_state": None, "review_expires_at": None,
+                    "review_reject_reason": None,
+                    "resume_s3_key": "", "resume_tex_key": "",
+                    "resume_seed": "", "jd_read_prepare_only": True,
+                    "jd_read_revision": int(row.get("jd_read_revision") or 0) + 1,
+                })
+                committed = submit_review.begin_manual_restart(
+                    pk, row, changes, tracking=stores.tracking)
+                admitted = {**row, **{
+                    key: getattr(value, "value", value) if key == "status" else value
+                    for key, value in changes.items()}}
+            else:
+                committed, admitted = _reader_patch(pk, row, stores, changes)
         except Exception as exc:
             return _reader_storage_error(pk, stores, row, exc)
         if not committed:

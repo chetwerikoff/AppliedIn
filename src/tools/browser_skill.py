@@ -311,6 +311,19 @@ class Session:
         # its context-sync awaits, immediately before raw IPC.
         self._run = self._guarded_raw_run
 
+    @staticmethod
+    def _fixed_application_read(args) -> bool:
+        """Exact producer-owned passive readers, never a model-supplied script."""
+        from tools.browser_skill_dom import PAGE, ENTRY_PAGE, GREENHOUSE_PAGE
+        from tools.browser_skill_apply import (
+            _FIXED_CONTROL_WITNESS, _ENTRY_FIXED_CONTROL_WITNESS,
+            _GREENHOUSE_FIXED_CONTROL_WITNESS,
+        )
+        readers = (PAGE, ENTRY_PAGE, GREENHOUSE_PAGE, _FIXED_CONTROL_WITNESS,
+                   _ENTRY_FIXED_CONTROL_WITNESS, _GREENHOUSE_FIXED_CONTROL_WITNESS)
+        return (len(args) == 2 and args[0] == "evaluate"
+                and isinstance(args[1], str) and args[1] in readers)
+
     def _check_review_raw_effect(self, args) -> None:
         controller = self._application_controller
         if self.kind != "apply" or controller is None:
@@ -321,6 +334,10 @@ class Session:
             # A normal OFF-mode Submit may have awaited a page or context sync
             # while review mode turned ON. Check again at the real IPC edge.
             controller.final_unreviewed_effect_guard(self, args)
+        elif getattr(controller, "committed", False) and not self._fixed_application_read(args):
+            # The transient one-shot permission is gone after its attempt, but
+            # even a direct internal raw runner must never regain write access.
+            raise Unavailable("Raw application IPC refused after committing attempt.")
 
     async def _guarded_raw_run(self, args, kwargs):
         self._check_review_raw_effect(args)
@@ -546,19 +563,9 @@ class Session:
 
     async def call(self, *args, **kwargs):
         if self.kind == "apply":
-            # At this privileged producer even an otherwise authenticated raw
-            # click or executable evaluation must have zero CLI effect. Only
-            # fixed code-owned observation scripts are harmless raw reads.
-            from tools.browser_skill_dom import PAGE, ENTRY_PAGE, GREENHOUSE_PAGE
-            from tools.browser_skill_apply import (
-                _FIXED_CONTROL_WITNESS, _ENTRY_FIXED_CONTROL_WITNESS,
-                _GREENHOUSE_FIXED_CONTROL_WITNESS,
-            )
-            readers = (PAGE, ENTRY_PAGE, GREENHOUSE_PAGE, _FIXED_CONTROL_WITNESS,
-                       _ENTRY_FIXED_CONTROL_WITNESS, _GREENHOUSE_FIXED_CONTROL_WITNESS)
-            if (len(args) != 2 or args[0] != "evaluate"
-                    or not isinstance(args[1], str)
-                    or not any(args[1] == reader for reader in readers)):
+            # At this producer, only code-owned fixed read-only scripts are
+            # exposed through call(), before and after the one Submit attempt.
+            if not self._fixed_application_read(args):
                 raise Unavailable("Raw application IPC refused before BrowserSkill CLI.")
         return await self._run(args, kwargs)
 

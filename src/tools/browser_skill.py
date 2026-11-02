@@ -328,8 +328,50 @@ class Session:
         finally:
             # Stable local PDF bytes alone cannot prove an interrupted upload
             # completed. The final guard cannot accept a failed CLI transfer.
-            await self._application_controller.after_ipc(
-                self, args, kwargs, succeeded=succeeded)
+            try:
+                await self._application_controller.after_ipc(
+                    self, args, kwargs, succeeded=succeeded)
+            finally:
+                holder = self._application_controller.review_holder
+                if holder is not None and self._application_controller.committed:
+                    from tools import submit_review
+                    submit_review.finish(holder)
+
+    async def review_screenshot(self) -> bytes:
+        """One read-only screenshot of this owned application tab, never shared.
+
+        BrowserSkill writes an exact PNG into a private temporary directory;
+        the screenshot never enters CLI logs, model prompts, or public artifacts.
+        """
+        from tempfile import mkdtemp
+        from tools import submit_review
+        if (self.kind != "apply" or not self.id
+                or self._application_controller is None
+                or self.owner is not asyncio.current_task()):
+            raise Unavailable("The original application session is unavailable.")
+        directory = Path(mkdtemp(prefix=".capture-", dir=submit_review._private_root()))
+        path = directory / "screenshot.png"
+        try:
+            result = await self._run(("screenshot", "--out", str(path)), {})
+            reported = result.get("path")
+            if reported is None and isinstance(result.get("data"), dict):
+                reported = result["data"].get("path")
+            if (not isinstance(reported, str) or Path(reported).absolute() != path
+                    or path.is_symlink() or not path.is_file()
+                    or path.stat().st_size > 12_000_000):
+                raise Unavailable("The private application screenshot is unavailable.")
+            path.chmod(0o600)
+            data = path.read_bytes()
+            if not data.startswith(b"\\x89PNG\\r\\n\\x1a\\n") or not data:
+                raise Unavailable("The private application screenshot is not PNG.")
+            return data
+        finally:
+            if not path.is_symlink():
+                path.unlink(missing_ok=True)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
 
     async def sync_context(self, *, settle: bool = True) -> str:
         """Fetch the latest cooperation context; absent or malformed fails closed.
@@ -392,6 +434,12 @@ class Session:
                             extra += ("--observation", self._observation)
                     # Spent whether or not the action succeeds: never reuse it.
                     self._context = self._observation = ""
+                # Every await above could have changed the effective mode,
+                # company lease, reviewer generation or tab ownership. Inspect
+                # immediately before invoking the raw committing CLI.
+                if (self.kind == "apply" and self._application_controller is not None
+                        and self._application_controller.review_effect_args == args):
+                    self._application_controller.final_review_effect_guard(self, args)
                 try:
                     result = await command(*args, *extra, "--session", self.id, **kwargs)
                 except Unavailable as exc:

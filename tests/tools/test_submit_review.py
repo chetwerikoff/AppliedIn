@@ -483,3 +483,86 @@ async def test_submit_review_on_during_awaited_precheck_never_reaches_raw_ipc(mo
     assert not called
     assert controller.review_effect_args is None
     assert controller.pending_commit_args is None
+
+
+def test_explicit_retry_http_route_denies_active_review(monkeypatch):
+    """Existing Retry endpoint, not queue/resume, is the human recovery entry."""
+    from fastapi import BackgroundTasks
+    import server
+
+    row = {"pk": PK, "status": "needs_human", "gate_reason": "submit_review",
+           "review_state": "rejected", "gate_generation": "synthetic-generation"}
+    tracking = SimpleNamespace(
+        r=None, get=lambda pk: dict(row), get_current=lambda pk: dict(row))
+    monkeypatch.setattr(server, "make_stores",
+                        lambda *args, **kwargs: SimpleNamespace(tracking=tracking))
+    allowed = {"rejected", "expired", "restart", "session_lost"}
+    monkeypatch.setattr(submit_review, "manual_restart_allowed",
+                        lambda pk, current, *, tracking:
+                        current.get("review_state") in allowed)
+    route = next(r.endpoint for r in server.create_app().routes
+                 if getattr(r, "path", None) == "/actions/retry/{pk}")
+    for state in ("rejected", "expired", "restart", "session_lost",
+                  "pending", "claimed"):
+        row["review_state"] = state
+        background = BackgroundTasks()
+        response = route(PK, background)
+        if state in allowed:
+            assert response["ok"] and response["fresh_preparation"]
+            assert len(background.tasks) == 1
+            assert background.tasks[0].kwargs == {"explicit_review_restart": True}
+        else:
+            assert not response["ok"]
+            assert background.tasks == []
+
+
+@pytest.mark.asyncio
+async def test_new_packet_after_explicit_restart_has_new_generation(monkeypatch, tmp_path):
+    """Consumed reviewer tokens do not survive a fresh synthetic preparation."""
+    from tools import browser_skill as bsk
+
+    controller, page, target = world()
+    old_generation = "synthetic-generation-previous"
+    row = {
+        "pk": PK, "company": "example-co", "job_id": "1",
+        "jd_url": URL, "status": "needs_human", "gate_reason": "submit_review",
+        "review_state": "rejected", "gate_generation": old_generation,
+        "possible_submission": False, "confirmation_id": None,
+    }
+    tracking = SimpleNamespace(r=None, get_current=lambda pk: dict(row))
+    monkeypatch.setattr(submit_review, "_HOLDERS", {})
+    monkeypatch.setattr(submit_review, "_tracking", lambda: tracking)
+    monkeypatch.setattr(submit_review, "_private_root", lambda: tmp_path)
+    monkeypatch.setattr(submit_review, "_live_lease", lambda *a: True)
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: True)
+    monkeypatch.setattr(browser_runtime, "backend", lambda: bsk)
+
+    def conditional_patch(pk, *, states, status, generation, changes):
+        if (pk != PK or row["status"] != status
+                or row["review_state"] not in states
+                or (generation is not None
+                    and row["gate_generation"] != generation)):
+            return False
+        row.update(changes)
+        return True
+
+    monkeypatch.setattr(submit_review, "_patch", conditional_patch)
+    assert submit_review.begin_manual_restart(PK, dict(row), {
+        "status": "tailoring", "gate_reason": "",
+        "review_state": None, "gate_generation": None}, tracking=tracking)
+    assert row["gate_generation"] is None
+    # A new tailored job enters a separate BrowserSkill attempt; it must
+    # independently publish a new private packet, not revive the old one.
+    row["status"] = "submitting"
+    packet = submit_review.form_snapshot(controller, page, target)
+    holder = submit_review.publish(
+        pk=PK, company="example-co", controller=controller,
+        session=SimpleNamespace(id="synthetic-tab"), packet=packet,
+        screenshot=b"\\x89PNG\\r\\n\\x1a\\nsynthetic")
+    assert holder.generation != old_generation
+    assert row["gate_generation"] == holder.generation
+    assert row["review_state"] == "pending"
+    assert submit_review.packet_for(PK)["packet"]["gate_generation"] == holder.generation
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, old_generation, "approve")
+    submit_review.invalidate(holder, "rejected")

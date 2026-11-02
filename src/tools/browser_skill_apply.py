@@ -3247,6 +3247,7 @@ class ApplicationIPCController:
         self.submit_review_at_start = bool(submit_review_at_start)
         self.review_holder = None
         self.review_effect_args = None
+        self.pending_commit_args = None
         self.review_raw_effect_started = False
         self.expected_digest = None
         if self.resume_path and Path(self.resume_path).is_file():
@@ -3504,6 +3505,10 @@ class ApplicationIPCController:
             await self._review_before_commit(session, page, target, args, kwargs)
         else:
             await self.check_pre_submit(session, page, target)
+            # The flag can turn ON during the awaited precheck or subsequent
+            # BrowserSkill cooperation sync. This is only an IPC candidate,
+            # never enduring permission to bypass final review.
+            self.pending_commit_args = tuple(args)
             self.committed = True
             self.mark_click_started()
 
@@ -3585,6 +3590,24 @@ class ApplicationIPCController:
             if isinstance(exc, submit_review.Refused):
                 submit_review.raise_review_gate('Submit review is stale or no longer safe; start a fresh run.')
             raise
+
+    def final_unreviewed_effect_guard(self, session, args) -> None:
+        """Re-sample mode immediately before a previously OFF-mode raw Submit."""
+        from core import flags
+        from tools import browser_runtime, browser_skill, submit_review
+        if (not self.committed or self.pending_commit_args != tuple(args)
+                or getattr(session, '_application_controller', None) is not self
+                or self.submit_review_at_start):
+            submit_review.raise_review_gate(
+                'Unreviewed Submit lost its original application authority.')
+        # This is also called after the native transport's awaited context
+        # sync. A new ON mode must never inherit an earlier OFF decision.
+        if flags.submit_review_enabled():
+            if browser_runtime.backend() is not browser_skill:
+                submit_review.raise_review_gate(
+                    'Submit review requires the current BrowserSkill engine.')
+            submit_review.raise_review_gate(
+                'Submit review became enabled before raw IPC; start a fresh review run.')
 
     def final_review_effect_guard(self, session, args) -> None:
         """No review grant survives a changed raw effect, owner or lease."""

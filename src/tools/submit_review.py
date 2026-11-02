@@ -70,6 +70,42 @@ def guarded_row(row: dict | None) -> bool:
                 and row.get("gate_reason") == "submit_review")
 
 
+_MANUAL_RESTART_STATES = frozenset({"rejected", "expired", "restart", "session_lost"})
+
+
+def manual_restart_allowed(pk: str, row: dict, *, tracking=None) -> bool:
+    """An explicit fresh Retry may recover only an unsent, ownerless review."""
+    from tools import submit_hold
+    with _LOCK:
+        if (not guarded_row(row) or row.get("status") != "needs_human"
+                or row.get("review_state") not in _MANUAL_RESTART_STATES
+                or not isinstance(row.get("gate_generation"), str)
+                or not 16 <= len(row["gate_generation"]) <= 128
+                or row.get("pk") != pk or pk in _HOLDERS
+                or row.get("possible_submission") or row.get("confirmation_id")):
+            return False
+        try:
+            tracking = tracking or _tracking()
+            current = tracking.get_current(pk) or {}
+            if any(current.get(key) != row.get(key) for key in (
+                    "pk", "company", "job_id", "jd_url", "status",
+                    "gate_reason", "review_state", "gate_generation")):
+                return False
+            return not submit_hold.blocked(pk, current, tracking=tracking)
+        except Exception:
+            return False
+
+
+def begin_manual_restart(pk: str, row: dict, changes: dict, *, tracking=None) -> bool:
+    """Consume the closed generation atomically; no old packet can re-authorize."""
+    with _LOCK:
+        if not manual_restart_allowed(pk, row, tracking=tracking):
+            return False
+        return _patch(pk, states=(row["review_state"],),
+                      status="needs_human", generation=row["gate_generation"],
+                      changes=changes)
+
+
 def _tracking():
     from core.stores import make_stores
     if get_settings().mode != "local":
@@ -125,6 +161,7 @@ def _patch(pk: str, *, states: tuple[str, ...], status: str,
                         or (generation is not None
                             and row.get("gate_generation") != generation)
                         or row.get("possible_submission")
+                        or row.get("confirmation_id")
                         or (generation is not None
                             and row.get("gate_reason") != "submit_review")):
                     pipe.unwatch()

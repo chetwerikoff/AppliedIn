@@ -277,12 +277,13 @@ def _reader_url(row: dict) -> str:
         if not isinstance(name, str) or not name.strip() or ats not in ("custom", "workday"):
             raise JDURLUnresolvable("Missing exact historical source classification")
         cfg = Path(get_settings().config_dir) / "watchlist.yaml"
-        matches = [c for c in load_watchlist(cfg)
+        current_watchlist = load_watchlist(cfg)
+        matches = [c for c in current_watchlist
                    if c.name.strip().casefold() == name.strip().casefold()
                    and c.ats == ats]
         # Another company entry with the same name but different source is
         # ambiguous too; it must not be used as a source-specific fallback.
-        all_names = [c for c in load_watchlist(cfg)
+        all_names = [c for c in current_watchlist
                      if c.name.strip().casefold() == name.strip().casefold()]
         if len(matches) != 1 or len(all_names) != 1:
             raise JDURLUnresolvable("Current watchlist source is missing or ambiguous")
@@ -512,7 +513,7 @@ def run_job(pk: str, stores: Any = None, *, prepare_only: bool = False) -> dict:
         if (result or {}).get("result") == "prepared":
             try:
                 current = stores.tracking.get(pk) or {}
-                if current.get("apply_requested_at"):
+                if current.get("apply_requested_at") and not _historical_relative(current):
                     # Request authority is checked AGAIN inside the queue entry.
                     # The first GET can race a cancellation in any prepare-only
                     # mode, not just a JD-attention recovery.

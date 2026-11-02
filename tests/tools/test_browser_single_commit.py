@@ -1097,6 +1097,37 @@ async def test_final_review_rechecks_before_real_raw_cli_after_context_wait(monk
 
 
 @pytest.mark.asyncio
+async def test_reviewed_effect_refuses_swapped_raw_command_even_with_legacy_transport(monkeypatch):
+    """A substituted runner must not bypass a revoked generation or switch Submit targets.
+
+    The synthetic legacy CLI shim routes directly to command(), so this fails
+    on the former head that only checked an exact argv inside native _run.
+    """
+    from types import SimpleNamespace
+    calls = []
+    session = bsk.Session("apply")
+    session.id = "synthetic-session"
+
+    def guard(_session, args):
+        calls.append(("guard", args))
+        raise forms.Gate("revoked synthetic review", reason="submit_review")
+
+    session._application_controller = SimpleNamespace(
+        review_effect_args=("click", "#original-submit"),
+        final_review_effect_guard=guard,
+    )
+
+    async def forbidden(*args, **kwargs):
+        calls.append(("raw", args))
+        raise AssertionError("No raw command is authorized by a stale review")
+
+    monkeypatch.setattr(bsk, "command", forbidden)
+    with pytest.raises(forms.Gate, match="revoked synthetic review"):
+        await session._run(("click", "#different-submit"), {})
+    assert calls == [("guard", ("click", "#different-submit"))]
+
+
+@pytest.mark.asyncio
 async def test_private_screenshot_is_one_png_and_cleaned_from_temp(monkeypatch, tmp_path):
     """In-memory synthetic PNG, not an employer screenshot or live CLI."""
     from tools import submit_review
@@ -1104,7 +1135,7 @@ async def test_private_screenshot_is_one_png_and_cleaned_from_temp(monkeypatch, 
     session.id = "synthetic-session"
     session.owner = asyncio.current_task()
     session._application_controller = object()
-    png = b"\\x89PNG\\r\\n\\x1a\\n" + b"synthetic-only"
+    png = b"\x89PNG\r\n\x1a\n" + b"synthetic-only"
     calls = []
 
     async def fake_screenshot(args, kwargs):

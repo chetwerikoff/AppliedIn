@@ -313,9 +313,14 @@ class Session:
 
     def _check_review_raw_effect(self, args) -> None:
         controller = self._application_controller
-        if (self.kind == "apply" and controller is not None
-                and getattr(controller, "review_effect_args", None) is not None):
+        if self.kind != "apply" or controller is None:
+            return
+        if getattr(controller, "review_effect_args", None) is not None:
             controller.final_review_effect_guard(self, args)
+        elif getattr(controller, "pending_commit_args", None) is not None:
+            # A normal OFF-mode Submit may have awaited a page or context sync
+            # while review mode turned ON. Check again at the real IPC edge.
+            controller.final_unreviewed_effect_guard(self, args)
 
     async def _guarded_raw_run(self, args, kwargs):
         self._check_review_raw_effect(args)
@@ -353,14 +358,21 @@ class Session:
             finally:
                 controller = self._application_controller
                 holder = getattr(controller, "review_holder", None)
-                if holder is not None and controller.committed:
-                    from tools import submit_review
-                    # Revocation before raw IPC is never a successful reviewer
-                    # continuation, even when the original marker was staged.
-                    if getattr(controller, "review_raw_effect_started", False):
-                        submit_review.finish(holder)
-                    else:
-                        submit_review.invalidate(holder, "invalidated")
+                try:
+                    if holder is not None and controller.committed:
+                        from tools import submit_review
+                        # Revocation before raw IPC is never a successful reviewer
+                        # continuation, even when the original marker was staged.
+                        if getattr(controller, "review_raw_effect_started", False):
+                            submit_review.finish(holder)
+                        else:
+                            submit_review.invalidate(holder, "invalidated")
+                finally:
+                    # The one committing attempt spent its transient argv grant.
+                    # The permanent committed/submit_hold guards still forbid
+                    # further mutations; fixed read-only confirmation can resume.
+                    controller.review_effect_args = None
+                    controller.pending_commit_args = None
 
     async def review_screenshot(self) -> bytes:
         """One read-only screenshot of this owned application tab, never shared.

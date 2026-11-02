@@ -1449,3 +1449,38 @@ async def test_greenhouse_phone_country_local_choice_item_two(
         assert refused.value.item == 2
         assert refused.value.reason == 'defect_pre_submit_item_2'
         assert not fixture.held and not controller.committed
+
+
+
+@pytest.mark.asyncio
+async def test_review_precheck_keeps_form_unheld_and_not_committed(monkeypatch, tmp_path):
+    """Issue #301: all five predicates run without recording a possible click."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    await controller.check_pre_submit(None, page, target, validation_only=True)
+    assert fixture.held is False
+    assert fixture.row["status"] == "submitting"
+    assert controller.committed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("at_start", "at_boundary"), [
+    (True, False), (False, True), (True, True),
+])
+async def test_submit_review_start_or_boundary_cannot_fall_through(
+        monkeypatch, tmp_path, at_start, at_boundary):
+    from core import flags
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    controller.submit_review_at_start = at_start
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: at_boundary)
+    review_calls = []
+
+    async def intercept(session, current, receiver, args, kwargs):
+        review_calls.append(tuple(args))
+        raise forms.Gate("synthetic final review refusal", reason="submit_review")
+
+    monkeypatch.setattr(controller, "_review_before_commit", intercept)
+    with pytest.raises(forms.Gate, match="synthetic final review refusal"):
+        await controller.before_ipc(None, ("click", "#submit"), {})
+    assert review_calls == [("click", "#submit")]
+    assert fixture.held is False
+    assert controller.committed is False

@@ -47,6 +47,7 @@ class Holder:
     decision: Future
     response: Future
     closed: bool = False
+    reviewer_reason: str = ""
 
 
 def guarded_row(row: dict | None) -> bool:
@@ -300,6 +301,7 @@ def claim(pk: str, expected: str, decision: str, reason: str = "") -> Future:
                       generation=expected, changes={"review_state": "claimed"}):
             raise Refused("Another decision already consumed this review.")
         if decision == "reject":
+            holder.reviewer_reason = reason
             # No private answer text is placed in the tracked row or event stream.
             if reason:
                 try:
@@ -360,6 +362,34 @@ def invalidate(holder: Holder, state: str = "invalidated") -> None:
                         + "; start a fresh application run."})
 
 
+def require_actual_marker(holder: Holder) -> None:
+    """Final synchronous check at the raw BrowserSkill committing IPC edge."""
+    from core import flags
+    from tools import browser_runtime, browser_skill, submit_hold
+    from core.apply_queue import ApplyQueue
+    with _LOCK:
+        if (holder.closed or _HOLDERS.get(holder.pk) is not holder
+                or time.monotonic() >= holder.deadline
+                or not getattr(holder.session, "id", None)
+                or not flags.submit_review_enabled()
+                or browser_runtime.backend() is not browser_skill):
+            raise Refused("Submit review authority was revoked before Submit.")
+        tracking = _tracking()
+        row = tracking.get_current(holder.pk) or {}
+        queue = ApplyQueue(tracking.r)
+        if (row.get("pk") != holder.pk or row.get("company") != holder.company
+                or row.get("gate_generation") != holder.generation
+                or row.get("review_state") != "claimed"
+                or row.get("gate_reason") != "submit_uncertain"
+                or row.get("status") != "needs_human"
+                or not submit_hold.is_held(holder.pk, tracking=tracking)
+                or holder.pk not in queue.in_flight()
+                or holder.company.strip().lower() not in queue.depth()["running"]
+                or not getattr(holder.controller, "committed", False)
+                or holder.controller.upload_identity != holder.controller._row_pdf()):
+            raise Refused("Submit review form/lease/marker is not current at raw IPC.")
+
+
 def finish(holder: Holder) -> None:
     with _LOCK:
         holder.closed = True
@@ -374,6 +404,10 @@ async def await_decision(holder: Holder) -> str:
     try:
         while True:
             with _LOCK:
+                # A rejected token has already lost pending/claimed authority.
+                # That is the intended no-click outcome, not a lost session.
+                if holder.decision.done() and holder.decision.result() == "reject":
+                    return "reject"
                 if not _authority(holder, claimed=holder.decision.done()):
                     raise Refused("Submit review expired or lost its live lease.")
                 if holder.decision.done():
@@ -406,12 +440,143 @@ def recover_orphans() -> None:
                 if item.is_dir() and item.name != "reasons" and not item.is_symlink():
                     _cleanup(item)
             tracking = _tracking()
-            for row in tracking.query_status("needs_human"):
-                if (guarded_row(row)
-                        and row.get("review_state") in {"pending", "claimed"}):
-                    _patch(row["pk"], states=("pending", "claimed"),
-                           status="needs_human", generation=row.get("gate_generation"),
-                           changes={"review_state": "restart"})
+            for status in ("needs_human", "submitting"):
+                for row in tracking.query_status(status):
+                    if (guarded_row(row)
+                            and row.get("review_state") in {"pending", "claimed"}):
+                        _patch(row["pk"], states=("pending", "claimed"),
+                               status=status, generation=row.get("gate_generation"),
+                               changes={"status": "needs_human",
+                                        "review_state": "restart"})
         except Exception:
             # A storage outage leaves rows visibly gated, never approvable.
             pass
+
+
+def _selected_control(control: dict) -> dict:
+    """Private exact-value representation, without document/credential bytes."""
+    combo = control.get("combobox") or {}
+    return {
+        "selector": control.get("selector"),
+        "label": control.get("label") or control.get("question") or "",
+        "question": control.get("question") or control.get("label") or "",
+        "tag": control.get("tag"), "type": control.get("type"),
+        "name": control.get("name"), "required": control.get("required"),
+        "disabled": control.get("disabled"),
+        "in_form": control.get("in_form"),
+        "form_selector": control.get("form_selector"),
+        "form_action": control.get("form_action"),
+        "formaction": control.get("formaction"),
+        "value": control.get("value"), "checked": control.get("checked"),
+        "files": control.get("files"),
+        "options": control.get("options"),
+        "option_count": control.get("option_count"),
+        "options_capped": control.get("options_capped"),
+        "combobox": {
+            k: combo.get(k) for k in (
+                "selected_text", "selected_value", "displayed_text",
+                "hidden_selector", "hidden_value", "selected_caption_unreadable",
+                "local_selected_proven", "options")},
+    }
+
+
+def form_snapshot(controller, page: dict, target: dict) -> dict:
+    """Read-only complete same-receiver inventory; fail closed on opaque items."""
+    from tools.browser_skill_apply import _formless_boundary, _formless_root
+    if (page.get("inventory_verified") is not True
+            or page.get("truncated") or page.get("opaque_controls")
+            or page.get("shadow_roots") or page.get("unsupported_frames")
+            or not isinstance(page.get("controls"), list)
+            or not isinstance(target, dict)
+            or not target.get("selector")):
+        raise Refused("The visible form inventory is incomplete.")
+    root = ""
+    if target.get("in_form") is True:
+        root = target.get("form_selector")
+        if not isinstance(root, str) or not root:
+            raise Refused("The application form owner is ambiguous.")
+        members = [c for c in page["controls"] if
+                   c.get("in_form") is True and c.get("form_selector") == root]
+        if len([c for c in members if c.get("selector") == target["selector"]]) != 1:
+            raise Refused("The Submit receiver changed.")
+    else:
+        if not _formless_root(page):
+            raise Refused("The formless application root is not proven.")
+        members = _formless_boundary(
+            page, controller.entry_provenance or controller.greenhouse_provenance,
+            submit_selector=target["selector"])
+    if not isinstance(members, list):
+        raise Refused("The application root is incomplete.")
+    visible = []
+    for c in members:
+        if not isinstance(c, dict):
+            raise Refused("An application control is unreadable.")
+        # Hidden machine backing is captured inside the linked combobox. Never
+        # store independent hidden/credential controls or ignore an account wall.
+        kind = str(c.get("type") or "")
+        if kind in {"password", "otp"} or (
+                "one-time" in str(c.get("label") or "").lower()):
+            raise Refused("An account challenge needs separate owner handling.")
+        if kind == "hidden" or c.get("visible") is False:
+            continue
+        if (not isinstance(c.get("selector"), str) or not c["selector"]
+                or not isinstance(c.get("label"), str)
+                or not isinstance(c.get("question"), str)
+                or not isinstance(c.get("checked"), bool)
+                or not isinstance(c.get("value"), str)
+                or not isinstance(c.get("files"), list)
+                or not isinstance(c.get("options"), list)):
+            raise Refused("A visible application control is unreadable.")
+        combo = c.get("combobox") or {}
+        if combo.get("selected_caption_unreadable") is True:
+            raise Refused("A selected choice caption is unreadable.")
+        if c.get("tag") == "select" and c.get("value"):
+            choices = [o for o in c["options"] if o.get("value") == c["value"]]
+            if len(choices) != 1:
+                raise Refused("The selected option is ambiguous.")
+        visible.append(_selected_control(c))
+    selectors = [c["selector"] for c in visible]
+    if len(set(selectors)) != len(selectors) or not visible:
+        raise Refused("Visible application control identities are ambiguous.")
+    from pathlib import Path as _Path
+    row = controller._row()
+    return {
+        "job": {"pk": controller.pk, "company": controller.company,
+                "job_id": row.get("job_id"), "ats": row.get("ats"),
+                "jd_url": controller.url},
+        "page": {"url": page.get("url"), "title": page.get("title"),
+                 "form_selector": root, "submit_selector": target["selector"],
+                 "form_action": target.get("form_action"),
+                 "formaction": target.get("formaction"),
+                 "application_identity": page.get("application_identity"),
+                 "attached_file_displays": page.get("attached_file_displays")},
+        "attachment": {
+            "filename": _Path(controller.resume_path).name,
+            "pdf_sha256": controller.expected_digest,
+            "identity": list(controller._row_pdf())},
+        "controls": visible,
+    }
+
+
+def form_differences(previous: dict, current: dict) -> list[dict]:
+    """Bounded private reviewer differences; no values go to logs/tracking."""
+    changes: list[dict] = []
+    for key in ("job", "page", "attachment"):
+        if previous.get(key) != current.get(key):
+            changes.append({"control": key, "before": previous.get(key),
+                            "after": current.get(key)})
+    before, after = previous.get("controls") or [], current.get("controls") or []
+    if len(before) != len(after):
+        changes.append({"control": "visible control count",
+                        "before": len(before), "after": len(after)})
+    for i in range(max(len(before), len(after))):
+        old = before[i] if i < len(before) else None
+        new = after[i] if i < len(after) else None
+        if old != new:
+            changes.append({"control": (old or new or {}).get("label")
+                            or (old or new or {}).get("selector") or str(i),
+                            "identity": (old or new or {}).get("selector"),
+                            "before": old, "after": new})
+        if len(changes) >= 12:
+            break
+    return changes

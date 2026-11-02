@@ -165,6 +165,148 @@ def test_status_distinguishes_connection_states_without_launch(sandbox, monkeypa
                               'check' if expected == 'not_running' else 'action')
 
 
+
+_SKEW_DETAIL = 'bsk update, then bsk daemon stop; the next bsk call starts the new daemon'
+_MISSING_DETAIL = 'Dedicated Chrome is running but pinned BrowserSkill is not connected.'
+_CONNECTED_DETAIL = 'Pinned extension and dedicated Chrome argv observed.'
+_NOT_RUNNING_DETAIL = 'Dedicated Chrome is not running; it will start for the next browser task.'
+
+
+@pytest.mark.parametrize(('rows', 'pids', 'state', 'detail'), [
+    ([{'instance_id': 'pinned', 'version_skew': True}], [123],
+     'version_skew', _SKEW_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': True},
+      {'instance_id': 'foreign', 'version_skew': True}], [123],
+     'version_skew', _SKEW_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': True},
+      {'instance_id': 'pinned', 'version_skew': True}], [123],
+     'extension_missing', _MISSING_DETAIL),
+    ([{'instance_id': 'foreign', 'version_skew': True}], [123],
+     'extension_missing', _MISSING_DETAIL),
+    ([{'instance_id': 'pinned', 'unresponsive': True}], [123],
+     'extension_missing', _MISSING_DETAIL),
+    ([], [123], 'extension_missing', _MISSING_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': False}], [123],
+     'connected', _CONNECTED_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': True},
+      {'instance_id': 'pinned'}], [123], 'connected', _CONNECTED_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': True}], [],
+     'not_running', _NOT_RUNNING_DETAIL),
+    ([{'instance_id': 'pinned', 'version_skew': True}], [123, 456],
+     'unavailable', 'Dedicated Chrome process is absent or ambiguous for pinned user-data-dir'),
+    ([{'instance_id': 'pinned'}], [],
+     'unavailable', 'Dedicated Chrome process is absent or ambiguous for pinned user-data-dir'),
+])
+def test_status_classifies_only_observed_pinned_skew(
+        sandbox, monkeypatch, rows, pids, state, detail):
+    observations = []
+
+    def browsers():
+        observations.append(True)
+        return rows
+
+    monkeypatch.setattr(profile, '_browsers', browsers)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: pids)
+    expected = {'state': state, 'detail': detail}
+    assert profile.connection_status() == expected
+    assert runtime.browser_status() == expected
+    # Each status consumer gets one enumeration, not a second potentially
+    # contradictory snapshot for skew classification.
+    assert len(observations) == 2
+
+
+def test_status_without_pin_never_enumerates_or_checks_process(sandbox, monkeypatch):
+    path, _ = sandbox
+    cfg = yaml.safe_load(path.read_text())
+    cfg['browser'] = ''
+    path.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(profile, '_browsers',
+                        lambda: pytest.fail('No enumeration before pinning'))
+    monkeypatch.setattr(profile, 'profile_pids',
+                        lambda _: pytest.fail('No process check before pinning'))
+    assert profile.connection_status() == {
+        'state': 'setup_required',
+        'detail': 'Run ./appliedin browser-setup for the clean profile.',
+    }
+
+
+@pytest.mark.parametrize('source', ['rows', 'process'])
+def test_status_observation_error_remains_unavailable(sandbox, monkeypatch, source):
+    def fail(*_args):
+        raise OSError('synthetic observation error')
+
+    if source == 'rows':
+        monkeypatch.setattr(profile, '_browsers', fail)
+    else:
+        monkeypatch.setattr(profile, 'profile_pids', fail)
+    assert profile.connection_status() == {
+        'state': 'unavailable', 'detail': 'synthetic observation error'}
+
+
+def test_status_configuration_error_remains_unavailable(sandbox):
+    path, _ = sandbox
+    path.write_text(yaml.safe_dump({
+        'engine': 'browser_skill', 'browser': 'pinned', 'user_data_dir': ''}))
+    assert runtime.browser_status()['state'] == 'unavailable'
+
+
+def test_status_version_skew_is_diagnostic_only(sandbox, monkeypatch):
+    rows = [{'instance_id': 'pinned', 'version_skew': True}]
+    assert not profile._connected(rows, 'pinned')
+    monkeypatch.setattr(profile, '_browsers', lambda: rows)
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [123])
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('Status must not start, update, stop, navigate, or apply')
+
+    for target, name in ((profile, '_launch'), (profile, '_launch_lock'),
+                         (profile, 'ensure_browser'), (profile, 'browser_setup'),
+                         (bsk, 'ensure_daemon'), (bsk, 'command')):
+        monkeypatch.setattr(target, name, forbidden)
+    assert profile.connection_status() == {
+        'state': 'version_skew', 'detail': _SKEW_DETAIL}
+    assert runtime.browser_status() == {
+        'state': 'version_skew', 'detail': _SKEW_DETAIL}
+    assert runtime.setup_check()['state'] == 'action'
+
+
+def test_status_version_skew_reaches_stats_route_offline(sandbox, monkeypatch):
+    from fastapi.testclient import TestClient
+    from core import flags, preparation
+    from discovery import handler
+    import server
+
+    monkeypatch.setattr(profile, '_browsers',
+                        lambda: [{'instance_id': 'pinned', 'version_skew': True}])
+    monkeypatch.setattr(profile, 'profile_pids', lambda _directory: [123])
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail('/stats must not cause browser, daemon, or application actions')
+
+    for target, name in ((profile, '_launch'), (profile, '_launch_lock'),
+                         (profile, 'ensure_browser'), (bsk, 'ensure_daemon'),
+                         (bsk, 'command')):
+        monkeypatch.setattr(target, name, forbidden)
+    monkeypatch.setattr(server, 'make_stores', lambda _settings: SimpleNamespace(
+        tracking=SimpleNamespace(status_counts=lambda: {})))
+    monkeypatch.setattr(preparation, 'snapshot', lambda: [])
+    monkeypatch.setattr(handler, 'scanning', lambda: [])
+    monkeypatch.setattr(handler, 'active', lambda: False)
+    monkeypatch.setattr(server, '_discovery_running', lambda: False)
+    monkeypatch.setattr(server, '_applying_now', lambda: 0)
+    monkeypatch.setattr(server, '_throttle_state', lambda: {})
+    monkeypatch.setattr(server, '_RUNNING', {'discover': False, 'process': False})
+    for name, value in (('llm_error', ''), ('paused', False),
+                        ('apply_mode', 'gated'), ('browser_headless', False),
+                        ('workers_down', [])):
+        monkeypatch.setattr(flags, name, lambda result=value: result)
+
+    response = TestClient(server.create_app()).get('/stats')
+    assert response.status_code == 200
+    assert response.json()['browser_status'] == {
+        'state': 'version_skew', 'detail': _SKEW_DETAIL}
+
+
 @pytest.mark.parametrize('answer', ['', 'n', 'y'])
 def test_setup_saves_only_after_y_and_keeps_optional_settings(sandbox, monkeypatch, answer):
     path, directory = sandbox

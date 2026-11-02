@@ -720,11 +720,11 @@ async def test_real_controller_fills_uploads_holds_and_classifies_fake_submit(mo
     monkeypatch.setattr(forms, 'check_before_committing_click', check)
     def clicked():
         assert checkpoints == ['held', 'checked']
-        fixed_reads = [i for i, call in enumerate(raw.calls)
-                       if call == ('evaluate', forms._ENTRY_FIXED_CONTROL_WITNESS)]
+        # The committing boundary consumes its own current PAGE. A second
+        # all-control fixed witness is no longer a Submit precondition.
         page_reads = [i for i, call in enumerate(raw.calls)
                       if call == ('evaluate', forms.ENTRY_PAGE)]
-        assert fixed_reads and page_reads and fixed_reads[-1] < page_reads[-1]
+        assert page_reads
         if outcome == 'click-fault':
             raise OSError('Synthetic transport lost after possibly committing')
     raw.before_click = clicked

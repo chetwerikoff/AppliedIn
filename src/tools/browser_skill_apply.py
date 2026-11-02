@@ -3358,39 +3358,6 @@ class ApplicationIPCController:
         return False
 
 
-    async def _final_control_read(self, session, page):
-        """Use the entry site's independent reader at the irreversible boundary."""
-        if self.entry_provenance is None and self.greenhouse_provenance is None:
-            return page, {}
-        if self.entry_provenance is not None:
-            allowed = lambda href: _job_preparation_route(
-                href, self.url, provenance=self.entry_provenance,
-                pk=self.pk, company=self.company,
-                fixture_context=self.fixture_context)
-            try:
-                _entry_safety(page, allowed, self.entry_provenance)
-            except (CaptchaGate, CaptchaArtifactGate):
-                raise
-            except Gate:
-                # Let the substantive final check preserve its item-1 mapping.
-                return page, {}
-            observation_session = _EntrySession(
-                session, allowed, self.entry_provenance,
-                fixture_context=self.fixture_context)
-        else:
-            allowed = lambda href: navigation_allowed(
-                href, self.url, provenance=self.greenhouse_provenance)
-            try:
-                _greenhouse_safety(page, allowed, self.greenhouse_provenance)
-            except (CaptchaGate, CaptchaArtifactGate):
-                raise
-            except Gate:
-                return page, {}
-            observation_session = _GreenhouseSession(
-                session, allowed, self.greenhouse_provenance)
-        return await _observe_controls(
-            observation_session, page, site='final-submit')
-
     async def before_ipc(self, session, args: tuple, kwargs: dict) -> None:
         """Classify only committing IPC; all other form actions are preparation."""
         if not args or not isinstance(args[0], str) or self.committed:
@@ -3460,7 +3427,11 @@ class ApplicationIPCController:
             matching = [c for c in page.get('controls', [])
                         if c.get('selector') == args[1]]
             committing = [c for c in matching
-                          if is_submission(c) or native_submit(c)]
+                          if (is_submission(c) or native_submit(c)
+                              or (c.get('tag') == 'a'
+                                  and isinstance(c.get('href'), str)
+                                  and bool(c['href'])
+                                  and _committing_get_route(c['href'])))]
             if committing:
                 # A known Submit selector does not become ordinary preparation
                 # merely because extra CLI arguments or multiple receivers
@@ -3509,7 +3480,8 @@ class ApplicationIPCController:
             raise PreSubmitGate(1, 'Raw application click or implicit Submit receiver is ambiguous.')
         if target is None:
             return
-        page, _ = await self._final_control_read(session, page)
+        # The fresh self._page read is the final decision's evidence.
+        # check_pre_submit already owns route, CAPTCHA and five-item checks.
         await self.check_pre_submit(session, page, target)
         self.committed = True
         self.mark_click_started()

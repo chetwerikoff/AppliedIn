@@ -142,11 +142,6 @@ def _world(monkeypatch, tmp_path, *, case='ready', resume_name='Test User.pdf'):
         return deepcopy(page)
 
     monkeypatch.setattr(controller, '_page', current)
-
-    async def fixed_reader(_session, current_page, **kwargs):
-        return current_page, {}
-
-    monkeypatch.setattr(forms, '_observe_controls', fixed_reader)
     return controller, page, target, fixture
 
 
@@ -725,6 +720,130 @@ async def test_model_submit_click_reaches_the_same_final_check_and_hold(
     await controller.before_ipc(None, ('click', '#submit'), {})
     assert fixture.held and controller.committed
 
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('suffix', 'committing'), [
+    ('/submit', True),
+    ('/submitApplication', True),
+    ('/application', False),
+])
+@pytest.mark.parametrize('through_model', [False, True])
+async def test_neutral_continue_anchor_click_classifies_current_get_effect(
+        monkeypatch, tmp_path, suffix, committing, through_model):
+    """The raw click, including model-issued clicks, uses one final check
+    for committing GET links without gating an ordinary same-job Continue.
+    """
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    page['controls'].append({
+        'selector': '#continue-link', 'tag': 'a', 'type': 'link',
+        'label': 'Continue', 'href': URL + suffix, 'submit': False,
+        'in_form': True, 'form_selector': '#app',
+        'form_action': URL, 'disabled': False,
+    })
+    checked = []
+    original = controller.check_pre_submit
+
+    async def count_final(session, current_page, receiver):
+        checked.append((current_page['url'], receiver['selector']))
+        await original(session, current_page, receiver)
+
+    monkeypatch.setattr(controller, 'check_pre_submit', count_final)
+
+    class OfflineApplicationSession:
+        def __init__(self):
+            self.effects = []
+
+        async def application_effect(self, *args, **kwargs):
+            # This synthetic producer exercises the same private raw IPC
+            # classifier that the real model-click path must traverse.
+            await controller.before_ipc(self, args, kwargs)
+            self.effects.append(args)
+            return {}
+
+    session = OfflineApplicationSession()
+    if through_model:
+        result = await forms.execute(
+            session, page, {'action': 'click', 'selector': '#continue-link'},
+            facts={}, filled={}, resume_path='', company='example-co',
+            jd_text='', resume_tex='', github='', pk=PK, job_url=URL,
+            allow_click=True, fixture_context=fixture)
+        assert result['action'] == 'click'
+        assert session.effects == [('click', '#continue-link')]
+    else:
+        await controller.before_ipc(session, ('click', '#continue-link'), {})
+        assert session.effects == []
+    if committing:
+        assert checked == [(URL, '#continue-link')]
+        assert fixture.held and controller.committed
+    else:
+        assert checked == []
+        assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid', ['duplicate-selector', 'extra-cli-argument'])
+async def test_committing_get_click_preserves_existing_ambiguity_refusal(
+        monkeypatch, tmp_path, invalid):
+    """A malformed or ambiguous committing anchor must not become reversible."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    anchor = {
+        'selector': '#continue-link', 'tag': 'a', 'label': 'Continue',
+        'href': URL + '/submit', 'submit': False, 'in_form': True,
+        'form_selector': '#app', 'form_action': URL,
+    }
+    page['controls'].append(anchor)
+    args = ('click', '#continue-link')
+    if invalid == 'duplicate-selector':
+        page['controls'].append({**anchor, 'label': 'Another Continue'})
+    else:
+        args += ('--unknown',)
+    with pytest.raises(forms.PreSubmitGate) as denied:
+        await controller.before_ipc(None, args, {})
+    assert denied.value.item == 1
+    assert not fixture.held and not controller.committed
+
+
+@pytest.mark.asyncio
+async def test_raw_submit_uses_fresh_page_and_no_final_control_parity(
+        monkeypatch, tmp_path):
+    """Preparation may compare readers, but the irreversible check consumes
+    its own fresh PAGE observation and code-owned substantive predicates.
+    """
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    reads = []
+
+    async def current(_session):
+        reads.append('fresh-page')
+        return deepcopy(page)
+
+    async def no_full_witness(*_args, **_kwargs):
+        raise AssertionError('Final Submit must not run all-control parity.')
+
+    monkeypatch.setattr(controller, '_page', current)
+    monkeypatch.setattr(forms, '_observe_controls', no_full_witness)
+    await controller.before_ipc(None, ('click', '#submit'), {})
+    assert len(reads) >= 2  # Before the check and after acquiring its own hold.
+    assert fixture.held and controller.committed
+
+
+@pytest.mark.asyncio
+async def test_final_route_safety_failure_still_maps_to_item_one(
+        monkeypatch, tmp_path):
+    """Removing final parity cannot bypass existing tenant/CAPTCHA classifier."""
+    controller, page, target, fixture = _world(monkeypatch, tmp_path)
+    controller.entry_provenance = object()
+
+    def blocked(*_args, **_kwargs):
+        raise forms.Gate('Synthetic route or tenant evidence is invalid.')
+
+    monkeypatch.setattr(forms, '_entry_safety', blocked)
+    with pytest.raises(forms.PreSubmitGate) as refused:
+        await controller.before_ipc(None, ('click', '#submit'), {})
+    assert refused.value.item == 1
+    assert refused.value.reason == 'defect_pre_submit_item_1'
+    assert not fixture.held and not controller.committed
 
 @pytest.mark.parametrize(('value', 'blocked'), [
     ('1,500,000', True), ('2,500,000', False),

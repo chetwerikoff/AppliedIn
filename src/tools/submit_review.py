@@ -147,6 +147,27 @@ def _private_root() -> Path:
     return root
 
 
+def _prune_reasons() -> None:
+    """Limit private Reject notes to 100 small files and at most 30 days."""
+    directory = _private_root() / "reasons"
+    if not directory.exists():
+        return
+    if (directory.is_symlink() or not directory.is_dir()
+            or stat.S_IMODE(directory.stat().st_mode) & 0o077):
+        raise Refused("Private Reject reason storage is unsafe.")
+    entries = []
+    for item in directory.iterdir():
+        if (item.is_symlink() or not item.is_file() or item.suffix != ".txt"):
+            continue
+        info = item.stat()
+        entries.append((info.st_mtime, item))
+    entries.sort(reverse=True)
+    now = time.time()
+    for index, (stamp, item) in enumerate(entries):
+        if index >= 100 or now - stamp > 30 * 86400:
+            item.unlink(missing_ok=True)
+
+
 def private_directory(pk: str, generation: str) -> Path:
     name = hashlib.sha256(pk.encode()).hexdigest()[:24] + "-" + generation
     return _private_root() / name
@@ -310,8 +331,11 @@ def claim(pk: str, expected: str, decision: str, reason: str = "") -> Future:
                     if reasons.is_symlink():
                         raise Refused("Reviewer reason storage is unsafe.")
                     reasons.mkdir(mode=0o700, exist_ok=True)
+                    if stat.S_IMODE(reasons.stat().st_mode) & 0o077:
+                        raise Refused("Reviewer reason directory is not private.")
                     _write_private(reasons / (hashlib.sha256(
                         (pk + expected).encode()).hexdigest() + ".txt"), reason.encode())
+                    _prune_reasons()
                 except OSError:
                     reason = ""
             if not _patch(pk, states=("claimed",), status="needs_human",
@@ -438,11 +462,16 @@ def recover_orphans() -> None:
     with _LOCK:
         if _HOLDERS:
             return
+        # A filesystem failure must not hide a durable orphaned pending row.
         try:
             root = _private_root()
             for item in root.iterdir():
                 if item.is_dir() and item.name != "reasons" and not item.is_symlink():
                     _cleanup(item)
+            _prune_reasons()
+        except Exception:
+            pass
+        try:
             tracking = _tracking()
             for status in ("needs_human", "submitting"):
                 for row in tracking.query_status(status):

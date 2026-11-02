@@ -4000,7 +4000,10 @@ async def apply(url: str, company: str, facts: dict, model: str, *, pk: str = ''
         from tools.browser_apply import _site_rules
         from tools.claude_chrome import _stage_resume
     from core import flags
-    review_start_enabled = flags.submit_review_enabled()
+    # The sealed daemon-only synthetic fixture is forbidden from reading the
+    # owner's Redis; it never carries live reviewer authority. All ordinary
+    # applications sample the effective flag at start and again at raw Submit.
+    review_start_enabled = flags.submit_review_enabled() if ctx is None else False
     submitted = False
     producer_guard = None
 

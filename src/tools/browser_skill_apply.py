@@ -1621,7 +1621,7 @@ def _identity(target: dict) -> tuple:
         'selector', 'label', 'question', 'tag', 'type', 'native_type', 'in_form',
         'form_selector', 'form_action', 'formaction', 'form_action_attr_present',
         'form_action_raw', 'formaction_attr_present', 'formaction_raw',
-        'options', 'combobox', 'disabled',
+        'options', 'selected_options', 'combobox', 'disabled', 'visible',
         'required', 'has_value', 'value', 'value_attr_present', 'checked', 'name',
         'files', 'submit', 'navigates', 'href', 'native_form_owner_selector'))
 

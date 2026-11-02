@@ -317,10 +317,19 @@ function routeNotice(r) {
 }
 // A closed, never-submitted generation needs a new preparation and packet.
 // Only the existing human Retry button can initiate that separate run.
-const FRESH_REVIEW_STATES = new Set(["rejected", "expired", "restart", "session_lost"]);
+const FRESH_REVIEW_STATES = new Set(["rejected", "expired", "restart", "session_lost", "invalidated"]);
 function canFreshSubmitReview(r) {
-  return !!r && r.status === "needs_human" && r.gate_reason === "submit_review"
-    && FRESH_REVIEW_STATES.has(r.review_state) && r.submit_hold_state === "clear"
+  if (!r) return false;
+  const closedGeneration = FRESH_REVIEW_STATES.has(r.review_state)
+    && typeof r.gate_generation === "string"
+    && r.gate_generation.length >= 16 && r.gate_generation.length <= 128;
+  // A no-effect refusal can happen before a review token was published.
+  // Only explicit Retry starts new preparation; it never revives that attempt.
+  const unpublished = (r.review_state == null || r.review_state === "")
+    && (r.gate_generation == null || r.gate_generation === "")
+    && (r.review_expires_at == null || r.review_expires_at === "");
+  return r.status === "needs_human" && r.gate_reason === "submit_review"
+    && (closedGeneration || unpublished) && r.submit_hold_state === "clear"
     && r.possible_submission !== true && !r.confirmation_id;
 }
 // Every delegated action re-checks current rows. DOM visibility cannot authorize.

@@ -70,17 +70,27 @@ def guarded_row(row: dict | None) -> bool:
                 and row.get("gate_reason") == "submit_review")
 
 
-_MANUAL_RESTART_STATES = frozenset({"rejected", "expired", "restart", "session_lost"})
+_MANUAL_RESTART_STATES = frozenset({
+    "rejected", "expired", "restart", "session_lost", "invalidated",
+})
 
 
 def manual_restart_allowed(pk: str, row: dict, *, tracking=None) -> bool:
     """An explicit fresh Retry may recover only an unsent, ownerless review."""
     from tools import submit_hold
     with _LOCK:
+        generation = row.get("gate_generation")
+        closed_generation = (isinstance(row.get("review_state"), str)
+                             and row["review_state"] in _MANUAL_RESTART_STATES
+                             and isinstance(generation, str)
+                             and 16 <= len(generation) <= 128)
+        # A pre-publication refusal can be gated without any reviewer token.
+        # Only the exact unissued shape is recoverable; pending/claimed are not.
+        unpublished = (row.get("review_state") in (None, "")
+                       and generation in (None, "")
+                       and row.get("review_expires_at") in (None, ""))
         if (not guarded_row(row) or row.get("status") != "needs_human"
-                or row.get("review_state") not in _MANUAL_RESTART_STATES
-                or not isinstance(row.get("gate_generation"), str)
-                or not 16 <= len(row["gate_generation"]) <= 128
+                or not (closed_generation or unpublished)
                 or row.get("pk") != pk or pk in _HOLDERS
                 or row.get("possible_submission") or row.get("confirmation_id")):
             return False
@@ -89,7 +99,8 @@ def manual_restart_allowed(pk: str, row: dict, *, tracking=None) -> bool:
             current = tracking.get_current(pk) or {}
             if any(current.get(key) != row.get(key) for key in (
                     "pk", "company", "job_id", "jd_url", "status",
-                    "gate_reason", "review_state", "gate_generation")):
+                    "gate_reason", "review_state", "gate_generation",
+                    "review_expires_at")):
                 return False
             return not submit_hold.blocked(pk, current, tracking=tracking)
         except Exception:
@@ -101,8 +112,8 @@ def begin_manual_restart(pk: str, row: dict, changes: dict, *, tracking=None) ->
     with _LOCK:
         if not manual_restart_allowed(pk, row, tracking=tracking):
             return False
-        return _patch(pk, states=(row["review_state"],),
-                      status="needs_human", generation=row["gate_generation"],
+        return _patch(pk, states=(row.get("review_state"),),
+                      status="needs_human", generation=row.get("gate_generation"),
                       changes=changes)
 
 
@@ -163,7 +174,14 @@ def _patch(pk: str, *, states: tuple[str, ...], status: str,
                         or row.get("possible_submission")
                         or row.get("confirmation_id")
                         or (generation is not None
-                            and row.get("gate_reason") != "submit_review")):
+                            and row.get("gate_reason") != "submit_review")
+                        # A tokenless fresh Retry must not clear a competing
+                        # reviewer/owner gate if the row changed during admission.
+                        or (changes.get("gate_reason") == ""
+                            and row.get("gate_reason") != "submit_review")
+                        or (changes.get("gate_reason") == "" and generation is None
+                            and (row.get("gate_generation") not in (None, "")
+                                 or row.get("review_expires_at") not in (None, "")))):
                     pipe.unwatch()
                     return False
                 before = row.get("status")

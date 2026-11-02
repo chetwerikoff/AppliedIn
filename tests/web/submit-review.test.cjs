@@ -162,7 +162,7 @@ test('native multi-select review separates every selected caption and value', as
 });
 
 test('only closed harmless review states display the explicit fresh Retry action', () => {
-  for (const review_state of ['rejected', 'expired', 'restart', 'session_lost']) {
+  for (const review_state of ['rejected', 'expired', 'restart', 'session_lost', 'invalidated']) {
     const h = harness();
     const closed = { ...job(), review_state };
     h.state.apps = [closed];
@@ -172,11 +172,22 @@ test('only closed harmless review states display the explicit fresh Retry action
       assert.equal(h.fn('rowActionAllowed')(PK, action), false);
     }
   }
-  for (const review_state of ['pending', 'claimed', 'invalidated']) {
+  const unpublished = { ...job(), review_state: null,
+    gate_generation: null, review_expires_at: null };
+  const fresh = harness();
+  fresh.state.apps = [unpublished];
+  assert.equal(fresh.fn('rowActionAllowed')(PK, 'retry'), true);
+  assert.match(fresh.fn('needsCard')(unpublished), /data-act="retry"/);
+  for (const review_state of ['pending', 'claimed', 'unknown']) {
     const h = harness();
     const active = { ...job(), review_state };
     h.state.apps = [active];
     assert.equal(h.fn('rowActionAllowed')(PK, 'retry'), false);
     assert.doesNotMatch(h.fn('needsCard')(active), /data-act="retry"/);
   }
+  const partial = { ...job(), review_state: 'invalidated', gate_generation: null };
+  const h = harness();
+  h.state.apps = [partial];
+  assert.equal(h.fn('rowActionAllowed')(PK, 'retry'), false);
+  assert.doesNotMatch(h.fn('needsCard')(partial), /data-act="retry"/);
 });

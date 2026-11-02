@@ -104,12 +104,18 @@ def closed_review(state="rejected"):
     }
 
 
-@pytest.mark.parametrize("review_state", ["rejected", "expired", "restart", "session_lost"])
+@pytest.mark.parametrize("review_state", [
+    "rejected", "expired", "restart", "session_lost", "invalidated", None,
+])
 def test_explicit_terminal_review_retry_destroys_old_generation(
         monkeypatch, review_state):
     """The human Retry action starts new preparation, never the held browser."""
     from core import events
     row = closed_review(review_state)
+    if review_state is None:
+        # The pre-publication refusal has no generation or review-state key.
+        row.pop("review_state")
+        row.pop("gate_generation")
     actions = []
     class Store:
         r = None
@@ -135,8 +141,8 @@ def test_explicit_terminal_review_retry_destroys_old_generation(
 
     def fake_patch(pk, *, states, status, generation, changes):
         assert pk == PK and status == "needs_human"
-        assert row["review_state"] in states
-        assert generation == row["gate_generation"]
+        assert row.get("review_state") in states
+        assert generation == row.get("gate_generation")
         row.update({k: getattr(v, "value", v) for k, v in changes.items()})
         return True
 
@@ -161,7 +167,7 @@ def test_explicit_terminal_review_retry_destroys_old_generation(
     assert row["status"] == "tailoring"
 
 
-@pytest.mark.parametrize("review_state", ["pending", "claimed", "invalidated"])
+@pytest.mark.parametrize("review_state", ["pending", "claimed", "unknown"])
 def test_nonterminal_review_never_admits_manual_retry(monkeypatch, review_state):
     """An owner click cannot consume a pending/claimed or ambiguous generation."""
     row = closed_review(review_state)
@@ -174,9 +180,14 @@ def test_nonterminal_review_never_admits_manual_retry(monkeypatch, review_state)
         "result": "gated", "pk": PK, "reason": "submit_review"}
 
 
-def test_closed_review_recovery_refuses_active_holder_or_submission_evidence(monkeypatch):
+@pytest.mark.parametrize("review_state", ["rejected", "invalidated", None])
+def test_closed_review_recovery_refuses_active_holder_or_submission_evidence(
+        monkeypatch, review_state):
     from tools import submit_hold
-    row = closed_review()
+    row = closed_review(review_state)
+    if review_state is None:
+        row.pop("review_state")
+        row.pop("gate_generation")
     tracking = SimpleNamespace(r=None, get_current=lambda pk: dict(row))
     monkeypatch.setattr(submit_review, "_HOLDERS", {PK: object()})
     assert not submit_review.manual_restart_allowed(PK, row, tracking=tracking)
@@ -188,3 +199,10 @@ def test_closed_review_recovery_refuses_active_holder_or_submission_evidence(mon
             PK, guarded, tracking=tracking)
     monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: True)
     assert not submit_review.manual_restart_allowed(PK, row, tracking=tracking)
+    if review_state is None:
+        monkeypatch.setattr(submit_hold, "blocked", lambda *a, **kw: False)
+        for state, token in (("invalidated", None), (None, "token"), (None, None)):
+            malformed = dict(row, review_state=state, gate_generation=token,
+                             review_expires_at="synthetic-expiry")
+            assert not submit_review.manual_restart_allowed(
+                PK, malformed, tracking=tracking)

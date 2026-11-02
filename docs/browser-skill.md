@@ -153,13 +153,16 @@ BrowserSkill click. No application is marked `applied` merely because the owner
 approved: actual employer confirmation remains necessary, and interrupted
 committing effects retain the stronger portal-verification/uncertainty gate.
 
-The private packet GET, Reject/Approve POST and settings toggle POST require
-local mode and exact loopback peer, Host and Origin. Extension origins, missing
-Origin and cross-origin requests refuse before any decision or private bytes.
-These checks are not authentication of other processes on the trusted machine.
-Browser compatibility with the strict missing-Origin GET policy must be verified
-offline before operator use; the server intentionally does not relax the
-accepted r08 origin rule to make a packet visible.
+The private packet GET, Reject/Approve POST and settings toggle POST all
+require local mode, a loopback peer, and the exact expected loopback Host:port.
+Under r09, packet **GET** requires a present Origin to match exactly
+`http://<Host>`; when Origin is absent, `Sec-Fetch-Site` must be
+`same-origin`, `none`, or absent. Anonymous `cross-site` and `same-site`
+GET requests are denied. Both the mode and review-decision **POSTs** require
+Origin exactly `http://<Host>`; missing or foreign Origins, including
+extension schemes, are denied. These route-local guards contain requests to
+the existing first-party loopback boundary, not authentication of other
+processes on the trusted machine (which can spoof these headers).
 
 **Verification boundary:** authoring these files is *not* proof of a successful
 live Submit flow. Tests are offline with synthetic employers and synthetic forms.

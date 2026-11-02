@@ -829,6 +829,61 @@ async def test_raw_submit_uses_fresh_page_and_no_final_control_parity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('drift', ['visibility', 'second_selected_option'])
+async def test_post_marker_unreviewed_control_drift_never_reaches_raw_submit(
+        monkeypatch, tmp_path, drift):
+    """The existing post-marker identity must include all selected values."""
+    controller, page, _target, fixture = _world(monkeypatch, tmp_path)
+    if drift == 'visibility':
+        page['controls'][0]['visible'] = True
+    else:
+        page['controls'].insert(-1, {
+            'selector': '#preferences', 'label': 'Work preferences',
+            'question': 'Work preferences', 'tag': 'select', 'type': 'select',
+            'name': 'preferences', 'value': 'keep', 'multiple': True,
+            'visible': True, 'required': False, 'disabled': False,
+            'options': [{'value': 'keep', 'label': 'Keep'},
+                        {'value': 'other', 'label': 'Other'}],
+            'selected_options': [{'value': 'keep', 'label': 'Keep'}],
+            'in_form': True, 'form_selector': '#app', 'form_action': URL,
+        })
+    original_hold = forms.hold_possible_submission
+
+    def drift_after_marker(pk, step, **kwargs):
+        original_hold(pk, step, **kwargs)
+        if drift == 'visibility':
+            page['controls'][0]['visible'] = False
+        else:
+            page['controls'][-2]['selected_options'].append(
+                {'value': 'other', 'label': 'Other'})
+            assert page['controls'][-2]['value'] == 'keep'
+
+    monkeypatch.setattr(forms, 'hold_possible_submission', drift_after_marker)
+    raw_calls, approved_claims, guards = [], [], []
+    monkeypatch.setattr(forms, 'check_dispatch',
+                        lambda *a, **kw: guards.append('dispatch'))
+    monkeypatch.setattr(forms, 'check_before_committing_click',
+                        lambda *a, **kw: guards.append('after_marker'))
+
+    class FakeRaw:
+        async def call(self, *args, **kwargs):
+            # This is the exact approved-continuation precheck, including the
+            # claimed-generation hook, before the raw Submit effect.
+            await controller.check_pre_submit(
+                self, page, _target,
+                review_before_hold=lambda: approved_claims.append('claimed'))
+            raw_calls.append(args)
+
+    with pytest.raises(forms.Gate, match='Final application form changed after the own hold'):
+        await FakeRaw().call('click', '#submit')
+    assert fixture.held
+    assert approved_claims == ['claimed']
+    assert guards == ['dispatch', 'after_marker']
+    assert raw_calls == []
+    assert not controller.committed
+
+
+@pytest.mark.asyncio
 async def test_final_route_safety_failure_still_maps_to_item_one(
         monkeypatch, tmp_path):
     """Removing final parity cannot bypass existing tenant/CAPTCHA classifier."""

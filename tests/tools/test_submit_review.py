@@ -90,6 +90,171 @@ def test_same_caption_with_different_hidden_value_is_not_approved():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["mode_revoked", "publication_refused"])
+async def test_prepublication_review_refusal_cannot_click_or_mint_token(
+        monkeypatch, failure):
+    """Without a published holder there is no authority, only fresh Retry."""
+    from tools import browser_skill as bsk
+    controller, page, target = world()
+    async def screenshot():
+        return b"\x89PNG\r\n\x1a\nsynthetic"
+    session = SimpleNamespace(
+        owner=asyncio.current_task(), _application_controller=controller,
+        review_screenshot=screenshot)
+    monkeypatch.setattr(flags, "submit_review_enabled",
+                        lambda: failure != "mode_revoked")
+    monkeypatch.setattr(browser_runtime, "backend", lambda: bsk)
+    calls = []
+    if failure == "publication_refused":
+        async def validate(_session, _page, _target, *, validation_only=False):
+            assert validation_only
+            calls.append("validated")
+        async def read(_session):
+            return copy.deepcopy(page)
+        def refuse_publish(**kwargs):
+            raise submit_review.Refused("Synthetic tracking refused publication.")
+        controller.check_pre_submit = validate
+        controller._page = read
+        monkeypatch.setattr(submit_review, "publish", refuse_publish)
+    with pytest.raises(Gate, match="revoked|stale or no longer safe"):
+        await ApplicationIPCController._review_before_commit(
+            controller, session, page, target, ("click", "#submit"), {})
+    assert calls == (["validated"] if failure == "publication_refused" else [])
+    assert getattr(controller, "review_holder", None) is None
+
+
+def test_toggle_off_pending_invalidates_and_allows_only_fresh_retry(
+        monkeypatch, tmp_path):
+    """A revoked, unsent holder has no raw effect or reusable generation."""
+    from tools import submit_hold
+    generation = "synthetic-generation-previous-1234"
+    row = {
+        "pk": PK, "company": "example-co", "job_id": "1", "jd_url": URL,
+        "status": "needs_human", "gate_reason": "submit_review",
+        "review_state": "pending", "gate_generation": generation,
+        "review_expires_at": "synthetic-expiry", "possible_submission": False,
+        "confirmation_id": None,
+    }
+    tracking = SimpleNamespace(get_current=lambda pk: dict(row), r=None)
+    monkeypatch.setattr(submit_review, "_tracking", lambda: tracking)
+    holder = submit_review.Holder(
+        PK, "example-co", generation, time.monotonic() + 600,
+        "synthetic-expiry", None, SimpleNamespace(id="synthetic-tab"),
+        object(), {}, tmp_path / "synthetic-closed", Future(), Future())
+    monkeypatch.setattr(submit_review, "_HOLDERS", {PK: holder})
+    checked = []
+    monkeypatch.setattr(submit_hold, "blocked",
+                        lambda *args, **kw: checked.append("hold") or False)
+
+    def cas(pk, *, states, status, generation, changes):
+        if (pk != PK or row["status"] != status
+                or row.get("review_state") not in states
+                or (generation is not None
+                    and row.get("gate_generation") != generation)):
+            return False
+        row.update(changes)
+        return True
+
+    monkeypatch.setattr(submit_review, "_patch", cas)
+    submit_review.invalidate_all()  # the mode-toggle OFF route's invalidation
+    assert row["review_state"] == "invalidated"
+    assert holder.closed and PK not in submit_review._HOLDERS
+    with pytest.raises(submit_review.Refused):
+        submit_review.claim(PK, generation, "approve")
+    assert submit_review.manual_restart_allowed(PK, dict(row), tracking=tracking)
+    assert submit_review.begin_manual_restart(PK, dict(row), {
+        "status": "tailoring", "gate_reason": "", "review_state": None,
+        "gate_generation": None}, tracking=tracking)
+    assert row["status"] == "tailoring"
+    assert row["gate_generation"] is None and checked
+
+
+@pytest.mark.asyncio
+async def test_form_drift_after_approval_invalidates_for_fresh_retry(
+        monkeypatch):
+    """The claimed old generation cannot click; Retry recreates preparation."""
+    from tools import browser_skill as bsk, submit_hold
+    controller, page, target = world()
+    generation = "synthetic-generation-before-drift-1234"
+    row = {
+        "pk": PK, "company": "example-co", "job_id": "1", "jd_url": URL,
+        "status": "needs_human", "gate_reason": "submit_review",
+        "review_state": "pending", "gate_generation": generation,
+        "review_expires_at": "synthetic-expiry", "possible_submission": False,
+        "confirmation_id": None,
+    }
+    holder = SimpleNamespace(pk=PK, generation=generation,
+                             deadline=time.monotonic() + 600)
+    holders = {PK: holder}
+    monkeypatch.setattr(submit_review, "_HOLDERS", holders)
+    tracking = SimpleNamespace(get_current=lambda pk: dict(row), r=None)
+    monkeypatch.setattr(submit_review, "_tracking", lambda: tracking)
+    monkeypatch.setattr(submit_hold, "blocked", lambda *args, **kw: False)
+    monkeypatch.setattr(flags, "submit_review_enabled", lambda: True)
+    monkeypatch.setattr(browser_runtime, "backend", lambda: bsk)
+    reads = []
+    prechecks = []
+    raw_effects = []
+
+    async def read(_session):
+        reads.append("page")
+        current = copy.deepcopy(page)
+        if len(reads) == 2:
+            # The visible caption stays Remote; the linked machine value drifts.
+            current["controls"][2]["combobox"]["hidden_value"] = "other"
+        return current
+    async def validate(_session, _page, _target, *, validation_only=False):
+        assert validation_only
+        prechecks.append("five")
+    async def screenshot():
+        return b"\x89PNG\r\n\x1a\nsynthetic"
+    async def forbidden_raw(*args):
+        raw_effects.append(args)
+        raise AssertionError("Synthetic raw Submit was sent")
+    session = SimpleNamespace(
+        owner=asyncio.current_task(), _application_controller=controller,
+        review_screenshot=screenshot, call=forbidden_raw)
+    controller._page = read
+    controller.check_pre_submit = validate
+    monkeypatch.setattr(submit_review, "publish", lambda **kwargs: holder)
+
+    async def approve(_holder):
+        row["review_state"] = "claimed"
+        return "approve"
+    monkeypatch.setattr(submit_review, "await_decision", approve)
+    monkeypatch.setattr(submit_review, "require_claim",
+                        lambda _holder, **kw: row["review_state"] == "claimed")
+    settled = []
+    monkeypatch.setattr(submit_review, "settle",
+                        lambda _holder, outcome: settled.append(outcome))
+    def invalidate(_holder, state="invalidated"):
+        row["review_state"] = state
+        holders.pop(PK, None)
+    monkeypatch.setattr(submit_review, "invalidate", invalidate)
+
+    def cas(pk, *, states, status, generation, changes):
+        if (pk != PK or row["status"] != status
+                or row.get("review_state") not in states
+                or (generation is not None
+                    and row.get("gate_generation") != generation)):
+            return False
+        row.update(changes)
+        return True
+    monkeypatch.setattr(submit_review, "_patch", cas)
+
+    with pytest.raises(Gate, match="Application controls changed after review"):
+        await ApplicationIPCController._review_before_commit(
+            controller, session, page, target, ("click", "#submit"), {})
+    assert len(reads) == 2 and prechecks == ["five"]
+    assert settled and settled[0]["error"] == "form_changed"
+    assert row["review_state"] == "invalidated"
+    assert PK not in holders and raw_effects == []
+    assert submit_review.begin_manual_restart(PK, dict(row), {
+        "status": "tailoring", "gate_reason": "", "review_state": None,
+        "gate_generation": None}, tracking=tracking)
+    assert row["status"] == "tailoring" and row["gate_generation"] is None
+
+@pytest.mark.asyncio
 async def test_native_raw_submit_rechecks_current_generation_after_context_await(monkeypatch):
     """Revoking a generation while sync_context awaits cannot reach raw IPC."""
     from tools import browser_skill as bsk
